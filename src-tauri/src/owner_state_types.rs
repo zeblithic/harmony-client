@@ -1169,6 +1169,8 @@ impl_canonical!(
     ReadMarker,
     LibraryEntry,
     RootPublishPayload,
+    crate::friend_graph::FriendGraph, // ZEB-370 Phase 1: friend-graph sub-CRDT
+    crate::friend_graph::FriendEntry,
 );
 
 // OwnerState lives in owner_state_crdt to keep CRDT semantics together;

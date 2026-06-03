@@ -43,6 +43,7 @@ pub mod event_loop;
 pub mod folder_ingest;
 pub mod folders;
 mod follows;
+pub mod friend_graph;
 pub mod identity;
 pub mod identity_commands;
 pub mod inbound_packet;
