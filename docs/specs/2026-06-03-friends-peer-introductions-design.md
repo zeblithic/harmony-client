@@ -42,29 +42,30 @@ This works with **zero communities**. It is a sibling to communities, not built 
 | pkarr case derivation | `harmony_pkarr::{PkarrCase, derive_ephemeral_key, PkarrPublisher, PkarrRoutingRecord, RecordBuilder}` (ZEB-322) | `PkarrCase::Friend` (cross-repo, harmony-core) |
 | Cross-WAN connect | iroh endpoint + `harmony/handshake/v1` ALPN (`iroh_endpoint.rs`, `iroh_invite_acceptor.rs`) | `harmony/friend/v1` ALPN for friend-link control messages |
 | One-shot sealed token | Invite mint (`invite_mint.rs`: `mint_invite_token`, `seal_epoch_key`/`SealRecipient`) + Case-A publish (`pkarr_invite_publisher.rs`) | Friend-token: peer-scoped variant of the same machinery |
-| Owner-to-owner sealing | `dm_signing::{seal_to_owner, open_from_owner}` (X25519 to owner key) | Pairwise ECDH secret derived from the same owner X25519 keypair |
+| Owner authentication | `community_membership::enrolled_key_from_cert` + `EnrollmentCert::verify()` (device-#2 + Master cert) | Same logic applied point-to-point (no `SignedMembershipEvent` wrapper) |
 | Republish cadence | `reachability_publisher.rs` (startup / network-change / 60-min idle / force) | Case-D records added to the same cadence |
 
 **Cross-repo dependency:** `PkarrCase::Friend` is a small additive change to the `harmony_pkarr` crate in harmony-core (mirrors how `Identity`/`Community`/`Invite` are defined). It ships as Phase 0 before the client work.
 
 ---
 
-## 3. Key model & the pairwise secret
+## 3. Identity & auth model
 
-An owner identity is the 64-byte composite `X25519_pub(32) ‖ Ed25519_pub(32)` (confirmed by `pkarr_identity_publisher.rs` test `build_id_pub`). The owner's X25519 private half is already custodied and used by `dm_signing::open_from_owner`.
+> **Correction (2026-06-03):** the original draft of this section keyed friends on the Reticulum/DM combined-pub identity (`X25519 ‖ Ed25519`) and rooted the pairwise secret in "owner X25519 ECDH." That conflated two distinct harmony identities and was wrong. Corrected below; the Phase-1 data model and the pairwise-secret plan changed accordingly.
 
-**Two distinct keys, two distinct jobs — to avoid the ZEB-326 derivation mismatch:**
+A Harmony **owner** is identified by its master **`owner_id`** (16 bytes) = `PubKeyBundle::identity_hash()` = `SHA256(canonical_CBOR{ed25519_master_verify, ml_dsa?})[:16]` (`harmony-owner/pubkey_bundle.rs`). This is the SAME principal used by `self_owner`, community membership, profile cards (ZEB-341), and enrollment certs. **The Friend Graph keys friends on this master `owner_id`** — *not* the Reticulum/DM combined-pub `Identity::address_hash` (`SHA256(X25519‖Ed25519)[:16]`), which is a different identity used only for DM transport routing.
 
-- **Signing** of friend-request / accept / introduction events uses the **enrolled device-#2 Ed25519 key** (consistent with ZEB-339 community-event signing). This is what proves "a real enrolled device of owner O authored this."
-- **The pairwise rendezvous secret** uses **owner-level X25519 ECDH**, computed identically on both sides:
+**Authentication = device-#2 signature + `EnrollmentCert` (the ZEB-339 model).** A node proves control of owner `O` by presenting `O`'s `EnrollmentCert` — a `Master`-issued cert binding `O`'s `owner_id` → an enrolled device-#2 Ed25519 key — and signing the handshake with that device-#2 key. A verifier:
+1. runs `cert.verify()` (checks `master_pubkey.identity_hash() == cert.owner_id` and the master→device signature chain),
+2. requires `cert.issuer == Master` (Quorum certs are rejected — the friend path can't fully verify them, mirroring `enrolled_key_from_cert`),
+3. checks `cert.owner_id == claimed owner_id`, and
+4. verifies the handshake signature against `cert.device_pubkeys.classical.ed25519_verify`.
 
-  ```
-  pairwise_secret = ECDH(my_owner_x25519_priv, their_owner_x25519_pub)
-  ```
+This is exactly `community_membership::enrolled_key_from_cert`'s logic, applied point-to-point (no `SignedMembershipEvent` wrapper — extract the 4-step core). Runtime handles: the device-#2 key + this node's own cert live in `DmOutbox` (`community_signing_key`, `enrollment_cert`); `self_owner = OwnerAddr(loaded.state.owner_id)`.
 
-  Both friends derive the same 32-byte secret; no third party can. This is the same owner X25519 keypair `dm_signing` already uses, so there is **no new key custody**. The secret is the root for Case-D rendezvous (§5) and is the natural place to later root a direct friend-channel cipher (out of scope now).
+> **Implementer rule:** the friend address IS the master `owner_id`. Enforce `addr == PubKeyBundle::classical_only(master_ed25519).identity_hash()` (v1; no PQ) in `apply_friend_update`. Sign/verify handshakes with the enrolled device-#2 key via the cert. Never key friends on, or authenticate via, the Reticulum combined-pub identity.
 
-> **Explicit rule for implementers:** never derive the pairwise secret from a device key or from `ed25519_priv_to_x25519(signing_key)`. It is owner-X25519 ECDH only. Signing is device-#2 only. Mixing these is exactly the ZEB-326 bug class.
+**Pairwise rendezvous secret — DEFERRED to Phase 1b, and OPEN.** Case-D was to be rooted in an "owner X25519 ECDH," but that does not hold under the master model: the master *and* device `PubKeyBundle` X25519 fields are currently a **zeroed stub** (`mint.rs` TODO v1.1). The only live per-owner X25519 is the **Reticulum identity** (`harmony_identity::PrivateIdentity::ecdh`), which is keyed on a *different* identity than `owner_id`. Phase 1b must reconcile "friends keyed on master `owner_id`" with "the only usable ECDH key is the Reticulum identity" (e.g. bind/store the friend's Reticulum identity alongside `owner_id`, or wait for the planned master/device X25519 HKDF derivation). **Phase 1 stores nothing that presumes a particular answer.**
 
 ---
 
@@ -82,12 +83,13 @@ pub struct FriendGraph {
 }
 
 pub struct FriendEntry {
-    /// The friend's 64-byte owner identity (X25519_pub || Ed25519_pub).
-    pub friend_owner_pub: [u8; 64],
-    /// Human label (their advertised display name at link time; refreshable).
+    /// The friend's master Ed25519 verify key. The map key (their `owner_id`)
+    /// MUST equal `PubKeyBundle::classical_only(master_ed25519).identity_hash()`
+    /// (v1; no PQ) — enforced in `apply_friend_update`. This anchors the friend
+    /// to the SAME principal as their community/profile identity.
+    pub master_ed25519: [u8; 32],
+    /// Human label (their advertised display name at link time; refreshable). Length-capped.
     pub display: Option<String>,
-    /// Last known iroh reachability for this friend (resolved via Case-D).
-    pub cached_reachability: Option<ReachabilityAnnouncePayload>,
     /// Lifecycle. Pending = request sent/received, not yet mutual.
     pub status: FriendStatus,           // Pending | Active | Revoked
     /// How this link was formed (provenance, for UX + audit).
@@ -101,7 +103,8 @@ pub struct FriendEntry {
 ```
 
 Notes:
-- The **pairwise secret is not stored in the replicated CRDT in plaintext.** It is recomputed on demand from `friend_owner_pub` + the local owner X25519 private (deterministic ECDH), so it never has to traverse the owner-state sync. (If caching is desired for hot paths, cache it in volatile per-process memory only.)
+- **No reachability or pairwise-secret material is stored in Phase 1.** `cached_reachability` and any Reticulum-identity binding needed for the pairwise secret belong to Phase 1b (see §3 — the key model is unresolved). Phase 1 stores only the master identity anchor + metadata.
+- The friend's identity is verified at the handshake (via their `EnrollmentCert`) before an entry is written; `master_ed25519` is the cert's `issuer.master_pubkey.classical.ed25519_verify`, and the map key is `cert.owner_id`.
 - `status: Revoked` acts as a tombstone (LWW), so an unfriend on one device propagates and cannot be silently resurrected by a stale `Active` from another device unless its `learned_at` is strictly newer.
 - The `referrable` and `established_via` fields exist in Phase 1 even though §6 ships in Phase 2 — this is the "introduction-ready data model" requirement that avoids a later CRDT migration.
 
@@ -140,7 +143,7 @@ pub struct ReferralEntry {
 
 ## 5. Peering handshake — three bootstrap paths
 
-All paths are **consensual (request → accept)** and converge on the same outcome: a mutual `FriendEntry{status: Active}` on both sides and a derivable pairwise secret. There is **no unilateral add**.
+All paths are **consensual (request → accept)** and converge on the same outcome: a mutual `FriendEntry{status: Active}` on both sides, each keyed on the other's master `owner_id` and authenticated by the other's device-#2 + `EnrollmentCert`. There is **no unilateral add**. (A pairwise rendezvous secret is a Phase-1b concern — see §3.)
 
 ### 5.1 Transport
 
@@ -212,12 +215,14 @@ Over an existing live `harmony/friend/v1` link to friend F, you may send `Catalo
 ## 9. Phasing
 
 - **Phase 0 — harmony-core (prereq, small):** add `PkarrCase::Friend` to `harmony_pkarr`; unit-test its derivation is distinct from Identity/Community/Invite.
-- **Phase 1 — client foundation (ships a complete feature):**
-  - `friend_graph.rs`: `FriendGraph` / `FriendEntry` CRDT + strict serde + LWW merge.
-  - Owner X25519 ECDH pairwise-secret helper (with the §3 device-vs-owner-key guardrail).
-  - `harmony/friend/v1` ALPN + `PeerRequest`/`PeerAccept` handshake; Paths A (mutual-key) and B (friend-token via reused mint machinery).
-  - `PkarrFriendPublisher` (Case-D) + resolver; wire into `reachability_publisher` cadence.
-  - Minimal Friends UX (list, add-by-key, generate/redeem friend-token, unfriend) + IPCs.
+- **Phase 1 — client foundation (this PR = ZEB-370; harmony-client only; ships a complete feature):**
+  - `friend_graph.rs`: `FriendGraph` / `FriendEntry` CRDT (keyed on master `owner_id`) + strict serde + LWW merge.
+  - `harmony/friend/v1` ALPN + `FriendLinkRequest`/`FriendLinkAccepted` handshake authenticated by device-#2 + `EnrollmentCert` (point-to-point `enrolled_key_from_cert` core); **Path B (friend-token)** via the reused ZEB-367 mint + Case-A pkarr machinery.
+  - Friends UX (list, generate/redeem friend-token, unfriend) + IPCs.
+  - `PeerIntroPolicy` *type* stored (not enforced); `referrable`/`established_via` fields present — introduction-ready data model, no later migration.
+- **Phase 1b — cross-WAN rendezvous (next PR; needs harmony-core `PkarrCase::Friend`):**
+  - Resolve the master-`owner_id`↔Reticulum-identity pairwise-secret question (§3); `PkarrFriendPublisher` (Case-D) + resolver wired into the `reachability_publisher` cadence; friend-scoped reconnection.
+  - **Path A (mutual-key)** first-contact.
 - **Phase 2 — introductions:**
   - `ReferralCatalog` request/response over `harmony/friend/v1`; `referrable` flag UX.
   - `IntroduceRequest` / `Introduction` broker; `PeerIntroPolicy` setting + enforcement; Path C.
@@ -229,10 +234,11 @@ Each phase is an independent PR (or small PR set) under the new ticket(s).
 
 ## 10. Testing strategy (TDD)
 
-**Unit**
-- Pairwise secret: both sides of an ECDH derive the identical 32 bytes; derivation is owner-X25519 (not device key).
-- Case-D key derivation distinct from cases A/B/C for the same inputs.
-- `FriendGraph` LWW merge: newer `learned_at` wins; `Revoked` tombstone not resurrected by stale `Active`; strict serde round-trip + rejection of malformed entries (mirror the `OwnerDeviceCache` serde tests).
+**Unit (Phase 1)**
+- Friend identity: `owner_id == PubKeyBundle::classical_only(master_ed25519).identity_hash()`; `apply_friend_update` rejects an entry whose key doesn't match its `master_ed25519`.
+- Handshake auth: a valid device-#2 sig + `Master` `EnrollmentCert` verifies; tampered sig, wrong `owner_id`, or non-`Master` issuer is rejected.
+- `FriendGraph` LWW merge: newer `learned_at` wins; `Revoked` tombstone not resurrected by stale `Active`; strict serde round-trip + rejection of malformed/oversized entries (mirror the `OwnerDeviceCache` serde tests).
+- (Phase 1b) Case-D key derivation distinct from cases A/B/C for the same inputs.
 - Friend-token mint → redeem produces a mutual PeerLink; tampered token rejected (reuse ZEB-367 token-sig tests as template).
 - `PeerIntroPolicy` truth table: Open/FoF/AskMe/Closed each accept/reject correctly; FoF accepts only when voucher is an Active friend of the target.
 - Referral catalog only includes `referrable` friends; signature verifies; tampered catalog rejected.
