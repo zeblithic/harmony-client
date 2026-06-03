@@ -32518,6 +32518,325 @@ where
     }
 }
 
+/// Outcome of a successful outbound friend-link redeem
+/// ([`connectivity_link_friend_iroh_inner`]): the newly-added friend's master
+/// `owner_id` and the display name recorded for them. The Phase-4 IPC wrapper
+/// maps this into a frontend DTO; tests assert on it directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FriendLinkOutcome {
+    /// The friend's (inviter's) 16-byte master `OwnerAddr` — the key under which
+    /// the new `FriendEntry` was written into local owner-state.
+    pub friend_addr: crate::owner_state_types::OwnerAddr,
+    /// The display name recorded on the new `FriendEntry` (the accept's display,
+    /// falling back to the token's `display_hint`). `None` when neither was set.
+    pub display: Option<String>,
+}
+
+/// ZEB-370 Phase 1 (Task 10): the OUTBOUND side of the friend handshake — decode
+/// a `harmony://friend/<token>` URL, resolve the inviter's reachability via
+/// Case-A pkarr (keyed on `token.sig`, exactly like an invite redeem), connect
+/// on the `harmony/friend/v1` ALPN, exchange a signed `FriendLinkRequest` /
+/// `FriendLinkAccepted`, and write the inviter into local owner-state as an
+/// `Active`/`Token` friend.
+///
+/// Split out as a reusable `pub` inner (the Phase-4 IPC wrapper snapshots
+/// `NodeState` and delegates) so integration tests can drive it with explicit
+/// resources. Structural template: [`connectivity_redeem_invite_iroh_inner`].
+///
+/// On a genuine *unreachable* condition (no pkarr record, dial/open_bi failure,
+/// IO timeout) this returns `Err(String)` describing the failure — unlike the
+/// invite redeem, the friend path has no "soft outcome" DTO, so the caller maps
+/// the `Err` into a user-facing diagnostic. Crypto/authentication failures
+/// (cert invalid, signature mismatch, apply rejected) also surface as `Err`.
+#[allow(clippy::too_many_arguments)]
+pub async fn connectivity_link_friend_iroh_inner(
+    token_url: String,
+    pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
+    iroh_endpoint: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    self_enrollment: harmony_owner::certs::EnrollmentCert,
+    self_device2_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    self_display: Option<String>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    dial_config: HandshakeDialConfig,
+) -> Result<FriendLinkOutcome, String> {
+    use crate::iroh_friend_acceptor::{
+        decode_friend_accepted, encode_friend_request, friend_accept_sig_preimage,
+        friend_request_sig_preimage, master_ed25519_from_cert, verify_enrolled_device,
+        FriendLinkRequest, FRIEND_MAX_PACKET_LEN,
+    };
+    use ed25519_dalek::{Signature, Signer, VerifyingKey};
+
+    // 1. Decode the friend-token URL (structural addr↔cert check happens inside
+    //    decode_friend_token_url) + verify the inviter.
+    let payload = crate::friend_token::decode_friend_token_url(&token_url)
+        .map_err(|e| format!("decode friend token URL: {e}"))?;
+
+    // 1a. Verify the inviter's EnrollmentCert binds the claimed owner_id, and
+    //     recover the inviter's enrolled device-#2 key.
+    let inviter_device_key =
+        verify_enrolled_device(&payload.inviter_enrollment, payload.inviter_addr)
+            .map_err(|e| format!("verify inviter enrollment: {e}"))?;
+
+    // 1b. Verify the friend token's device-#2 signature against that key (the
+    //     token is `InviteToken`-shaped, minted by `mint_friend_token`).
+    crate::community_invite::verify_invite_token_sig_device_key(
+        &payload.token,
+        &inviter_device_key,
+    )
+    .map_err(|e| format!("verify friend token sig: {e:?}"))?;
+
+    // 2. Resolve the inviter's reachability via Case-A pkarr, keyed on
+    //    `token.sig` — SAME mechanism as the invite redeem (friend tokens
+    //    publish under a `friend:`-namespaced handle but derive the ephemeral
+    //    key from `token.sig` under `PkarrCase::Invite`, exactly like invites).
+    let Some(resolver) = pkarr_resolver else {
+        return Err("pkarr resolver unavailable — cannot resolve inviter".to_string());
+    };
+    let Some(iroh_endpoint) = iroh_endpoint else {
+        return Err("iroh endpoint unavailable — cannot dial inviter".to_string());
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let epoch_window = harmony_pkarr::epoch_tolerance_window(now_ms);
+    let verifying_keys: Vec<_> = epoch_window
+        .iter()
+        .map(|&epoch| {
+            harmony_pkarr::derive_ephemeral_key(
+                harmony_pkarr::PkarrCase::Invite,
+                &payload.token.sig,
+                &epoch.to_be_bytes(),
+            )
+            .verifying_key()
+        })
+        .collect();
+
+    // `resolve_window` internally verifies the record's inner sig + skew and
+    // returns the freshest valid record. We skip `verify_identity_match` —
+    // unlike an invite, the friend token does not carry the inviter's transport
+    // composite pub; the friend handshake authenticates the inviter
+    // cryptographically via their EnrollmentCert + accept signature below.
+    let rec = resolver
+        .resolve_window(&verifying_keys)
+        .await
+        .map_err(|e| format!("pkarr resolve: {e}"))?;
+    let Some(rec) = rec else {
+        return Err("inviter_unreachable: no pkarr record for friend token".to_string());
+    };
+
+    // 3. Decode the inner routing payload + synthesize an EndpointAddr.
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(rec.routing_blob.as_slice())
+            .map_err(|e| format!("decode routing_blob: {e}"))?;
+
+    let inviter_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode inviter iroh_node_id: {e}"))?;
+    let mut inviter_addr = iroh::EndpointAddr::new(inviter_iroh_id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => inviter_addr = inviter_addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        inviter_addr = inviter_addr.with_ip_addr(*da);
+    }
+
+    // 4. Connect on the friend ALPN + open a bi-stream, bounded by dial_config.
+    let conn = match tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint
+            .inner()
+            .connect(inviter_addr, crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("inviter_unreachable: iroh connect failed: {e}")),
+        Err(_elapsed) => {
+            return Err(format!(
+                "inviter_unreachable: iroh connect timeout after {}ms",
+                dial_config.connect_timeout.as_millis()
+            ));
+        }
+    };
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Err(format!("inviter_unreachable: open_bi failed: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Err(format!(
+                    "inviter_unreachable: open_bi timeout after {}ms",
+                    dial_config.open_bi_timeout.as_millis()
+                ));
+            }
+        };
+
+    // 5. Build + device-#2-sign the FriendLinkRequest.
+    let req_sig = self_device2_signing_key
+        .sign(&friend_request_sig_preimage(self_owner, &payload.token.sig))
+        .to_bytes();
+    let request = FriendLinkRequest {
+        from_addr: self_owner,
+        display: self_display,
+        token_sig: payload.token.sig,
+        enrollment: self_enrollment,
+        sig: req_sig,
+    };
+    let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
+    let wire_len = wire.len() as u32;
+
+    // Write [u32 LE length-prefix][body], each bounded by write_timeout.
+    let write_prefix = async {
+        send.write_all(&wire_len.to_le_bytes())
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("inviter_unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("inviter_unreachable: request length-prefix write timeout".to_string());
+        }
+    }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write request body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("inviter_unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("inviter_unreachable: request body write timeout".to_string());
+        }
+    }
+    if let Err(e) = send.finish() {
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Err(format!("inviter_unreachable: send.finish failed: {e}"));
+    }
+
+    // 6. Read [u32 LE length-prefix][FriendLinkAccepted], bounded by
+    //    response_read_timeout.
+    let read_response = async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("read length-prefix: {e}"))?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > FRIEND_MAX_PACKET_LEN {
+            return Err(format!(
+                "response length out of bounds: len={len} max={FRIEND_MAX_PACKET_LEN}"
+            ));
+        }
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read response body: {e}"))?;
+        Ok::<Vec<u8>, String>(body)
+    };
+    let response_bytes =
+        match tokio::time::timeout(dial_config.response_read_timeout, read_response).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"response-read-failed");
+                return Err(format!("inviter_unreachable: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"response-read-timeout");
+                return Err("inviter_unreachable: friend accept response timeout".to_string());
+            }
+        };
+
+    // The acceptor already has our request bytes (it could not have produced an
+    // accept otherwise), so close immediately — the friend acceptor's
+    // `conn.closed()` wait is bounded by its own io_deadline.
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"friend-handshake-complete");
+    drop(conn);
+
+    let accepted =
+        decode_friend_accepted(&response_bytes).map_err(|e| format!("decode accepted: {e}"))?;
+
+    // 7. Verify the accept: it must be from the inviter (cert binds
+    //    payload.inviter_addr) and signed over the accept preimage.
+    let accept_device_key = verify_enrolled_device(&accepted.enrollment, payload.inviter_addr)
+        .map_err(|e| format!("verify accept enrollment: {e}"))?;
+    let accept_vk =
+        VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
+    accept_vk
+        .verify_strict(
+            &friend_accept_sig_preimage(payload.inviter_addr, &payload.token.sig),
+            &Signature::from_bytes(&accepted.sig),
+        )
+        .map_err(|_| "friend accept signature invalid".to_string())?;
+
+    // 8. Extract the inviter's master key (their friend-graph anchor) + apply
+    //    them as an Active/Token friend to local owner-state.
+    let master_ed25519 = master_ed25519_from_cert(&accepted.enrollment)
+        .map_err(|e| format!("extract inviter master key: {e}"))?;
+    let display = accepted.display.clone().or(payload.display_hint.clone());
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let learned_at =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let entry = crate::friend_graph::FriendEntry {
+        master_ed25519,
+        display: display.clone(),
+        status: crate::friend_graph::FriendStatus::Active,
+        established_via: crate::friend_graph::FriendOrigin::Token,
+        referrable: false,
+        learned_at,
+    };
+    {
+        let mut state = crdt_state.lock().await;
+        match state.apply_friend_update(payload.inviter_addr, entry) {
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+            | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {}
+            crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+                return Err(format!("friend-graph apply rejected: {reason:?}"));
+            }
+        }
+    }
+
+    tracing::info!(
+        friend = %hex::encode(payload.inviter_addr.0),
+        "ZEB-370: friend link established (inviter added as Active/Token friend)"
+    );
+
+    Ok(FriendLinkOutcome {
+        friend_addr: payload.inviter_addr,
+        display,
+    })
+}
+
 /// Toggle case-B "Make me discoverable" setting. Persists the toggle to
 /// `connectivity-settings.json` and registers / unregisters the pkarr
 /// identity publication accordingly.
