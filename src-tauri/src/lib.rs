@@ -14816,11 +14816,6 @@ async fn generate_invite(
     invitee_hint: Option<String>,
     expires_at: Option<u64>,
 ) -> Result<String, String> {
-    // `invitee_hint` selects a targeted invite-only invite — wired in a
-    // follow-up (ZEB-367 targeted path). `expires_at` is honored below for
-    // invite-only invites (bound into the InviteToken signature).
-    let _ = &invitee_hint;
-
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .as_slice()
@@ -14933,6 +14928,18 @@ async fn generate_invite(
         admin_identity_pub,
         untargeted_decrypt_key,
     ) = if is_invite_only {
+        // Targeted invites (invitee_hint = Some) are deferred to ZEB-369: they
+        // require resolving the invitee's enrolled device-#2 verifying key, which
+        // OwnerDeviceCache does NOT carry (it holds the identity/#3 key). Reject
+        // rather than silently hand back a weaker untargeted link (key-in-URL) in
+        // response to a request for a confidential targeted invite.
+        if invitee_hint.is_some() {
+            return Err(
+                "targeted invite-only invites are not yet supported (ZEB-369); \
+                 omit invitee_hint to generate an untargeted single-use link"
+                    .to_string(),
+            );
+        }
         // Inviter identity: device-#2 signing key (signs the token), reticulum
         // identity (admin_identity_pub), device id (per-device HLC stream).
         let (self_owner, self_private_identity, community_signing_key, device_id) = {

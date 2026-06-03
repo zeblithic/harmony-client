@@ -5,6 +5,8 @@
 - **Blocks / fixes:** [ZEB-366](https://linear.app/zeblith/issue/ZEB-366) (cross-WAN iroh join has no working generate→redeem loop), [ZEB-330](https://linear.app/zeblith/issue/ZEB-330) (Sub-D end-to-end validation)
 - **Builds on:** ZEB-262 (Phase 4 invite-only design — Reticulum-framed), ZEB-323 (case-A pkarr publisher), ZEB-325 (iroh redeem handshake), ZEB-339 (enrolled device-#2 signing)
 
+> **Implementation correction (2026-06-03):** During the build, recon proved the **targeted** mechanism below rests on a wrong assumption — "resolve the invitee's device-#2 X25519 from `OwnerDeviceCache`" is not implementable, because the cache stores the invitee's **identity (#3)** key, not the **enrolled device-#2 (#2)** key that `mint_redemption` decrypts with. Sealing to the cache value encrypts but never decrypts. The invitee's #2 key lives in their `EnrollmentCert` (only available when they're a visible member somewhere), so targeted is a larger, separate mechanism. **Targeted is deferred to [ZEB-369](https://linear.app/zeblith/issue/ZEB-369); ZEB-367 ships the untargeted path only** (the cross-WAN first-contact unlock). `generate_invite` rejects `invitee_hint` on invite-only with an error pointing to ZEB-369. The untargeted design below is correct and shipped; the targeted passages are retained for historical context, corrected in ZEB-369.
+
 ## Problem
 
 `generate_invite` (`src-tauri/src/lib.rs:14812`) supports **open communities only**; invite-only generation hard-errors:
