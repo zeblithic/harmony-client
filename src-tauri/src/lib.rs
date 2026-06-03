@@ -12353,6 +12353,214 @@ async fn decline_group_call(
     .await
 }
 
+// ── ZEB-360 Group-DM voice: media + presence IPCs ────────────────────────────
+
+fn parse_space_id_16(s: &str) -> Result<[u8; 16], String> {
+    parse_voice_id_16("spaceId", s)
+}
+
+/// ZEB-360: start a READ-ONLY group presence subscription (banner).
+#[tauri::command]
+async fn watch_group_call(
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let (_members, dm_key, _sk, _self) = resolve_group_call_members(&state, &space_id).await?;
+    let presence_key =
+        std::sync::Arc::new(crate::community_channel_log::derive_groupdm_presence_key(&dm_key));
+    let space_arr = parse_space_id_16(&space_id)?;
+    let tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::WatchGroupCall {
+        space_id: space_arr,
+        presence_key,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-360: stop the read-only banner subscription for a space.
+#[tauri::command]
+async fn unwatch_group_call(
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let space_arr = parse_space_id_16(&space_id)?;
+    let tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::UnwatchGroupCall { space_id: space_arr })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-360: join (or drop into) a group-DM call — reuses the DM media path
+/// (JoinDmCall) and additionally starts the group presence publisher.
+#[tauri::command]
+async fn join_group_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    let (_members, dm_key, signing_key, self_owner) =
+        resolve_group_call_members(&state, &space_id).await?;
+    let space_arr = parse_space_id_16(&space_id)?;
+
+    // Snapshot device + hlc exactly like join_dm_call.
+    let (voice_channel_tx, device_hex, self_device, hlc_tracker) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let tx = guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        let device_hex = guard
+            .dm_device_id
+            .clone()
+            .ok_or_else(|| "no device id".to_string())?;
+        let self_device = <[u8; 32]>::try_from(
+            hex::decode(&device_hex)
+                .map_err(|_| "device id not hex".to_string())?
+                .as_slice(),
+        )
+        .map_err(|_| "device id must be 32 bytes".to_string())?;
+        let hlc_tracker = guard
+            .hlc_tracker
+            .clone()
+            .ok_or_else(|| "no hlc tracker".to_string())?;
+        (tx, device_hex, self_device, hlc_tracker)
+    };
+
+    let k_voice = crate::community_channel_log::derive_dm_voice_key(&dm_key, &call);
+    let presence_key =
+        std::sync::Arc::new(crate::community_channel_log::derive_groupdm_presence_key(&dm_key));
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let joined_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms)
+            .await;
+
+    // Media: identical to a DM call (same topic/key/AAD), addressed by call_id.
+    voice_channel_tx
+        .send(voice::VoiceChannelRequest::JoinDmCall {
+            call_id: call,
+            caps: voice::VoiceJoinCaps {
+                channel_key: std::sync::Arc::new(k_voice),
+                signing_key: signing_key.clone(),
+                self_owner,
+                self_device,
+                joined_hlc: joined_hlc.clone(),
+            },
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    // Presence: publish our beacon + ensure the read subscriber is running.
+    voice_channel_tx
+        .send(voice::VoiceChannelRequest::StartGroupPresence {
+            space_id: space_arr,
+            call_id: call,
+            presence_key,
+            caps: voice::VoiceGroupPresenceCaps {
+                signing_key,
+                self_owner,
+                self_device,
+                joined_hlc,
+            },
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-360: leave a group-DM call — tombstone our presence beacon + tear down media.
+#[tauri::command]
+async fn leave_group_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    let space_arr = parse_space_id_16(&space_id)?;
+    let tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::StopGroupPresence {
+        space_id: space_arr,
+        call_id: call,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())?;
+    tx.send(voice::VoiceChannelRequest::LeaveDmCall { call_id: call })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-360: send a group-call media frame — reuses the DM media outbound.
+#[tauri::command]
+async fn send_group_voice_frame(
+    payload: voice::SendGroupVoiceFramePayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&payload.call_id)?;
+    let voice_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    voice_tx
+        .send(voice::VoiceOutbound::Dm {
+            call_id: call,
+            frame: payload.frame_bytes,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-360: flip the mute bit for an active group call (media + presence).
+#[tauri::command]
+async fn set_group_call_muted(
+    payload: voice::SetGroupCallMutedPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&payload.call_id)?;
+    let space_arr = parse_space_id_16(&payload.space_id)?;
+    let tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    // Media mute (reuses the DM mute flag keyed by call_id).
+    tx.send(voice::VoiceChannelRequest::SetDmCallMuted {
+        call_id: call,
+        muted: payload.muted,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())?;
+    // Presence mute (next beacon reflects it).
+    tx.send(voice::VoiceChannelRequest::SetGroupCallMuted {
+        space_id: space_arr,
+        call_id: call,
+        muted: payload.muted,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
 /// ZEB-352: join a 1:1 DM voice call media session. Derives the per-call
 /// `K_voice` from the DM content key + call-id and sends a
 /// `VoiceChannelRequest::JoinDmCall` to the event loop.
@@ -33181,9 +33389,15 @@ pub fn run() {
             leave_dm_call,
             send_dm_voice_frame,
             set_dm_call_muted,
-            // ZEB-360 Group-DM voice calls (signaling; media+presence IPCs land in Task 8).
+            // ZEB-360 Group-DM voice calls (signaling + media + presence IPCs).
             place_group_call,
             decline_group_call,
+            watch_group_call,
+            unwatch_group_call,
+            join_group_call,
+            leave_group_call,
+            send_group_voice_frame,
+            set_group_call_muted,
             send_mail,
             list_mail,
             get_mail,
@@ -33389,9 +33603,15 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         leave_dm_call,
         send_dm_voice_frame,
         set_dm_call_muted,
-        // ZEB-360 Group-DM voice calls (signaling; media+presence IPCs land in Task 8).
+        // ZEB-360 Group-DM voice calls (signaling + media + presence IPCs).
         place_group_call,
         decline_group_call,
+        watch_group_call,
+        unwatch_group_call,
+        join_group_call,
+        leave_group_call,
+        send_group_voice_frame,
+        set_group_call_muted,
     ])
 }
 
