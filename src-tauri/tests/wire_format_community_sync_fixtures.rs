@@ -217,6 +217,7 @@ fn invite_payload_with_epoch_snapshot_wire_bytes_pinned() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
     let bytes = canonical_cbor_encode(&payload).expect("encode");
     let expected_hex = "a562636950c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0626573a36265700062736b5820abababababababababababababababababababababababababababababababab627373a2626d62a062706ca062616450d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0626e6d6370696e62696ff4";

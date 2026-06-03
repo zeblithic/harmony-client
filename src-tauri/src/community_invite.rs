@@ -170,6 +170,20 @@ pub struct CommunityInvitePayload {
     /// binding (and thus the InviteToken signature) at first contact.
     #[serde(rename = "ec", skip_serializing_if = "Option::is_none", default)]
     pub inviter_enrollment: Option<harmony_owner::certs::EnrollmentCert>,
+
+    /// ZEB-367 untargeted invite-only only: the ephemeral X25519 private key the
+    /// redeemer uses to open `epoch_snapshot.sealed_epoch_key`. Rides ONLY in the
+    /// URL — never in the case-A pkarr record (which publishes routing keyed by
+    /// token.sig) and OUTSIDE the token-sig preimage. `None` for targeted + open
+    /// invites. Guarded so it can appear only on an untargeted invite-only payload.
+    #[serde(
+        rename = "ud",
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::owner_state_types::serialize_optional_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_optional_bytes_from_bstr"
+    )]
+    pub untargeted_decrypt_key: Option<[u8; 32]>,
 }
 
 /// The inviter's pre-signed authorization, embedded in the invite link
@@ -776,6 +790,13 @@ pub enum InviteUrlError {
         expected: usize,
         got: usize,
     },
+    /// ZEB-367: `untargeted_decrypt_key` was set on a payload that is not an
+    /// untargeted invite-only invite (i.e. open, or invite-only but targeted
+    /// via `invite_token.invitee_hint == Some(_)`). This key seals the epoch
+    /// key open to anyone holding the URL; allowing it on a targeted or open
+    /// payload would leak the epoch key. Enforced at both encode and decode.
+    #[error("untargeted_decrypt_key is only valid on an untargeted invite-only payload")]
+    UntargetedKeyNotAllowed,
 }
 
 /// Hard cap on the base64url body length (post-prefix-strip, in base64
@@ -868,6 +889,19 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
         payload.is_invite_only,
         payload.epoch_snapshot.sealed_epoch_key.len(),
     )?;
+    // ZEB-367: confidentiality invariant — the untargeted decrypt key may ONLY
+    // ride on an untargeted invite-only payload (invite-only with no
+    // invitee_hint). On a targeted or open payload it would leak the epoch key.
+    if payload.untargeted_decrypt_key.is_some() {
+        let untargeted_ok = payload.is_invite_only
+            && payload
+                .invite_token
+                .as_ref()
+                .is_some_and(|t| t.invitee_hint.is_none());
+        if !untargeted_ok {
+            return Err(InviteUrlError::UntargetedKeyNotAllowed);
+        }
+    }
     let cbor = canonical_cbor_encode(payload).map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
     // Encode-time size check: fail fast rather than producing an invite URL
@@ -952,6 +986,21 @@ pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlE
             ));
         }
         _ => {} // (None, None) or matching (Some, Some) — valid
+    }
+    // ZEB-367: confidentiality invariant — the untargeted decrypt key may ONLY
+    // ride on an untargeted invite-only payload (invite-only with no
+    // invitee_hint). A tampered/hostile URL that smuggles this key onto a
+    // targeted or open payload is rejected on receipt so the epoch key never
+    // leaks. Mirrors the encode-side guard.
+    if payload.untargeted_decrypt_key.is_some() {
+        let untargeted_ok = payload.is_invite_only
+            && payload
+                .invite_token
+                .as_ref()
+                .is_some_and(|t| t.invitee_hint.is_none());
+        if !untargeted_ok {
+            return Err(InviteUrlError::UntargetedKeyNotAllowed);
+        }
     }
     Ok(payload)
 }
@@ -1972,6 +2021,7 @@ mod tests {
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         }
     }
 
@@ -2031,6 +2081,7 @@ mod tests {
             pre_fork_snapshot: None,
             // ZEB-339: invite-only payloads must carry the inviter's cert.
             inviter_enrollment: Some(crate::community_membership::mint_test_owner(0x7E).cert),
+            untargeted_decrypt_key: None,
         }
     }
 
@@ -2058,6 +2109,47 @@ mod tests {
             ),
             "unexpected err: {err}"
         );
+    }
+
+    // ── ZEB-367 untargeted_decrypt_key guards ────────────────────────
+
+    #[test]
+    fn untargeted_key_rejected_on_open_payload() {
+        let mut p = make_open_payload_correct();
+        p.untargeted_decrypt_key = Some([1u8; 32]);
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::UntargetedKeyNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn untargeted_key_rejected_on_targeted_invite_only() {
+        // make_invite_only_payload_correct() builds an UNtargeted invite-only
+        // payload (invitee_hint == None). Flip it to targeted so the
+        // untargeted key becomes illegal. encode_invite_url does NOT verify the
+        // token sig (only structural presence — confirmed by reading the fn),
+        // so mutating invitee_hint without re-signing is fine here.
+        let mut p = make_invite_only_payload_correct();
+        if let Some(t) = p.invite_token.as_mut() {
+            t.invitee_hint = Some(OwnerAddr([5u8; 16]));
+        }
+        p.untargeted_decrypt_key = Some([1u8; 32]);
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::UntargetedKeyNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn untargeted_key_round_trips_on_untargeted_invite_only() {
+        // make_invite_only_payload_correct() is already untargeted
+        // (invite_token Some, invitee_hint None) and otherwise valid.
+        let mut p = make_invite_only_payload_correct();
+        p.untargeted_decrypt_key = Some([7u8; 32]);
+        let url = encode_invite_url(&p).expect("untargeted invite-only encodes");
+        let back = decode_invite_url(&url).expect("decodes");
+        assert_eq!(back.untargeted_decrypt_key, Some([7u8; 32]));
     }
 
     // ── decode_invite_url ────────────────────────────────────────────
@@ -2283,6 +2375,7 @@ mod tests {
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
 
         let bytes = canonical_cbor_encode(&payload).expect("encode");
@@ -2362,6 +2455,7 @@ mod tests {
             forked_from: Some(forked_from_id),
             pre_fork_snapshot: Some(snapshot.clone()),
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
 
         let bytes = canonical_cbor_encode(&payload).expect("encode");

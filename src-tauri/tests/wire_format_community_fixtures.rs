@@ -193,6 +193,7 @@ fn community_invite_payload_open_wire_bytes_pinned() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
     let bytes = canonical_cbor_encode(&p).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -250,6 +251,7 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
     let bytes = canonical_cbor_encode(&p).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();

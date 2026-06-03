@@ -15031,6 +15031,9 @@ async fn generate_invite(
         } else {
             None
         },
+        // ZEB-367: the untargeted decrypt key is set only by the dedicated
+        // generate-untargeted path (a later task); always None here for now.
+        untargeted_decrypt_key: None,
     };
 
     // ZEB-323 Phase 2b: case-A pkarr hook. Register a pending-invite publication
@@ -18163,6 +18166,7 @@ mod redeem_invite_inner_tests {
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
 
         let invite_url =
@@ -18462,6 +18466,7 @@ mod redeem_invite_inner_tests {
             // EnrollmentCert. This test exercises the no-Reticulum-destinations
             // fast-fail skip, not cert verification, so any valid cert suffices.
             inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA1).cert),
+            untargeted_decrypt_key: None,
         };
 
         let invite_url =
@@ -18624,6 +18629,7 @@ mod redeem_invite_inner_tests {
             pre_fork_snapshot: None,
             // ZEB-339: invite-only payloads must carry the inviter's cert.
             inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA2).cert),
+            untargeted_decrypt_key: None,
         };
         let invite_url_b = crate::community_invite::encode_invite_url(&invite_payload_b)
             .expect("encode invite url (run 2)");
@@ -18726,6 +18732,7 @@ mod redeem_invite_inner_tests {
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
 
         let device_id = "joiner-dev";
@@ -18820,6 +18827,7 @@ mod redeem_invite_inner_tests {
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
 
         let invite_url =
@@ -18945,6 +18953,7 @@ mod redeem_invite_inner_tests {
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
 
         let invite_url =
@@ -19051,6 +19060,7 @@ mod redeem_invite_inner_tests {
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
 
         let invite_url =
@@ -19144,6 +19154,7 @@ mod redeem_invite_inner_tests {
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
 
         let hlc = Hlc {
@@ -19217,6 +19228,7 @@ mod redeem_invite_inner_tests {
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
 
         let hlc = Hlc {
@@ -19279,6 +19291,7 @@ mod join_open_community_tests {
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
         let invite_url = encode_invite_url(&payload).expect("encode open url");
         let entry = LibraryDirectoryEntry {
@@ -34366,6 +34379,7 @@ mod generate_invite_helper_tests {
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
         let url = build_open_invite_url(&payload).expect("url");
         let decoded = decode_invite_url(&url).expect("decode");
@@ -34422,6 +34436,7 @@ mod generate_invite_helper_tests {
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
 
         let url = build_open_invite_url(&payload).expect("encode fork-invite url");

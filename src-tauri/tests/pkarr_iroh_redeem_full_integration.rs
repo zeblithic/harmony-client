@@ -615,6 +615,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             // alice_enrollment_for_invite = alice_comm.cert (cert.owner_id == alice_addr),
             // so enrolled_key_from_cert will successfully bind the cert to the actor.
             inviter_enrollment: Some(alice_enrollment_for_invite),
+            untargeted_decrypt_key: None,
         };
         let invite_url =
             community_invite::encode_invite_url(&invite_payload).expect("encode invite");
