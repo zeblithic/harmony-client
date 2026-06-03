@@ -879,3 +879,90 @@ describe('MessageService optimistic helpers', () => {
     expect(svc.messages[0].deliveryState).toBe('failed');
   });
 });
+
+// ── ZEB-337: self-authored messages must render the configured display
+// name, not the hardcoded literal "You". `ownDisplayName` is kept in sync
+// with the user's profile by App.svelte; the self-echo mapping sites must
+// honour it instead of stamping "You". Each test sets a distinctive name
+// so a regression to the literal "You" fails loudly.
+describe('MessageService — ZEB-337: self messages use configured ownDisplayName', () => {
+  let svc: MessageService;
+
+  beforeEach(() => {
+    svc = new MessageService();
+  });
+
+  function hexEncode(s: string): string {
+    return Array.from(new TextEncoder().encode(s))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  it('labels a self-echoed channel message with ownDisplayName, not "You"', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
+    svc.ownDisplayName = 'Jake Englund';
+    await svc.connectAdapter(adapter);
+    emit('message-received', {
+      id: 'self-echo-1', senderAddress: 'myaddr', senderName: 'whatever',
+      channel: 'c', hub: 'h', text: 'echo', timestamp: 1, priority: 'standard',
+    } satisfies ChannelMessageEvent);
+    const msg = svc.messages.find((m) => m.id === 'self-echo-1')!;
+    expect(msg.sender.address).toBe('self');
+    expect(msg.sender.displayName).toBe('Jake Englund');
+  });
+
+  it('labels a self-sent DM (dm-received echo) with ownDisplayName', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
+    svc.ownDisplayName = 'Jake Englund';
+    await svc.connectAdapter(adapter);
+    emit('dm-received', {
+      spaceId: 'space-1', messageCid: 'dm-self-1', from: 'myaddr',
+      sentAt: 1, receivedAt: 2, body: hexEncode('hi'), mimeType: 'text/plain',
+    });
+    const msg = svc.messages.find((m) => m.id === 'dm-self-1')!;
+    expect(msg.sender.address).toBe('self');
+    expect(msg.sender.displayName).toBe('Jake Englund');
+  });
+
+  it('labels the offline-fallback self message with ownDisplayName', async () => {
+    svc.ownDisplayName = 'Jake Englund';
+    await svc.send('offline', 'standard', 'general', 'main');
+    const msg = svc.messages.at(-1)!;
+    expect(msg.sender.address).toBe('self');
+    expect(msg.sender.displayName).toBe('Jake Englund');
+  });
+
+  it('labels self-outbound scrollback (loadDmThread) with ownDisplayName', async () => {
+    const { adapter } = createMockAdapter();
+    svc.ownDisplayName = 'Jake Englund';
+    await svc.connectAdapter(adapter);
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        messageCid: 'sb-self-1', from: 'myaddr', sentAt: 1, receivedAt: 2,
+        body: hexEncode('history'), mimeType: 'text/plain', isSelfOutbound: true,
+      },
+    ]);
+    await svc.loadDmThread('space-1');
+    const msg = svc.messages.find((m) => m.id === 'sb-self-1')!;
+    expect(msg.sender.address).toBe('self');
+    expect(msg.sender.displayName).toBe('Jake Englund');
+  });
+
+  // CodeAnt (PR #180): a whitespace-only display name (e.g. a legacy untrimmed
+  // profile) must not render a blank self author label — fall back to "You".
+  it('falls back to "You" when ownDisplayName is whitespace-only', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
+    svc.ownDisplayName = '   ';
+    await svc.connectAdapter(adapter);
+    emit('message-received', {
+      id: 'self-echo-ws', senderAddress: 'myaddr', senderName: 'whatever',
+      channel: 'c', hub: 'h', text: 'echo', timestamp: 1, priority: 'standard',
+    } satisfies ChannelMessageEvent);
+    const msg = svc.messages.find((m) => m.id === 'self-echo-ws')!;
+    expect(msg.sender.address).toBe('self');
+    expect(msg.sender.displayName).toBe('You');
+  });
+});
