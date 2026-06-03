@@ -240,7 +240,18 @@
     if (!groupCall) return;
     const entry = get(groupCallBanners)[spaceId];
     if (!entry) return;
-    if (get(groupCall.state).callId === entry.callId) return;
+    const gs = get(groupCall.state);
+    if (gs.callId === entry.callId) return;
+    // ZEB-360 (Cursor R6): if we're being RUNG for a *different* concurrent call
+    // in this space, dismiss that ring before joining the one the user picked.
+    // `leaveOtherVoiceThen` intentionally skips 'incoming' (it's the accept path),
+    // so joinActive — which requires 'idle' — would otherwise throw and the Join
+    // would silently no-op. Declining is the honest semantic: D6 allows only one
+    // engine, so choosing this call means we're not answering the other, and the
+    // decline signal lets that caller know. Best-effort; never blocks the join.
+    if (gs.phase === 'incoming') {
+      await groupCall.decline().catch(() => {});
+    }
     const { invoke } = await import('@tauri-apps/api/core');
     await ensureGroupMembers(invoke, spaceId);
     await leaveOtherVoiceThen(() => groupCall!.joinActive(entry.callId, spaceId));
