@@ -46,15 +46,48 @@ impl PkarrInvitePublisher {
             // per-invite secret to key an HKDF record on.
             return;
         };
-        // Re-derive the ephemeral key on EVERY publish so it tracks the
-        // current epoch. Capturing the key once at registration would silently
-        // break case-A discovery after the first epoch boundary (resolvers
-        // query the current-epoch key ± tolerance; a frozen old-epoch key
-        // falls outside the window after one or two boundaries).
-        let token_sig = token.sig;
+        let handle = format!("invite:{}", hex::encode(token.sig));
+        self.register_case_a(handle, token.sig).await;
+    }
+
+    /// Called when the invite is consumed, expires, or is revoked.
+    pub async fn unregister_invite(&self, invite_token_sig: &[u8; 64]) {
+        let handle = format!("invite:{}", hex::encode(invite_token_sig));
+        self.publisher.unregister(&handle).await;
+    }
+
+    /// ZEB-370 Phase 1: publish the inviter's iroh routing for a friend token
+    /// under the `friend:{hex}` handle namespace (distinct from `invite:` so
+    /// friend links never collide with community invites). Reuses Case-A
+    /// `PkarrCase::Invite` keying for now; Phase 1b switches this to
+    /// `PkarrCase::Friend`. Called after `mint_friend_token` /
+    /// `generate_friend_token` succeeds; unregistered on consume/expiry.
+    pub async fn register_friend_token(&self, token_sig: &[u8; 64]) {
+        let handle = format!("friend:{}", hex::encode(token_sig));
+        self.register_case_a(handle, *token_sig).await;
+    }
+
+    /// Called when the friend token is consumed, expires, or is revoked.
+    pub async fn unregister_friend_token(&self, token_sig: &[u8; 64]) {
+        let handle = format!("friend:{}", hex::encode(token_sig));
+        self.publisher.unregister(&handle).await;
+    }
+
+    /// Shared Case-A registration core for `register_invite` /
+    /// `register_friend_token`. Publishes this node's routing blob (from the
+    /// struct's `routing_blob_builder` field) under `handle`, keyed by an
+    /// ephemeral key derived from `ikm` (the one-shot token sig) + the current
+    /// epoch.
+    ///
+    /// Re-derives the ephemeral key on EVERY publish so it tracks the current
+    /// epoch. Capturing the key once at registration would silently break
+    /// Case-A discovery after the first epoch boundary (resolvers query the
+    /// current-epoch key ± tolerance; a frozen old-epoch key falls outside the
+    /// window after one or two boundaries).
+    async fn register_case_a(&self, handle: String, ikm: [u8; 64]) {
         let key_builder: EphemeralKeyBuilder = Arc::new(move |at_ms| {
             let epoch_id = current_epoch_id(at_ms);
-            derive_ephemeral_key(PkarrCase::Invite, &token_sig, &epoch_id.to_be_bytes())
+            derive_ephemeral_key(PkarrCase::Invite, &ikm, &epoch_id.to_be_bytes())
         });
 
         let id_sk = self.identity_signing_key.clone();
@@ -65,14 +98,7 @@ impl PkarrInvitePublisher {
                 .expect("sign — fixed-size buffers should not fail")
         });
 
-        let handle = format!("invite:{}", hex::encode(token.sig));
         self.publisher.register(handle, key_builder, builder).await;
-    }
-
-    /// Called when the invite is consumed, expires, or is revoked.
-    pub async fn unregister_invite(&self, invite_token_sig: &[u8; 64]) {
-        let handle = format!("invite:{}", hex::encode(invite_token_sig));
-        self.publisher.unregister(&handle).await;
     }
 }
 
@@ -108,6 +134,39 @@ mod tests {
 
         // Verify the unregister path is safe when nothing was registered.
         inv_pub.unregister_invite(&[0u8; 64]).await;
+    }
+
+    #[tokio::test]
+    async fn friend_token_register_unregister_round_trip() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let id_pub = build_identity_pub(&sk);
+        let inv_pub = PkarrInvitePublisher::new(
+            publisher.clone(),
+            sk,
+            id_pub,
+            Arc::new(|| b"friend-routing".to_vec()),
+        );
+
+        let token_sig = [0x44u8; 64];
+        let handle = format!("friend:{}", hex::encode(token_sig));
+
+        inv_pub.register_friend_token(&token_sig).await;
+        assert!(
+            publisher.active_handles().await.contains(&handle),
+            "friend handle must be active after register"
+        );
+
+        inv_pub.unregister_friend_token(&token_sig).await;
+        assert!(
+            !publisher.active_handles().await.contains(&handle),
+            "friend handle must be gone after unregister"
+        );
     }
 
     #[tokio::test]
