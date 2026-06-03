@@ -3787,6 +3787,16 @@ pub async fn run<R: Runtime>(
                             );
                         }
                     }
+                    // TODO(ZEB-360 Task 6): real group-presence handlers. No IPC sends
+                    // these variants yet (place/join/watch IPCs land in Task 7/8), so
+                    // this arm is unreachable until then; warn loudly if it ever fires.
+                    crate::voice::VoiceChannelRequest::WatchGroupCall { .. }
+                    | crate::voice::VoiceChannelRequest::UnwatchGroupCall { .. }
+                    | crate::voice::VoiceChannelRequest::StartGroupPresence { .. }
+                    | crate::voice::VoiceChannelRequest::StopGroupPresence { .. }
+                    | crate::voice::VoiceChannelRequest::SetGroupCallMuted { .. } => {
+                        tracing::warn!("ZEB-360 group presence request reached event loop before Task 6 wiring; dropping");
+                    }
                 }
             }
 
