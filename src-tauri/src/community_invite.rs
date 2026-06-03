@@ -2152,6 +2152,30 @@ mod tests {
         assert_eq!(back.untargeted_decrypt_key, Some([7u8; 32]));
     }
 
+    /// The decode-side guard is the REAL confidentiality defense: an attacker
+    /// crafts URL bytes directly and never calls the guarded `encode_invite_url`.
+    /// CBOR-encode a payload that smuggles the untargeted decrypt key onto a
+    /// TARGETED invite-only payload (invitee_hint Some) — bypassing the encode
+    /// gate — and confirm `decode_invite_url` rejects it before the key can leak
+    /// the epoch secret. Without this test the decode-side guard is unverified
+    /// (the round-trip test above only exercises decode's accept path).
+    #[test]
+    fn decode_rejects_smuggled_untargeted_key_on_targeted_payload() {
+        let mut p = make_invite_only_payload_correct();
+        if let Some(t) = p.invite_token.as_mut() {
+            t.invitee_hint = Some(OwnerAddr([5u8; 16])); // targeted → untargeted key illegal
+        }
+        p.untargeted_decrypt_key = Some([1u8; 32]); // smuggled secret
+                                                    // Bypass the encode-side guard by CBOR-encoding directly.
+        let cbor = canonical_cbor_encode(&p).expect("cbor encode");
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
+        let url = format!("harmony://invite/{b64}");
+        assert!(matches!(
+            decode_invite_url(&url),
+            Err(InviteUrlError::UntargetedKeyNotAllowed)
+        ));
+    }
+
     // ── decode_invite_url ────────────────────────────────────────────
 
     /// Encode a payload with correct key length, then manually replace
