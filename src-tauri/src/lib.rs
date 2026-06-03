@@ -12141,6 +12141,7 @@ async fn resolve_group_call_members(
 /// ZEB-360: build, sign, seal, and fan a group `VoiceSignal` to a set of member
 /// owners (one sealed envelope per enrolled device each). `space_id` is always
 /// set so the inbound handler takes the group path.
+#[allow(clippy::too_many_arguments)]
 async fn send_group_voice_signal(
     state: &std::sync::Mutex<NodeState>,
     space_id_hex: &str,
