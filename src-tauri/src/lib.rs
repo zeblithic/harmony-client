@@ -12612,15 +12612,23 @@ async fn leave_group_call(
             .clone()
             .ok_or_else(|| "not connected".to_string())?
     };
+    // ZEB-360 (Cursor R4): tear down MEDIA first, then presence. Both requests
+    // travel the same mpsc, so a partial failure is only reachable if the event
+    // loop's receiver is dropped strictly between these two awaits (i.e. the loop
+    // is shutting down and tearing the whole session down anyway). In that window
+    // media-first yields the SAFE residual — the mic/audio is already gone, so no
+    // "hot mic after leave"; a lingering presence beacon self-evicts via the
+    // VOICE_PRESENCE_TTL_MS TTL on peers. (Mirrors the media-first privacy
+    // ordering used for mute.)
+    tx.send(voice::VoiceChannelRequest::LeaveDmCall { call_id: call })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
     tx.send(voice::VoiceChannelRequest::StopGroupPresence {
         space_id: space_arr,
         call_id: call,
     })
     .await
-    .map_err(|_| "event loop not running".to_string())?;
-    tx.send(voice::VoiceChannelRequest::LeaveDmCall { call_id: call })
-        .await
-        .map_err(|_| "event loop not running".to_string())
+    .map_err(|_| "event loop not running".to_string())
 }
 
 /// ZEB-360: send a group-call media frame — reuses the DM media outbound.
