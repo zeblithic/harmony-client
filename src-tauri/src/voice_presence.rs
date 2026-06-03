@@ -367,6 +367,21 @@ impl VoicePresenceMap {
     pub fn remove_channel(&mut self, c: &SpaceId, ch: &ChannelId) {
         self.inner.remove(&(*c, *ch));
     }
+
+    /// Resolve the owner for a device currently known in (c, ch), for media-drop
+    /// resolution (works even for entries hidden from the visible roster, i.e.
+    /// gravestones, since this looks at the raw entry map, not `roster()`).
+    pub fn owner_for_device(
+        &self,
+        c: &SpaceId,
+        ch: &ChannelId,
+        device: &[u8; 32],
+    ) -> Option<[u8; 16]> {
+        self.inner
+            .get(&(*c, *ch))
+            .and_then(|m| m.get(device))
+            .map(|e| e.owner)
+    }
 }
 
 // ── Membership verification + pub/sub spawn helpers ──────────────
@@ -557,6 +572,10 @@ pub async fn publish_presence_once(
 /// sentinel produced: the sentinel permanently poisoned same-session freshness,
 /// stalling the roster). `u64::MAX` stays reserved for the leave tombstone.
 ///
+/// `self_kicked` is a per-(community, channel) `Arc<AtomicBool>` SHARED with the
+/// control sub / sweep tick. While set, the publisher skips publishing so peers
+/// presence-evict this kicked client (ZEB-358).
+///
 /// `session` is an owned, cheaply-cloned `zenoh::Session`.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_voice_presence_publisher(
@@ -570,6 +589,7 @@ pub fn spawn_voice_presence_publisher(
     self_device: [u8; 32],
     joined_hlc: Hlc,
     muted: Arc<AtomicBool>,
+    self_kicked: Arc<AtomicBool>,
     seq_counter: Arc<AtomicU64>,
     interval: std::time::Duration,
     closing: Arc<AtomicBool>,
@@ -582,6 +602,15 @@ pub fn spawn_voice_presence_publisher(
             tick.tick().await;
             if closing.load(Ordering::SeqCst) {
                 break;
+            }
+            // ZEB-358 (Cursor HIGH): a kicked owner must stop advertising
+            // presence so peers presence-evict us (the 12 s TTL backstops; the FE
+            // overlay hides us immediately). Skip publishing while the per-channel
+            // `self_kicked` flag is set — set by the control sub / sweep tick from
+            // the moderation map. We keep ticking (no break) so a later
+            // un-kick within the same session resumes beacons.
+            if self_kicked.load(Ordering::Relaxed) {
+                continue;
             }
             let seq = seq_counter.fetch_add(1, Ordering::SeqCst);
             let beacon = build_heartbeat_beacon(
@@ -930,6 +959,20 @@ mod map_tests {
             "old-session tombstone is ignored"
         );
         assert_eq!(m.roster(&C, &CH).len(), 1, "freshly-rejoined entry remains");
+    }
+
+    #[test]
+    fn owner_for_device_resolves_known_and_gravestone_entries() {
+        let mut m = VoicePresenceMap::new();
+        m.apply(&C, &CH, &b(1, 1, 0, true, false), 0);
+        assert_eq!(m.owner_for_device(&C, &CH, &[1u8; 32]), Some([1u8; 16]));
+        // Unknown device → None.
+        assert_eq!(m.owner_for_device(&C, &CH, &[9u8; 32]), None);
+        // A buried (gravestone) entry is hidden from the roster but still
+        // resolvable here, so a muted-then-departing sender's last frames drop.
+        m.apply(&C, &CH, &b(1, 1, 1, true, true), 100);
+        assert!(m.roster(&C, &CH).is_empty());
+        assert_eq!(m.owner_for_device(&C, &CH, &[1u8; 32]), Some([1u8; 16]));
     }
 
     #[test]

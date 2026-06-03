@@ -10,12 +10,16 @@ use harmony_app::community_membership::ChannelId;
 use harmony_app::dm_signing::{
     derive_device_hash_from_identity_pub, sign_dm_packet, verify_dm_packet_signature,
 };
+use harmony_app::owner_state_crypto::canonical_cbor_encode;
 use harmony_app::owner_state_types::{
     DeviceIdentityHash, DmContentKey, EpochKey, Hlc, OwnerAddr, SpaceId,
 };
 use harmony_app::voice_crypto::{
     encrypt_dm_voice_packet_with_nonce, encrypt_voice_packet_with_nonce, VOICE_DM_PACKET_AAD,
     VOICE_PACKET_AAD,
+};
+use harmony_app::voice_moderation::{
+    seal_directive_with_nonce, sign_directive, ModAction, VoiceModerationDirective,
 };
 use harmony_app::voice_presence::{
     open_presence_beacon, seal_presence_beacon_with_nonce, sign_presence_beacon,
@@ -197,5 +201,70 @@ fn voice_signal_invite_signed_inner_wire_bytes_pinned() {
     assert_eq!(
         derived_hash, device_hash,
         "device_hash must match derived value"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ZEB-358 — voice moderation directive wire-format pins
+// ---------------------------------------------------------------------------
+
+/// Fully deterministic unsigned directive: fixed actor/target bytes, fixed HLC,
+/// seq 3. All fields are compile-time constants so the CBOR is stable.
+fn fixture_directive() -> VoiceModerationDirective {
+    VoiceModerationDirective {
+        actor_owner: [0xA1; 16],
+        actor_device: [0xD2; 32],
+        target_owner: [0xB3; 16],
+        action: ModAction::Mute,
+        issued_hlc: Hlc {
+            wall_ms: 42,
+            logical: 7,
+            device_id: "fixture-dev".into(),
+        },
+        seq: 3,
+    }
+}
+
+/// Pin the canonical-CBOR encoding of an unsigned `VoiceModerationDirective`.
+/// A drift here means a field rename (serde rename attr), a field added/removed,
+/// or the CBOR codec changed. Re-pin deliberately — never silently.
+#[test]
+fn voice_moderation_directive_canonical_cbor_is_pinned() {
+    let bytes = canonical_cbor_encode(&fixture_directive()).unwrap();
+    assert_eq!(
+        hex::encode(&bytes),
+        "a662616f50a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16261645820d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d262746f50b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b362616300626968a36177182a616c0761646b666978747572652d64657662737103",
+        "VoiceModerationDirective canonical-CBOR wire format drifted"
+    );
+}
+
+/// Pin the sealed (signed + ChannelKey-encrypted) directive wire format.
+/// Signing key is `[7u8; 32]`, nonce is `[9u8; 12]`, channel key/community/channel
+/// match the existing presence-beacon fixture exactly.
+///
+/// Unlike the unsigned-CBOR pin above (which keeps the synthetic `[0xD2; 32]`
+/// actor_device to lock serialization), this sealed fixture sets
+/// `actor_device = verifying_key([7u8; 32])` so it is a VALID wire example: the
+/// embedded device key matches the signer, so the packet passes
+/// `verify_directive_sig` (CodeRabbit Minor).
+#[test]
+fn voice_moderation_sealed_directive_is_pinned() {
+    let signing = SigningKey::from_bytes(&[7u8; 32]);
+    let mut directive = fixture_directive();
+    directive.actor_device = signing.verifying_key().to_bytes();
+    let signed = sign_directive(directive, &signing).expect("sign");
+    let key = derive_channel_key(
+        &EpochKey::new([0x11; 32]),
+        &SpaceId([0xc0; 16]),
+        &ChannelId([0xc1; 16]),
+    );
+    let community = SpaceId([0xc0; 16]);
+    let channel = ChannelId([0xc1; 16]);
+    let sealed =
+        seal_directive_with_nonce(&key, &community, &channel, &signed, [9u8; 12]).expect("seal");
+    assert_eq!(
+        hex::encode(&sealed),
+        "090909090909090909090909f76ed9e6ed6f16b7af2d4cdeba79cd9b2b52875c6c8dd9f55e6a6d3821f4eeac9766925d2973eb0c91014bd56686fe5976fe41136c9daba59323e9d50551fa78f3b765450ad1ebcb42c289f12efb521c3095d4204761a6235672205ac88454a330218cf5e02f8710576af956a769a71b5e1b2657eb6af19d43c5f0f7b0f6f9a4dec3298f7901d7979496c8a3f5583bbc5af6476b76332a0dc6b2e2fe15062fa509a2c1e8066233fa4ef0398626296a5d10440184ad8b9a19f02d566de18e35546864bc95e6788401",
+        "sealed VoiceModerationDirective wire format drifted"
     );
 }

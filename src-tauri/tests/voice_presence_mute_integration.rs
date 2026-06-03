@@ -121,6 +121,8 @@ async fn run_inner() {
     // ── Shared mute flag, started muted (V3 start-muted join). A's publisher
     //    reads this each heartbeat; flipping it simulates the `SetMuted` arm.
     let mute_flag = Arc::new(AtomicBool::new(true));
+    // ZEB-358: never kicked in this test → flag stays false (publisher always emits).
+    let self_kicked = Arc::new(AtomicBool::new(false));
     // Shared monotone beacon `seq` source — in production the same `Arc<AtomicU64>`
     // is handed to both this publisher and the `SetMuted` immediate-beacon path.
     let seq_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -143,6 +145,7 @@ async fn run_inner() {
         device_a,
         joined_hlc.clone(),
         Arc::clone(&mute_flag),
+        Arc::clone(&self_kicked),
         Arc::clone(&seq_counter),
         Duration::from_millis(200),
         Arc::clone(&closing),

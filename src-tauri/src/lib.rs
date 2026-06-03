@@ -87,6 +87,7 @@ pub mod state_snapshot;
 pub mod vine_feed_cache;
 pub mod voice;
 pub mod voice_crypto;
+pub mod voice_moderation;
 pub mod voice_presence;
 pub mod voice_signal;
 // ZEB-321 Phase 1 Task 5: zenoh-link::LinkUnicastTrait impl over an
@@ -11778,6 +11779,71 @@ async fn set_voice_muted(
         community_id: community,
         channel_id: channel,
         muted: payload.muted,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-358: issue a voice-moderation directive (mute/unmute/kick/unkick) against
+/// `targetOwnerHex` in a community voice channel. Mints a fresh issue-time HLC so
+/// cross-moderator last-writer-wins orders by issue time, then hands off to the
+/// event loop, which re-verifies the moderator's power before broadcasting.
+///
+/// Fire-and-forget beyond input validation: authority is enforced independently
+/// by EVERY receiver (and the issuer's own loopback), so an under-powered or
+/// not-joined request is dropped with a server-side log rather than surfaced
+/// here. The UI only renders moderation controls when the client already holds
+/// sufficient power, so the unauthorized path is a rare race (power changed
+/// underneath the moderator).
+#[tauri::command]
+async fn moderate_voice(
+    payload: voice::ModerateVoicePayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let community =
+        crate::owner_state_types::SpaceId(parse_voice_id_16("communityId", &payload.community_id)?);
+    let channel = crate::community_membership::ChannelId(parse_voice_id_16(
+        "channelId",
+        &payload.channel_id,
+    )?);
+    let target_owner = crate::owner_state_types::OwnerAddr(parse_voice_id_16(
+        "targetOwnerHex",
+        &payload.target_owner_hex,
+    )?);
+    let action = voice::ModerateVoicePayload::parse_action(&payload.action)?;
+
+    // Snapshot handles without holding the !Send guard across awaits.
+    let (tx, device_hex, hlc_tracker) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let tx = guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        let device_hex = guard
+            .dm_device_id
+            .clone()
+            .ok_or_else(|| "no device id".to_string())?;
+        let hlc_tracker = guard
+            .hlc_tracker
+            .clone()
+            .ok_or_else(|| "no hlc tracker".to_string())?;
+        (tx, device_hex, hlc_tracker)
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let issued_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms).await;
+
+    tx.send(voice::VoiceChannelRequest::Moderate {
+        community_id: community,
+        channel_id: channel,
+        target_owner,
+        action,
+        duration_ms: payload.duration_ms,
+        issued_hlc,
     })
     .await
     .map_err(|_| "event loop not running".to_string())
@@ -32801,6 +32867,7 @@ pub fn run() {
             join_voice_channel,
             leave_voice_channel,
             set_voice_muted,
+            moderate_voice,
             get_self_voice_identity,
             // ZEB-352 Voice V4: DM-call signaling + media IPCs.
             place_call,

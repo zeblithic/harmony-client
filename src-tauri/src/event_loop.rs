@@ -329,6 +329,71 @@ pub struct IrohRuntimeHandles {
     pub link_manager: std::sync::Arc<crate::zenoh_iroh_transport::IrohZenohLinkManager>,
 }
 
+/// ZEB-358: build + emit the `voice-moderation-changed` overlay for
+/// (community, channel). Resolves power levels from materialized membership;
+/// lists currently-enforced muted/kicked owners; flags the local node's own
+/// state. Best-effort (a failed emit is logged by Tauri, not surfaced).
+#[allow(clippy::too_many_arguments)]
+async fn emit_moderation_changed<R: Runtime>(
+    app: &AppHandle<R>,
+    registry: &std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    presence_map: &std::sync::Arc<tokio::sync::Mutex<crate::voice_presence::VoicePresenceMap>>,
+    moderation_map: &std::sync::Arc<tokio::sync::Mutex<crate::voice_moderation::ActiveModeration>>,
+    community: crate::owner_state_types::SpaceId,
+    channel: crate::community_membership::ChannelId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    now_ms: u64,
+) {
+    let (muted, kicked) = {
+        let g = moderation_map.lock().await;
+        g.snapshot(&community, &channel, now_ms)
+    };
+    // Resolve power levels (mirror beacon_signer_is_member's resolution).
+    let materialized = match registry.engine_arc(&community).await {
+        Some(engine) => {
+            let admin = engine.admin_addr();
+            let state = engine.state();
+            let guard = state.lock().await;
+            Some(guard.materialized(admin))
+        }
+        None => None,
+    };
+    let roster_owners: Vec<[u8; 16]> = {
+        let g = presence_map.lock().await;
+        g.roster(&community, &channel)
+            .into_iter()
+            .map(|e| e.owner)
+            .collect()
+    };
+    let power_of = |owner: &[u8; 16]| -> u8 {
+        materialized
+            .as_ref()
+            .and_then(|m| {
+                m.power_levels
+                    .get(&crate::owner_state_types::OwnerAddr(*owner))
+                    .copied()
+            })
+            .unwrap_or(0)
+    };
+    let mut powers = serde_json::Map::new();
+    for o in roster_owners.iter().chain(std::iter::once(&self_owner.0)) {
+        powers.insert(hex::encode(o), serde_json::json!(power_of(o)));
+    }
+    let _ = app.emit(
+        "voice-moderation-changed",
+        serde_json::json!({
+            "community": hex::encode(community.0),
+            "channel": hex::encode(channel.0),
+            "mutedOwners": muted.iter().map(hex::encode).collect::<Vec<_>>(),
+            "kickedOwners": kicked.iter().map(hex::encode).collect::<Vec<_>>(),
+            "powers": powers,
+            "selfPower": power_of(&self_owner.0),
+            "selfModMuted": muted.contains(&self_owner.0),
+            "selfKicked": kicked.contains(&self_owner.0),
+        }),
+    );
+}
+
 /// Run the NodeRuntime event loop as a background task.
 ///
 /// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
@@ -2004,6 +2069,56 @@ pub async fn run<R: Runtime>(
     // idle gap during which the gated branch wasn't polled.
     voice_sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // ── ZEB-358 voice moderation ──────────────────────────────────
+    // Receiver-side enforcement state shared with the per-channel control
+    // subscriber tasks (apply on receipt) and the loop (issue + sweep).
+    let voice_moderation_map = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::voice_moderation::ActiveModeration::default(),
+    ));
+    let mut voice_control_subs: std::collections::HashMap<
+        (
+            crate::owner_state_types::SpaceId,
+            crate::community_membership::ChannelId,
+        ),
+        tokio::task::JoinHandle<()>,
+    > = std::collections::HashMap::new();
+    // ZEB-358 (Cursor HIGH): per-channel "this node is kicked" flag, SHARED with
+    // that channel's presence publisher (gates beacon publishing) and its control
+    // sub (sets it from the moderation map after each apply). Kept in lockstep
+    // with `voice_control_subs` on Join/Leave.
+    let mut voice_self_kicked_flags: std::collections::HashMap<
+        (
+            crate::owner_state_types::SpaceId,
+            crate::community_membership::ChannelId,
+        ),
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    > = std::collections::HashMap::new();
+    // ZEB-358 (Qodo perf): true iff ANY moderation is currently enforced in ANY
+    // channel. The audio media subscriber reads this to skip the per-frame
+    // presence+moderation `Mutex` locks when no moderation is active (the common
+    // case). Updated after every apply (control sub + Moderate) and every sweep.
+    let voice_moderation_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Directives THIS node issued and is re-asserting until `stop_after_ms`.
+    // Key: (community, channel, target_owner, is_mute_class). Main-loop owned.
+    #[allow(clippy::type_complexity)]
+    let mut voice_issuer_directives: std::collections::HashMap<
+        (
+            crate::owner_state_types::SpaceId,
+            crate::community_membership::ChannelId,
+            [u8; 16],
+            bool,
+        ),
+        (crate::voice_moderation::SignedVoiceModerationDirective, u64),
+    > = std::collections::HashMap::new();
+    // Per-channel monotone seq for moderation directive LWW tiebreak.
+    let mut voice_moderation_seq: std::collections::HashMap<
+        (
+            crate::owner_state_types::SpaceId,
+            crate::community_membership::ChannelId,
+        ),
+        u64,
+    > = std::collections::HashMap::new();
+
     // ZEB-227 PR #80 review fix: retry buffer for RuntimeActions whose
     // dispatch transiently failed because dm_outbox/crdt_state locks were
     // contended by an in-flight IPC handler. Today only
@@ -2714,6 +2829,15 @@ pub async fn run<R: Runtime>(
                         let sub_key_retry = sub_key.clone();
                         let community_hex = hex::encode(community_id.0);
                         let channel_hex = hex::encode(channel_id.0);
+                        // ZEB-358: media-drop — resolve each sender's owner via the
+                        // presence map and drop the frame if that owner is currently
+                        // muted/kicked in this channel.
+                        let mod_map_media = std::sync::Arc::clone(&voice_moderation_map);
+                        let presence_map_media = std::sync::Arc::clone(&voice_presence_map);
+                        let voice_now_ms_media = std::sync::Arc::clone(&voice_now_ms);
+                        // ZEB-358 (Qodo perf): skip the per-frame presence+moderation
+                        // lookups entirely while no moderation is active.
+                        let mod_active_media = std::sync::Arc::clone(&voice_moderation_active);
                         match session.declare_subscriber(&sub_key).await {
                             Ok(sub) => {
                                 // The subscriber opens (decrypts) before emitting;
@@ -2747,6 +2871,42 @@ pub async fn run<R: Runtime>(
                                                     "oversized voice packet dropped"
                                                 );
                                                 continue;
+                                            }
+                                            // ZEB-358 media-drop: resolve this frame's
+                                            // sender device (last topic segment) → owner
+                                            // and drop the frame if that owner is muted
+                                            // or kicked in this channel right now. Fails
+                                            // open on an unparseable/unknown sender (not
+                                            // 32-byte hex, or not yet in the roster): such
+                                            // a frame can't carry a validly-sealed payload
+                                            // for this channel anyway, and the sender
+                                            // resolves within ~4 s once presence lands.
+                                            //
+                                            // Gated on the `voice_moderation_active` flag
+                                            // so the hot path does ZERO extra locks/parsing
+                                            // in the common case where no moderation is in
+                                            // effect (Qodo perf).
+                                            if mod_active_media.load(std::sync::atomic::Ordering::Relaxed) {
+                                                let key = sample.key_expr().as_str();
+                                                if let Some(sender_hex) = key.rsplit('/').next() {
+                                                    if let Ok(dev_bytes) = hex::decode(sender_hex) {
+                                                        if let Ok(dev) = <[u8; 32]>::try_from(dev_bytes.as_slice()) {
+                                                            let owner = {
+                                                                let g = presence_map_media.lock().await;
+                                                                g.owner_for_device(&c_sub, &ch_sub, &dev)
+                                                            };
+                                                            if let Some(owner) = owner {
+                                                                let now = (voice_now_ms_media)();
+                                                                let g = mod_map_media.lock().await;
+                                                                if g.is_muted(&c_sub, &ch_sub, &owner, now)
+                                                                    || g.is_kicked(&c_sub, &ch_sub, &owner, now)
+                                                                {
+                                                                    continue; // drop moderated sender's frame
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                             let sealed = sample.payload().to_bytes().to_vec();
                                             match crate::voice_crypto::decrypt_voice_packet(
@@ -2890,7 +3050,7 @@ pub async fn run<R: Runtime>(
                                         std::sync::Arc::clone(&caps.channel_key),
                                         community_id,
                                         channel_id,
-                                        registry,
+                                        registry.clone(),
                                         std::sync::Arc::clone(&voice_presence_map),
                                         app.clone(),
                                         closing.clone(),
@@ -2917,6 +3077,17 @@ pub async fn run<R: Runtime>(
                                         (community_id, channel_id),
                                         std::sync::Arc::clone(&seq_counter),
                                     );
+                                    // ZEB-358: per-channel self-kicked flag gating the
+                                    // presence publisher (a kicked owner stops beaconing
+                                    // so peers presence-evict us). Set by the control sub
+                                    // + sweep tick from the moderation map.
+                                    let self_kicked_flag = std::sync::Arc::new(
+                                        std::sync::atomic::AtomicBool::new(false),
+                                    );
+                                    voice_self_kicked_flags.insert(
+                                        (community_id, channel_id),
+                                        std::sync::Arc::clone(&self_kicked_flag),
+                                    );
                                     let pubh = crate::voice_presence::spawn_voice_presence_publisher(
                                         session.clone(),
                                         pres_topic,
@@ -2928,6 +3099,7 @@ pub async fn run<R: Runtime>(
                                         caps.self_device,
                                         caps.joined_hlc.clone(),
                                         mute_flag,
+                                        std::sync::Arc::clone(&self_kicked_flag),
                                         seq_counter,
                                         Duration::from_secs(4),
                                         closing.clone(),
@@ -2938,6 +3110,196 @@ pub async fn run<R: Runtime>(
                                     if let Some(h) = voice_presence_pubs.insert((community_id, channel_id), pubh) {
                                         h.abort();
                                     }
+                                    // ZEB-358: control subscriber — open + verify +
+                                    // authorize each sealed directive, then apply to
+                                    // the shared moderation map and re-emit the
+                                    // overlay. Mirrors the media sub's reconnect
+                                    // backoff (5s → 60s cap; reset only on progress).
+                                    let control_topic = format!(
+                                        "harmony/voice-control/{}/{}",
+                                        hex::encode(community_id.0),
+                                        hex::encode(channel_id.0),
+                                    );
+                                    let ctrl_session = Arc::clone(&session_arc);
+                                    let ctrl_key = std::sync::Arc::clone(&caps.channel_key);
+                                    let ctrl_registry = community_registry
+                                        .clone()
+                                        .expect("registry present in this branch");
+                                    let ctrl_mod_map =
+                                        std::sync::Arc::clone(&voice_moderation_map);
+                                    let ctrl_presence_map =
+                                        std::sync::Arc::clone(&voice_presence_map);
+                                    let ctrl_app = app.clone();
+                                    let ctrl_closing = closing.clone();
+                                    let ctrl_now_ms = std::sync::Arc::clone(&voice_now_ms);
+                                    let ctrl_self_owner = caps.self_owner;
+                                    let ctrl_community = community_id;
+                                    let ctrl_channel = channel_id;
+                                    // ZEB-358: the control sub updates the self-kicked
+                                    // flag (gates presence publishing) and the global
+                                    // moderation-active flag (gates the audio hot path)
+                                    // from the moderation map after each apply.
+                                    let ctrl_self_kicked =
+                                        std::sync::Arc::clone(&self_kicked_flag);
+                                    let ctrl_mod_active =
+                                        std::sync::Arc::clone(&voice_moderation_active);
+                                    let handle = tokio::spawn(async move {
+                                        let mut backoff = std::time::Duration::from_secs(5);
+                                        const MAX_BACKOFF: std::time::Duration =
+                                            std::time::Duration::from_secs(60);
+                                        loop {
+                                            let sub = match ctrl_session
+                                                .declare_subscriber(&control_topic)
+                                                .await
+                                            {
+                                                Ok(s) => s,
+                                                Err(e) => {
+                                                    if ctrl_closing.load(
+                                                        std::sync::atomic::Ordering::SeqCst,
+                                                    ) {
+                                                        return;
+                                                    }
+                                                    tracing::warn!(
+                                                        %control_topic,
+                                                        err = %e,
+                                                        backoff_s = backoff.as_secs(),
+                                                        "voice control subscribe failed; retrying"
+                                                    );
+                                                    tokio::time::sleep(backoff).await;
+                                                    backoff = std::cmp::min(
+                                                        backoff * 2,
+                                                        MAX_BACKOFF,
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+                                            // Track real progress so a flapping
+                                            // sub (declares OK, never receives)
+                                            // rate-limits instead of spinning.
+                                            let mut made_progress = false;
+                                            while let Ok(sample) = sub.recv_async().await {
+                                                made_progress = true;
+                                                if sample.payload().len()
+                                                    > crate::voice_crypto::MAX_VOICE_PACKET_BYTES
+                                                {
+                                                    continue;
+                                                }
+                                                let packet =
+                                                    sample.payload().to_bytes().to_vec();
+                                                let Some(signed) =
+                                                    crate::voice_moderation::open_directive(
+                                                        &ctrl_key,
+                                                        &ctrl_community,
+                                                        &ctrl_channel,
+                                                        &packet,
+                                                    )
+                                                else {
+                                                    continue;
+                                                };
+                                                // `directive_signer_is_authorized`
+                                                // verifies the device-#2 signature
+                                                // (via `verify_directive_authority`)
+                                                // before the membership + power
+                                                // gates, so an explicit
+                                                // `verify_directive_sig` here would
+                                                // be redundant (Qodo).
+                                                if crate::voice_moderation::directive_signer_is_authorized(
+                                                    &ctrl_registry,
+                                                    &ctrl_community,
+                                                    &signed,
+                                                )
+                                                .await
+                                                .is_err()
+                                                {
+                                                    continue;
+                                                }
+                                                let now = (ctrl_now_ms)();
+                                                let changed = {
+                                                    let mut g = ctrl_mod_map.lock().await;
+                                                    g.apply(
+                                                        &ctrl_community,
+                                                        &ctrl_channel,
+                                                        &signed.directive,
+                                                        now,
+                                                        crate::voice_moderation::ENFORCE_TTL_MS,
+                                                    )
+                                                };
+                                                // ZEB-358: refresh the self-kicked flag
+                                                // (gates our presence publisher) and the
+                                                // global moderation-active flag (gates the
+                                                // audio hot path) from the just-applied map.
+                                                {
+                                                    let g = ctrl_mod_map.lock().await;
+                                                    ctrl_self_kicked.store(
+                                                        g.is_kicked(
+                                                            &ctrl_community,
+                                                            &ctrl_channel,
+                                                            &ctrl_self_owner.0,
+                                                            now,
+                                                        ),
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    ctrl_mod_active.store(
+                                                        g.any_enforced(now),
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                }
+                                                if changed {
+                                                    emit_moderation_changed(
+                                                        &ctrl_app,
+                                                        &ctrl_registry,
+                                                        &ctrl_presence_map,
+                                                        &ctrl_mod_map,
+                                                        ctrl_community,
+                                                        ctrl_channel,
+                                                        ctrl_self_owner,
+                                                        now,
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                            // Inner receive loop ended on a
+                                            // transport error.
+                                            if ctrl_closing
+                                                .load(std::sync::atomic::Ordering::SeqCst)
+                                            {
+                                                break;
+                                            }
+                                            tracing::warn!(
+                                                %control_topic,
+                                                "voice control subscriber closed unexpectedly; reconnecting"
+                                            );
+                                            if made_progress {
+                                                backoff = std::time::Duration::from_secs(5);
+                                            } else {
+                                                tokio::time::sleep(backoff).await;
+                                                backoff =
+                                                    std::cmp::min(backoff * 2, MAX_BACKOFF);
+                                            }
+                                        }
+                                    });
+                                    if let Some(old) = voice_control_subs
+                                        .insert((community_id, channel_id), handle)
+                                    {
+                                        old.abort();
+                                    }
+                                    // Emit the moderation overlay once on join so the
+                                    // frontend gets `selfPower` immediately — otherwise a
+                                    // moderator joining a quiet channel (no active
+                                    // directives) would see no Mute/Remove controls until
+                                    // the next moderation apply/sweep (Cursor: "overlay
+                                    // missing on join").
+                                    emit_moderation_changed(
+                                        &app,
+                                        &registry,
+                                        &voice_presence_map,
+                                        &voice_moderation_map,
+                                        community_id,
+                                        channel_id,
+                                        caps.self_owner,
+                                        (voice_now_ms)(),
+                                    )
+                                    .await;
                                 }
                             }
                             Err(e) => {
@@ -2982,6 +3344,30 @@ pub async fn run<R: Runtime>(
                                 }
                             }
                         }
+                        // ZEB-358: tear down the moderation control sub + drop the
+                        // channel's enforcement state, any issuer directives we were
+                        // re-asserting, and the per-channel directive seq.
+                        if let Some(h) = voice_control_subs.remove(&(community_id, channel_id)) {
+                            h.abort();
+                        }
+                        voice_self_kicked_flags.remove(&(community_id, channel_id));
+                        // Drop this channel's enforcement state AND recompute the
+                        // global moderation-active flag in the same lock — the
+                        // channel we left may have held the only enforced
+                        // directives, so without this the atomic could stay true
+                        // and force needless per-frame lookups on later joins
+                        // (Cursor: "Leave skips moderation flag refresh").
+                        let mod_active_after_leave = {
+                            let mut g = voice_moderation_map.lock().await;
+                            g.remove_channel(&community_id, &channel_id);
+                            g.any_enforced((voice_now_ms)())
+                        };
+                        voice_moderation_active
+                            .store(mod_active_after_leave, std::sync::atomic::Ordering::Relaxed);
+                        voice_issuer_directives.retain(|(c, ch, _t, _m), _| {
+                            !(*c == community_id && *ch == channel_id)
+                        });
+                        voice_moderation_seq.remove(&(community_id, channel_id));
                         // ZEB-351 Voice V3: drop the shared mute flag in lockstep
                         // with the media key so a later `SetMuted` for a left
                         // channel is a no-op.
@@ -3010,6 +3396,22 @@ pub async fn run<R: Runtime>(
                                 "community": hex::encode(community_id.0),
                                 "channel": hex::encode(channel_id.0),
                                 "roster": Vec::<crate::voice_presence::RosterEntry>::new(),
+                            }),
+                        );
+                        // ZEB-358: likewise clear the moderation overlay for the
+                        // channel we left, so the UI never shows a stale mute/kick
+                        // banner after leaving (mirrors the empty-roster emit above).
+                        let _ = app.emit(
+                            "voice-moderation-changed",
+                            serde_json::json!({
+                                "community": hex::encode(community_id.0),
+                                "channel": hex::encode(channel_id.0),
+                                "mutedOwners": Vec::<String>::new(),
+                                "kickedOwners": Vec::<String>::new(),
+                                "powers": serde_json::Map::new(),
+                                "selfPower": 0,
+                                "selfModMuted": false,
+                                "selfKicked": false,
                             }),
                         );
                     }
@@ -3238,6 +3640,153 @@ pub async fn run<R: Runtime>(
                             flag.store(muted, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
+                    // ZEB-358: a moderator issues a directive. Sign + seal under
+                    // the channel key, publish to the control topic, loopback-apply
+                    // locally, and track for re-assert/revoke in the 4 s tick.
+                    crate::voice::VoiceChannelRequest::Moderate {
+                        community_id,
+                        channel_id,
+                        target_owner,
+                        action,
+                        duration_ms,
+                        issued_hlc,
+                    } => {
+                        // Resolve the active-channel caps (mirrors the SetMuted arm).
+                        if let (Some(key), Some((self_owner, self_device, _hlc, signing_key)), Some(registry)) = (
+                            voice_keys.get(&(community_id, channel_id)),
+                            voice_identity.get(&(community_id, channel_id)),
+                            community_registry.clone(),
+                        ) {
+                            let seq = {
+                                let c = voice_moderation_seq
+                                    .entry((community_id, channel_id))
+                                    .or_insert(0);
+                                *c += 1;
+                                *c
+                            };
+                            let directive = crate::voice_moderation::VoiceModerationDirective {
+                                actor_owner: self_owner.0,
+                                actor_device: *self_device,
+                                target_owner: target_owner.0,
+                                action,
+                                issued_hlc,
+                                seq,
+                            };
+                            match crate::voice_moderation::sign_directive(directive, signing_key) {
+                                Ok(signed) => {
+                                    // Local authority pre-check (re-verified by all
+                                    // receivers; this is just issuer-side UX).
+                                    if crate::voice_moderation::directive_signer_is_authorized(
+                                        &registry,
+                                        &community_id,
+                                        &signed,
+                                    )
+                                    .await
+                                    .is_ok()
+                                    {
+                                        let control_topic = format!(
+                                            "harmony/voice-control/{}/{}",
+                                            hex::encode(community_id.0),
+                                            hex::encode(channel_id.0),
+                                        );
+                                        match crate::voice_moderation::seal_directive(
+                                            key,
+                                            &community_id,
+                                            &channel_id,
+                                            &signed,
+                                        ) {
+                                            // Seal failed: do NOT enforce locally or
+                                            // register a re-assert — peers would never
+                                            // get a valid directive, so the issuer must
+                                            // not show phantom enforcement (Cursor).
+                                            Err(e) => tracing::warn!(
+                                                err = ?e,
+                                                "moderation directive seal failed; not applied"
+                                            ),
+                                            Ok(sealed) => {
+                                            // A publish failure here is transient — the
+                                            // 4 s re-assert retries — so we still enforce
+                                            // locally + register the directive.
+                                            if let Err(e) = session.put(&control_topic, sealed).await {
+                                                tracing::warn!(%control_topic, err = %e, "moderation directive publish failed");
+                                            }
+                                            let now = (voice_now_ms)();
+                                        let stop_after = now
+                                            + duration_ms.unwrap_or(
+                                                crate::voice_moderation::DEFAULT_MODERATION_MS,
+                                            );
+                                        let idkey = (
+                                            community_id,
+                                            channel_id,
+                                            target_owner.0,
+                                            action.is_mute_class(),
+                                        );
+                                        if action.enforces() {
+                                            voice_issuer_directives
+                                                .insert(idkey, (signed.clone(), stop_after));
+                                        } else {
+                                            // Revoke: re-assert briefly for reliable
+                                            // delivery, then drop the positive entry.
+                                            voice_issuer_directives.insert(
+                                                idkey,
+                                                (
+                                                    signed.clone(),
+                                                    now + crate::voice_moderation::ENFORCE_TTL_MS,
+                                                ),
+                                            );
+                                        }
+                                        // Loopback apply + emit.
+                                        let changed = {
+                                            let mut g = voice_moderation_map.lock().await;
+                                            g.apply(
+                                                &community_id,
+                                                &channel_id,
+                                                &signed.directive,
+                                                now,
+                                                crate::voice_moderation::ENFORCE_TTL_MS,
+                                            )
+                                        };
+                                        // ZEB-358 (Qodo perf): refresh the hot-path
+                                        // moderation-active flag after the issuer apply.
+                                        voice_moderation_active.store(
+                                            {
+                                                let g = voice_moderation_map.lock().await;
+                                                g.any_enforced(now)
+                                            },
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        if changed {
+                                            emit_moderation_changed(
+                                                &app,
+                                                &registry,
+                                                &voice_presence_map,
+                                                &voice_moderation_map,
+                                                community_id,
+                                                channel_id,
+                                                *self_owner,
+                                                now,
+                                            )
+                                            .await;
+                                        }
+                                            }
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            "local moderation pre-check failed: insufficient power or not a member"
+                                        );
+                                    }
+                                }
+                                Err(e) => tracing::warn!(err = ?e, "moderation directive sign failed"),
+                            }
+                        } else {
+                            // Not joined to this (community, channel): no caps to
+                            // sign/seal with, so the directive can't be issued. Log
+                            // rather than drop silently.
+                            tracing::warn!(
+                                "moderate request for a channel we are not joined to; dropped"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -3287,6 +3836,76 @@ pub async fn run<R: Runtime>(
                                 "roster": roster,
                             }),
                         );
+                    }
+                }
+                // ZEB-358: lapse moderation directives past TTL, re-emit overlay.
+                let now2 = (voice_now_ms)();
+                let mod_changed = {
+                    let mut g = voice_moderation_map.lock().await;
+                    g.sweep(now2)
+                };
+                // ZEB-358 (Qodo perf): refresh the hot-path moderation-active flag
+                // after the sweep (a lapse can flip the last enforcement off).
+                voice_moderation_active.store(
+                    {
+                        let g = voice_moderation_map.lock().await;
+                        g.any_enforced(now2)
+                    },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Some(registry) = community_registry.clone() {
+                    for (c, ch) in mod_changed {
+                        // self_owner for this channel from voice_identity.
+                        if let Some((self_owner, _d, _h, _k)) =
+                            voice_identity.get(&(c, ch))
+                        {
+                            // ZEB-358 (Cursor HIGH): a sweep that lapses our own
+                            // kick must clear the self-kicked flag so the presence
+                            // publisher resumes beaconing.
+                            if let Some(flag) = voice_self_kicked_flags.get(&(c, ch)) {
+                                let kicked = {
+                                    let g = voice_moderation_map.lock().await;
+                                    g.is_kicked(&c, &ch, &self_owner.0, now2)
+                                };
+                                flag.store(kicked, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            emit_moderation_changed(
+                                &app,
+                                &registry,
+                                &voice_presence_map,
+                                &voice_moderation_map,
+                                c,
+                                ch,
+                                *self_owner,
+                                now2,
+                            )
+                            .await;
+                        }
+                    }
+                    // Re-assert issuer directives still within their window; drop
+                    // expired ones.
+                    let mut expired: Vec<_> = Vec::new();
+                    for (idkey, (signed, stop_after)) in voice_issuer_directives.iter() {
+                        if now2 >= *stop_after {
+                            expired.push(*idkey);
+                            continue;
+                        }
+                        let (c, ch, _t, _m) = idkey;
+                        if let Some(key) = voice_keys.get(&(*c, *ch)) {
+                            if let Ok(sealed) = crate::voice_moderation::seal_directive(
+                                key, c, ch, signed,
+                            ) {
+                                let topic = format!(
+                                    "harmony/voice-control/{}/{}",
+                                    hex::encode(c.0),
+                                    hex::encode(ch.0),
+                                );
+                                let _ = session.put(&topic, sealed).await;
+                            }
+                        }
+                    }
+                    for k in expired {
+                        voice_issuer_directives.remove(&k);
                     }
                 }
             }
@@ -3420,6 +4039,11 @@ pub async fn run<R: Runtime>(
         handle.abort();
     }
     for (_, handle) in voice_presence_pubs.drain() {
+        handle.abort();
+    }
+    // ZEB-358: abort the per-channel moderation control subscriber tasks too, so
+    // they don't run detached past shutdown (CodeRabbit).
+    for (_, handle) in voice_control_subs.drain() {
         handle.abort();
     }
     // ZEB-352: abort the DM-call media subscriber tasks too, so they don't run

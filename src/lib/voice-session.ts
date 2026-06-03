@@ -28,6 +28,8 @@ export interface RosterMember {
   speaking: boolean;    // derived (Task 5)
   displayName?: string; // resolved from member card (Task 5)
   avatarUrl?: string;   // resolved from member card (Task 5)
+  modMuted: boolean;    // server-muted by a moderator (distinct from self-mute `muted`)
+  power: number;        // moderation power level (for FE control gating)
 }
 
 export interface VoiceSessionState {
@@ -61,6 +63,9 @@ export interface VoiceSessionState {
    * Reset to false on the next join attempt.
    */
   micBlocked: boolean;
+  selfPower: number;      // this node's moderation power in the active channel
+  selfModMuted: boolean;  // this node is currently server-muted by a moderator
+  selfKicked: boolean;    // this node is currently kicked from voice by a moderator
 }
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -80,7 +85,8 @@ function rostersEqual(a: RosterMember[], b: RosterMember[]): boolean {
     if (
       x.ownerHex !== y.ownerHex || x.deviceHex !== y.deviceHex ||
       x.muted !== y.muted || x.speaking !== y.speaking ||
-      x.displayName !== y.displayName || x.avatarUrl !== y.avatarUrl
+      x.displayName !== y.displayName || x.avatarUrl !== y.avatarUrl ||
+      x.modMuted !== y.modMuted || x.power !== y.power
     ) {
       return false;
     }
@@ -120,6 +126,7 @@ const INITIAL: VoiceSessionState = {
   phase: 'idle', community: null, channel: null,
   muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
   channelFull: false, reconnecting: false, micBlocked: false,
+  selfPower: 0, selfModMuted: false, selfKicked: false,
 };
 
 /**
@@ -234,6 +241,12 @@ export class VoiceSession {
   private lastSelfSpeaking = false;
   private lastRoster: { ownerHex: string; deviceHex: string; muted: boolean }[] = [];
 
+  private modMutedOwners = new Set<string>();
+  private kickedOwners = new Set<string>();
+  private powers: Record<string, number> = {};
+  private selfModMuted = false;
+  private selfKicked = false;
+
   async join(community: string, channel: string): Promise<void> {
     if (get(this.store).phase !== 'idle') {
       throw new Error('A voice session is already active');
@@ -328,6 +341,7 @@ export class VoiceSession {
 
       await this.subscribePresence();
       await this.subscribeTransport();
+      await this.subscribeModeration();
 
       // Open the soft-cap grace window: an over-cap roster arriving within the
       // next few seconds bounces this join (see maybeBounceForFull). The window
@@ -343,6 +357,8 @@ export class VoiceSession {
   }
 
   async setMuted(muted: boolean): Promise<void> {
+    // A moderator server-mute / kick blocks the target from self-unmuting.
+    if (muted === false && (this.selfModMuted || this.selfKicked)) return;
     const prev = this.muted;
     this.muted = muted;
     if (muted) this.vad.reset();
@@ -360,6 +376,30 @@ export class VoiceSession {
         throw err;
       }
     }
+  }
+
+  /** Force the local mic muted and best-effort publish it, WITHOUT rolling back
+   *  on IPC failure — a moderator server-mute/kick must stick locally even if
+   *  the presence beacon publish transiently fails. */
+  private forceLocalMute(): void {
+    this.muted = true;
+    this.patch({ muted: true });
+    if (this.community && this.channel) {
+      void this.deps
+        .invoke('set_voice_muted', { communityId: this.community, channelId: this.channel, muted: true })
+        .catch(() => {});
+    }
+  }
+
+  /**
+   * Issue a moderation directive against another participant (requires power).
+   * Backend re-verifies the moderator's power before broadcasting.
+   */
+  async moderate(targetOwnerHex: string, action: 'mute' | 'unmute' | 'kick' | 'unkick'): Promise<void> {
+    if (!this.community || !this.channel) return;
+    await this.deps.invoke('moderate_voice', {
+      communityId: this.community, channelId: this.channel, targetOwnerHex, action,
+    });
   }
 
   /**
@@ -429,6 +469,8 @@ export class VoiceSession {
     const community = this.community, channel = this.channel;
     this.community = null; this.channel = null;
     this.lastRoster = []; this.lastEmittedRoster = []; this.lastSelfSpeaking = false;
+    this.modMutedOwners = new Set(); this.kickedOwners = new Set(); this.powers = {};
+    this.selfModMuted = false; this.selfKicked = false;
     if (invokeLeave && community && channel) {
       await this.deps.invoke('leave_voice_channel', { communityId: community, channelId: channel }).catch(() => {});
     }
@@ -475,20 +517,57 @@ export class VoiceSession {
     this.unlisteners.push(unRestored);
   }
 
+  protected async subscribeModeration(): Promise<void> {
+    const un = await this.deps.listen('voice-moderation-changed', (e) => {
+      const p = e.payload as {
+        community: string; channel: string;
+        mutedOwners: string[]; kickedOwners: string[];
+        powers: Record<string, number>;
+        selfPower: number; selfModMuted: boolean; selfKicked: boolean;
+      };
+      if (p.community !== this.community || p.channel !== this.channel) return;
+      this.modMutedOwners = new Set(p.mutedOwners);
+      this.kickedOwners = new Set(p.kickedOwners);
+      this.powers = p.powers ?? {};
+      const wasSilenced = this.selfModMuted || this.selfKicked;
+      this.selfModMuted = p.selfModMuted;
+      this.selfKicked = p.selfKicked;
+      const nowSilenced = this.selfModMuted || this.selfKicked;
+      this.patch({ selfPower: p.selfPower, selfModMuted: p.selfModMuted, selfKicked: p.selfKicked });
+      // On ANY transition of the silenced state, force local self-mute. On a
+      // LIFT (nowSilenced=false, wasSilenced=true) this keeps the mic muted —
+      // the unattended-mic guard: a server-mute lapsing must NOT auto-resume
+      // transmitting; the user opts back in explicitly. This INTENTIONALLY
+      // extends the spec's D3 guard to the kick class too: an unkick (or a
+      // kick's TTL expiry) is a reinstatement, not a presence signal, so we
+      // don't know the user is back at the mic — keep them muted until they
+      // choose to talk again (Greptile P2).
+      if (nowSilenced !== wasSilenced) {
+        this.forceLocalMute();
+      }
+      this.refreshRoster();
+    });
+    this.unlisteners.push(un);
+  }
+
   /** Recompute roster view (speaking + card resolution). Call on presence + each drain. */
   private refreshRoster(): void {
-    const roster: RosterMember[] = this.lastRoster.map((r) => {
-      const isSelf = r.deviceHex.slice(0, 32) === this.deps.selfDeviceHex.slice(0, 32);
-      const speaking = isSelf
-        ? (!this.muted && !this.deafened && this.lastSelfSpeaking)
-        : (this.receiver?.isSpeaking(r.deviceHex.slice(0, 32)) ?? false);
-      const card = this.deps.resolveCard?.(r.ownerHex);
-      return {
-        ownerHex: r.ownerHex, deviceHex: r.deviceHex, muted: r.muted, speaking,
-        ...(card?.displayName ? { displayName: card.displayName } : {}),
-        ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
-      } as RosterMember;
-    });
+    const roster: RosterMember[] = this.lastRoster
+      .filter((r) => !this.kickedOwners.has(r.ownerHex))
+      .map((r) => {
+        const isSelf = r.deviceHex.slice(0, 32) === this.deps.selfDeviceHex.slice(0, 32);
+        const speaking = isSelf
+          ? (!this.muted && !this.deafened && this.lastSelfSpeaking)
+          : (this.receiver?.isSpeaking(r.deviceHex.slice(0, 32)) ?? false);
+        const card = this.deps.resolveCard?.(r.ownerHex);
+        return {
+          ownerHex: r.ownerHex, deviceHex: r.deviceHex, muted: r.muted, speaking,
+          modMuted: this.modMutedOwners.has(r.ownerHex),
+          power: this.powers[r.ownerHex] ?? 0,
+          ...(card?.displayName ? { displayName: card.displayName } : {}),
+          ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
+        } as RosterMember;
+      });
     // Only touch the store when the view actually changed — the drain tick calls
     // this ~10×/s, but most ticks produce an identical roster.
     if (!rostersEqual(roster, this.lastEmittedRoster)) {
@@ -515,10 +594,18 @@ export class VoiceSession {
   private maybeBounceForFull(): void {
     if (get(this.store).phase !== 'connected') return;
     if (Date.now() >= this.joinGraceUntilMs) return;
-    // Count OTHERS using the same self-identification refreshRoster uses.
+    // Count OTHERS using the same self-identification refreshRoster uses, and
+    // EXCLUDE kicked owners (Cursor Medium): a kicked member is presence-evicted
+    // and must not inflate the count into a false "channel full" bounce.
     const selfPrefix = this.deps.selfDeviceHex.slice(0, 32);
     const others = this.lastRoster.reduce(
-      (n, r) => n + (r.deviceHex.slice(0, 32) === selfPrefix ? 0 : 1), 0);
+      (n, r) =>
+        n +
+        (r.deviceHex.slice(0, 32) === selfPrefix || this.kickedOwners.has(r.ownerHex)
+          ? 0
+          : 1),
+      0,
+    );
     if (others < VOICE_CHANNEL_SOFT_CAP) return;
     this.joinGraceUntilMs = 0; // one-shot: don't let the drain tick re-bounce
     // leave() reset the store to INITIAL (channelFull:false); stamp the banner
