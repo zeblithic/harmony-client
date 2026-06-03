@@ -17,7 +17,13 @@ pub fn mint_invite_token(
     expires_at: Option<u64>,
     device2_signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<InviteToken, String> {
-    let mut token = InviteToken { inviter, invitee_hint, minted_at, expires_at, sig: [0u8; 64] };
+    let mut token = InviteToken {
+        inviter,
+        invitee_hint,
+        minted_at,
+        expires_at,
+        sig: [0u8; 64],
+    };
     let bytes = canonical_invite_token_bytes(&token)
         .map_err(|e| format!("canonical_invite_token_bytes: {e}"))?;
     use ed25519_dalek::Signer;
@@ -25,7 +31,7 @@ pub fn mint_invite_token(
     Ok(token)
 }
 
-use crate::dm_signing::{open_from_owner, seal_to_owner};
+use crate::dm_signing::seal_to_owner;
 
 /// Who the epoch key is sealed to.
 pub enum SealRecipient {
@@ -49,25 +55,75 @@ pub fn seal_epoch_key(
 ) -> Result<SealedEpochKey, String> {
     match recipient {
         SealRecipient::Targeted(pub_) => {
-            let sealed = seal_to_owner(&pub_, epoch_key).map_err(|e| format!("seal_to_owner: {e}"))?;
-            Ok(SealedEpochKey { sealed, untargeted_decrypt_key: None })
+            let sealed =
+                seal_to_owner(&pub_, epoch_key).map_err(|e| format!("seal_to_owner: {e}"))?;
+            Ok(SealedEpochKey {
+                sealed,
+                untargeted_decrypt_key: None,
+            })
         }
         SealRecipient::Untargeted => {
             let ephemeral_priv = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
             let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral_priv);
             let sealed = seal_to_owner(ephemeral_pub.as_bytes(), epoch_key)
                 .map_err(|e| format!("seal_to_owner: {e}"))?;
-            Ok(SealedEpochKey { sealed, untargeted_decrypt_key: Some(ephemeral_priv.to_bytes()) })
+            Ok(SealedEpochKey {
+                sealed,
+                untargeted_decrypt_key: Some(ephemeral_priv.to_bytes()),
+            })
         }
     }
+}
+
+use crate::community_membership::{MembershipEventKind, SignedMembershipEvent};
+use crate::owner_state_types::SpaceId;
+
+#[derive(Debug)]
+pub enum InviteMintError {
+    NoAdminBootstrap,
+}
+impl std::fmt::Display for InviteMintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAdminBootstrap => write!(f, "admin bootstrap Join not found in community log"),
+        }
+    }
+}
+
+/// Find the admin's bootstrap self-Join (kind=Join, actor=admin, no countersig,
+/// carries an enrollment cert) in a community's event set. This is what the
+/// redeemer pre-inserts so its empty CRDT can verify the admin's publish-back.
+pub fn extract_admin_bootstrap(
+    events: &[SignedMembershipEvent],
+    community_id: SpaceId,
+    admin_addr: OwnerAddr,
+) -> Result<SignedMembershipEvent, InviteMintError> {
+    events
+        .iter()
+        .find(|e| {
+            e.actor == admin_addr
+                && e.community_id == community_id
+                && matches!(e.kind, MembershipEventKind::Join)
+                && e.countersig.is_none()
+                && e.enrollment.is_some()
+        })
+        .cloned()
+        .ok_or(InviteMintError::NoAdminBootstrap)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::community_invite::verify_invite_token_sig_device_key;
+    use crate::dm_signing::open_from_owner;
 
-    fn hlc() -> Hlc { Hlc { wall_ms: 1_000, logical: 0, device_id: "dev2".to_string() } }
+    fn hlc() -> Hlc {
+        Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "dev2".to_string(),
+        }
+    }
 
     #[test]
     fn minted_token_verifies_against_device_key() {
@@ -81,7 +137,9 @@ mod tests {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut token = mint_invite_token(OwnerAddr([1u8; 16]), None, hlc(), None, &sk).unwrap();
         token.expires_at = Some(999_999); // not covered by the now-stale sig
-        assert!(verify_invite_token_sig_device_key(&token, &sk.verifying_key().to_bytes()).is_err());
+        assert!(
+            verify_invite_token_sig_device_key(&token, &sk.verifying_key().to_bytes()).is_err()
+        );
     }
 
     #[test]
@@ -99,8 +157,45 @@ mod tests {
     fn untargeted_seal_round_trips_via_url_key() {
         let epoch = [3u8; 32];
         let out = seal_epoch_key(&epoch, SealRecipient::Untargeted).unwrap();
-        let key = out.untargeted_decrypt_key.expect("untargeted returns a key");
+        let key = out
+            .untargeted_decrypt_key
+            .expect("untargeted returns a key");
         let opened = open_from_owner(&key, &out.sealed).unwrap();
         assert_eq!(opened.as_slice(), &epoch);
+    }
+
+    #[test]
+    fn extracts_admin_join_with_enrollment() {
+        let admin = OwnerAddr([0x6Eu8; 16]);
+        let cid = SpaceId([0x11u8; 16]);
+        let owner = crate::community_membership::mint_test_owner(0x6E);
+        let admin_join = SignedMembershipEvent {
+            id: [1u8; 16],
+            community_id: cid,
+            kind: MembershipEventKind::Join,
+            actor: admin,
+            at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: Some(owner.cert),
+        };
+        let other = SignedMembershipEvent {
+            actor: OwnerAddr([2u8; 16]),
+            enrollment: None,
+            ..admin_join.clone()
+        };
+        let got = extract_admin_bootstrap(&[other, admin_join.clone()], cid, admin).unwrap();
+        assert_eq!(got.actor, admin);
+        assert!(got.enrollment.is_some());
+    }
+
+    #[test]
+    fn missing_admin_bootstrap_errors() {
+        let r = extract_admin_bootstrap(&[], SpaceId([0u8; 16]), OwnerAddr([0u8; 16]));
+        assert!(matches!(r, Err(InviteMintError::NoAdminBootstrap)));
     }
 }
