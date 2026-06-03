@@ -1640,9 +1640,14 @@
         // beacons only — no ringing rows — until a later event re-warms it).
         await ensureGroupMembers(invoke, p.spaceId).catch(() => {});
         groupCall?.onIncomingGroup(p.callId, p.callerOwner, p.spaceId);
-        // Only escalate if we actually entered 'incoming' (a busy session ignores
-        // the ring and stays put — no OS alert then).
-        if (groupCall && get(groupCall.state).phase === 'incoming') {
+        // Only escalate if the session actually ADOPTED this invite — i.e. it's in
+        // 'incoming' AND tracking this exact callId. `onIncomingGroup` no-ops when
+        // not idle (D6), so a second invite arriving while we're already ringing
+        // for a different call leaves the session on the original; without the
+        // callId check the toast + OS alert would overwrite to the new call while
+        // accept/decline still act on the original — a shown-vs-acted mismatch.
+        const gst = groupCall ? get(groupCall.state) : null;
+        if (gst && gst.phase === 'incoming' && gst.callId === p.callId) {
           const card = resolveCard(p.callerOwner);
           const name = card?.displayName ?? p.callerOwner.slice(0, 8);
           const groupName = navService.nodes.find((n) => n.id === p.spaceId)?.name ?? 'a group';
