@@ -14816,7 +14816,10 @@ async fn generate_invite(
     invitee_hint: Option<String>,
     expires_at: Option<u64>,
 ) -> Result<String, String> {
-    let _ = (invitee_hint, expires_at); // Phase 4 wiring; ignored in Phase 3.
+    // `invitee_hint` selects a targeted invite-only invite — wired in a
+    // follow-up (ZEB-367 targeted path). `expires_at` is honored below for
+    // invite-only invites (bound into the InviteToken signature).
+    let _ = &invitee_hint;
 
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
@@ -14871,13 +14874,6 @@ async fn generate_invite(
         .ok_or("community Space missing admin_addr (corrupt row?)")?;
     let is_invite_only = space.is_invite_only.unwrap_or(false);
 
-    if is_invite_only {
-        return Err(
-            "Phase 3 supports OPEN communities only; invite-only generate_invite ships in Phase 4"
-                .to_string(),
-        );
-    }
-
     // ZEB-249: build InviteEpochSnapshot. For open communities there is no
     // specific invitee to seal to, so sealed_epoch_key carries the raw 32-byte
     // epoch key (the key is "public" for open joins — anyone with the link may
@@ -14890,12 +14886,20 @@ async fn generate_invite(
     // Spec §5.2: state_snapshot is populated from the inviter's current
     // materialized state at issuance time. CRDT replay post-redemption
     // corrects any inviter-tampered snapshot.
-    let state_snapshot = {
-        let materialized = if let Some(state_arc) = community_registry.state_for(&space_id).await {
+    // ZEB-367: collect the community's membership events once. The bootstrap
+    // snapshot below uses them; for invite-only invites the power gate and the
+    // admin-bootstrap extraction (further below) reuse this same `events` vec.
+    let engine_state = community_registry.state_for(&space_id).await;
+    let events: Vec<crate::community_membership::SignedMembershipEvent> =
+        if let Some(state_arc) = &engine_state {
             let state = state_arc.lock().await;
-            let events: Vec<crate::community_membership::SignedMembershipEvent> =
-                state.events.values().cloned().collect();
-            drop(state);
+            state.events.values().cloned().collect()
+        } else {
+            Vec::new()
+        };
+
+    let state_snapshot = {
+        let materialized = if engine_state.is_some() {
             // R4-6: pass wall_now_ms so an idle-community PendingJoin
             // already past 30d is excluded from the bootstrap snapshot
             // sent to a new invitee.
@@ -14916,9 +14920,99 @@ async fn generate_invite(
         }
     };
 
+    // ZEB-367 Phase 4: invite-only invites seal the epoch key + carry a signed
+    // InviteToken + the admin bootstrap; open invites ship the raw 32-byte key.
+    // This block yields the mode-specific payload pieces; the shared case-A
+    // register + encode tail below handles both modes (so the TooLarge
+    // fork-invite fallback is inherited, not duplicated). Untargeted only in
+    // this task; targeted selection via `invitee_hint` is added in a follow-up.
+    let (
+        sealed_epoch_key_bytes,
+        invite_token,
+        admin_bootstrap,
+        admin_identity_pub,
+        untargeted_decrypt_key,
+    ) = if is_invite_only {
+        // Inviter identity: device-#2 signing key (signs the token), reticulum
+        // identity (admin_identity_pub), device id (per-device HLC stream).
+        let (self_owner, self_private_identity, community_signing_key, device_id) = {
+            let o = dm_outbox.lock().await;
+            (
+                o.self_owner,
+                std::sync::Arc::clone(&o.private_identity),
+                std::sync::Arc::clone(&o.community_signing_key),
+                o.device_id.clone(),
+            )
+        };
+        let hlc_tracker = {
+            let g = state_lock
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+        };
+
+        // v1: only the admin may mint invite-only invites — the admin holds the
+        // epoch key and can produce the admin_bootstrap. Non-admin invite is a
+        // follow-up. The power gate below is the general form; admin always
+        // clears it (POWER_THRESHOLDS.invite == 0).
+        if self_owner != admin {
+            return Err("only the admin can generate invite-only invites (v1)".to_string());
+        }
+        let wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        // Power gate: invite-only generation nominally requires
+        // POWER_THRESHOLDS.invite. That threshold is currently 0 (every member
+        // clears it), so the admin-only v1 restriction above is the operative
+        // gate — an explicit `power < 0` check would be dead code (and trips
+        // clippy::absurd_extreme_comparisons). When non-admin invite ships,
+        // materialize the membership here (materialize_with_now(&events, admin,
+        // Some(wall_now_ms))) and reinstate a real `power < threshold` check.
+
+        // Seal the epoch key to a one-time ephemeral X25519 key; its private half
+        // rides in the URL (untargeted_decrypt_key) — single-use "controlled open".
+        let sealed = crate::invite_mint::seal_epoch_key(
+            mk.as_bytes(),
+            crate::invite_mint::SealRecipient::Untargeted,
+        )?;
+
+        // Mint + sign the InviteToken (invitee_hint = None for untargeted).
+        // Default 7-day expiry when the caller passes none; the expiry is bound
+        // into the token signature so the redeemer enforces it.
+        let minted_at =
+            crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
+                .await;
+        let effective_expiry = expires_at.or(Some(wall_now_ms + 7 * 24 * 60 * 60 * 1000));
+        let token = crate::invite_mint::mint_invite_token(
+            self_owner,
+            None,
+            minted_at,
+            effective_expiry,
+            &community_signing_key,
+        )?;
+
+        // The admin's bootstrap self-Join (with its EnrollmentCert) lets the
+        // redeemer's empty CRDT verify the admin's publish-back at first contact.
+        let admin_bootstrap = crate::invite_mint::extract_admin_bootstrap(&events, space_id, admin)
+            .map_err(|e| e.to_string())?;
+        let admin_identity_pub: [u8; 64] = self_private_identity.identity.to_public_bytes();
+
+        (
+            sealed.sealed,
+            Some(token),
+            Some(admin_bootstrap),
+            Some(admin_identity_pub),
+            sealed.untargeted_decrypt_key,
+        )
+    } else {
+        // Open community: the link is the only gate; ship the raw 32-byte key.
+        (mk.as_bytes().to_vec(), None, None, None, None)
+    };
+
     let epoch_snapshot = crate::community_invite::InviteEpochSnapshot {
         epoch,
-        sealed_epoch_key: mk.as_bytes().to_vec(),
+        sealed_epoch_key: sealed_epoch_key_bytes,
         state_snapshot,
     };
 
@@ -15016,11 +15110,11 @@ async fn generate_invite(
         epoch_snapshot,
         admin_addr: admin,
         community_name: space.name.clone(),
-        is_invite_only: false,
+        is_invite_only,
         expires_at: None,
-        invite_token: None,
-        admin_bootstrap: None,
-        admin_identity_pub: None,
+        invite_token,
+        admin_bootstrap,
+        admin_identity_pub,
         forked_from,
         pre_fork_snapshot,
         // ZEB-339: required for invite-only payloads (open-community payloads
@@ -15031,9 +15125,9 @@ async fn generate_invite(
         } else {
             None
         },
-        // ZEB-367: the untargeted decrypt key is set only by the dedicated
-        // generate-untargeted path (a later task); always None here for now.
-        untargeted_decrypt_key: None,
+        // ZEB-367: untargeted invite-only invites carry the ephemeral decrypt key
+        // here (rides in the URL only); None for targeted + open.
+        untargeted_decrypt_key,
     };
 
     // ZEB-323 Phase 2b: case-A pkarr hook. Register a pending-invite publication
