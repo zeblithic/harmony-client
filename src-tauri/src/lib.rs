@@ -12366,8 +12366,9 @@ async fn watch_group_call(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
     let (_members, dm_key, _sk, _self) = resolve_group_call_members(&state, &space_id).await?;
-    let presence_key =
-        std::sync::Arc::new(crate::community_channel_log::derive_groupdm_presence_key(&dm_key));
+    let presence_key = std::sync::Arc::new(
+        crate::community_channel_log::derive_groupdm_presence_key(&dm_key),
+    );
     let space_arr = parse_space_id_16(&space_id)?;
     let tx = {
         let g = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -12396,9 +12397,11 @@ async fn unwatch_group_call(
             .clone()
             .ok_or_else(|| "not connected".to_string())?
     };
-    tx.send(voice::VoiceChannelRequest::UnwatchGroupCall { space_id: space_arr })
-        .await
-        .map_err(|_| "event loop not running".to_string())
+    tx.send(voice::VoiceChannelRequest::UnwatchGroupCall {
+        space_id: space_arr,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
 }
 
 /// ZEB-360: join (or drop into) a group-DM call — reuses the DM media path
@@ -12439,15 +12442,15 @@ async fn join_group_call(
     };
 
     let k_voice = crate::community_channel_log::derive_dm_voice_key(&dm_key, &call);
-    let presence_key =
-        std::sync::Arc::new(crate::community_channel_log::derive_groupdm_presence_key(&dm_key));
+    let presence_key = std::sync::Arc::new(
+        crate::community_channel_log::derive_groupdm_presence_key(&dm_key),
+    );
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
     let joined_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms)
-            .await;
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms).await;
 
     // Media: identical to a DM call (same topic/key/AAD), addressed by call_id.
     voice_channel_tx
