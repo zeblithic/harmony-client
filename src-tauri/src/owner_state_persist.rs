@@ -385,20 +385,20 @@ mod tests {
     #[test]
     fn crdt_file_v2_round_trips_friend_graph() {
         use crate::friend_graph::{
-            owner_addr_from_identity_pub, FriendEntry, FriendOrigin, FriendStatus,
+            owner_id_from_master_ed25519, FriendEntry, FriendOrigin, FriendStatus,
         };
-        // Derive a valid (addr, pub) pair so apply_friend_update's addr↔pub
-        // correspondence invariant is satisfied (an arbitrary addr would be
-        // rejected and the graph would stay empty).
-        let pub_bytes = harmony_identity::PrivateIdentity::from_seed(&[0xd1; 32])
-            .public_identity()
-            .to_public_bytes();
-        let friend_addr = owner_addr_from_identity_pub(&pub_bytes).expect("seeded pub derives");
+        // Derive a valid (addr, master_ed25519) pair so apply_friend_update's
+        // key↔master-key correspondence invariant is satisfied (an arbitrary
+        // addr would be rejected and the graph would stay empty).
+        let master_ed25519 = ed25519_dalek::SigningKey::from_bytes(&[0xd1; 32])
+            .verifying_key()
+            .to_bytes();
+        let friend_addr = owner_id_from_master_ed25519(&master_ed25519);
         let mut s = OwnerState::default();
         let outcome = s.apply_friend_update(
             friend_addr,
             FriendEntry {
-                friend_owner_pub: pub_bytes,
+                master_ed25519,
                 display: Some("dave".into()),
                 status: FriendStatus::Active,
                 established_via: FriendOrigin::Token,

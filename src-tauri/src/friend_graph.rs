@@ -8,11 +8,23 @@
 //! Wire format: canonical CBOR. Every map key at a single nesting level must
 //! encode to the same byte length (see the precondition on
 //! `crate::owner_state_crypto::canonical_cbor_encode`). `FriendEntry` uses
-//! all single-char keys ("p","n","s","v","r","l"); `FriendGraph` uses "f".
+//! all single-char keys ("m","n","s","v","r","l"); `FriendGraph` uses "f".
+//!
+//! ## Identity model (corrected 2026-06-03, spec §3)
+//!
+//! Friends are keyed on the friend's master **`owner_id`** (16 bytes) =
+//! `PubKeyBundle::identity_hash()` — the SAME principal used by `self_owner`,
+//! community membership, profile cards, and enrollment certs. An earlier draft
+//! wrongly keyed friends on the Reticulum/DM combined-pub `Identity::address_hash`
+//! (`SHA256(X25519‖Ed25519)[:16]`), a different identity used only for DM
+//! transport routing. `FriendEntry` therefore stores the friend's master
+//! Ed25519 verify key, and the map key MUST equal
+//! `PubKeyBundle::classical_only(master_ed25519).identity_hash()` (v1; no PQ).
 
 use crate::owner_state_types::{
     deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr,
 };
+use harmony_owner::pubkey_bundle::PubKeyBundle;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
@@ -23,22 +35,23 @@ use std::collections::BTreeMap;
 /// unchanged. 256 bytes is generous for a human display name.
 pub(crate) const MAX_FRIEND_DISPLAY_LEN: usize = 256;
 
-/// Derive the friend's 16-byte `OwnerAddr` from their 64-byte combined
-/// identity public-bytes value (`X25519_pub(32) || Ed25519_pub(32)`, the
-/// canonical `harmony_identity::Identity::to_public_bytes()` layout).
+/// Derive the friend's 16-byte master `OwnerAddr` (their `owner_id`) from their
+/// 32-byte master Ed25519 verify key.
 ///
 /// Single source of truth: delegates to
-/// `harmony_identity::Identity::from_public_bytes(pub_).address_hash`, the
-/// same primitive behind `dm_signing::derive_device_hash_from_identity_pub`
-/// (which produces a `DeviceIdentityHash` from the identical bytes). Never
-/// re-derive the hash formula here — if harmony changes its scheme, we follow
-/// automatically rather than silently diverge.
+/// `PubKeyBundle::classical_only(master_ed25519).identity_hash()` — exactly the
+/// `owner_id` derivation `self_owner`, community membership, and enrollment
+/// certs use (`harmony-owner/pubkey_bundle.rs`; cf. the `classical_only(..)
+/// .identity_hash()` device-id derivation at `lib.rs:2651`). v1 has no
+/// post-quantum key, so a Master `EnrollmentCert`'s `owner_id` equals this for
+/// the same master key — the friend-graph key invariant holds by construction.
+/// Never re-derive the hash formula here; if harmony changes its scheme we
+/// follow automatically rather than silently diverge.
 ///
-/// Returns `None` if the bytes are malformed (invalid X25519 or Ed25519 point
-/// encoding). `apply_friend_update` treats `None` as an invariant failure.
-pub(crate) fn owner_addr_from_identity_pub(pub_: &[u8; 64]) -> Option<OwnerAddr> {
-    let identity = harmony_identity::Identity::from_public_bytes(pub_).ok()?;
-    Some(OwnerAddr(identity.address_hash))
+/// Infallible: any 32-byte value is a valid input to `identity_hash` (the
+/// classical bundle hashes the raw bytes; no point-decoding is performed).
+pub(crate) fn owner_id_from_master_ed25519(master_ed25519: &[u8; 32]) -> OwnerAddr {
+    OwnerAddr(PubKeyBundle::classical_only(*master_ed25519).identity_hash())
 }
 
 /// Strict deserializer for `FriendEntry.display`: rejects (does NOT truncate)
@@ -105,17 +118,21 @@ pub enum PeerIntroPolicy {
     Closed,
 }
 
-/// One friend, keyed in `FriendGraph.friends` by the friend's `OwnerAddr`.
+/// One friend, keyed in `FriendGraph.friends` by the friend's master
+/// `OwnerAddr` (their `owner_id`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FriendEntry {
-    /// Friend's 64-byte owner identity: `X25519_pub(32) || Ed25519_pub(32)`.
-    /// Stored as a CBOR bstr(64).
+    /// Friend's 32-byte master Ed25519 verify key. The map key (their
+    /// `owner_id`) MUST equal
+    /// `owner_id_from_master_ed25519(&master_ed25519)` (v1; no PQ) — enforced
+    /// in `apply_friend_update`. This anchors the friend to the SAME principal
+    /// as their community/profile identity. Stored as a CBOR bstr(32).
     #[serde(
-        rename = "p",
+        rename = "m",
         serialize_with = "serialize_bytes_as_bstr",
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
-    pub friend_owner_pub: [u8; 64],
+    pub master_ed25519: [u8; 32],
     /// Human label (their advertised display name at link time; refreshable).
     /// Capped at [`MAX_FRIEND_DISPLAY_LEN`] at deserialize time (oversized →
     /// hard decode error, not truncation). `serialize_with`/`skip_serializing_if`
@@ -172,7 +189,7 @@ mod tests {
 
     fn sample_entry() -> FriendEntry {
         FriendEntry {
-            friend_owner_pub: [0x11; 64],
+            master_ed25519: [0x11; 32],
             display: Some("alice".into()),
             status: FriendStatus::Active,
             established_via: FriendOrigin::Token,
@@ -207,23 +224,26 @@ mod tests {
     }
 
     #[test]
-    fn owner_addr_from_identity_pub_matches_harmony_address_hash() {
-        // The helper MUST agree with harmony_identity's own address_hash for
-        // the same identity — it's the binding `apply_friend_update` checks
-        // friend_owner_pub against. Mirrors dm_signing's equivalent pin.
-        let private = harmony_identity::PrivateIdentity::from_seed(&[0x5a; 32]);
-        let public = private.public_identity();
-        let pub_bytes = public.to_public_bytes();
-        let derived = owner_addr_from_identity_pub(&pub_bytes).expect("valid pub derives");
-        assert_eq!(derived, OwnerAddr(public.address_hash));
-        // Note: we deliberately do NOT assert that `[0u8; 64]` returns `None`.
-        // Per the documented quirk in `dm_signing` (see the dropped
-        // "malformed_rejects" note there), the harmony-pinned
-        // `Identity::from_public_bytes(&[0u8; 64])` actually SUCCEEDS, so the
-        // `None` branch is unreachable with trivially-constructed inputs. The
-        // load-bearing property — that the helper agrees with harmony's own
-        // `address_hash` — is what `apply_friend_update` relies on, and that
-        // is what we pin above.
+    fn owner_id_from_master_ed25519_matches_master_cert_owner_id() {
+        // The helper MUST agree with the master `owner_id` derivation used by
+        // enrollment certs and `self_owner` — it's the binding
+        // `apply_friend_update` checks `master_ed25519` against. For a v1
+        // Master cert (no PQ), `cert.owner_id` is exactly
+        // `PubKeyBundle::classical_only(master_ed25519).identity_hash()`, so a
+        // friend learned from such a cert satisfies the key invariant by
+        // construction.
+        let owner = crate::community_membership::mint_test_owner(0x5a);
+        let master_ed25519 =
+            if let harmony_owner::certs::EnrollmentIssuer::Master { master_pubkey } =
+                &owner.cert.issuer
+            {
+                master_pubkey.classical.ed25519_verify
+            } else {
+                panic!("mint_test_owner produces a Master cert");
+            };
+        let derived = owner_id_from_master_ed25519(&master_ed25519);
+        assert_eq!(derived, OwnerAddr(owner.cert.owner_id));
+        assert_eq!(derived, owner.owner);
     }
 
     #[test]

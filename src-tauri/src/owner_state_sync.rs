@@ -1254,18 +1254,18 @@ mod subscriber_tests {
         );
 
         // Build a remote OwnerState that has befriended a peer. The friend's
-        // OwnerAddr MUST derive from their friend_owner_pub (apply_friend_update
-        // enforces that correspondence), so use a real seeded identity pair.
-        let friend_pub = harmony_identity::PrivateIdentity::from_seed(&[0xe5; 32])
-            .public_identity()
-            .to_public_bytes();
-        let friend_addr = crate::friend_graph::owner_addr_from_identity_pub(&friend_pub)
-            .expect("seeded pub derives");
+        // OwnerAddr (their owner_id) MUST derive from their master_ed25519
+        // (apply_friend_update enforces that correspondence), so use a real
+        // seeded master signing key.
+        let friend_master = ed25519_dalek::SigningKey::from_bytes(&[0xe5; 32])
+            .verifying_key()
+            .to_bytes();
+        let friend_addr = crate::friend_graph::owner_id_from_master_ed25519(&friend_master);
         let mut remote = OwnerState::default();
         let outcome = remote.apply_friend_update(
             friend_addr,
             FriendEntry {
-                friend_owner_pub: friend_pub,
+                master_ed25519: friend_master,
                 display: Some("eve".into()),
                 status: FriendStatus::Active,
                 established_via: FriendOrigin::Token,
