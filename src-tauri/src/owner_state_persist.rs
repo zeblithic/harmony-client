@@ -111,6 +111,16 @@ struct CrdtFileV2 {
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     outbox_tombstones:
         BTreeMap<crate::owner_state_types::OutboxEntryId, crate::owner_state_types::Hlc>,
+    /// ZEB-370 Phase 1: persisted Friend Graph sub-CRDT. Absent in
+    /// pre-ZEB-370 V2 files; `serde(default)` loads those as an empty
+    /// graph (no schema-version bump needed — absent == empty).
+    /// `skip_serializing_if` omits the field when empty so existing file
+    /// shapes stay compact.
+    #[serde(
+        skip_serializing_if = "crate::friend_graph::FriendGraph::is_empty",
+        default
+    )]
+    friend_graph: crate::friend_graph::FriendGraph,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -124,6 +134,7 @@ impl From<&OwnerState> for CrdtFileV2 {
             owner_device_cache: s.owner_device_cache.clone(),
             libraries: s.libraries.clone(),
             outbox_tombstones: s.outbox_tombstones.clone(),
+            friend_graph: s.friend_graph.clone(),
         }
     }
 }
@@ -139,8 +150,7 @@ impl From<CrdtFileV2> for OwnerState {
             owner_device_cache: f.owner_device_cache,
             libraries: f.libraries,
             outbox_tombstones: f.outbox_tombstones,
-            // ZEB-370: persisted in Task 3; default until that wiring lands.
-            friend_graph: Default::default(),
+            friend_graph: f.friend_graph,
         }
     }
 }
@@ -370,6 +380,42 @@ mod tests {
         let path = dir.path().join("never_written.cbor");
         let loaded = load_crdt(&path).unwrap();
         assert_eq!(loaded, OwnerState::default());
+    }
+
+    #[test]
+    fn crdt_file_v2_round_trips_friend_graph() {
+        use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+        let mut s = OwnerState::default();
+        s.apply_friend_update(
+            OwnerAddr([3u8; 16]),
+            FriendEntry {
+                friend_owner_pub: [9u8; 64],
+                display: Some("dave".into()),
+                status: FriendStatus::Active,
+                established_via: FriendOrigin::Token,
+                referrable: true,
+                learned_at: hlc(42),
+            },
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert_eq!(loaded.friend_graph, s.friend_graph);
+        assert!(!loaded.friend_graph.is_empty());
+    }
+
+    #[test]
+    fn pre_friendgraph_snapshot_loads_empty() {
+        // A V2 file serialized WITHOUT any friend graph (the field is
+        // skipped on the wire when empty) must load to an empty graph —
+        // backward-compat with pre-ZEB-370 snapshots.
+        let s = OwnerState::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert!(loaded.friend_graph.is_empty());
     }
 
     #[test]

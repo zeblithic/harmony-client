@@ -547,8 +547,7 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         owner_device_cache,
         libraries,
         outbox_tombstones,
-        // ZEB-370: merged in Task 3; ignored here until that wiring lands.
-        friend_graph: _,
+        friend_graph,
     } = remote;
 
     // ZEB-243: apply remote outbox tombstones FIRST. LWW per id by HLC;
@@ -646,6 +645,15 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         if should_replace {
             local.libraries.insert(addr, remote_entry);
         }
+    }
+    // ZEB-370 Phase 1: per-entry LWW merge of the friend graph. Each
+    // `FriendEntry` is keyed by the friend's OwnerAddr and merged on its
+    // `learned_at` HLC (newer wins; `Revoked` is a tombstone). Independent
+    // of the other sub-CRDTs (keyed by OwnerAddr, not SpaceId), so its
+    // merge order doesn't matter — placed last. Closes the snapshot-merge
+    // path so the friend graph replicates across the owner's own devices.
+    for (addr, entry) in friend_graph.friends {
+        local.apply_friend_update(addr, entry);
     }
 }
 
@@ -1219,6 +1227,74 @@ mod subscriber_tests {
             local.spaces.contains_key(&SpaceId([42; 16])),
             "remote folder must merge into local"
         );
+        drop(local);
+
+        let _ = engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscriber_merges_friend_graph_entries() {
+        use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+        let (pub_tx, _pub_rx) = mpsc::channel(16);
+        let (sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let kt = make_kt();
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let local_state = Arc::new(Mutex::new(OwnerState::default()));
+        let engine = SyncEngine::new(
+            Arc::clone(&kt),
+            "self-device".into(),
+            Arc::clone(&local_state),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::clone(&store),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000,
+        );
+
+        // Build a remote OwnerState that has befriended addr [7; 16].
+        let friend_addr = OwnerAddr([7; 16]);
+        let mut remote = OwnerState::default();
+        remote.apply_friend_update(
+            friend_addr,
+            FriendEntry {
+                friend_owner_pub: [9u8; 64],
+                display: Some("eve".into()),
+                status: FriendStatus::Active,
+                established_via: FriendOrigin::Token,
+                referrable: false,
+                learned_at: Hlc {
+                    wall_ms: 100,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+            },
+        );
+
+        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0).await;
+        sub_tx.send(wire).await.unwrap();
+        let converged = wait_until(
+            || async {
+                let local = local_state.lock().await;
+                local.friend_graph.friends.contains_key(&friend_addr)
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            converged,
+            "subscriber did not merge friend_graph entry within 2s"
+        );
+
+        let local = local_state.lock().await;
+        let entry = local
+            .friend_graph
+            .friends
+            .get(&friend_addr)
+            .expect("friend entry present after merge");
+        assert_eq!(entry.status, FriendStatus::Active);
+        assert_eq!(entry.established_via, FriendOrigin::Token);
         drop(local);
 
         let _ = engine.shutdown().await;
