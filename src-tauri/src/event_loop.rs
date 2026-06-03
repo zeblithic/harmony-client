@@ -2914,6 +2914,7 @@ pub async fn run<R: Runtime>(
                         // leave any prior state for this (community, channel)
                         // intact — old subscriber keeps running with the old key.
                         let key_for_sub = std::sync::Arc::clone(&caps.channel_key);
+                        let own_device_hex_sub = hex::encode(caps.self_device);
                         let (c_sub, ch_sub) = (community_id, channel_id);
                         let app_sub = app.clone();
                         let closing_sub = closing.clone();
@@ -2959,6 +2960,16 @@ pub async fn run<R: Runtime>(
                                         let mut made_progress = false;
                                         while let Ok(sample) = sub.recv_async().await {
                                             made_progress = true;
+                                            // ZEB-362 (Qodo perf): the `.../*` subscription also
+                                            // delivers our OWN published frames; skip them before
+                                            // the per-frame verify/open work (mirrors the DM
+                                            // subscriber's self-skip). We never play our own mic
+                                            // back.
+                                            if sample.key_expr().as_str().rsplit('/').next()
+                                                == Some(own_device_hex_sub.as_str())
+                                            {
+                                                continue;
+                                            }
                                             if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
                                                 tracing::warn!(
                                                     len = sample.payload().len(),
@@ -3023,7 +3034,7 @@ pub async fn run<R: Runtime>(
                                                 }
                                             }
                                             // (5) open the packet (AAD binds the device VK).
-                                            let frame = match crate::voice_crypto::open_voice_packet(
+                                            let frame = match crate::voice_crypto::open_voice_packet_unchecked(
                                                 &key_for_sub,
                                                 &dev,
                                                 &c_sub,

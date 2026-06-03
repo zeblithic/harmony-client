@@ -15,8 +15,8 @@ use harmony_app::owner_state_types::{
     DeviceIdentityHash, DmContentKey, EpochKey, Hlc, OwnerAddr, SpaceId,
 };
 use harmony_app::voice_crypto::{
-    encrypt_dm_voice_packet_with_nonce, open_voice_packet, seal_and_sign_voice_packet_with_nonce,
-    verify_voice_frame_sig, VOICE_DM_PACKET_AAD,
+    encrypt_dm_voice_packet_with_nonce, seal_and_sign_voice_packet_with_nonce,
+    verify_and_open_voice_packet, VOICE_DM_PACKET_AAD,
 };
 use harmony_app::voice_moderation::{
     seal_directive_with_nonce, sign_directive, ModAction, VoiceModerationDirective,
@@ -58,22 +58,15 @@ fn voice_packet_v2_wire_bytes_pinned() {
         "sealed v2 voice-packet wire format drifted"
     );
     // Meaningful, not opaque: the pinned bytes must verify + open back to `frame`.
-    verify_voice_frame_sig(
-        &device_vk,
-        &SpaceId([0xc0; 16]),
-        &ChannelId([0xc1; 16]),
-        &sealed,
-    )
-    .expect("pinned v2 packet must verify");
     assert_eq!(
-        open_voice_packet(
+        verify_and_open_voice_packet(
             &key,
             &device_vk,
             &SpaceId([0xc0; 16]),
             &ChannelId([0xc1; 16]),
-            &sealed,
+            &sealed
         )
-        .expect("pinned v2 packet must open"),
+        .expect("pinned v2 packet must verify+open"),
         frame,
         "pinned v2 packet opened to a different frame"
     );

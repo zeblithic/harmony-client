@@ -10,9 +10,7 @@ use ed25519_dalek::SigningKey;
 use harmony_app::community_channel_log::{derive_channel_key, ChannelKey};
 use harmony_app::community_membership::ChannelId;
 use harmony_app::owner_state_types::{EpochKey, SpaceId};
-use harmony_app::voice_crypto::{
-    open_voice_packet, seal_and_sign_voice_packet, verify_voice_frame_sig,
-};
+use harmony_app::voice_crypto::{seal_and_sign_voice_packet, verify_and_open_voice_packet};
 
 const C: SpaceId = SpaceId([0xc0; 16]);
 const CH: ChannelId = ChannelId([0xc1; 16]);
@@ -40,8 +38,8 @@ fn receive(
     claimed_dev: &[u8; 32],
     packet: &[u8],
 ) -> Result<Vec<u8>, &'static str> {
-    verify_voice_frame_sig(claimed_dev, &C, &CH, packet).map_err(|_| "sig")?;
-    let frame = open_voice_packet(key, claimed_dev, &C, &CH, packet).map_err(|_| "open")?;
+    let frame = verify_and_open_voice_packet(key, claimed_dev, &C, &CH, packet)
+        .map_err(|_| "verify_or_open")?;
     if frame.len() < 23 || frame[7..23] != claimed_dev[..16] {
         return Err("attribution");
     }
@@ -72,7 +70,7 @@ fn spoofed_suffix_without_senders_key_is_dropped() {
     let b_vk = b.verifying_key().to_bytes();
     let frame = frame_with_header(&b_vk);
     let packet = seal_and_sign_voice_packet(&key, &b, &C, &CH, &frame).unwrap();
-    assert_eq!(receive(&key, &a_vk, &packet), Err("sig"));
+    assert_eq!(receive(&key, &a_vk, &packet), Err("verify_or_open"));
 }
 
 #[test]
@@ -99,5 +97,5 @@ fn tampered_ciphertext_is_dropped() {
     let frame = frame_with_header(&a_vk);
     let mut packet = seal_and_sign_voice_packet(&key, &a, &C, &CH, &frame).unwrap();
     packet[12 + 1] ^= 0xff; // flip a ciphertext byte → sig verify fails
-    assert_eq!(receive(&key, &a_vk, &packet), Err("sig"));
+    assert_eq!(receive(&key, &a_vk, &packet), Err("verify_or_open"));
 }

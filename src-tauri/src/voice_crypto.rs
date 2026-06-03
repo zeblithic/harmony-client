@@ -259,12 +259,11 @@ pub fn verify_voice_frame_sig(
         .map_err(|_| VoiceCryptoError::SigFailed)
 }
 
-/// ZEB-362: open a v2 community voice packet sealed by
-/// [`seal_and_sign_voice_packet`]. Verify the signature first via
-/// [`verify_voice_frame_sig`]; this strips the trailing signature and AEAD-opens
-/// `[nonce][ct]` with the v2 AAD (which binds `device_vk`). Any failure returns
-/// an error — callers drop.
-pub fn open_voice_packet(
+/// Crate-private: AEAD-opens WITHOUT verifying the sender signature. Callers
+/// MUST verify first (the event loop's verify→moderation→open split) or use
+/// `verify_and_open_voice_packet`. Exposing this publicly would be a security
+/// footgun.
+pub(crate) fn open_voice_packet_unchecked(
     key: &ChannelKey,
     device_vk: &[u8; 32],
     community: &SpaceId,
@@ -285,6 +284,24 @@ pub fn open_voice_packet(
             Payload { msg: ct, aad: &aad },
         )
         .map_err(|_| VoiceCryptoError::OpenFailed)
+}
+
+/// ZEB-362: the SAFE public entry point — verify the detached sender signature
+/// against `device_vk`, then AEAD-open. Fail-closed by default: a frame whose
+/// signature does not match `device_vk` (e.g. forged by another `ChannelKey`
+/// holder) is rejected before decryption. Prefer this over the crate-private
+/// `open_voice_packet_unchecked`, which exists only so the event loop can run
+/// its verify → moderation-drop → open split (dropping a moderated sender's
+/// frame before spending the AEAD-open).
+pub fn verify_and_open_voice_packet(
+    key: &ChannelKey,
+    device_vk: &[u8; 32],
+    community: &SpaceId,
+    channel: &ChannelId,
+    packet: &[u8],
+) -> Result<Vec<u8>, VoiceCryptoError> {
+    verify_voice_frame_sig(device_vk, community, channel, packet)?;
+    open_voice_packet_unchecked(key, device_vk, community, channel, packet)
 }
 
 /// Seal `plaintext` under `key` for a DM call identified by `call_id`, with
@@ -578,7 +595,10 @@ mod tests {
         let sealed = seal_and_sign_voice_packet(&k, &sk, &C, &CH, &plain).unwrap();
         assert!(sealed.len() >= MIN_PACKET_LEN_V2);
         verify_voice_frame_sig(&vk, &C, &CH, &sealed).unwrap();
-        assert_eq!(open_voice_packet(&k, &vk, &C, &CH, &sealed).unwrap(), plain);
+        assert_eq!(
+            open_voice_packet_unchecked(&k, &vk, &C, &CH, &sealed).unwrap(),
+            plain
+        );
     }
 
     #[test]
@@ -600,7 +620,7 @@ mod tests {
         let tag_byte = s2.len() - SIG_LEN - 1; // last ciphertext/tag byte
         s2[tag_byte] ^= 0xff;
         assert_eq!(
-            open_voice_packet(&k, &vk, &C, &CH, &s2),
+            open_voice_packet_unchecked(&k, &vk, &C, &CH, &s2),
             Err(VoiceCryptoError::OpenFailed)
         );
     }
@@ -645,7 +665,7 @@ mod tests {
         );
         // AAD also includes the channel id → opening for another channel fails
         assert_eq!(
-            open_voice_packet(&k, &vk, &C, &other_ch, &sealed),
+            open_voice_packet_unchecked(&k, &vk, &C, &other_ch, &sealed),
             Err(VoiceCryptoError::OpenFailed)
         );
     }
@@ -677,6 +697,25 @@ mod tests {
         let b = seal_and_sign_voice_packet_with_nonce(&k, &sk, &C, &CH, b"hi", [0u8; 12]).unwrap();
         assert_eq!(a, b);
         assert_eq!(&a[..NONCE_LEN], &[0u8; 12]);
+    }
+
+    #[test]
+    fn v2_verify_and_open_rejects_forged_then_opens_honest() {
+        let k = key();
+        let sk = dev_sk(1);
+        let vk = sk.verifying_key().to_bytes();
+        let sealed = seal_and_sign_voice_packet(&k, &sk, &C, &CH, b"hello").unwrap();
+        // Honest frame opens.
+        assert_eq!(
+            verify_and_open_voice_packet(&k, &vk, &C, &CH, &sealed).unwrap(),
+            b"hello"
+        );
+        // Wrong device VK → rejected BEFORE decryption (fail-closed).
+        let other_vk = dev_sk(2).verifying_key().to_bytes();
+        assert_eq!(
+            verify_and_open_voice_packet(&k, &other_vk, &C, &CH, &sealed),
+            Err(VoiceCryptoError::SigFailed)
+        );
     }
 }
 
