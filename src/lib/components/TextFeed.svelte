@@ -178,12 +178,16 @@
 >
   <div class="main-section" style={showThreadPanel ? `flex: 0 0 ${splitPercent}%` : ''}>
     {#if channelType === 'dm'}
+      <!-- ZEB-360 D6: the 1:1 Call button is disabled while ANY voice session is
+           active (community voice, another DM call, or a group call) — one media
+           engine at a time, symmetric with the group Call/Join buttons below. -->
       <div class="dm-header">
         <span class="dm-name">{channelName}</span>
         <button
           type="button"
           class="btn-call"
           aria-label="Start call"
+          disabled={groupCallBusy}
           onclick={() => onStartCall?.(channelId)}
         >
           📞 Call

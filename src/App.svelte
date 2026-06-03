@@ -200,6 +200,19 @@
         await callSession.end().catch(() => {});
       }
     }
+    // ZEB-360 D6: also tear down an in-progress GROUP call before entering any
+    // other voice session, so the group media engine never runs alongside a 1:1
+    // call or community voice. 'incoming' is excluded for the same reason as
+    // callSession above — the group accept path routes through this helper and
+    // must NOT decline the very call it's about to answer. (An 'incoming' group
+    // call has no media engine running yet — only a ring toast — so leaving it up
+    // does not create two live engines.)
+    if (groupCall) {
+      const gp = get(groupCall.state).phase;
+      if (gp !== 'idle' && gp !== 'incoming') {
+        await groupCall.leave().catch(() => {});
+      }
+    }
     return fn();
   }
 
@@ -2521,6 +2534,15 @@
           // channel voice, so the two media engines never run concurrently.
           if (callSession && get(callSession.state).phase !== 'idle') {
             await callSession.end().catch(() => {});
+          }
+          // ZEB-360 D6: also tear down an in-progress GROUP call before joining
+          // community voice. 'incoming' is excluded — it's only a ring toast with
+          // no media engine yet, so it can't run alongside community voice.
+          if (groupCall) {
+            const gp = get(groupCall.state).phase;
+            if (gp !== 'idle' && gp !== 'incoming') {
+              await groupCall.leave().catch(() => {});
+            }
           }
         }}
       />
