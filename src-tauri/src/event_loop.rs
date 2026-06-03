@@ -4373,6 +4373,16 @@ pub async fn run<R: Runtime>(
     for (_, handle) in dm_voice_subs.drain() {
         handle.abort();
     }
+    // ZEB-360: abort the group-DM presence subscriber/publisher tasks too, for the
+    // same reason — the group subscriber can emit `group-call-presence-changed`
+    // into a stale AppHandle in the closing→session-close window, and a leftover
+    // publisher would keep putting beacons past shutdown.
+    for (_, handle) in groupdm_presence_subs.drain() {
+        handle.abort();
+    }
+    for (_, handle) in groupdm_presence_pubs.drain() {
+        handle.abort();
+    }
     // ZEB-352: abort the always-on voice-signal subscriber too, so it can't emit
     // signaling events into a stale AppHandle during the closing→session-close
     // window or race a subsequent start_node restart.
