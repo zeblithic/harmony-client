@@ -16,7 +16,7 @@
 
 use crate::community_invite::InviteToken;
 use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
-use crate::owner_state_types::{deserialize_bytes_from_bstr, serialize_bytes_as_bstr, OwnerAddr};
+use crate::owner_state_types::OwnerAddr;
 use base64::Engine;
 use harmony_owner::certs::EnrollmentCert;
 use serde::{Deserialize, Serialize};
@@ -35,29 +35,26 @@ pub const MAX_FRIEND_BODY_B64_CHARS: usize = crate::community_invite::MAX_INVITE
 
 /// The payload carried by a `harmony://friend/<b64>` URL. Wraps a device-#2-
 /// signed `InviteToken` (the cryptographic one-shot redemption proof) with the
-/// inviter's owner address + 64-byte identity public bytes + an optional display
-/// hint + optional `EnrollmentCert` (so the redeemer can verify the inviter's
-/// owner->device binding before it has synced any shared state).
+/// inviter's master owner address + an optional display hint + the inviter's
+/// `EnrollmentCert` (so the redeemer can verify the inviter's owner->device
+/// binding before it has synced any shared state).
 ///
-/// Wire format: up to 5-key map; `dn`/`ie` are skipped when `None`. Field codes
-/// are 2 chars (3-byte encoded) to satisfy the canonical-CBOR same-length-key
-/// rule at this nesting level (matching `CommunityInvitePayload`).
+/// Per the corrected identity model (spec §3), the inviter is identified by
+/// their master `owner_id`, and the cert carries the master Ed25519 key — there
+/// is no separate Reticulum combined-pub field. `inviter_addr` MUST equal
+/// `inviter_enrollment.owner_id` (a structural check enforced in
+/// [`decode_friend_token_url`]; the full crypto verification of the cert happens
+/// later at handshake time).
+///
+/// Wire format: up to 4-key map; `dn` is skipped when `None`. Field codes are
+/// 2 chars (3-byte encoded) to satisfy the canonical-CBOR same-length-key rule
+/// at this nesting level (matching `CommunityInvitePayload`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FriendTokenPayload {
-    /// The inviter's 16-byte owner address (matches `token.inviter`).
+    /// The inviter's 16-byte master owner address (their `owner_id`; matches
+    /// `token.inviter` and `inviter_enrollment.owner_id`).
     #[serde(rename = "ia")]
     pub inviter_addr: OwnerAddr,
-
-    /// The inviter's 64-byte owner identity: `X25519_pub(32) || Ed25519_pub(32)`.
-    /// Stored as a CBOR bstr(64). The redeemer needs the full pubkey (not just
-    /// the address) to verify accept-side signatures and derive the pairwise
-    /// secret in later phases. Reuses the in-repo bstr serde helper.
-    #[serde(
-        rename = "ip",
-        serialize_with = "serialize_bytes_as_bstr",
-        deserialize_with = "deserialize_bytes_from_bstr"
-    )]
-    pub inviter_owner_pub: [u8; 64],
 
     /// The inviter's advertised display name at mint time (UX hint; refreshable
     /// on accept). `None`/absent on the wire when unset.
@@ -70,10 +67,10 @@ pub struct FriendTokenPayload {
 
     /// The inviter's Master `EnrollmentCert`, so the redeemer can verify the
     /// inviter's owner->device binding (and thus the `InviteToken` signature)
-    /// before syncing any shared state. `None`/absent on the wire when unset
-    /// (e.g. in unit fixtures); populated by `mint_friend_token` in production.
-    #[serde(rename = "ie", skip_serializing_if = "Option::is_none", default)]
-    pub inviter_enrollment: Option<EnrollmentCert>,
+    /// before syncing any shared state. REQUIRED — the redeemer authenticates
+    /// the inviter solely from this cert under the device-#2 + `owner_id` model.
+    #[serde(rename = "ie")]
+    pub inviter_enrollment: EnrollmentCert,
 }
 
 // `FriendTokenPayload`'s `CanonicalPayload`/`CanonicalPayloadSealed` impls are
@@ -95,6 +92,13 @@ pub enum FriendTokenError {
     /// Bounds allocator + decode work on a hostile multi-MB paste.
     #[error("friend payload exceeds base64-char limit (got {0} chars)")]
     TooLarge(usize),
+    /// `inviter_addr` does not equal `inviter_enrollment.owner_id`. A structural
+    /// (field-equality) check only — the cert's full crypto verification happens
+    /// later at handshake time. A mismatch means the payload's claimed inviter
+    /// address is not the one the embedded cert attests, so the token is
+    /// internally inconsistent and rejected before any further processing.
+    #[error("inviter_addr does not match inviter_enrollment.owner_id")]
+    AddrCertMismatch,
 }
 
 /// Canonical-CBOR-encode the payload, base64url-no-pad the result, and prefix
@@ -127,8 +131,15 @@ pub fn decode_friend_token_url(url: &str) -> Result<FriendTokenPayload, FriendTo
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(body)
         .map_err(|e| FriendTokenError::Base64(e.to_string()))?;
-    canonical_cbor_decode::<FriendTokenPayload>(&bytes)
-        .map_err(|e| FriendTokenError::Cbor(e.to_string()))
+    let payload = canonical_cbor_decode::<FriendTokenPayload>(&bytes)
+        .map_err(|e| FriendTokenError::Cbor(e.to_string()))?;
+    // Structural consistency: the claimed inviter address MUST be the one the
+    // embedded cert attests. Field-equality only — full cert crypto verification
+    // is deferred to handshake time (`verify_enrolled_device`).
+    if payload.inviter_addr.0 != payload.inviter_enrollment.owner_id {
+        return Err(FriendTokenError::AddrCertMismatch);
+    }
+    Ok(payload)
 }
 
 /// Mint a friend token: sign an `InviteToken` with the enrolled device-#2 key
@@ -140,14 +151,12 @@ pub fn decode_friend_token_url(url: &str) -> Result<FriendTokenPayload, FriendTo
 ///
 /// Returns `Err` only if the underlying `InviteToken` signing fails (string
 /// error, surfaced verbatim from `mint_invite_token`).
-#[allow(clippy::too_many_arguments)]
 pub fn mint_friend_token(
     inviter_addr: OwnerAddr,
-    inviter_owner_pub: [u8; 64],
     display_hint: Option<String>,
     minted_at: crate::owner_state_types::Hlc,
     expires_at: Option<u64>,
-    inviter_enrollment: Option<EnrollmentCert>,
+    inviter_enrollment: EnrollmentCert,
     device2_signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<FriendTokenPayload, String> {
     // invitee_hint = None: untargeted, "controlled open" friend link. The token
@@ -161,7 +170,6 @@ pub fn mint_friend_token(
     )?;
     Ok(FriendTokenPayload {
         inviter_addr,
-        inviter_owner_pub,
         display_hint,
         token,
         inviter_enrollment,
@@ -172,15 +180,19 @@ pub fn mint_friend_token(
 mod tests {
     use super::*;
     use crate::community_invite::InviteToken;
-    use crate::owner_state_types::{Hlc, OwnerAddr};
+    use crate::community_membership::mint_test_owner;
+    use crate::owner_state_types::Hlc;
 
+    /// A realistic payload whose `inviter_addr` is the master `owner_id` the
+    /// embedded Master `EnrollmentCert` attests (the structural invariant
+    /// `decode_friend_token_url` enforces). The token's `inviter` matches too.
     fn sample() -> FriendTokenPayload {
+        let owner = mint_test_owner(0x42);
         FriendTokenPayload {
-            inviter_addr: OwnerAddr([1u8; 16]),
-            inviter_owner_pub: [2u8; 64],
+            inviter_addr: owner.owner,
             display_hint: Some("bob".into()),
             token: InviteToken {
-                inviter: OwnerAddr([1u8; 16]),
+                inviter: owner.owner,
                 invitee_hint: None,
                 minted_at: Hlc {
                     wall_ms: 1,
@@ -190,7 +202,7 @@ mod tests {
                 expires_at: None,
                 sig: [3u8; 64],
             },
-            inviter_enrollment: None, // Some(cert) in real mint; codec must handle None
+            inviter_enrollment: owner.cert,
         }
     }
 
@@ -217,25 +229,50 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_addr_cert_mismatch() {
+        // A payload whose inviter_addr does NOT equal the embedded cert's
+        // owner_id must be rejected at decode (structural consistency).
+        let mut p = sample();
+        // Re-point inviter_addr at a different owner while keeping the original
+        // cert — now inviter_addr != inviter_enrollment.owner_id.
+        let other = mint_test_owner(0x43);
+        assert_ne!(other.owner.0, p.inviter_enrollment.owner_id);
+        p.inviter_addr = other.owner;
+        let url = encode_friend_token_url(&p).expect("encode (no check on encode)");
+        match decode_friend_token_url(&url) {
+            Err(FriendTokenError::AddrCertMismatch) => {}
+            other => panic!("expected AddrCertMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn minted_friend_token_verifies_and_encodes() {
         use crate::community_invite::verify_invite_token_sig_device_key;
-        let device2 = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // mint_friend_token signs the InviteToken with the OWNER's enrolled
+        // device-#2 key (the same key the cert attests), so the token sig must
+        // verify against `cert.device_pubkeys.classical.ed25519_verify`.
+        let owner = mint_test_owner(0x55);
+        let device2 = owner.device_key.clone();
         let p = mint_friend_token(
-            OwnerAddr([1u8; 16]), // inviter_addr
-            [2u8; 64],            // inviter_owner_pub
-            Some("bob".into()),   // display_hint
+            owner.owner,        // inviter_addr (= cert.owner_id)
+            Some("bob".into()), // display_hint
             Hlc {
                 wall_ms: 100,
                 logical: 0,
                 device_id: "d".into(),
             }, // minted_at
-            Some(200),            // expires_at
-            None,                 // inviter_enrollment (Some in prod)
+            Some(200),          // expires_at
+            owner.cert.clone(), // inviter_enrollment (required)
             &device2,
         )
         .expect("mint");
-        verify_invite_token_sig_device_key(&p.token, &device2.verifying_key().to_bytes())
-            .expect("sig ok");
-        assert!(encode_friend_token_url(&p).is_ok());
+        verify_invite_token_sig_device_key(
+            &p.token,
+            &owner.cert.device_pubkeys.classical.ed25519_verify,
+        )
+        .expect("sig ok against the cert's enrolled device key");
+        // Round-trips through the URL codec (passes the addr↔cert check).
+        let url = encode_friend_token_url(&p).expect("encode");
+        assert_eq!(decode_friend_token_url(&url).expect("decode"), p);
     }
 }
