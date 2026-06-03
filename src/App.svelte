@@ -131,6 +131,9 @@
   // Unsubscribe for the callSession.state subscription that clears the toast;
   // torn down on unmount via fileManagerService.addUnlisten.
   let callStateUnsub: (() => void) | null = null;
+  // ── ZEB-356: incoming-call OS notification + window attention ──────
+  // Built in the Tauri-init IIFE below (real Tauri deps); null in web/dev.
+  let incomingCallAlerter: import('./lib/incoming-call-alert').IncomingCallAlerter | null = null;
 
   // ── ZEB-353 Voice V5: SPA-unmount teardown ────────────────────────
   // Leave any active voice channel / end any in-progress DM call when the
@@ -230,7 +233,14 @@
       // the unsubscribe is registered for unmount cleanup below.
       callStateUnsub?.();
       callStateUnsub = callSession.state.subscribe((s) => {
-        if (s.phase !== 'incoming') incomingCall = null;
+        if (s.phase !== 'incoming') {
+          // ZEB-356: drop the OS escalation when the call leaves 'incoming'
+          // (accepted / declined / canceled / timeout). Capture the id before
+          // clearing the banner model.
+          const id = incomingCall?.callId;
+          if (id) void incomingCallAlerter?.clear(id);
+          incomingCall = null;
+        }
       });
     } catch (err) {
       // Allow a retry on a later trigger (reconnect) if the IPC wasn't ready.
@@ -1383,6 +1393,13 @@
             callerName: card?.displayName ?? p.callerOwner.slice(0, 8),
             ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
           };
+          // ZEB-356: escalate to the OS if the window is unfocused (no-op if
+          // focused — the in-app toast above suffices).
+          void incomingCallAlerter?.notify({
+            id: p.callId,
+            title: 'Incoming call',
+            body: `${incomingCall.callerName} is calling`,
+          });
         }
       });
       fileManagerService.addUnlisten(unlistenIncomingCall);
@@ -1422,6 +1439,21 @@
         void callSession?.onRemoteEnded(p.callId);
       });
       fileManagerService.addUnlisten(unlistenCallEnded);
+
+      // ── ZEB-356: build the incoming-call alerter (OS notification + attention).
+      // Request notification permission once up front so the first incoming call
+      // doesn't lose its banner to a permission-prompt race. Dynamic import keeps
+      // the web bundle free of the plugin (matches the dynamic-import pattern used
+      // for the close handler below).
+      try {
+        const { createDefaultIncomingCallAlerter } = await import('./lib/incoming-call-alert');
+        incomingCallAlerter = await createDefaultIncomingCallAlerter();
+        const { isPermissionGranted, requestPermission } = await import('@tauri-apps/plugin-notification');
+        if (!(await isPermissionGranted())) { await requestPermission(); }
+        fileManagerService.addUnlisten(() => { incomingCallAlerter?.dispose(); incomingCallAlerter = null; });
+      } catch (e) {
+        console.warn('[harmony-client] incoming-call alerter init failed:', e);
+      }
 
       // Tear down the callSession.state subscription (set in buildVoiceSession)
       // on unmount, alongside the listeners.
