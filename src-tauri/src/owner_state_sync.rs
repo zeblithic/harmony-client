@@ -1253,13 +1253,19 @@ mod subscriber_tests {
             5000,
         );
 
-        // Build a remote OwnerState that has befriended addr [7; 16].
-        let friend_addr = OwnerAddr([7; 16]);
+        // Build a remote OwnerState that has befriended a peer. The friend's
+        // OwnerAddr MUST derive from their friend_owner_pub (apply_friend_update
+        // enforces that correspondence), so use a real seeded identity pair.
+        let friend_pub = harmony_identity::PrivateIdentity::from_seed(&[0xe5; 32])
+            .public_identity()
+            .to_public_bytes();
+        let friend_addr = crate::friend_graph::owner_addr_from_identity_pub(&friend_pub)
+            .expect("seeded pub derives");
         let mut remote = OwnerState::default();
-        remote.apply_friend_update(
+        let outcome = remote.apply_friend_update(
             friend_addr,
             FriendEntry {
-                friend_owner_pub: [9u8; 64],
+                friend_owner_pub: friend_pub,
                 display: Some("eve".into()),
                 status: FriendStatus::Active,
                 established_via: FriendOrigin::Token,
@@ -1271,6 +1277,10 @@ mod subscriber_tests {
                 },
             },
         );
+        assert!(matches!(
+            outcome,
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
 
         let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();

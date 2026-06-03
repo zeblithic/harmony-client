@@ -261,7 +261,7 @@ pub fn load_replay(path: &Path) -> Result<BTreeMap<String, Hlc>, PersistError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_crdt::{ApplyOutcome, OwnerState};
     use crate::owner_state_types::{
         ContentId, DeliveryStatus, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, ReadMarker, Space,
         SpaceId, SpaceKind, TransportBinding,
@@ -384,12 +384,21 @@ mod tests {
 
     #[test]
     fn crdt_file_v2_round_trips_friend_graph() {
-        use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+        use crate::friend_graph::{
+            owner_addr_from_identity_pub, FriendEntry, FriendOrigin, FriendStatus,
+        };
+        // Derive a valid (addr, pub) pair so apply_friend_update's addr↔pub
+        // correspondence invariant is satisfied (an arbitrary addr would be
+        // rejected and the graph would stay empty).
+        let pub_bytes = harmony_identity::PrivateIdentity::from_seed(&[0xd1; 32])
+            .public_identity()
+            .to_public_bytes();
+        let friend_addr = owner_addr_from_identity_pub(&pub_bytes).expect("seeded pub derives");
         let mut s = OwnerState::default();
-        s.apply_friend_update(
-            OwnerAddr([3u8; 16]),
+        let outcome = s.apply_friend_update(
+            friend_addr,
             FriendEntry {
-                friend_owner_pub: [9u8; 64],
+                friend_owner_pub: pub_bytes,
                 display: Some("dave".into()),
                 status: FriendStatus::Active,
                 established_via: FriendOrigin::Token,
@@ -397,6 +406,7 @@ mod tests {
                 learned_at: hlc(42),
             },
         );
+        assert!(matches!(outcome, ApplyOutcome::Inserted));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner_state_crdt.cbor");
         save_crdt(&path, &s).unwrap();

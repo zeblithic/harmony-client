@@ -819,6 +819,25 @@ impl OwnerState {
         addr: crate::owner_state_types::OwnerAddr,
         entry: crate::friend_graph::FriendEntry,
     ) -> ApplyOutcome {
+        // Key↔pub correspondence invariant. A `FriendEntry` is keyed by the
+        // friend's `OwnerAddr` AND carries their 64-byte `friend_owner_pub`;
+        // the two MUST refer to the same identity. A divergent entry (address
+        // X paired with peer Y's pubkey) would make Phase-2 key establishment
+        // silently use the wrong key. Re-derive the expected address from the
+        // pub via the SAME primitive the rest of the codebase uses
+        // (`harmony_identity::Identity::from_public_bytes(..).address_hash`,
+        // behind `friend_graph::owner_addr_from_identity_pub`) and reject any
+        // mismatch — or a structurally-invalid pub — before LWW, so a bad
+        // entry never enters the CRDT (mirrors the identity-pub→device-hash
+        // gate in `apply_owner_device_update`).
+        match crate::friend_graph::owner_addr_from_identity_pub(&entry.friend_owner_pub) {
+            Some(derived) if derived == addr => {}
+            _ => {
+                return ApplyOutcome::Rejected(RejectionReason::InvariantFail(
+                    "friend_owner_pub does not derive to addr".into(),
+                ));
+            }
+        }
         if let Some(existing) = self.friend_graph.friends.get(&addr) {
             if existing
                 .learned_at
@@ -3895,12 +3914,27 @@ mod outbox_tombstones_tests {
 #[cfg(test)]
 mod friend_graph_tests {
     use super::*;
-    use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+    use crate::friend_graph::{
+        owner_addr_from_identity_pub, FriendEntry, FriendOrigin, FriendStatus,
+    };
     use crate::owner_state_types::{Hlc, OwnerAddr};
 
-    fn entry(w: u64, st: FriendStatus) -> FriendEntry {
+    /// A real (OwnerAddr, identity_pub) pair derived from a seeded
+    /// `PrivateIdentity`, so the addr↔pub correspondence invariant in
+    /// `apply_friend_update` is satisfied. `apply_friend_update` re-derives the
+    /// addr from `friend_owner_pub`, so tests MUST key entries by the derived
+    /// addr (an arbitrary `[9u8; 16]` would now be rejected).
+    fn friend_pair(seed: u8) -> (OwnerAddr, [u8; 64]) {
+        let private = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
+        let public = private.public_identity();
+        let pub_bytes = public.to_public_bytes();
+        let addr = owner_addr_from_identity_pub(&pub_bytes).expect("seeded pub derives");
+        (addr, pub_bytes)
+    }
+
+    fn entry(pub_bytes: [u8; 64], w: u64, st: FriendStatus) -> FriendEntry {
         FriendEntry {
-            friend_owner_pub: [1u8; 64],
+            friend_owner_pub: pub_bytes,
             display: None,
             status: st,
             established_via: FriendOrigin::Token,
@@ -3916,21 +3950,21 @@ mod friend_graph_tests {
     #[test]
     fn friend_lww_newer_wins_and_tombstone_sticks() {
         let mut s = OwnerState::default();
-        let addr = OwnerAddr([9u8; 16]);
+        let (addr, p) = friend_pair(0x91);
         // First active → Inserted.
         assert!(matches!(
-            s.apply_friend_update(addr, entry(10, FriendStatus::Active)),
+            s.apply_friend_update(addr, entry(p, 10, FriendStatus::Active)),
             ApplyOutcome::Inserted
         ));
         // Newer revoke wins (tombstone) → Merged.
         assert!(matches!(
-            s.apply_friend_update(addr, entry(20, FriendStatus::Revoked)),
+            s.apply_friend_update(addr, entry(p, 20, FriendStatus::Revoked)),
             ApplyOutcome::Merged { old_id: None }
         ));
         assert_eq!(s.friend_graph.friends[&addr].status, FriendStatus::Revoked);
         // Stale active (older HLC) must NOT resurrect → Rejected(StaleHlc).
         assert!(matches!(
-            s.apply_friend_update(addr, entry(15, FriendStatus::Active)),
+            s.apply_friend_update(addr, entry(p, 15, FriendStatus::Active)),
             ApplyOutcome::Rejected(RejectionReason::StaleHlc { .. })
         ));
         assert_eq!(s.friend_graph.friends[&addr].status, FriendStatus::Revoked);
@@ -3939,14 +3973,14 @@ mod friend_graph_tests {
     #[test]
     fn friend_equal_hlc_identical_is_idempotent() {
         let mut s = OwnerState::default();
-        let addr = OwnerAddr([5u8; 16]);
+        let (addr, p) = friend_pair(0x55);
         assert!(matches!(
-            s.apply_friend_update(addr, entry(10, FriendStatus::Active)),
+            s.apply_friend_update(addr, entry(p, 10, FriendStatus::Active)),
             ApplyOutcome::Inserted
         ));
         // Same HLC, identical payload → idempotent Merged.
         assert!(matches!(
-            s.apply_friend_update(addr, entry(10, FriendStatus::Active)),
+            s.apply_friend_update(addr, entry(p, 10, FriendStatus::Active)),
             ApplyOutcome::Merged { old_id: None }
         ));
     }
@@ -3954,15 +3988,44 @@ mod friend_graph_tests {
     #[test]
     fn friend_equal_hlc_diverging_payload_rejected() {
         let mut s = OwnerState::default();
-        let addr = OwnerAddr([5u8; 16]);
+        let (addr, p) = friend_pair(0x55);
         assert!(matches!(
-            s.apply_friend_update(addr, entry(10, FriendStatus::Active)),
+            s.apply_friend_update(addr, entry(p, 10, FriendStatus::Active)),
             ApplyOutcome::Inserted
         ));
         // Same HLC but a different status (diverging payload) → InvariantFail.
         assert!(matches!(
-            s.apply_friend_update(addr, entry(10, FriendStatus::Revoked)),
+            s.apply_friend_update(addr, entry(p, 10, FriendStatus::Revoked)),
             ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
         ));
+    }
+
+    #[test]
+    fn friend_apply_rejects_addr_pub_mismatch() {
+        let mut s = OwnerState::default();
+        let (addr_a, pub_a) = friend_pair(0xa1);
+        let (addr_b, _pub_b) = friend_pair(0xb2);
+        assert_ne!(addr_a, addr_b);
+
+        // Correctly-derived (addr, pub) pair → Inserted.
+        assert!(matches!(
+            s.apply_friend_update(addr_a, entry(pub_a, 10, FriendStatus::Active)),
+            ApplyOutcome::Inserted
+        ));
+
+        // Mismatched pair: key by addr_b but carry peer A's pubkey → Rejected.
+        match s.apply_friend_update(addr_b, entry(pub_a, 10, FriendStatus::Active)) {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("friend_owner_pub does not derive to addr"),
+                    "expected addr↔pub mismatch rejection; got: {msg}"
+                );
+            }
+            other => panic!("expected InvariantFail rejection, got {other:?}"),
+        }
+        assert!(
+            !s.friend_graph.friends.contains_key(&addr_b),
+            "mismatched entry must NOT enter the CRDT"
+        );
     }
 }
