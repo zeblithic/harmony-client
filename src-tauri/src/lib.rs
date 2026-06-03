@@ -32779,8 +32779,32 @@ async fn network_health_export_payload(
     ))
 }
 
+/// ZEB-356: real application exit. A tray-resident app does NOT quit when its
+/// last window is hidden/destroyed (the tray keeps the process alive), so the
+/// FE Quit path runs its voice/call teardown and then invokes this to terminate
+/// the process. Distinct from the window-close path, which now only hides.
+#[tauri::command]
+fn quit_app(app_handle: tauri::AppHandle) {
+    app_handle.exit(0);
+}
+
 pub fn run() {
     tauri::Builder::default()
+        // ZEB-356: single-instance MUST be registered first. On a second launch
+        // its callback shows + focuses the existing window instead of spawning a
+        // duplicate (closing now only hides to the tray). Note: this intercepts a
+        // Windows/Linux deep-link second-launch (URL in argv); we only raise the
+        // window here — routing that URL is a follow-up. macOS uses on_open_url
+        // (already wired) so its invite flow is unaffected.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            use tauri::Manager;
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -32836,6 +32860,7 @@ pub fn run() {
             publish_vine_reaction,
             start_node,
             stop_node,
+            quit_app,
             connect_zenoh,
             disconnect_zenoh,
             publish_profile,
