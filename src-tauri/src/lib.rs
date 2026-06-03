@@ -32822,6 +32822,58 @@ pub fn run() {
                     tracing::warn!(error = %e, "deep-link emit failed");
                 }
             });
+
+            // ── ZEB-356: system tray (close-to-tray reachability). ──────────
+            // Tray click / "Show Harmony" → raise the window. "Quit Harmony"
+            // emits `quit-requested`; the FE runs voice/call teardown then
+            // invokes `quit_app`. The window never destroys on close (the FE's
+            // onCloseRequested only hides), so the last-window-closed auto-exit
+            // never fires — quit_app is the sole exit path.
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+                use tauri::Manager;
+
+                fn raise_main(app: &tauri::AppHandle) {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.unminimize();
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+
+                let show_i = MenuItem::with_id(app, "show", "Show Harmony", true, None::<&str>)?;
+                let quit_i = MenuItem::with_id(app, "quit", "Quit Harmony", true, None::<&str>)?;
+                let tray_menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+                if let Some(icon) = app.default_window_icon().cloned() {
+                    let _tray = TrayIconBuilder::with_id("main-tray")
+                        .icon(icon)
+                        .tooltip("Harmony")
+                        .menu(&tray_menu)
+                        .show_menu_on_left_click(false)
+                        .on_menu_event(|app, event| match event.id.as_ref() {
+                            "show" => raise_main(app),
+                            "quit" => {
+                                let _ = app.emit("quit-requested", ());
+                            }
+                            _ => {}
+                        })
+                        .on_tray_icon_event(|tray, event| {
+                            if let TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            } = event
+                            {
+                                raise_main(tray.app_handle());
+                            }
+                        })
+                        .build(app)?;
+                } else {
+                    tracing::warn!("ZEB-356: no default window icon; tray not created");
+                }
+            }
+
             Ok(())
         })
         .manage(Mutex::new(NodeState::default()))
