@@ -16425,7 +16425,15 @@ pub fn mint_redemption(
             ));
         }
         use crate::dm_signing::{ed25519_priv_to_x25519, open_from_owner};
-        let x25519_priv = ed25519_priv_to_x25519(signing_key);
+        // ZEB-367: untargeted invite-only invites seal the epoch key to a
+        // one-time ephemeral X25519 key whose PRIVATE half rides in the URL
+        // (payload.untargeted_decrypt_key). Use it when present; otherwise this
+        // is a targeted invite sealed to our enrolled device-#2 X25519 key.
+        // Both branches stay wrapped in Zeroizing so the scalar is wiped on drop.
+        let x25519_priv: zeroize::Zeroizing<[u8; 32]> = match payload.untargeted_decrypt_key {
+            Some(ephemeral_priv) => zeroize::Zeroizing::new(ephemeral_priv),
+            None => ed25519_priv_to_x25519(signing_key),
+        };
         let plaintext = open_from_owner(&x25519_priv, &payload.epoch_snapshot.sealed_epoch_key)
             .map_err(|e| format!("invite-only epoch key decryption failed: {e}"))?;
         plaintext.as_slice().try_into().map_err(|_| {
