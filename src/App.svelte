@@ -242,6 +242,18 @@
           incomingCall = null;
         }
       });
+      // ZEB-356: now that owner identity is present (buildVoiceSession only runs
+      // then), request notification permission once so an incoming call's banner
+      // isn't lost to a permission-prompt race. Deferred here (not app-init) so
+      // first-run users aren't prompted before completing onboarding; notify() has
+      // a lazy permission fallback regardless. Tauri-only; the import/calls throw
+      // and are caught outside Tauri.
+      void (async () => {
+        try {
+          const { isPermissionGranted, requestPermission } = await import('@tauri-apps/plugin-notification');
+          if (!(await isPermissionGranted())) await requestPermission();
+        } catch { /* non-Tauri / plugin absent — notify()'s lazy fallback covers it */ }
+      })();
     } catch (err) {
       // Allow a retry on a later trigger (reconnect) if the IPC wasn't ready.
       voiceSessionInit = false;
@@ -1375,6 +1387,19 @@
       });
       fileManagerService.addUnlisten(unlistenMemberCard);
 
+      // ── ZEB-356: build the incoming-call alerter (OS notification + window
+      // attention). Constructed BEFORE the call-signaling listeners below so an
+      // `incoming-call` arriving right after init still escalates (no startup
+      // gap). The notification-permission prompt is deferred to buildVoiceSession
+      // (owner ready) so first-run users aren't prompted before onboarding.
+      try {
+        const { createDefaultIncomingCallAlerter } = await import('./lib/incoming-call-alert');
+        incomingCallAlerter = await createDefaultIncomingCallAlerter();
+        fileManagerService.addUnlisten(() => { incomingCallAlerter?.dispose(); incomingCallAlerter = null; });
+      } catch (e) {
+        console.warn('[harmony-client] incoming-call alerter init failed:', e);
+      }
+
       // ── ZEB-352 Voice V4: DM-call signaling listeners ───────────────
       // The backend emits these once per call-state transition; route each into
       // the CallSession state machine (built lazily in buildVoiceSession, so
@@ -1439,21 +1464,6 @@
         void callSession?.onRemoteEnded(p.callId);
       });
       fileManagerService.addUnlisten(unlistenCallEnded);
-
-      // ── ZEB-356: build the incoming-call alerter (OS notification + attention).
-      // Request notification permission once up front so the first incoming call
-      // doesn't lose its banner to a permission-prompt race. Dynamic import keeps
-      // the web bundle free of the plugin (matches the dynamic-import pattern used
-      // for the close handler below).
-      try {
-        const { createDefaultIncomingCallAlerter } = await import('./lib/incoming-call-alert');
-        incomingCallAlerter = await createDefaultIncomingCallAlerter();
-        const { isPermissionGranted, requestPermission } = await import('@tauri-apps/plugin-notification');
-        if (!(await isPermissionGranted())) { await requestPermission(); }
-        fileManagerService.addUnlisten(() => { incomingCallAlerter?.dispose(); incomingCallAlerter = null; });
-      } catch (e) {
-        console.warn('[harmony-client] incoming-call alerter init failed:', e);
-      }
 
       // Tear down the callSession.state subscription (set in buildVoiceSession)
       // on unmount, alongside the listeners.

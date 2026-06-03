@@ -81,6 +81,14 @@ describe('IncomingCallAlerter', () => {
     await Promise.resolve();
     expect(d.raiseWindow).toHaveBeenCalled();
   });
+
+  it('dispose cancels in-flight attention when a call is still ringing', async () => {
+    const a = createIncomingCallAlerter(d);
+    await a.notify({ id: 'c1', title: 'Incoming call', body: 'Alice is calling' });
+    (d.requestUserAttention as ReturnType<typeof vi.fn>).mockClear();
+    a.dispose();
+    expect(d.requestUserAttention).toHaveBeenCalledWith(false);
+  });
 });
 
 describe('createDefaultIncomingCallAlerter (non-Tauri)', () => {

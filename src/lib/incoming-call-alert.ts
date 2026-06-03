@@ -87,6 +87,10 @@ class Alerter implements IncomingCallAlerter {
   }
 
   dispose(): void {
+    // Cancel any in-flight OS attention so a dock/taskbar bounce doesn't persist
+    // after teardown (e.g. SPA unmount or identity switch while a call is still
+    // ringing). Best-effort; fire-and-forget.
+    if (this.activeId) void this.deps.requestUserAttention(false).catch(() => {});
     if (this.unlistenFocus) { this.unlistenFocus(); this.unlistenFocus = null; }
     this.activeId = null;
   }

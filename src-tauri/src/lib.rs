@@ -32792,12 +32792,24 @@ pub fn run() {
     tauri::Builder::default()
         // ZEB-356: single-instance MUST be registered first. On a second launch
         // its callback shows + focuses the existing window instead of spawning a
-        // duplicate (closing now only hides to the tray). Note: this intercepts a
-        // Windows/Linux deep-link second-launch (URL in argv); we only raise the
-        // window here — routing that URL is a follow-up. macOS uses on_open_url
-        // (already wired) so its invite flow is unaffected.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            use tauri::Manager;
+        // duplicate (closing now only hides to the tray). On Windows/Linux a
+        // `harmony://` deep link arrives as a second-launch argv; forward it to the
+        // running instance's deep-link handler (mirrors on_open_url below) so a
+        // deep-link-while-running isn't dropped now that single-instance suppresses
+        // the duplicate process that used to handle it. macOS delivers deep links
+        // via on_open_url directly, so it is unaffected either way.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            use tauri::Manager; // Emitter (for app.emit) is in scope at module level
+            let urls: Vec<String> = args
+                .iter()
+                .filter(|a| a.starts_with("harmony://"))
+                .cloned()
+                .collect();
+            if !urls.is_empty() {
+                if let Err(e) = app.emit("deep-link-received", &urls) {
+                    tracing::warn!(error = %e, "single-instance deep-link emit failed");
+                }
+            }
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.unminimize();
                 let _ = w.show();
@@ -32854,7 +32866,18 @@ pub fn run() {
                         .on_menu_event(|app, event| match event.id.as_ref() {
                             "show" => raise_main(app),
                             "quit" => {
+                                // Emit for graceful FE teardown (voice/call leave
+                                // then quit_app). Also arm a fallback exit so a
+                                // tray-resident app is never unquittable if the FE
+                                // `quit-requested` listener failed to init (window
+                                // close only hides). Whichever calls exit(0) first
+                                // wins; the other is moot once the process is gone.
                                 let _ = app.emit("quit-requested", ());
+                                let app2 = app.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(std::time::Duration::from_secs(3));
+                                    app2.exit(0);
+                                });
                             }
                             _ => {}
                         })
