@@ -1171,6 +1171,7 @@ impl_canonical!(
     RootPublishPayload,
     crate::friend_graph::FriendGraph, // ZEB-370 Phase 1: friend-graph sub-CRDT
     crate::friend_graph::FriendEntry,
+    crate::friend_token::FriendTokenPayload, // ZEB-370 Phase 1: friend-token URL payload
 );
 
 // OwnerState lives in owner_state_crdt to keep CRDT semantics together;
