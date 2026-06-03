@@ -18,6 +18,8 @@ import {
   listPeerReachability,
   forceRepublish,
   onReachabilityChanged,
+  redeemInviteIroh,
+  discoverIdentity,
 } from './connectivity-adapter';
 import type {
   ReachabilityRecord,
@@ -168,6 +170,30 @@ describe('connectivity-adapter', () => {
       capturedHandler!({ payload });
       expect(callback).toHaveBeenCalledWith(payload);
       expect(callback).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ZEB-365: these two commands take multi-word args, so the JS->Rust key
+  // casing must match. The backend commands are bare `#[tauri::command]`
+  // (camelCase, the app convention), so the adapter MUST send camelCase. These
+  // tests pin the keys against a regression to snake_case, which silently
+  // breaks the Tauri arg boundary ("missing required key invite_url").
+  describe('camelCase arg contract (ZEB-365)', () => {
+    it('redeemInviteIroh invokes with a camelCase inviteUrl key', async () => {
+      mockInvoke.mockResolvedValueOnce({ status: 'joined', communityId: 'abc' });
+      await redeemInviteIroh('harmony://invite/xyz');
+      expect(mockInvoke).toHaveBeenCalledWith('connectivity_redeem_invite_iroh', {
+        inviteUrl: 'harmony://invite/xyz',
+      });
+    });
+
+    it('discoverIdentity invokes with a camelCase identityPubHex key', async () => {
+      mockInvoke.mockResolvedValueOnce(null);
+      const key = 'ab'.repeat(64);
+      await discoverIdentity(key);
+      expect(mockInvoke).toHaveBeenCalledWith('connectivity_discover_identity', {
+        identityPubHex: key,
+      });
     });
   });
 });

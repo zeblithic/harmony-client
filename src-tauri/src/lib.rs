@@ -31425,7 +31425,11 @@ pub struct PkarrPublicationStatus {
 /// resources (pkarr resolver, reachability resolver, NodeState handles)
 /// without spinning up the full Tauri AppState. The Tauri command itself
 /// only snapshots NodeState and delegates.
-#[tauri::command(rename_all = "snake_case")]
+// ZEB-365: bare `#[tauri::command]` => camelCase args, the app's IPC convention
+// (CLAUDE.md "Tauri IPC parameter naming"). Do NOT add `rename_all = "snake_case"`
+// here — `connectivity-adapter.ts` invokes this with `{ inviteUrl }`, and
+// snake_case silently breaks the arg boundary ("missing required key invite_url").
+#[tauri::command]
 async fn connectivity_redeem_invite_iroh(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -32377,7 +32381,10 @@ async fn connectivity_get_identity_discoverable(
 ///
 /// Returns `Ok(None)` when the peer is not discoverable (record not found or
 /// pkarr not initialized), `Ok(Some(DiscoveredRecord))` when found and valid.
-#[tauri::command(rename_all = "snake_case")]
+// ZEB-365: bare `#[tauri::command]` => camelCase args (see
+// `connectivity_redeem_invite_iroh`). `connectivity-adapter.ts` invokes this
+// with `{ identityPubHex }`; `rename_all = "snake_case"` would break it.
+#[tauri::command]
 async fn connectivity_discover_identity(
     state: tauri::State<'_, Mutex<NodeState>>,
     identity_pub_hex: String,
