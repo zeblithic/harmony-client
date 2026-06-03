@@ -14929,18 +14929,6 @@ async fn generate_invite(
         admin_identity_pub,
         untargeted_decrypt_key,
     ) = if is_invite_only {
-        // Targeted invites (invitee_hint = Some) are deferred to ZEB-369: they
-        // require resolving the invitee's enrolled device-#2 verifying key, which
-        // OwnerDeviceCache does NOT carry (it holds the identity/#3 key). Reject
-        // rather than silently hand back a weaker untargeted link (key-in-URL) in
-        // response to a request for a confidential targeted invite.
-        if invitee_hint.is_some() {
-            return Err(
-                "targeted invite-only invites are not yet supported (ZEB-369); \
-                 omit invitee_hint to generate an untargeted single-use link"
-                    .to_string(),
-            );
-        }
         // Inviter identity: device-#2 signing key (signs the token), reticulum
         // identity (admin_identity_pub), device id (per-device HLC stream).
         let (self_owner, self_private_identity, community_signing_key, device_id) = {
@@ -14959,24 +14947,18 @@ async fn generate_invite(
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?
         };
 
-        // v1: only the admin may mint invite-only invites — the admin holds the
-        // epoch key and can produce the admin_bootstrap. Non-admin invite is a
-        // follow-up. The power gate below is the general form; admin always
-        // clears it (POWER_THRESHOLDS.invite == 0).
-        if self_owner != admin {
-            return Err("only the admin can generate invite-only invites (v1)".to_string());
-        }
+        // Security gates, extracted to `invite_only_generation_guard` so the
+        // security-relevant rejections are unit-tested without a NodeState
+        // harness: reject targeted requests (invitee_hint = Some → deferred to
+        // ZEB-369) and restrict invite-only generation to the admin (v1). The
+        // power gate is implicit — POWER_THRESHOLDS.invite == 0, so admin-only is
+        // the operative restriction; reinstate a real `power < threshold` check
+        // (materialize_with_now(&events, admin, ..)) when non-admin invite ships.
+        invite_only_generation_guard(&invitee_hint, self_owner, admin)?;
         let wall_now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        // Power gate: invite-only generation nominally requires
-        // POWER_THRESHOLDS.invite. That threshold is currently 0 (every member
-        // clears it), so the admin-only v1 restriction above is the operative
-        // gate — an explicit `power < 0` check would be dead code (and trips
-        // clippy::absurd_extreme_comparisons). When non-admin invite ships,
-        // materialize the membership here (materialize_with_now(&events, admin,
-        // Some(wall_now_ms))) and reinstate a real `power < threshold` check.
 
         // Seal the epoch key to a one-time ephemeral X25519 key; its private half
         // rides in the URL (untargeted_decrypt_key) — single-use "controlled open".
@@ -15138,23 +15120,10 @@ async fn generate_invite(
         untargeted_decrypt_key,
     };
 
-    // ZEB-323 Phase 2b: case-A pkarr hook. Register a pending-invite publication
-    // so that the redeemer can locate our iroh routing via pkarr before the Zenoh
-    // session is established. The publisher handles the open-community case
-    // (invite_token = None) by returning early without publishing — this is correct
-    // for Phase 2b which only supports open-community invites. Phase 4 invite-only
-    // support will pass a non-None token and the publisher will register it.
-    // TODO ZEB-323 §5: wire unregister on invite consumption here.
-    {
-        let inv_pub = state_lock
-            .lock()
-            .ok()
-            .and_then(|g| g.pkarr_invite_publisher.clone());
-        if let Some(inv_pub) = inv_pub {
-            inv_pub.register_invite(&payload).await;
-        }
-    }
-
+    // Encode the invite URL FIRST so we never publish a case-A pkarr record for
+    // an invite that failed to encode (which would leave dangling iroh routing
+    // advertised in the DHT for a URL the caller never received).
+    //
     // RELIABILITY: if the encoded invite payload would exceed the URL cap
     // (MAX_INVITE_BODY_B64_CHARS ≈ 64 KiB), a snapshot-bundled fork-invite
     // will fail. Fall back to no-snapshot mode: the forker still gets a
@@ -15164,8 +15133,8 @@ async fn generate_invite(
     // Both forked_from and pre_fork_snapshot are cleared together to maintain
     // the invariant that forked_from is None iff pre_fork_snapshot is None.
     // (Fix: PR #122 bot review — CodeAnt invariant + size cap issue.)
-    match crate::community_invite::encode_invite_url(&payload) {
-        Ok(url) => Ok(url),
+    let url = match crate::community_invite::encode_invite_url(&payload) {
+        Ok(url) => url,
         Err(crate::community_invite::InviteUrlError::TooLarge(actual_len))
             if payload.pre_fork_snapshot.is_some() =>
         {
@@ -15180,10 +15149,57 @@ async fn generate_invite(
             );
             payload.forked_from = None;
             payload.pre_fork_snapshot = None;
-            build_open_invite_url(&payload)
+            build_open_invite_url(&payload)?
         }
-        Err(e) => Err(format!("encode invite URL: {e}")),
+        Err(e) => return Err(format!("encode invite URL: {e}")),
+    };
+
+    // ZEB-323 Phase 2b / ZEB-367: now that we hold a URL to hand out, register the
+    // case-A pkarr publication (keyed on the invite token sig) so a redeemer can
+    // locate our iroh routing before a Zenoh session exists. Open-community
+    // invites (invite_token = None) return early inside register_invite without
+    // publishing. Best-effort: if the NodeState lock is poisoned we skip the
+    // publish (cross-WAN case-A discovery is degraded, but the invite + LAN redeem
+    // still work) rather than failing invite creation. Unregister-on-consume fires
+    // at the countersign-acceptance points (community_invite::handle_unicast).
+    {
+        let inv_pub = state_lock
+            .lock()
+            .ok()
+            .and_then(|g| g.pkarr_invite_publisher.clone());
+        if let Some(inv_pub) = inv_pub {
+            inv_pub.register_invite(&payload).await;
+        }
     }
+    Ok(url)
+}
+
+/// ZEB-367: security gates for invite-only invite generation, factored out of
+/// `generate_invite` so they're unit-testable without a NodeState/Tauri harness.
+///
+/// - Targeted invites (`invitee_hint = Some`) are deferred to ZEB-369 — the
+///   invitee's enrolled device-#2 key isn't resolvable from `OwnerDeviceCache`
+///   (which stores the identity/#3 key). Rejecting prevents silently downgrading
+///   a confidential targeted request to a weaker untargeted (key-in-URL) link.
+/// - v1 restricts invite-only generation to the admin (only the admin holds the
+///   epoch key and can produce the admin_bootstrap). Non-admin invite is a
+///   follow-up; reinstate a real power check then.
+fn invite_only_generation_guard(
+    invitee_hint: &Option<String>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    admin: crate::owner_state_types::OwnerAddr,
+) -> Result<(), String> {
+    if invitee_hint.is_some() {
+        return Err(
+            "targeted invite-only invites are not yet supported (ZEB-369); \
+             omit invitee_hint to generate an untargeted single-use link"
+                .to_string(),
+        );
+    }
+    if self_owner != admin {
+        return Err("only the admin can generate invite-only invites (v1)".to_string());
+    }
+    Ok(())
 }
 
 // ── ZEB-217 Sub-C Phase 3 Task 9: create_community ───────────────────
@@ -34469,6 +34485,45 @@ mod generate_invite_helper_tests {
     use super::*;
     use crate::community_invite::{decode_invite_url, CommunityInvitePayload};
     use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
+
+    // ── ZEB-367: invite-only generation security gates ───────────────────
+    // These exercise `invite_only_generation_guard` directly — the two
+    // security-relevant rejections in `generate_invite`'s invite-only branch
+    // that can't otherwise be reached without a full NodeState harness.
+
+    #[test]
+    fn invite_only_guard_rejects_targeted_request() {
+        // invitee_hint = Some → targeted, deferred to ZEB-369. Must reject even
+        // when the caller IS the admin (the rejection is about the model, not
+        // authorization), so confidential-targeted requests never silently
+        // downgrade to an untargeted (key-in-URL) link.
+        let admin = OwnerAddr([0x11; 16]);
+        let err = invite_only_generation_guard(&Some("deadbeef".to_string()), admin, admin)
+            .expect_err("targeted (invitee_hint Some) must be rejected");
+        assert!(
+            err.contains("ZEB-369"),
+            "rejection must point to the targeted follow-up ticket: {err}"
+        );
+    }
+
+    #[test]
+    fn invite_only_guard_rejects_non_admin_caller() {
+        let admin = OwnerAddr([0x11; 16]);
+        let someone_else = OwnerAddr([0x22; 16]);
+        let err = invite_only_generation_guard(&None, someone_else, admin)
+            .expect_err("non-admin caller must be rejected (v1 admin-only)");
+        assert!(
+            err.contains("admin"),
+            "rejection must explain the admin-only restriction: {err}"
+        );
+    }
+
+    #[test]
+    fn invite_only_guard_allows_admin_untargeted() {
+        let admin = OwnerAddr([0x11; 16]);
+        invite_only_generation_guard(&None, admin, admin)
+            .expect("admin + untargeted (invitee_hint None) must be allowed");
+    }
 
     #[test]
     fn build_open_invite_payload_round_trips_via_url() {
