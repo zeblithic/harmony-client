@@ -57,6 +57,8 @@ impl crate::owner_state_crypto::sealed::CanonicalPayloadSealed for VoicePresence
 impl crate::owner_state_crypto::CanonicalPayload for VoicePresenceBeacon {}
 impl crate::owner_state_crypto::sealed::CanonicalPayloadSealed for SignedVoicePresenceBeacon {}
 impl crate::owner_state_crypto::CanonicalPayload for SignedVoicePresenceBeacon {}
+impl crate::owner_state_crypto::sealed::CanonicalPayloadSealed for GroupSignedPresenceBeacon {}
+impl crate::owner_state_crypto::CanonicalPayload for GroupSignedPresenceBeacon {}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BeaconError {
@@ -140,6 +142,80 @@ pub fn seal_presence_beacon_with_nonce(
         community,
         channel,
         VOICE_PRESENCE_AAD,
+        &plain,
+        nonce,
+    )
+    .map_err(|_| BeaconError::Encode)
+}
+
+/// ZEB-360: a signed presence beacon plus the `call_id` it belongs to. The
+/// group presence topic is space-scoped (so a banner can discover the active
+/// call without holding the `call_id`), therefore the `call_id` must ride
+/// INSIDE the sealed payload. Wrapping (rather than adding a field to
+/// `VoicePresenceBeacon`) keeps the community-voice beacon + its pinned fixture
+/// byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupSignedPresenceBeacon {
+    #[serde(
+        rename = "ci",
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub call_id: [u8; 16],
+    #[serde(rename = "sb")]
+    pub signed: SignedVoicePresenceBeacon,
+}
+
+/// Seal a wrapped group-DM presence beacon (ZEB-360). Scopes the AEAD to
+/// `space_id` under the group-DM presence key (`derive_groupdm_presence_key`).
+pub fn seal_groupdm_presence_beacon(
+    key: &ChannelKey,
+    space_id: &SpaceId,
+    wrapped: &GroupSignedPresenceBeacon,
+) -> Result<Vec<u8>, BeaconError> {
+    let plain = canonical_cbor_encode(wrapped).map_err(|_| BeaconError::Encode)?;
+    crate::voice_crypto::encrypt_groupdm_presence_packet(
+        key,
+        &space_id.0,
+        crate::voice_crypto::VOICE_GROUPDM_PRESENCE_AAD,
+        &plain,
+    )
+    .map_err(|_| BeaconError::Encode)
+}
+
+/// Open + decode a sealed wrapped group-DM presence beacon. Returns `None` on
+/// any failure (drop), matching [`open_presence_beacon`].
+pub fn open_groupdm_presence_beacon(
+    key: &ChannelKey,
+    space_id: &SpaceId,
+    packet: &[u8],
+) -> Option<GroupSignedPresenceBeacon> {
+    let plain = crate::voice_crypto::decrypt_groupdm_presence_packet(
+        key,
+        &space_id.0,
+        crate::voice_crypto::VOICE_GROUPDM_PRESENCE_AAD,
+        packet,
+    )
+    .ok()?;
+    ciborium::from_reader(plain.as_slice()).ok()
+}
+
+/// Deterministic-nonce group-DM presence seal for wire-format fixtures. NEVER
+/// call from production — a fixed nonce with a reused key is catastrophic nonce
+/// reuse.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub fn seal_groupdm_presence_beacon_with_nonce(
+    key: &ChannelKey,
+    space_id: &SpaceId,
+    wrapped: &GroupSignedPresenceBeacon,
+    nonce: [u8; 12],
+) -> Result<Vec<u8>, BeaconError> {
+    let plain = canonical_cbor_encode(wrapped).map_err(|_| BeaconError::Encode)?;
+    crate::voice_crypto::encrypt_groupdm_presence_packet_with_nonce(
+        key,
+        &space_id.0,
+        crate::voice_crypto::VOICE_GROUPDM_PRESENCE_AAD,
         &plain,
         nonce,
     )

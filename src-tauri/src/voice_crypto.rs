@@ -202,6 +202,99 @@ pub fn encrypt_dm_voice_packet_with_nonce(
     seal_inner_dm(key, call_id, domain, plaintext, nonce)
 }
 
+/// AAD domain tag for group-DM presence beacons (ZEB-360). Distinct from
+/// `VOICE_DM_PACKET_AAD` / `VOICE_PRESENCE_AAD` so a beacon can never be
+/// confused for media or community-presence even under the same key.
+pub const VOICE_GROUPDM_PRESENCE_AAD: &[u8] = b"harmony-voice-groupdm-presence-v1";
+
+/// AAD = domain ‖ space_id (16B). Binds every sealed group-DM presence beacon
+/// to its domain and `space_id` (presence is group-scoped, not call-scoped).
+fn scope_aad_groupdm(domain: &[u8], space_id: &[u8; 16]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(domain.len() + 16);
+    aad.extend_from_slice(domain);
+    aad.extend_from_slice(&space_id[..]);
+    aad
+}
+
+/// Seal a group-DM presence payload under `key`, scoped to `space_id`, with a
+/// random nonce. Mirrors [`encrypt_dm_voice_packet`] but binds the 16-byte
+/// `space_id` instead of a `call_id` (presence is group-scoped, not
+/// call-scoped). Output: `[12B nonce][ChaCha20-Poly1305 ciphertext+tag]`.
+pub fn encrypt_groupdm_presence_packet(
+    key: &ChannelKey,
+    space_id: &[u8; 16],
+    domain: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, VoiceCryptoError> {
+    use chacha20poly1305::aead::OsRng;
+    use chacha20poly1305::AeadCore;
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let nonce_bytes: [u8; NONCE_LEN] = nonce.into();
+    seal_inner_groupdm(key, space_id, domain, plaintext, nonce_bytes)
+}
+
+fn seal_inner_groupdm(
+    key: &ChannelKey,
+    space_id: &[u8; 16],
+    domain: &[u8],
+    plaintext: &[u8],
+    nonce_bytes: [u8; NONCE_LEN],
+) -> Result<Vec<u8>, VoiceCryptoError> {
+    let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
+    let aad = scope_aad_groupdm(domain, space_id);
+    let ct = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| VoiceCryptoError::SealFailed)?;
+    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Open a group-DM presence packet sealed by [`encrypt_groupdm_presence_packet`].
+/// Any failure (wrong key, wrong space_id, wrong domain, tamper, truncation)
+/// returns an error — callers drop silently.
+pub fn decrypt_groupdm_presence_packet(
+    key: &ChannelKey,
+    space_id: &[u8; 16],
+    domain: &[u8],
+    packet: &[u8],
+) -> Result<Vec<u8>, VoiceCryptoError> {
+    if packet.len() < MIN_PACKET_LEN {
+        return Err(VoiceCryptoError::TooShort(packet.len()));
+    }
+    let (nonce_bytes, ct) = packet.split_at(NONCE_LEN);
+    let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
+    let aad = scope_aad_groupdm(domain, space_id);
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            Payload { msg: ct, aad: &aad },
+        )
+        .map_err(|_| VoiceCryptoError::OpenFailed)
+}
+
+/// Deterministic-nonce group-DM presence variant for wire-format fixtures.
+/// NEVER call from production — a fixed nonce with a reused key is catastrophic
+/// nonce reuse.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub fn encrypt_groupdm_presence_packet_with_nonce(
+    key: &ChannelKey,
+    space_id: &[u8; 16],
+    domain: &[u8],
+    plaintext: &[u8],
+    nonce: [u8; NONCE_LEN],
+) -> Result<Vec<u8>, VoiceCryptoError> {
+    seal_inner_groupdm(key, space_id, domain, plaintext, nonce)
+}
+
 /// Deterministic-nonce variant for wire-format fixtures. NEVER call from
 /// production — a fixed nonce with a reused key is catastrophic nonce reuse.
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -332,5 +425,41 @@ mod dm_tests {
         let frame = (0u8..30).collect::<Vec<_>>();
         let sealed = encrypt_dm_voice_packet(&k, &call, VOICE_DM_PACKET_AAD, &frame).unwrap();
         assert!(decrypt_dm_voice_packet(&k, &call, VOICE_PACKET_AAD, &sealed).is_err());
+    }
+}
+
+#[cfg(test)]
+mod groupdm_presence_tests {
+    use super::*;
+    use crate::community_channel_log::derive_groupdm_presence_key;
+    use crate::owner_state_types::DmContentKey;
+
+    // `ChannelKey`'s field is private to `community_channel_log`, so construct
+    // the key via the real call-independent presence-key derivation.
+    fn key() -> ChannelKey {
+        derive_groupdm_presence_key(&DmContentKey::new([0x33; 32]))
+    }
+
+    #[test]
+    fn groupdm_presence_packet_round_trips_and_binds_space() {
+        let k = key();
+        let sp = [0x44u8; 16];
+        let pt = b"beacon-bytes".to_vec();
+        let sealed =
+            encrypt_groupdm_presence_packet(&k, &sp, VOICE_GROUPDM_PRESENCE_AAD, &pt).unwrap();
+        assert_eq!(
+            decrypt_groupdm_presence_packet(&k, &sp, VOICE_GROUPDM_PRESENCE_AAD, &sealed).unwrap(),
+            pt
+        );
+        // Wrong space_id in AAD must fail.
+        assert!(decrypt_groupdm_presence_packet(
+            &k,
+            &[0x45; 16],
+            VOICE_GROUPDM_PRESENCE_AAD,
+            &sealed
+        )
+        .is_err());
+        // Wrong domain must fail.
+        assert!(decrypt_groupdm_presence_packet(&k, &sp, VOICE_DM_PACKET_AAD, &sealed).is_err());
     }
 }
