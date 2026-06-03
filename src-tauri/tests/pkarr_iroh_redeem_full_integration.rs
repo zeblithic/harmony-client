@@ -422,6 +422,8 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
                 Arc::clone(&alice_dm_outbox),
                 Arc::clone(&alice_crdt_state),
                 None,
+                // ZEB-367: no case-A pkarr publisher in this test harness.
+                None,
                 harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
                     io_deadline: Duration::from_millis(10_000),
                     poll_deadline: Duration::from_millis(10_000),

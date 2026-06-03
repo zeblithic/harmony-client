@@ -436,6 +436,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
                 &crdt_a_for_fwd,
                 req.packet,
                 None,
+                // ZEB-367: no case-A pkarr publisher in this test harness.
+                None,
             )
             .await;
         }

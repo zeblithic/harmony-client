@@ -4435,6 +4435,7 @@ pub(crate) async fn start_node_inner(
                                 std::sync::Arc::clone(&outbox),
                                 std::sync::Arc::clone(&crdt_state),
                                 Some(std::sync::Arc::new(app.clone())),
+                                pkarr_invite_publisher_for_state.clone(),
                                 crate::iroh_invite_acceptor::HandshakeAcceptorConfig::from_env(),
                             ),
                         );

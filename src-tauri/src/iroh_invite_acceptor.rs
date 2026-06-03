@@ -196,6 +196,11 @@ where
     /// path; `None` falls through to the warn-log-only branch (matches
     /// the test-stub convention).
     app: Option<Arc<H>>,
+    /// ZEB-367: case-A pkarr publisher handle. When `Some`, a successful
+    /// invite consumption (PendingJoin / counter-signed Join `Inserted`)
+    /// unregisters the invite's case-A publication via
+    /// `handle_unicast`, freeing the DHT slot. `None` in tests.
+    pkarr_invite_publisher: Option<Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>>,
     /// Per-handler timeouts. Production wiring constructs this via
     /// [`HandshakeAcceptorConfig::from_env`] so operators can override
     /// without recompiling; tests construct directly to keep wall-clock
@@ -215,12 +220,14 @@ where
         dm_outbox: Arc<TokioMutex<DmOutbox>>,
         crdt_state: Arc<TokioMutex<OwnerState>>,
         app: Option<Arc<H>>,
+        pkarr_invite_publisher: Option<Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>>,
     ) -> Self {
         Self::with_config(
             community_registry,
             dm_outbox,
             crdt_state,
             app,
+            pkarr_invite_publisher,
             HandshakeAcceptorConfig::default(),
         )
     }
@@ -234,6 +241,7 @@ where
         dm_outbox: Arc<TokioMutex<DmOutbox>>,
         crdt_state: Arc<TokioMutex<OwnerState>>,
         app: Option<Arc<H>>,
+        pkarr_invite_publisher: Option<Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>>,
         config: HandshakeAcceptorConfig,
     ) -> Self {
         Self {
@@ -241,6 +249,7 @@ where
             dm_outbox,
             crdt_state,
             app,
+            pkarr_invite_publisher,
             config,
         }
     }
@@ -332,6 +341,7 @@ where
             &self.crdt_state,
             packet_bytes,
             self.app.as_deref(),
+            self.pkarr_invite_publisher.as_ref(),
         )
         .await;
         if let Err(e) = unicast_result {

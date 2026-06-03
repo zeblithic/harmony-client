@@ -1738,6 +1738,9 @@ pub async fn handle_unicast<H: AppHandleEmit>(
     _crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     packet_bytes: Vec<u8>,
     app: Option<&H>,
+    pkarr_invite_publisher: Option<
+        &std::sync::Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>,
+    >,
 ) -> Result<(), CommunityInviteVerifyError> {
     // 1. decode_packet — peels the 0x10 discriminant + 64-byte trailer,
     //    canonical-CBOR-checks the inner body, enforces the
@@ -1905,7 +1908,14 @@ pub async fn handle_unicast<H: AppHandleEmit>(
             .insert_local_event_with_pubs(join_event, joiner_identity_pub, None)
             .await
         {
-            Ok(crate::community_state_crdt::InsertOutcome::Inserted) => Ok(()),
+            Ok(crate::community_state_crdt::InsertOutcome::Inserted) => {
+                // ZEB-367: invite consumed — stop the case-A pkarr publication
+                // (single-use; frees the DHT slot) now that the Join is inserted.
+                if let Some(pubr) = pkarr_invite_publisher {
+                    pubr.unregister_invite(&signed.invite_token.sig).await;
+                }
+                Ok(())
+            }
             Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => Ok(()),
             Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
                 tracing::warn!(error = ?verr, "ZEB-254 handle_unicast: PendingJoin rejected by engine");
@@ -1969,7 +1979,14 @@ pub async fn handle_unicast<H: AppHandleEmit>(
             )
             .await
         {
-            Ok(crate::community_state_crdt::InsertOutcome::Inserted) => Ok(()),
+            Ok(crate::community_state_crdt::InsertOutcome::Inserted) => {
+                // ZEB-367: invite consumed — stop the case-A pkarr publication
+                // (single-use; frees the DHT slot) now that the Join is inserted.
+                if let Some(pubr) = pkarr_invite_publisher {
+                    pubr.unregister_invite(&signed.invite_token.sig).await;
+                }
+                Ok(())
+            }
             Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
                 // Idempotent retransmit (Reticulum can deliver duplicates).
                 // Treat as success — we've already counter-signed this id.
