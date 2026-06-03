@@ -249,6 +249,369 @@ pub fn master_ed25519_from_cert(cert: &EnrollmentCert) -> Result<[u8; 32], Frien
     }
 }
 
+// =====================================================================
+// Task 8 — ALPN acceptor
+// =====================================================================
+
+use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+use crate::owner_state_crdt::{ApplyOutcome, OwnerState};
+use crate::owner_state_types::Hlc;
+use async_trait::async_trait;
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
+use iroh::endpoint::Connection;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex as TokioMutex;
+
+/// Tiny emit trait so the acceptor can signal the UI a friend was added
+/// without depending on `tauri` directly (mirrors
+/// `community_invite::AppHandleEmit`). Production impl on `tauri::AppHandle`
+/// lives in `lib.rs`; the unit-type impl lets tests pass `None::<Arc<()>>`.
+pub trait FriendEventEmit: Send + Sync + 'static {
+    /// Emit a `friend-list-changed` Tauri event (no payload — the frontend
+    /// re-fetches the friend list on receipt).
+    fn emit_friend_list_changed(&self);
+}
+
+impl FriendEventEmit for () {
+    fn emit_friend_list_changed(&self) {}
+}
+
+/// Default per-await IO deadline for the inbound friend handshake. Mirrors
+/// `iroh_invite_acceptor::DEFAULT_ACCEPTOR_IO_DEADLINE_MS`.
+pub const DEFAULT_FRIEND_IO_DEADLINE_MS: u64 = 30_000;
+
+/// Tunable timeouts for the friend handshake handler. Tests construct this
+/// directly with sub-second values; production uses [`Self::default`] (or an
+/// env override at the call site).
+#[derive(Debug, Clone, Copy)]
+pub struct FriendAcceptorConfig {
+    /// Per-await IO timeout bounding `accept_bi`, both `read_exact`s, both
+    /// `write_all`s, and `conn.closed()`.
+    pub io_deadline: Duration,
+}
+
+impl Default for FriendAcceptorConfig {
+    fn default() -> Self {
+        Self {
+            io_deadline: Duration::from_millis(DEFAULT_FRIEND_IO_DEADLINE_MS),
+        }
+    }
+}
+
+/// PURE, testable core of the friend handshake. Authenticates `req`, writes the
+/// resulting `FriendEntry` into `state`, and returns a signed
+/// `FriendLinkAccepted` for the requester. No I/O.
+///
+/// Steps (spec §5.2 accept side):
+/// 1. `verify_enrolled_device(&req.enrollment, req.from_addr)` → device key,
+/// 2. verify `req.sig` over the request preimage against that device key,
+/// 3. extract the requester's `master_ed25519` from their Master cert,
+/// 4. build `FriendEntry { master_ed25519, display, Active, Token, referrable:
+///    false, learned_at }`,
+/// 5. `state.apply_friend_update(req.from_addr, entry)` — must be
+///    `Inserted`/`Merged` (a `Rejected` is a hard error),
+/// 6. build + device-#2-sign a `FriendLinkAccepted` from `self_owner` /
+///    `self_enrollment`, signing `friend_accept_sig_preimage(self_owner,
+///    req.token_sig)`.
+#[allow(clippy::too_many_arguments)]
+pub fn process_friend_request(
+    state: &mut OwnerState,
+    learned_at: Hlc,
+    req: &FriendLinkRequest,
+    self_owner: OwnerAddr,
+    self_display: Option<String>,
+    self_enrollment: &EnrollmentCert,
+    self_device2: &ed25519_dalek::SigningKey,
+) -> Result<FriendLinkAccepted, FriendHandshakeError> {
+    // 1. Authenticate the requester's cert → enrolled device-#2 key.
+    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr)?;
+
+    // 2. Verify the request signature over the canonical preimage.
+    let vk = VerifyingKey::from_bytes(&device_key)
+        .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
+    let preimage = friend_request_sig_preimage(req.from_addr, &req.token_sig);
+    vk.verify_strict(&preimage, &Signature::from_bytes(&req.sig))
+        .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
+
+    // 3. Extract the requester's master key (their friend-graph anchor).
+    let master_ed25519 = master_ed25519_from_cert(&req.enrollment)?;
+
+    // 4-5. Apply the new friend entry to the CRDT. apply_friend_update re-checks
+    // the key↔master-key invariant; a Rejected is a hard error here.
+    let entry = FriendEntry {
+        master_ed25519,
+        display: req.display.clone(),
+        status: FriendStatus::Active,
+        established_via: FriendOrigin::Token,
+        referrable: false,
+        learned_at,
+    };
+    match state.apply_friend_update(req.from_addr, entry) {
+        ApplyOutcome::Inserted | ApplyOutcome::Merged { .. } => {}
+        ApplyOutcome::Rejected(reason) => {
+            return Err(FriendHandshakeError::ApplyRejected(format!("{reason:?}")));
+        }
+    }
+
+    // 6. Build + sign the mutual accept reply. The accept sig binds to the same
+    // token_sig as the request it answers (domain-separated from the request).
+    let accept_preimage = friend_accept_sig_preimage(self_owner, &req.token_sig);
+    let sig = self_device2.sign(&accept_preimage).to_bytes();
+    Ok(FriendLinkAccepted {
+        from_addr: self_owner,
+        display: self_display,
+        enrollment: self_enrollment.clone(),
+        sig,
+    })
+}
+
+/// Inbound dispatcher for the `harmony/friend/v1` ALPN. Holds the handles the
+/// pure core needs plus the IO plumbing. Generic over the `FriendEventEmit`
+/// impl so tests can stub with `()`.
+///
+/// Structural template: `iroh_invite_acceptor::IrohInviteHandshakeAcceptor`.
+pub struct IrohFriendHandshakeAcceptor<H>
+where
+    H: FriendEventEmit,
+{
+    crdt_state: Arc<TokioMutex<OwnerState>>,
+    /// Shared HLC tracker (`device_id → last Hlc`), bumped per accepted request
+    /// to stamp `FriendEntry.learned_at`. Same map the profile broadcaster uses.
+    hlc_tracker: Arc<TokioMutex<std::collections::BTreeMap<String, Hlc>>>,
+    device_id: String,
+    self_owner: OwnerAddr,
+    self_display: Option<String>,
+    self_enrollment: EnrollmentCert,
+    device2_signing_key: Arc<ed25519_dalek::SigningKey>,
+    /// `Some(app)` emits `friend-list-changed`; `None` warn-logs only (tests).
+    app: Option<Arc<H>>,
+    /// `Some` unregisters the consumed Case-A friend-token one-shot on success.
+    pkarr_invite_publisher: Option<Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>>,
+    config: FriendAcceptorConfig,
+}
+
+impl<H> IrohFriendHandshakeAcceptor<H>
+where
+    H: FriendEventEmit,
+{
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        crdt_state: Arc<TokioMutex<OwnerState>>,
+        hlc_tracker: Arc<TokioMutex<std::collections::BTreeMap<String, Hlc>>>,
+        device_id: String,
+        self_owner: OwnerAddr,
+        self_display: Option<String>,
+        self_enrollment: EnrollmentCert,
+        device2_signing_key: Arc<ed25519_dalek::SigningKey>,
+        app: Option<Arc<H>>,
+        pkarr_invite_publisher: Option<Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>>,
+    ) -> Self {
+        Self::with_config(
+            crdt_state,
+            hlc_tracker,
+            device_id,
+            self_owner,
+            self_display,
+            self_enrollment,
+            device2_signing_key,
+            app,
+            pkarr_invite_publisher,
+            FriendAcceptorConfig::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_config(
+        crdt_state: Arc<TokioMutex<OwnerState>>,
+        hlc_tracker: Arc<TokioMutex<std::collections::BTreeMap<String, Hlc>>>,
+        device_id: String,
+        self_owner: OwnerAddr,
+        self_display: Option<String>,
+        self_enrollment: EnrollmentCert,
+        device2_signing_key: Arc<ed25519_dalek::SigningKey>,
+        app: Option<Arc<H>>,
+        pkarr_invite_publisher: Option<Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>>,
+        config: FriendAcceptorConfig,
+    ) -> Self {
+        Self {
+            crdt_state,
+            hlc_tracker,
+            device_id,
+            self_owner,
+            self_display,
+            self_enrollment,
+            device2_signing_key,
+            app,
+            pkarr_invite_publisher,
+            config,
+        }
+    }
+
+    /// Bump-and-return a fresh HLC stamped with this device's id. Mirrors
+    /// `profile_broadcast::OwnerStateBroadcastSource::next_hlc`.
+    async fn next_hlc(&self) -> Hlc {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut tracker = self.hlc_tracker.lock().await;
+        let entry = tracker.entry(self.device_id.clone()).or_insert(Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: self.device_id.clone(),
+        });
+        if now_ms > entry.wall_ms {
+            entry.wall_ms = now_ms;
+            entry.logical = 0;
+        } else {
+            entry.logical = entry.logical.saturating_add(1);
+        }
+        entry.clone()
+    }
+
+    /// Inbound bi-stream handler: read the length-prefixed `FriendLinkRequest`,
+    /// run the pure core under the CRDT lock, side-effect (unregister token,
+    /// emit event), and write the length-prefixed `FriendLinkAccepted`.
+    async fn handle_friend_handshake_inbound(
+        &self,
+        conn: &Connection,
+    ) -> Result<(), FriendAcceptError> {
+        let (mut send, mut recv) = tokio::time::timeout(self.config.io_deadline, conn.accept_bi())
+            .await
+            .map_err(|_| FriendAcceptError::IoTimeout { step: "accept_bi" })?
+            .map_err(|e| FriendAcceptError::AcceptBi(e.to_string()))?;
+
+        // Read [u32 LE length-prefix][body].
+        let mut len_buf = [0u8; 4];
+        tokio::time::timeout(self.config.io_deadline, recv.read_exact(&mut len_buf))
+            .await
+            .map_err(|_| FriendAcceptError::IoTimeout {
+                step: "read length-prefix",
+            })?
+            .map_err(|e| FriendAcceptError::ReadPrefix(e.to_string()))?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > FRIEND_MAX_PACKET_LEN {
+            return Err(FriendAcceptError::PrefixOutOfBounds {
+                len,
+                max: FRIEND_MAX_PACKET_LEN,
+            });
+        }
+        let mut body = vec![0u8; len];
+        tokio::time::timeout(self.config.io_deadline, recv.read_exact(&mut body))
+            .await
+            .map_err(|_| FriendAcceptError::IoTimeout { step: "read body" })?
+            .map_err(|e| FriendAcceptError::ReadBody(e.to_string()))?;
+
+        let req = decode_friend_request(&body).map_err(FriendAcceptError::Handshake)?;
+
+        // Run the pure core under the CRDT lock with a fresh HLC.
+        let learned_at = self.next_hlc().await;
+        let accepted = {
+            let mut state = self.crdt_state.lock().await;
+            process_friend_request(
+                &mut state,
+                learned_at,
+                &req,
+                self.self_owner,
+                self.self_display.clone(),
+                &self.self_enrollment,
+                &self.device2_signing_key,
+            )
+            .map_err(FriendAcceptError::Handshake)?
+        };
+
+        // Success side-effects: free the consumed Case-A one-shot, signal UI.
+        if let Some(pub_) = self.pkarr_invite_publisher.as_ref() {
+            pub_.unregister_friend_token(&req.token_sig).await;
+        }
+        match self.app.as_ref() {
+            Some(app) => app.emit_friend_list_changed(),
+            None => tracing::debug!(
+                from_addr = %hex::encode(req.from_addr.0),
+                "friend added (no app handle); not emitting friend-list-changed"
+            ),
+        }
+
+        // Write [u32 LE length-prefix][accepted CBOR].
+        let resp = encode_friend_accepted(&accepted).map_err(FriendAcceptError::Handshake)?;
+        if resp.len() > FRIEND_MAX_PACKET_LEN {
+            return Err(FriendAcceptError::ResponseTooLarge {
+                len: resp.len(),
+                max: FRIEND_MAX_PACKET_LEN,
+            });
+        }
+        let resp_len = resp.len() as u32;
+        tokio::time::timeout(
+            self.config.io_deadline,
+            send.write_all(&resp_len.to_le_bytes()),
+        )
+        .await
+        .map_err(|_| FriendAcceptError::IoTimeout {
+            step: "write length-prefix",
+        })?
+        .map_err(|e| FriendAcceptError::WritePrefix(e.to_string()))?;
+        tokio::time::timeout(self.config.io_deadline, send.write_all(&resp))
+            .await
+            .map_err(|_| FriendAcceptError::IoTimeout { step: "write body" })?
+            .map_err(|e| FriendAcceptError::WriteBody(e.to_string()))?;
+        // `send.finish()` is sync — no timeout needed.
+        send.finish()
+            .map_err(|e| FriendAcceptError::Finish(e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<H> crate::iroh_invite_acceptor::IrohHandshakeDispatcher for IrohFriendHandshakeAcceptor<H>
+where
+    H: FriendEventEmit,
+{
+    async fn handle_connection(&self, conn: Connection) {
+        match self.handle_friend_handshake_inbound(&conn).await {
+            Ok(()) => tracing::info!(
+                remote_id = ?conn.remote_id(),
+                "ZEB-370: friend handshake completed (accept delivered)"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                remote_id = ?conn.remote_id(),
+                "ZEB-370: friend handshake failed"
+            ),
+        }
+        // Wait for the dialer to drive the close so the response bytes flush
+        // before `conn` drops (same race-avoidance as iroh_invite_acceptor).
+        let _ = tokio::time::timeout(self.config.io_deadline, conn.closed()).await;
+    }
+}
+
+/// Errors that can short-circuit the inbound friend handshake. The crypto/codec
+/// failures are wrapped from [`FriendHandshakeError`]; the rest are IO framing.
+#[derive(Debug, thiserror::Error)]
+pub enum FriendAcceptError {
+    #[error("accept_bi failed: {0}")]
+    AcceptBi(String),
+    #[error("read length-prefix: {0}")]
+    ReadPrefix(String),
+    #[error("length-prefix out of bounds: len={len} max={max}")]
+    PrefixOutOfBounds { len: usize, max: usize },
+    #[error("read body: {0}")]
+    ReadBody(String),
+    #[error("handshake: {0}")]
+    Handshake(#[source] FriendHandshakeError),
+    #[error("response too large: len={len} max={max}")]
+    ResponseTooLarge { len: usize, max: usize },
+    #[error("write length-prefix: {0}")]
+    WritePrefix(String),
+    #[error("write body: {0}")]
+    WriteBody(String),
+    #[error("send.finish: {0}")]
+    Finish(String),
+    #[error("IO timeout in {step}")]
+    IoTimeout { step: &'static str },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +751,124 @@ mod tests {
         assert_eq!(
             crate::friend_graph::owner_id_from_master_ed25519(&master),
             owner.owner
+        );
+    }
+
+    fn test_hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "self".into(),
+        }
+    }
+
+    #[test]
+    fn process_friend_request_adds_active_token_friend_and_returns_verifiable_accept() {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        let me = mint_test_owner(0x60); // the acceptor (self)
+        let token_sig = [0x5a; 64];
+        let (req, _requester_device) = signed_request(0x61, token_sig);
+
+        let mut state = OwnerState::default();
+        let accepted = process_friend_request(
+            &mut state,
+            test_hlc(1_000),
+            &req,
+            me.owner,
+            Some("me".into()),
+            &me.cert,
+            &me.device_key,
+        )
+        .expect("valid request processed");
+
+        // The requester is now an Active/Token friend keyed on req.from_addr,
+        // anchored to the requester's master key.
+        let entry = state
+            .friend_graph
+            .friends
+            .get(&req.from_addr)
+            .expect("friend inserted");
+        assert_eq!(entry.status, FriendStatus::Active);
+        assert_eq!(entry.established_via, FriendOrigin::Token);
+        assert!(!entry.referrable);
+        assert_eq!(entry.display.as_deref(), Some("alice"));
+        assert_eq!(
+            crate::friend_graph::owner_id_from_master_ed25519(&entry.master_ed25519),
+            req.from_addr
+        );
+
+        // The returned accept is from self and signed by self's device-#2 key
+        // over the accept preimage (same token_sig, accept domain tag).
+        assert_eq!(accepted.from_addr, me.owner);
+        assert_eq!(accepted.display.as_deref(), Some("me"));
+        let self_device_key = verify_enrolled_device(&accepted.enrollment, accepted.from_addr)
+            .expect("self cert verifies");
+        let vk = VerifyingKey::from_bytes(&self_device_key).expect("vk");
+        let accept_preimage = friend_accept_sig_preimage(accepted.from_addr, &token_sig);
+        vk.verify_strict(&accept_preimage, &Signature::from_bytes(&accepted.sig))
+            .expect("accept sig verifies against self enrolled device key");
+    }
+
+    #[test]
+    fn process_friend_request_rejects_bad_signature_and_writes_nothing() {
+        let me = mint_test_owner(0x62);
+        let (mut req, _) = signed_request(0x63, [0x11; 64]);
+        // Corrupt the request signature.
+        req.sig[0] ^= 0xFF;
+
+        let mut state = OwnerState::default();
+        let err = process_friend_request(
+            &mut state,
+            test_hlc(1),
+            &req,
+            me.owner,
+            None,
+            &me.cert,
+            &me.device_key,
+        )
+        .expect_err("bad sig rejected");
+        assert!(matches!(err, FriendHandshakeError::SignatureInvalid));
+        assert!(
+            state.friend_graph.friends.is_empty(),
+            "a rejected request must not write a friend entry"
+        );
+    }
+
+    #[test]
+    fn process_friend_request_rejects_wrong_owner_cert_and_writes_nothing() {
+        let me = mint_test_owner(0x64);
+        // Build a request whose from_addr does NOT match its embedded cert's
+        // owner_id (cert/owner mismatch) — verify_enrolled_device must reject.
+        let requester = mint_test_owner(0x65);
+        let imposter = mint_test_owner(0x66);
+        let token_sig = [0x22; 64];
+        // Sign with the imposter's owner addr in the preimage so the request is
+        // internally consistent except for the cert↔from_addr binding.
+        let preimage = friend_request_sig_preimage(imposter.owner, &token_sig);
+        let sig = imposter.device_key.sign(&preimage).to_bytes();
+        let req = FriendLinkRequest {
+            from_addr: imposter.owner, // claims to be imposter…
+            display: None,
+            token_sig,
+            enrollment: requester.cert, // …but presents requester's cert
+            sig,
+        };
+
+        let mut state = OwnerState::default();
+        let err = process_friend_request(
+            &mut state,
+            test_hlc(1),
+            &req,
+            me.owner,
+            None,
+            &me.cert,
+            &me.device_key,
+        )
+        .expect_err("owner-mismatched cert rejected");
+        assert!(matches!(err, FriendHandshakeError::EnrollmentOwnerMismatch));
+        assert!(
+            state.friend_graph.friends.is_empty(),
+            "a rejected request must not write a friend entry"
         );
     }
 }

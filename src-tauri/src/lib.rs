@@ -120,6 +120,17 @@ impl<R: tauri::Runtime> crate::community_invite::AppHandleEmit for tauri::AppHan
     }
 }
 
+/// ZEB-370: production impl of `iroh_friend_acceptor::FriendEventEmit` on
+/// `tauri::AppHandle<R>`. Lets the friend handshake acceptor signal the UI a
+/// friend was added without depending on `tauri` directly (the trait + unit-
+/// type stub live in `iroh_friend_acceptor.rs` so tests compile without a
+/// Tauri runtime).
+impl<R: tauri::Runtime> crate::iroh_friend_acceptor::FriendEventEmit for tauri::AppHandle<R> {
+    fn emit_friend_list_changed(&self) {
+        let _ = self.emit("friend-list-changed", ());
+    }
+}
+
 // ── Chunked ingest (ZEB-154 + ZEB-161 nested-bundle streaming) ───────────
 
 /// Errors raised by the internal path-based ingest helpers
