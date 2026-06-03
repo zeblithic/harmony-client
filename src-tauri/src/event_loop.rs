@@ -2090,10 +2090,11 @@ pub async fn run<R: Runtime>(
 
     // ── ZEB-360: group-DM voice presence bookkeeping ───────────────────────
     // Group presence is space-scoped (topic harmony/voice-presence/group-dm/
-    // {spaceIdHex}, sealed under derive_groupdm_presence_key). The ROSTER reuses
-    // the shared `voice_presence_map` keyed by (SpaceId(space_id),
-    // ChannelId(call_id)); that key space can't collide with community voice
-    // (community/channel) entries, so one shared map is correct.
+    // {spaceIdHex}, sealed under derive_groupdm_presence_key). The ROSTER lives
+    // in its OWN `groupdm_presence_map` (declared below), keyed by
+    // (SpaceId(space_id), ChannelId(call_id)); a dedicated map (rather than the
+    // shared community `voice_presence_map`) lets the eviction sweep TTL-evict
+    // crashed group participants without disturbing community sweep semantics.
     //
     // One read-subscriber per watched space (WatchGroupCall; banner + in-call
     // roster both consume it). Keyed by raw 16-byte space_id.
@@ -2127,6 +2128,14 @@ pub async fn run<R: Runtime>(
             crate::owner_state_types::Hlc,                            // joined_hlc
         ),
     > = std::collections::HashMap::new();
+    // ZEB-360 crash-eviction parity: group presence gets its OWN roster map (not
+    // the shared community `voice_presence_map`). The eviction sweep below sweeps
+    // BOTH maps with the same TTL, so a crashed group-call participant who never
+    // published a `left` tombstone TTL-evicts as a ghost row, exactly like
+    // community voice. Keyed by (SpaceId(space_id), ChannelId(call_id)).
+    let groupdm_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::voice_presence::VoicePresenceMap::new(),
+    ));
 
     // Monotonic clock for apply/sweep (ms since the loop's `start` Instant,
     // matching the `now` math the UDP/timer arms already use).
@@ -3863,8 +3872,8 @@ pub async fn run<R: Runtime>(
                     // ── ZEB-360: group-DM voice presence ──────────────────────
                     // Space-scoped presence on topic
                     // harmony/voice-presence/group-dm/{spaceIdHex}, sealed under the
-                    // group-DM presence key. The ROSTER reuses the shared
-                    // `voice_presence_map` keyed by (SpaceId(space_id),
+                    // group-DM presence key. The ROSTER lives in the dedicated
+                    // `groupdm_presence_map` keyed by (SpaceId(space_id),
                     // ChannelId(call_id)); media reuses the 1:1 DM path verbatim
                     // (JoinDmCall), so nothing media-related lives here.
                     crate::voice::VoiceChannelRequest::WatchGroupCall {
@@ -3889,7 +3898,7 @@ pub async fn run<R: Runtime>(
                                         presence_key,
                                         crate::owner_state_types::SpaceId(space_id),
                                         std::sync::Arc::clone(crdt),
-                                        std::sync::Arc::clone(&voice_presence_map),
+                                        std::sync::Arc::clone(&groupdm_presence_map),
                                         app.clone(),
                                         closing.clone(),
                                         std::sync::Arc::clone(&voice_now_ms),
@@ -3924,7 +3933,7 @@ pub async fn run<R: Runtime>(
                                 .map(|(_sp, c)| *c)
                                 .collect();
                             if !calls.is_empty() {
-                                let mut g = voice_presence_map.lock().await;
+                                let mut g = groupdm_presence_map.lock().await;
                                 for call in calls {
                                     g.remove_channel(
                                         &crate::owner_state_types::SpaceId(space_id),
@@ -3957,7 +3966,7 @@ pub async fn run<R: Runtime>(
                                         std::sync::Arc::clone(&presence_key),
                                         crate::owner_state_types::SpaceId(space_id),
                                         std::sync::Arc::clone(crdt),
-                                        std::sync::Arc::clone(&voice_presence_map),
+                                        std::sync::Arc::clone(&groupdm_presence_map),
                                         app.clone(),
                                         closing.clone(),
                                         std::sync::Arc::clone(&voice_now_ms),
@@ -4084,7 +4093,10 @@ pub async fn run<R: Runtime>(
             // silent for >12 s, then re-emits the roster for each affected
             // (community, channel) exactly once. Gated on active voice channels
             // so a node with none joined never wakes here (Cursor review).
-            _ = voice_sweep_tick.tick(), if !voice_keys.is_empty() => {
+            // ZEB-360: also fires while any group-DM presence subscriber is live,
+            // so a crashed group-call participant's ghost row TTL-evicts too.
+            _ = voice_sweep_tick.tick(),
+                if !voice_keys.is_empty() || !groupdm_presence_subs.is_empty() => {
                 let now = (voice_now_ms)();
                 let evicted = {
                     let mut g = voice_presence_map.lock().await;
@@ -4109,6 +4121,39 @@ pub async fn run<R: Runtime>(
                             serde_json::json!({
                                 "community": hex::encode(c.0),
                                 "channel": hex::encode(ch.0),
+                                "roster": roster,
+                            }),
+                        );
+                    }
+                }
+                // ── ZEB-360: group-DM presence crash-eviction ─────────────
+                // Sweep the dedicated group map with the SAME `now` + TTL, then
+                // re-emit each affected (space, call) roster as a group event so
+                // a crashed participant (no `left` tombstone) drops to ghost like
+                // community voice. Graceful leaves already publish a tombstone.
+                let swept_group = {
+                    let mut g = groupdm_presence_map.lock().await;
+                    g.sweep(now, VOICE_PRESENCE_TTL_MS)
+                };
+                if !swept_group.is_empty() {
+                    // Dedup the (space, call) keys; emit each once.
+                    let mut seen: std::collections::HashSet<(
+                        crate::owner_state_types::SpaceId,
+                        crate::community_membership::ChannelId,
+                    )> = std::collections::HashSet::new();
+                    for ((sp, call), _owner, _device) in &swept_group {
+                        seen.insert((*sp, *call));
+                    }
+                    for (sp, call) in seen {
+                        let roster = {
+                            let g = groupdm_presence_map.lock().await;
+                            g.roster(&sp, &call)
+                        };
+                        let _ = app.emit(
+                            "group-call-presence-changed",
+                            serde_json::json!({
+                                "spaceId": hex::encode(sp.0),
+                                "callId": hex::encode(call.0),
                                 "roster": roster,
                             }),
                         );
