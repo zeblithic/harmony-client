@@ -131,6 +131,43 @@ pub fn decode_friend_token_url(url: &str) -> Result<FriendTokenPayload, FriendTo
         .map_err(|e| FriendTokenError::Cbor(e.to_string()))
 }
 
+/// Mint a friend token: sign an `InviteToken` with the enrolled device-#2 key
+/// (reusing `invite_mint::mint_invite_token` verbatim, `invitee_hint = None` so
+/// the link is an untargeted "controlled open" peer link per spec §5.3), then
+/// assemble the `FriendTokenPayload`. The returned payload is ready for
+/// [`encode_friend_token_url`] and for Case-A pkarr publication (the inviter's
+/// reachability is keyed off `token.sig`).
+///
+/// Returns `Err` only if the underlying `InviteToken` signing fails (string
+/// error, surfaced verbatim from `mint_invite_token`).
+#[allow(clippy::too_many_arguments)]
+pub fn mint_friend_token(
+    inviter_addr: OwnerAddr,
+    inviter_owner_pub: [u8; 64],
+    display_hint: Option<String>,
+    minted_at: crate::owner_state_types::Hlc,
+    expires_at: Option<u64>,
+    inviter_enrollment: Option<EnrollmentCert>,
+    device2_signing_key: &ed25519_dalek::SigningKey,
+) -> Result<FriendTokenPayload, String> {
+    // invitee_hint = None: untargeted, "controlled open" friend link. The token
+    // sig is bound to (inviter, minted_at, expires_at?) by mint_invite_token.
+    let token = crate::invite_mint::mint_invite_token(
+        inviter_addr,
+        None,
+        minted_at,
+        expires_at,
+        device2_signing_key,
+    )?;
+    Ok(FriendTokenPayload {
+        inviter_addr,
+        inviter_owner_pub,
+        display_hint,
+        token,
+        inviter_enrollment,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +214,28 @@ mod tests {
             "A".repeat(MAX_FRIEND_BODY_B64_CHARS + 1)
         );
         assert!(decode_friend_token_url(&url).is_err());
+    }
+
+    #[test]
+    fn minted_friend_token_verifies_and_encodes() {
+        use crate::community_invite::verify_invite_token_sig_device_key;
+        let device2 = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let p = mint_friend_token(
+            OwnerAddr([1u8; 16]), // inviter_addr
+            [2u8; 64],            // inviter_owner_pub
+            Some("bob".into()),   // display_hint
+            Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            }, // minted_at
+            Some(200),            // expires_at
+            None,                 // inviter_enrollment (Some in prod)
+            &device2,
+        )
+        .expect("mint");
+        verify_invite_token_sig_device_key(&p.token, &device2.verifying_key().to_bytes())
+            .expect("sig ok");
+        assert!(encode_friend_token_url(&p).is_ok());
     }
 }
