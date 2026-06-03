@@ -12441,11 +12441,13 @@ async fn get_group_dm_members(
         .try_into()
         .map_err(|_| "space_id must be 16 bytes".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(space_arr);
-    let crdt_state = {
+    let (crdt_state, self_owner) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+        let crdt = g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let owner = g.dm_self_owner.ok_or("dm_self_owner missing")?;
+        (crdt, owner)
     };
     let os = crdt_state.lock().await;
     let space = os
@@ -12454,6 +12456,12 @@ async fn get_group_dm_members(
         .ok_or_else(|| "group dm space not found".to_string())?;
     if space.kind != crate::owner_state_types::SpaceKind::GroupDm {
         return Err("not a group-dm space".to_string());
+    }
+    // ZEB-360 (Cursor R3): parity with `resolve_group_call_members` — only a
+    // current member may read the roster. Without this gate a removed identity
+    // could still read the membership of a group DM lingering in its local CRDT.
+    if !space.members.contains(&self_owner) {
+        return Err("self is not a member of this group dm".to_string());
     }
     Ok(space.members.iter().map(|m| hex::encode(m.0)).collect())
 }
