@@ -1,6 +1,7 @@
 // src/lib/incoming-call-alert.test.ts
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createIncomingCallAlerter, type AlerterDeps } from './incoming-call-alert';
+import { createDefaultIncomingCallAlerter } from './incoming-call-alert';
 
 function makeDeps() {
   let focusCb: ((f: boolean) => void) | undefined;
@@ -79,5 +80,15 @@ describe('IncomingCallAlerter', () => {
     d._fireActivation();
     await Promise.resolve();
     expect(d.raiseWindow).toHaveBeenCalled();
+  });
+});
+
+describe('createDefaultIncomingCallAlerter (non-Tauri)', () => {
+  it('returns a no-op alerter outside Tauri — methods never throw', async () => {
+    // jsdom has window but no Tauri internals → isTauri() === false.
+    const a = await createDefaultIncomingCallAlerter();
+    await expect(a.notify({ id: 'c1', title: 't', body: 'b' })).resolves.toBeUndefined();
+    await expect(a.clear('c1')).resolves.toBeUndefined();
+    expect(() => a.dispose()).not.toThrow();
   });
 });

@@ -95,3 +95,51 @@ class Alerter implements IncomingCallAlerter {
 export function createIncomingCallAlerter(deps: AlerterDeps): IncomingCallAlerter {
   return new Alerter(deps);
 }
+
+import { isTauri } from '@tauri-apps/api/core';
+
+function noopAlerter(): IncomingCallAlerter {
+  return { notify: async () => {}, clear: async () => {}, dispose: () => {} };
+}
+
+/**
+ * Build the alerter wired to the real Tauri plugin/window APIs. Outside Tauri
+ * (web preview / unit tests) returns a no-op so callers need no guard. Dynamic
+ * imports match App.svelte's pattern (no static @tauri-apps plugin import that
+ * would break the web bundle).
+ */
+export async function createDefaultIncomingCallAlerter(): Promise<IncomingCallAlerter> {
+  if (!isTauri()) return noopAlerter();
+  try {
+    const notif = await import('@tauri-apps/plugin-notification');
+    const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+    const { UserAttentionType } = await import('@tauri-apps/api/window');
+    const appWin = getCurrentWebviewWindow();
+    const deps: AlerterDeps = {
+      isPermissionGranted: () => notif.isPermissionGranted(),
+      requestPermission: () => notif.requestPermission(),
+      sendNotification: (o) => notif.sendNotification(o),
+      isFocused: () => appWin.isFocused(),
+      onFocusChanged: async (cb) => {
+        const un = await appWin.onFocusChanged(({ payload }) => cb(payload));
+        return un;
+      },
+      requestUserAttention: (critical) =>
+        appWin.requestUserAttention(critical ? UserAttentionType.Critical : null),
+      raiseWindow: async () => {
+        await appWin.unminimize().catch(() => {});
+        await appWin.show().catch(() => {});
+        await appWin.setFocus().catch(() => {});
+      },
+      // onAction exists in @tauri-apps/plugin-notification@^2.3.x: wired here.
+      // Activation (notification click) → raise. Best-effort: graceful degradation
+      // per spec D2 (tray click also raises the window).
+      registerActivation: notif.onAction
+        ? async (cb) => { await notif.onAction(() => cb()); }
+        : undefined,
+    };
+    return createIncomingCallAlerter(deps);
+  } catch {
+    return noopAlerter();
+  }
+}
