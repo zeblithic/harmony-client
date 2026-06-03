@@ -1691,9 +1691,21 @@
       // so we don't linger in peers' rosters or hold the mic, then invoke
       // quit_app to terminate the tray-resident process.
       const unlistenQuit = await listen('quit-requested', async () => {
+        // ZEB-360 (Cursor R2): also leave an active GROUP call on quit, or we
+        // linger in peers' rosters (no presence tombstone + no `leave_group_call`)
+        // and hold the mic until the presence TTL expires. 'incoming' has no media
+        // engine yet, so there's nothing to tear down for a ring-only state.
+        let groupLeave: Promise<void> = Promise.resolve();
+        if (groupCall) {
+          const gp = get(groupCall.state).phase;
+          if (gp !== 'idle' && gp !== 'incoming') {
+            groupLeave = groupCall.leave().catch(() => {});
+          }
+        }
         const teardown = Promise.allSettled([
           voiceSession?.leave() ?? Promise.resolve(),
           callSession?.end() ?? Promise.resolve(),
+          groupLeave,
         ]);
         const timedOut = Symbol('timeout');
         const raced = await Promise.race([

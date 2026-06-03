@@ -12138,6 +12138,38 @@ async fn resolve_group_call_members(
     Ok((members, dm_key, signing_key, self_owner))
 }
 
+/// ZEB-360 (Greptile R2): resolve a SINGLE owner's deduped X25519 device pubs
+/// from the CRDT owner-device cache. Mirrors the per-member resolution inside
+/// `resolve_group_call_members` (take `ip[..32]` of each non-`None`
+/// `device_identity_pub`, sort+dedup). Returns an empty vec if the owner has no
+/// cached device keys yet (keys not propagated). Read-only.
+async fn resolve_owner_x25519_pubs(
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    owner: &crate::owner_state_types::OwnerAddr,
+) -> Vec<[u8; 32]> {
+    let os = crdt_state.lock().await;
+    let mut pubs: Vec<[u8; 32]> = os
+        .owner_device_cache
+        .devices
+        .get(owner)
+        .map(|entry| {
+            entry
+                .device_identity_pubs
+                .iter()
+                .filter_map(|p| *p)
+                .map(|identity_pub| {
+                    let mut x = [0u8; 32];
+                    x.copy_from_slice(&identity_pub[..32]);
+                    x
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    pubs.sort_unstable();
+    pubs.dedup();
+    pubs
+}
+
 /// ZEB-360: build, sign, seal, and fan a group `VoiceSignal` to a set of member
 /// owners (one sealed envelope per enrolled device each). `space_id` is always
 /// set so the inbound handler takes the group path.
@@ -12335,10 +12367,50 @@ async fn decline_group_call(
         .try_into()
         .map_err(|_| "caller_owner must be 16 bytes".to_string())?;
     let caller = crate::owner_state_types::OwnerAddr(caller_arr);
+    // `resolve_group_call_members` validates this is a GroupDm we're in and gives
+    // us the signing key + self owner. Its member list is FILTERED to owners whose
+    // X25519 keys are already cached, so the caller may be absent from it even
+    // though they are a space member whose keys simply haven't propagated yet.
     let (members, _dm_key, signing_key, self_owner) =
         resolve_group_call_members(&state, &space_id).await?;
-    let Some(target) = members.into_iter().find(|(o, _)| *o == caller) else {
-        return Err("caller not a member of this group dm".to_string());
+    let target = if let Some(t) = members.into_iter().find(|(o, _)| *o == caller) {
+        Some(t)
+    } else {
+        // ZEB-360 (Greptile R2): the caller wasn't in the (key-cached) member set.
+        // Try a DIRECT CRDT lookup of their X25519 pubs so a not-yet-propagated
+        // key doesn't swallow the Decline (which would leave them ringing forever).
+        let space_arr = parse_space_id_16(&space_id)?;
+        let space_id_typed = crate::owner_state_types::SpaceId(space_arr);
+        let crdt_state = {
+            let g = state
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+        };
+        let is_member = {
+            let os = crdt_state.lock().await;
+            os.spaces
+                .get(&space_id_typed)
+                .is_some_and(|space| space.members.contains(&caller))
+        };
+        if is_member {
+            let pubs = resolve_owner_x25519_pubs(&crdt_state, &caller).await;
+            if pubs.is_empty() {
+                None
+            } else {
+                Some((caller, pubs))
+            }
+        } else {
+            return Err("caller not a member of this group dm".to_string());
+        }
+    };
+    let Some(target) = target else {
+        // Keys genuinely unresolvable (not yet propagated) — best-effort no-op
+        // rather than an error, so the UI Decline doesn't surface a failure.
+        tracing::debug!(
+            "decline_group_call: caller keys not cached, decline not delivered (best-effort)"
+        );
+        return Ok(());
     };
     send_group_voice_signal(
         &state,

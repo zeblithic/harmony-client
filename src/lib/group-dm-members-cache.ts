@@ -9,13 +9,14 @@
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
 
 const cache = new Map<string, string[]>();
+// In-flight fetches keyed by spaceId. Each carries a monotonic `gen` token: a
+// fetch only writes its result (and only clears its own slot) while it is STILL
+// the current in-flight entry for the space. `invalidateGroupMembers` deletes
+// the inflight entry, so any still-running fetch finds its gen no longer current
+// and discards its write — closing the clear-all gap where a space with an
+// in-flight fetch but no prior generation entry could still write stale data.
 const inflight = new Map<string, { gen: number; promise: Promise<void> }>();
-// Per-space generation token. An in-flight fetch captures the current
-// generation at start and only writes its result back if the generation is
-// still current — so an `invalidateGroupMembers` that fires DURING a fetch
-// (membership change / identity switch) can't be overwritten by the now-stale
-// result that resolves after it.
-const generations = new Map<string, number>();
+let counter = 0;
 
 /** Synchronous read — returns [] until the cache is warmed. */
 export function getCachedGroupMembers(spaceId: string): string[] {
@@ -27,46 +28,42 @@ export function getCachedGroupMembers(spaceId: string): string[] {
 export async function ensureGroupMembers(invoke: Invoke, spaceId: string): Promise<void> {
   if (cache.has(spaceId)) return;
   const existing = inflight.get(spaceId);
-  // Only reuse an in-flight fetch if it was started in the CURRENT generation;
-  // a fetch from before an invalidation is stale and must not be awaited as if
-  // it reflected the post-invalidation membership.
-  const currentGen = generations.get(spaceId) ?? 0;
-  if (existing && existing.gen === currentGen) return existing.promise;
-  const gen = currentGen;
+  if (existing) return existing.promise;
+  const gen = ++counter;
   const promise = (async () => {
     try {
       const members = (await invoke('get_group_dm_members', { spaceId })) as string[];
-      // Drop the result if an invalidation bumped the generation while we were
-      // in flight — writing it back would resurrect stale membership.
-      if ((generations.get(spaceId) ?? 0) === gen) cache.set(spaceId, members);
+      // Only write back if WE are still the current in-flight fetch. An
+      // `invalidateGroupMembers` (membership change / identity switch) that
+      // fired while we were in flight deletes our slot, so this guard discards
+      // the now-stale result instead of resurrecting old membership.
+      if (inflight.get(spaceId)?.gen === gen) cache.set(spaceId, members);
     } catch (e) {
       // Leave uncached on failure; a later event retries. Roster degrades to
       // live beacons only (no ringing rows) until it succeeds.
       const msg = e instanceof Error ? e.message : String(e);
       console.warn('[group-dm-members] warm failed:', msg);
     } finally {
-      // Only clear OUR inflight slot — a newer-generation fetch may have already
-      // replaced it.
-      const slot = inflight.get(spaceId);
-      if (slot && slot.gen === gen) inflight.delete(spaceId);
+      // Only clear OUR inflight slot — a newer fetch may have already replaced
+      // it (and invalidate may have already removed it).
+      if (inflight.get(spaceId)?.gen === gen) inflight.delete(spaceId);
     }
   })();
   inflight.set(spaceId, { gen, promise });
   return promise;
 }
 
-/** Clear a cached entry (e.g. on membership change / identity switch). Bumps the
- *  per-space generation so any in-flight fetch's result is discarded instead of
- *  writing stale data back, and drops the in-flight slot so the next
- *  `ensureGroupMembers` starts a fresh fetch. */
+/** Clear a cached entry (e.g. on membership change / identity switch). Drops the
+ *  in-flight slot so any running fetch finds its gen no longer current and
+ *  discards its write, and so the next `ensureGroupMembers` starts a fresh
+ *  fetch. Clear-all (no arg) does the same for every space — including spaces
+ *  with an in-flight fetch but no cached entry yet. */
 export function invalidateGroupMembers(spaceId?: string): void {
   if (spaceId) {
     cache.delete(spaceId);
-    generations.set(spaceId, (generations.get(spaceId) ?? 0) + 1);
     inflight.delete(spaceId);
   } else {
     cache.clear();
-    for (const k of generations.keys()) generations.set(k, (generations.get(k) ?? 0) + 1);
     inflight.clear();
   }
 }
