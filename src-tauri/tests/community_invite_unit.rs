@@ -67,6 +67,7 @@ fn community_invite_payload_round_trips_open_form() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
 
     let bytes = canonical_cbor_encode(&p).expect("encode");
@@ -113,6 +114,7 @@ fn community_invite_payload_round_trips_invite_only_form() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
 
     let bytes = canonical_cbor_encode(&p).expect("encode");
@@ -183,6 +185,7 @@ fn invite_url_round_trips_open_payload() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
 
     let url = encode_invite_url(&payload).expect("encode");
@@ -258,6 +261,7 @@ fn decode_trims_whitespace() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
     let url = encode_invite_url(&payload).expect("encode");
     let padded = format!("  \n{url}\t  ");
@@ -321,6 +325,7 @@ fn encode_rejects_open_community_with_admin_identity_pub_set() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
     assert!(matches!(
         encode_invite_url(&payload).unwrap_err(),
@@ -374,6 +379,7 @@ fn encode_rejects_open_community_with_admin_bootstrap_set() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
     assert!(matches!(
         encode_invite_url(&payload).unwrap_err(),
@@ -1254,6 +1260,7 @@ mod admin_bootstrap_helpers {
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         }
     }
 }
@@ -1426,6 +1433,7 @@ mod verify_admin_bootstrap_tests {
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
         assert_eq!(
             verify_admin_bootstrap(&p).unwrap_err(),

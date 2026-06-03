@@ -207,6 +207,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
     for (target_addr, target_signing, target_cert) in [
         (bob_addr, &bob_signing, &bob.cert),

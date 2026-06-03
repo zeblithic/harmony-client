@@ -411,6 +411,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     })
     .expect("encode URL");
 
@@ -434,6 +435,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
                 &alice_dm_for_fwd,
                 &crdt_a_for_fwd,
                 req.packet,
+                None,
+                // ZEB-367: no case-A pkarr publisher in this test harness.
                 None,
             )
             .await;
@@ -677,6 +680,7 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
         // assert on the tampered admin_bootstrap.sig rejection), so any valid
         // cert satisfies the presence check.
         inviter_enrollment: Some(harmony_app::community_membership::mint_test_owner(0xAA).cert),
+        untargeted_decrypt_key: None,
     })
     .expect("encode URL");
 

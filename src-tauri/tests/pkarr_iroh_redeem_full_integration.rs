@@ -201,7 +201,517 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// The test.
+// Shared two-party setup.
+//
+// ZEB-367: the targeted (`bob_joins_alice_via_iroh_handshake_option_a`) and
+// untargeted (`invite_only_untargeted_generate_then_redeem_roundtrip`) tests
+// share the entire two-party harness — identities, iroh endpoints + link
+// managers, Alice's community engine + acceptor, Bob's redeem deps, and the
+// mock pkarr relay — and differ ONLY in how the invite is sealed/minted and in
+// a handful of post-redeem assertions. The block below was byte-identical
+// between both before this extraction; pulling it into a single helper keeps
+// the two tests in lock-step (a regression in the shared setup fails both).
+//
+// The helper builds Alice's acceptor with `Some(invite_pub)` (the case-A
+// `PkarrInvitePublisher`, shared via `Arc`), so the ZEB-367 unregister-on-
+// consume wiring (`handle_unicast` → `unregister_invite` on `Inserted`) is
+// live for BOTH tests. Each test calls `invite_pub.register_invite(&payload)`
+// with its own payload after constructing the invite.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Everything the two roundtrip tests need after the shared two-party setup.
+/// Fields prefixed `_` are keep-alive handles (spawned tasks, accept loops,
+/// tempdirs, the mock relay server) that must outlive the redeem call.
+struct TwoPartySetup {
+    // ── Identities / community ──────────────────────────────────────────
+    alice_comm: harmony_app::community_membership::TestOwner,
+    bob_comm: harmony_app::community_membership::TestOwner,
+    alice_comm_sk: Arc<SigningKey>,
+    bob_comm_sk: Arc<SigningKey>,
+    alice_addr: OwnerAddr,
+    bob_addr: OwnerAddr,
+    alice_pub: [u8; 64],
+    alice_minted: harmony_app::MintedCommunity,
+    community_id: harmony_app::owner_state_types::SpaceId,
+
+    // ── Endpoints (for teardown) ────────────────────────────────────────
+    alice_ep: Arc<IrohEndpoint>,
+    bob_ep: Arc<IrohEndpoint>,
+
+    // ── Registries (for post-redeem assertions) ─────────────────────────
+    registry_alice: Arc<CommunitySyncRegistry>,
+    registry_bob: Arc<CommunitySyncRegistry>,
+
+    // ── Bob redeem deps ─────────────────────────────────────────────────
+    bob_reachability: ReachabilityResolver,
+    bob_crdt_state: Arc<TokioMutex<OwnerState>>,
+    bob_hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>>,
+    bob_dm_outbox: Arc<TokioMutex<DmOutbox>>,
+    bob_channel_log_registry: Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+    bob_adapter_tx: mpsc::Sender<CommunityAdapterRequest>,
+    bob_unicast_tx: mpsc::Sender<UnicastSendRequest>,
+    bob_unicast_count: Arc<AtomicUsize>,
+
+    // ── pkarr ───────────────────────────────────────────────────────────
+    invite_pub: Arc<harmony_app::pkarr_invite_publisher::PkarrInvitePublisher>,
+    pkarr_resolver: Arc<harmony_pkarr::PkarrResolver>,
+    pkarr_publisher: Arc<harmony_pkarr::PkarrPublisher>,
+
+    // ── keep-alive ──────────────────────────────────────────────────────
+    _alice_accept: tokio::task::JoinHandle<()>,
+    _bob_accept: tokio::task::JoinHandle<()>,
+    _relay: harmony_pkarr::testing::MockPkarrRelay,
+    // Aborted during teardown (not just dropped) so the long-lived pkarr publisher
+    // task can't bleed background work into later tests. Not underscore-prefixed:
+    // it is actively used (.abort()), unlike the pure keep-alive fields above.
+    publisher_handle: tokio::task::JoinHandle<()>,
+    _dir_alice: tempfile::TempDir,
+    _dir_bob: tempfile::TempDir,
+    _bob_app: tauri::App<tauri::test::MockRuntime>,
+}
+
+/// Stand up the full two-party iroh-handshake harness (identities, endpoints,
+/// Alice's engine + acceptor, Bob's redeem deps, mock pkarr relay). Identical
+/// for the targeted and untargeted roundtrip tests; the only thing that
+/// differs between them is the invite payload each constructs afterward.
+async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
+    // ── 1. Identities. ───────────────────────────────────────────────
+    // ZEB-339 dual-identity model: each party has TWO identities.
+    //   - Community identity  = mint_test_owner(seed) → owner (OwnerAddr),
+    //     device_key (SigningKey #2), cert (EnrollmentCert). Used as the
+    //     community actor, to sign all community-membership events, and as
+    //     the DmOutbox community_signing_key + enrollment_cert.
+    //   - Transport identity  = PrivateIdentity::from_seed (Reticulum).
+    //     Used for iroh endpoints, DeviceIdentityHash, and DmOutbox
+    //     signing_key (Reticulum transport layer).
+
+    // Transport identities (Reticulum).
+    let alice_identity = PrivateIdentity::from_seed(&[0xa1; 32]);
+    let bob_identity = PrivateIdentity::from_seed(&[0xb2; 32]);
+    // Transport signing keys (Reticulum) — used for pkarr, DmOutbox.signing_key,
+    // and joiner_identity_pub derivation in the iroh handshake packet.
+    let alice_sk = Arc::new(signing_key_from(&alice_identity));
+    let bob_sk = Arc::new(signing_key_from(&bob_identity));
+    // Reticulum composite pubs: still needed for pkarr
+    // (PkarrInvitePublisher + admin_identity_pub in payload).
+    let (alice_transport_addr, alice_pub) = derive_composite_owner(&alice_sk);
+    let (bob_transport_addr, _bob_pub) = derive_composite_owner(&bob_sk);
+
+    // Community identities (ZEB-339 owner model).
+    let alice_comm = harmony_app::community_membership::mint_test_owner(0xA1);
+    let bob_comm = harmony_app::community_membership::mint_test_owner(0xB2);
+    let alice_comm_sk = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &alice_comm.device_key.to_bytes(),
+    ));
+    let bob_comm_sk = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &bob_comm.device_key.to_bytes(),
+    ));
+    // Community owner addresses (used as community actor).
+    let alice_addr = alice_comm.owner;
+    let bob_addr = bob_comm.owner;
+
+    // Identity resolver: uses community owner addresses; the 64-byte pub
+    // is not used by the cert-based ZEB-339 verify path but is kept for
+    // structural compat (the Reticulum composite pubs serve double duty
+    // here since the resolver is queried by OwnerAddr, which under
+    // dual-identity is the community owner addr, not the Reticulum addr).
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
+        alice: (alice_addr, [0u8; 64]),
+        bob: (bob_addr, [0u8; 64]),
+    });
+
+    // Suppress unused-variable warnings for the transport addrs.
+    let _ = (alice_transport_addr, bob_transport_addr);
+
+    // ── 2. Iroh endpoints + link managers (one per "process"). ──────
+    let alice_ep = build_hermetic_endpoint().await;
+    let bob_ep = build_hermetic_endpoint().await;
+    let alice_bound = alice_ep.bound_sockets();
+    assert!(
+        !alice_bound.is_empty(),
+        "alice's hermetic endpoint must expose bound_sockets() so bob's \
+         dialer has a loopback target"
+    );
+
+    let alice_reachability = ReachabilityResolver::new();
+    let bob_reachability = ReachabilityResolver::new();
+
+    let (alice_link_tx, _alice_link_rx) = flume::unbounded::<LinkUnicast>();
+    let alice_link_mgr = Arc::new(IrohZenohLinkManager::new(
+        Arc::clone(&alice_ep),
+        alice_reachability.clone(),
+        alice_link_tx,
+    ));
+    // Acceptor is wired below (after Alice's registry + dm_outbox + the
+    // case-A invite publisher are built). Spawn the accept loop FIRST so
+    // the loop is live before the dispatcher install — early connections
+    // (before install) log warn-only, but install lands before Bob dials.
+
+    let (bob_link_tx, _bob_link_rx) = flume::unbounded::<LinkUnicast>();
+    let bob_link_mgr = Arc::new(IrohZenohLinkManager::new(
+        Arc::clone(&bob_ep),
+        bob_reachability.clone(),
+        bob_link_tx,
+    ));
+    let alice_accept = alice_link_mgr.spawn_accept_loop();
+    let bob_accept = bob_link_mgr.spawn_accept_loop();
+
+    // ── 3. Alice's community + engine. ──────────────────────────────
+    // ZEB-339: use alice_comm.owner as actor, alice_comm.device_key as signer,
+    // and alice_comm.cert as the EnrollmentCert. The bootstrap_join will carry
+    // alice_comm.cert so verify_admin_bootstrap passes (cert.owner_id == actor).
+    let alice_minted = harmony_app::mint_community_creation(
+        "OptionAHandshakeCommunity",
+        true,
+        alice_addr,
+        alice_comm_sk.as_ref(),
+        &alice_comm.cert,
+        Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".to_string(),
+        },
+    )
+    .expect("alice mint community");
+    let community_id = alice_minted.community_id;
+
+    let cas_op_tx = spawn_shared_cas();
+    let cs_alice: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx.clone(),
+        Duration::from_secs(2),
+    ));
+    let cs_bob: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx.clone(),
+        Duration::from_secs(2),
+    ));
+
+    let dir_alice = tempfile::tempdir().expect("alice tempdir");
+    let dir_bob = tempfile::tempdir().expect("bob tempdir");
+
+    // ZEB-339: registries use the community owner addr and device signing key.
+    // The auto-counter-sign task reads signing_key from the engine config
+    // (sourced from registry.cfg), so alice's JoinCountersign will be
+    // signed by alice_comm_sk and bear actor == alice_comm.owner.
+    let registry_alice = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "alice-dev".into(),
+        content_store: Arc::clone(&cs_alice),
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir_alice.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: alice_addr,
+        signing_key: Arc::clone(&alice_comm_sk),
+        crdt_state: None,
+        nav_emitter: None,
+    }));
+    let registry_bob = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "bob-dev".into(),
+        content_store: Arc::clone(&cs_bob),
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir_bob.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: bob_addr,
+        signing_key: Arc::clone(&bob_comm_sk),
+        crdt_state: None,
+        nav_emitter: None,
+    }));
+
+    // Spawn Alice's engine + insert her bootstrap Join.
+    // admin_addr = alice_addr (community owner), matching alice_minted.bootstrap_join.actor.
+    let (alice_pub_tx, _alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (_alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    registry_alice
+        .spawn_engine_inner_now(
+            community_id,
+            alice_minted.membership_key.clone(),
+            alice_addr,
+            true,
+            alice_pub_tx,
+            alice_sub_rx,
+        )
+        .await
+        .expect("spawn alice engine");
+    let alice_engine = registry_alice
+        .engine_arc(&community_id)
+        .await
+        .expect("alice engine arc");
+    // bind_admin_identity_pub: the _admin_identity_pub param in
+    // spawn_auto_counter_sign_task is unused (ZEB-339 cert path), so the
+    // exact bytes here don't affect correctness. Kept for structural parity.
+    alice_engine.bind_admin_identity_pub(alice_pub);
+    alice_engine
+        .insert_local_event(alice_minted.bootstrap_join.clone())
+        .await
+        .expect("alice bootstrap insert");
+
+    // ── 4. Alice's dm_outbox + crdt_state (acceptor dependencies). ──
+    // ZEB-339 dual-identity DmOutbox wiring:
+    //   self_owner            = alice_comm.owner  (community actor)
+    //   signing_key           = alice_sk          (Reticulum transport — unchanged)
+    //   community_signing_key = alice_comm_sk     (enrolled device #2 key)
+    //   enrollment_cert       = alice_comm.cert   (cert.owner_id == alice_addr ✓)
+    // The three DmOutbox::new debug_asserts all pass:
+    //   ① cert.verify() ✓  ② cert.owner_id == alice_addr ✓
+    //   ③ cert.device_pubkeys.classical.ed25519_verify == alice_comm_sk.verifying_key() ✓
+    let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+        "alice-dev".into(),
+        alice_addr,
+        DeviceIdentityHash(alice_identity.identity.address_hash),
+        Arc::clone(&alice_sk),
+        Arc::new(dup_identity(&alice_identity)),
+        Arc::clone(&alice_comm_sk),
+        alice_comm.cert.clone(),
+    )));
+    let alice_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+
+    // ── 4b. Mock pkarr relay + case-A invite publisher. ─────────────
+    // Built BEFORE Alice's acceptor so the acceptor can be wired with
+    // `Some(invite_pub)`, enabling the ZEB-367 unregister-on-consume path
+    // (`handle_unicast` → `unregister_invite` once Bob's PendingJoin lands
+    // as `Inserted`). The publisher object only depends on alice_sk /
+    // alice_pub / the routing-blob builder — all available here. Each test
+    // calls `register_invite(&its_own_payload)` after constructing the
+    // invite; the publisher is shared via `Arc` because both the acceptor
+    // and the test body hold it and `register/unregister_invite` take `&self`.
+    let relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
+    let pool = harmony_pkarr::RelayPool::new(vec![relay.base_url.clone()]);
+    let client = Arc::new(harmony_pkarr::RelayClient::new(pool));
+    let pkarr_publisher = Arc::new(harmony_pkarr::PkarrPublisher::new(Arc::clone(&client)));
+    let publisher_handle = Arc::clone(&pkarr_publisher).spawn();
+    let pkarr_resolver = Arc::new(harmony_pkarr::PkarrResolver::new(Arc::clone(&client)));
+
+    // Alice's routing record — both the pkarr case-A record (via the blob
+    // builder below) and Bob's seeded ReachabilityResolver entry use it.
+    let alice_routing = ReachabilityAnnouncePayload {
+        iroh_node_id: *alice_ep.node_id().as_bytes(),
+        home_relay_url: alice_ep
+            .home_relay()
+            .map(|r| r.to_string())
+            .unwrap_or_default(),
+        direct_addresses: alice_bound.clone(),
+        announced_at_ms: 1_700_000_000_000,
+        identity_signature: [0xCDu8; 64],
+    };
+    let alice_routing_blob = {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&alice_routing, &mut buf).expect("encode alice routing_blob");
+        buf
+    };
+    let alice_routing_blob_clone = alice_routing_blob.clone();
+    let invite_pub: Arc<harmony_app::pkarr_invite_publisher::PkarrInvitePublisher> = Arc::new(
+        harmony_app::pkarr_invite_publisher::PkarrInvitePublisher::new(
+            Arc::clone(&pkarr_publisher),
+            (*alice_sk).clone(),
+            alice_pub,
+            Arc::new(move || alice_routing_blob_clone.clone()),
+        ),
+    );
+
+    // Install the production handshake acceptor onto Alice's link
+    // manager. Using `None` for the app handle keeps the warn-only
+    // emit_degraded path active; sufficient for the test.
+    //
+    // ZEB-367: pass `Some(Arc::clone(&invite_pub))` so a successful invite
+    // consumption unregisters the case-A pkarr publication.
+    //
+    // ZEB-325 PR #159 F10: pass an explicit short-deadline config
+    // so a test-driven IO stall would surface as
+    // `HandshakeAcceptError::IoTimeout` within seconds rather than
+    // pinning the test until the 60s tokio::timeout fires above.
+    let alice_acceptor: Arc<IrohInviteHandshakeAcceptor<()>> =
+        Arc::new(IrohInviteHandshakeAcceptor::<()>::with_config(
+            Arc::clone(&registry_alice),
+            Arc::clone(&alice_dm_outbox),
+            Arc::clone(&alice_crdt_state),
+            None,
+            Some(Arc::clone(&invite_pub)),
+            harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
+                io_deadline: Duration::from_millis(10_000),
+                poll_deadline: Duration::from_millis(10_000),
+                poll_interval: Duration::from_millis(20),
+            },
+        ));
+    if alice_link_mgr
+        .install_handshake_dispatcher(alice_acceptor)
+        .await
+        .is_err()
+    {
+        panic!("first install must succeed (OnceCell empty)");
+    }
+
+    // ── 5. Bob's redemption setup. ──────────────────────────────────
+    // Drain Bob's adapter dispatch — engine spawns produce a single
+    // CommunityAdapterRequest; we drop the publisher_rx/subscriber_tx
+    // halves because option A does NOT use CRDT sync round-trip.
+    let (bob_adapter_tx, mut bob_adapter_rx) = mpsc::channel::<CommunityAdapterRequest>(8);
+    tokio::spawn(async move {
+        while let Some(req) = bob_adapter_rx.recv().await {
+            drop(req.publisher_rx);
+            drop(req.subscriber_tx);
+        }
+    });
+
+    let (bob_unicast_tx, mut bob_unicast_rx) = mpsc::channel::<UnicastSendRequest>(8);
+    // ZEB-325 PR #159 R6 (Cursor HIGH): count Reticulum unicast sends so
+    // the post-redeem assertion can prove the iroh-redeem path skipped
+    // the fan-out entirely when pre_delivered_countersign was in hand.
+    // Pre-fix, populating bob_crdt_state with alice's device (below)
+    // would have caused the fan-out to fire — the counter would be ≥1.
+    let bob_unicast_count = Arc::new(AtomicUsize::new(0));
+    let bob_unicast_count_sink = Arc::clone(&bob_unicast_count);
+    tokio::spawn(async move {
+        while bob_unicast_rx.recv().await.is_some() {
+            bob_unicast_count_sink.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    // ZEB-339 dual-identity DmOutbox wiring for Bob:
+    //   self_owner            = bob_comm.owner  (community actor)
+    //   signing_key           = bob_sk          (Reticulum transport — unchanged)
+    //   community_signing_key = bob_comm_sk     (enrolled device #2 key)
+    //   enrollment_cert       = bob_comm.cert   (cert.owner_id == bob_addr ✓)
+    // redeem_invite_inner_with_overrides reads dm_outbox.signing_key for
+    // the Reticulum joiner_identity_pub derivation, and bob_comm_sk/cert
+    // flow through via the top-level signing_key/enrollment_cert params.
+    let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+        "bob-dev".into(),
+        bob_addr,
+        DeviceIdentityHash(bob_identity.identity.address_hash),
+        Arc::clone(&bob_sk),
+        Arc::new(dup_identity(&bob_identity)),
+        Arc::clone(&bob_comm_sk),
+        bob_comm.cert.clone(),
+    )));
+
+    let (bob_channel_log_adapter_tx, _bob_channel_log_adapter_rx) =
+        mpsc::unbounded_channel::<ChannelLogAdapterRequest>();
+    let bob_app = tauri::test::mock_app();
+    // ZEB-339: channel log registry uses community owner addr and device key.
+    // `ChannelLogRegistry::new` already returns `Arc<Self>`; do not re-wrap.
+    let bob_channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        adapter_request_tx: bob_channel_log_adapter_tx,
+        app: bob_app.handle().clone(),
+        identity_dir: dir_bob.path().to_path_buf(),
+        self_owner: bob_addr,
+        self_device_id: "bob-dev".into(),
+        signing_key: Arc::clone(&bob_comm_sk),
+        engine_config: ChannelLogEngineConfig::default(),
+    });
+
+    let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+    let bob_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+
+    // ZEB-325 PR #159 R6 (Cursor HIGH): pre-populate bob's owner_device_cache
+    // with a fabricated alice device so `resolve_destinations_for_owner`
+    // returns non-empty for alice_addr (community owner addr). This simulates
+    // "stale Reticulum DM cache from prior interactions" — the exact condition
+    // that, pre-fix, would have driven the iroh-redeem path into the Reticulum
+    // fan-out branch and Err'd if every try_send failed.
+    // ZEB-339: key is alice_addr (community owner), matching payload.admin_addr.
+    {
+        let mut g = bob_crdt_state.lock().await;
+        g.owner_device_cache.devices.insert(
+            alice_addr,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0xAAu8; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 100_000,
+                    logical: 0,
+                    device_id: "alice-dev".into(),
+                },
+            },
+        );
+    }
+
+    // Seed Bob's ReachabilityResolver with Alice's routing record
+    // directly. The IPC's iroh dial uses the routing record from the
+    // pkarr-verified ReachabilityAnnouncePayload it decoded; bypassing
+    // the pkarr step keeps this test focused on the wire handshake.
+    // ZEB-339: seed key is alice_addr (community owner), matching
+    // payload.admin_addr which the IPC uses as inviter_addr.
+    bob_reachability
+        .seed_from_pkarr(
+            alice_addr,
+            DeviceIdentityHash([0u8; 16]),
+            alice_routing.clone(),
+        )
+        .await;
+
+    TwoPartySetup {
+        alice_comm,
+        bob_comm,
+        alice_comm_sk,
+        bob_comm_sk,
+        alice_addr,
+        bob_addr,
+        alice_pub,
+        alice_minted,
+        community_id,
+        alice_ep,
+        bob_ep,
+        registry_alice,
+        registry_bob,
+        bob_reachability,
+        bob_crdt_state,
+        bob_hlc_tracker,
+        bob_dm_outbox,
+        bob_channel_log_registry,
+        bob_adapter_tx,
+        bob_unicast_tx,
+        bob_unicast_count,
+        invite_pub,
+        pkarr_resolver,
+        pkarr_publisher,
+        _alice_accept: alice_accept,
+        _bob_accept: bob_accept,
+        _relay: relay,
+        publisher_handle,
+        _dir_alice: dir_alice,
+        _dir_bob: dir_bob,
+        _bob_app: bob_app,
+    }
+}
+
+/// Wait (≤5s) for Alice's case-A pkarr record — keyed on the invite token's
+/// signature for the current epoch — to become visible in the mock relay.
+/// Returns the probe verifying key so callers can re-resolve it later (e.g.
+/// to assert the record disappears after the invite is consumed).
+async fn await_pkarr_record_visible(
+    pkarr_resolver: &harmony_pkarr::PkarrResolver,
+    token_sig: &[u8; 64],
+) -> ed25519_dalek::VerifyingKey {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as u64;
+    let epoch_id = harmony_pkarr::current_epoch_id(now_ms);
+    let probe_signing = harmony_pkarr::derive_ephemeral_key(
+        harmony_pkarr::PkarrCase::Invite,
+        token_sig,
+        &epoch_id.to_be_bytes(),
+    );
+    let probe_verifying = probe_signing.verifying_key();
+    let mut record_visible = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(Some(_)) = pkarr_resolver.resolve(&probe_verifying).await {
+            record_visible = true;
+            break;
+        }
+    }
+    assert!(
+        record_visible,
+        "alice's pkarr record must appear in the mock relay within 5s before driving Bob's IPC"
+    );
+    probe_verifying
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Targeted roundtrip (ZEB-325 Phase 2c option A).
 // ────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -215,337 +725,9 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         .try_init();
 
     tokio::time::timeout(Duration::from_secs(60), async {
-        // ── 1. Identities. ───────────────────────────────────────────────
-        // ZEB-339 dual-identity model: each party has TWO identities.
-        //   - Community identity  = mint_test_owner(seed) → owner (OwnerAddr),
-        //     device_key (SigningKey #2), cert (EnrollmentCert). Used as the
-        //     community actor, to sign all community-membership events, and as
-        //     the DmOutbox community_signing_key + enrollment_cert.
-        //   - Transport identity  = PrivateIdentity::from_seed (Reticulum).
-        //     Used for iroh endpoints, DeviceIdentityHash, and DmOutbox
-        //     signing_key (Reticulum transport layer).
+        let s = setup_two_party_iroh_handshake().await;
 
-        // Transport identities (Reticulum).
-        let alice_identity = PrivateIdentity::from_seed(&[0xa1; 32]);
-        let bob_identity = PrivateIdentity::from_seed(&[0xb2; 32]);
-        // Transport signing keys (Reticulum) — used for pkarr, DmOutbox.signing_key,
-        // and joiner_identity_pub derivation in the iroh handshake packet.
-        let alice_sk = Arc::new(signing_key_from(&alice_identity));
-        let bob_sk = Arc::new(signing_key_from(&bob_identity));
-        // Reticulum composite pubs: still needed for pkarr
-        // (PkarrInvitePublisher + admin_identity_pub in payload).
-        let (alice_transport_addr, alice_pub) = derive_composite_owner(&alice_sk);
-        let (bob_transport_addr, bob_pub) = derive_composite_owner(&bob_sk);
-
-        // Community identities (ZEB-339 owner model).
-        let alice_comm = harmony_app::community_membership::mint_test_owner(0xA1);
-        let bob_comm = harmony_app::community_membership::mint_test_owner(0xB2);
-        let alice_comm_sk = Arc::new(ed25519_dalek::SigningKey::from_bytes(
-            &alice_comm.device_key.to_bytes(),
-        ));
-        let bob_comm_sk = Arc::new(ed25519_dalek::SigningKey::from_bytes(
-            &bob_comm.device_key.to_bytes(),
-        ));
-        // Community owner addresses (used as community actor).
-        let alice_addr = alice_comm.owner;
-        let bob_addr = bob_comm.owner;
-
-        // Identity resolver: uses community owner addresses; the 64-byte pub
-        // is not used by the cert-based ZEB-339 verify path but is kept for
-        // structural compat (the Reticulum composite pubs serve double duty
-        // here since the resolver is queried by OwnerAddr, which under
-        // dual-identity is the community owner addr, not the Reticulum addr).
-        let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
-            alice: (alice_addr, [0u8; 64]),
-            bob: (bob_addr, [0u8; 64]),
-        });
-
-        // Suppress unused-variable warnings for the transport addrs.
-        let _ = (alice_transport_addr, bob_transport_addr);
-
-        // ── 2. Iroh endpoints + link managers (one per "process"). ──────
-        let alice_ep = build_hermetic_endpoint().await;
-        let bob_ep = build_hermetic_endpoint().await;
-        let alice_bound = alice_ep.bound_sockets();
-        assert!(
-            !alice_bound.is_empty(),
-            "alice's hermetic endpoint must expose bound_sockets() so bob's \
-             dialer has a loopback target"
-        );
-
-        let alice_reachability = ReachabilityResolver::new();
-        let bob_reachability = ReachabilityResolver::new();
-
-        let (alice_link_tx, _alice_link_rx) = flume::unbounded::<LinkUnicast>();
-        let alice_link_mgr = Arc::new(IrohZenohLinkManager::new(
-            Arc::clone(&alice_ep),
-            alice_reachability.clone(),
-            alice_link_tx,
-        ));
-        // Acceptor is wired below (after Alice's registry + dm_outbox are
-        // built). Spawn the accept loop FIRST so the loop is live before
-        // the dispatcher install — early connections (before install)
-        // log warn-only, but install lands before Bob dials.
-
-        let (bob_link_tx, _bob_link_rx) = flume::unbounded::<LinkUnicast>();
-        let bob_link_mgr = Arc::new(IrohZenohLinkManager::new(
-            Arc::clone(&bob_ep),
-            bob_reachability.clone(),
-            bob_link_tx,
-        ));
-        let _alice_accept = alice_link_mgr.spawn_accept_loop();
-        let _bob_accept = bob_link_mgr.spawn_accept_loop();
-
-        // ── 3. Alice's community + engine. ──────────────────────────────
-        // ZEB-339: use alice_comm.owner as actor, alice_comm.device_key as signer,
-        // and alice_comm.cert as the EnrollmentCert. The bootstrap_join will carry
-        // alice_comm.cert so verify_admin_bootstrap passes (cert.owner_id == actor).
-        let alice_minted = harmony_app::mint_community_creation(
-            "OptionAHandshakeCommunity",
-            true,
-            alice_addr,
-            alice_comm_sk.as_ref(),
-            &alice_comm.cert,
-            Hlc {
-                wall_ms: 100_000,
-                logical: 0,
-                device_id: "alice-dev".to_string(),
-            },
-        )
-        .expect("alice mint community");
-        let community_id = alice_minted.community_id;
-
-        let cas_op_tx = spawn_shared_cas();
-        let cs_alice: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
-            cas_op_tx.clone(),
-            Duration::from_secs(2),
-        ));
-        let cs_bob: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
-            cas_op_tx.clone(),
-            Duration::from_secs(2),
-        ));
-
-        let dir_alice = tempfile::tempdir().expect("alice tempdir");
-        let dir_bob = tempfile::tempdir().expect("bob tempdir");
-
-        // ZEB-339: registries use the community owner addr and device signing key.
-        // The auto-counter-sign task reads signing_key from the engine config
-        // (sourced from registry.cfg), so alice's JoinCountersign will be
-        // signed by alice_comm_sk and bear actor == alice_comm.owner.
-        let registry_alice = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
-            device_id: "alice-dev".into(),
-            content_store: Arc::clone(&cs_alice),
-            identity_resolver: Arc::clone(&resolver),
-            identity_dir: dir_alice.path().to_path_buf(),
-            debounce_ms: DEFAULT_DEBOUNCE_MS,
-            error_tx: None,
-            delta_tx: None,
-            self_owner: alice_addr,
-            signing_key: Arc::clone(&alice_comm_sk),
-            crdt_state: None,
-            nav_emitter: None,
-        }));
-        let registry_bob = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
-            device_id: "bob-dev".into(),
-            content_store: Arc::clone(&cs_bob),
-            identity_resolver: Arc::clone(&resolver),
-            identity_dir: dir_bob.path().to_path_buf(),
-            debounce_ms: DEFAULT_DEBOUNCE_MS,
-            error_tx: None,
-            delta_tx: None,
-            self_owner: bob_addr,
-            signing_key: Arc::clone(&bob_comm_sk),
-            crdt_state: None,
-            nav_emitter: None,
-        }));
-
-        // Spawn Alice's engine + insert her bootstrap Join.
-        // admin_addr = alice_addr (community owner), matching alice_minted.bootstrap_join.actor.
-        let (alice_pub_tx, _alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);
-        let (_alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
-        registry_alice
-            .spawn_engine_inner_now(
-                community_id,
-                alice_minted.membership_key.clone(),
-                alice_addr,
-                true,
-                alice_pub_tx,
-                alice_sub_rx,
-            )
-            .await
-            .expect("spawn alice engine");
-        let alice_engine = registry_alice
-            .engine_arc(&community_id)
-            .await
-            .expect("alice engine arc");
-        // bind_admin_identity_pub: the _admin_identity_pub param in
-        // spawn_auto_counter_sign_task is unused (ZEB-339 cert path), so the
-        // exact bytes here don't affect correctness. Kept for structural parity.
-        alice_engine.bind_admin_identity_pub(alice_pub);
-        alice_engine
-            .insert_local_event(alice_minted.bootstrap_join.clone())
-            .await
-            .expect("alice bootstrap insert");
-
-        // ── 4. Alice's dm_outbox + crdt_state (acceptor dependencies). ──
-        // ZEB-339 dual-identity DmOutbox wiring:
-        //   self_owner            = alice_comm.owner  (community actor)
-        //   signing_key           = alice_sk          (Reticulum transport — unchanged)
-        //   community_signing_key = alice_comm_sk     (enrolled device #2 key)
-        //   enrollment_cert       = alice_comm.cert   (cert.owner_id == alice_addr ✓)
-        // The three DmOutbox::new debug_asserts all pass:
-        //   ① cert.verify() ✓  ② cert.owner_id == alice_addr ✓
-        //   ③ cert.device_pubkeys.classical.ed25519_verify == alice_comm_sk.verifying_key() ✓
-        let alice_enrollment_for_invite = alice_comm.cert.clone();
-        let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
-            "alice-dev".into(),
-            alice_addr,
-            DeviceIdentityHash(alice_identity.identity.address_hash),
-            Arc::clone(&alice_sk),
-            Arc::new(dup_identity(&alice_identity)),
-            Arc::clone(&alice_comm_sk),
-            alice_comm.cert.clone(),
-        )));
-        let alice_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
-
-        // Install the production handshake acceptor onto Alice's link
-        // manager. Using `None` for the app handle keeps the warn-only
-        // emit_degraded path active; sufficient for the test.
-        //
-        // ZEB-325 PR #159 F10: pass an explicit short-deadline config
-        // so a test-driven IO stall would surface as
-        // `HandshakeAcceptError::IoTimeout` within seconds rather than
-        // pinning the test until the 60s tokio::timeout fires above.
-        let alice_acceptor: Arc<IrohInviteHandshakeAcceptor<()>> =
-            Arc::new(IrohInviteHandshakeAcceptor::<()>::with_config(
-                Arc::clone(&registry_alice),
-                Arc::clone(&alice_dm_outbox),
-                Arc::clone(&alice_crdt_state),
-                None,
-                harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
-                    io_deadline: Duration::from_millis(10_000),
-                    poll_deadline: Duration::from_millis(10_000),
-                    poll_interval: Duration::from_millis(20),
-                },
-            ));
-        if alice_link_mgr
-            .install_handshake_dispatcher(alice_acceptor)
-            .await
-            .is_err()
-        {
-            panic!("first install must succeed (OnceCell empty)");
-        }
-
-        // ── 5. Bob's redemption setup. ──────────────────────────────────
-        // Drain Bob's adapter dispatch — engine spawns produce a single
-        // CommunityAdapterRequest; we drop the publisher_rx/subscriber_tx
-        // halves because option A does NOT use CRDT sync round-trip.
-        let (bob_adapter_tx, mut bob_adapter_rx) = mpsc::channel::<CommunityAdapterRequest>(8);
-        tokio::spawn(async move {
-            while let Some(req) = bob_adapter_rx.recv().await {
-                drop(req.publisher_rx);
-                drop(req.subscriber_tx);
-            }
-        });
-
-        let (bob_unicast_tx, mut bob_unicast_rx) = mpsc::channel::<UnicastSendRequest>(8);
-        // ZEB-325 PR #159 R6 (Cursor HIGH): count Reticulum unicast sends so
-        // the post-redeem assertion can prove the iroh-redeem path skipped
-        // the fan-out entirely when pre_delivered_countersign was in hand.
-        // Pre-fix, populating bob_crdt_state with alice's device (below)
-        // would have caused the fan-out to fire — the counter would be ≥1.
-        let bob_unicast_count = Arc::new(AtomicUsize::new(0));
-        let bob_unicast_count_sink = Arc::clone(&bob_unicast_count);
-        tokio::spawn(async move {
-            while bob_unicast_rx.recv().await.is_some() {
-                bob_unicast_count_sink.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-
-        // ZEB-339 dual-identity DmOutbox wiring for Bob:
-        //   self_owner            = bob_comm.owner  (community actor)
-        //   signing_key           = bob_sk          (Reticulum transport — unchanged)
-        //   community_signing_key = bob_comm_sk     (enrolled device #2 key)
-        //   enrollment_cert       = bob_comm.cert   (cert.owner_id == bob_addr ✓)
-        // redeem_invite_inner_with_overrides reads dm_outbox.signing_key for
-        // the Reticulum joiner_identity_pub derivation, and bob_comm_sk/cert
-        // flow through via the top-level signing_key/enrollment_cert params.
-        let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
-            "bob-dev".into(),
-            bob_addr,
-            DeviceIdentityHash(bob_identity.identity.address_hash),
-            Arc::clone(&bob_sk),
-            Arc::new(dup_identity(&bob_identity)),
-            Arc::clone(&bob_comm_sk),
-            bob_comm.cert.clone(),
-        )));
-
-        let (bob_channel_log_adapter_tx, _bob_channel_log_adapter_rx) =
-            mpsc::unbounded_channel::<ChannelLogAdapterRequest>();
-        let bob_app = tauri::test::mock_app();
-        // ZEB-339: channel log registry uses community owner addr and device key.
-        let bob_channel_log_registry =
-            Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
-                adapter_request_tx: bob_channel_log_adapter_tx,
-                app: bob_app.handle().clone(),
-                identity_dir: dir_bob.path().to_path_buf(),
-                self_owner: bob_addr,
-                self_device_id: "bob-dev".into(),
-                signing_key: Arc::clone(&bob_comm_sk),
-                engine_config: ChannelLogEngineConfig::default(),
-            }));
-
-        let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
-        let bob_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
-
-        // ZEB-325 PR #159 R6 (Cursor HIGH): pre-populate bob's owner_device_cache
-        // with a fabricated alice device so `resolve_destinations_for_owner`
-        // returns non-empty for alice_addr (community owner addr). This simulates
-        // "stale Reticulum DM cache from prior interactions" — the exact condition
-        // that, pre-fix, would have driven the iroh-redeem path into the Reticulum
-        // fan-out branch and Err'd if every try_send failed.
-        // ZEB-339: key is alice_addr (community owner), matching payload.admin_addr.
-        {
-            let mut g = bob_crdt_state.lock().await;
-            g.owner_device_cache.devices.insert(
-                alice_addr,
-                OwnerDeviceEntry {
-                    devices: vec![DeviceIdentityHash([0xAAu8; 16])],
-                    device_identity_pubs: vec![None],
-                    learned_at: Hlc {
-                        wall_ms: 100_000,
-                        logical: 0,
-                        device_id: "alice-dev".into(),
-                    },
-                },
-            );
-        }
-
-        // Seed Bob's ReachabilityResolver with Alice's routing record
-        // directly. The IPC's iroh dial uses the routing record from the
-        // pkarr-verified ReachabilityAnnouncePayload it decoded; bypassing
-        // the pkarr step keeps this test focused on the wire handshake.
-        // ZEB-339: seed key is alice_addr (community owner), matching
-        // payload.admin_addr which the IPC uses as inviter_addr.
-        let alice_routing = ReachabilityAnnouncePayload {
-            iroh_node_id: *alice_ep.node_id().as_bytes(),
-            home_relay_url: alice_ep
-                .home_relay()
-                .map(|r| r.to_string())
-                .unwrap_or_default(),
-            direct_addresses: alice_bound.clone(),
-            announced_at_ms: 1_700_000_000_000,
-            identity_signature: [0xCDu8; 64],
-        };
-        bob_reachability
-            .seed_from_pkarr(
-                alice_addr,
-                DeviceIdentityHash([0u8; 16]),
-                alice_routing.clone(),
-            )
-            .await;
-
-        // ── 6. Build the invite URL (invite-only). ──────────────────────
+        // ── 6. Build the invite URL (TARGETED invite-only). ─────────────
         // ZEB-339: InviteToken.inviter = alice_comm.owner (community actor).
         // The token is signed with alice_comm_sk (enrolled device #2 key).
         // P5 verify_invite_token_sig_with_enrolled resolves alice's enrolled
@@ -557,18 +739,18 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             device_id: "alice-dev".into(),
         };
         let invite_token_unsigned = InviteToken {
-            inviter: alice_addr,
-            invitee_hint: Some(bob_addr),
+            inviter: s.alice_addr,
+            invitee_hint: Some(s.bob_addr),
             minted_at: token_minted_at.clone(),
             expires_at: None,
             sig: [0u8; 64],
         };
         let token_payload_bytes =
             canonical_invite_token_bytes(&invite_token_unsigned).expect("canonical token bytes");
-        let token_sig: [u8; 64] = alice_comm_sk.sign(&token_payload_bytes).to_bytes();
+        let token_sig: [u8; 64] = s.alice_comm_sk.sign(&token_payload_bytes).to_bytes();
         let invite_token = InviteToken {
-            inviter: alice_addr,
-            invitee_hint: Some(bob_addr),
+            inviter: s.alice_addr,
+            invitee_hint: Some(s.bob_addr),
             minted_at: token_minted_at,
             expires_at: None,
             sig: token_sig,
@@ -579,13 +761,13 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         // applied to the `signing_key` param (= bob_comm_sk here). So the seal
         // target must derive from bob_comm_sk, NOT from bob_sk (Reticulum).
         let bob_x25519_pub = {
-            let verifying_bytes = bob_comm_sk.verifying_key().to_bytes();
+            let verifying_bytes = s.bob_comm_sk.verifying_key().to_bytes();
             harmony_app::dm_signing::ed25519_pub_to_x25519(&verifying_bytes)
                 .expect("bob_comm ed25519→x25519")
         };
         let sealed_epoch_key = harmony_app::dm_signing::seal_to_owner(
             &bob_x25519_pub,
-            alice_minted.membership_key.as_bytes(),
+            s.alice_minted.membership_key.as_bytes(),
         )
         .expect("seal epoch key to bob");
 
@@ -594,86 +776,39 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         // because pkarr step 6 (verify_identity_match) checks it against the
         // pkarr record's harmony_identity_pub, which is signed by alice_sk.
         let invite_payload = CommunityInvitePayload {
-            community_id,
+            community_id: s.community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key,
                 state_snapshot: MaterializedCommunityState::default(),
             },
-            admin_addr: alice_addr,
+            admin_addr: s.alice_addr,
             community_name: "OptionAHandshakeCommunity".into(),
             is_invite_only: true,
             expires_at: None,
             invite_token: Some(invite_token),
-            admin_bootstrap: Some(alice_minted.bootstrap_join.clone()),
+            admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
             // admin_identity_pub = Reticulum composite pub; used only for the
             // pkarr verify_identity_match check (step 6) — not for membership.
-            admin_identity_pub: Some(alice_pub),
+            admin_identity_pub: Some(s.alice_pub),
             forked_from: None,
             pre_fork_snapshot: None,
             // ZEB-339: invite-only payloads REQUIRE an inviter EnrollmentCert.
-            // alice_enrollment_for_invite = alice_comm.cert (cert.owner_id == alice_addr),
-            // so enrolled_key_from_cert will successfully bind the cert to the actor.
-            inviter_enrollment: Some(alice_enrollment_for_invite),
+            // alice_comm.cert (cert.owner_id == alice_addr) lets enrolled_key_from_cert
+            // successfully bind the cert to the actor.
+            inviter_enrollment: Some(s.alice_comm.cert.clone()),
+            // Targeted invite: epoch key is sealed to Bob's enrolled key, so no
+            // URL-borne decrypt key is needed (or allowed by the encode guard).
+            untargeted_decrypt_key: None,
         };
         let invite_url =
             community_invite::encode_invite_url(&invite_payload).expect("encode invite");
 
-        // The IPC's pkarr resolve step would normally find Alice's record;
-        // for this test we wire `pkarr_resolver: None` and short-circuit
-        // by calling a thin variant. Actually no — the IPC's case-A
-        // resolve path is gated on pkarr_resolver: Some(...). We
-        // construct a no-op pkarr resolver that returns Alice's record
-        // for the case-A epoch keys derived from token_sig.
-        //
-        // Simpler: use a real `MockPkarrRelay` round-trip so the IPC
-        // exercises pkarr + iroh end-to-end without any test-specific
-        // short-circuit.
-        let relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
-        let pool = harmony_pkarr::RelayPool::new(vec![relay.base_url.clone()]);
-        let client = Arc::new(harmony_pkarr::RelayClient::new(pool));
-        let pkarr_publisher = Arc::new(harmony_pkarr::PkarrPublisher::new(Arc::clone(&client)));
-        let _publisher_handle = Arc::clone(&pkarr_publisher).spawn();
-
-        let alice_routing_blob_for_builder = {
-            let mut buf = Vec::new();
-            ciborium::into_writer(&alice_routing, &mut buf).expect("encode alice routing_blob");
-            buf
-        };
-        let alice_routing_blob_clone = alice_routing_blob_for_builder.clone();
-        let invite_pub = harmony_app::pkarr_invite_publisher::PkarrInvitePublisher::new(
-            Arc::clone(&pkarr_publisher),
-            (*alice_sk).clone(),
-            alice_pub,
-            Arc::new(move || alice_routing_blob_clone.clone()),
-        );
-        invite_pub.register_invite(&invite_payload).await;
-        let pkarr_resolver = Arc::new(harmony_pkarr::PkarrResolver::new(Arc::clone(&client)));
-
-        // Wait for pkarr record visibility (the mock relay is async).
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_millis() as u64;
-        let epoch_id = harmony_pkarr::current_epoch_id(now_ms);
-        let probe_signing = harmony_pkarr::derive_ephemeral_key(
-            harmony_pkarr::PkarrCase::Invite,
-            &token_sig,
-            &epoch_id.to_be_bytes(),
-        );
-        let probe_verifying = probe_signing.verifying_key();
-        let mut record_visible = false;
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Ok(Some(_)) = pkarr_resolver.resolve(&probe_verifying).await {
-                record_visible = true;
-                break;
-            }
-        }
-        assert!(
-            record_visible,
-            "alice's pkarr record must appear in the mock relay within 5s before driving Bob's IPC"
-        );
+        // Publish Alice's case-A pkarr record for this invite and wait for
+        // the mock relay to make it visible. The IPC resolves it end-to-end
+        // (pkarr → iroh) with no test-specific short-circuit.
+        s.invite_pub.register_invite(&invite_payload).await;
+        let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
 
         // ── 7. Drive Bob's IPC. ─────────────────────────────────────────
         // ZEB-325 PR #159 R4-3 (CodeRabbit NITPICK): capture nav-updated
@@ -690,20 +825,20 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         // (= bob_sk, Reticulum) is used for joiner_identity_pub derivation.
         let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
             invite_url,
-            Some(Arc::clone(&pkarr_resolver)),
-            Some(bob_reachability.clone()),
-            Some(Arc::clone(&bob_ep)),
-            Arc::clone(&bob_crdt_state),
-            Arc::clone(&bob_hlc_tracker),
+            Some(Arc::clone(&s.pkarr_resolver)),
+            Some(s.bob_reachability.clone()),
+            Some(Arc::clone(&s.bob_ep)),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
             "bob-dev".to_string(),
-            bob_addr,
-            Arc::clone(&bob_comm_sk),
-            bob_comm.cert.clone(),
-            Arc::clone(&registry_bob),
-            bob_adapter_tx,
-            bob_unicast_tx,
-            Arc::clone(&bob_dm_outbox),
-            Arc::clone(&bob_channel_log_registry),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            s.bob_unicast_tx.clone(),
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
             None,
             |_| {},
             // ZEB-325 PR #159 R4-3 (CodeRabbit NITPICK): record each
@@ -751,7 +886,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         );
         assert_eq!(
             outcome.community_id.as_deref(),
-            Some(hex::encode(community_id.0).as_str()),
+            Some(hex::encode(s.community_id.0).as_str()),
             "community_id must echo Alice's invite"
         );
 
@@ -775,7 +910,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         );
         assert_eq!(
             emit.space_id,
-            hex::encode(community_id.0),
+            hex::encode(s.community_id.0),
             "nav-updated space_id must match the joined community"
         );
 
@@ -787,19 +922,20 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         // fabricated DeviceIdentityHash doesn't correspond to any real
         // Reticulum destination) eventually Err'd, rolling back the join.
         assert_eq!(
-            bob_unicast_count.load(Ordering::Relaxed),
+            s.bob_unicast_count.load(Ordering::Relaxed),
             0,
             "iroh-redeem path must NOT enqueue any Reticulum unicast sends \
              when pre_delivered_countersign is present (R6 regression): \
              counter={}",
-            bob_unicast_count.load(Ordering::Relaxed)
+            s.bob_unicast_count.load(Ordering::Relaxed)
         );
 
         // Bob's CRDT must contain ≥ 3 events: admin bootstrap (from the
         // invite payload's admin_bootstrap field), Bob's own PendingJoin,
         // and the pre-delivered JoinCountersign authored by Alice.
-        let bob_state = registry_bob
-            .state_for(&community_id)
+        let bob_state = s
+            .registry_bob
+            .state_for(&s.community_id)
             .await
             .expect("bob state must exist after redeem");
         let bob_events: Vec<_> = {
@@ -824,9 +960,9 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         );
 
         // Bob must materialize as Joined.
-        let bob_materialized = materialize(&bob_events, alice_addr);
+        let bob_materialized = materialize(&bob_events, s.alice_addr);
         assert_eq!(
-            bob_materialized.members.get(&bob_addr).map(|m| m.status),
+            bob_materialized.members.get(&s.bob_addr).map(|m| m.status),
             Some(MemberStatus::Joined),
             "Bob must materialize as Joined after option A handshake completes"
         );
@@ -834,8 +970,9 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         // Alice's CRDT must also contain Bob's PendingJoin + her own
         // auto-counter-sign. Her engine inserts both as part of the
         // handle_unicast → auto_counter_sign flow.
-        let alice_state = registry_alice
-            .state_for(&community_id)
+        let alice_state = s
+            .registry_alice
+            .state_for(&s.community_id)
             .await
             .expect("alice state");
         let alice_events: Vec<_> = {
@@ -846,7 +983,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             matches!(
                 &e.kind,
                 harmony_app::community_membership::MembershipEventKind::PendingJoin { .. }
-            ) && e.actor == bob_addr
+            ) && e.actor == s.bob_addr
         });
         assert!(
             alice_has_pending,
@@ -857,20 +994,261 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             matches!(
                 &e.kind,
                 harmony_app::community_membership::MembershipEventKind::JoinCountersign { .. }
-            ) && e.actor == alice_addr
+            ) && e.actor == s.alice_addr
         });
         assert!(
             alice_has_countersign,
             "Alice's CRDT must contain her own auto-counter-sign for Bob's PendingJoin"
         );
 
-        // Reference unused — placate the unused-warnings drift.
-        let _ = (alice_pub, bob_pub);
-
-        // Graceful teardown.
-        alice_ep.shutdown().await;
-        bob_ep.shutdown().await;
+        // Graceful teardown. Abort the long-lived pkarr publisher task FIRST so it
+        // stops using the endpoints before we shut them down, and so no background
+        // work leaks into later tests.
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
     })
     .await
     .expect("bob_joins_alice_via_iroh_handshake_option_a timed out at 60s");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Untargeted roundtrip (ZEB-367 Phase 4: invite-only generate → redeem).
+//
+// THE proof that the untargeted invite-only crypto loop closes: Alice mints an
+// UNTARGETED invite (no invitee_hint) whose epoch key is sealed to a FRESH
+// EPHEMERAL X25519 key that has nothing to do with Bob. The ephemeral PRIVATE
+// half rides in the URL (`untargeted_decrypt_key`). Bob redeems with his OWN
+// `bob_comm_sk` as `signing_key` — a key the epoch key was never sealed to — so
+// the ONLY way he can recover the epoch key is via the URL's ephemeral private
+// (the `Some(ephemeral_priv)` branch in `mint_redemption`, lib.rs ~16535). A
+// `joined` outcome is therefore airtight evidence that the untargeted decrypt
+// path executed.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let s = setup_two_party_iroh_handshake().await;
+
+        // ── 6. Build the invite URL (UNTARGETED invite-only). ───────────
+        // Differs from the targeted test in exactly three places:
+        //   (1) the epoch key is sealed via `SealRecipient::Untargeted` (fresh
+        //       ephemeral key; the private half rides in the URL),
+        //   (2) the token is minted with `invitee_hint = None`, and
+        //   (3) `untargeted_decrypt_key` carries the ephemeral private.
+        // Everything else mirrors the targeted payload.
+        let token_minted_at = Hlc {
+            wall_ms: 100_500,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        // (2) Mint the token via the production primitive with invitee_hint = None.
+        //     `&s.alice_comm_sk` derefs `Arc<SigningKey>` → `&SigningKey`.
+        let invite_token = harmony_app::invite_mint::mint_invite_token(
+            s.alice_addr, // inviter (community actor)
+            None,         // invitee_hint = None → untargeted
+            token_minted_at,
+            None, // expires_at
+            &s.alice_comm_sk,
+        )
+        .expect("mint invite token");
+        // The case-A pkarr probe derives from the minted token's sig.
+        let token_sig = invite_token.sig;
+
+        // (1) Seal the epoch key to a FRESH EPHEMERAL key (NOT Bob's). The
+        //     ephemeral private (sealed.untargeted_decrypt_key) is the ONLY way
+        //     to recover the epoch key; Bob's enrolled key cannot open it.
+        let sealed = harmony_app::invite_mint::seal_epoch_key(
+            s.alice_minted.membership_key.as_bytes(),
+            harmony_app::invite_mint::SealRecipient::Untargeted,
+        )
+        .expect("seal epoch key untargeted");
+        assert_eq!(
+            sealed.sealed.len(),
+            92,
+            "untargeted seal must produce the 92-byte X25519 envelope"
+        );
+        assert!(
+            sealed.untargeted_decrypt_key.is_some(),
+            "untargeted seal must surface the ephemeral private for the URL"
+        );
+
+        let invite_payload = CommunityInvitePayload {
+            community_id: s.community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                // (1) sealed to the ephemeral key, not to Bob.
+                sealed_epoch_key: sealed.sealed,
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr: s.alice_addr,
+            community_name: "OptionAHandshakeCommunity".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(invite_token),
+            admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
+            admin_identity_pub: Some(s.alice_pub),
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: Some(s.alice_comm.cert.clone()),
+            // (3) the ephemeral private rides in the URL — this is what lets Bob
+            //     decrypt despite the seal target being a key he never held.
+            untargeted_decrypt_key: sealed.untargeted_decrypt_key,
+        };
+        let invite_url =
+            community_invite::encode_invite_url(&invite_payload).expect("encode untargeted invite");
+
+        // Publish Alice's case-A pkarr record (keyed on the minted token sig)
+        // and wait for visibility before driving Bob's IPC.
+        s.invite_pub.register_invite(&invite_payload).await;
+        let probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+
+        // ── 7. Drive Bob's IPC. ─────────────────────────────────────────
+        // Bob passes his OWN bob_comm_sk as signing_key. The epoch key was NOT
+        // sealed to that key; recovery is only possible via the URL's
+        // untargeted_decrypt_key. (Call signature mirrors the targeted test.)
+        let nav_emits: Arc<Mutex<Vec<harmony_app::NavUpdatedPayload>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let nav_emits_sink = Arc::clone(&nav_emits);
+        let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
+            invite_url,
+            Some(Arc::clone(&s.pkarr_resolver)),
+            Some(s.bob_reachability.clone()),
+            Some(Arc::clone(&s.bob_ep)),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            s.bob_unicast_tx.clone(),
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            None,
+            |_| {},
+            move |payload: harmony_app::NavUpdatedPayload| {
+                nav_emits_sink
+                    .lock()
+                    .expect("nav_emits mutex")
+                    .push(payload);
+            },
+            harmony_app::HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(10_000),
+                open_bi_timeout: Duration::from_millis(10_000),
+                response_read_timeout: Duration::from_millis(10_000),
+                write_timeout: Duration::from_millis(10_000),
+            },
+            || Ok(()),
+        )
+        .await
+        .expect(
+            "connectivity_redeem_invite_iroh_inner must Ok (it converts internal errors \
+             into outcome.status)",
+        );
+
+        // ── 8. The proof. ───────────────────────────────────────────────
+        // outcome.status == "joined" is the airtight proof: Bob could ONLY have
+        // recovered the epoch key via the URL's untargeted_decrypt_key, because
+        // the seal target was a fresh ephemeral X25519 key Bob never held (his
+        // bob_comm_sk-derived key was NOT the seal recipient). A decryption
+        // failure in the untargeted branch would surface here as a non-"joined"
+        // status; "joined" means the untargeted decrypt path executed correctly.
+        assert_eq!(
+            outcome.status, "joined",
+            "untargeted invite-only redeem must return 'joined' — Bob recovered the \
+             epoch key via the URL's untargeted_decrypt_key (the seal target was an \
+             ephemeral key he never had). Got status={:?} community_id={:?}.",
+            outcome.status, outcome.community_id
+        );
+        assert_eq!(
+            outcome.community_id.as_deref(),
+            Some(hex::encode(s.community_id.0).as_str()),
+            "community_id must echo Alice's invite"
+        );
+
+        // Structural cross-checks (apply equally to the untargeted path):
+        // Bob materializes as Joined off a CRDT that carries the JoinCountersign.
+        let bob_state = s
+            .registry_bob
+            .state_for(&s.community_id)
+            .await
+            .expect("bob state must exist after redeem");
+        let bob_events: Vec<_> = {
+            let g = bob_state.lock().await;
+            g.events.values().cloned().collect()
+        };
+        let has_countersign = bob_events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                harmony_app::community_membership::MembershipEventKind::JoinCountersign { .. }
+            )
+        });
+        assert!(
+            has_countersign,
+            "Bob's CRDT must contain the JoinCountersign delivered via the handshake response"
+        );
+        let bob_materialized = materialize(&bob_events, s.alice_addr);
+        assert_eq!(
+            bob_materialized.members.get(&s.bob_addr).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "Bob must materialize as Joined after the untargeted handshake completes"
+        );
+
+        // ZEB-367 unregister-on-consume (e2e). Alice's acceptor was built with
+        // Some(invite_pub); once Bob's PendingJoin lands as `Inserted` on
+        // Alice's accept side, handle_unicast calls
+        // unregister_invite(&invite_token.sig), which removes the case-A
+        // publication from the publisher's active set so it stops republishing.
+        //
+        // NOTE: `PkarrPublisher::unregister` only stops FUTURE republishes — it
+        // does not send a DELETE to the relay, so the already-PUT record lingers
+        // in the mock relay until its TTL expires. We therefore observe the
+        // unregister via the publisher's active-handle set (`active_handles()`),
+        // not by re-resolving the relay (which would keep returning the stale
+        // record for far longer than the test's 5s budget). The handle format
+        // mirrors `PkarrInvitePublisher::register_invite`: `invite:{hex(sig)}`.
+        // `probe_verifying` is retained for the resolve above; the
+        // active-handle check is the deterministic teardown signal.
+        let _ = probe_verifying;
+        let invite_handle = format!("invite:{}", hex::encode(token_sig));
+        let mut handle_gone = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !s
+                .pkarr_publisher
+                .active_handles()
+                .await
+                .contains(&invite_handle)
+            {
+                handle_gone = true;
+                break;
+            }
+        }
+        assert!(
+            handle_gone,
+            "ZEB-367: Alice's case-A invite publication must be unregistered \
+             (handle {invite_handle:?} dropped from active_handles) within 5s after \
+             the invite is consumed (handle_unicast → unregister_invite on Inserted)"
+        );
+
+        // Graceful teardown. Abort the long-lived pkarr publisher task FIRST so it
+        // stops using the endpoints before we shut them down, and so no background
+        // work leaks into later tests.
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("invite_only_untargeted_generate_then_redeem_roundtrip timed out at 60s");
 }

@@ -8,8 +8,22 @@
 # `/STACK:...` is MSVC linker syntax — only apply on the MSVC toolchain.
 # Bare `cfg(windows)` would break `windows-gnu` builds because lld/ld.bfd
 # don't accept MSVC-style linker options.
+#
+# `/MANIFESTDEPENDENCY:...Common-Controls 6.0`: the Tauri GUI dependency graph
+# (tao/muda/webview2-com) statically imports `TaskDialogIndirect` from
+# comctl32.dll, which only exists in the v6 (WinSxS) common-controls assembly.
+# `tauri-build` embeds the v6 dependency manifest into the main app binary, but
+# `cargo test` binaries get no such manifest, so on machines whose
+# System32\comctl32.dll is the legacy v5 stub the loader fails every GUI-linking
+# test binary at startup with 0xc0000139 (STATUS_ENTRYPOINT_NOT_FOUND). Adding
+# the manifest-dependency link-arg makes the loader bind comctl32 imports to the
+# v6 assembly for ALL binaries in the crate (tests included). Harmless on the
+# main app binary (matches the manifest tauri-build already injects).
 [target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "link-arg=/STACK:8388608"]
+rustflags = [
+    "-C", "link-arg=/STACK:8388608",
+    "-C", "link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'",
+]
 
 # Rust std's thread::min_stack() reads RUST_MIN_STACK at runtime (default
 # 2 MiB). Belt-and-suspenders for `cargo run` / `tauri dev` launches —

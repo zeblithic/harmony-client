@@ -59,6 +59,12 @@ pub async fn try_dispatch_community<H: crate::community_invite::AppHandleEmit>(
         crdt_state,
         packet_bytes.to_vec(),
         app,
+        // TODO ZEB-367: LAN-path unregister-on-consume is deferred. Threading the
+        // PkarrInvitePublisher into the event loop is disproportionate for the
+        // legacy Reticulum path (case-A pubs are epoch-keyed + expire; single-use
+        // is enforced at the membership layer). The cross-WAN iroh path
+        // unregisters via IrohInviteHandshakeAcceptor.
+        None,
     )
     .await;
     true

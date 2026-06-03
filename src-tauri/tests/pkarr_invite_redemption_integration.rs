@@ -64,6 +64,7 @@ fn fixture_invite_payload(inviter: OwnerAddr) -> CommunityInvitePayload {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     }
 }
 

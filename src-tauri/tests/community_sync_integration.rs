@@ -2326,6 +2326,7 @@ mod task3_kick_setpower_round_trip {
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
+            untargeted_decrypt_key: None,
         };
         let minted_b = mint_redemption(
             &invite_payload,
@@ -2680,6 +2681,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         // This test fails before the joiner verifies it (inviter unreachable →
         // timeout → rollback), so any valid cert satisfies the presence check.
         inviter_enrollment: Some(mint_test_owner(0xA1).cert),
+        untargeted_decrypt_key: None,
     })
     .expect("encode URL");
 

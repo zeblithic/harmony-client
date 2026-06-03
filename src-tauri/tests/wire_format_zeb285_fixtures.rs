@@ -162,6 +162,7 @@ fn community_invite_with_fork_fields_pinned() {
         forked_from: Some(SpaceId([0xa0; 16])),
         pre_fork_snapshot: Some(snapshot),
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
 
     let bytes = canonical_cbor_encode(&payload).expect("encode");

@@ -72,6 +72,7 @@ fn open_invite_url_for(community_id: SpaceId, admin_seed: [u8; 32]) -> String {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
     encode_invite_url(&payload).expect("encode open invite url")
 }
@@ -131,6 +132,9 @@ fn invite_only_url() -> String {
         // inviter's EnrollmentCert. Its content is irrelevant — this URL must be
         // rejected at receive (verify_entry rejects invite-only directory entries).
         inviter_enrollment: Some(harmony_app::community_membership::mint_test_owner(0xC1).cert),
+        // ZEB-367: untargeted invite-only payload requires the URL decrypt key for
+        // encode_invite_url to accept it (content irrelevant — rejected at verify).
+        untargeted_decrypt_key: Some([0u8; 32]),
     };
     encode_invite_url(&payload).expect("encode invite-only url")
 }
@@ -693,6 +697,7 @@ async fn click_to_join_redeem_invite_smoke() {
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
+        untargeted_decrypt_key: None,
     };
     let founder_invite_url =
         harmony_app::build_open_invite_url(&invite_payload).expect("build open invite url");
