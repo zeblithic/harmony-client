@@ -59,7 +59,13 @@ pub(crate) fn owner_id_from_master_ed25519(master_ed25519: &[u8; 32]) -> OwnerAd
 /// `Option<String>`; a present value over the cap is a hard decode error so a
 /// malformed/oversized wire entry never enters the CRDT. `None`/absent is
 /// passed through unchanged, preserving the `skip_serializing_if` wire shape.
-fn deserialize_capped_display<'de, D>(d: D) -> Result<Option<String>, D::Error>
+///
+/// `pub(crate)` so the friend-handshake wire types (`FriendLinkRequest` /
+/// `FriendLinkAccepted` in `iroh_friend_acceptor`) can enforce the SAME cap at
+/// network ingress — an authenticated peer must not be able to push an
+/// oversized `display` through the handshake into a `FriendEntry` that then
+/// fails to deserialize on the owner's other devices during owner-state sync.
+pub(crate) fn deserialize_capped_display<'de, D>(d: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {

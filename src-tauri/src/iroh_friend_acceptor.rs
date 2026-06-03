@@ -57,6 +57,17 @@ pub struct FriendLinkRequest {
     /// `enrollment.owner_id` (checked by `verify_enrolled_device`).
     pub from_addr: OwnerAddr,
     /// The requester's advertised display name (UX hint). `None` when unset.
+    ///
+    /// Capped at `MAX_FRIEND_DISPLAY_LEN` at the WIRE boundary (oversized →
+    /// hard decode error, not truncation) via the same strict deserializer
+    /// `FriendEntry.display` uses. Without this cap an authenticated peer could
+    /// push an oversized `display` through the handshake into a `FriendEntry`,
+    /// which would then fail to deserialize on the owner's other devices during
+    /// owner-state sync.
+    #[serde(
+        default,
+        deserialize_with = "crate::friend_graph::deserialize_capped_display"
+    )]
     pub display: Option<String>,
     /// The friend-token signature being redeemed (the inviter's published
     /// `InviteToken.sig`). Bound into the request preimage; lets the acceptor
@@ -91,6 +102,14 @@ pub struct FriendLinkAccepted {
     /// `enrollment.owner_id`.
     pub from_addr: OwnerAddr,
     /// The accepter's advertised display name (UX hint). `None` when unset.
+    ///
+    /// Capped at `MAX_FRIEND_DISPLAY_LEN` at the WIRE boundary, same as
+    /// `FriendLinkRequest.display` — matters for the future Task-10 redeem path
+    /// that turns an accept into a local `FriendEntry`.
+    #[serde(
+        default,
+        deserialize_with = "crate::friend_graph::deserialize_capped_display"
+    )]
     pub display: Option<String>,
     /// The accepter's Master `EnrollmentCert`.
     pub enrollment: EnrollmentCert,
@@ -152,6 +171,12 @@ pub enum FriendHandshakeError {
     Encode(String),
     #[error("CBOR decode failed: {0}")]
     Decode(String),
+    /// Trailing bytes remained after the first CBOR item. `ciborium::from_reader`
+    /// stops at the first item and ignores the rest; we reject the remainder so
+    /// the friend decoders match the codebase's strict `canonical_cbor_decode`
+    /// (no smuggling extra bytes inside an otherwise-valid packet).
+    #[error("trailing bytes after CBOR: consumed={consumed} len={len}")]
+    TrailingBytes { consumed: usize, len: usize },
     /// The body exceeds [`FRIEND_MAX_PACKET_LEN`]. Bounds work on hostile input.
     #[error("friend packet exceeds size limit: len={len} max={max}")]
     TooLarge { len: usize, max: usize },
@@ -188,7 +213,7 @@ pub fn decode_friend_request(bytes: &[u8]) -> Result<FriendLinkRequest, FriendHa
             max: FRIEND_MAX_PACKET_LEN,
         });
     }
-    ciborium::from_reader(bytes).map_err(|e| FriendHandshakeError::Decode(e.to_string()))
+    decode_strict(bytes)
 }
 
 /// Encode a [`FriendLinkAccepted`] to CBOR bytes (no length prefix).
@@ -208,7 +233,26 @@ pub fn decode_friend_accepted(bytes: &[u8]) -> Result<FriendLinkAccepted, Friend
             max: FRIEND_MAX_PACKET_LEN,
         });
     }
-    ciborium::from_reader(bytes).map_err(|e| FriendHandshakeError::Decode(e.to_string()))
+    decode_strict(bytes)
+}
+
+/// Decode a single CBOR item from `bytes` and reject any trailing bytes.
+/// `ciborium::from_reader` reads the first item and silently ignores the rest;
+/// decoding via a cursor lets us assert the whole buffer was consumed, matching
+/// the codebase's strict `canonical_cbor_decode` (no extra bytes smuggled inside
+/// an otherwise-valid friend packet).
+fn decode_strict<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, FriendHandshakeError> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let val = ciborium::from_reader(&mut cursor)
+        .map_err(|e| FriendHandshakeError::Decode(e.to_string()))?;
+    let consumed = cursor.position() as usize;
+    if consumed != bytes.len() {
+        return Err(FriendHandshakeError::TrailingBytes {
+            consumed,
+            len: bytes.len(),
+        });
+    }
+    Ok(val)
 }
 
 /// Point-to-point enrolled-device authentication: the 4-step core of
@@ -667,6 +711,108 @@ mod tests {
             Err(FriendHandshakeError::TooLarge { .. }) => {}
             other => panic!("expected TooLarge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_rejects_oversized_display_request() {
+        // FIX 1: an authenticated peer must not be able to push a display longer
+        // than MAX_FRIEND_DISPLAY_LEN through the handshake. The cap is enforced
+        // at decode (wire ingress), mirroring FriendEntry.display.
+        use crate::friend_graph::MAX_FRIEND_DISPLAY_LEN;
+        let (mut req, _) = signed_request(0x40, [3u8; 64]);
+
+        // 257-byte display → must FAIL to decode.
+        req.display = Some("x".repeat(MAX_FRIEND_DISPLAY_LEN + 1));
+        let bytes = encode_friend_request(&req).expect("encode (serialize is uncapped)");
+        let err = decode_friend_request(&bytes).expect_err("oversized display rejected");
+        assert!(
+            matches!(err, FriendHandshakeError::Decode(_)),
+            "expected Decode error, got {err:?}"
+        );
+
+        // 256-byte display (exactly at the cap) → still decodes.
+        req.display = Some("y".repeat(MAX_FRIEND_DISPLAY_LEN));
+        let bytes = encode_friend_request(&req).expect("encode");
+        let back = decode_friend_request(&bytes).expect("at-cap display decodes");
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_display_accepted() {
+        // FIX 1, accept side (matters for the Task-10 redeem path that turns an
+        // accept into a local FriendEntry).
+        use crate::friend_graph::MAX_FRIEND_DISPLAY_LEN;
+        let owner = mint_test_owner(0x41);
+        let mut acc = FriendLinkAccepted {
+            from_addr: owner.owner,
+            display: Some("x".repeat(MAX_FRIEND_DISPLAY_LEN + 1)),
+            enrollment: owner.cert,
+            sig: [4u8; 64],
+        };
+
+        // 257-byte display → must FAIL to decode.
+        let bytes = encode_friend_accepted(&acc).expect("encode (serialize is uncapped)");
+        let err = decode_friend_accepted(&bytes).expect_err("oversized display rejected");
+        assert!(
+            matches!(err, FriendHandshakeError::Decode(_)),
+            "expected Decode error, got {err:?}"
+        );
+
+        // 256-byte display (exactly at the cap) → still decodes.
+        acc.display = Some("y".repeat(MAX_FRIEND_DISPLAY_LEN));
+        let bytes = encode_friend_accepted(&acc).expect("encode");
+        let back = decode_friend_accepted(&bytes).expect("at-cap display decodes");
+        assert_eq!(acc, back);
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes_request() {
+        // FIX 2: a valid request packet with extra trailing bytes appended (still
+        // within FRIEND_MAX_PACKET_LEN) must be rejected; the clean packet still
+        // round-trips.
+        let (req, _) = signed_request(0x42, [5u8; 64]);
+        let bytes = encode_friend_request(&req).expect("encode");
+
+        // Clean packet round-trips.
+        let back = decode_friend_request(&bytes).expect("clean packet decodes");
+        assert_eq!(req, back);
+
+        // Append trailing garbage → must be rejected as TrailingBytes.
+        let mut trailing = bytes.clone();
+        trailing.extend_from_slice(&[0xff, 0x00, 0x42]);
+        assert!(trailing.len() <= FRIEND_MAX_PACKET_LEN);
+        let err = decode_friend_request(&trailing).expect_err("trailing bytes rejected");
+        assert!(
+            matches!(err, FriendHandshakeError::TrailingBytes { .. }),
+            "expected TrailingBytes, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes_accepted() {
+        // FIX 2, accept side.
+        let owner = mint_test_owner(0x43);
+        let acc = FriendLinkAccepted {
+            from_addr: owner.owner,
+            display: None,
+            enrollment: owner.cert,
+            sig: [6u8; 64],
+        };
+        let bytes = encode_friend_accepted(&acc).expect("encode");
+
+        // Clean packet round-trips.
+        let back = decode_friend_accepted(&bytes).expect("clean packet decodes");
+        assert_eq!(acc, back);
+
+        // Append trailing garbage → must be rejected as TrailingBytes.
+        let mut trailing = bytes.clone();
+        trailing.extend_from_slice(&[0x01, 0x02]);
+        assert!(trailing.len() <= FRIEND_MAX_PACKET_LEN);
+        let err = decode_friend_accepted(&trailing).expect_err("trailing bytes rejected");
+        assert!(
+            matches!(err, FriendHandshakeError::TrailingBytes { .. }),
+            "expected TrailingBytes, got {err:?}"
+        );
     }
 
     #[test]
