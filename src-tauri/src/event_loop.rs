@@ -2827,17 +2827,22 @@ pub async fn run<R: Runtime>(
             Some(voice) = voice_rx.recv() => {
                 match voice {
                     crate::voice::VoiceOutbound::Channel { community_id, channel_id, frame } => {
-                        // ZEB-350: seal the whole frame (header + payload) under the
-                        // per-(community, channel) ChannelKey, then publish to an
-                        // own-device-named topic segment. Sender routing now lives in
-                        // the topic, not the cleartext header.
-                        if let Some(key) = voice_keys.get(&(community_id, channel_id)) {
+                        // ZEB-362: seal the frame AND sign it with this device's
+                        // signing key (the same device-#2 key that signs presence
+                        // beacons, stashed in `voice_identity` at Join), then
+                        // publish to the own-device-named topic. A receiver now
+                        // authenticates the sender from the verified presence map
+                        // instead of trusting the (sender-controlled) topic suffix.
+                        if let (Some(key), Some(identity)) = (
+                            voice_keys.get(&(community_id, channel_id)),
+                            voice_identity.get(&(community_id, channel_id)),
+                        ) {
                             let own = voice_own_device.as_deref().unwrap_or("self");
-                            match crate::voice_crypto::encrypt_voice_packet(
+                            match crate::voice_crypto::seal_and_sign_voice_packet(
                                 key,
+                                &identity.3,
                                 &community_id,
                                 &channel_id,
-                                crate::voice_crypto::VOICE_PACKET_AAD,
                                 &frame,
                             ) {
                                 Ok(sealed) => {
@@ -2851,10 +2856,11 @@ pub async fn run<R: Runtime>(
                                         tracing::warn!(%key_expr, err = %e, "voice publish failed");
                                     }
                                 }
-                                Err(e) => tracing::warn!(err = %e, "voice seal failed; dropping frame"),
+                                Err(e) => tracing::warn!(err = %e, "voice seal+sign failed; dropping frame"),
                             }
                         }
-                        // else: not joined to that (community, channel) — drop.
+                        // else: not joined / no signing identity for that
+                        // (community, channel) — drop.
                     }
                     // ZEB-352: DM call outbound — seal under the per-call K_voice and
                     // publish to harmony/voice/dm/{callId}/{own}.
@@ -2908,6 +2914,7 @@ pub async fn run<R: Runtime>(
                         // leave any prior state for this (community, channel)
                         // intact — old subscriber keeps running with the old key.
                         let key_for_sub = std::sync::Arc::clone(&caps.channel_key);
+                        let own_device_hex_sub = hex::encode(caps.self_device);
                         let (c_sub, ch_sub) = (community_id, channel_id);
                         let app_sub = app.clone();
                         let closing_sub = closing.clone();
@@ -2953,6 +2960,16 @@ pub async fn run<R: Runtime>(
                                         let mut made_progress = false;
                                         while let Ok(sample) = sub.recv_async().await {
                                             made_progress = true;
+                                            // ZEB-362 (Qodo perf): the `.../*` subscription also
+                                            // delivers our OWN published frames; skip them before
+                                            // the per-frame verify/open work (mirrors the DM
+                                            // subscriber's self-skip). We never play our own mic
+                                            // back.
+                                            if sample.key_expr().as_str().rsplit('/').next()
+                                                == Some(own_device_hex_sub.as_str())
+                                            {
+                                                continue;
+                                            }
                                             if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
                                                 tracing::warn!(
                                                     len = sample.payload().len(),
@@ -2961,58 +2978,83 @@ pub async fn run<R: Runtime>(
                                                 );
                                                 continue;
                                             }
-                                            // ZEB-358 media-drop: resolve this frame's
-                                            // sender device (last topic segment) → owner
-                                            // and drop the frame if that owner is muted
-                                            // or kicked in this channel right now. Fails
-                                            // open on an unparseable/unknown sender (not
-                                            // 32-byte hex, or not yet in the roster): such
-                                            // a frame can't carry a validly-sealed payload
-                                            // for this channel anyway, and the sender
-                                            // resolves within ~4 s once presence lands.
+                                            // ZEB-362: authenticate the sender of EVERY frame
+                                            // (always-verify, fail-closed). The topic suffix is
+                                            // now an untrusted hint; the detached Ed25519
+                                            // signature, checked against the device VK we trust
+                                            // from the verified presence roster, binds the frame
+                                            // to its owner.
                                             //
-                                            // Gated on the `voice_moderation_active` flag
-                                            // so the hot path does ZERO extra locks/parsing
-                                            // in the common case where no moderation is in
-                                            // effect (Qodo perf).
-                                            if mod_active_media.load(std::sync::atomic::Ordering::Relaxed) {
-                                                let key = sample.key_expr().as_str();
-                                                if let Some(sender_hex) = key.rsplit('/').next() {
-                                                    if let Ok(dev_bytes) = hex::decode(sender_hex) {
-                                                        if let Ok(dev) = <[u8; 32]>::try_from(dev_bytes.as_slice()) {
-                                                            let owner = {
-                                                                let g = presence_map_media.lock().await;
-                                                                g.owner_for_device(&c_sub, &ch_sub, &dev)
-                                                            };
-                                                            if let Some(owner) = owner {
-                                                                let now = (voice_now_ms_media)();
-                                                                let g = mod_map_media.lock().await;
-                                                                if g.is_muted(&c_sub, &ch_sub, &owner, now)
-                                                                    || g.is_kicked(&c_sub, &ch_sub, &owner, now)
-                                                                {
-                                                                    continue; // drop moderated sender's frame
-                                                                }
-                                                            }
-                                                        }
-                                                    }
+                                            // (1) parse the claimed device VK from the suffix.
+                                            let dev = match sample
+                                                .key_expr()
+                                                .as_str()
+                                                .rsplit('/')
+                                                .next()
+                                                .and_then(|h| hex::decode(h).ok())
+                                                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                                            {
+                                                Some(d) => d,
+                                                None => continue, // not 32-byte hex → drop
+                                            };
+                                            // (2) device → verified owner from the signed presence
+                                            //     roster. Unknown device → drop (fail-closed). The
+                                            //     start-muted invariant (D10) means a transmitting
+                                            //     device has already announced presence, so this
+                                            //     costs no real audio.
+                                            let owner = {
+                                                let g = presence_map_media.lock().await;
+                                                g.owner_for_device(&c_sub, &ch_sub, &dev)
+                                            };
+                                            let owner = match owner {
+                                                Some(o) => o,
+                                                None => continue,
+                                            };
+                                            let sealed = sample.payload().to_bytes().to_vec();
+                                            // (3) verify the per-frame signature against the device.
+                                            if crate::voice_crypto::verify_voice_frame_sig(
+                                                &dev, &c_sub, &ch_sub, &sealed,
+                                            )
+                                            .is_err()
+                                            {
+                                                continue; // forged / spoofed-suffix / corrupt → drop
+                                            }
+                                            // (4) moderation drop on the now-AUTHENTICATED owner,
+                                            //     gated for the hot path (no extra locks while no
+                                            //     moderation is active — Qodo perf).
+                                            if mod_active_media
+                                                .load(std::sync::atomic::Ordering::Relaxed)
+                                            {
+                                                let now = (voice_now_ms_media)();
+                                                let g = mod_map_media.lock().await;
+                                                if g.is_muted(&c_sub, &ch_sub, &owner, now)
+                                                    || g.is_kicked(&c_sub, &ch_sub, &owner, now)
+                                                {
+                                                    continue; // moderated sender — un-spoofable now
                                                 }
                                             }
-                                            let sealed = sample.payload().to_bytes().to_vec();
-                                            match crate::voice_crypto::decrypt_voice_packet(
+                                            // (5) open the packet (AAD binds the device VK).
+                                            let frame = match crate::voice_crypto::open_voice_packet_unchecked(
                                                 &key_for_sub,
+                                                &dev,
                                                 &c_sub,
                                                 &ch_sub,
-                                                crate::voice_crypto::VOICE_PACKET_AAD,
                                                 &sealed,
                                             ) {
-                                                Ok(frame) => {
-                                                    let _ = app_sub.emit(
-                                                        "voice-frame-received",
-                                                        serde_json::json!({ "frameBytes": frame }),
-                                                    );
-                                                }
-                                                Err(_) => { /* non-member / stale epoch / tamper → drop silently */ }
+                                                Ok(f) => f,
+                                                Err(_) => continue, // wrong key / stale / tamper → drop
+                                            };
+                                            // (6) attribution integrity: the cleartext header's
+                                            //     senderHash (VK[0..16], bytes 7..23) must match the
+                                            //     authenticated device, so a member can't sign their
+                                            //     own frame but mislabel the audio as someone else.
+                                            if frame.len() < 23 || frame[7..23] != dev[..16] {
+                                                continue;
                                             }
+                                            let _ = app_sub.emit(
+                                                "voice-frame-received",
+                                                serde_json::json!({ "frameBytes": frame }),
+                                            );
                                         }
                                         // Inner receive loop ended on a transport
                                         // error. Stop if we're shutting down.

@@ -15,8 +15,8 @@ use harmony_app::owner_state_types::{
     DeviceIdentityHash, DmContentKey, EpochKey, Hlc, OwnerAddr, SpaceId,
 };
 use harmony_app::voice_crypto::{
-    encrypt_dm_voice_packet_with_nonce, encrypt_voice_packet_with_nonce, VOICE_DM_PACKET_AAD,
-    VOICE_PACKET_AAD,
+    encrypt_dm_voice_packet_with_nonce, seal_and_sign_voice_packet_with_nonce,
+    verify_and_open_voice_packet, VOICE_DM_PACKET_AAD,
 };
 use harmony_app::voice_moderation::{
     seal_directive_with_nonce, sign_directive, ModAction, VoiceModerationDirective,
@@ -28,27 +28,48 @@ use harmony_app::voice_presence::{
 use harmony_app::voice_signal::{SignedVoiceSignal, VoiceSignal, VoiceSignalKind};
 
 #[test]
-fn voice_packet_wire_bytes_pinned() {
+fn voice_packet_v2_wire_bytes_pinned() {
     let key = derive_channel_key(
         &EpochKey::new([0x11; 32]),
         &SpaceId([0xc0; 16]),
         &ChannelId([0xc1; 16]),
     );
-    // 23-byte header (flags|seq|ts|senderHash) + a short opus payload, all zeros
-    // except markers — the relay seals the whole frame opaquely.
+    // Fixed device-#2 signing key [7u8;32] (matches the presence-beacon fixture),
+    // 23-byte header + short payload, zeroed nonce → fully deterministic envelope
+    // [nonce(12)][ct+tag][sig(64)]. Ed25519 is deterministic for a fixed key+msg.
+    let device_sk = SigningKey::from_bytes(&[7u8; 32]);
+    let device_vk = device_sk.verifying_key().to_bytes();
     let frame: Vec<u8> = (0u8..30).collect();
-    let sealed = encrypt_voice_packet_with_nonce(
+    let sealed = seal_and_sign_voice_packet_with_nonce(
         &key,
+        &device_sk,
         &SpaceId([0xc0; 16]),
         &ChannelId([0xc1; 16]),
-        VOICE_PACKET_AAD,
         &frame,
         [0u8; 12],
     )
-    .expect("seal");
-    let actual = hex::encode(&sealed);
-    let expected = "000000000000000000000000ac5b18940b0bae8a9581f7fe741e457ecacd15abbe96c2fe579c73777fc6b4542adb6477613e68651bd4237c586c";
-    assert_eq!(actual, expected, "sealed voice-packet wire format drifted");
+    .expect("seal+sign");
+    // GENERATE-THEN-PIN: run this test once with the placeholder below; it will
+    // fail and print the actual hex. Paste that value here, then re-run to green.
+    let expected = "000000000000000000000000ac5b18940b0bae8a9581f7fe741e457ecacd15abbe96c2fe579c73777fc6928b5daad373502dfd16022c6313ee0c438e6d109bb945eb6ace67025f3ce27120489aeeff75aa1a02ca51b97fc71f9746924b8a21de8780d907aeea2bf304f8be6c4346e6667ecd0bc7762ff253d500";
+    assert_eq!(
+        hex::encode(&sealed),
+        expected,
+        "sealed v2 voice-packet wire format drifted"
+    );
+    // Meaningful, not opaque: the pinned bytes must verify + open back to `frame`.
+    assert_eq!(
+        verify_and_open_voice_packet(
+            &key,
+            &device_vk,
+            &SpaceId([0xc0; 16]),
+            &ChannelId([0xc1; 16]),
+            &sealed
+        )
+        .expect("pinned v2 packet must verify+open"),
+        frame,
+        "pinned v2 packet opened to a different frame"
+    );
 }
 
 /// Fully deterministic signed+sealed presence beacon: fixed device-#2 key
