@@ -1530,184 +1530,223 @@ pub async fn run<R: Runtime>(
     // dropped (and aborted) at the end of this block. It is explicitly aborted
     // in the shutdown drain below (like the media subscribers) rather than left
     // to terminate on the `closing` flag + a `recv_async` error.
-    let voice_signal_sub_handle: Option<tokio::task::JoinHandle<()>> =
-        if let (Some(dm_outbox), Some(crdt_state)) = (dm_outbox.as_ref(), crdt_state.as_ref()) {
-            // Snapshot self owner + derive our X25519 private once, under the
-            // outbox lock, before spawning the long-lived subscriber.
-            let (self_owner_hex, self_x25519_priv) = {
-                let g = dm_outbox.lock().await;
-                let hex = hex::encode(g.self_owner.0);
-                let x_priv = crate::dm_signing::ed25519_priv_to_x25519(&g.community_signing_key);
-                (hex, x_priv)
-            };
-            let key_expr = format!("harmony/voice-signal/{self_owner_hex}");
-            let session_for_signal = Arc::clone(&session_arc);
-            let crdt_for_signal = Arc::clone(crdt_state);
-            let app_for_signal = app.clone();
-            let closing_for_signal = Arc::clone(&closing);
-            let signal_handle = tokio::spawn(async move {
-                let mut backoff = std::time::Duration::from_secs(5);
-                const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
-                loop {
-                    if closing_for_signal.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let sub = match session_for_signal.declare_subscriber(&key_expr).await {
-                        Ok(s) => {
-                            backoff = std::time::Duration::from_secs(5);
-                            s
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                %key_expr,
-                                error = %e,
-                                backoff_s = backoff.as_secs(),
-                                "voice signal declare_subscriber failed; retrying after backoff"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
-                            continue;
-                        }
-                    };
-                    loop {
-                        match sub.recv_async().await {
-                            Ok(sample) => {
-                                // The signaling topic is peer-writable, so bound
-                                // the payload BEFORE allocating: a sealed signal
-                                // is a few hundred bytes; cap well above that so
-                                // one oversized sample can't force an unbounded
-                                // heap allocation ahead of peek_caller's reject.
-                                const MAX_VOICE_SIGNAL_BYTES: usize = 8 * 1024;
-                                if sample.payload().len() > MAX_VOICE_SIGNAL_BYTES {
-                                    tracing::warn!(
-                                        size = sample.payload().len(),
-                                        max = MAX_VOICE_SIGNAL_BYTES,
-                                        "oversized voice signal dropped"
-                                    );
-                                    continue;
-                                }
-                                let sealed = sample.payload().to_bytes().to_vec();
-                                // Open + decode the sealed box ONCE. The box is
-                                // sealed to our X25519 key (identical for every
-                                // candidate device), so we open here and only
-                                // re-verify the Ed25519 signature per candidate
-                                // below — never re-opening. The decoded caller is
-                                // unverified until verify_decoded_signal binds the
-                                // signature to a cached identity.
-                                let signed = match crate::voice_signal::open_and_decode_unverified(
-                                    &self_x25519_priv,
-                                    &sealed,
-                                ) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
-                                let caller = signed.body.caller;
-                                // Collect ALL cached identity pubs for the
-                                // caller — Harmony is multi-device, so the
-                                // caller may have signed with any enrolled
-                                // device. Try each until one verifies.
-                                let candidate_pubs: Vec<[u8; 64]> = {
-                                    let g = crdt_for_signal.lock().await;
-                                    g.owner_device_cache
-                                        .devices
-                                        .get(&caller)
-                                        .map(|entry| {
-                                            entry
-                                                .device_identity_pubs
-                                                .iter()
-                                                .filter_map(|p| *p)
-                                                .collect()
-                                        })
-                                        .unwrap_or_default()
-                                };
-                                let mut emitted = false;
-                                for identity_pub in candidate_pubs {
-                                    let Some(device_hash) =
-                                        crate::dm_signing::derive_device_hash_from_identity_pub(
-                                            &identity_pub,
-                                        )
-                                    else {
-                                        continue;
-                                    };
-                                    if let Ok(signal) = crate::voice_signal::verify_decoded_signal(
-                                        &signed,
-                                        &identity_pub,
-                                        device_hash,
-                                    ) {
-                                        if matches!(
-                                            signal.kind,
-                                            crate::voice_signal::VoiceSignalKind::Invite
-                                        ) {
-                                            // Resolve the shared DM space for this caller so the
-                                            // frontend can pass spaceId to accept_call/decline_call.
-                                            let space_hex = {
-                                                let g = crdt_for_signal.lock().await;
-                                                g.spaces.iter().find_map(|(sid, sp)| {
-                                                    // Match the 1:1 DM space with this caller only.
-                                                    // `members.len() == 2` excludes group-DM spaces
-                                                    // (which also have a content_key and include the
-                                                    // caller) — the send side likewise assumes a
-                                                    // 2-member DM (resolve_dm_call_peer).
-                                                    if sp.content_key.is_some()
-                                                        && sp.members.len() == 2
-                                                        && sp.members.contains(&signal.caller)
-                                                    {
-                                                        Some(hex::encode(sid.0))
-                                                    } else {
-                                                        None
-                                                    }
-                                                })
-                                            };
-                                            match space_hex {
-                                                Some(ref sh) => {
-                                                    emit_voice_signal_event(
-                                                        &app_for_signal,
-                                                        &signal,
-                                                        Some(sh.as_str()),
-                                                    );
-                                                }
-                                                None => {
-                                                    // No shared DM space with the caller — callee
-                                                    // cannot service this invite; drop silently.
-                                                    tracing::debug!(
-                                                        caller = %hex::encode(signal.caller.0),
-                                                        "voice Invite dropped: no shared DM space"
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            emit_voice_signal_event(&app_for_signal, &signal, None);
-                                        }
-                                        emitted = true;
-                                        break;
-                                    }
-                                }
-                                let _ = emitted;
-                            }
-                            Err(_) => {
-                                if !closing_for_signal.load(Ordering::SeqCst) {
-                                    tracing::warn!(
-                                        %key_expr,
-                                        "voice signal subscriber closed; reconnecting"
-                                    );
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if closing_for_signal.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    // Brief pause before re-declaring on mid-session failure.
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-            });
-            // Hand the handle back as the block's tail value so the run()-scope
-            // binding keeps the task alive (vs. dropping it here, which aborts).
-            Some(signal_handle)
-        } else {
-            None
+    let voice_signal_sub_handle: Option<tokio::task::JoinHandle<()>> = if let (
+        Some(dm_outbox),
+        Some(crdt_state),
+    ) =
+        (dm_outbox.as_ref(), crdt_state.as_ref())
+    {
+        // Snapshot self owner + derive our X25519 private once, under the
+        // outbox lock, before spawning the long-lived subscriber.
+        let (self_owner_hex, self_owner, self_x25519_priv) = {
+            let g = dm_outbox.lock().await;
+            let hex = hex::encode(g.self_owner.0);
+            let x_priv = crate::dm_signing::ed25519_priv_to_x25519(&g.community_signing_key);
+            (hex, g.self_owner, x_priv)
         };
+        let key_expr = format!("harmony/voice-signal/{self_owner_hex}");
+        let session_for_signal = Arc::clone(&session_arc);
+        let crdt_for_signal = Arc::clone(crdt_state);
+        let app_for_signal = app.clone();
+        let closing_for_signal = Arc::clone(&closing);
+        let signal_handle = tokio::spawn(async move {
+            let mut backoff = std::time::Duration::from_secs(5);
+            const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+            loop {
+                if closing_for_signal.load(Ordering::SeqCst) {
+                    break;
+                }
+                let sub = match session_for_signal.declare_subscriber(&key_expr).await {
+                    Ok(s) => {
+                        backoff = std::time::Duration::from_secs(5);
+                        s
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %key_expr,
+                            error = %e,
+                            backoff_s = backoff.as_secs(),
+                            "voice signal declare_subscriber failed; retrying after backoff"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                        continue;
+                    }
+                };
+                loop {
+                    match sub.recv_async().await {
+                        Ok(sample) => {
+                            // The signaling topic is peer-writable, so bound
+                            // the payload BEFORE allocating: a sealed signal
+                            // is a few hundred bytes; cap well above that so
+                            // one oversized sample can't force an unbounded
+                            // heap allocation ahead of peek_caller's reject.
+                            const MAX_VOICE_SIGNAL_BYTES: usize = 8 * 1024;
+                            if sample.payload().len() > MAX_VOICE_SIGNAL_BYTES {
+                                tracing::warn!(
+                                    size = sample.payload().len(),
+                                    max = MAX_VOICE_SIGNAL_BYTES,
+                                    "oversized voice signal dropped"
+                                );
+                                continue;
+                            }
+                            let sealed = sample.payload().to_bytes().to_vec();
+                            // Open + decode the sealed box ONCE. The box is
+                            // sealed to our X25519 key (identical for every
+                            // candidate device), so we open here and only
+                            // re-verify the Ed25519 signature per candidate
+                            // below — never re-opening. The decoded caller is
+                            // unverified until verify_decoded_signal binds the
+                            // signature to a cached identity.
+                            let signed = match crate::voice_signal::open_and_decode_unverified(
+                                &self_x25519_priv,
+                                &sealed,
+                            ) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            let caller = signed.body.caller;
+                            // Collect ALL cached identity pubs for the
+                            // caller — Harmony is multi-device, so the
+                            // caller may have signed with any enrolled
+                            // device. Try each until one verifies.
+                            let candidate_pubs: Vec<[u8; 64]> = {
+                                let g = crdt_for_signal.lock().await;
+                                g.owner_device_cache
+                                    .devices
+                                    .get(&caller)
+                                    .map(|entry| {
+                                        entry
+                                            .device_identity_pubs
+                                            .iter()
+                                            .filter_map(|p| *p)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            let mut emitted = false;
+                            for identity_pub in candidate_pubs {
+                                let Some(device_hash) =
+                                    crate::dm_signing::derive_device_hash_from_identity_pub(
+                                        &identity_pub,
+                                    )
+                                else {
+                                    continue;
+                                };
+                                if let Ok(signal) = crate::voice_signal::verify_decoded_signal(
+                                    &signed,
+                                    &identity_pub,
+                                    device_hash,
+                                ) {
+                                    if let Some(sp) = signal.space_id {
+                                        // ZEB-360 group path: the signal names its
+                                        // space directly — no 2-member scan. Verify the
+                                        // space exists, is a GroupDm, the caller is a
+                                        // member, and it carries a content_key. Then
+                                        // route by kind. For a Decline, `signal.caller`
+                                        // is the decliner (responder), so requiring the
+                                        // caller to be a group member is correct.
+                                        let ok = {
+                                            let g = crdt_for_signal.lock().await;
+                                            g.spaces.get(&sp).is_some_and(|s| {
+                                                s.kind
+                                                    == crate::owner_state_types::SpaceKind::GroupDm
+                                                    && s.content_key.is_some()
+                                                    && s.members.contains(&signal.caller)
+                                                    // The LOCAL owner must also still be a
+                                                    // current member — a device holding the
+                                                    // space in CRDT but no longer in `members`
+                                                    // would otherwise surface a ring it can't
+                                                    // join (join_group_call /
+                                                    // resolve_group_call_members reject it).
+                                                    && s.members.contains(&self_owner)
+                                            })
+                                        };
+                                        if ok {
+                                            emit_group_voice_signal_event(
+                                                &app_for_signal,
+                                                &signal,
+                                                &hex::encode(sp.0),
+                                            );
+                                        } else {
+                                            tracing::debug!(
+                                                    "group voice signal dropped: space invalid / caller not a member"
+                                                );
+                                        }
+                                    } else if matches!(
+                                        signal.kind,
+                                        crate::voice_signal::VoiceSignalKind::Invite
+                                    ) {
+                                        // Resolve the shared DM space for this caller so the
+                                        // frontend can pass spaceId to accept_call/decline_call.
+                                        let space_hex = {
+                                            let g = crdt_for_signal.lock().await;
+                                            g.spaces.iter().find_map(|(sid, sp)| {
+                                                // Match the 1:1 DM space with this caller only.
+                                                // `members.len() == 2` excludes group-DM spaces
+                                                // (which also have a content_key and include the
+                                                // caller) — the send side likewise assumes a
+                                                // 2-member DM (resolve_dm_call_peer).
+                                                if sp.content_key.is_some()
+                                                    && sp.members.len() == 2
+                                                    && sp.members.contains(&signal.caller)
+                                                {
+                                                    Some(hex::encode(sid.0))
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                        };
+                                        match space_hex {
+                                            Some(ref sh) => {
+                                                emit_voice_signal_event(
+                                                    &app_for_signal,
+                                                    &signal,
+                                                    Some(sh.as_str()),
+                                                );
+                                            }
+                                            None => {
+                                                // No shared DM space with the caller — callee
+                                                // cannot service this invite; drop silently.
+                                                tracing::debug!(
+                                                    caller = %hex::encode(signal.caller.0),
+                                                    "voice Invite dropped: no shared DM space"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        emit_voice_signal_event(&app_for_signal, &signal, None);
+                                    }
+                                    emitted = true;
+                                    break;
+                                }
+                            }
+                            let _ = emitted;
+                        }
+                        Err(_) => {
+                            if !closing_for_signal.load(Ordering::SeqCst) {
+                                tracing::warn!(
+                                    %key_expr,
+                                    "voice signal subscriber closed; reconnecting"
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+                if closing_for_signal.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Brief pause before re-declaring on mid-session failure.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+        // Hand the handle back as the block's tail value so the run()-scope
+        // binding keeps the task alive (vs. dropping it here, which aborts).
+        Some(signal_handle)
+    } else {
+        None
+    };
 
     // ── ZEB-343: content-serve queryable ─────────────────────────
     // Answer peer content GETs from the local StorageTier cache. The
@@ -2055,6 +2094,56 @@ pub async fn run<R: Runtime>(
             std::sync::Arc<ed25519_dalek::SigningKey>,
         ),
     > = std::collections::HashMap::new();
+
+    // ── ZEB-360: group-DM voice presence bookkeeping ───────────────────────
+    // Group presence is space-scoped (topic harmony/voice-presence/group-dm/
+    // {spaceIdHex}, sealed under derive_groupdm_presence_key). The ROSTER lives
+    // in its OWN `groupdm_presence_map` (declared below), keyed by
+    // (SpaceId(space_id), ChannelId(call_id)); a dedicated map (rather than the
+    // shared community `voice_presence_map`) lets the eviction sweep TTL-evict
+    // crashed group participants without disturbing community sweep semantics.
+    //
+    // One read-subscriber per watched space (WatchGroupCall; banner + in-call
+    // roster both consume it). Keyed by raw 16-byte space_id.
+    let mut groupdm_presence_subs: std::collections::HashMap<
+        [u8; 16],
+        tokio::task::JoinHandle<()>,
+    > = std::collections::HashMap::new();
+    // One beacon publisher per active call we're in, keyed by (space_id, call_id).
+    let mut groupdm_presence_pubs: std::collections::HashMap<
+        ([u8; 16], [u8; 16]),
+        tokio::task::JoinHandle<()>,
+    > = std::collections::HashMap::new();
+    // The shared mute flag handed to each call's publisher; SetGroupCallMuted
+    // flips it (next beacon reflects it). Keyed by (space_id, call_id).
+    let mut groupdm_presence_mute: std::collections::HashMap<
+        ([u8; 16], [u8; 16]),
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    > = std::collections::HashMap::new();
+    // Caps needed to mint+sign the `left` tombstone at StopGroupPresence time
+    // (topic + presence_key + signing identity), stashed alongside the publisher.
+    // Keyed by (space_id, call_id).
+    #[allow(clippy::type_complexity)]
+    let mut groupdm_presence_caps: std::collections::HashMap<
+        ([u8; 16], [u8; 16]),
+        (
+            String,                                                   // topic
+            std::sync::Arc<crate::community_channel_log::ChannelKey>, // presence_key
+            std::sync::Arc<ed25519_dalek::SigningKey>,                // signing_key
+            crate::owner_state_types::OwnerAddr,                      // self_owner
+            [u8; 32],                                                 // self_device
+            crate::owner_state_types::Hlc,                            // joined_hlc
+        ),
+    > = std::collections::HashMap::new();
+    // ZEB-360 crash-eviction parity: group presence gets its OWN roster map (not
+    // the shared community `voice_presence_map`). The eviction sweep below sweeps
+    // BOTH maps with the same TTL, so a crashed group-call participant who never
+    // published a `left` tombstone TTL-evicts as a ghost row, exactly like
+    // community voice. Keyed by (SpaceId(space_id), ChannelId(call_id)).
+    let groupdm_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::voice_presence::VoicePresenceMap::new(),
+    ));
+
     // Monotonic clock for apply/sweep (ms since the loop's `start` Instant,
     // matching the `now` math the UDP/timer arms already use).
     let voice_now_ms: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> =
@@ -3787,6 +3876,204 @@ pub async fn run<R: Runtime>(
                             );
                         }
                     }
+                    // ── ZEB-360: group-DM voice presence ──────────────────────
+                    // Space-scoped presence on topic
+                    // harmony/voice-presence/group-dm/{spaceIdHex}, sealed under the
+                    // group-DM presence key. The ROSTER lives in the dedicated
+                    // `groupdm_presence_map` keyed by (SpaceId(space_id),
+                    // ChannelId(call_id)); media reuses the 1:1 DM path verbatim
+                    // (JoinDmCall), so nothing media-related lives here.
+                    crate::voice::VoiceChannelRequest::WatchGroupCall {
+                        space_id,
+                        presence_key,
+                    } => {
+                        // Read-only roster subscriber for the banner + in-call view.
+                        // Idempotent: a second watch for the same space is a no-op
+                        // (keep the running sub). Needs the CRDT to verify membership.
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            groupdm_presence_subs.entry(space_id)
+                        {
+                            if let Some(crdt) = crdt_state.as_ref() {
+                                let topic = format!(
+                                    "harmony/voice-presence/group-dm/{}",
+                                    hex::encode(space_id)
+                                );
+                                let sub =
+                                    crate::voice_presence::spawn_groupdm_presence_subscriber(
+                                        session.clone(),
+                                        topic,
+                                        presence_key,
+                                        crate::owner_state_types::SpaceId(space_id),
+                                        std::sync::Arc::clone(crdt),
+                                        std::sync::Arc::clone(&groupdm_presence_map),
+                                        app.clone(),
+                                        closing.clone(),
+                                        std::sync::Arc::clone(&voice_now_ms),
+                                    );
+                                slot.insert(sub);
+                            } else {
+                                tracing::warn!(
+                                    "WatchGroupCall before CRDT state loaded; dropping"
+                                );
+                            }
+                        }
+                    }
+                    crate::voice::VoiceChannelRequest::UnwatchGroupCall { space_id } => {
+                        // Only tear down the read subscriber if NO publisher is active
+                        // for this space (an in-call member keeps the roster live).
+                        let publisher_active = groupdm_presence_pubs
+                            .keys()
+                            .any(|(sp, _call)| *sp == space_id);
+                        if !publisher_active {
+                            if let Some(h) = groupdm_presence_subs.remove(&space_id) {
+                                h.abort();
+                            }
+                            // Drop ALL of this space's roster rows — including
+                            // subscriber-discovered `(space, call)` rows we never
+                            // published into (those `groupdm_presence_caps` can't
+                            // reach, and which would otherwise survive until the TTL
+                            // sweep with no subscriber left to refresh/evict them).
+                            {
+                                let mut g = groupdm_presence_map.lock().await;
+                                g.remove_space(&crate::owner_state_types::SpaceId(space_id));
+                            }
+                        }
+                    }
+                    crate::voice::VoiceChannelRequest::StartGroupPresence {
+                        space_id,
+                        call_id,
+                        presence_key,
+                        caps,
+                    } => {
+                        let topic = format!(
+                            "harmony/voice-presence/group-dm/{}",
+                            hex::encode(space_id)
+                        );
+                        // Ensure the read subscriber is running (reuse the
+                        // WatchGroupCall setup if absent) so the in-call roster is live.
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            groupdm_presence_subs.entry(space_id)
+                        {
+                            if let Some(crdt) = crdt_state.as_ref() {
+                                let sub =
+                                    crate::voice_presence::spawn_groupdm_presence_subscriber(
+                                        session.clone(),
+                                        topic.clone(),
+                                        std::sync::Arc::clone(&presence_key),
+                                        crate::owner_state_types::SpaceId(space_id),
+                                        std::sync::Arc::clone(crdt),
+                                        std::sync::Arc::clone(&groupdm_presence_map),
+                                        app.clone(),
+                                        closing.clone(),
+                                        std::sync::Arc::clone(&voice_now_ms),
+                                    );
+                                slot.insert(sub);
+                            } else {
+                                tracing::warn!(
+                                    "StartGroupPresence before CRDT state loaded; \
+                                     publishing without a local roster subscriber"
+                                );
+                            }
+                        }
+                        // Start muted (D7); SetGroupCallMuted flips it later. The
+                        // publisher and any immediate beacon share one monotone seq.
+                        let muted = std::sync::Arc::new(
+                            std::sync::atomic::AtomicBool::new(true),
+                        );
+                        let seq_counter = std::sync::Arc::new(
+                            std::sync::atomic::AtomicU64::new(0),
+                        );
+                        groupdm_presence_mute.insert(
+                            (space_id, call_id),
+                            std::sync::Arc::clone(&muted),
+                        );
+                        let pubh = crate::voice_presence::spawn_groupdm_presence_publisher(
+                            session.clone(),
+                            topic.clone(),
+                            std::sync::Arc::clone(&presence_key),
+                            crate::owner_state_types::SpaceId(space_id),
+                            call_id,
+                            std::sync::Arc::clone(&caps.signing_key),
+                            caps.self_owner,
+                            caps.self_device,
+                            caps.joined_hlc.clone(),
+                            muted,
+                            seq_counter,
+                            Duration::from_secs(4),
+                            closing.clone(),
+                        );
+                        // Stash the tombstone caps so StopGroupPresence can mint the
+                        // `left` beacon without re-resolving identity.
+                        groupdm_presence_caps.insert(
+                            (space_id, call_id),
+                            (
+                                topic,
+                                presence_key,
+                                std::sync::Arc::clone(&caps.signing_key),
+                                caps.self_owner,
+                                caps.self_device,
+                                caps.joined_hlc,
+                            ),
+                        );
+                        if let Some(old) =
+                            groupdm_presence_pubs.insert((space_id, call_id), pubh)
+                        {
+                            old.abort();
+                        }
+                    }
+                    crate::voice::VoiceChannelRequest::StopGroupPresence {
+                        space_id,
+                        call_id,
+                    } => {
+                        // Abort the heartbeat publisher BEFORE publishing the
+                        // `left` tombstone: otherwise a heartbeat tick can race the
+                        // tombstone and re-add this device to peer rosters until the
+                        // TTL sweep. Leave the read subscriber running (the DM view
+                        // may still be watching; UnwatchGroupCall stops it on
+                        // unmount).
+                        if let Some((
+                            topic,
+                            presence_key,
+                            signing_key,
+                            self_owner,
+                            self_device,
+                            joined_hlc,
+                        )) = groupdm_presence_caps.remove(&(space_id, call_id))
+                        {
+                            if let Some(h) = groupdm_presence_pubs.remove(&(space_id, call_id)) {
+                                h.abort();
+                            }
+                            crate::voice_presence::publish_groupdm_leave_tombstone(
+                                &session,
+                                &topic,
+                                &presence_key,
+                                &crate::owner_state_types::SpaceId(space_id),
+                                call_id,
+                                &signing_key,
+                                self_owner,
+                                self_device,
+                                &joined_hlc,
+                            )
+                            .await;
+                        } else if let Some(h) = groupdm_presence_pubs.remove(&(space_id, call_id)) {
+                            // No caps stashed (shouldn't happen) — still abort the
+                            // publisher so it can't keep advertising presence.
+                            h.abort();
+                        }
+                        groupdm_presence_mute.remove(&(space_id, call_id));
+                    }
+                    crate::voice::VoiceChannelRequest::SetGroupCallMuted {
+                        space_id,
+                        call_id,
+                        muted,
+                    } => {
+                        // Flip the presence beacon's mute bit (next beacon reflects
+                        // it). Media mute is handled separately via SetDmCallMuted
+                        // (Task 8) — do NOT touch media here. No-op if not in this call.
+                        if let Some(flag) = groupdm_presence_mute.get(&(space_id, call_id)) {
+                            flag.store(muted, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
                 }
             }
 
@@ -3808,7 +4095,10 @@ pub async fn run<R: Runtime>(
             // silent for >12 s, then re-emits the roster for each affected
             // (community, channel) exactly once. Gated on active voice channels
             // so a node with none joined never wakes here (Cursor review).
-            _ = voice_sweep_tick.tick(), if !voice_keys.is_empty() => {
+            // ZEB-360: also fires while any group-DM presence subscriber is live,
+            // so a crashed group-call participant's ghost row TTL-evicts too.
+            _ = voice_sweep_tick.tick(),
+                if !voice_keys.is_empty() || !groupdm_presence_subs.is_empty() => {
                 let now = (voice_now_ms)();
                 let evicted = {
                     let mut g = voice_presence_map.lock().await;
@@ -3833,6 +4123,39 @@ pub async fn run<R: Runtime>(
                             serde_json::json!({
                                 "community": hex::encode(c.0),
                                 "channel": hex::encode(ch.0),
+                                "roster": roster,
+                            }),
+                        );
+                    }
+                }
+                // ── ZEB-360: group-DM presence crash-eviction ─────────────
+                // Sweep the dedicated group map with the SAME `now` + TTL, then
+                // re-emit each affected (space, call) roster as a group event so
+                // a crashed participant (no `left` tombstone) drops to ghost like
+                // community voice. Graceful leaves already publish a tombstone.
+                let swept_group = {
+                    let mut g = groupdm_presence_map.lock().await;
+                    g.sweep(now, VOICE_PRESENCE_TTL_MS)
+                };
+                if !swept_group.is_empty() {
+                    // Dedup the (space, call) keys; emit each once.
+                    let mut seen: std::collections::HashSet<(
+                        crate::owner_state_types::SpaceId,
+                        crate::community_membership::ChannelId,
+                    )> = std::collections::HashSet::new();
+                    for ((sp, call), _owner, _device) in &swept_group {
+                        seen.insert((*sp, *call));
+                    }
+                    for (sp, call) in seen {
+                        let roster = {
+                            let g = groupdm_presence_map.lock().await;
+                            g.roster(&sp, &call)
+                        };
+                        let _ = app.emit(
+                            "group-call-presence-changed",
+                            serde_json::json!({
+                                "spaceId": hex::encode(sp.0),
+                                "callId": hex::encode(call.0),
                                 "roster": roster,
                             }),
                         );
@@ -4052,6 +4375,16 @@ pub async fn run<R: Runtime>(
     for (_, handle) in dm_voice_subs.drain() {
         handle.abort();
     }
+    // ZEB-360: abort the group-DM presence subscriber/publisher tasks too, for the
+    // same reason — the group subscriber can emit `group-call-presence-changed`
+    // into a stale AppHandle in the closing→session-close window, and a leftover
+    // publisher would keep putting beacons past shutdown.
+    for (_, handle) in groupdm_presence_subs.drain() {
+        handle.abort();
+    }
+    for (_, handle) in groupdm_presence_pubs.drain() {
+        handle.abort();
+    }
     // ZEB-352: abort the always-on voice-signal subscriber too, so it can't emit
     // signaling events into a stale AppHandle during the closing→session-close
     // window or race a subsequent start_node restart.
@@ -4104,6 +4437,44 @@ fn emit_voice_signal_event<R: Runtime>(
         VoiceSignalKind::End => {
             let _ = app.emit("call-ended", serde_json::json!({ "callId": call_hex }));
         }
+    }
+}
+
+/// ZEB-360: emit the frontend event for a verified inbound *group* voice signal.
+/// Only `Invite`/`Decline` carry to the UI (group calls follow a drop-in model:
+/// no Accept/Cancel/End signals are sent). `space_id_hex` names the GroupDm space
+/// so the banner/roster can scope correctly. Mirrors [`emit_voice_signal_event`].
+fn emit_group_voice_signal_event<R: Runtime>(
+    app: &AppHandle<R>,
+    signal: &crate::voice_signal::VoiceSignal,
+    space_id_hex: &str,
+) {
+    use crate::voice_signal::VoiceSignalKind;
+    let call_hex = hex::encode(signal.call_id);
+    match signal.kind {
+        VoiceSignalKind::Invite => {
+            let _ = app.emit(
+                "incoming-group-call",
+                serde_json::json!({
+                    "callId": call_hex,
+                    "callerOwner": hex::encode(signal.caller.0),
+                    "spaceId": space_id_hex,
+                }),
+            );
+        }
+        VoiceSignalKind::Decline => {
+            // `caller` on a Decline is the decliner (responder).
+            let _ = app.emit(
+                "group-call-declined",
+                serde_json::json!({
+                    "callId": call_hex,
+                    "spaceId": space_id_hex,
+                    "owner": hex::encode(signal.caller.0),
+                }),
+            );
+        }
+        // Drop-in model: no group Accept/Cancel/End signals are sent.
+        _ => {}
     }
 }
 

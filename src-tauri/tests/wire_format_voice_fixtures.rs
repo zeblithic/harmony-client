@@ -100,6 +100,37 @@ fn presence_beacon_wire_bytes_pinned() {
     assert_eq!(opened, signed, "pinned beacon decoded to a different value");
 }
 
+/// ZEB-360: pin the sealed group-DM presence beacon wire format. Wrapped with a
+/// `call_id` and sealed under the call-independent `derive_groupdm_presence_key`,
+/// scoped to a `space_id`.
+#[test]
+fn groupdm_presence_beacon_wire_bytes_pinned() {
+    use harmony_app::community_channel_log::derive_groupdm_presence_key;
+    use harmony_app::voice_presence::{
+        open_groupdm_presence_beacon, seal_groupdm_presence_beacon_with_nonce,
+        GroupSignedPresenceBeacon,
+    };
+    let key = derive_groupdm_presence_key(&DmContentKey::new([0x11; 32]));
+    let space = SpaceId([0x44; 16]);
+    let wrapped = GroupSignedPresenceBeacon {
+        call_id: [0x22; 16],
+        signed: fixture_signed_beacon(),
+    };
+    let sealed =
+        seal_groupdm_presence_beacon_with_nonce(&key, &space, &wrapped, [0u8; 12]).expect("seal");
+    assert_eq!(
+        hex::encode(&sealed),
+        "0000000000000000000000000f3487b70aeee9f5cef22160d2b0ad5a0979b3eb01cc5e76501622e7497d8551e46b97eeec02cdf8f11fed60b3bbd6a08428d6e304ec9c5ab627a1bbcf1e16856caa769b096446a4df4c2b49d1fa740942b17173f9149d0c21c59d1596a4c09d8c09899efc9122ec6375c78526a51c0a8ca29e6414d29550b12bc0162d6267a039904a0f42d11dac6e76466d665f27100817f9076fd132e60c2c10edb256d68e4629c897486d113933657ee7af357132dc6e531d3180aed9fd27eb537844b25330d44b9976210e168c7f9b04185c7481fde745cb31881463a929d039c1af0f6e527bc04eb35efa23afac8ab0ca86073e53ab5e68a53b7f49dfd36f57e94fc77d4a4b08",
+        "group-DM presence-beacon wire format drifted"
+    );
+    // Round-trip back-compat: pinned bytes must reopen to the same wrapped beacon.
+    let opened = open_groupdm_presence_beacon(&key, &space, &sealed).expect("open pinned beacon");
+    assert_eq!(
+        opened, wrapped,
+        "pinned group beacon decoded to a different value"
+    );
+}
+
 /// Pin the DM voice-packet wire format. A drift here means the AEAD
 /// framing or AAD construction changed — re-pin deliberately.
 #[test]
@@ -166,6 +197,7 @@ fn voice_signal_invite_signed_inner_wire_bytes_pinned() {
         kind: VoiceSignalKind::Invite,
         call_id: [0x22; 16],
         caller: OwnerAddr([0x33; 16]),
+        space_id: None,
         decline_reason: None,
     };
 
@@ -202,6 +234,35 @@ fn voice_signal_invite_signed_inner_wire_bytes_pinned() {
         derived_hash, device_hash,
         "device_hash must match derived value"
     );
+}
+
+/// ZEB-360: pin the signed-inner CBOR of a GROUP-DM voice Invite (space_id set).
+/// Distinct from the 1:1 fixture by exactly the added `si` bstr(16) field; the
+/// 1:1 fixture's byte-identity is the back-compat guard that proves the field is
+/// skipped when None.
+#[test]
+fn voice_signal_group_invite_signed_inner_wire_bytes_pinned() {
+    let (signing_key, identity_pub, device_hash) = fixture_caller_identity(0x42);
+    let body = VoiceSignal {
+        kind: VoiceSignalKind::Invite,
+        call_id: [0x22; 16],
+        caller: OwnerAddr([0x33; 16]),
+        space_id: Some(SpaceId([0x44; 16])),
+        decline_reason: None,
+    };
+    let mut body_bytes = Vec::new();
+    ciborium::into_writer(&body, &mut body_bytes).expect("CBOR serialize VoiceSignal");
+    let sig = sign_dm_packet(&body_bytes, &signing_key);
+    let signed = SignedVoiceSignal { body, sig };
+    let mut signed_bytes = Vec::new();
+    ciborium::into_writer(&signed, &mut signed_bytes).expect("CBOR serialize SignedVoiceSignal");
+    assert_eq!(
+        hex::encode(&signed_bytes),
+        "a2626264a4616b66696e76697465626369502222222222222222222222222222222262636c50333333333333333333333333333333336273695044444444444444444444444444444444627367584007d34024a63e25c951df586b6e179a9e5fdf3b4cdb47ae5fdf9819b0ba24cb30d360ab2c88e499f5cbc0c3b2f87f4611cacf761d269ef0b2453abeedbf53f10c",
+        "GroupDm SignedVoiceSignal signed-inner CBOR wire format drifted"
+    );
+    verify_dm_packet_signature(&body_bytes, &sig, &identity_pub, device_hash)
+        .expect("group Invite signature must verify");
 }
 
 // ---------------------------------------------------------------------------

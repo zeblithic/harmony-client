@@ -93,6 +93,22 @@ pub fn derive_dm_voice_key(dm_key: &DmContentKey, call_id: &[u8; 16]) -> Channel
     ChannelKey(*out)
 }
 
+/// HKDF-SHA256 derivation of the group-DM **presence** key from the group's
+/// `DmContentKey`. Unlike `derive_dm_voice_key`, this is **call-independent**
+/// (no `call_id` salt) so every member can derive it and decrypt presence
+/// beacons BEFORE joining any call — the basis for the join-in-progress banner
+/// (ZEB-360 D2). Domain-separated from the media key by a distinct `info`
+/// string; the same group content key yields a presence key unrelated to any
+/// per-call `derive_dm_voice_key` output, and it survives across successive
+/// calls in the group.
+pub fn derive_groupdm_presence_key(dm_key: &DmContentKey) -> ChannelKey {
+    let mut out = zeroize::Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(None, dm_key.as_bytes())
+        .expand(b"voice-presence-groupdm:", out.as_mut())
+        .expect("32 ≤ 8160");
+    ChannelKey(*out)
+}
+
 /// 16-byte ULID identifying a single message within a channel.
 /// Generated client-side at post time. Stable identity for v3
 /// references (Edit/Delete/React variants will target this id).
@@ -2668,5 +2684,29 @@ mod tests {
         let k_b = derive_dm_voice_key(&dm, &call_b);
         assert_eq!(k_a1.as_bytes(), k_a2.as_bytes());
         assert_ne!(k_a1.as_bytes(), k_b.as_bytes());
+    }
+
+    #[test]
+    fn groupdm_presence_key_is_stable_and_domain_separated() {
+        let ck = crate::owner_state_types::DmContentKey::new([0x11; 32]);
+        // Stable across calls (no per-call salt): same content_key -> same key.
+        let a = derive_groupdm_presence_key(&ck);
+        let b = derive_groupdm_presence_key(&ck);
+        assert_eq!(
+            a.as_bytes(),
+            b.as_bytes(),
+            "presence key must be call-independent"
+        );
+        // Domain-separated from the media key for any call_id.
+        let media = derive_dm_voice_key(&ck, &[0x22; 16]);
+        assert_ne!(
+            a.as_bytes(),
+            media.as_bytes(),
+            "presence key must differ from media key"
+        );
+        // Different content_key -> different presence key.
+        let other =
+            derive_groupdm_presence_key(&crate::owner_state_types::DmContentKey::new([0x99; 32]));
+        assert_ne!(a.as_bytes(), other.as_bytes());
     }
 }

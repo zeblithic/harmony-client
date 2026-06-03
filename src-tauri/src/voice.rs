@@ -88,6 +88,45 @@ pub enum VoiceChannelRequest {
         /// HLC minted at the IPC boundary for directive LWW ordering.
         issued_hlc: crate::owner_state_types::Hlc,
     },
+    /// ZEB-360: start a READ-ONLY group-DM presence subscriber for the banner
+    /// (no beacon publishing). Idempotent per space_id.
+    WatchGroupCall {
+        space_id: [u8; 16],
+        presence_key: Arc<ChannelKey>,
+    },
+    /// ZEB-360: stop the read-only subscriber for a space (banner closed).
+    UnwatchGroupCall { space_id: [u8; 16] },
+    /// ZEB-360: start the group-DM presence PUBLISHER for our own beacon on a
+    /// call we are joining. The read subscriber (WatchGroupCall) is reused for
+    /// the in-call roster; this only adds the publisher.
+    StartGroupPresence {
+        space_id: [u8; 16],
+        call_id: [u8; 16],
+        presence_key: Arc<ChannelKey>,
+        caps: VoiceGroupPresenceCaps,
+    },
+    /// ZEB-360: publish a `left` tombstone beacon and stop the publisher (we are
+    /// leaving the call). The read subscriber persists if the DM is still open.
+    StopGroupPresence {
+        space_id: [u8; 16],
+        call_id: [u8; 16],
+    },
+    /// ZEB-360: flip the mute bit for an active group call — updates the presence
+    /// beacon's muted bit (media mute is handled via the existing SetDmCallMuted).
+    SetGroupCallMuted {
+        space_id: [u8; 16],
+        call_id: [u8; 16],
+        muted: bool,
+    },
+}
+
+/// ZEB-360: capabilities needed to publish a group-DM presence beacon.
+#[derive(Debug, Clone)]
+pub struct VoiceGroupPresenceCaps {
+    pub signing_key: Arc<ed25519_dalek::SigningKey>,
+    pub self_owner: OwnerAddr,
+    pub self_device: [u8; 32],
+    pub joined_hlc: crate::owner_state_types::Hlc,
 }
 
 /// Payload for the send_voice_frame Tauri command.
@@ -122,6 +161,23 @@ pub struct SendDmVoiceFramePayload {
 #[serde(rename_all = "camelCase")]
 pub struct SetDmCallMutedPayload {
     pub call_id: String,
+    pub muted: bool,
+}
+
+/// ZEB-360: a media frame for a group-DM call. Identical shape to the DM
+/// payload — group media reuses the DM media path (topic + key + AAD).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendGroupVoiceFramePayload {
+    pub call_id: String,
+    pub frame_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetGroupCallMutedPayload {
+    pub call_id: String,
+    pub space_id: String,
     pub muted: bool,
 }
 

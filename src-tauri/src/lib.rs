@@ -12020,6 +12020,7 @@ async fn send_voice_signal(
         kind,
         call_id,
         caller: self_owner,
+        space_id: None,
         decline_reason: reason,
     };
 
@@ -12048,6 +12049,176 @@ async fn send_voice_signal(
             })
             .await
             .map_err(|_| "event loop not running".to_string())?;
+    }
+    Ok(())
+}
+
+// ── ZEB-360 Group-DM voice: helpers ───────────────────────────────────────────
+
+/// ZEB-360: resolve everything needed to fan a group-DM voice signal. Returns
+/// (other_members_with_x25519_pubs, dm_key, signing_key, self_owner). Each entry
+/// is one OwnerAddr + its X25519 pub per enrolled device (signal delivery is
+/// owner-scoped, so we fan one sealed envelope per device).
+///
+/// Snapshots under the sync mutex (no await while locked), then does the
+/// async CRDT + outbox reads outside the lock.
+async fn resolve_group_call_members(
+    state: &std::sync::Mutex<NodeState>,
+    space_id_hex: &str,
+) -> Result<
+    (
+        Vec<(crate::owner_state_types::OwnerAddr, Vec<[u8; 32]>)>,
+        crate::owner_state_types::DmContentKey,
+        std::sync::Arc<ed25519_dalek::SigningKey>,
+        crate::owner_state_types::OwnerAddr,
+    ),
+    String,
+> {
+    let space_bytes = hex::decode(space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
+    let space_arr: [u8; 16] = space_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("space_id must be 16 bytes, got {}", space_bytes.len()))?;
+    let space_id = crate::owner_state_types::SpaceId(space_arr);
+
+    // Snapshot handles under the std mutex — no await while locked.
+    let (crdt_state, dm_outbox, self_owner) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let crdt = g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let outbox = g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let owner = g.dm_self_owner.ok_or("dm_self_owner missing")?;
+        (crdt, outbox, owner)
+    };
+
+    let (members, dm_key) = {
+        let os = crdt_state.lock().await;
+        let space = os
+            .spaces
+            .get(&space_id)
+            .ok_or_else(|| "group dm space not found".to_string())?;
+        if space.kind != crate::owner_state_types::SpaceKind::GroupDm {
+            return Err("not a group-dm space".to_string());
+        }
+        let dm_key = space
+            .content_key
+            .clone()
+            .ok_or_else(|| "group dm has no content key".to_string())?;
+        if !space.members.contains(&self_owner) {
+            return Err("self is not a member of this group dm".to_string());
+        }
+        let mut out: Vec<(crate::owner_state_types::OwnerAddr, Vec<[u8; 32]>)> = Vec::new();
+        for m in space.members.iter().filter(|m| **m != self_owner) {
+            let mut pubs: Vec<[u8; 32]> = os
+                .owner_device_cache
+                .devices
+                .get(m)
+                .map(|entry| {
+                    entry
+                        .device_identity_pubs
+                        .iter()
+                        .filter_map(|p| *p)
+                        .map(|identity_pub| {
+                            let mut x = [0u8; 32];
+                            x.copy_from_slice(&identity_pub[..32]);
+                            x
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            pubs.sort_unstable();
+            pubs.dedup();
+            if !pubs.is_empty() {
+                out.push((*m, pubs));
+            }
+        }
+        (out, dm_key)
+    };
+
+    let signing_key = dm_outbox.lock().await.community_signing_key.clone();
+    Ok((members, dm_key, signing_key, self_owner))
+}
+
+/// ZEB-360 (Greptile R2): resolve a SINGLE owner's deduped X25519 device pubs
+/// from the CRDT owner-device cache. Mirrors the per-member resolution inside
+/// `resolve_group_call_members` (take `ip[..32]` of each non-`None`
+/// `device_identity_pub`, sort+dedup). Returns an empty vec if the owner has no
+/// cached device keys yet (keys not propagated). Read-only.
+async fn resolve_owner_x25519_pubs(
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    owner: &crate::owner_state_types::OwnerAddr,
+) -> Vec<[u8; 32]> {
+    let os = crdt_state.lock().await;
+    let mut pubs: Vec<[u8; 32]> = os
+        .owner_device_cache
+        .devices
+        .get(owner)
+        .map(|entry| {
+            entry
+                .device_identity_pubs
+                .iter()
+                .filter_map(|p| *p)
+                .map(|identity_pub| {
+                    let mut x = [0u8; 32];
+                    x.copy_from_slice(&identity_pub[..32]);
+                    x
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    pubs.sort_unstable();
+    pubs.dedup();
+    pubs
+}
+
+/// ZEB-360: build, sign, seal, and fan a group `VoiceSignal` to a set of member
+/// owners (one sealed envelope per enrolled device each). `space_id` is always
+/// set so the inbound handler takes the group path.
+#[allow(clippy::too_many_arguments)]
+async fn send_group_voice_signal(
+    state: &std::sync::Mutex<NodeState>,
+    space_id_hex: &str,
+    kind: crate::voice_signal::VoiceSignalKind,
+    call_id: [u8; 16],
+    reason: Option<crate::voice_signal::DeclineReason>,
+    recipients: &[(crate::owner_state_types::OwnerAddr, Vec<[u8; 32]>)],
+    signing_key: &std::sync::Arc<ed25519_dalek::SigningKey>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+) -> Result<(), String> {
+    let space_bytes = hex::decode(space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
+    let space_arr: [u8; 16] = space_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "space_id must be 16 bytes".to_string())?;
+    let signal = crate::voice_signal::VoiceSignal {
+        kind,
+        call_id,
+        caller: self_owner,
+        space_id: Some(crate::owner_state_types::SpaceId(space_arr)),
+        decline_reason: reason,
+    };
+    let voice_signal_tx = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.voice_signal_tx
+            .clone()
+            .ok_or_else(|| "voice signal not running".to_string())?
+    };
+    for (owner, pubs) in recipients {
+        let callee_owner_hex = hex::encode(owner.0);
+        for p in pubs {
+            let sealed = crate::voice_signal::build_sealed_signal(&signal, signing_key, p)
+                .map_err(|e| format!("seal signal: {e}"))?;
+            voice_signal_tx
+                .send(crate::voice_signal::VoiceSignalRequest {
+                    callee_owner_hex: callee_owner_hex.clone(),
+                    sealed,
+                })
+                .await
+                .map_err(|_| "event loop not running".to_string())?;
+        }
     }
     Ok(())
 }
@@ -12151,6 +12322,369 @@ async fn end_call(
         None,
     )
     .await
+}
+
+// ── ZEB-360 Group-DM voice: signaling IPCs ────────────────────────────────────
+
+/// ZEB-360: place a group-DM voice call. Mints a 16-byte call_id, fans a sealed
+/// Invite (with space_id) to every other member, returns the call_id hex.
+#[tauri::command]
+async fn place_group_call(
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    use rand::RngCore;
+    let (members, _dm_key, signing_key, self_owner) =
+        resolve_group_call_members(&state, &space_id).await?;
+    let mut call_id = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut call_id);
+    send_group_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Invite,
+        call_id,
+        None,
+        &members,
+        &signing_key,
+        self_owner,
+    )
+    .await?;
+    Ok(hex::encode(call_id))
+}
+
+/// ZEB-360: decline an incoming group-DM call — seals a Decline back to the
+/// caller only (parity). `caller_owner` comes from the incoming-group-call event.
+#[tauri::command]
+async fn decline_group_call(
+    call_id: String,
+    space_id: String,
+    caller_owner: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    let caller_bytes =
+        hex::decode(&caller_owner).map_err(|_| "caller_owner not hex".to_string())?;
+    let caller_arr: [u8; 16] = caller_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "caller_owner must be 16 bytes".to_string())?;
+    let caller = crate::owner_state_types::OwnerAddr(caller_arr);
+    // `resolve_group_call_members` validates this is a GroupDm we're in and gives
+    // us the signing key + self owner. Its member list is FILTERED to owners whose
+    // X25519 keys are already cached, so the caller may be absent from it even
+    // though they are a space member whose keys simply haven't propagated yet.
+    let (members, _dm_key, signing_key, self_owner) =
+        resolve_group_call_members(&state, &space_id).await?;
+    let target = if let Some(t) = members.into_iter().find(|(o, _)| *o == caller) {
+        Some(t)
+    } else {
+        // ZEB-360 (Greptile R2): the caller wasn't in the (key-cached) member set.
+        // Try a DIRECT CRDT lookup of their X25519 pubs so a not-yet-propagated
+        // key doesn't swallow the Decline (which would leave them ringing forever).
+        let space_arr = parse_space_id_16(&space_id)?;
+        let space_id_typed = crate::owner_state_types::SpaceId(space_arr);
+        let crdt_state = {
+            let g = state
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+        };
+        let is_member = {
+            let os = crdt_state.lock().await;
+            os.spaces
+                .get(&space_id_typed)
+                .is_some_and(|space| space.members.contains(&caller))
+        };
+        if is_member {
+            let pubs = resolve_owner_x25519_pubs(&crdt_state, &caller).await;
+            if pubs.is_empty() {
+                None
+            } else {
+                Some((caller, pubs))
+            }
+        } else {
+            return Err("caller not a member of this group dm".to_string());
+        }
+    };
+    let Some(target) = target else {
+        // Keys genuinely unresolvable (not yet propagated) — best-effort no-op
+        // rather than an error, so the UI Decline doesn't surface a failure.
+        tracing::debug!(
+            "decline_group_call: caller keys not cached, decline not delivered (best-effort)"
+        );
+        return Ok(());
+    };
+    send_group_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Decline,
+        call,
+        Some(crate::voice_signal::DeclineReason::User),
+        &[target],
+        &signing_key,
+        self_owner,
+    )
+    .await
+}
+
+/// ZEB-360: return a group-DM space's member owner addresses as lowercase hex.
+/// Read-only; the CRDT `space.members` is the authoritative membership the
+/// frontend needs to render ringing/declined roster rows for members who have
+/// not yet sent a presence beacon. Includes self (the caller); the frontend
+/// roster merge excludes self.
+#[tauri::command]
+async fn get_group_dm_members(
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<String>, String> {
+    let space_bytes = hex::decode(&space_id).map_err(|e| format!("space_id hex: {e}"))?;
+    let space_arr: [u8; 16] = space_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "space_id must be 16 bytes".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(space_arr);
+    let (crdt_state, self_owner) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let crdt = g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let owner = g.dm_self_owner.ok_or("dm_self_owner missing")?;
+        (crdt, owner)
+    };
+    let os = crdt_state.lock().await;
+    let space = os
+        .spaces
+        .get(&space_id)
+        .ok_or_else(|| "group dm space not found".to_string())?;
+    if space.kind != crate::owner_state_types::SpaceKind::GroupDm {
+        return Err("not a group-dm space".to_string());
+    }
+    // ZEB-360 (Cursor R3): parity with `resolve_group_call_members` — only a
+    // current member may read the roster. Without this gate a removed identity
+    // could still read the membership of a group DM lingering in its local CRDT.
+    if !space.members.contains(&self_owner) {
+        return Err("self is not a member of this group dm".to_string());
+    }
+    Ok(space.members.iter().map(|m| hex::encode(m.0)).collect())
+}
+
+// ── ZEB-360 Group-DM voice: media + presence IPCs ────────────────────────────
+
+fn parse_space_id_16(s: &str) -> Result<[u8; 16], String> {
+    parse_voice_id_16("spaceId", s)
+}
+
+/// ZEB-360: start a READ-ONLY group presence subscription (banner).
+#[tauri::command]
+async fn watch_group_call(
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let (_members, dm_key, _sk, _self) = resolve_group_call_members(&state, &space_id).await?;
+    let presence_key = std::sync::Arc::new(
+        crate::community_channel_log::derive_groupdm_presence_key(&dm_key),
+    );
+    let space_arr = parse_space_id_16(&space_id)?;
+    let tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::WatchGroupCall {
+        space_id: space_arr,
+        presence_key,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-360: stop the read-only banner subscription for a space.
+#[tauri::command]
+async fn unwatch_group_call(
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let space_arr = parse_space_id_16(&space_id)?;
+    let tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::UnwatchGroupCall {
+        space_id: space_arr,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-360: join (or drop into) a group-DM call — reuses the DM media path
+/// (JoinDmCall) and additionally starts the group presence publisher.
+#[tauri::command]
+async fn join_group_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    let (_members, dm_key, signing_key, self_owner) =
+        resolve_group_call_members(&state, &space_id).await?;
+    let space_arr = parse_space_id_16(&space_id)?;
+
+    // Snapshot device + hlc exactly like join_dm_call.
+    let (voice_channel_tx, device_hex, self_device, hlc_tracker) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let tx = guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        let device_hex = guard
+            .dm_device_id
+            .clone()
+            .ok_or_else(|| "no device id".to_string())?;
+        let self_device = <[u8; 32]>::try_from(
+            hex::decode(&device_hex)
+                .map_err(|_| "device id not hex".to_string())?
+                .as_slice(),
+        )
+        .map_err(|_| "device id must be 32 bytes".to_string())?;
+        let hlc_tracker = guard
+            .hlc_tracker
+            .clone()
+            .ok_or_else(|| "no hlc tracker".to_string())?;
+        (tx, device_hex, self_device, hlc_tracker)
+    };
+
+    let k_voice = crate::community_channel_log::derive_dm_voice_key(&dm_key, &call);
+    let presence_key = std::sync::Arc::new(
+        crate::community_channel_log::derive_groupdm_presence_key(&dm_key),
+    );
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let joined_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms).await;
+
+    // Media: identical to a DM call (same topic/key/AAD), addressed by call_id.
+    voice_channel_tx
+        .send(voice::VoiceChannelRequest::JoinDmCall {
+            call_id: call,
+            caps: voice::VoiceJoinCaps {
+                channel_key: std::sync::Arc::new(k_voice),
+                signing_key: signing_key.clone(),
+                self_owner,
+                self_device,
+                joined_hlc: joined_hlc.clone(),
+            },
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    // Presence: publish our beacon + ensure the read subscriber is running.
+    voice_channel_tx
+        .send(voice::VoiceChannelRequest::StartGroupPresence {
+            space_id: space_arr,
+            call_id: call,
+            presence_key,
+            caps: voice::VoiceGroupPresenceCaps {
+                signing_key,
+                self_owner,
+                self_device,
+                joined_hlc,
+            },
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-360: leave a group-DM call — tombstone our presence beacon + tear down media.
+#[tauri::command]
+async fn leave_group_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    let space_arr = parse_space_id_16(&space_id)?;
+    let tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    // ZEB-360 (Cursor R4): tear down MEDIA first, then presence. Both requests
+    // travel the same mpsc, so a partial failure is only reachable if the event
+    // loop's receiver is dropped strictly between these two awaits (i.e. the loop
+    // is shutting down and tearing the whole session down anyway). In that window
+    // media-first yields the SAFE residual — the mic/audio is already gone, so no
+    // "hot mic after leave"; a lingering presence beacon self-evicts via the
+    // VOICE_PRESENCE_TTL_MS TTL on peers. (Mirrors the media-first privacy
+    // ordering used for mute.)
+    tx.send(voice::VoiceChannelRequest::LeaveDmCall { call_id: call })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    tx.send(voice::VoiceChannelRequest::StopGroupPresence {
+        space_id: space_arr,
+        call_id: call,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-360: send a group-call media frame — reuses the DM media outbound.
+#[tauri::command]
+async fn send_group_voice_frame(
+    payload: voice::SendGroupVoiceFramePayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&payload.call_id)?;
+    let voice_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    voice_tx
+        .send(voice::VoiceOutbound::Dm {
+            call_id: call,
+            frame: payload.frame_bytes,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-360: flip the mute bit for an active group call (media + presence).
+#[tauri::command]
+async fn set_group_call_muted(
+    payload: voice::SetGroupCallMutedPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&payload.call_id)?;
+    let space_arr = parse_space_id_16(&payload.space_id)?;
+    let tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    // Media mute (reuses the DM mute flag keyed by call_id).
+    tx.send(voice::VoiceChannelRequest::SetDmCallMuted {
+        call_id: call,
+        muted: payload.muted,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())?;
+    // Presence mute (next beacon reflects it).
+    tx.send(voice::VoiceChannelRequest::SetGroupCallMuted {
+        space_id: space_arr,
+        call_id: call,
+        muted: payload.muted,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
 }
 
 /// ZEB-352: join a 1:1 DM voice call media session. Derives the per-call
@@ -33140,6 +33674,16 @@ pub fn run() {
             leave_dm_call,
             send_dm_voice_frame,
             set_dm_call_muted,
+            // ZEB-360 Group-DM voice calls (signaling + media + presence IPCs).
+            place_group_call,
+            decline_group_call,
+            get_group_dm_members,
+            watch_group_call,
+            unwatch_group_call,
+            join_group_call,
+            leave_group_call,
+            send_group_voice_frame,
+            set_group_call_muted,
             send_mail,
             list_mail,
             get_mail,
@@ -33345,6 +33889,16 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         leave_dm_call,
         send_dm_voice_frame,
         set_dm_call_muted,
+        // ZEB-360 Group-DM voice calls (signaling + media + presence IPCs).
+        place_group_call,
+        decline_group_call,
+        get_group_dm_members,
+        watch_group_call,
+        unwatch_group_call,
+        join_group_call,
+        leave_group_call,
+        send_group_voice_frame,
+        set_group_call_muted,
     ])
 }
 
