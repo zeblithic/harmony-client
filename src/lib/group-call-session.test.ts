@@ -234,6 +234,22 @@ describe('GroupCallSession signaling + roster', () => {
     });
   });
 
+  it('setDeafened rolls deafened back when the coupled setMuted rejects', async () => {
+    const s = newSession();
+    await s.joinActive('c1'.repeat(16), 'space-1');
+    await s.setMuted(false); // unmute first so deafen triggers the coupled self-mute
+    expect(get(s.state).muted).toBe(false);
+    expect(get(s.state).deafened).toBe(false);
+    d.invoke.mockClear();
+
+    d.invoke.mockRejectedValueOnce(new Error('mute refused'));
+    await expect(s.setDeafened(true)).rejects.toThrow(/refused/);
+    // The coupled mute IPC failed → deafen must NOT stick (no "deafened but the
+    // backend never self-muted" limbo), and the mixer is rolled back too.
+    expect(get(s.state).deafened).toBe(false);
+    expect(d.mixer.setDeafened).toHaveBeenLastCalledWith(false);
+  });
+
   // 10 ────────────────────────────────────────────────────────────────────────
   it('leave invokes leave_group_call, returns to idle, clears participants', async () => {
     const s = newSession();

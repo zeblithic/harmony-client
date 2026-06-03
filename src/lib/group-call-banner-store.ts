@@ -32,6 +32,18 @@ function createGroupCallBannerStore() {
         return next;
       });
     },
+    /** Drop a space's banner entry outright. Called on `unwatch_group_call`:
+     *  once unwatched the app stops receiving presence updates for the space, so
+     *  a call that ends while unwatched would otherwise leave a stale entry that
+     *  `joinGroupCall` could drive a join into (a now-dead callId). */
+    clear(spaceId: string) {
+      update((m) => {
+        if (!(spaceId in m)) return m;
+        const next = { ...m };
+        delete next[spaceId];
+        return next;
+      });
+    },
   };
 }
 

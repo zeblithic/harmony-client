@@ -1538,11 +1538,11 @@ pub async fn run<R: Runtime>(
     {
         // Snapshot self owner + derive our X25519 private once, under the
         // outbox lock, before spawning the long-lived subscriber.
-        let (self_owner_hex, self_x25519_priv) = {
+        let (self_owner_hex, self_owner, self_x25519_priv) = {
             let g = dm_outbox.lock().await;
             let hex = hex::encode(g.self_owner.0);
             let x_priv = crate::dm_signing::ed25519_priv_to_x25519(&g.community_signing_key);
-            (hex, x_priv)
+            (hex, g.self_owner, x_priv)
         };
         let key_expr = format!("harmony/voice-signal/{self_owner_hex}");
         let session_for_signal = Arc::clone(&session_arc);
@@ -1653,6 +1653,13 @@ pub async fn run<R: Runtime>(
                                                     == crate::owner_state_types::SpaceKind::GroupDm
                                                     && s.content_key.is_some()
                                                     && s.members.contains(&signal.caller)
+                                                    // The LOCAL owner must also still be a
+                                                    // current member — a device holding the
+                                                    // space in CRDT but no longer in `members`
+                                                    // would otherwise surface a ring it can't
+                                                    // join (join_group_call /
+                                                    // resolve_group_call_members reject it).
+                                                    && s.members.contains(&self_owner)
                                             })
                                         };
                                         if ok {
@@ -3921,25 +3928,14 @@ pub async fn run<R: Runtime>(
                             if let Some(h) = groupdm_presence_subs.remove(&space_id) {
                                 h.abort();
                             }
-                            // Drop this space's roster rows. We can only remove rows
-                            // for call_ids we know about (the calls we published into
-                            // — see groupdm_presence_caps); subscriber-discovered rows
-                            // for other call_ids fall to the TTL backstop. In the
-                            // group-DM drop-in model there is at most one in-flight
-                            // call per space, so this clears the common case.
-                            let calls: Vec<[u8; 16]> = groupdm_presence_caps
-                                .keys()
-                                .filter(|(sp, _c)| *sp == space_id)
-                                .map(|(_sp, c)| *c)
-                                .collect();
-                            if !calls.is_empty() {
+                            // Drop ALL of this space's roster rows — including
+                            // subscriber-discovered `(space, call)` rows we never
+                            // published into (those `groupdm_presence_caps` can't
+                            // reach, and which would otherwise survive until the TTL
+                            // sweep with no subscriber left to refresh/evict them).
+                            {
                                 let mut g = groupdm_presence_map.lock().await;
-                                for call in calls {
-                                    g.remove_channel(
-                                        &crate::owner_state_types::SpaceId(space_id),
-                                        &crate::community_membership::ChannelId(call),
-                                    );
-                                }
+                                g.remove_space(&crate::owner_state_types::SpaceId(space_id));
                             }
                         }
                     }
@@ -4029,10 +4025,12 @@ pub async fn run<R: Runtime>(
                         space_id,
                         call_id,
                     } => {
-                        // Publish a `left` tombstone so peers evict us immediately,
-                        // then stop the publisher. Leave the read subscriber running
-                        // (the DM view may still be watching; UnwatchGroupCall stops
-                        // it on unmount).
+                        // Abort the heartbeat publisher BEFORE publishing the
+                        // `left` tombstone: otherwise a heartbeat tick can race the
+                        // tombstone and re-add this device to peer rosters until the
+                        // TTL sweep. Leave the read subscriber running (the DM view
+                        // may still be watching; UnwatchGroupCall stops it on
+                        // unmount).
                         if let Some((
                             topic,
                             presence_key,
@@ -4042,6 +4040,9 @@ pub async fn run<R: Runtime>(
                             joined_hlc,
                         )) = groupdm_presence_caps.remove(&(space_id, call_id))
                         {
+                            if let Some(h) = groupdm_presence_pubs.remove(&(space_id, call_id)) {
+                                h.abort();
+                            }
                             crate::voice_presence::publish_groupdm_leave_tombstone(
                                 &session,
                                 &topic,
@@ -4054,8 +4055,9 @@ pub async fn run<R: Runtime>(
                                 &joined_hlc,
                             )
                             .await;
-                        }
-                        if let Some(h) = groupdm_presence_pubs.remove(&(space_id, call_id)) {
+                        } else if let Some(h) = groupdm_presence_pubs.remove(&(space_id, call_id)) {
+                            // No caps stashed (shouldn't happen) — still abort the
+                            // publisher so it can't keep advertising presence.
                             h.abort();
                         }
                         groupdm_presence_mute.remove(&(space_id, call_id));

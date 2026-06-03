@@ -225,7 +225,12 @@
           {/if}
         {/if}
       </div>
-      <GroupCallBanner spaceId={channelId} invoke={groupCallInvoke ?? noopInvoke} {groupCall} />
+      <GroupCallBanner
+        spaceId={channelId}
+        invoke={groupCallInvoke ?? noopInvoke}
+        {groupCall}
+        onJoin={(_callId, sid) => onJoinGroupCall?.(sid)}
+      />
     {/if}
     <FloatingThreadBar
       {threadMeta}

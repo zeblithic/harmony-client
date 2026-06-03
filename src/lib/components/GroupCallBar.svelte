@@ -51,6 +51,15 @@
   const toggleDeafen = () => { if (session && $callState) swallow(session.setDeafened(!$callState.deafened)); };
   const pttDown = () => session?.setPttHeld(true);
   const pttUp = () => session?.setPttHeld(false);
+  // Keyboard hold-to-talk (a11y): Space/Enter hold the PTT gate like a pointer
+  // press, so keyboard users aren't locked out of push-to-talk. `e.repeat`
+  // guards the OS key-repeat stream so a held key doesn't re-fire setPttHeld.
+  function pttKeyDown(e: KeyboardEvent) {
+    if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) { e.preventDefault(); session?.setPttHeld(true); }
+  }
+  function pttKeyUp(e: KeyboardEvent) {
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); session?.setPttHeld(false); }
+  }
   const onLeave = () => { if (session) swallow(session.leave()); };
 </script>
 
@@ -104,6 +113,9 @@
           onpointerup={pttUp}
           onpointerleave={pttUp}
           onpointercancel={pttUp}
+          onkeydown={pttKeyDown}
+          onkeyup={pttKeyUp}
+          onblur={pttUp}
           aria-label="Hold to talk"
         >
           {$callState.pttHeld ? '🎙 Talking…' : '🎙 Hold'}

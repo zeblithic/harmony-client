@@ -433,10 +433,21 @@ export class GroupCallSession {
   }
 
   async setDeafened(deaf: boolean): Promise<void> {
+    const prevDeafened = this.deafened;
     this.deafened = deaf;
     this.mixer?.setDeafened(deaf);
     this.patch({ deafened: deaf });
-    if (deaf && !this.muted) await this.setMuted(true); // deafen implies self-mute
+    try {
+      if (deaf && !this.muted) await this.setMuted(true); // deafen implies self-mute
+    } catch (err) {
+      // The coupled mute IPC was rejected (setMuted already rolled its own muted
+      // state back). Roll the deafen state back too so the UI never advertises a
+      // deafened state whose self-mute the backend won't reflect.
+      this.deafened = prevDeafened;
+      this.mixer?.setDeafened(prevDeafened);
+      this.patch({ deafened: prevDeafened });
+      throw err;
+    }
   }
 
   /**
@@ -446,6 +457,12 @@ export class GroupCallSession {
    * timers firing, or media bound to stale IPC handles. Fire-and-forget.
    */
   destroy(): void {
+    // Capture call identity BEFORE resetToIdle() nulls it, so we can leave the
+    // backend room. An 'incoming' session never joined media (ring toast only),
+    // so there's nothing to leave there.
+    const phase = get(this.store).phase;
+    const callId = this.callId;
+    const spaceId = this.spaceId;
     this.clearRingTimer();
     if (this.drainTimer) { clearInterval(this.drainTimer); this.drainTimer = null; }
     for (const u of this.unlisteners) u();
@@ -454,6 +471,11 @@ export class GroupCallSession {
     this.receiver?.destroy();
     void this.mixer?.destroy().catch(() => {});
     this.sender = null; this.receiver = null; this.mixer = null;
+    // Fire-and-forget leave so an identity switch that rebuilds the singleton
+    // drops group presence immediately instead of lingering to the TTL.
+    if (callId && phase !== 'incoming') {
+      void this.deps.invoke('leave_group_call', { callId, spaceId }).catch(() => {});
+    }
     this.resetToIdle();
   }
 }

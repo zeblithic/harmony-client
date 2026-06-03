@@ -444,6 +444,16 @@ impl VoicePresenceMap {
         self.inner.remove(&(*c, *ch));
     }
 
+    /// Drop EVERY roster sub-map whose key's `SpaceId` is `space`, regardless of
+    /// channel/call id. Called on `UnwatchGroupCall` so stale `(space, call)`
+    /// rows for subscriber-discovered calls (those we never published into, so
+    /// `remove_channel` can't reach them) are cleared rather than lingering to
+    /// the TTL. The inner map is keyed by `(SpaceId, ChannelId)`; retaining only
+    /// the rows whose space differs also reclaims the emptied sub-maps.
+    pub fn remove_space(&mut self, space: &SpaceId) {
+        self.inner.retain(|(s, _), _| s != space);
+    }
+
     /// Resolve the owner for a device currently known in (c, ch), for media-drop
     /// resolution (works even for entries hidden from the visible roster, i.e.
     /// gravestones, since this looks at the raw entry map, not `roster()`).

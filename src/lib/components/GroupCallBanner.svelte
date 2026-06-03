@@ -10,10 +10,16 @@
   import { ensureGroupMembers } from '../group-dm-members-cache';
   import type { GroupCallSession } from '../group-call-session';
 
-  let { spaceId, invoke, groupCall }: {
+  let { spaceId, invoke, groupCall, onJoin }: {
     spaceId: string;
     invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
     groupCall: GroupCallSession | null;
+    // ZEB-360 (D6, CodeAnt/CodeRabbit): the coordinated join helper from
+    // App.svelte. Routes through `leaveOtherVoiceThen` (tears down community
+    // voice / a 1:1 call first) + `ensureGroupMembers` + `joinActive`, so the
+    // banner can never spin up a SECOND media engine by calling joinActive
+    // directly. Reads the live callId from the banner store itself.
+    onJoin?: (callId: string, spaceId: string) => void;
   } = $props();
 
   // Track the session's phase/callId reactively so the banner hides the instant
@@ -43,11 +49,13 @@
     if (groupCall && get(groupCall.state).callId === latest.callId) return;
     joining = true;
     try {
+      // Warm the members cache so the ringing rows render on the first beacon,
+      // then route the actual join through the one-engine coordinator
+      // (`onJoin` → App.svelte's `joinGroupCall`), which tears down any other
+      // live voice engine first. Calling `groupCall.joinActive` directly here
+      // would bypass that teardown and run two media engines at once.
       await ensureGroupMembers(invoke, spaceId);
-      await groupCall.joinActive(latest.callId, spaceId);
-    } catch {
-      // joinActive resets to idle on failure; surfacing isn't required here —
-      // the banner stays visible so the user can retry.
+      onJoin?.(latest.callId, spaceId);
     } finally {
       joining = false;
     }

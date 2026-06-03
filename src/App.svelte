@@ -1624,7 +1624,10 @@
       // what renders the ringing/declined rows on the very first beacon.
       fileManagerService.addUnlisten(await listen('incoming-group-call', async (event) => {
         const p = (event as { payload: { callId: string; callerOwner: string; spaceId: string } }).payload;
-        await ensureGroupMembers(invoke, p.spaceId);
+        // Best-effort cache warm: a transient get_group_dm_members failure must
+        // NOT abort the handler and drop the ring (the roster degrades to live
+        // beacons only — no ringing rows — until a later event re-warms it).
+        await ensureGroupMembers(invoke, p.spaceId).catch(() => {});
         groupCall?.onIncomingGroup(p.callId, p.callerOwner, p.spaceId);
         // Only escalate if we actually entered 'incoming' (a busy session ignores
         // the ring and stays put — no OS alert then).
@@ -1651,7 +1654,10 @@
 
       fileManagerService.addUnlisten(await listen('group-call-presence-changed', async (event) => {
         const p = (event as { payload: { spaceId: string; callId: string; roster: { owner: string; device: string; muted: boolean }[] } }).payload;
-        await ensureGroupMembers(invoke, p.spaceId); // warm cache BEFORE the merge so ringing rows render on the first beacon
+        // Best-effort cache warm BEFORE the merge so ringing rows render on the
+        // first beacon — but a transient failure must NOT drop the presence
+        // update (banner count / roster), so swallow it and proceed.
+        await ensureGroupMembers(invoke, p.spaceId).catch(() => {});
         groupCall?.onPresenceChanged(p.callId, p.roster);
         groupCallBanners.apply(p.spaceId, p.callId, p.roster);
       }));
@@ -2039,13 +2045,29 @@
     if (!spaceId || !isTauri()) return;
     let active = true;
     void (async () => {
-      try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        if (active) await invoke('watch_group_call', { spaceId });
-      } catch { /* not in Tauri / node not ready — banner degrades to none */ }
+      // Bounded retry/backoff: a transient "node not ready" at startup would
+      // otherwise swallow the watch permanently (the effect only re-runs on a
+      // space change), leaving the banner subscription off for this space. Retry
+      // a few times so the watch establishes once the node is up. `active` is
+      // cleared by the cleanup below, so a space change / unmount aborts the loop.
+      const { invoke } = await import('@tauri-apps/api/core');
+      for (let attempt = 0; attempt < 5 && active; attempt++) {
+        try {
+          await invoke('watch_group_call', { spaceId });
+          return; // watch established
+        } catch {
+          // not in Tauri / node not ready — back off and retry.
+          if (!active) return;
+          await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+        }
+      }
     })();
     return () => {
       active = false;
+      // Stop driving a join into a call that may end while we're unwatched: once
+      // unwatched we stop receiving presence updates, so clear the stale banner
+      // entry for this space.
+      groupCallBanners.clear(spaceId);
       void (async () => {
         try {
           const { invoke } = await import('@tauri-apps/api/core');

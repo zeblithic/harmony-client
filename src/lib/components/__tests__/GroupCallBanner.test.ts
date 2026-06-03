@@ -80,17 +80,22 @@ describe('GroupCallBanner', () => {
     expect(await screen.findByTestId('group-call-banner')).toBeInTheDocument();
   });
 
-  it('Join warms members then calls joinActive with the active callId', async () => {
+  it('Join warms members then routes through the onJoin coordinator (not joinActive directly)', async () => {
     groupCallBanners.apply('space-1', 'call-1', roster);
     const session = fakeSession({ phase: 'idle' });
+    const onJoin = vi.fn();
     const invoke = vi.fn(async (cmd: string) => (cmd === 'get_group_dm_members' ? ['aaaa', 'bbbb'] : undefined));
     render(GroupCallBanner, {
-      props: { spaceId: 'space-1', invoke: invoke as never, groupCall: session as never },
+      props: { spaceId: 'space-1', invoke: invoke as never, groupCall: session as never, onJoin },
     });
     await fireEvent.click(await screen.findByTestId('group-call-join'));
     await waitFor(() => {
-      expect(session.joinActive).toHaveBeenCalledWith('call-1', 'space-1');
+      // The banner must NOT spin up a second media engine by calling joinActive
+      // directly — it routes through the coordinated onJoin (App.svelte's
+      // joinGroupCall, which tears down any other live voice engine first).
+      expect(onJoin).toHaveBeenCalledWith('call-1', 'space-1');
     });
+    expect(session.joinActive).not.toHaveBeenCalled();
     expect(invoke).toHaveBeenCalledWith('get_group_dm_members', { spaceId: 'space-1' });
   });
 });

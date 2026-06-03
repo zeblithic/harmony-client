@@ -144,4 +144,24 @@ describe('GroupCallBar', () => {
     fireEvent.pointerUp(hold);
     expect(session.setPttHeld).toHaveBeenCalledWith(false);
   });
+
+  it('PTT hold is keyboard-operable (Space/Enter hold; blur releases)', () => {
+    const session = fakeSession({ phase: 'active', pttMode: true, pttHeld: false });
+    render(GroupCallBar, { props: { session: session as never } });
+    const hold = screen.getByTestId('group-ptt-hold');
+    // Space holds, keyup releases.
+    fireEvent.keyDown(hold, { key: ' ' });
+    expect(session.setPttHeld).toHaveBeenCalledWith(true);
+    fireEvent.keyUp(hold, { key: ' ' });
+    expect(session.setPttHeld).toHaveBeenCalledWith(false);
+    // OS key-repeat must not re-fire the hold.
+    session.setPttHeld.mockClear();
+    fireEvent.keyDown(hold, { key: 'Enter', repeat: true });
+    expect(session.setPttHeld).not.toHaveBeenCalled();
+    // Losing focus while held releases the gate.
+    fireEvent.keyDown(hold, { key: 'Enter' });
+    expect(session.setPttHeld).toHaveBeenCalledWith(true);
+    fireEvent.blur(hold);
+    expect(session.setPttHeld).toHaveBeenCalledWith(false);
+  });
 });
