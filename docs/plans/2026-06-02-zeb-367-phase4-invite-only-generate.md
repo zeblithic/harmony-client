@@ -669,7 +669,7 @@ Assertions: redeem returns `status == "joined"`; the community appears in Bob's 
 - [ ] **Step 2: Run the integration test**
 
 Run: `cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(invite_only_untargeted_generate_then_redeem)'`
-Expected: PASS. Then the targeted variant. These are the spec's acceptance tests — the first time the iroh redeem runs against a generated invite-only invite end-to-end.
+Expected: PASS. (The targeted variant is **deferred to ZEB-369** — do not run it in this PR.) This is the spec's acceptance test — the first time the iroh redeem runs against a generated invite-only invite end-to-end.
 
 - [ ] **Step 3: Full gate + commit**
 

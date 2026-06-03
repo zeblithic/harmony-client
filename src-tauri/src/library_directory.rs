@@ -1433,7 +1433,11 @@ mod tests {
             // EnrollmentCert. The directory rejects invite-only entries at
             // verify time regardless of cert content, so any valid cert suffices.
             inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA1).cert),
-            untargeted_decrypt_key: None,
+            // ZEB-367: an untargeted invite-only payload (invitee_hint None) must
+            // carry the URL decrypt key or encode_invite_url rejects it
+            // (UntargetedKeyMissing). Content is irrelevant here — these directory
+            // tests reject invite-only entries at verify time regardless.
+            untargeted_decrypt_key: Some([0u8; 32]),
         };
         encode_invite_url(&payload).expect("encode invite-only url")
     }
@@ -2688,7 +2692,9 @@ mod tests {
             // ZEB-339: invite-only payloads must carry the inviter's
             // EnrollmentCert; rejected at receive regardless of cert content.
             inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA2).cert),
-            untargeted_decrypt_key: None,
+            // ZEB-367: untargeted invite-only payload requires the URL decrypt key
+            // for encode_invite_url to accept it (content irrelevant for this test).
+            untargeted_decrypt_key: Some([0u8; 32]),
         };
         let invite_url = encode_invite_url(&payload).expect("encode invite-only url");
 

@@ -155,11 +155,11 @@ The case-A pkarr publication must stop once the invite is consumed (single-use) 
 > _Targeted-path assertions below (targeted seal round-trip, `invitee_hint`-set generation, targeted redeem) are **deferred to [ZEB-369](https://linear.app/zeblith/issue/ZEB-369)**. ZEB-367's tests cover the untargeted path, the guard rejecting `invitee_hint`, and the encode/decode guard requiring `untargeted_decrypt_key` on untargeted invite-only payloads._
 
 - **`mint_invite_token`:** mint → `verify_invite_token_sig_device_key` passes; tamper a field → verify fails.
-- **`seal_epoch_key`:** targeted round-trip (`seal_to_owner` → `open_from_owner` with the invitee key recovers the epoch key); untargeted round-trip (recovers via the returned ephemeral private); untargeted returns `Some(key)`, targeted returns `None`.
-- **`extract_admin_bootstrap`:** returns the admin's Join-0 with cert; `verify_admin_bootstrap` accepts it.
-- **`generate_invite` invite-only:** targeted sets `invitee_hint` + leaves `untargeted_decrypt_key` None; untargeted sets `untargeted_decrypt_key` + `invitee_hint` None; both pass `encode_invite_url`; `register_invite` fires (case-A) iff `invite_token` is `Some`; open still leaves token None + no publish.
-- **Wire guard:** `untargeted_decrypt_key` on an open or targeted payload → `encode/decode` rejects.
-- **Full redeem round-trip (both kinds)** through `connectivity_redeem_invite_iroh_inner` — extends the existing iroh integration tests, which today can't exercise the happy path for lack of a generated invite-only invite. This closes the end-to-end gap and is the spec's acceptance test.
+- **`seal_epoch_key` (untargeted):** untargeted round-trip recovers the epoch key via the returned ephemeral private half; untargeted returns `Some(key)`. _(Targeted round-trip and `None`-return → ZEB-369.)_
+- **`extract_admin_bootstrap`:** returns the admin's Join-0 with cert; `verify_admin_bootstrap` accepts it; with multiple admin Joins present, selects the earliest deterministically.
+- **`generate_invite` invite-only (untargeted):** sets `untargeted_decrypt_key` + `invitee_hint` None; passes `encode_invite_url`; `register_invite` fires (case-A) because `invite_token` is `Some`; open still leaves token None + no publish; **`invitee_hint = Some(_)` is rejected** (targeted deferred → ZEB-369). _(Targeted generation — `invitee_hint` set, no URL key → ZEB-369.)_
+- **Wire guard:** `untargeted_decrypt_key` on an open or targeted payload → `encode/decode` rejects (`UntargetedKeyNotAllowed`); an untargeted invite-only payload that **omits** the key → `encode/decode` rejects (`UntargetedKeyMissing`).
+- **Full untargeted redeem round-trip** through `connectivity_redeem_invite_iroh_inner` — extends the existing iroh integration tests, which today can't exercise the happy path for lack of a generated invite-only invite. This closes the end-to-end gap and is the spec's acceptance test. _(Targeted full redeem → ZEB-369.)_
 - **Unregister-on-consume:** after a countersigned redemption, `unregister_invite(sig)` was called; a second redeem of the same token finds no case-A record.
 
 ## Relationship to Spec B
