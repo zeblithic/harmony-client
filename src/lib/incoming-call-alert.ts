@@ -116,6 +116,16 @@ class Alerter implements IncomingCallAlerter {
       try { this.deps.sendNotification({ title: target.title, body: target.body }); } catch { /* ignore */ }
     }
     try { await this.deps.requestUserAttention(true); } catch { /* ignore */ }
+    // Final re-validation — the arm above is itself an await. clear() or dispose()
+    // can land while it's in flight (call accepted/declined/timed-out, or quit),
+    // and their cancel(false) may have raced ahead of our arm(true), leaving a
+    // stale dock/taskbar bounce. If the call is no longer ringing (cleared) or
+    // we're torn down, cancel what we just armed. Gated on `ringing === null`
+    // (not `!== target`) so a newer call that replaced this one isn't disarmed.
+    if (this.disposed || this.ringing === null) {
+      this.escalated = false;
+      try { await this.deps.requestUserAttention(false); } catch { /* ignore */ }
+    }
   }
 
   private async isFocusedSafe(): Promise<boolean> {

@@ -132,6 +132,24 @@ describe('IncomingCallAlerter', () => {
     expect(d.requestUserAttention).not.toHaveBeenCalledWith(true);
     expect(d.sendNotification).not.toHaveBeenCalled();
   });
+
+  it('REGRESSION — clear during the attention-arm await ends with attention cancelled (Cursor R3)', async () => {
+    // Hold the attention(true) arm open so we can clear() while it is in flight.
+    let releaseArm!: () => void;
+    d.requestUserAttention = vi.fn((critical: boolean) =>
+      critical ? new Promise<void>((r) => { releaseArm = r; }) : Promise.resolve(),
+    );
+    const a = createIncomingCallAlerter(d);
+    const p = a.notify({ id: 'c1', title: 'Incoming call', body: 'Alice is calling' });
+    await tick(); // let escalate() reach the (now-pending) arm await
+    await a.clear('c1'); // call accepted/declined/timed-out while the arm is in flight
+    releaseArm(); // let the arm resolve
+    await p;
+    await tick();
+    // The final OS attention state must be cancelled, not left bouncing.
+    const calls = (d.requestUserAttention as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(calls.at(-1)).toBe(false);
+  });
 });
 
 describe('createDefaultIncomingCallAlerter (non-Tauri)', () => {
