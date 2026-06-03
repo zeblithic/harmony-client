@@ -25,6 +25,43 @@ pub fn mint_invite_token(
     Ok(token)
 }
 
+use crate::dm_signing::{open_from_owner, seal_to_owner};
+
+/// Who the epoch key is sealed to.
+pub enum SealRecipient {
+    /// Sealed to a specific invitee's device-#2 X25519 public key (confidential).
+    Targeted([u8; 32]),
+    /// Sealed to a fresh ephemeral key whose private half ships in the URL
+    /// (single-use "controlled open" link).
+    Untargeted,
+}
+
+pub struct SealedEpochKey {
+    /// 92-byte X25519 envelope (32 ephemeral_pub || 12 nonce || 32 ct || 16 tag).
+    pub sealed: Vec<u8>,
+    /// Untargeted only: the ephemeral X25519 private key the redeemer uses.
+    pub untargeted_decrypt_key: Option<[u8; 32]>,
+}
+
+pub fn seal_epoch_key(
+    epoch_key: &[u8; 32],
+    recipient: SealRecipient,
+) -> Result<SealedEpochKey, String> {
+    match recipient {
+        SealRecipient::Targeted(pub_) => {
+            let sealed = seal_to_owner(&pub_, epoch_key).map_err(|e| format!("seal_to_owner: {e}"))?;
+            Ok(SealedEpochKey { sealed, untargeted_decrypt_key: None })
+        }
+        SealRecipient::Untargeted => {
+            let ephemeral_priv = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+            let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral_priv);
+            let sealed = seal_to_owner(ephemeral_pub.as_bytes(), epoch_key)
+                .map_err(|e| format!("seal_to_owner: {e}"))?;
+            Ok(SealedEpochKey { sealed, untargeted_decrypt_key: Some(ephemeral_priv.to_bytes()) })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,5 +82,25 @@ mod tests {
         let mut token = mint_invite_token(OwnerAddr([1u8; 16]), None, hlc(), None, &sk).unwrap();
         token.expires_at = Some(999_999); // not covered by the now-stale sig
         assert!(verify_invite_token_sig_device_key(&token, &sk.verifying_key().to_bytes()).is_err());
+    }
+
+    #[test]
+    fn targeted_seal_round_trips() {
+        let priv_ = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let pub_ = x25519_dalek::PublicKey::from(&priv_);
+        let epoch = [9u8; 32];
+        let out = seal_epoch_key(&epoch, SealRecipient::Targeted(*pub_.as_bytes())).unwrap();
+        assert!(out.untargeted_decrypt_key.is_none());
+        let opened = open_from_owner(&priv_.to_bytes(), &out.sealed).unwrap();
+        assert_eq!(opened.as_slice(), &epoch);
+    }
+
+    #[test]
+    fn untargeted_seal_round_trips_via_url_key() {
+        let epoch = [3u8; 32];
+        let out = seal_epoch_key(&epoch, SealRecipient::Untargeted).unwrap();
+        let key = out.untargeted_decrypt_key.expect("untargeted returns a key");
+        let opened = open_from_owner(&key, &out.sealed).unwrap();
+        assert_eq!(opened.as_slice(), &epoch);
     }
 }
