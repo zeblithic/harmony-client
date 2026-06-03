@@ -77,6 +77,9 @@
   import { MemberCardService } from './lib/member-card-service';
   import { getVoiceSession, type VoiceSession } from './lib/voice-session';
   import { getCallSession, type CallSession } from './lib/call-session';
+  import { getGroupCallSession, type GroupCallSession } from './lib/group-call-session';
+  import { groupCallBanners } from './lib/group-call-banner-store';
+  import { ensureGroupMembers, getCachedGroupMembers } from './lib/group-dm-members-cache';
   import { toastStore } from './lib/stores/toast';
   import { get } from 'svelte/store';
   import { classifyOwnerIdentity, type OwnerIdentityState } from './lib/owner-gate';
@@ -127,6 +130,11 @@
   // the same identity + adapter deps. Drives the global incoming-call toast and
   // the in-call bar. null until buildVoiceSession() resolves.
   let callSession = $state<CallSession | null>(null);
+  // ── ZEB-360 Voice (group DM calls): app-lifetime singleton GroupCallSession,
+  // built alongside callSession from the same identity + adapter deps. Exposed
+  // module-level (sibling to callSession) so T13 can render the group in-call /
+  // ring UI; THIS task only wires the session + its remote-event listeners.
+  let groupCall = $state<GroupCallSession | null>(null);
   // Incoming-call banner model. Set when an `incoming-call` event lands AND the
   // session actually entered the 'incoming' phase (not busy-auto-declined);
   // cleared whenever the call leaves that phase (accepted / declined / canceled).
@@ -134,6 +142,10 @@
   // Unsubscribe for the callSession.state subscription that clears the toast;
   // torn down on unmount via fileManagerService.addUnlisten.
   let callStateUnsub: (() => void) | null = null;
+  // ZEB-360: unsubscribe for the groupCall.state subscription that clears the
+  // incoming-group-call OS alert when the group phase leaves 'incoming'. Torn
+  // down on unmount via fileManagerService.addUnlisten (alongside callStateUnsub).
+  let groupCallStateUnsub: (() => void) | null = null;
   // ── ZEB-356: incoming-call OS notification + window attention ──────
   // Built in the Tauri-init IIFE below (real Tauri deps); null in web/dev.
   let incomingCallAlerter: import('./lib/incoming-call-alert').IncomingCallAlerter | null = null;
@@ -148,6 +160,7 @@
   $effect(() => () => {
     void voiceSession?.leave().catch(() => {});
     void callSession?.end().catch(() => {});
+    void groupCall?.leave().catch(() => {});
   });
 
   /** Fire-and-forget: swallow a (possibly async) result so a click handler never
@@ -231,6 +244,30 @@
           };
         },
       });
+      // ZEB-360: build the group-DM call session from the same identity + adapter
+      // deps (getGroupCallSession is a singleton, so reconnect re-runs are no-ops).
+      // resolveMembers reads the sync members cache warmed by the group listeners
+      // below (await ensureGroupMembers before each forward). Its remote-event
+      // listeners are wired in the Tauri-init block once this is up.
+      groupCall = getGroupCallSession({
+        invoke,
+        listen,
+        selfOwnerHex,
+        selfDeviceHex: deviceVkHex,
+        senderHash: new Uint8Array(senderHash),
+        resolveCard: (ownerHex: string) => {
+          const card = resolveCard(ownerHex);
+          if (!card) return undefined;
+          return {
+            displayName: card.displayName,
+            ...(card.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
+          };
+        },
+        resolveMembers: (spaceId: string) => getCachedGroupMembers(spaceId),
+        onRosterOwners: (ownerHexes: string[]) => {
+          void memberCardService.subscribeVisible(ownerHexes);
+        },
+      });
       // Clear the incoming-call banner whenever the call leaves the 'incoming'
       // phase (accepted, declined, canceled, or busy-rejected). Subscribed once;
       // the unsubscribe is registered for unmount cleanup below.
@@ -243,6 +280,21 @@
           const id = incomingCall?.callId;
           if (id) void incomingCallAlerter?.clear(id);
           incomingCall = null;
+        }
+      });
+      // ZEB-360: mirror the above for the group session — clear the incoming-
+      // group-call OS alert when the group phase leaves 'incoming' (accepted /
+      // declined / canceled / timeout). The group banner model (T13) lives
+      // elsewhere; here we only drop the OS escalation, keyed by callId. Track the
+      // last incoming callId so the clear fires exactly on the transition out.
+      groupCallStateUnsub?.();
+      let lastGroupIncomingId: string | null = null;
+      groupCallStateUnsub = groupCall.state.subscribe((s) => {
+        if (s.phase === 'incoming') {
+          lastGroupIncomingId = s.callId;
+        } else if (lastGroupIncomingId) {
+          void incomingCallAlerter?.clear(lastGroupIncomingId);
+          lastGroupIncomingId = null;
         }
       });
       // ZEB-356: now that owner identity is present (buildVoiceSession only runs
@@ -1501,9 +1553,48 @@
       });
       fileManagerService.addUnlisten(unlistenCallEnded);
 
+      // ── ZEB-360 Voice (group DM): group-call signaling listeners ─────
+      // Mirror the 1:1 wiring above. Each handler is callId-guarded inside the
+      // GroupCallSession, so stale events for an old call can't disturb a current
+      // one (guard with `groupCall?.` — built lazily in buildVoiceSession). The
+      // presence/incoming handlers await ensureGroupMembers FIRST so the sync
+      // members cache (resolveMembers) is warm before the roster merge — that's
+      // what renders the ringing/declined rows on the very first beacon.
+      fileManagerService.addUnlisten(await listen('incoming-group-call', async (event) => {
+        const p = (event as { payload: { callId: string; callerOwner: string; spaceId: string } }).payload;
+        await ensureGroupMembers(invoke, p.spaceId);
+        groupCall?.onIncomingGroup(p.callId, p.callerOwner, p.spaceId);
+        // Only escalate if we actually entered 'incoming' (a busy session ignores
+        // the ring and stays put — no OS alert then).
+        if (groupCall && get(groupCall.state).phase === 'incoming') {
+          const card = resolveCard(p.callerOwner);
+          const name = card?.displayName ?? p.callerOwner.slice(0, 8);
+          const groupName = navService.nodes.find((n) => n.id === p.spaceId)?.name ?? 'a group';
+          void incomingCallAlerter?.notify({
+            id: p.callId,
+            title: 'Incoming group call',
+            body: `${name} is calling ${groupName}`,
+          });
+        }
+      }));
+
+      fileManagerService.addUnlisten(await listen('group-call-presence-changed', async (event) => {
+        const p = (event as { payload: { spaceId: string; callId: string; roster: { owner: string; device: string; muted: boolean }[] } }).payload;
+        await ensureGroupMembers(invoke, p.spaceId); // warm cache BEFORE the merge so ringing rows render on the first beacon
+        groupCall?.onPresenceChanged(p.callId, p.roster);
+        groupCallBanners.apply(p.spaceId, p.callId, p.roster);
+      }));
+
+      fileManagerService.addUnlisten(await listen('group-call-declined', (event) => {
+        const p = (event as { payload: { callId: string; spaceId: string; owner: string } }).payload;
+        groupCall?.onDeclined(p.callId, p.owner);
+      }));
+
       // Tear down the callSession.state subscription (set in buildVoiceSession)
       // on unmount, alongside the listeners.
       fileManagerService.addUnlisten(() => { callStateUnsub?.(); callStateUnsub = null; });
+      // ZEB-360: same for the group session's state subscription.
+      fileManagerService.addUnlisten(() => { groupCallStateUnsub?.(); groupCallStateUnsub = null; });
 
       const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const appWin = getCurrentWebviewWindow();
