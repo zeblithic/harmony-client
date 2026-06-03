@@ -33,6 +33,8 @@
   import ToastHost from './lib/components/ToastHost.svelte';
   import IncomingCallToast from './lib/components/IncomingCallToast.svelte';
   import CallInProgressBar from './lib/components/CallInProgressBar.svelte';
+  import GroupCallBar from './lib/components/GroupCallBar.svelte';
+  import GroupCallBanner from './lib/components/GroupCallBanner.svelte';
   import { VotingAdapter } from './lib/voting-adapter';
   import { setupDelegateOnBehalfToast } from './lib/voting-toast-wiring';
   import { LibraryDirectoryService } from './lib/library-directory-service';
@@ -135,10 +137,24 @@
   // module-level (sibling to callSession) so T13 can render the group in-call /
   // ring UI; THIS task only wires the session + its remote-event listeners.
   let groupCall = $state<GroupCallSession | null>(null);
+  // T13: reactive aliases of the voice/call/group-call state stores so the
+  // `$store` syntax auto-subscribes in the script + markup (the group-DM header's
+  // busy/active/self model and the in-call bar's group-name lookup read these).
+  // Each re-points if its singleton is rebuilt on an identity switch; undefined
+  // until buildVoiceSession resolves.
+  const groupCallState = $derived(groupCall?.state);
+  const voiceState = $derived(voiceSession?.state);
+  const callSessionState = $derived(callSession?.state);
   // Incoming-call banner model. Set when an `incoming-call` event lands AND the
   // session actually entered the 'incoming' phase (not busy-auto-declined);
   // cleared whenever the call leaves that phase (accepted / declined / canceled).
   let incomingCall = $state<{ callId: string; spaceId: string; callerName: string; callerAvatarUrl?: string } | null>(null);
+  // ZEB-360 T13: incoming GROUP-call banner model, mirroring `incomingCall`. Set
+  // when an `incoming-group-call` event lands AND the group session entered the
+  // 'incoming' phase (not busy-ignored); cleared when the group phase leaves
+  // 'incoming' (the groupCallStateUnsub subscription below). The toast body reads
+  // "{caller} is calling {group name}".
+  let groupIncomingCall = $state<{ callId: string; spaceId: string; callerName: string; groupName: string; callerAvatarUrl?: string } | null>(null);
   // Unsubscribe for the callSession.state subscription that clears the toast;
   // torn down on unmount via fileManagerService.addUnlisten.
   let callStateUnsub: (() => void) | null = null;
@@ -185,6 +201,36 @@
       }
     }
     return fn();
+  }
+
+  /** ZEB-360 T13: stable Tauri-invoke wrapper threaded into the group-call banner
+   *  (its self-contained Join path warms the members cache + calls joinActive).
+   *  Rejects outside Tauri so the banner's Join no-ops gracefully. */
+  const groupCallInvoke = (cmd: string, args?: Record<string, unknown>): Promise<unknown> =>
+    import('@tauri-apps/api/core').then(({ invoke }) => invoke(cmd, args));
+
+  /** ZEB-360 T13: place a new group-DM call. Warms the members cache first (so the
+   *  ringing rows render on the first beacon), then drops into media via the
+   *  one-engine coordinator. Tauri-only; the dynamic invoke import throws outside
+   *  Tauri and is swallowed by the caller. */
+  async function placeGroupCall(spaceId: string): Promise<void> {
+    if (!groupCall) return;
+    const { invoke } = await import('@tauri-apps/api/core');
+    await ensureGroupMembers(invoke, spaceId);
+    await leaveOtherVoiceThen(() => groupCall!.placeGroupCall(spaceId));
+  }
+
+  /** ZEB-360 T13: join the active group-DM call for a space. Reads the live callId
+   *  from the banner store, warms the members cache, then joins via the one-engine
+   *  coordinator. No-op if the banner entry has gone or we're already in it. */
+  async function joinGroupCall(spaceId: string): Promise<void> {
+    if (!groupCall) return;
+    const entry = get(groupCallBanners)[spaceId];
+    if (!entry) return;
+    if (get(groupCall.state).callId === entry.callId) return;
+    const { invoke } = await import('@tauri-apps/api/core');
+    await ensureGroupMembers(invoke, spaceId);
+    await leaveOtherVoiceThen(() => groupCall!.joinActive(entry.callId, spaceId));
   }
 
   /** ZEB-351: typed wrapper for the get_self_voice_identity IPC.
@@ -296,6 +342,9 @@
           void incomingCallAlerter?.clear(lastGroupIncomingId);
           lastGroupIncomingId = null;
         }
+        // T13: drop the in-app group ring toast whenever the group session leaves
+        // 'incoming' (accepted / declined / canceled / timeout).
+        if (s.phase !== 'incoming') groupIncomingCall = null;
       });
       // ZEB-356: now that owner identity is present (buildVoiceSession only runs
       // then), request notification permission once so an incoming call's banner
@@ -1570,6 +1619,15 @@
           const card = resolveCard(p.callerOwner);
           const name = card?.displayName ?? p.callerOwner.slice(0, 8);
           const groupName = navService.nodes.find((n) => n.id === p.spaceId)?.name ?? 'a group';
+          // T13: raise the in-app ring toast (rendered next to the 1:1 toast).
+          // Cleared when the group phase leaves 'incoming' (subscription above).
+          groupIncomingCall = {
+            callId: p.callId,
+            spaceId: p.spaceId,
+            callerName: name,
+            groupName,
+            ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
+          };
           void incomingCallAlerter?.notify({
             id: p.callId,
             title: 'Incoming group call',
@@ -1929,6 +1987,60 @@
   let activeHub = $state('harmony-dev');
   let activeChannelName = $state('general');
   let activeChannelType = $state<'channel' | 'dm' | 'group-chat'>('channel');
+
+  // ── ZEB-360 T13: group-DM call presence watch/unwatch ──────────────
+  // The currently-selected group-DM space (null when the active view isn't a
+  // group DM). Drives the read-only presence subscription (watch_group_call)
+  // that feeds the group-call banner store, plus the header Call/Join button.
+  let activeGroupDmSpaceId = $derived(
+    activeChannelType === 'group-chat' && !selectedCommunityId ? activeChannel : null,
+  );
+  // Header-button model for the active group DM. `groupCallActive` = a call is in
+  // progress in this space (banner store has an entry); `groupCallSelf` = the
+  // local user is in *that* call (any non-idle phase whose callId matches this
+  // space's banner entry); `groupCallBusy` = any voice session is active, so a new
+  // place/join must be blocked (one media engine at a time).
+  let groupCallActive = $derived(
+    !!activeGroupDmSpaceId && !!$groupCallBanners[activeGroupDmSpaceId],
+  );
+  let groupCallSelf = $derived(
+    !!activeGroupDmSpaceId
+    && !!$groupCallState
+    && $groupCallState.phase !== 'idle'
+    && !!$groupCallState.callId
+    && $groupCallState.callId === $groupCallBanners[activeGroupDmSpaceId]?.callId,
+  );
+  let groupCallBusy = $derived(
+    (!!$voiceState && $voiceState.phase === 'connected')
+    || (!!$callSessionState && $callSessionState.phase !== 'idle')
+    || (!!$groupCallState && $groupCallState.phase !== 'idle'),
+  );
+
+  // Subscribe to group-call presence for the viewed group DM; unsubscribe when
+  // the selection changes away (or the view unmounts). The $effect cleanup runs
+  // before each re-run AND on teardown, so a stable space id re-runs the effect
+  // only when it actually changes — no double-watch. Tauri-only; the dynamic
+  // import / invoke throw outside Tauri and are swallowed.
+  $effect(() => {
+    const spaceId = activeGroupDmSpaceId;
+    if (!spaceId || !isTauri()) return;
+    let active = true;
+    void (async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        if (active) await invoke('watch_group_call', { spaceId });
+      } catch { /* not in Tauri / node not ready — banner degrades to none */ }
+    })();
+    return () => {
+      active = false;
+      void (async () => {
+        try {
+          const { invoke } = await import('@tauri-apps/api/core');
+          await invoke('unwatch_group_call', { spaceId });
+        } catch { /* best-effort */ }
+      })();
+    };
+  });
   // ZEB-334: when true (and no community is selected) the main feed renders the
   // private self-notes space instead of the legacy "#general" void. Defaults
   // true so a fresh, community-less user lands in Notes, not the void.
@@ -2242,6 +2354,31 @@
   <CallInProgressBar session={callSession} onEnd={() => swallow(callSession!.end())} />
 {/if}
 
+<!--
+  ZEB-360 T13: the global GROUP-DM call surfaces, mirroring the 1:1 pair above.
+  The incoming-group-call ring toast reuses IncomingCallToast (body extended with
+  the group name via the model below); the in-call bar is a sibling GroupCallBar
+  iterating the participant roster. Both live at the app root so a group call is
+  reachable regardless of which view is active.
+-->
+{#if groupCall}
+  <IncomingCallToast
+    incomingCall={groupIncomingCall
+      ? {
+          callId: groupIncomingCall.callId,
+          callerName: `${groupIncomingCall.callerName} · ${groupIncomingCall.groupName}`,
+          ...(groupIncomingCall.callerAvatarUrl ? { callerAvatarUrl: groupIncomingCall.callerAvatarUrl } : {}),
+        }
+      : null}
+    onAccept={() => { if (groupIncomingCall) swallow(leaveOtherVoiceThen(() => groupCall!.accept())); }}
+    onDecline={() => swallow(groupCall!.decline())}
+  />
+  <GroupCallBar
+    session={groupCall}
+    groupName={navService.nodes.find((n) => n.id === $groupCallState?.spaceId)?.name}
+  />
+{/if}
+
 <BackupStalenessWarning onExportRequested={handleExportRequested} />
 
 <Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null}>
@@ -2401,6 +2538,13 @@
         channelType={activeChannelType}
         channelId={activeChannel}
         onStartCall={(spaceId) => { if (callSession) swallow(leaveOtherVoiceThen(() => callSession!.placeCall(spaceId))); }}
+        onStartGroupCall={(spaceId) => swallow(placeGroupCall(spaceId))}
+        onJoinGroupCall={(spaceId) => swallow(joinGroupCall(spaceId))}
+        {groupCallActive}
+        {groupCallSelf}
+        {groupCallBusy}
+        {groupCall}
+        groupCallInvoke={groupCallInvoke}
         onMediaClick={scrollToMedia}
         onSend={handleSend}
         onAvatarClick={handleAvatarClick}

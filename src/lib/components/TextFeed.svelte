@@ -9,6 +9,8 @@
   import ThreadView from './ThreadView.svelte';
   import ThreadIndicator from './ThreadIndicator.svelte';
   import FloatingThreadBar from './FloatingThreadBar.svelte';
+  import GroupCallBanner from './GroupCallBanner.svelte';
+  import type { GroupCallSession } from '../group-call-session';
 
   let {
     messages,
@@ -20,6 +22,13 @@
     onSend,
     onAvatarClick,
     onStartCall,
+    onStartGroupCall,
+    onJoinGroupCall,
+    groupCallActive = false,
+    groupCallSelf = false,
+    groupCallBusy = false,
+    groupCall = null,
+    groupCallInvoke,
     trustService,
     trustVersion = 0,
     threadRoot = null,
@@ -46,6 +55,25 @@
     /** ZEB-352: invoked when the user clicks "Call" in the DM header. Only
      *  rendered when channelType === 'dm'. */
     onStartCall?: (spaceId: string) => void;
+    /** ZEB-360 T13: place a new group-DM call. Rendered in the group-chat header
+     *  when no call is active for this space. */
+    onStartGroupCall?: (spaceId: string) => void;
+    /** ZEB-360 T13: join the active group-DM call for this space. Rendered when a
+     *  call exists for this space and the local user isn't in it. */
+    onJoinGroupCall?: (spaceId: string) => void;
+    /** ZEB-360 T13: true when a group call is in progress in THIS space (drives
+     *  Call vs Join in the header). */
+    groupCallActive?: boolean;
+    /** ZEB-360 T13: true when the local user is in THIS space's group call (hides
+     *  the header button — the in-call bar takes over). */
+    groupCallSelf?: boolean;
+    /** ZEB-360 T13: true when any voice session is active (disables the header
+     *  Call/Join button — one media engine at a time). */
+    groupCallBusy?: boolean;
+    /** ZEB-360 T13: the group-call session singleton (threaded to the banner). */
+    groupCall?: GroupCallSession | null;
+    /** ZEB-360 T13: Tauri invoke, threaded to the banner's Join path. */
+    groupCallInvoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
     trustService?: TrustService;
     trustVersion?: number;
     threadRoot?: Message | null;
@@ -66,6 +94,12 @@
      *  only shown on outgoing messages. */
     ownAddress?: string;
   } = $props();
+
+  // Fallback invoke for the group-call banner when the parent doesn't thread one
+  // (e.g. unit tests rendering TextFeed in isolation). Rejects so the banner's
+  // Join path no-ops gracefully rather than calling `undefined(...)`.
+  const noopInvoke = (_cmd: string, _args?: Record<string, unknown>) =>
+    Promise.reject(new Error('invoke not wired'));
 
   let visibleThreadIds = $state(new Set<string>());
 
@@ -155,6 +189,39 @@
           📞 Call
         </button>
       </div>
+    {:else if channelType === 'group-chat'}
+      <!-- ZEB-360 T13: group-DM header. The Call/Join button hides once the local
+           user is in this call (the in-call bar takes over); it's disabled while
+           any other voice session is active (one media engine at a time). -->
+      <div class="dm-header">
+        <span class="dm-name">{channelName}</span>
+        {#if !groupCallSelf}
+          {#if groupCallActive}
+            <button
+              type="button"
+              class="btn-call"
+              data-testid="group-join-button"
+              aria-label="Join call"
+              disabled={groupCallBusy}
+              onclick={() => onJoinGroupCall?.(channelId)}
+            >
+              📞 Join call
+            </button>
+          {:else}
+            <button
+              type="button"
+              class="btn-call"
+              data-testid="group-call-button"
+              aria-label="Start call"
+              disabled={groupCallBusy}
+              onclick={() => onStartGroupCall?.(channelId)}
+            >
+              📞 Call
+            </button>
+          {/if}
+        {/if}
+      </div>
+      <GroupCallBanner spaceId={channelId} invoke={groupCallInvoke ?? noopInvoke} {groupCall} />
     {/if}
     <FloatingThreadBar
       {threadMeta}
@@ -263,9 +330,13 @@
     white-space: nowrap;
     flex-shrink: 0;
   }
-  .btn-call:hover {
+  .btn-call:hover:not(:disabled) {
     background: var(--bg-tertiary);
     color: var(--text-primary);
+  }
+  .btn-call:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .main-section {
