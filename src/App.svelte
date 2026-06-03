@@ -720,6 +720,11 @@
     if (selectedCommunityId !== id) {
       communityMembers = [];
     }
+    // ZEB-334 (Cursor PR #180): selecting a real community leaves the Notes
+    // space, so the nav highlights the community and the feed shows it. Passing
+    // null (e.g. from selectNotes/leave) does NOT touch notesSelected — those
+    // callers manage it themselves.
+    if (id !== null) notesSelected = false;
     selectedCommunityId = id;
     isCurrentCommunityDegraded = id != null ? communityService.isDegraded(id) : false;
   }
