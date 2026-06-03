@@ -134,6 +134,9 @@
   // Unsubscribe for the callSession.state subscription that clears the toast;
   // torn down on unmount via fileManagerService.addUnlisten.
   let callStateUnsub: (() => void) | null = null;
+  // ── ZEB-356: incoming-call OS notification + window attention ──────
+  // Built in the Tauri-init IIFE below (real Tauri deps); null in web/dev.
+  let incomingCallAlerter: import('./lib/incoming-call-alert').IncomingCallAlerter | null = null;
 
   // ── ZEB-353 Voice V5: SPA-unmount teardown ────────────────────────
   // Leave any active voice channel / end any in-progress DM call when the
@@ -233,8 +236,27 @@
       // the unsubscribe is registered for unmount cleanup below.
       callStateUnsub?.();
       callStateUnsub = callSession.state.subscribe((s) => {
-        if (s.phase !== 'incoming') incomingCall = null;
+        if (s.phase !== 'incoming') {
+          // ZEB-356: drop the OS escalation when the call leaves 'incoming'
+          // (accepted / declined / canceled / timeout). Capture the id before
+          // clearing the banner model.
+          const id = incomingCall?.callId;
+          if (id) void incomingCallAlerter?.clear(id);
+          incomingCall = null;
+        }
       });
+      // ZEB-356: now that owner identity is present (buildVoiceSession only runs
+      // then), request notification permission once so an incoming call's banner
+      // isn't lost to a permission-prompt race. Deferred here (not app-init) so
+      // first-run users aren't prompted before completing onboarding; notify() has
+      // a lazy permission fallback regardless. Tauri-only; the import/calls throw
+      // and are caught outside Tauri.
+      void (async () => {
+        try {
+          const { isPermissionGranted, requestPermission } = await import('@tauri-apps/plugin-notification');
+          if (!(await isPermissionGranted())) await requestPermission();
+        } catch { /* non-Tauri / plugin absent — notify()'s lazy fallback covers it */ }
+      })();
     } catch (err) {
       // Allow a retry on a later trigger (reconnect) if the IPC wasn't ready.
       voiceSessionInit = false;
@@ -1401,6 +1423,19 @@
       });
       fileManagerService.addUnlisten(unlistenMemberCard);
 
+      // ── ZEB-356: build the incoming-call alerter (OS notification + window
+      // attention). Constructed BEFORE the call-signaling listeners below so an
+      // `incoming-call` arriving right after init still escalates (no startup
+      // gap). The notification-permission prompt is deferred to buildVoiceSession
+      // (owner ready) so first-run users aren't prompted before onboarding.
+      try {
+        const { createDefaultIncomingCallAlerter } = await import('./lib/incoming-call-alert');
+        incomingCallAlerter = await createDefaultIncomingCallAlerter();
+        fileManagerService.addUnlisten(() => { incomingCallAlerter?.dispose(); incomingCallAlerter = null; });
+      } catch (e) {
+        console.warn('[harmony-client] incoming-call alerter init failed:', e);
+      }
+
       // ── ZEB-352 Voice V4: DM-call signaling listeners ───────────────
       // The backend emits these once per call-state transition; route each into
       // the CallSession state machine (built lazily in buildVoiceSession, so
@@ -1419,6 +1454,13 @@
             callerName: card?.displayName ?? p.callerOwner.slice(0, 8),
             ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
           };
+          // ZEB-356: escalate to the OS if the window is unfocused (no-op if
+          // focused — the in-app toast above suffices).
+          void incomingCallAlerter?.notify({
+            id: p.callId,
+            title: 'Incoming call',
+            body: `${incomingCall.callerName} is calling`,
+          });
         }
       });
       fileManagerService.addUnlisten(unlistenIncomingCall);
@@ -1463,33 +1505,24 @@
       // on unmount, alongside the listeners.
       fileManagerService.addUnlisten(() => { callStateUnsub?.(); callStateUnsub = null; });
 
-      // ── ZEB-353 Voice V5: native window-close teardown ──────────────
-      // Svelte's $effect-cleanup does NOT fire on a native window close, so the
-      // SPA-unmount hook above can't cover the real-world "user closes the app"
-      // path. Intercept the OS close request, leave/end the voice channel & DM
-      // call so the leave/end IPCs flush (otherwise the user lingers in peers'
-      // rosters until the 12s presence TTL and the mic stays open until the OS
-      // force-closes the process), THEN destroy the window. preventDefault +
-      // explicit destroy() is the documented Tauri v2 pattern to run async
-      // cleanup before the window actually closes. Dynamic import matches the
-      // core/event imports above (no static @tauri-apps import in this file).
       const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const appWin = getCurrentWebviewWindow();
-      let closing = false;
+      // ── ZEB-356: close-to-tray (reverses ZEB-353 close-to-quit). ─────
+      // Closing the window hides it to the tray and keeps the process, the
+      // Zenoh node, and any ACTIVE CALL alive (hide-during-call = "minimize to
+      // keep talking"). The real exit is the tray "Quit Harmony" item, handled
+      // by the quit-requested listener below. No teardown here.
       const unlistenClose = await appWin.onCloseRequested(async (event) => {
-        // Each close-request event independently proceeds to the default close
-        // unless THIS event calls preventDefault() — so always prevent first, or
-        // a second request (e.g. a double-click) would close via the default path
-        // and interrupt the first request's in-flight teardown.
         event.preventDefault();
-        // Re-entry guard: only the first request runs teardown + destroy; a
-        // second just defers (it already prevented its own default above).
-        if (closing) return;
-        closing = true;
-        // Bound the teardown: leave()/end() await IPCs that could in principle
-        // hang, and preventDefault means a hung promise would block the close
-        // forever. Race the (best-effort, never-rejecting) teardown against a
-        // 1.5s deadline so the window always closes; log if the deadline wins.
+        await appWin.hide();
+      });
+      fileManagerService.addUnlisten(unlistenClose);
+
+      // ── ZEB-356: real quit path. The tray "Quit Harmony" item emits
+      // `quit-requested`; run the (bounded, best-effort) V5 voice/call teardown
+      // so we don't linger in peers' rosters or hold the mic, then invoke
+      // quit_app to terminate the tray-resident process.
+      const unlistenQuit = await listen('quit-requested', async () => {
         const teardown = Promise.allSettled([
           voiceSession?.leave() ?? Promise.resolve(),
           callSession?.end() ?? Promise.resolve(),
@@ -1500,11 +1533,11 @@
           new Promise((r) => setTimeout(() => r(timedOut), 1500)),
         ]);
         if (raced === timedOut) {
-          console.warn('[harmony-client] voice teardown on close exceeded 1.5s; closing anyway');
+          console.warn('[harmony-client] voice teardown on quit exceeded 1.5s; quitting anyway');
         }
-        await appWin.destroy();
+        await invoke('quit_app');
       });
-      fileManagerService.addUnlisten(unlistenClose);
+      fileManagerService.addUnlisten(unlistenQuit);
     } catch (err) {
       console.warn('[harmony-client] Tauri init failed:', err);
     }

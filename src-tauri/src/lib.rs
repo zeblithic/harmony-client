@@ -32779,8 +32779,44 @@ async fn network_health_export_payload(
     ))
 }
 
+/// ZEB-356: real application exit. A tray-resident app does NOT quit when its
+/// last window is hidden/destroyed (the tray keeps the process alive), so the
+/// FE Quit path runs its voice/call teardown and then invokes this to terminate
+/// the process. Distinct from the window-close path, which now only hides.
+#[tauri::command]
+fn quit_app(app_handle: tauri::AppHandle) {
+    app_handle.exit(0);
+}
+
 pub fn run() {
     tauri::Builder::default()
+        // ZEB-356: single-instance MUST be registered first. On a second launch
+        // its callback shows + focuses the existing window instead of spawning a
+        // duplicate (closing now only hides to the tray). On Windows/Linux a
+        // `harmony://` deep link arrives as a second-launch argv; forward it to the
+        // running instance's deep-link handler (mirrors on_open_url below) so a
+        // deep-link-while-running isn't dropped now that single-instance suppresses
+        // the duplicate process that used to handle it. macOS delivers deep links
+        // via on_open_url directly, so it is unaffected either way.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            use tauri::Manager; // Emitter (for app.emit) is in scope at module level
+            let urls: Vec<String> = args
+                .iter()
+                .filter(|a| a.starts_with("harmony://"))
+                .cloned()
+                .collect();
+            if !urls.is_empty() {
+                if let Err(e) = app.emit("deep-link-received", &urls) {
+                    tracing::warn!(error = %e, "single-instance deep-link emit failed");
+                }
+            }
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -32798,6 +32834,69 @@ pub fn run() {
                     tracing::warn!(error = %e, "deep-link emit failed");
                 }
             });
+
+            // ── ZEB-356: system tray (close-to-tray reachability). ──────────
+            // Tray click / "Show Harmony" → raise the window. "Quit Harmony"
+            // emits `quit-requested`; the FE runs voice/call teardown then
+            // invokes `quit_app`. The window never destroys on close (the FE's
+            // onCloseRequested only hides), so the last-window-closed auto-exit
+            // never fires — quit_app is the sole exit path.
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+                use tauri::Manager;
+
+                fn raise_main(app: &tauri::AppHandle) {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.unminimize();
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+
+                let show_i = MenuItem::with_id(app, "show", "Show Harmony", true, None::<&str>)?;
+                let quit_i = MenuItem::with_id(app, "quit", "Quit Harmony", true, None::<&str>)?;
+                let tray_menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+                if let Some(icon) = app.default_window_icon().cloned() {
+                    let _tray = TrayIconBuilder::with_id("main-tray")
+                        .icon(icon)
+                        .tooltip("Harmony")
+                        .menu(&tray_menu)
+                        .show_menu_on_left_click(false)
+                        .on_menu_event(|app, event| match event.id.as_ref() {
+                            "show" => raise_main(app),
+                            "quit" => {
+                                // Emit for graceful FE teardown (voice/call leave
+                                // then quit_app). Also arm a fallback exit so a
+                                // tray-resident app is never unquittable if the FE
+                                // `quit-requested` listener failed to init (window
+                                // close only hides). Whichever calls exit(0) first
+                                // wins; the other is moot once the process is gone.
+                                let _ = app.emit("quit-requested", ());
+                                let app2 = app.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(std::time::Duration::from_secs(3));
+                                    app2.exit(0);
+                                });
+                            }
+                            _ => {}
+                        })
+                        .on_tray_icon_event(|tray, event| {
+                            if let TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            } = event
+                            {
+                                raise_main(tray.app_handle());
+                            }
+                        })
+                        .build(app)?;
+                } else {
+                    tracing::warn!("ZEB-356: no default window icon; tray not created");
+                }
+            }
+
             Ok(())
         })
         .manage(Mutex::new(NodeState::default()))
@@ -32836,6 +32935,7 @@ pub fn run() {
             publish_vine_reaction,
             start_node,
             stop_node,
+            quit_app,
             connect_zenoh,
             disconnect_zenoh,
             publish_profile,
