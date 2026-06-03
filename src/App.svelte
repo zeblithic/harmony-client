@@ -1459,33 +1459,24 @@
       // on unmount, alongside the listeners.
       fileManagerService.addUnlisten(() => { callStateUnsub?.(); callStateUnsub = null; });
 
-      // ── ZEB-353 Voice V5: native window-close teardown ──────────────
-      // Svelte's $effect-cleanup does NOT fire on a native window close, so the
-      // SPA-unmount hook above can't cover the real-world "user closes the app"
-      // path. Intercept the OS close request, leave/end the voice channel & DM
-      // call so the leave/end IPCs flush (otherwise the user lingers in peers'
-      // rosters until the 12s presence TTL and the mic stays open until the OS
-      // force-closes the process), THEN destroy the window. preventDefault +
-      // explicit destroy() is the documented Tauri v2 pattern to run async
-      // cleanup before the window actually closes. Dynamic import matches the
-      // core/event imports above (no static @tauri-apps import in this file).
       const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const appWin = getCurrentWebviewWindow();
-      let closing = false;
+      // ── ZEB-356: close-to-tray (reverses ZEB-353 close-to-quit). ─────
+      // Closing the window hides it to the tray and keeps the process, the
+      // Zenoh node, and any ACTIVE CALL alive (hide-during-call = "minimize to
+      // keep talking"). The real exit is the tray "Quit Harmony" item, handled
+      // by the quit-requested listener below. No teardown here.
       const unlistenClose = await appWin.onCloseRequested(async (event) => {
-        // Each close-request event independently proceeds to the default close
-        // unless THIS event calls preventDefault() — so always prevent first, or
-        // a second request (e.g. a double-click) would close via the default path
-        // and interrupt the first request's in-flight teardown.
         event.preventDefault();
-        // Re-entry guard: only the first request runs teardown + destroy; a
-        // second just defers (it already prevented its own default above).
-        if (closing) return;
-        closing = true;
-        // Bound the teardown: leave()/end() await IPCs that could in principle
-        // hang, and preventDefault means a hung promise would block the close
-        // forever. Race the (best-effort, never-rejecting) teardown against a
-        // 1.5s deadline so the window always closes; log if the deadline wins.
+        await appWin.hide();
+      });
+      fileManagerService.addUnlisten(unlistenClose);
+
+      // ── ZEB-356: real quit path. The tray "Quit Harmony" item emits
+      // `quit-requested`; run the (bounded, best-effort) V5 voice/call teardown
+      // so we don't linger in peers' rosters or hold the mic, then invoke
+      // quit_app to terminate the tray-resident process.
+      const unlistenQuit = await listen('quit-requested', async () => {
         const teardown = Promise.allSettled([
           voiceSession?.leave() ?? Promise.resolve(),
           callSession?.end() ?? Promise.resolve(),
@@ -1496,11 +1487,11 @@
           new Promise((r) => setTimeout(() => r(timedOut), 1500)),
         ]);
         if (raced === timedOut) {
-          console.warn('[harmony-client] voice teardown on close exceeded 1.5s; closing anyway');
+          console.warn('[harmony-client] voice teardown on quit exceeded 1.5s; quitting anyway');
         }
-        await appWin.destroy();
+        await invoke('quit_app');
       });
-      fileManagerService.addUnlisten(unlistenClose);
+      fileManagerService.addUnlisten(unlistenQuit);
     } catch (err) {
       console.warn('[harmony-client] Tauri init failed:', err);
     }
