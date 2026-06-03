@@ -33,23 +33,26 @@ export interface IncomingCallAlerter {
 
 class Alerter implements IncomingCallAlerter {
   private deps: AlerterDeps;
-  /** Cached focus state; re-checked at notify() time. Defaults true (safe: no-op). */
+  /** Cached focus state; only a fallback for isFocusedSafe(). Defaults true (safe: no-op). */
   private focused = true;
-  private activeId: string | null = null;
+  /**
+   * The call currently ringing, or null. Escalation is focus-driven off this:
+   * while a call is armed, losing focus (re-)escalates and regaining it cancels.
+   */
+  private ringing: { id: string; title: string; body: string } | null = null;
+  /** Whether OS attention is currently armed for `ringing` (or claimed in-flight). */
+  private escalated = false;
   private unlistenFocus: (() => void) | null = null;
+  private disposed = false;
 
   constructor(deps: AlerterDeps) {
     this.deps = deps;
-    // Best-effort focus tracking. Failures (non-Tauri) leave focused=true, so
-    // notify() simply no-ops rather than throwing.
+    // Best-effort focus tracking. Failures (non-Tauri) leave focused=true.
     void this.deps.isFocused().then((f) => { this.focused = f; }).catch(() => {});
     void this.deps
-      .onFocusChanged((f) => {
-        this.focused = f;
-        // Focusing the app drops the OS escalation; the in-app toast remains.
-        if (f && this.activeId) void this.clear(this.activeId);
-      })
-      .then((un) => { this.unlistenFocus = un; })
+      .onFocusChanged((f) => this.onFocusChange(f))
+      // If teardown beat the async registration, unlisten immediately.
+      .then((un) => { if (this.disposed) un(); else this.unlistenFocus = un; })
       .catch(() => {});
     if (this.deps.registerActivation) {
       void this.deps
@@ -58,41 +61,90 @@ class Alerter implements IncomingCallAlerter {
     }
   }
 
+  private onFocusChange(focused: boolean): void {
+    this.focused = focused;
+    if (focused) {
+      // Looking at the app → the in-app toast suffices; drop OS attention but
+      // keep the call armed so re-unfocusing while it still rings re-escalates.
+      if (this.escalated) {
+        this.escalated = false;
+        void this.deps.requestUserAttention(false).catch(() => {});
+      }
+    } else if (this.ringing && !this.escalated) {
+      // Unfocused while a call is still ringing → (re-)escalate.
+      void this.escalate();
+    }
+  }
+
   async notify(opts: { id: string; title: string; body: string }): Promise<void> {
-    // Re-check focus at call time: if the user is looking at the app, the in-app
-    // toast suffices — never double-alert.
-    let focused = this.focused;
-    try { focused = await this.deps.isFocused(); } catch { /* keep cached */ }
-    if (focused) return;
-    this.activeId = opts.id;
-    // Permission gates only the banner; attention (dock bounce) needs no grant.
+    if (this.disposed) return;
+    this.ringing = { ...opts };
+    this.escalated = false;
+    await this.escalate();
+  }
+
+  /**
+   * Escalate the ringing call to the OS iff the window is unfocused. Idempotent
+   * and re-entrant-safe: claims the escalation synchronously so a concurrent
+   * trigger can't double-fire, then re-validates (disposed / cleared / newer
+   * call / focus regained) after every await before arming OS attention. This
+   * closes the TOCTOU windows where dispose()/clear()/focus could otherwise be
+   * defeated by an in-flight notify().
+   */
+  private async escalate(): Promise<void> {
+    const target = this.ringing;
+    if (!target || this.disposed || this.escalated) return;
+    this.escalated = true; // claim synchronously
+
+    // If the user is already looking at the app, don't even request permission.
+    if (await this.isFocusedSafe()) { this.escalated = false; return; }
+
+    // Permission gates only the banner; the dock/taskbar attention needs no grant.
     let granted = false;
     try {
       granted = await this.deps.isPermissionGranted();
       if (!granted) granted = (await this.deps.requestPermission()) === 'granted';
     } catch { granted = false; }
+
+    // Re-validate before the side effect: teardown, a clear()/newer call, or
+    // focus regained during the permission await each cancel this escalation.
+    if (this.disposed || this.ringing !== target || (await this.isFocusedSafe())) {
+      this.escalated = false;
+      return;
+    }
     if (granted) {
-      try { this.deps.sendNotification({ title: opts.title, body: opts.body }); } catch { /* ignore */ }
+      try { this.deps.sendNotification({ title: target.title, body: target.body }); } catch { /* ignore */ }
     }
     try { await this.deps.requestUserAttention(true); } catch { /* ignore */ }
   }
 
+  private async isFocusedSafe(): Promise<boolean> {
+    try { return await this.deps.isFocused(); } catch { return this.focused; }
+  }
+
   async clear(id: string): Promise<void> {
-    if (this.activeId !== id) return;
-    this.activeId = null;
+    if (this.ringing?.id !== id) return;
+    this.ringing = null;
+    const wasEscalated = this.escalated;
+    this.escalated = false;
     // Load-bearing cancellation: stops the persistent bounce/flash. Programmatic
     // dismissal of an already-posted desktop banner is best-effort/unavailable
     // across platforms, so we only cancel attention here.
-    try { await this.deps.requestUserAttention(false); } catch { /* ignore */ }
+    if (wasEscalated) {
+      try { await this.deps.requestUserAttention(false); } catch { /* ignore */ }
+    }
   }
 
   dispose(): void {
-    // Cancel any in-flight OS attention so a dock/taskbar bounce doesn't persist
-    // after teardown (e.g. SPA unmount or identity switch while a call is still
-    // ringing). Best-effort; fire-and-forget.
-    if (this.activeId) void this.deps.requestUserAttention(false).catch(() => {});
+    // Mark disposed FIRST so any in-flight escalate() bails at its next
+    // re-validation instead of re-arming a dock/taskbar bounce after teardown
+    // (e.g. SPA unmount or identity switch while a call is still ringing).
+    this.disposed = true;
+    const wasEscalated = this.escalated;
+    this.ringing = null;
+    this.escalated = false;
+    if (wasEscalated) void this.deps.requestUserAttention(false).catch(() => {});
     if (this.unlistenFocus) { this.unlistenFocus(); this.unlistenFocus = null; }
-    this.activeId = null;
   }
 }
 

@@ -3,6 +3,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createIncomingCallAlerter, type AlerterDeps } from './incoming-call-alert';
 import { createDefaultIncomingCallAlerter } from './incoming-call-alert';
 
+/** Flush all pending microtasks (escalate() chains several awaits). */
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
 function makeDeps() {
   let focusCb: ((f: boolean) => void) | undefined;
   let activationCb: (() => void) | undefined;
@@ -88,6 +91,46 @@ describe('IncomingCallAlerter', () => {
     (d.requestUserAttention as ReturnType<typeof vi.fn>).mockClear();
     a.dispose();
     expect(d.requestUserAttention).toHaveBeenCalledWith(false);
+  });
+
+  it('REGRESSION — re-escalates when the window loses focus while a call still rings (Cursor High)', async () => {
+    let focused = true;
+    d.isFocused = vi.fn(async () => focused);
+    const a = createIncomingCallAlerter(d);
+    await a.notify({ id: 'c1', title: 'Incoming call', body: 'Alice is calling' });
+    // Focused at arrival → the in-app toast suffices, no OS escalation yet.
+    expect(d.sendNotification).not.toHaveBeenCalled();
+    expect(d.requestUserAttention).not.toHaveBeenCalledWith(true);
+    // Now the user switches away while the call is still ringing.
+    focused = false;
+    d._fireFocus(false);
+    await tick();
+    expect(d.sendNotification).toHaveBeenCalledWith({ title: 'Incoming call', body: 'Alice is calling' });
+    expect(d.requestUserAttention).toHaveBeenCalledWith(true);
+  });
+
+  it('REGRESSION — does not arm attention if focus is regained during the permission await (Cursor Medium)', async () => {
+    let focused = false;
+    d.isFocused = vi.fn(async () => focused);
+    // Simulate the user focusing the app *during* the permission await.
+    d.isPermissionGranted = vi.fn(async () => { focused = true; return true; });
+    const a = createIncomingCallAlerter(d);
+    await a.notify({ id: 'c1', title: 'Incoming call', body: 'Alice is calling' });
+    // First focus gate saw unfocused → requested permission; that flipped focus;
+    // the post-permission gate sees focused → bail before arming.
+    expect(d.sendNotification).not.toHaveBeenCalled();
+    expect(d.requestUserAttention).not.toHaveBeenCalledWith(true);
+  });
+
+  it('REGRESSION — dispose during a pending notify never re-arms OS attention (CodeRabbit TOCTOU)', async () => {
+    const a = createIncomingCallAlerter(d);
+    // Tear down mid-flight, during the permission await of escalate().
+    d.isPermissionGranted = vi.fn(async () => { a.dispose(); return true; });
+    await a.notify({ id: 'c1', title: 'Incoming call', body: 'Alice is calling' });
+    await tick();
+    // The resumed escalate() must bail at its re-validation, not arm attention.
+    expect(d.requestUserAttention).not.toHaveBeenCalledWith(true);
+    expect(d.sendNotification).not.toHaveBeenCalled();
   });
 });
 
