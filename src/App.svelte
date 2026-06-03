@@ -81,7 +81,7 @@
   import { getCallSession, type CallSession } from './lib/call-session';
   import { getGroupCallSession, type GroupCallSession } from './lib/group-call-session';
   import { groupCallBanners } from './lib/group-call-banner-store';
-  import { ensureGroupMembers, getCachedGroupMembers } from './lib/group-dm-members-cache';
+  import { ensureGroupMembers, getCachedGroupMembers, invalidateGroupMembers } from './lib/group-dm-members-cache';
   import { toastStore } from './lib/stores/toast';
   import { get } from 'svelte/store';
   import { classifyOwnerIdentity, type OwnerIdentityState } from './lib/owner-gate';
@@ -2080,6 +2080,13 @@
       // unwatched we stop receiving presence updates, so clear the stale banner
       // entry for this space.
       groupCallBanners.clear(spaceId);
+      // ZEB-360 (Cursor R5): the members cache (warmed by the presence/incoming
+      // handlers) is otherwise write-once-per-space for the session. Drop this
+      // space's entry on the watch boundary so re-opening the group DM re-fetches
+      // membership from the CRDT — picking up any add/remove. (Identity switch is
+      // handled separately: it goes through location.reload(), which wipes the
+      // module-global cache entirely.)
+      invalidateGroupMembers(spaceId);
       void (async () => {
         try {
           const { invoke } = await import('@tauri-apps/api/core');
