@@ -80,6 +80,23 @@ describe('GroupCallBanner', () => {
     expect(await screen.findByTestId('group-call-banner')).toBeInTheDocument();
   });
 
+  it('disables Join (and no-ops the coordinator) while another voice session is busy (D6)', async () => {
+    groupCallBanners.apply('space-1', 'call-1', roster);
+    const session = fakeSession({ phase: 'idle' });
+    const onJoin = vi.fn();
+    const invoke = vi.fn(async (cmd: string) => (cmd === 'get_group_dm_members' ? ['aaaa', 'bbbb'] : undefined));
+    render(GroupCallBanner, {
+      props: { spaceId: 'space-1', invoke: invoke as never, groupCall: session as never, busy: true, onJoin },
+    });
+    const btn = await screen.findByTestId('group-call-join');
+    expect(btn).toBeDisabled();
+    // Even a forced click must not start a join while busy — the header forbids it
+    // too (one media engine at a time); switching is gated behind leaving first.
+    await fireEvent.click(btn);
+    expect(onJoin).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
   it('Join warms members then routes through the onJoin coordinator (not joinActive directly)', async () => {
     groupCallBanners.apply('space-1', 'call-1', roster);
     const session = fakeSession({ phase: 'idle' });

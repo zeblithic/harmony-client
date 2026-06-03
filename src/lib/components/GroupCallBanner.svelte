@@ -10,10 +10,17 @@
   import { ensureGroupMembers } from '../group-dm-members-cache';
   import type { GroupCallSession } from '../group-call-session';
 
-  let { spaceId, invoke, groupCall, onJoin }: {
+  let { spaceId, invoke, groupCall, busy = false, onJoin }: {
     spaceId: string;
     invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
     groupCall: GroupCallSession | null;
+    // ZEB-360 (D6, Cursor R7): one media engine at a time. Mirrors the same
+    // busy guard the group header Call/Join buttons honor — the banner Join is
+    // disabled whenever another voice session is active (community voice, a 1:1
+    // call, or a group call). Joining would otherwise silently switch sessions
+    // via `leaveOtherVoiceThen`, an affordance the header forbids; greying it out
+    // keeps the surfaces consistent and makes the one-session model explicit.
+    busy?: boolean;
     // ZEB-360 (D6, CodeAnt/CodeRabbit): the coordinated join helper from
     // App.svelte. Routes through `leaveOtherVoiceThen` (tears down community
     // voice / a 1:1 call first) + `ensureGroupMembers` + `joinActive`, so the
@@ -41,7 +48,7 @@
   let joining = $state(false);
 
   async function join() {
-    if (!groupCall || !entry || joining) return;
+    if (!groupCall || !entry || joining || busy) return;
     // Re-read the latest entry at click time (the roster/callId may have advanced
     // since render); also bail if we've since joined this call.
     const latest = get(groupCallBanners)[spaceId];
@@ -70,7 +77,8 @@
       class="btn-join"
       data-testid="group-call-join"
       onclick={join}
-      disabled={joining}
+      disabled={joining || busy}
+      title={busy ? 'Leave your current call first' : undefined}
     >
       {joining ? 'Joining…' : 'Join'}
     </button>

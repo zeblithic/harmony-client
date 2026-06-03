@@ -229,6 +229,7 @@
         spaceId={channelId}
         invoke={groupCallInvoke ?? noopInvoke}
         {groupCall}
+        busy={groupCallBusy}
         onJoin={(_callId, sid) => onJoinGroupCall?.(sid)}
       />
     {/if}
