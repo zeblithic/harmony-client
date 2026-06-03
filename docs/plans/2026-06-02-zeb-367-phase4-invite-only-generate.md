@@ -503,13 +503,22 @@ if is_invite_only {
         untargeted_decrypt_key: sealed.untargeted_decrypt_key,
     };
 
+    // --- encode FIRST so we never publish a case-A record for a URL that fails
+    //     to encode; only register on a successful encode. ---
+    let url = crate::community_invite::encode_invite_url(&payload)
+        .map_err(|e| format!("encode invite url: {e}"))?;
     // --- case-A pkarr publish (fires because invite_token is Some) ---
     {
         let inv_pub = state_lock.lock().ok().and_then(|g| g.pkarr_invite_publisher.clone());
-        if let Some(inv_pub) = inv_pub { inv_pub.register_invite(&payload).await; }
+        match inv_pub {
+            Some(inv_pub) => inv_pub.register_invite(&payload).await,
+            // An invite-only invite is un-redeemable cross-WAN without its case-A
+            // publication — fail at the mint site rather than return a broken URL.
+            None => return Err("invite-only invite could not be published for \
+                                cross-WAN (case-A) discovery".to_string()),
+        }
     }
-    return crate::community_invite::encode_invite_url(&payload)
-        .map_err(|e| format!("encode invite url: {e}"));
+    return Ok(url);
 }
 ```
 > `events`, `state_snapshot`, `forked_from`, `pre_fork_snapshot`, `space`, `admin`, `epoch`, `space_id`, `mk`, `inviter_enrollment_cert` are all already in scope from the open-branch prelude (lib.rs:14827-15033). Reuse them; do NOT recompute. Confirm `materialize_with_now` and the `events` Vec are built before this branch — if the open path builds `state_snapshot`/`events` *after* the stub, hoist that computation above this `if`.
@@ -529,6 +538,14 @@ git commit -m "ZEB-367: generate_invite invite-only branch (untargeted) + 7-day 
 ---
 
 ## Task 7: `generate_invite` — TARGETED recipient (+ the device-cache lookup)
+
+> **DEFERRED to ZEB-369 — NOT implemented in this PR.** Targeted invites seal the
+> epoch key to the invitee's enrolled **device-#2** X25519 key, but that key is not
+> resolvable from `OwnerDeviceCache`, which stores the identity/**#3** key, not
+> device-#2. Implementing Steps 1–2 as written would silently mint invites the
+> invitee can never decrypt. Instead, `generate_invite` REJECTS `invitee_hint =
+> Some(_)` up front (see `invite_only_generation_guard` in lib.rs). The steps below
+> are retained verbatim as the ZEB-369 starting point, not as work for this PR.
 
 **Files:**
 - Modify: `src-tauri/src/lib.rs` (`generate_invite`)
@@ -647,7 +664,7 @@ let admin_bootstrap = harmony_app::invite_mint::extract_admin_bootstrap(&alice_e
 let payload = CommunityInvitePayload { /* is_invite_only: true, invite_token: Some(token), admin_bootstrap: Some(admin_bootstrap), admin_identity_pub: Some(alice_id_pub), untargeted_decrypt_key: sealed.untargeted_decrypt_key, ... */ };
 // Bob redeems via connectivity_redeem_invite_iroh_inner(...) — assert status == "joined" and the community materializes on Bob.
 ```
-Assertions: redeem returns `status == "joined"`; the community appears in Bob's engine with Alice as admin; the epoch key decrypts (a channel/member is visible). For the **targeted** variant, seal to Bob's device-#2 X25519 and set `invitee_hint = Some(bob_owner)`; assert it still joins. Add the **unregister** assertion from Task 8 Step 4: a second `connectivity_redeem_invite_iroh_inner` with the same token no longer resolves the inviter (case-A unregistered).
+Assertions: redeem returns `status == "joined"`; the community appears in Bob's engine with Alice as admin; the epoch key decrypts (a channel/member is visible). Add the **unregister** assertion from Task 8 Step 4: a second `connectivity_redeem_invite_iroh_inner` with the same token no longer resolves the inviter (case-A unregistered). _(The **targeted** variant — seal to Bob's device-#2 X25519, `invitee_hint = Some(bob_owner)` — is **deferred to ZEB-369** along with Task 7; only the untargeted roundtrip ships in this PR.)_
 
 - [ ] **Step 2: Run the integration test**
 

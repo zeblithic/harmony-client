@@ -33,11 +33,11 @@ In: invite-only `generate_invite` (mint the signed `InviteToken`, seal the epoch
 
 Out: ongoing cross-WAN CRDT sync after join (Spec B — Zenoh-over-iroh ingestion); DM-over-iroh migration (separate track); offline-countersigner redemption (ZEB-254).
 
-## Two invite models (both supported)
+## Two invite models (untargeted shipped; **targeted deferred to ZEB-369**)
 
-Open communities ship the 32-byte epoch key **in the clear** in the URL. Invite-only **seals** it (92-byte `seal_to_owner` envelope) so the link alone is insufficient. Two recipient models, with **different guarantees**:
+Open communities ship the 32-byte epoch key **in the clear** in the URL. Invite-only **seals** it (92-byte `seal_to_owner` envelope) so the link alone is insufficient. Two recipient models, with **different guarantees** (only **untargeted** ships in ZEB-367 — see the correction note above):
 
-- **Targeted** — seal to a *specific* invitee's enrolled **device-#2 X25519** key. The epoch key is genuinely confidential to that invitee (true invite-only). `invite_token.invitee_hint = Some(invitee_addr)`; the redeemer's `join_event.actor` must equal it. Reuses `seal_to_owner` verbatim — **no new cryptography**. Requires the invitee's devices to already be resolvable (a known peer).
+- **Targeted** _(deferred to [ZEB-369](https://linear.app/zeblith/issue/ZEB-369); not implemented in this PR)_ — seal to a *specific* invitee's enrolled **device-#2 X25519** key. The epoch key is genuinely confidential to that invitee (true invite-only). `invite_token.invitee_hint = Some(invitee_addr)`; the redeemer's `join_event.actor` must equal it. Reuses `seal_to_owner` verbatim — **no new cryptography**. Requires the invitee's devices to already be resolvable (a known peer).
 - **Untargeted** — a single-use link for *anyone*. Generate a one-time **ephemeral X25519 keypair**, seal the epoch key to its public half, and carry the **private** half in the URL. The URL holder can decrypt the epoch key — so confidentiality is **no better than Open**; the value is **single-use + admin-countersigned membership** ("controlled open"). The link must be treated as a secret (sent privately, burned on use). `invite_token.invitee_hint = None`.
 
 ## Architecture — a new `invite_mint` module
@@ -92,6 +92,8 @@ pub untargeted_decrypt_key: Option<[u8; 32]>,
 
 ## The `generate_invite` invite-only branch (replaces the stub)
 
+> _Step 2's `targeted(...)` arm is **deferred to [ZEB-369](https://linear.app/zeblith/issue/ZEB-369)**; ZEB-367 ships only the `untargeted` arm and rejects `invitee_hint = Some(_)` up front (`invite_only_generation_guard`). As built, encode happens before the case-A `register_invite`, and invite-only generation fails if the case-A publisher is unavailable._
+
 ```
 1. Power check: caller power ≥ POWER_THRESHOLDS.invite (existing).
 2. recipient =
@@ -142,13 +144,15 @@ The case-A pkarr publication must stop once the invite is consumed (single-use) 
 
 ## Error handling
 
-- Targeted invitee unresolvable → `"can't target <addr>: their devices aren't known yet — use an untargeted link"`.
+- _(ZEB-369, deferred)_ Targeted invitee unresolvable → `"can't target <addr>: their devices aren't known yet — use an untargeted link"`.
 - Caller power < `POWER_THRESHOLDS.invite` → existing insufficient-power error.
 - Non-admin caller (v1) → `"only the admin can generate invite-only invites (v1)"`.
 - `expires_at`: default **7 days** when the caller passes `None` (Phase 3 ignored it; Phase 4 honors it — it's bound into the token sig, so the redeemer enforces expiry).
 - `encode_invite_url` already rejects malformed invite-only payloads (missing token / bootstrap / inviter_enrollment, wrong sealed-key length); the new `untargeted_decrypt_key` guard joins them.
 
 ## Testing (TDD)
+
+> _Targeted-path assertions below (targeted seal round-trip, `invitee_hint`-set generation, targeted redeem) are **deferred to [ZEB-369](https://linear.app/zeblith/issue/ZEB-369)**. ZEB-367's tests cover the untargeted path, the guard rejecting `invitee_hint`, and the encode/decode guard requiring `untargeted_decrypt_key` on untargeted invite-only payloads._
 
 - **`mint_invite_token`:** mint → `verify_invite_token_sig_device_key` passes; tamper a field → verify fails.
 - **`seal_epoch_key`:** targeted round-trip (`seal_to_owner` → `open_from_owner` with the invitee key recovers the epoch key); untargeted round-trip (recovers via the returned ephemeral private); untargeted returns `Some(key)`, targeted returns `None`.

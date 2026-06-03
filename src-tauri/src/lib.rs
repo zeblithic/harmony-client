@@ -15156,19 +15156,33 @@ async fn generate_invite(
 
     // ZEB-323 Phase 2b / ZEB-367: now that we hold a URL to hand out, register the
     // case-A pkarr publication (keyed on the invite token sig) so a redeemer can
-    // locate our iroh routing before a Zenoh session exists. Open-community
-    // invites (invite_token = None) return early inside register_invite without
-    // publishing. Best-effort: if the NodeState lock is poisoned we skip the
-    // publish (cross-WAN case-A discovery is degraded, but the invite + LAN redeem
-    // still work) rather than failing invite creation. Unregister-on-consume fires
-    // at the countersign-acceptance points (community_invite::handle_unicast).
+    // locate our iroh routing before a Zenoh session exists. Unregister-on-consume
+    // fires at the countersign-acceptance points (community_invite::handle_unicast).
+    //
+    // Open-community invites (invite_token = None) need no case-A record — they
+    // return early inside register_invite — so a missing publisher is harmless and
+    // they still succeed. For invite-only invites, however, this publication is the
+    // ONLY way an off-LAN redeemer locates the inviter; without it the invite is
+    // silently un-redeemable cross-WAN. Matching this module's "never ship an
+    // un-redeemable invite-only URL" contract, we FAIL at the mint site rather than
+    // return a misleading Ok when the publisher is unavailable (iroh boot failed, or
+    // the NodeState lock is poisoned). Trade-off: this also blocks invite-only
+    // minting while iroh is down even for LAN-only use — acceptable, since cross-WAN
+    // join is the entire point of the invite-only flow.
     {
         let inv_pub = state_lock
             .lock()
             .ok()
             .and_then(|g| g.pkarr_invite_publisher.clone());
-        if let Some(inv_pub) = inv_pub {
-            inv_pub.register_invite(&payload).await;
+        match inv_pub {
+            Some(inv_pub) => inv_pub.register_invite(&payload).await,
+            None if payload.invite_token.is_some() => {
+                return Err("invite-only invite could not be published for cross-WAN \
+                            (case-A) discovery: pkarr invite publisher unavailable \
+                            (iroh routing not ready)"
+                    .to_string());
+            }
+            None => {}
         }
     }
     Ok(url)

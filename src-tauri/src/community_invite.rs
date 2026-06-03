@@ -797,6 +797,16 @@ pub enum InviteUrlError {
     /// payload would leak the epoch key. Enforced at both encode and decode.
     #[error("untargeted_decrypt_key is only valid on an untargeted invite-only payload")]
     UntargetedKeyNotAllowed,
+    /// ZEB-367: an untargeted invite-only payload (invite-only, `invite_token`
+    /// present, `invitee_hint == None`) is MISSING its `untargeted_decrypt_key`.
+    /// Such a URL encodes/decodes cleanly, but at redeem `mint_redemption` treats
+    /// the absent key as the targeted path and derives the redeemer's own device-#2
+    /// key — which never matches the ephemeral key the epoch was sealed to, so
+    /// decryption fails late with a confusing "epoch key decryption failed". Caught
+    /// at both encode and decode so the un-redeemable URL never leaves the mint site
+    /// and is rejected clearly on receipt. Mirrors `UntargetedKeyNotAllowed`.
+    #[error("untargeted invite-only payload is missing its untargeted_decrypt_key")]
+    UntargetedKeyMissing,
 }
 
 /// Hard cap on the base64url body length (post-prefix-strip, in base64
@@ -846,6 +856,40 @@ fn validate_sealed_epoch_key_len(
     Ok(())
 }
 
+/// ZEB-367: the presence of `untargeted_decrypt_key` and the payload's invite
+/// shape must agree EXACTLY. The key may ride ONLY on an untargeted invite-only
+/// payload (invite-only, `invite_token` present, `invitee_hint == None`):
+///
+/// - On an untargeted invite-only payload the key is REQUIRED — without it
+///   `mint_redemption` falls back to the device-#2 (targeted) decrypt path and
+///   fails late with "epoch key decryption failed" (`UntargetedKeyMissing`).
+/// - On any other shape (open, or invite-only-but-targeted) the key is FORBIDDEN
+///   — it seals the epoch key open to any URL holder and would leak it on a
+///   payload whose confidentiality model assumes otherwise (`UntargetedKeyNotAllowed`).
+///
+/// Enforced identically at encode and decode so a structurally-inconsistent
+/// invite-only URL never leaves the mint site and is rejected clearly on receipt.
+fn validate_untargeted_decrypt_key_shape(
+    payload: &CommunityInvitePayload,
+) -> Result<(), InviteUrlError> {
+    let is_untargeted_invite_only = payload.is_invite_only
+        && payload
+            .invite_token
+            .as_ref()
+            .is_some_and(|t| t.invitee_hint.is_none());
+    match (
+        is_untargeted_invite_only,
+        payload.untargeted_decrypt_key.is_some(),
+    ) {
+        // untargeted invite-only WITH key, or any other shape WITHOUT key
+        (true, true) | (false, false) => Ok(()),
+        // key present on a targeted / open payload — would leak the epoch key
+        (false, true) => Err(InviteUrlError::UntargetedKeyNotAllowed),
+        // untargeted invite-only missing its URL-carried decrypt key
+        (true, false) => Err(InviteUrlError::UntargetedKeyMissing),
+    }
+}
+
 /// Canonical-CBOR-encode the payload, then base64url-no-pad the result,
 /// and prefix `harmony://invite/`. The output is copy-paste-safe across
 /// chat / email / messaging clients that munge `+`, `/`, or `=`.
@@ -889,19 +933,10 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
         payload.is_invite_only,
         payload.epoch_snapshot.sealed_epoch_key.len(),
     )?;
-    // ZEB-367: confidentiality invariant — the untargeted decrypt key may ONLY
-    // ride on an untargeted invite-only payload (invite-only with no
-    // invitee_hint). On a targeted or open payload it would leak the epoch key.
-    if payload.untargeted_decrypt_key.is_some() {
-        let untargeted_ok = payload.is_invite_only
-            && payload
-                .invite_token
-                .as_ref()
-                .is_some_and(|t| t.invitee_hint.is_none());
-        if !untargeted_ok {
-            return Err(InviteUrlError::UntargetedKeyNotAllowed);
-        }
-    }
+    // ZEB-367: confidentiality + redeemability invariant — the untargeted decrypt
+    // key and the invite shape must agree exactly (key required on untargeted
+    // invite-only, forbidden elsewhere). See validate_untargeted_decrypt_key_shape.
+    validate_untargeted_decrypt_key_shape(payload)?;
     let cbor = canonical_cbor_encode(payload).map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
     // Encode-time size check: fail fast rather than producing an invite URL
@@ -987,21 +1022,11 @@ pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlE
         }
         _ => {} // (None, None) or matching (Some, Some) — valid
     }
-    // ZEB-367: confidentiality invariant — the untargeted decrypt key may ONLY
-    // ride on an untargeted invite-only payload (invite-only with no
-    // invitee_hint). A tampered/hostile URL that smuggles this key onto a
-    // targeted or open payload is rejected on receipt so the epoch key never
-    // leaks. Mirrors the encode-side guard.
-    if payload.untargeted_decrypt_key.is_some() {
-        let untargeted_ok = payload.is_invite_only
-            && payload
-                .invite_token
-                .as_ref()
-                .is_some_and(|t| t.invitee_hint.is_none());
-        if !untargeted_ok {
-            return Err(InviteUrlError::UntargetedKeyNotAllowed);
-        }
-    }
+    // ZEB-367: confidentiality + redeemability invariant — mirrors the encode-side
+    // guard. A tampered/hostile URL that smuggles the untargeted key onto a
+    // targeted/open payload (key leak), or an untargeted invite-only URL that omits
+    // the key (un-redeemable), is rejected on receipt. See the shared helper.
+    validate_untargeted_decrypt_key_shape(&payload)?;
     Ok(payload)
 }
 
@@ -2098,7 +2123,11 @@ mod tests {
             pre_fork_snapshot: None,
             // ZEB-339: invite-only payloads must carry the inviter's cert.
             inviter_enrollment: Some(crate::community_membership::mint_test_owner(0x7E).cert),
-            untargeted_decrypt_key: None,
+            // ZEB-367: this helper builds an UNtargeted invite-only payload
+            // (invitee_hint == None), which now REQUIRES the URL-carried
+            // ephemeral decrypt key to be redeemable. Tests that exercise the
+            // targeted path flip invitee_hint to Some and set/clear this field.
+            untargeted_decrypt_key: Some([0x99; 32]),
         }
     }
 
@@ -2190,6 +2219,38 @@ mod tests {
         assert!(matches!(
             decode_invite_url(&url),
             Err(InviteUrlError::UntargetedKeyNotAllowed)
+        ));
+    }
+
+    /// An untargeted invite-only payload (invitee_hint None) that OMITS the
+    /// untargeted_decrypt_key must be rejected at the mint site: without the key
+    /// `mint_redemption` would derive the redeemer's device-#2 key (targeted path)
+    /// and fail to decrypt the ephemeral-sealed epoch key. Catching it at encode
+    /// keeps the un-redeemable URL from ever leaving.
+    #[test]
+    fn encode_rejects_untargeted_invite_only_missing_key() {
+        let mut p = make_invite_only_payload_correct(); // untargeted, key Some
+        p.untargeted_decrypt_key = None; // drop the required key
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::UntargetedKeyMissing)
+        ));
+    }
+
+    /// Decode-side mirror: a hostile/buggy URL whose CBOR carries an untargeted
+    /// invite-only payload with no untargeted_decrypt_key is rejected on receipt
+    /// (CBOR-encoded directly to bypass the encode-side guard), so the redeemer
+    /// never spins up an engine for an invite it can't decrypt.
+    #[test]
+    fn decode_rejects_untargeted_invite_only_missing_key() {
+        let mut p = make_invite_only_payload_correct(); // untargeted, key Some
+        p.untargeted_decrypt_key = None; // drop the required key
+        let cbor = canonical_cbor_encode(&p).expect("cbor encode");
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
+        let url = format!("harmony://invite/{b64}");
+        assert!(matches!(
+            decode_invite_url(&url),
+            Err(InviteUrlError::UntargetedKeyMissing)
         ));
     }
 

@@ -261,7 +261,10 @@ struct TwoPartySetup {
     _alice_accept: tokio::task::JoinHandle<()>,
     _bob_accept: tokio::task::JoinHandle<()>,
     _relay: harmony_pkarr::testing::MockPkarrRelay,
-    _publisher_handle: tokio::task::JoinHandle<()>,
+    // Aborted during teardown (not just dropped) so the long-lived pkarr publisher
+    // task can't bleed background work into later tests. Not underscore-prefixed:
+    // it is actively used (.abort()), unlike the pure keep-alive fields above.
+    publisher_handle: tokio::task::JoinHandle<()>,
     _dir_alice: tempfile::TempDir,
     _dir_bob: tempfile::TempDir,
     _bob_app: tauri::App<tauri::test::MockRuntime>,
@@ -666,7 +669,7 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
         _alice_accept: alice_accept,
         _bob_accept: bob_accept,
         _relay: relay,
-        _publisher_handle: publisher_handle,
+        publisher_handle,
         _dir_alice: dir_alice,
         _dir_bob: dir_bob,
         _bob_app: bob_app,
@@ -998,7 +1001,10 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             "Alice's CRDT must contain her own auto-counter-sign for Bob's PendingJoin"
         );
 
-        // Graceful teardown.
+        // Graceful teardown. Abort the long-lived pkarr publisher task FIRST so it
+        // stops using the endpoints before we shut them down, and so no background
+        // work leaks into later tests.
+        s.publisher_handle.abort();
         s.alice_ep.shutdown().await;
         s.bob_ep.shutdown().await;
     })
@@ -1236,7 +1242,10 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
              the invite is consumed (handle_unicast → unregister_invite on Inserted)"
         );
 
-        // Graceful teardown.
+        // Graceful teardown. Abort the long-lived pkarr publisher task FIRST so it
+        // stops using the endpoints before we shut them down, and so no background
+        // work leaks into later tests.
+        s.publisher_handle.abort();
         s.alice_ep.shutdown().await;
         s.bob_ep.shutdown().await;
     })

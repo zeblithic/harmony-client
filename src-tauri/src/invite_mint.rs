@@ -100,12 +100,26 @@ pub fn extract_admin_bootstrap(
 ) -> Result<SignedMembershipEvent, InviteMintError> {
     events
         .iter()
-        .find(|e| {
+        .filter(|e| {
             e.actor == admin_addr
                 && e.community_id == community_id
                 && matches!(e.kind, MembershipEventKind::Join)
                 && e.countersig.is_none()
                 && e.enrollment.is_some()
+        })
+        // Deterministic selection: pick the EARLIEST qualifying bootstrap Join by
+        // canonical HLC order (wall_ms, logical, device_id), with the event id as a
+        // final total-order tiebreaker. A plain `.find()` would surface whichever
+        // match happens to come first in iterator order — non-deterministic if the
+        // slice ever holds more than one admin bootstrap Join, which would let a
+        // non-canonical record get embedded in the minted invite.
+        .min_by(|a, b| {
+            (a.at.wall_ms, a.at.logical, &a.at.device_id, &a.id).cmp(&(
+                b.at.wall_ms,
+                b.at.logical,
+                &b.at.device_id,
+                &b.id,
+            ))
         })
         .cloned()
         .ok_or(InviteMintError::NoAdminBootstrap)
@@ -197,5 +211,42 @@ mod tests {
     fn missing_admin_bootstrap_errors() {
         let r = extract_admin_bootstrap(&[], SpaceId([0u8; 16]), OwnerAddr([0u8; 16]));
         assert!(matches!(r, Err(InviteMintError::NoAdminBootstrap)));
+    }
+
+    #[test]
+    fn picks_earliest_bootstrap_when_multiple_admin_joins() {
+        // Two qualifying admin bootstrap Joins differing only by HLC. Selection
+        // must be deterministic (earliest by canonical HLC order), independent of
+        // the order they appear in the slice.
+        let admin = OwnerAddr([0x6Eu8; 16]);
+        let cid = SpaceId([0x11u8; 16]);
+        let owner = crate::community_membership::mint_test_owner(0x6E);
+        let earlier = SignedMembershipEvent {
+            id: [1u8; 16],
+            community_id: cid,
+            kind: MembershipEventKind::Join,
+            actor: admin,
+            at: Hlc {
+                wall_ms: 10,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: Some(owner.cert.clone()),
+        };
+        let later = SignedMembershipEvent {
+            id: [2u8; 16],
+            at: Hlc {
+                wall_ms: 20,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            ..earlier.clone()
+        };
+        // Present in reverse (later first) so a naive `.find()` would pick `later`.
+        let got = extract_admin_bootstrap(&[later.clone(), earlier.clone()], cid, admin).unwrap();
+        assert_eq!(got.id, earlier.id, "must pick the earliest-HLC bootstrap");
+        assert_eq!(got.at.wall_ms, 10);
     }
 }
