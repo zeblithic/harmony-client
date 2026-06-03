@@ -12051,6 +12051,143 @@ async fn send_voice_signal(
     Ok(())
 }
 
+// ── ZEB-360 Group-DM voice: helpers ───────────────────────────────────────────
+
+/// ZEB-360: resolve everything needed to fan a group-DM voice signal. Returns
+/// (other_members_with_x25519_pubs, dm_key, signing_key, self_owner). Each entry
+/// is one OwnerAddr + its X25519 pub per enrolled device (signal delivery is
+/// owner-scoped, so we fan one sealed envelope per device).
+///
+/// Snapshots under the sync mutex (no await while locked), then does the
+/// async CRDT + outbox reads outside the lock.
+async fn resolve_group_call_members(
+    state: &std::sync::Mutex<NodeState>,
+    space_id_hex: &str,
+) -> Result<
+    (
+        Vec<(crate::owner_state_types::OwnerAddr, Vec<[u8; 32]>)>,
+        crate::owner_state_types::DmContentKey,
+        std::sync::Arc<ed25519_dalek::SigningKey>,
+        crate::owner_state_types::OwnerAddr,
+    ),
+    String,
+> {
+    let space_bytes = hex::decode(space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
+    let space_arr: [u8; 16] = space_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("space_id must be 16 bytes, got {}", space_bytes.len()))?;
+    let space_id = crate::owner_state_types::SpaceId(space_arr);
+
+    // Snapshot handles under the std mutex — no await while locked.
+    let (crdt_state, dm_outbox, self_owner) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let crdt = g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let outbox = g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let owner = g.dm_self_owner.ok_or("dm_self_owner missing")?;
+        (crdt, outbox, owner)
+    };
+
+    let (members, dm_key) = {
+        let os = crdt_state.lock().await;
+        let space = os
+            .spaces
+            .get(&space_id)
+            .ok_or_else(|| "group dm space not found".to_string())?;
+        if space.kind != crate::owner_state_types::SpaceKind::GroupDm {
+            return Err("not a group-dm space".to_string());
+        }
+        let dm_key = space
+            .content_key
+            .clone()
+            .ok_or_else(|| "group dm has no content key".to_string())?;
+        if !space.members.contains(&self_owner) {
+            return Err("self is not a member of this group dm".to_string());
+        }
+        let mut out: Vec<(crate::owner_state_types::OwnerAddr, Vec<[u8; 32]>)> = Vec::new();
+        for m in space.members.iter().filter(|m| **m != self_owner) {
+            let mut pubs: Vec<[u8; 32]> = os
+                .owner_device_cache
+                .devices
+                .get(m)
+                .map(|entry| {
+                    entry
+                        .device_identity_pubs
+                        .iter()
+                        .filter_map(|p| *p)
+                        .map(|identity_pub| {
+                            let mut x = [0u8; 32];
+                            x.copy_from_slice(&identity_pub[..32]);
+                            x
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            pubs.sort_unstable();
+            pubs.dedup();
+            if !pubs.is_empty() {
+                out.push((*m, pubs));
+            }
+        }
+        (out, dm_key)
+    };
+
+    let signing_key = dm_outbox.lock().await.community_signing_key.clone();
+    Ok((members, dm_key, signing_key, self_owner))
+}
+
+/// ZEB-360: build, sign, seal, and fan a group `VoiceSignal` to a set of member
+/// owners (one sealed envelope per enrolled device each). `space_id` is always
+/// set so the inbound handler takes the group path.
+async fn send_group_voice_signal(
+    state: &std::sync::Mutex<NodeState>,
+    space_id_hex: &str,
+    kind: crate::voice_signal::VoiceSignalKind,
+    call_id: [u8; 16],
+    reason: Option<crate::voice_signal::DeclineReason>,
+    recipients: &[(crate::owner_state_types::OwnerAddr, Vec<[u8; 32]>)],
+    signing_key: &std::sync::Arc<ed25519_dalek::SigningKey>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+) -> Result<(), String> {
+    let space_bytes = hex::decode(space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
+    let space_arr: [u8; 16] = space_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "space_id must be 16 bytes".to_string())?;
+    let signal = crate::voice_signal::VoiceSignal {
+        kind,
+        call_id,
+        caller: self_owner,
+        space_id: Some(crate::owner_state_types::SpaceId(space_arr)),
+        decline_reason: reason,
+    };
+    let voice_signal_tx = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.voice_signal_tx
+            .clone()
+            .ok_or_else(|| "voice signal not running".to_string())?
+    };
+    for (owner, pubs) in recipients {
+        let callee_owner_hex = hex::encode(owner.0);
+        for p in pubs {
+            let sealed = crate::voice_signal::build_sealed_signal(&signal, signing_key, p)
+                .map_err(|e| format!("seal signal: {e}"))?;
+            voice_signal_tx
+                .send(crate::voice_signal::VoiceSignalRequest {
+                    callee_owner_hex: callee_owner_hex.clone(),
+                    sealed,
+                })
+                .await
+                .map_err(|_| "event loop not running".to_string())?;
+        }
+    }
+    Ok(())
+}
+
 /// ZEB-352: initiate a 1:1 DM voice call. Generates a random 16-byte
 /// call-id, sends an `Invite` signal to the peer, and returns the
 /// call-id hex to the frontend for correlation.
@@ -12148,6 +12285,69 @@ async fn end_call(
         crate::voice_signal::VoiceSignalKind::End,
         call,
         None,
+    )
+    .await
+}
+
+// ── ZEB-360 Group-DM voice: signaling IPCs ────────────────────────────────────
+
+/// ZEB-360: place a group-DM voice call. Mints a 16-byte call_id, fans a sealed
+/// Invite (with space_id) to every other member, returns the call_id hex.
+#[tauri::command]
+async fn place_group_call(
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    use rand::RngCore;
+    let (members, _dm_key, signing_key, self_owner) =
+        resolve_group_call_members(&state, &space_id).await?;
+    let mut call_id = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut call_id);
+    send_group_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Invite,
+        call_id,
+        None,
+        &members,
+        &signing_key,
+        self_owner,
+    )
+    .await?;
+    Ok(hex::encode(call_id))
+}
+
+/// ZEB-360: decline an incoming group-DM call — seals a Decline back to the
+/// caller only (parity). `caller_owner` comes from the incoming-group-call event.
+#[tauri::command]
+async fn decline_group_call(
+    call_id: String,
+    space_id: String,
+    caller_owner: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    let caller_bytes =
+        hex::decode(&caller_owner).map_err(|_| "caller_owner not hex".to_string())?;
+    let caller_arr: [u8; 16] = caller_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "caller_owner must be 16 bytes".to_string())?;
+    let caller = crate::owner_state_types::OwnerAddr(caller_arr);
+    let (members, _dm_key, signing_key, self_owner) =
+        resolve_group_call_members(&state, &space_id).await?;
+    let Some(target) = members.into_iter().find(|(o, _)| *o == caller) else {
+        return Err("caller not a member of this group dm".to_string());
+    };
+    send_group_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Decline,
+        call,
+        Some(crate::voice_signal::DeclineReason::User),
+        &[target],
+        &signing_key,
+        self_owner,
     )
     .await
 }
@@ -32980,6 +33180,9 @@ pub fn run() {
             leave_dm_call,
             send_dm_voice_frame,
             set_dm_call_muted,
+            // ZEB-360 Group-DM voice calls (signaling; media+presence IPCs land in Task 8).
+            place_group_call,
+            decline_group_call,
             send_mail,
             list_mail,
             get_mail,
@@ -33185,6 +33388,9 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         leave_dm_call,
         send_dm_voice_frame,
         set_dm_call_muted,
+        // ZEB-360 Group-DM voice calls (signaling; media+presence IPCs land in Task 8).
+        place_group_call,
+        decline_group_call,
     ])
 }
 
