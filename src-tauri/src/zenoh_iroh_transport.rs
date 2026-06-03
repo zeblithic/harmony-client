@@ -327,9 +327,16 @@ impl IrohZenohLinkManager {
                         {
                             tracing::warn!("zenoh new_link channel closed: {e}");
                         }
-                    } else if alpn_used == alpn::HARMONY_HANDSHAKE_V1 {
+                    } else if alpn_used == alpn::HARMONY_HANDSHAKE_V1
+                        || alpn_used == alpn::HARMONY_FRIEND_V1
+                    {
                         // ZEB-325 Phase 2c (option A) + PR #159 R2:
-                        // inbound invite handshake. Take the pending-
+                        // inbound invite handshake. ZEB-370 Task 9: the
+                        // friend-link ALPN (`harmony/friend/v1`) shares this
+                        // dispatch path — the installed dispatcher is a
+                        // `MultiplexHandshakeDispatcher` that re-reads
+                        // `conn.alpn()` and routes friend → friend acceptor,
+                        // else → invite acceptor. Take the pending-
                         // queue mutex around the dispatcher OnceCell
                         // observation so install_handshake_dispatcher's
                         // drain sees a consistent

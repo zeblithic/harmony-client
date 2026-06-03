@@ -2673,6 +2673,11 @@ pub(crate) async fn start_node_inner(
                         .ok_or_else(|| {
                             "owner state missing this device's enrollment cert".to_string()
                         })?;
+                    // ZEB-370 Task 9: keep a clone for the friend-handshake
+                    // acceptor wired below. `own_enrollment_cert` itself is
+                    // moved into `DmOutbox::new` further down, so capture the
+                    // cert (cheap `Clone`) here while it's still in scope.
+                    let own_enrollment_cert_for_friend = own_enrollment_cert.clone();
 
                     let crdt_path = identity_dir.join("owner_state_crdt.cbor");
                     let replay_path = identity_dir.join("state_root_replay.cbor");
@@ -4441,7 +4446,9 @@ pub(crate) async fn start_node_inner(
                     // (link manager Arc is None) — those sessions have no
                     // inbound iroh traffic to dispatch.
                     if let Some(ref link_mgr) = iroh_link_mgr_for_handshake {
-                        let acceptor = std::sync::Arc::new(
+                        let invite_acceptor: std::sync::Arc<
+                            dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
+                        > = std::sync::Arc::new(
                             crate::iroh_invite_acceptor::IrohInviteHandshakeAcceptor::<
                                 tauri::AppHandle<tauri::Wry>,
                             >::with_config(
@@ -4453,8 +4460,50 @@ pub(crate) async fn start_node_inner(
                                 crate::iroh_invite_acceptor::HandshakeAcceptorConfig::from_env(),
                             ),
                         );
+
+                        // ZEB-370 Task 9: build the friend-handshake acceptor
+                        // from the SAME sources the invite acceptor uses
+                        // (crdt_state, hlc_tracker, self_owner, this device's
+                        // own EnrollmentCert + device-#2 signing key, the
+                        // AppHandle for `friend-list-changed`, and the case-A
+                        // pkarr publisher so a consumed friend token is
+                        // unregistered). `self_display = None`: the node's own
+                        // profile display name isn't persisted at start_node
+                        // time (it arrives per `publish_profile` IPC), and the
+                        // field is only a UX hint on the friend's side.
+                        let friend_acceptor: std::sync::Arc<
+                            dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
+                        > = std::sync::Arc::new(
+                            crate::iroh_friend_acceptor::IrohFriendHandshakeAcceptor::<
+                                tauri::AppHandle<tauri::Wry>,
+                            >::new(
+                                std::sync::Arc::clone(&crdt_state),
+                                std::sync::Arc::clone(&tracker),
+                                device_id.clone(),
+                                self_owner,
+                                None,
+                                own_enrollment_cert_for_friend.clone(),
+                                std::sync::Arc::clone(&community_signing_key_arc),
+                                Some(std::sync::Arc::new(app.clone())),
+                                pkarr_invite_publisher_for_state.clone(),
+                            ),
+                        );
+
+                        // Multiplex both acceptors behind the single dispatcher
+                        // slot the accept loop drives. The accept loop forwards
+                        // BOTH `harmony/handshake/v1` and `harmony/friend/v1`
+                        // here; the multiplexer re-reads `conn.alpn()` and
+                        // routes friend → friend_acceptor, else → invite.
+                        let dispatcher: std::sync::Arc<
+                            dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
+                        > = std::sync::Arc::new(
+                            crate::iroh_friend_acceptor::MultiplexHandshakeDispatcher::new(
+                                invite_acceptor,
+                                friend_acceptor,
+                            ),
+                        );
                         if let Err(_dispatcher_back) =
-                            link_mgr.install_handshake_dispatcher(acceptor).await
+                            link_mgr.install_handshake_dispatcher(dispatcher).await
                         {
                             // Pre-installed (idempotent restart? OnceCell
                             // refused the second set). Production

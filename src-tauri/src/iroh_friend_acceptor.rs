@@ -656,6 +656,87 @@ pub enum FriendAcceptError {
     IoTimeout { step: &'static str },
 }
 
+// =====================================================================
+// Task 9 — ALPN dispatch multiplexer
+// =====================================================================
+
+/// Which inner dispatcher an inbound connection's negotiated ALPN routes to.
+/// Factored out as a pure value so the routing decision is unit-testable
+/// without constructing a live `iroh::endpoint::Connection`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FriendDispatchTarget {
+    /// `harmony/friend/v1` → the friend-link acceptor.
+    Friend,
+    /// `harmony/handshake/v1` (and any other non-friend handshake ALPN the
+    /// accept loop forwards) → the invite acceptor. The accept loop only ever
+    /// hands the multiplexer connections whose ALPN it already matched to one
+    /// of the two handshake ALPNs, so the invite acceptor is the correct
+    /// default for "not the friend ALPN".
+    Invite,
+}
+
+/// Pure ALPN → target decision. `HARMONY_FRIEND_V1` routes to the friend
+/// acceptor; everything else (the accept loop only forwards
+/// `HARMONY_HANDSHAKE_V1` besides friend) routes to the invite acceptor.
+pub fn route_handshake_alpn(alpn: &[u8]) -> FriendDispatchTarget {
+    if alpn == crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1 {
+        FriendDispatchTarget::Friend
+    } else {
+        FriendDispatchTarget::Invite
+    }
+}
+
+/// Multiplexing [`IrohHandshakeDispatcher`] that fans an inbound connection to
+/// the friend or invite acceptor based on its negotiated ALPN
+/// ([`iroh::endpoint::Connection::alpn`]). Installed as the SINGLE dispatcher on
+/// the iroh link manager (the accept loop forwards both `HARMONY_HANDSHAKE_V1`
+/// and `HARMONY_FRIEND_V1` to it); the multiplexer then re-reads `conn.alpn()`
+/// and delegates.
+pub struct MultiplexHandshakeDispatcher {
+    /// Receives `harmony/handshake/v1` connections (community-invite redemption).
+    invite: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+    /// Receives `harmony/friend/v1` connections (friend-link handshake).
+    friend: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+}
+
+impl MultiplexHandshakeDispatcher {
+    /// Build a multiplexer over the invite + friend acceptors.
+    pub fn new(
+        invite: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+        friend: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+    ) -> Self {
+        Self { invite, friend }
+    }
+}
+
+impl MultiplexHandshakeDispatcher {
+    /// Select (by reference) the inner dispatcher an ALPN routes to, without
+    /// consuming a `Connection`. The thin `handle_connection` impl forwards the
+    /// owned `Connection` to whichever this returns; splitting the selection out
+    /// lets unit tests assert routing with stub dispatchers (a live
+    /// `iroh::endpoint::Connection` can't be constructed in-process).
+    fn select_for_alpn(
+        &self,
+        alpn: &[u8],
+    ) -> &Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher> {
+        match route_handshake_alpn(alpn) {
+            FriendDispatchTarget::Friend => &self.friend,
+            FriendDispatchTarget::Invite => &self.invite,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for MultiplexHandshakeDispatcher {
+    async fn handle_connection(&self, conn: Connection) {
+        // Re-read the negotiated ALPN the accept loop already matched and
+        // delegate the owned connection to the selected acceptor.
+        self.select_for_alpn(conn.alpn())
+            .handle_connection(conn)
+            .await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1096,71 @@ mod tests {
         assert!(
             state.friend_graph.friends.is_empty(),
             "a rejected request must not write a friend entry"
+        );
+    }
+
+    // ── Task 9: ALPN dispatch multiplexer ────────────────────────────────
+
+    use crate::iroh_endpoint::alpn;
+    use crate::iroh_invite_acceptor::IrohHandshakeDispatcher;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Stub dispatcher that records whether it was handed a connection. We can't
+    /// construct a real `iroh::endpoint::Connection` in-process, so the routing
+    /// tests assert via `select_for_alpn` (pointer identity) rather than driving
+    /// `handle_connection`; this stub is here to satisfy the `Arc<dyn …>` bound
+    /// the multiplexer holds and to prove the trait object is constructible.
+    struct RecordingDispatcher {
+        called: AtomicBool,
+    }
+
+    #[async_trait]
+    impl IrohHandshakeDispatcher for RecordingDispatcher {
+        async fn handle_connection(&self, _conn: Connection) {
+            self.called.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn route_handshake_alpn_maps_friend_and_invite() {
+        assert_eq!(
+            route_handshake_alpn(alpn::HARMONY_FRIEND_V1),
+            FriendDispatchTarget::Friend,
+            "harmony/friend/v1 must route to the friend acceptor"
+        );
+        assert_eq!(
+            route_handshake_alpn(alpn::HARMONY_HANDSHAKE_V1),
+            FriendDispatchTarget::Invite,
+            "harmony/handshake/v1 must route to the invite acceptor"
+        );
+        // Defensive: any other ALPN the accept loop might forward defaults to
+        // the invite acceptor (the loop only ever forwards the two handshake
+        // ALPNs, so this is the safe catch-all).
+        assert_eq!(
+            route_handshake_alpn(alpn::HARMONY_ZENOH_V1),
+            FriendDispatchTarget::Invite
+        );
+    }
+
+    #[test]
+    fn multiplexer_selects_friend_stub_for_friend_alpn_and_invite_stub_otherwise() {
+        let invite: Arc<dyn IrohHandshakeDispatcher> = Arc::new(RecordingDispatcher {
+            called: AtomicBool::new(false),
+        });
+        let friend: Arc<dyn IrohHandshakeDispatcher> = Arc::new(RecordingDispatcher {
+            called: AtomicBool::new(false),
+        });
+        let mux = MultiplexHandshakeDispatcher::new(Arc::clone(&invite), Arc::clone(&friend));
+
+        // A connection reporting `harmony/friend/v1` selects the friend stub…
+        assert!(
+            Arc::ptr_eq(mux.select_for_alpn(alpn::HARMONY_FRIEND_V1), &friend),
+            "friend ALPN must select the friend acceptor"
+        );
+        // …and `harmony/handshake/v1` selects the invite stub.
+        assert!(
+            Arc::ptr_eq(mux.select_for_alpn(alpn::HARMONY_HANDSHAKE_V1), &invite),
+            "handshake ALPN must select the invite acceptor"
         );
     }
 }
