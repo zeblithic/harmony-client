@@ -37,7 +37,7 @@ characterized on). Every *subsequent* bind in the same process is ~3ms.**
 
 Proof (single process, two binds, timed):
 
-```
+```text
 ZEB347_MINIMAL_BARE_BIND = 30.275 s   // first bind (presets::Minimal, relay disabled)
 ZEB347_BIND_ELAPSED      =  3.238 ms  // second bind, same process (presets::N0)
 ```
