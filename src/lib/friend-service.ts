@@ -1,19 +1,29 @@
 import type { TauriAdapter } from './zenoh-service';
 
 /**
- * ZEB-370 Phase 1: frontend friend-graph service. Mirrors
+ * ZEB-370 Phase 1 + ZEB-371 Phase 1b: frontend friend-graph service. Mirrors
  * `community-service.ts` (adapter-based, `connectAdapter` / private `invoke` /
  * `destroy`, event-listener wiring) so it's unit-testable against a mock
  * `TauriAdapter`.
  *
- * Backed by the four friend IPCs in `src-tauri/src/lib.rs`:
+ * Phase 1 IPCs:
  *   - `generate_friend_token` → a `harmony://friend/...` URL
  *   - `redeem_friend_token`   → adds the inviter as an Active friend
  *   - `list_friends`          → non-Revoked friend rows
  *   - `unfriend`              → writes a Revoked tombstone
  *
- * The backend emits `friend-list-changed` (no payload) after a redeem / accept
- * / unfriend; subscribers re-fetch `listFriends()` on receipt.
+ * Phase 1b IPCs:
+ *   - `add_friend_by_key`           → AddFriendOutcome (linked/pending/unreachable)
+ *   - `list_pending_friend_requests` → pending inbound request rows
+ *   - `accept_friend_request`       → void
+ *   - `decline_friend_request`      → void
+ *   - `set_friend_auto_accept`      → void
+ *   - `get_friend_auto_accept`      → boolean
+ *
+ * Events:
+ *   - `friend-list-changed`              → re-fetch friends + pending
+ *   - `friend-request-received`          → re-fetch pending
+ *   - `connectivity-friend-auto-accept-changed` → auto-accept setting changed
  */
 
 /** Lifecycle of a friend link (mirrors Rust `FriendStatus`). `revoked` rows are
@@ -44,12 +54,50 @@ export interface FriendLinkResultDto {
   display?: string | null;
 }
 
+/**
+ * A pending inbound friend request (mirrors `PendingFriendRequestDto` in
+ * src-tauri). Delivered by `list_pending_friend_requests`.
+ */
+export interface PendingFriendRequestDto {
+  ownerIdHex: string;
+  display: string | null;
+  receivedAtMs: number;
+}
+
+/**
+ * Outcome of `add_friend_by_key`. The backend returns an externally-tagged
+ * enum:
+ *   - `{ linked: { ownerIdHex, display } }` → the peer was immediately linked
+ *   - `"pending"` → a request was sent; the peer needs to accept
+ *   - `"unreachable"` → the peer's DHT record could not be resolved
+ *
+ * We normalise all three into a discriminated union with a `kind` field.
+ */
+export type AddFriendOutcome =
+  | { kind: 'linked'; ownerIdHex: string; display: string | null }
+  | { kind: 'pending' }
+  | { kind: 'unreachable' };
+
+/** Raw shape of the externally-tagged `AddFriendOutcome` from the backend. */
+type RawAddFriendOutcome =
+  | { linked: { ownerIdHex: string; display: string | null } }
+  | 'pending'
+  | 'unreachable';
+
 export class FriendService {
   /** Listeners notified when the backend emits `friend-list-changed` (a friend
    *  was added or removed, possibly on another device). A registry (not a
    *  single slot) so multiple `FriendsPanel` instances can each subscribe
    *  without stomping one another — see `onFriendsChanged`. */
   private friendsChangedListeners = new Set<() => void>();
+
+  /**
+   * Listeners notified when the pending-requests list changes. Fired on
+   * `friend-request-received` (new inbound) and `friend-list-changed`
+   * (accept/decline also mutates the pending list). Mirror of
+   * `friendsChangedListeners` — same multi-listener Set pattern.
+   */
+  private pendingRequestsChangedListeners = new Set<() => void>();
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
@@ -62,8 +110,15 @@ export class FriendService {
       // Snapshot before iterating so a listener that unsubscribes itself
       // during notification doesn't mutate the live set mid-loop.
       for (const cb of [...this.friendsChangedListeners]) cb();
+      // friend-list-changed also affects the pending list (accept/decline).
+      for (const cb of [...this.pendingRequestsChangedListeners]) cb();
     });
     this.unlisteners.push(unlistenChanged);
+
+    const unlistenRequestReceived = await adapter.listen('friend-request-received', () => {
+      for (const cb of [...this.pendingRequestsChangedListeners]) cb();
+    });
+    this.unlisteners.push(unlistenRequestReceived);
   }
 
   /**
@@ -108,10 +163,72 @@ export class FriendService {
     await this.invoke<void>('unfriend', { peerAddr: ownerIdHex });
   }
 
+  // ── Phase 1b ─────────────────────────────────────────────────────────────
+
+  /**
+   * Register a callback fired when the pending-requests list changes (a new
+   * inbound request arrived via `friend-request-received`, or the list was
+   * mutated by accept/decline via `friend-list-changed`). Returns an
+   * unsubscribe function. Multiple subscribers are supported.
+   */
+  onPendingRequestsChanged(cb: () => void): () => void {
+    this.pendingRequestsChangedListeners.add(cb);
+    return () => {
+      this.pendingRequestsChangedListeners.delete(cb);
+    };
+  }
+
+  /** List pending inbound friend requests (not yet accepted or declined). */
+  async listPendingRequests(): Promise<PendingFriendRequestDto[]> {
+    return this.invoke<PendingFriendRequestDto[]>('list_pending_friend_requests', {});
+  }
+
+  /** Accept an inbound friend request by the sender's owner_id hex. */
+  async acceptRequest(ownerIdHex: string): Promise<void> {
+    await this.invoke<void>('accept_friend_request', { ownerIdHex });
+  }
+
+  /** Decline an inbound friend request by the sender's owner_id hex. */
+  async declineRequest(ownerIdHex: string): Promise<void> {
+    await this.invoke<void>('decline_friend_request', { ownerIdHex });
+  }
+
+  /**
+   * Attempt to add a friend by their 64-byte transport identity public key
+   * (hex). The backend resolves the peer's DHT record and either:
+   *   - immediately links them (both sides already trust each other) → `linked`
+   *   - sends them an inbound request to accept later → `pending`
+   *   - can't reach their DHT record → `unreachable`
+   *
+   * Arg naming mirrors `connectivity_discover_identity` (`identityPubHex`).
+   */
+  async addByKey(identityPubHex: string): Promise<AddFriendOutcome> {
+    const raw = await this.invoke<RawAddFriendOutcome>('add_friend_by_key', { identityPubHex });
+    return FriendService.parseAddFriendOutcome(raw);
+  }
+
+  private static parseAddFriendOutcome(raw: RawAddFriendOutcome): AddFriendOutcome {
+    if (raw === 'pending') return { kind: 'pending' };
+    if (raw === 'unreachable') return { kind: 'unreachable' };
+    // Externally-tagged object variant: { linked: { ownerIdHex, display } }
+    return { kind: 'linked', ownerIdHex: raw.linked.ownerIdHex, display: raw.linked.display };
+  }
+
+  /** Enable or disable auto-accepting friend requests from known peers. */
+  async setAutoAccept(enabled: boolean): Promise<void> {
+    await this.invoke<void>('set_friend_auto_accept', { enabled });
+  }
+
+  /** Retrieve the current auto-accept setting. */
+  async getAutoAccept(): Promise<boolean> {
+    return this.invoke<boolean>('get_friend_auto_accept', {});
+  }
+
   destroy(): void {
     for (const fn of this.unlisteners) fn();
     this.unlisteners = [];
     this.friendsChangedListeners.clear();
+    this.pendingRequestsChangedListeners.clear();
     // Null the adapter so connectAdapter's duplicate-init guard doesn't no-op
     // on reconnect after destroy() (mirrors CommunityService.destroy()).
     this.adapter = null;
