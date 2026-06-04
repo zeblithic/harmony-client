@@ -33989,25 +33989,35 @@ pub fn list_friends_inner(state: &crate::owner_state_crdt::OwnerState) -> Vec<Fr
 /// notify so we don't churn an owner-state re-sync).
 /// ZEB-375 Phase 2a Task 6: pure core for `set_friend_referrable`.
 ///
-/// Looks up the existing `FriendEntry` for `owner` and returns a CLONE with
-/// `referrable` set to the new value and `learned_at` bumped to `at`,
-/// PRESERVING every other field (`master_ed25519`, `display`, `status`,
-/// `established_via`, `sealed_secret`). The caller LWW-applies the returned
-/// entry. Errors when `owner` is not a known friend (mirrors `unfriend_inner`'s
-/// unknown-peer guard) — there is nothing to mark referrable.
+/// Looks up the existing `FriendEntry` for `owner`. On a real change, returns
+/// `Ok(Some(clone))` with `referrable` set to the new value and `learned_at`
+/// bumped to `at`, PRESERVING every other field (`master_ed25519`, `display`,
+/// `status`, `established_via`, `sealed_secret`); the caller LWW-applies it.
+/// Returns `Ok(None)` when the value is unchanged — an idempotent no-op that
+/// skips the LWW bump so a redundant write can't clobber a concurrent toggle or
+/// churn an owner-state re-sync. Errors when `owner` is not a known friend
+/// (mirrors `unfriend_inner`'s unknown-peer guard), or when the friend is not
+/// `Active` (Pending/Revoked links can't be made referrable — mirrors
+/// `browse_friend_referrals`'s active-only contract).
 fn apply_set_referrable(
     fg: &crate::friend_graph::FriendGraph,
     owner: crate::owner_state_types::OwnerAddr,
     referrable: bool,
     at: crate::owner_state_types::Hlc,
-) -> Result<crate::friend_graph::FriendEntry, String> {
+) -> Result<Option<crate::friend_graph::FriendEntry>, String> {
     let Some(existing) = fg.friends.get(&owner) else {
         return Err(format!("unknown friend: {}", hex::encode(owner.0)));
     };
+    if existing.status != crate::friend_graph::FriendStatus::Active {
+        return Err(format!("friend is not active: {}", hex::encode(owner.0)));
+    }
+    if existing.referrable == referrable {
+        return Ok(None); // idempotent no-op: no LWW bump, no sync churn
+    }
     let mut updated = existing.clone();
     updated.referrable = referrable;
     updated.learned_at = at;
-    Ok(updated)
+    Ok(Some(updated))
 }
 
 pub async fn unfriend_inner(
@@ -34434,7 +34444,14 @@ async fn set_friend_referrable(
 
     {
         let mut s = crdt_state.lock().await;
-        let updated = apply_set_referrable(&s.friend_graph, owner, referrable, at)?;
+        // `Ok(None)` ⇒ the flag already had the requested value: idempotent
+        // no-op. Skip the LWW write + notify + emit so we don't churn an
+        // owner-state re-sync or risk clobbering a concurrent toggle. The
+        // wasted HLC reservation above is harmless. A non-Active friend (or an
+        // unknown one) surfaces as `Err` to the UI.
+        let Some(updated) = apply_set_referrable(&s.friend_graph, owner, referrable, at)? else {
+            return Ok(());
+        };
         match s.apply_friend_update(owner, updated) {
             crate::owner_state_crdt::ApplyOutcome::Inserted
             | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {}
@@ -35728,7 +35745,8 @@ mod friend_ipc_tests {
 
         // …flipped to referrable=true at a strictly-newer HLC.
         let updated = apply_set_referrable(&fg, addr, true, hlc(9))
-            .expect("setting referrable on a known friend succeeds");
+            .expect("setting referrable on a known friend succeeds")
+            .expect("a real change returns Some(updated)");
 
         assert!(updated.referrable, "referrable flag is flipped on");
         assert_eq!(updated.learned_at, hlc(9), "learned_at is bumped to `at`");
@@ -35760,6 +35778,46 @@ mod friend_ipc_tests {
         let err = apply_set_referrable(&fg, unknown, true, hlc(9))
             .expect_err("setting referrable on a non-friend errors");
         assert!(err.contains("unknown friend"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_set_referrable_same_value_is_noop() {
+        // An Active friend already at referrable=false…
+        let (addr, mut active) = friend_entry(0x55, FriendStatus::Active, 3);
+        active.referrable = false;
+        let mut fg = FriendGraph::default();
+        fg.friends.insert(addr, active);
+
+        // …setting it to the SAME value is an idempotent no-op: `Ok(None)`,
+        // so the caller skips the LWW bump (no sync churn, no clobber).
+        let outcome = apply_set_referrable(&fg, addr, false, hlc(9))
+            .expect("setting referrable to its current value succeeds");
+        assert!(
+            outcome.is_none(),
+            "unchanged value returns Ok(None) — no LWW write, no learned_at bump"
+        );
+    }
+
+    #[test]
+    fn apply_set_referrable_non_active_is_error() {
+        // A Pending friend cannot be made referrable — only Active links can.
+        let (pending_addr, pending) = friend_entry(0x77, FriendStatus::Pending, 3);
+        let mut fg = FriendGraph::default();
+        fg.friends.insert(pending_addr, pending);
+        let err = apply_set_referrable(&fg, pending_addr, true, hlc(9))
+            .expect_err("setting referrable on a Pending friend errors");
+        assert!(err.contains("not active"), "got: {err}");
+        // …and so is unsetting it (any value errors on a non-Active link).
+        let err = apply_set_referrable(&fg, pending_addr, false, hlc(9))
+            .expect_err("unsetting referrable on a Pending friend errors");
+        assert!(err.contains("not active"), "got: {err}");
+
+        // A Revoked friend is equally rejected.
+        let (revoked_addr, revoked) = friend_entry(0x88, FriendStatus::Revoked, 3);
+        fg.friends.insert(revoked_addr, revoked);
+        let err = apply_set_referrable(&fg, revoked_addr, true, hlc(9))
+            .expect_err("setting referrable on a Revoked friend errors");
+        assert!(err.contains("not active"), "got: {err}");
     }
 
     // ── ZEB-370 (cursor review): generate_friend_token publisher requirement ──

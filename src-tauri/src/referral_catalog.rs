@@ -30,6 +30,8 @@ pub enum ReferralCodecError {
     Decode(String),
     #[error("trailing bytes after referral CBOR")]
     TrailingBytes,
+    #[error("too many referral entries: {len} > {max}")]
+    TooManyEntries { len: usize, max: usize },
 }
 
 /// A single referrable peer the catalog author could introduce: the peer's
@@ -124,9 +126,20 @@ pub fn encode_referral_catalog(cat: &ReferralCatalog) -> Result<Vec<u8>, Referra
     Ok(out)
 }
 
-/// Decode a [`ReferralCatalog`] from CBOR bytes (bounded, strict).
+/// Decode a [`ReferralCatalog`] from CBOR bytes (bounded, strict). Enforces the
+/// logical [`MAX_REFERRAL_ENTRIES`] cap on the decoded entry count: a malicious
+/// friend could pack many more entries than the serve-side truncation allows
+/// while still fitting under [`PEX_MAX_PACKET_LEN`], so we reject any catalog
+/// over the cap rather than ingest it.
 pub fn decode_referral_catalog(bytes: &[u8]) -> Result<ReferralCatalog, ReferralCodecError> {
-    decode_strict(bytes)
+    let cat: ReferralCatalog = decode_strict(bytes)?;
+    if cat.entries.len() > MAX_REFERRAL_ENTRIES {
+        return Err(ReferralCodecError::TooManyEntries {
+            len: cat.entries.len(),
+            max: MAX_REFERRAL_ENTRIES,
+        });
+    }
+    Ok(cat)
 }
 
 /// Bytes R's device-#2 key signs for a [`CatalogRequest`]. `"hcr1"` domain tag +
@@ -458,6 +471,36 @@ mod tests {
     fn decode_rejects_oversize() {
         let huge = vec![0u8; PEX_MAX_PACKET_LEN + 1];
         assert!(decode_referral_catalog(&huge).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_too_many_entries() {
+        // A malicious friend packs MORE entries than the logical cap while
+        // still fitting under PEX_MAX_PACKET_LEN. Encoding has no cap, so the
+        // fixture builds fine — but decode must reject it.
+        let entries: Vec<ReferralEntry> = (0..=MAX_REFERRAL_ENTRIES)
+            .map(|i| ReferralEntry {
+                // Distinct peer_owner per entry (16-byte addr seeded by index).
+                peer_owner: OwnerAddr([(i % 256) as u8; 16]),
+                display: None,
+            })
+            .collect();
+        assert_eq!(entries.len(), MAX_REFERRAL_ENTRIES + 1);
+        let cat = ReferralCatalog {
+            author: OwnerAddr([0x11; 16]),
+            entries,
+            at: hlc(7),
+            enrollment: mint_test_owner(0x42).cert,
+            sig: [9u8; 64],
+        };
+        let bytes = encode_referral_catalog(&cat).expect("encode has no cap");
+        assert_eq!(
+            decode_referral_catalog(&bytes),
+            Err(ReferralCodecError::TooManyEntries {
+                len: MAX_REFERRAL_ENTRIES + 1,
+                max: MAX_REFERRAL_ENTRIES,
+            }),
+        );
     }
 
     #[test]
