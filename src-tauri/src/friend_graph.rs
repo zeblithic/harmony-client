@@ -167,6 +167,17 @@ pub struct FriendEntry {
     /// LWW key.
     #[serde(rename = "l")]
     pub learned_at: Hlc,
+    /// ZEB-371: the per-friendship rendezvous secret, KeyTree-sealed
+    /// (`owner_state_crypto::encrypt_friend_secret`). `None` for legacy Phase-1
+    /// entries and for `Pending`/`Revoked` entries. Opaque bytes; never stored
+    /// or logged in the clear. Stored as a CBOR bstr (major type 2) per spec §3.3.
+    #[serde(
+        rename = "k",
+        with = "serde_bytes",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub sealed_secret: Option<Vec<u8>>,
 }
 
 /// Owner-state sub-CRDT. Replicated across the user's own devices via the
@@ -205,6 +216,7 @@ mod tests {
             established_via: FriendOrigin::Token,
             referrable: false,
             learned_at: hlc(7),
+            sealed_secret: None,
         }
     }
 
@@ -277,5 +289,22 @@ mod tests {
         let bytes = canonical_cbor_encode(&at_cap).expect("encode");
         let back: FriendEntry = canonical_cbor_decode(&bytes).expect("at-cap display decodes");
         assert_eq!(at_cap, back);
+    }
+
+    #[test]
+    fn friend_entry_sealed_secret_round_trips() {
+        let mut e = sample_entry();
+        e.sealed_secret = Some(vec![0xCD; 12 + 32 + 16]); // fixed opaque blob
+        let bytes = canonical_cbor_encode(&e).expect("encode");
+        let back: FriendEntry = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn friend_entry_absent_sealed_secret_decodes_as_none() {
+        let e = sample_entry(); // sample_entry sets sealed_secret: None
+        let bytes = canonical_cbor_encode(&e).expect("encode");
+        let back: FriendEntry = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(back.sealed_secret, None);
     }
 }

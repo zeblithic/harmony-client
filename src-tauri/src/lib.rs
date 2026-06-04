@@ -44,6 +44,8 @@ pub mod folder_ingest;
 pub mod folders;
 mod follows;
 pub mod friend_graph;
+pub mod friend_rendezvous;
+pub mod friend_requests;
 pub mod friend_token;
 pub mod identity;
 pub mod identity_commands;
@@ -70,6 +72,7 @@ pub mod owner_state_types;
 pub mod pairing;
 pub mod pairing_commands;
 pub mod pkarr_community_publisher;
+pub mod pkarr_friend_publisher;
 pub mod pkarr_identity_publisher;
 pub mod pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
@@ -131,6 +134,9 @@ impl<R: tauri::Runtime> crate::community_invite::AppHandleEmit for tauri::AppHan
 impl<R: tauri::Runtime> crate::iroh_friend_acceptor::FriendEventEmit for tauri::AppHandle<R> {
     fn emit_friend_list_changed(&self) {
         let _ = self.emit("friend-list-changed", ());
+    }
+    fn emit_friend_request_received(&self) {
+        let _ = self.emit("friend-request-received", ());
     }
 }
 
@@ -483,6 +489,13 @@ pub struct NodeState {
     /// time, snapshot for IPC handlers that mint OutboxEntry / HLC stamps.
     dm_device_id: Option<String>,
     dm_self_owner: Option<crate::owner_state_types::OwnerAddr>,
+    /// ZEB-371: this node's owner `KeyTree` (derived from the master seed,
+    /// same `Arc` the SyncEngine + friend acceptor were built with). Snapshot
+    /// here so the `redeem_friend_token` IPC can KeyTree-seal the friendship
+    /// secret derived on the redeem side of the handshake. `Some` while an owner
+    /// identity is loaded; nulled on identity-restore alongside the other owner
+    /// handles.
+    owner_keytree: Option<std::sync::Arc<crate::owner_state_crypto::KeyTree>>,
     /// ContentStore handle — same `Arc` SyncEngine was constructed with.
     /// Lifted onto NodeState so send_dm can write blobs through the same
     /// store SyncEngine uses for state-root publishes (RuntimeContentStore
@@ -770,6 +783,22 @@ pub struct NodeState {
     /// that keeps case-A / B / C entries fresh on the Mainline DHT.
     pub pkarr_publisher: Option<std::sync::Arc<harmony_pkarr::PkarrPublisher>>,
 
+    /// ZEB-371: Case-D friend publisher. Holds one registered pkarr handle per
+    /// `Active` friend with a sealed rendezvous secret, keyed on that secret, so
+    /// each friend can resolve this node's iroh reachability across WAN without
+    /// global discoverability. Reconciled with the friend graph on the
+    /// reachability cadence and on friend writes (`sync_case_d_handles`).
+    pub pkarr_friend_publisher:
+        Option<std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
+
+    /// ZEB-371 Task 12: process-local pending inbound friend-request store
+    /// (Path A). Shared with the friend acceptor (which records new-owner
+    /// requests + consumes prior approvals) so the next task's
+    /// accept/decline/add IPCs can reach the same store. `None` until
+    /// `start_node` wires it; cleared on stop/restart.
+    pub pending_friend_requests:
+        Option<std::sync::Arc<crate::friend_requests::PendingFriendRequests>>,
+
     /// Shared pkarr resolver. Used by `connectivity_discover_identity` IPC
     /// and wired into the `ReachabilityResolver` as the case-C fallback.
     pub pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
@@ -860,6 +889,13 @@ impl NodeState {
             h.abort();
         }
         self.pkarr_publisher = None;
+        // ZEB-371: drop the Case-D friend publisher so a restart rebuilds it
+        // against the fresh pkarr publisher / blob builder.
+        self.pkarr_friend_publisher = None;
+        // ZEB-371 Task 12: drop the Path-A pending-request store so a restart
+        // rebuilds a fresh one (process-local + ephemeral — pending requests are
+        // re-sent by the requester's next dial after a restart).
+        self.pending_friend_requests = None;
         self.pkarr_resolver = None;
         self.pkarr_invite_publisher = None;
         self.pkarr_identity_publisher = None;
@@ -925,6 +961,7 @@ impl Default for NodeState {
             hlc_tracker: None,
             dm_device_id: None,
             dm_self_owner: None,
+            owner_keytree: None,
             content_store: None,
             dm_send_inflight: None,
             dm_send_stopping: None,
@@ -1005,6 +1042,8 @@ impl Default for NodeState {
             // ZEB-323 Phase 2b: pkarr policy handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
             pkarr_publisher: None,
+            pkarr_friend_publisher: None,
+            pending_friend_requests: None,
             pkarr_resolver: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
@@ -1295,6 +1334,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // identity's invites. `[u8; 64]` is Copy, so just `take()` and
         // discard — no extra cleanup needed beyond the assignment.
         let _ = guard.dm_identity_pub_64.take();
+        // ZEB-371: drop the owner KeyTree so a restart (or identity switch)
+        // re-derives a fresh one from the new master seed rather than sealing
+        // friend secrets under the prior identity's keys.
+        let _ = guard.owner_keytree.take();
         // ZEB-217 Sub-C Phase 3 Task 9: drop the on-demand
         // adapter-request sender. The event_loop's matching receiver
         // gets None on next recv(); the select arm exits cleanly.
@@ -2297,6 +2340,11 @@ pub(crate) async fn start_node_inner(
         // outside the SyncEngine constructor.
         let mut device_id_for_state: Option<String> = None;
         let mut self_owner_for_state: Option<crate::owner_state_types::OwnerAddr> = None;
+        // ZEB-371: lift the owner KeyTree out for NodeState so the
+        // `redeem_friend_token` IPC can KeyTree-seal the redeem-side friendship
+        // secret. Reuses the SAME `kt` Arc the SyncEngine + friend acceptor share.
+        let mut keytree_for_state: Option<std::sync::Arc<crate::owner_state_crypto::KeyTree>> =
+            None;
         let mut crdt_state_for_state: Option<
             std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
         > = None;
@@ -2437,6 +2485,10 @@ pub(crate) async fn start_node_inner(
         // NodeState assignment can reach them regardless of branch.
         let mut pkarr_publisher_for_state: Option<std::sync::Arc<harmony_pkarr::PkarrPublisher>> =
             None;
+        // ZEB-371: lifted Case-D friend publisher (built in the pkarr setup block).
+        let mut pkarr_friend_publisher_for_state: Option<
+            std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>,
+        > = None;
         let mut pkarr_resolver_for_state: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>> =
             None;
         let mut pkarr_invite_publisher_for_state: Option<
@@ -2450,6 +2502,22 @@ pub(crate) async fn start_node_inner(
         > = None;
         let mut pkarr_settings_path_for_state: Option<std::path::PathBuf> = None;
         let mut pkarr_publisher_handle_for_state: Option<tokio::task::JoinHandle<()>> = None;
+
+        // ZEB-371 Task 12: process-local pending inbound friend-request store
+        // (Path A). Built unconditionally so the next task's accept/decline/add
+        // IPCs can reach it via NodeState even when pkarr is disabled. Cloned
+        // into the friend acceptor at its construction below.
+        let pending_friend_requests_for_state =
+            std::sync::Arc::new(crate::friend_requests::PendingFriendRequests::new());
+        // ZEB-371 Task 12 (spec §7.1): "auto-accept known requesters" toggle.
+        // Assigned from persisted `PkarrSettings` in the pkarr setup block
+        // (default ON when the setting is absent). The variable is declared
+        // here without an initializer because the pkarr block always runs
+        // before the acceptor constructor below; the compiler enforces this via
+        // definite-assignment analysis. The loaded (or defaulted) value is
+        // forwarded to `.with_auto_accept_known(friend_auto_accept_known_for_state)`
+        // at the acceptor constructor call site.
+        let friend_auto_accept_known_for_state: bool;
 
         // ── ZEB-321 Phase 1 Task 8: iroh transport boot ──────────────────
         //
@@ -4059,9 +4127,28 @@ pub(crate) async fn start_node_inner(
                     // endpoint to snapshot). When NO communities are
                     // joined, the loop body is a no-op (still cheap —
                     // happens on startup + idle-60min + force).
+                    // ZEB-371: deferred slot for the Case-D friend publisher.
+                    // `publish_fn` is built HERE but the friend publisher is
+                    // constructed later (in the pkarr block below), so the
+                    // closure captures this `OnceCell` and the pkarr block sets
+                    // it once it exists. On each reachability tick, if the cell
+                    // is populated, the closure reconciles the friend slots
+                    // AFTER the per-community reachability publish — this picks
+                    // up address changes (re-register refreshes the blob) AND
+                    // friend-graph changes on every tick.
+                    let friend_pub_cell: std::sync::Arc<
+                        tokio::sync::OnceCell<
+                            std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>,
+                        >,
+                    > = std::sync::Arc::new(tokio::sync::OnceCell::new());
                     if let Some(ep_arc_for_publisher) = iroh_endpoint_arc.as_ref() {
                         let ep_for_cb = std::sync::Arc::clone(ep_arc_for_publisher);
                         let registry_for_cb = std::sync::Arc::clone(&registry);
+                        // ZEB-371: captures for the Case-D friend-slot reconcile
+                        // appended to the end of the reachability publish.
+                        let friend_pub_cell_for_cb = std::sync::Arc::clone(&friend_pub_cell);
+                        let crdt_state_for_cb = std::sync::Arc::clone(&crdt_state);
+                        let kt_for_cb = std::sync::Arc::clone(&kt);
                         // ZEB-339: ReachabilityAnnounce is a community-membership
                         // event. T4 rewired RCH2 verify to check BOTH the outer
                         // event sig AND the inner `identity_signature` against the
@@ -4085,6 +4172,11 @@ pub(crate) async fn start_node_inner(
                                 let actor = self_owner_for_cb;
                                 let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_cb);
                                 let device_id = device_id_for_cb.clone();
+                                // ZEB-371 per-invocation clones for the friend reconcile.
+                                let friend_pub_cell =
+                                    std::sync::Arc::clone(&friend_pub_cell_for_cb);
+                                let crdt_state = std::sync::Arc::clone(&crdt_state_for_cb);
+                                let kt = std::sync::Arc::clone(&kt_for_cb);
                                 Box::pin(async move {
                                     // 1. Snapshot iroh state ONCE.
                                     let node_id_bytes: [u8; 32] = *ep.node_id().as_bytes();
@@ -4097,14 +4189,12 @@ pub(crate) async fn start_node_inner(
                                         .as_millis()
                                         as u64;
 
-                                    // 2. Iterate joined communities.
+                                    // 2. Iterate joined communities. When NONE
+                                    // are joined this loop is skipped, but the
+                                    // ZEB-371 friend reconcile below still runs
+                                    // (friends can exist with zero communities) —
+                                    // so this is NO LONGER an early `return`.
                                     let community_ids = registry.known_ids().await;
-                                    if community_ids.is_empty() {
-                                        // No-op publish: no communities
-                                        // to announce into. Common
-                                        // pre-pair state.
-                                        return;
-                                    }
                                     for community_id in community_ids {
                                         // 3a. Reserve an HLC for this
                                         //     event. Each community
@@ -4213,6 +4303,31 @@ pub(crate) async fn start_node_inner(
                                                 );
                                             }
                                         }
+                                    }
+
+                                    // ── ZEB-371: reconcile Case-D friend slots ──
+                                    //
+                                    // After the per-community reachability
+                                    // publish, refresh the friend-keyed Case-D
+                                    // slots. Re-registering picks up an address
+                                    // change (the blob builder snapshots the
+                                    // current reachability) AND any friend-graph
+                                    // change since the last tick. No-op until the
+                                    // pkarr block populates the cell. Snapshot the
+                                    // friend map under the CRDT lock, drop the
+                                    // guard, THEN do pkarr IO — never hold the
+                                    // owner-state lock across network awaits.
+                                    if let Some(friend_pub) = friend_pub_cell.get() {
+                                        let friends_snapshot = {
+                                            let state = crdt_state.lock().await;
+                                            state.friend_graph.friends.clone()
+                                        };
+                                        crate::pkarr_friend_publisher::sync_case_d_handles(
+                                            friend_pub,
+                                            &friends_snapshot,
+                                            &kt,
+                                        )
+                                        .await;
                                     }
                                 })
                                     as futures::future::BoxFuture<'static, ()>
@@ -4357,6 +4472,51 @@ pub(crate) async fn start_node_inner(
                         ),
                     );
 
+                    // ZEB-371: Case-D friend publisher. Reuses the SAME shared
+                    // pkarr publisher and reachability `blob_builder` as the
+                    // other case managers, so a re-register refreshes the
+                    // friend's published blob with the current reachability.
+                    // `self_owner` (this node's master OwnerAddr) keys the
+                    // published slot so friends — who know it — can resolve us.
+                    let pkarr_friend_pub = std::sync::Arc::new(
+                        crate::pkarr_friend_publisher::PkarrFriendPublisher::new(
+                            std::sync::Arc::clone(&pkarr_publisher_arc),
+                            self_owner.0,
+                            std::sync::Arc::clone(&blob_builder),
+                        ),
+                    );
+
+                    // ZEB-371: hand the friend publisher to the reachability
+                    // `publish_fn` closure (built earlier) so each reachability
+                    // tick reconciles the Case-D slots. Set-once; ignore the
+                    // Err (the cell is only set here, exactly once per boot).
+                    let _ = friend_pub_cell.set(std::sync::Arc::clone(&pkarr_friend_pub));
+
+                    // ZEB-371: publish existing Active friends' Case-D slots once
+                    // at startup so they start resolving immediately (rather than
+                    // waiting for the first reachability tick). Snapshot the
+                    // friend graph under the CRDT lock, drop the guard, THEN do
+                    // pkarr IO — never hold the owner-state lock across network
+                    // awaits.
+                    {
+                        let friends_snapshot = {
+                            let state = crdt_state.lock().await;
+                            state.friend_graph.friends.clone()
+                        };
+                        if !friends_snapshot.is_empty() {
+                            crate::pkarr_friend_publisher::sync_case_d_handles(
+                                &pkarr_friend_pub,
+                                &friends_snapshot,
+                                &kt,
+                            )
+                            .await;
+                            tracing::info!(
+                                count = friends_snapshot.len(),
+                                "ZEB-371: reconciled Case-D friend slots at startup"
+                            );
+                        }
+                    }
+
                     // Resolve settings path and restore case-B if enabled.
                     let pkarr_settings_path = app_data_dir.join("connectivity-settings.json");
                     let pkarr_settings =
@@ -4364,6 +4524,9 @@ pub(crate) async fn start_node_inner(
                     if pkarr_settings.identity_discoverable {
                         pkarr_identity_pub.enable().await;
                     }
+                    // ZEB-371 Task 12: lift the persisted Path-A auto-accept
+                    // toggle so the friend acceptor (constructed below) reads it.
+                    friend_auto_accept_known_for_state = pkarr_settings.friend_auto_accept_known;
 
                     // Bootstrap case-C: register per-community publications for
                     // every community the device is currently a member of.
@@ -4388,6 +4551,8 @@ pub(crate) async fn start_node_inner(
                     // Stash all pkarr handles on lifted state so NodeState
                     // assignment below can pick them up.
                     pkarr_publisher_for_state = Some(pkarr_publisher_arc);
+                    pkarr_friend_publisher_for_state =
+                        Some(std::sync::Arc::clone(&pkarr_friend_pub));
                     pkarr_resolver_for_state = Some(pkarr_resolver_arc);
                     pkarr_invite_publisher_for_state = Some(pkarr_invite_pub);
                     pkarr_identity_publisher_for_state = Some(pkarr_identity_pub);
@@ -4485,6 +4650,7 @@ pub(crate) async fn start_node_inner(
                                 None,
                                 own_enrollment_cert_for_friend.clone(),
                                 std::sync::Arc::clone(&community_signing_key_arc),
+                                std::sync::Arc::clone(&kt),
                                 Some(std::sync::Arc::new(app.clone())),
                                 pkarr_invite_publisher_for_state.clone(),
                             )
@@ -4496,7 +4662,20 @@ pub(crate) async fn start_node_inner(
                             // user's other devices and a clean shutdown skips the
                             // publish). Arc-clone — `engine` is still returned via
                             // `Some(engine)` at the tail of this block.
-                            .with_owner_sync_engine(Some(std::sync::Arc::clone(&engine))),
+                            .with_owner_sync_engine(Some(std::sync::Arc::clone(&engine)))
+                            // ZEB-371: wire the Case-D friend publisher so a
+                            // successful inbound accept immediately publishes the
+                            // just-added friend's reachability slot (no wait for
+                            // the next reachability tick).
+                            .with_friend_publisher(Some(std::sync::Arc::clone(&pkarr_friend_pub)))
+                            // ZEB-371 Task 12: wire the Path-A pending-request
+                            // store + the persisted auto-accept toggle so the
+                            // consent decision tree can record/approve requests
+                            // and prompt vs auto-accept known requesters.
+                            .with_pending_requests(Some(std::sync::Arc::clone(
+                                &pending_friend_requests_for_state,
+                            )))
+                            .with_auto_accept_known(friend_auto_accept_known_for_state),
                         );
 
                         // Multiplex both acceptors behind the single dispatcher
@@ -4531,6 +4710,7 @@ pub(crate) async fn start_node_inner(
                     // assignment below.
                     device_id_for_state = Some(device_id);
                     self_owner_for_state = Some(self_owner);
+                    keytree_for_state = Some(std::sync::Arc::clone(&kt));
                     crdt_state_for_state = Some(crdt_state);
                     tracker_for_state = Some(tracker);
                     content_store_for_state = Some(content_store);
@@ -4963,6 +5143,7 @@ pub(crate) async fn start_node_inner(
                         guard.hlc_tracker = tracker_for_state.clone();
                         guard.dm_device_id = device_id_for_state.clone();
                         guard.dm_self_owner = self_owner_for_state;
+                        guard.owner_keytree = keytree_for_state.clone();
                         guard.content_store = content_store_for_state.clone();
                         // ZEB-234: initialize the shutdown fence. Semaphore starts
                         // at DM_SEND_FENCE_CAPACITY permits (one per concurrent
@@ -5081,6 +5262,13 @@ pub(crate) async fn start_node_inner(
                         guard.iroh_accept_handle = iroh_accept_handle.take();
                         // ZEB-323 Phase 2b: stash pkarr policy handles.
                         guard.pkarr_publisher = pkarr_publisher_for_state.take();
+                        guard.pkarr_friend_publisher = pkarr_friend_publisher_for_state.take();
+                        // ZEB-371 Task 12: stash the Path-A pending-request store
+                        // so the next task's accept/decline/add IPCs can reach the
+                        // SAME store the friend acceptor records into. Clone — the
+                        // acceptor (built above) holds the other strong ref.
+                        guard.pending_friend_requests =
+                            Some(std::sync::Arc::clone(&pending_friend_requests_for_state));
                         guard.pkarr_resolver = pkarr_resolver_for_state.take();
                         guard.pkarr_invite_publisher = pkarr_invite_publisher_for_state.take();
                         guard.pkarr_identity_publisher = pkarr_identity_publisher_for_state.take();
@@ -33107,12 +33295,13 @@ pub async fn connectivity_link_friend_iroh_inner(
         tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
     dial_config: HandshakeDialConfig,
 ) -> Result<FriendLinkOutcome, String> {
     use crate::iroh_friend_acceptor::{
-        decode_friend_accepted, encode_friend_request, friend_accept_sig_preimage,
+        decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
         friend_request_sig_preimage, master_ed25519_from_cert, verify_enrolled_device,
-        FriendLinkRequest, FRIEND_MAX_PACKET_LEN,
+        FriendLinkRequest, FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
     };
     use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
@@ -33244,14 +33433,23 @@ pub async fn connectivity_link_friend_iroh_inner(
             }
         };
 
-    // 5. Build + device-#2-sign the FriendLinkRequest.
+    // 5. Build + device-#2-sign the FriendLinkRequest. ZEB-371: generate this
+    // side's ephemeral X25519 keypair for the rendezvous secret. `self_eph_sk` is
+    // consumed below (step 8) to derive + KeyTree-seal the friendship secret once
+    // the accept carries the inviter's ephemeral public.
+    let (self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
     let req_sig = self_device2_signing_key
-        .sign(&friend_request_sig_preimage(self_owner, &payload.token.sig))
+        .sign(&friend_request_sig_preimage(
+            self_owner,
+            Some(&payload.token.sig),
+            &self_eph_pub,
+        ))
         .to_bytes();
     let request = FriendLinkRequest {
         from_addr: self_owner,
         display: self_display,
-        token_sig: payload.token.sig,
+        token_sig: Some(payload.token.sig),
+        eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment,
         sig: req_sig,
     };
@@ -33296,7 +33494,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         return Err(format!("inviter_unreachable: send.finish failed: {e}"));
     }
 
-    // 6. Read [u32 LE length-prefix][FriendLinkAccepted], bounded by
+    // 6. Read [u32 LE length-prefix][FriendLinkResponse], bounded by
     //    response_read_timeout.
     let read_response = async {
         let mut len_buf = [0u8; 4];
@@ -33336,8 +33534,19 @@ pub async fn connectivity_link_friend_iroh_inner(
     conn.close(0u32.into(), b"friend-handshake-complete");
     drop(conn);
 
-    let accepted =
-        decode_friend_accepted(&response_bytes).map_err(|e| format!("decode accepted: {e}"))?;
+    // ZEB-371 Task 12: the acceptor now replies with a `FriendLinkResponse`.
+    // The token (REDEEM) path should only ever receive `Accepted`; a `Pending`
+    // would mean the acceptor took the Path-A branch (it should not for a
+    // token-bearing request), so we surface it as a distinct error rather than
+    // silently treating it as success.
+    let accepted = match decode_friend_response(&response_bytes)
+        .map_err(|e| format!("decode response: {e}"))?
+    {
+        FriendLinkResponse::Accepted(a) => *a,
+        FriendLinkResponse::Pending => {
+            return Err("friend request pending acceptance".to_string());
+        }
+    };
 
     // 7. Verify the accept: it must be from the inviter (cert binds
     //    payload.inviter_addr) and signed over the accept preimage.
@@ -33347,7 +33556,11 @@ pub async fn connectivity_link_friend_iroh_inner(
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
     accept_vk
         .verify_strict(
-            &friend_accept_sig_preimage(payload.inviter_addr, &payload.token.sig),
+            &friend_accept_sig_preimage(
+                payload.inviter_addr,
+                Some(&payload.token.sig),
+                &accepted.eph_x25519_pub,
+            ),
             &Signature::from_bytes(&accepted.sig),
         )
         .map_err(|_| "friend accept signature invalid".to_string())?;
@@ -33365,6 +33578,25 @@ pub async fn connectivity_link_friend_iroh_inner(
     let learned_at =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
+    // ZEB-371 Task 7: derive the shared friendship secret via ECDH (this side's
+    // ephemeral secret + the inviter's ephemeral public from the accept), then
+    // KeyTree-seal it under this node's owner keys, AAD-bound to the inviter's
+    // owner_id. The acceptor derives the SAME 32-byte plaintext from their secret
+    // + our `self_eph_pub` (carried in the request); each side seals with its OWN
+    // KeyTree, so the sealed blobs differ but the plaintext secret matches.
+    let secret = crate::friend_rendezvous::derive_friendship_secret(
+        self_eph_sk,
+        &accepted.eph_x25519_pub,
+        self_owner,
+        payload.inviter_addr,
+    );
+    let sealed = crate::owner_state_crypto::encrypt_friend_secret(
+        &keytree,
+        &payload.inviter_addr.0,
+        &secret,
+    )
+    .map_err(|e| format!("friend-secret seal failed: {e}"))?;
+
     let entry = crate::friend_graph::FriendEntry {
         master_ed25519,
         display: display.clone(),
@@ -33372,6 +33604,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         established_via: crate::friend_graph::FriendOrigin::Token,
         referrable: false,
         learned_at,
+        sealed_secret: Some(sealed),
     };
     {
         let mut state = crdt_state.lock().await;
@@ -33447,6 +33680,7 @@ mod friend_redeem_expiry_tests {
             crdt_state.clone(),
             hlc_tracker,
             "redeem-dev".to_string(),
+            Arc::new(crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt")),
             HandshakeDialConfig {
                 connect_timeout: Duration::from_millis(100),
                 open_bi_timeout: Duration::from_millis(100),
@@ -33767,6 +34001,8 @@ pub async fn unfriend_inner(
         established_via: existing.established_via,
         referrable: existing.referrable,
         learned_at,
+        // ZEB-371: clear the rendezvous secret on revoke (spec §3.3).
+        sealed_secret: None,
     };
     let mut state = crdt_state.lock().await;
     match state.apply_friend_update(peer_addr, tombstone) {
@@ -33916,6 +34152,8 @@ async fn redeem_friend_token(
         self_owner,
         dm_outbox,
         sync_engine,
+        owner_keytree,
+        friend_publisher,
     ) = {
         let g = state
             .lock()
@@ -33929,11 +34167,26 @@ async fn redeem_friend_token(
             g.dm_self_owner,
             g.dm_outbox.clone(),
             g.sync_engine.clone(),
+            g.owner_keytree.clone(),
+            g.pkarr_friend_publisher.clone(),
         )
     };
 
-    let (Some(crdt_state), Some(hlc_tracker), Some(device_id), Some(self_owner), Some(dm_outbox)) =
-        (crdt_state, hlc_tracker, device_id, self_owner, dm_outbox)
+    let (
+        Some(crdt_state),
+        Some(hlc_tracker),
+        Some(device_id),
+        Some(self_owner),
+        Some(dm_outbox),
+        Some(owner_keytree),
+    ) = (
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        dm_outbox,
+        owner_keytree,
+    )
     else {
         return Err(OWNER_NOT_LOADED_MSG.into());
     };
@@ -33948,6 +34201,11 @@ async fn redeem_friend_token(
         )
     };
 
+    // ZEB-371: clone the handles needed for the post-redeem Case-D reconcile
+    // before they move into the inner call below.
+    let crdt_state_for_reconcile = std::sync::Arc::clone(&crdt_state);
+    let keytree_for_reconcile = std::sync::Arc::clone(&owner_keytree);
+
     let outcome = connectivity_link_friend_iroh_inner(
         url,
         pkarr_resolver,
@@ -33959,6 +34217,7 @@ async fn redeem_friend_token(
         crdt_state,
         hlc_tracker,
         device_id,
+        owner_keytree,
         HandshakeDialConfig::from_env(),
     )
     .await?;
@@ -33971,6 +34230,24 @@ async fn redeem_friend_token(
     // mint.rs's `notify_mint_dirty` lock-snapshot-drop pattern.
     if let Some(engine) = sync_engine {
         engine.notify_dirty();
+    }
+
+    // ZEB-371: publish the just-added friend's Case-D reachability slot
+    // immediately (don't wait for the next reachability tick). Snapshot the
+    // friend graph under the CRDT lock, drop the guard, THEN do pkarr IO — the
+    // owner-state lock is never held across a network await. No-op when pkarr
+    // isn't running (`pkarr_friend_publisher` is `None`).
+    if let Some(friend_pub) = friend_publisher {
+        let friends_snapshot = {
+            let s = crdt_state_for_reconcile.lock().await;
+            s.friend_graph.friends.clone()
+        };
+        crate::pkarr_friend_publisher::sync_case_d_handles(
+            &friend_pub,
+            &friends_snapshot,
+            &keytree_for_reconcile,
+        )
+        .await;
     }
 
     // Notify the UI so it re-fetches the friend list.
@@ -34014,7 +34291,7 @@ async fn unfriend(
         .map_err(|_| "peer_addr must be 16 bytes (32 hex chars)".to_string())?;
     let peer = crate::owner_state_types::OwnerAddr(addr_bytes);
 
-    let (crdt_state, hlc_tracker, device_id, sync_engine) = {
+    let (crdt_state, hlc_tracker, device_id, sync_engine, friend_publisher, owner_keytree) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -34023,6 +34300,8 @@ async fn unfriend(
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.sync_engine.clone(),
+            g.pkarr_friend_publisher.clone(),
+            g.owner_keytree.clone(),
         )
     };
 
@@ -34037,10 +34316,793 @@ async fn unfriend(
         if let Some(engine) = sync_engine {
             engine.notify_dirty();
         }
+
+        // ZEB-371: drop the now-revoked friend's Case-D slot immediately (don't
+        // wait for the next reachability tick). Snapshot the friend graph under
+        // the CRDT lock, drop the guard, THEN do pkarr IO — the owner-state lock
+        // is never held across a network await. No-op when pkarr isn't running
+        // or the keytree is absent. Only when `changed` (the revoke actually
+        // wrote a tombstone) — the idempotent no-op leaves slots untouched.
+        if let (Some(friend_pub), Some(keytree)) = (friend_publisher, owner_keytree) {
+            let friends_snapshot = {
+                let s = crdt_state.lock().await;
+                s.friend_graph.friends.clone()
+            };
+            crate::pkarr_friend_publisher::sync_case_d_handles(
+                &friend_pub,
+                &friends_snapshot,
+                &keytree,
+            )
+            .await;
+        }
     }
 
     let _ = app.emit("friend-list-changed", ());
     Ok(())
+}
+
+/// ZEB-371 resolve-on-connect: resolve a friend's current iroh reachability via
+/// their private Case-D pkarr slot, so we can (re)dial them across WAN without
+/// any shared session or global discoverability.
+///
+/// Loads the friend's `FriendEntry` from owner-state; requires the link be
+/// `Active` with a sealed rendezvous secret. Opens the secret with the node's
+/// KeyTree, resolves the friend's Case-D slot keyed on it, decodes the returned
+/// (already-unsealed) routing blob into a `ReachabilityAnnouncePayload`, and
+/// returns a `DiscoveredRecord` DTO. Returns `Ok(None)` when: pkarr/keytree
+/// aren't running, the peer isn't an Active friend, the entry has no sealed
+/// secret, the secret won't open, the slot isn't currently published, or the
+/// blob is empty/undecodable (an empty blob is what the publisher emits when
+/// iroh is down — un-dial-able, treated as "not reachable").
+///
+/// `peer_addr` is the friend's 16-byte master `owner_id` in hex.
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_resolve_friend(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+) -> Result<Option<DiscoveredRecord>, String> {
+    let addr_bytes: [u8; 16] = hex::decode(&owner_id_hex)
+        .map_err(|e| format!("invalid owner_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "owner_id must be 16 bytes (32 hex chars)".to_string())?;
+
+    let (resolver, crdt_state, owner_keytree) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pkarr_resolver.clone(),
+            g.crdt_state.clone(),
+            g.owner_keytree.clone(),
+        )
+    };
+    let (Some(resolver), Some(crdt_state), Some(keytree)) = (resolver, crdt_state, owner_keytree)
+    else {
+        return Ok(None);
+    };
+
+    // Load the friend entry; require Active + a sealed secret.
+    let sealed_secret = {
+        let s = crdt_state.lock().await;
+        let Some(entry) = s
+            .friend_graph
+            .friends
+            .get(&crate::owner_state_types::OwnerAddr(addr_bytes))
+        else {
+            return Ok(None);
+        };
+        if entry.status != crate::friend_graph::FriendStatus::Active {
+            return Ok(None);
+        }
+        match &entry.sealed_secret {
+            Some(blob) => blob.clone(),
+            None => return Ok(None),
+        }
+    };
+
+    // Open the sealed secret with the node's KeyTree (bound to this friend's id).
+    let secret = match crate::owner_state_crypto::decrypt_friend_secret(
+        &keytree,
+        &addr_bytes,
+        &sealed_secret,
+    ) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+
+    // Resolve the friend's Case-D slot — `resolve_friend_case_d` returns the
+    // already-UNSEALED routing blob (or None on miss / unseal failure).
+    let Some(blob) =
+        crate::pkarr_friend_publisher::resolve_friend_case_d(&resolver, &secret, &addr_bytes)
+            .await?
+    else {
+        return Ok(None);
+    };
+    if blob.is_empty() {
+        // Publisher emits an empty blob when iroh is down (un-dial-able).
+        return Ok(None);
+    }
+
+    // Decode the routing blob into the reachability payload (same decode the
+    // identity-discovery IPC uses on its unsealed routing_blob).
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(blob.as_slice())
+            .map_err(|e| format!("decode case-d routing blob: {e}"))?;
+
+    Ok(Some(DiscoveredRecord::from(routing)))
+}
+
+// ── ZEB-371 Task 13: Path A user-facing friend IPCs ──────────────────
+//
+// Five commands surfacing the Path-A (mutual-key, no-token) friend flow + the
+// pending-request inbox to the frontend:
+//
+//   * `list_pending_friend_requests` — project the process-local pending store.
+//   * `accept_friend_request` — mark a requester approved (the link completes on
+//     their NEXT dial, accepted inline by the acceptor's `prior_accept` gate).
+//   * `decline_friend_request` — drop the inbound request + any approval.
+//   * `set_friend_auto_accept` / `get_friend_auto_accept` — the persisted
+//     "auto-accept known requesters" toggle.
+//   * `add_friend_by_key` — Path-A INITIATE: resolve a target by their Case-B
+//     transport-identity pub, dial `HARMONY_FRIEND_V1`, and either link (the
+//     target auto-accepted) or report `Pending`/`Unreachable`.
+
+/// One pending inbound friend request surfaced to the frontend inbox. The
+/// requester is identified by their 16-byte master `owner_id` (hex); `display`
+/// is their advertised name (UX hint); `received_at_ms` is when we first
+/// recorded the request.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingFriendRequestDto {
+    /// The requester's 16-byte master `owner_id`, hex-encoded.
+    pub owner_id_hex: String,
+    /// The requester's advertised display name (UX hint), if any.
+    pub display: Option<String>,
+    /// Epoch-ms the request was first recorded.
+    pub received_at_ms: u64,
+}
+
+/// Project the process-local pending-inbound store into the frontend DTO list.
+/// Pure over the store so it's unit-testable without a NodeState harness.
+pub fn list_pending_friend_requests_inner(
+    store: &crate::friend_requests::PendingFriendRequests,
+) -> Vec<PendingFriendRequestDto> {
+    store
+        .list()
+        .into_iter()
+        .map(|(addr, p)| PendingFriendRequestDto {
+            owner_id_hex: hex::encode(addr.0),
+            display: p.display,
+            received_at_ms: p.received_at_ms,
+        })
+        .collect()
+}
+
+/// Decode a 16-byte owner_id from hex, shared by the accept/decline IPCs.
+fn decode_owner_id_16(owner_id_hex: &str) -> Result<crate::owner_state_types::OwnerAddr, String> {
+    let bytes: [u8; 16] = hex::decode(owner_id_hex)
+        .map_err(|e| format!("invalid owner_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "owner_id must be 16 bytes (32 hex chars)".to_string())?;
+    Ok(crate::owner_state_types::OwnerAddr(bytes))
+}
+
+/// List the process-local pending inbound friend requests (Path A) for the
+/// frontend inbox. Returns an empty list when the Path-A store isn't wired
+/// (pre-`start_node` or owner not loaded) rather than erroring.
+#[tauri::command(rename_all = "snake_case")]
+async fn list_pending_friend_requests(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<PendingFriendRequestDto>, String> {
+    let store = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .pending_friend_requests
+            .clone()
+    };
+    let Some(store) = store else {
+        return Ok(Vec::new());
+    };
+    Ok(list_pending_friend_requests_inner(&store))
+}
+
+/// Accept a pending inbound friend request: mark the requester APPROVED so their
+/// NEXT dial is accepted inline by the acceptor's `prior_accept` consent gate.
+/// This does NOT dial out — the link completes on the requester's re-dial. Emits
+/// `friend-list-changed` so the UI refreshes its inbox/friend views.
+#[tauri::command(rename_all = "snake_case")]
+async fn accept_friend_request(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+) -> Result<(), String> {
+    let addr = decode_owner_id_16(&owner_id_hex)?;
+    let store = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .pending_friend_requests
+            .clone()
+    };
+    let Some(store) = store else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+    store.approve(addr);
+    // Refresh the UI (friend list + pending inbox both re-fetch on this event).
+    let _ = app.emit("friend-list-changed", ());
+    Ok(())
+}
+
+/// Decline a pending inbound friend request: drop the recorded inbound request
+/// AND any approval. Emits `friend-list-changed` so the UI drops the row.
+#[tauri::command(rename_all = "snake_case")]
+async fn decline_friend_request(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+) -> Result<(), String> {
+    let addr = decode_owner_id_16(&owner_id_hex)?;
+    let store = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .pending_friend_requests
+            .clone()
+    };
+    let Some(store) = store else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+    store.decline(&addr);
+    let _ = app.emit("friend-list-changed", ());
+    Ok(())
+}
+
+/// Set the per-user "auto-accept known requesters" toggle (spec §7.1) and
+/// persist it to `connectivity-settings.json` (mirroring
+/// `connectivity_set_identity_discoverable`).
+///
+/// NOTE: this applies on the NEXT node start. The live friend acceptor captures
+/// `auto_accept_known` by value at `start_node` (it's installed once behind a
+/// trait object in the iroh link-manager's dispatcher OnceCell, with no
+/// interior-mutability handle exposed), so a running acceptor keeps its prior
+/// value until restart. The persisted value is what the next `start_node` reads.
+#[tauri::command(rename_all = "snake_case")]
+async fn set_friend_auto_accept(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let path = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .pkarr_settings_path
+            .clone()
+    };
+    let Some(path) = path else {
+        return Err("pkarr_settings_path missing".into());
+    };
+
+    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
+    settings.friend_auto_accept_known = enabled;
+    settings
+        .save(&path)
+        .map_err(|e| format!("save connectivity-settings: {e}"))?;
+
+    // Emit so the UI reflects the toggle (and can surface the "applies on next
+    // start" hint).
+    if let Err(e) = app.emit(
+        "connectivity-friend-auto-accept-changed",
+        serde_json::json!({ "enabled": enabled }),
+    ) {
+        tracing::warn!(error = %e, "set_friend_auto_accept: emit failed");
+    }
+    Ok(())
+}
+
+/// Read the current "auto-accept known requesters" toggle from the persisted
+/// settings file. Returns the spec default (ON) when the file is missing or the
+/// pkarr settings path is not initialized.
+#[tauri::command(rename_all = "snake_case")]
+async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Result<bool, String> {
+    let path = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .pkarr_settings_path
+            .clone()
+    };
+    let Some(path) = path else {
+        // Node not running / pkarr not initialized — return the spec default (ON).
+        return Ok(true);
+    };
+    Ok(pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known)
+}
+
+/// Outcome of a Path-A `add_friend_by_key` initiate.
+///
+/// `rename_all` camelCases the variant tags (`linked`/`pending`/`unreachable`);
+/// `rename_all_fields` camelCases the struct-variant fields (`ownerIdHex`) — the
+/// plain `rename_all` does NOT cascade to a variant's fields.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum AddFriendOutcome {
+    /// The target auto-accepted (known + auto-accept ON, or pre-approved): a
+    /// mutual `Active`/`MutualKey` friend was written. Carries the target's
+    /// master `owner_id` (hex) + the display they advertised.
+    Linked {
+        owner_id_hex: String,
+        display: Option<String>,
+    },
+    /// The target recorded our request and is awaiting their user's accept. NO
+    /// friend was written (the target's master owner_id is unknown until they
+    /// accept + send their cert). The user re-invokes `add_friend_by_key` later
+    /// to retry; once the target accepts, the retry's response is `Accepted`.
+    Pending,
+    /// The target is not currently discoverable (no Case-B pkarr record).
+    Unreachable,
+}
+
+/// Pure classifier for the Path-A `FriendLinkResponse` branch the inner takes on
+/// a `Pending` reply. Factored out so the "Pending → no friend written" decision
+/// is unit-testable without a live two-node handshake. (The `Accepted` branch
+/// does cryptographic verification + a CRDT write, so it can't be reduced to a
+/// pure value — it's covered by the inner + the shared dial/secret machinery the
+/// token roundtrip integration test exercises.)
+fn classify_pending_outcome() -> AddFriendOutcome {
+    AddFriendOutcome::Pending
+}
+
+/// ZEB-371 Task 13: the OUTBOUND side of the Path-A (mutual-key, no-token)
+/// friend handshake — resolve a target by their 64-byte Case-B transport
+/// identity pub, dial `harmony/friend/v1`, send a token-less `FriendLinkRequest`,
+/// and on an `Accepted` reply authenticate the target's cert + accept-sig,
+/// derive + KeyTree-seal the rendezvous secret, and write the target as an
+/// `Active`/`MutualKey` friend.
+///
+/// Split out as a reusable `pub` inner (the IPC wrapper snapshots `NodeState`
+/// and delegates) so integration tests can drive it with explicit resources.
+/// Structural template: [`connectivity_link_friend_iroh_inner`] (the TOKEN
+/// redeem path); the only material differences are (1) target resolution is
+/// Case-B (identity-keyed) not Case-A (token-keyed), and (2) `token_sig` is
+/// `None` end-to-end, so a `Pending` reply is a normal outcome (not an error).
+///
+/// On a genuine unreachable condition (no Case-B record) this returns
+/// `Ok(AddFriendOutcome::Unreachable)`. A dial/IO failure returns `Err(String)`.
+/// A garbage/unauthenticated `Accepted` reply returns `Err` — it MUST NOT write
+/// a friend.
+///
+/// Like [`connectivity_link_friend_iroh_inner`], this function writes the
+/// `FriendEntry` on a `Linked` outcome but the CALLER (the `add_friend_by_key`
+/// IPC wrapper) is responsible for `notify_dirty()` (owner-state sync) and
+/// `sync_case_d_handles` (Case-D publication) — a direct caller such as an
+/// integration test must trigger those itself.
+#[allow(clippy::too_many_arguments)]
+pub async fn connectivity_add_friend_by_key_inner(
+    identity_pub_hex: String,
+    pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
+    iroh_endpoint: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    self_enrollment: harmony_owner::certs::EnrollmentCert,
+    self_device2_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    self_display: Option<String>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    dial_config: HandshakeDialConfig,
+) -> Result<AddFriendOutcome, String> {
+    use crate::iroh_friend_acceptor::{
+        decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
+        friend_request_sig_preimage, master_ed25519_from_cert, verify_enrolled_device,
+        FriendLinkRequest, FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
+    };
+    use ed25519_dalek::{Signature, Signer, VerifyingKey};
+
+    // 1. Decode the target's 64-byte transport identity pub (the "key" held OOB).
+    let identity_pub: [u8; 64] = hex::decode(&identity_pub_hex)
+        .map_err(|e| format!("hex decode identity_pub: {e}"))?
+        .try_into()
+        .map_err(|_| "identity_pub must be 64 bytes (128 hex chars)".to_string())?;
+
+    let Some(resolver) = pkarr_resolver else {
+        return Err("pkarr resolver unavailable — cannot resolve target".to_string());
+    };
+    let Some(iroh_endpoint) = iroh_endpoint else {
+        return Err("iroh endpoint unavailable — cannot dial target".to_string());
+    };
+
+    // 2. Resolve the target's reachability via Case-B (identity-keyed) pkarr —
+    //    the SAME logic `connectivity_discover_identity` uses, but we keep the raw
+    //    routing payload (not just the DTO) so we can synthesize an EndpointAddr.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let epoch_window = harmony_pkarr::epoch_tolerance_window(now_ms);
+    let verifying_keys: Vec<_> = epoch_window
+        .iter()
+        .map(|&epoch| {
+            harmony_pkarr::derive_ephemeral_key(
+                harmony_pkarr::PkarrCase::Identity,
+                &identity_pub,
+                &epoch.to_be_bytes(),
+            )
+            .verifying_key()
+        })
+        .collect();
+
+    let Some(rec) = resolver
+        .resolve_window(&verifying_keys)
+        .await
+        .map_err(|e| format!("pkarr resolve: {e}"))?
+    else {
+        return Ok(AddFriendOutcome::Unreachable);
+    };
+    if rec.verify_inner_sig().is_err()
+        || rec.verify_identity_match(&identity_pub).is_err()
+        || rec.verify_skew(now_ms).is_err()
+    {
+        // A record that doesn't authenticate is treated as not-reachable (same as
+        // `connectivity_discover_identity`'s `Ok(None)`).
+        return Ok(AddFriendOutcome::Unreachable);
+    }
+
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(rec.routing_blob.as_slice())
+            .map_err(|e| format!("decode routing_blob: {e}"))?;
+
+    // 3. Synthesize an EndpointAddr from the verified routing record.
+    let target_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode target iroh_node_id: {e}"))?;
+    let mut target_addr = iroh::EndpointAddr::new(target_iroh_id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => target_addr = target_addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        target_addr = target_addr.with_ip_addr(*da);
+    }
+
+    // 4. Connect on the friend ALPN + open a bi-stream, bounded by dial_config.
+    let conn = match tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint
+            .inner()
+            .connect(target_addr, crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("target_unreachable: iroh connect failed: {e}")),
+        Err(_elapsed) => {
+            return Err(format!(
+                "target_unreachable: iroh connect timeout after {}ms",
+                dial_config.connect_timeout.as_millis()
+            ));
+        }
+    };
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Err(format!("target_unreachable: open_bi failed: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Err(format!(
+                    "target_unreachable: open_bi timeout after {}ms",
+                    dial_config.open_bi_timeout.as_millis()
+                ));
+            }
+        };
+
+    // 5. Build + device-#2-sign a token-LESS FriendLinkRequest. `token_sig` is
+    //    None end-to-end (Path A); the sig binds our ephemeral X25519 public.
+    let (self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+    let req_sig = self_device2_signing_key
+        .sign(&friend_request_sig_preimage(
+            self_owner,
+            None,
+            &self_eph_pub,
+        ))
+        .to_bytes();
+    let request = FriendLinkRequest {
+        from_addr: self_owner,
+        display: self_display,
+        token_sig: None,
+        eph_x25519_pub: self_eph_pub,
+        enrollment: self_enrollment,
+        sig: req_sig,
+    };
+    let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
+    let wire_len = wire.len() as u32;
+
+    let write_prefix = async {
+        send.write_all(&wire_len.to_le_bytes())
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("target_unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("target_unreachable: request length-prefix write timeout".to_string());
+        }
+    }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write request body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("target_unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("target_unreachable: request body write timeout".to_string());
+        }
+    }
+    if let Err(e) = send.finish() {
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Err(format!("target_unreachable: send.finish failed: {e}"));
+    }
+
+    // 6. Read [u32 LE length-prefix][FriendLinkResponse].
+    let read_response = async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("read length-prefix: {e}"))?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > FRIEND_MAX_PACKET_LEN {
+            return Err(format!(
+                "response length out of bounds: len={len} max={FRIEND_MAX_PACKET_LEN}"
+            ));
+        }
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read response body: {e}"))?;
+        Ok::<Vec<u8>, String>(body)
+    };
+    let response_bytes =
+        match tokio::time::timeout(dial_config.response_read_timeout, read_response).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"response-read-failed");
+                return Err(format!("target_unreachable: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"response-read-timeout");
+                return Err("target_unreachable: friend response timeout".to_string());
+            }
+        };
+
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"friend-handshake-complete");
+    drop(conn);
+
+    // 7. Branch on the response. Unlike the token redeem, `Pending` is a NORMAL
+    //    Path-A outcome (the target recorded our request, awaiting their accept):
+    //    we write NO friend and return `Pending` so the user can retry later.
+    let accepted = match decode_friend_response(&response_bytes)
+        .map_err(|e| format!("decode response: {e}"))?
+    {
+        FriendLinkResponse::Accepted(a) => *a,
+        FriendLinkResponse::Pending => {
+            tracing::info!(
+                target = %identity_pub_hex,
+                "ZEB-371 Path A: target recorded request (Pending); no friend written, retry after accept"
+            );
+            return Ok(classify_pending_outcome());
+        }
+    };
+
+    // 8. Authenticate the accept (MUST happen before deriving/storing anything):
+    //    the cert binds the target's claimed owner_id, and the accept sig is over
+    //    the token-LESS accept preimage. A garbage/forged reply errors here —
+    //    never writes a friend.
+    let target_addr_master = accepted.from_addr;
+    let accept_device_key = verify_enrolled_device(&accepted.enrollment, target_addr_master)
+        .map_err(|e| format!("verify accept enrollment: {e}"))?;
+    let accept_vk =
+        VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
+    accept_vk
+        .verify_strict(
+            &friend_accept_sig_preimage(target_addr_master, None, &accepted.eph_x25519_pub),
+            &Signature::from_bytes(&accepted.sig),
+        )
+        .map_err(|_| "friend accept signature invalid".to_string())?;
+
+    // 9. Extract the target's master key + apply them as an Active/MutualKey
+    //    friend (keyed on their authenticated master owner_id).
+    let master_ed25519 = master_ed25519_from_cert(&accepted.enrollment)
+        .map_err(|e| format!("extract target master key: {e}"))?;
+    let display = accepted.display.clone();
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let learned_at =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    // Derive the shared rendezvous secret (our ephemeral secret + the target's
+    // ephemeral public from the accept), KeyTree-seal it AAD-bound to the
+    // target's owner_id.
+    let secret = crate::friend_rendezvous::derive_friendship_secret(
+        self_eph_sk,
+        &accepted.eph_x25519_pub,
+        self_owner,
+        target_addr_master,
+    );
+    let sealed =
+        crate::owner_state_crypto::encrypt_friend_secret(&keytree, &target_addr_master.0, &secret)
+            .map_err(|e| format!("friend-secret seal failed: {e}"))?;
+
+    let entry = crate::friend_graph::FriendEntry {
+        master_ed25519,
+        display: display.clone(),
+        status: crate::friend_graph::FriendStatus::Active,
+        established_via: crate::friend_graph::FriendOrigin::MutualKey,
+        referrable: false,
+        learned_at,
+        sealed_secret: Some(sealed),
+    };
+    {
+        let mut state = crdt_state.lock().await;
+        match state.apply_friend_update(target_addr_master, entry) {
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+            | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {}
+            crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+                return Err(format!("friend-graph apply rejected: {reason:?}"));
+            }
+        }
+    }
+
+    tracing::info!(
+        friend = %hex::encode(target_addr_master.0),
+        "ZEB-371 Path A: friend link established (target added as Active/MutualKey friend)"
+    );
+
+    Ok(AddFriendOutcome::Linked {
+        owner_id_hex: hex::encode(target_addr_master.0),
+        display,
+    })
+}
+
+/// Path-A initiate IPC: add a friend by their 64-byte Case-B transport identity
+/// pub (the "key" held out-of-band). Resolves the target, runs the token-less
+/// friend handshake, and either links them (target auto-accepted), reports
+/// `Pending` (target recorded our request — retry later), or `Unreachable`.
+///
+/// On a successful `Linked`, arms the owner-state SyncEngine + reconciles the
+/// new friend's Case-D slot + emits `friend-list-changed` (mirroring
+/// `redeem_friend_token`). A `Pending`/`Unreachable` outcome writes nothing and
+/// emits nothing.
+// ZEB-365: bare `#[tauri::command]` => camelCase args (matches
+// `connectivity_discover_identity`; the frontend invokes with `{ identityPubHex }`).
+#[tauri::command]
+async fn add_friend_by_key(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    identity_pub_hex: String,
+) -> Result<AddFriendOutcome, String> {
+    let (
+        pkarr_resolver,
+        iroh_endpoint,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        dm_outbox,
+        sync_engine,
+        owner_keytree,
+        friend_publisher,
+    ) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pkarr_resolver.clone(),
+            g.iroh_endpoint.clone(),
+            g.crdt_state.clone(),
+            g.hlc_tracker.clone(),
+            g.dm_device_id.clone(),
+            g.dm_self_owner,
+            g.dm_outbox.clone(),
+            g.sync_engine.clone(),
+            g.owner_keytree.clone(),
+            g.pkarr_friend_publisher.clone(),
+        )
+    };
+
+    let (
+        Some(crdt_state),
+        Some(hlc_tracker),
+        Some(device_id),
+        Some(self_owner),
+        Some(dm_outbox),
+        Some(owner_keytree),
+    ) = (
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        dm_outbox,
+        owner_keytree,
+    )
+    else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+
+    let (device2_key, enrollment_cert) = {
+        let o = dm_outbox.lock().await;
+        (
+            std::sync::Arc::clone(&o.community_signing_key),
+            o.enrollment_cert.clone(),
+        )
+    };
+
+    let crdt_state_for_reconcile = std::sync::Arc::clone(&crdt_state);
+    let keytree_for_reconcile = std::sync::Arc::clone(&owner_keytree);
+
+    let outcome = connectivity_add_friend_by_key_inner(
+        identity_pub_hex,
+        pkarr_resolver,
+        iroh_endpoint,
+        self_owner,
+        enrollment_cert,
+        device2_key,
+        None, // self_display — not persisted at this layer (see acceptor note).
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        owner_keytree,
+        HandshakeDialConfig::from_env(),
+    )
+    .await?;
+
+    // Only a `Linked` outcome mutated owner-state → arm sync + reconcile Case-D +
+    // refresh the UI. `Pending`/`Unreachable` wrote nothing.
+    if matches!(outcome, AddFriendOutcome::Linked { .. }) {
+        if let Some(engine) = sync_engine {
+            engine.notify_dirty();
+        }
+        if let Some(friend_pub) = friend_publisher {
+            let friends_snapshot = {
+                let s = crdt_state_for_reconcile.lock().await;
+                s.friend_graph.friends.clone()
+            };
+            crate::pkarr_friend_publisher::sync_case_d_handles(
+                &friend_pub,
+                &friends_snapshot,
+                &keytree_for_reconcile,
+            )
+            .await;
+        }
+        let _ = app.emit("friend-list-changed", ());
+    }
+
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -34063,6 +35125,45 @@ mod friend_ipc_tests {
         }
     }
 
+    /// Pin the EXACT JSON the `add_friend_by_key` IPC emits for each variant —
+    /// this is the contract `parseAddFriendOutcome` (friend-service.ts) parses.
+    /// serde's externally-tagged representation serializes UNIT variants as bare
+    /// strings (`"pending"`/`"unreachable"`), NOT objects like `{"pending":null}`;
+    /// only struct variants get the `{"linked": {…}}` wrapper. (Refutes the
+    /// Cursor "add-friend outcome parse mismatch" report — the bare-string shape
+    /// the TS parser checks IS what the backend produces.)
+    #[test]
+    fn add_friend_outcome_serializes_to_the_ipc_contract() {
+        use serde_json::json;
+        assert_eq!(
+            serde_json::to_value(AddFriendOutcome::Pending).unwrap(),
+            json!("pending"),
+            "unit variant must serialize as a bare string"
+        );
+        assert_eq!(
+            serde_json::to_value(AddFriendOutcome::Unreachable).unwrap(),
+            json!("unreachable"),
+            "unit variant must serialize as a bare string"
+        );
+        assert_eq!(
+            serde_json::to_value(AddFriendOutcome::Linked {
+                owner_id_hex: "aabb".into(),
+                display: Some("Alice".into()),
+            })
+            .unwrap(),
+            json!({ "linked": { "ownerIdHex": "aabb", "display": "Alice" } })
+        );
+        assert_eq!(
+            serde_json::to_value(AddFriendOutcome::Linked {
+                owner_id_hex: "ccdd".into(),
+                display: None,
+            })
+            .unwrap(),
+            json!({ "linked": { "ownerIdHex": "ccdd", "display": null } }),
+            "absent display serializes as null, matching `display ?? null`"
+        );
+    }
+
     /// A friend entry whose `master_ed25519` derives to `addr` (so
     /// `apply_friend_update` accepts it — it enforces the addr↔key invariant).
     fn friend_entry(master_seed: u8, status: FriendStatus, w: u64) -> (OwnerAddr, FriendEntry) {
@@ -34079,6 +35180,7 @@ mod friend_ipc_tests {
                 established_via: FriendOrigin::Token,
                 referrable: false,
                 learned_at: hlc(w),
+                sealed_secret: None,
             },
         )
     }
@@ -34207,6 +35309,32 @@ mod friend_ipc_tests {
         }
     }
 
+    #[tokio::test]
+    async fn unfriend_inner_clears_present_sealed_secret() {
+        // An Active friend WITH a sealed secret must have it cleared to None on revoke (spec §3.3).
+        let (addr, mut active) = friend_entry(0x77, FriendStatus::Active, 5);
+        active.sealed_secret = Some(vec![0xAB; 12 + 32 + 16]);
+        let mut state = OwnerState::default();
+        assert!(matches!(
+            state.apply_friend_update(addr, active),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+        let crdt_state = Arc::new(TokioMutex::new(state));
+        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
+            Arc::new(TokioMutex::new(BTreeMap::new()));
+        let changed = unfriend_inner(&crdt_state, &hlc_tracker, "self", addr)
+            .await
+            .expect("unfriend ok");
+        assert!(changed, "revoking an Active friend returns Ok(true)");
+        let s = crdt_state.lock().await;
+        let entry = &s.friend_graph.friends[&addr];
+        assert_eq!(entry.status, FriendStatus::Revoked);
+        assert_eq!(
+            entry.sealed_secret, None,
+            "revoke must clear the rendezvous secret"
+        );
+    }
+
     // ── ZEB-370 (cursor review): generate_friend_token publisher requirement ──
 
     /// A real `PkarrInvitePublisher` backed by a mock relay. The guard only
@@ -34251,6 +35379,136 @@ mod friend_ipc_tests {
         let publisher = test_publisher().await;
         super::friend_token_publish_guard(Some(&publisher))
             .expect("a present publisher must pass the guard");
+    }
+
+    // ── ZEB-371 Task 13: Path A simple-IPC inners ────────────────────────
+
+    #[test]
+    fn list_pending_friend_requests_inner_projects_to_dto() {
+        use crate::friend_requests::PendingFriendRequests;
+        let store = PendingFriendRequests::new();
+        store.record_inbound(OwnerAddr([0xA1; 16]), Some("alice".into()), 1_000);
+        store.record_inbound(OwnerAddr([0xB2; 16]), None, 2_000);
+
+        let mut dtos = list_pending_friend_requests_inner(&store);
+        // Map iteration order is unspecified — sort for a stable assert.
+        dtos.sort_by(|a, b| a.received_at_ms.cmp(&b.received_at_ms));
+        assert_eq!(dtos.len(), 2);
+        assert_eq!(dtos[0].owner_id_hex, hex::encode([0xA1; 16]));
+        assert_eq!(dtos[0].display.as_deref(), Some("alice"));
+        assert_eq!(dtos[0].received_at_ms, 1_000);
+        assert_eq!(dtos[1].owner_id_hex, hex::encode([0xB2; 16]));
+        assert_eq!(dtos[1].display, None);
+        assert_eq!(dtos[1].received_at_ms, 2_000);
+    }
+
+    #[test]
+    fn list_pending_friend_requests_inner_empty_store_is_empty() {
+        use crate::friend_requests::PendingFriendRequests;
+        let store = PendingFriendRequests::new();
+        assert!(list_pending_friend_requests_inner(&store).is_empty());
+    }
+
+    #[test]
+    fn accept_marks_approved_so_next_dial_is_inline() {
+        // The accept IPC's effect: mark_approved → the acceptor's `is_approved`
+        // (which it consults for `prior_accept`) now returns true, so the
+        // requester's next dial is accepted inline.
+        use crate::friend_requests::PendingFriendRequests;
+        let store = PendingFriendRequests::new();
+        let addr = OwnerAddr([0xC3; 16]);
+        store.record_inbound(addr, Some("carol".into()), 5_000);
+        assert!(!store.is_approved(&addr), "not approved before accept");
+        store.mark_approved(addr);
+        assert!(
+            store.is_approved(&addr),
+            "after accept, the requester is approved (prior_accept gate opens)"
+        );
+    }
+
+    #[test]
+    fn decline_drops_inbound_and_approval() {
+        use crate::friend_requests::PendingFriendRequests;
+        let store = PendingFriendRequests::new();
+        let addr = OwnerAddr([0xD4; 16]);
+        store.record_inbound(addr, None, 6_000);
+        store.mark_approved(addr);
+        store.decline(&addr);
+        assert!(
+            list_pending_friend_requests_inner(&store).is_empty(),
+            "decline drops the inbound request"
+        );
+        assert!(!store.is_approved(&addr), "decline drops the approval too");
+    }
+
+    #[test]
+    fn decode_owner_id_16_roundtrips_and_rejects_bad_len() {
+        let addr = OwnerAddr([0x5A; 16]);
+        let hexed = hex::encode(addr.0);
+        assert_eq!(super::decode_owner_id_16(&hexed).expect("decode"), addr);
+        // 15 bytes → wrong length.
+        let short = hex::encode([0u8; 15]);
+        assert!(super::decode_owner_id_16(&short).is_err());
+        // not hex.
+        assert!(super::decode_owner_id_16("zz").is_err());
+    }
+
+    #[test]
+    fn classify_pending_outcome_is_pending() {
+        // The Path-A `Pending` reply MUST classify as `AddFriendOutcome::Pending`
+        // (no FriendEntry written — the caller retries after the target accepts).
+        assert_eq!(super::classify_pending_outcome(), AddFriendOutcome::Pending);
+    }
+
+    #[test]
+    fn set_friend_auto_accept_persists_round_trips() {
+        // The IPC's persistence half (independent of NodeState): flipping the
+        // toggle writes through `PkarrSettings::save` and reads back via
+        // `load_or_default`, exactly as `set_/get_friend_auto_accept` do.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        // Default (no file) is ON (spec §7.1) — what `get_friend_auto_accept`
+        // returns when the file is absent.
+        assert!(
+            crate::pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known
+        );
+
+        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        settings.friend_auto_accept_known = false;
+        settings.save(&path).expect("save");
+        assert!(
+            !crate::pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known,
+            "toggle OFF persists"
+        );
+
+        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        settings.friend_auto_accept_known = true;
+        settings.save(&path).expect("save");
+        assert!(
+            crate::pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known,
+            "toggle back ON persists"
+        );
+    }
+
+    #[test]
+    fn add_friend_outcome_serializes_camelcase() {
+        // The DTO contract the frontend depends on: externally-tagged enum with
+        // camelCase variant names + fields.
+        let linked = AddFriendOutcome::Linked {
+            owner_id_hex: "aa".into(),
+            display: Some("dave".into()),
+        };
+        let v = serde_json::to_value(&linked).expect("serialize linked");
+        assert_eq!(v["linked"]["ownerIdHex"], "aa");
+        assert_eq!(v["linked"]["display"], "dave");
+
+        let pending = serde_json::to_value(AddFriendOutcome::Pending).expect("serialize pending");
+        assert_eq!(pending, serde_json::json!("pending"));
+
+        let unreachable =
+            serde_json::to_value(AddFriendOutcome::Unreachable).expect("serialize unreachable");
+        assert_eq!(unreachable, serde_json::json!("unreachable"));
     }
 }
 
@@ -34907,6 +36165,15 @@ pub fn run() {
             redeem_friend_token,
             list_friends,
             unfriend,
+            // ZEB-371: resolve a friend's reachability via their Case-D slot.
+            connectivity_resolve_friend,
+            // ZEB-371 Task 13: Path A user-facing friend IPCs.
+            add_friend_by_key,
+            list_pending_friend_requests,
+            accept_friend_request,
+            decline_friend_request,
+            set_friend_auto_accept,
+            get_friend_auto_accept,
             // ZEB-329: Network Health IPCs.
             network_health_snapshot,
             network_health_run_self_test,
@@ -38289,6 +39556,7 @@ mod start_node_race_tests {
             hlc_tracker: None,
             dm_device_id: None,
             dm_self_owner: None,
+            owner_keytree: None,
             content_store: None,
             unicast_send_tx: None,
             dm_send_inflight: None,
@@ -38337,6 +39605,8 @@ mod start_node_race_tests {
             iroh_accept_handle: None,
             // ZEB-323 Phase 2b: pkarr handles unused in race tests.
             pkarr_publisher: None,
+            pkarr_friend_publisher: None,
+            pending_friend_requests: None,
             pkarr_resolver: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,

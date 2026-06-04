@@ -12,7 +12,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
 use std::collections::HashMap;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub use crate::owner_state_types::Hlc;
 
@@ -105,6 +105,7 @@ const INFO_ENTRY_AEAD: &[u8] = b"entry-aead-key";
 const INFO_ROOT_AEAD: &[u8] = b"root-aead-key";
 const INFO_TREE_LOOKUP: &[u8] = b"tree-lookup";
 const INFO_NONCE_DERIV: &[u8] = b"nonce-deriv";
+const INFO_FRIEND_AEAD: &[u8] = b"friend-secret-aead-key";
 
 /// Four owner-state keys derived deterministically from the master seed.
 /// Every bound device that holds the seed computes identical keys.
@@ -121,6 +122,7 @@ pub struct KeyTree {
     root_aead: Zeroizing<[u8; 32]>,
     lookup: Zeroizing<[u8; 32]>,
     nonce: Zeroizing<[u8; 32]>,
+    friend_aead: Zeroizing<[u8; 32]>,
 }
 
 impl KeyTree {
@@ -144,11 +146,16 @@ impl KeyTree {
         hk.expand(INFO_NONCE_DERIV, nonce.as_mut())
             .map_err(|e| CryptoError::Hkdf(format!("nonce-deriv: {e}")))?;
 
+        let mut friend_aead = Zeroizing::new([0u8; 32]);
+        hk.expand(INFO_FRIEND_AEAD, friend_aead.as_mut())
+            .map_err(|e| CryptoError::Hkdf(format!("friend-aead: {e}")))?;
+
         Ok(Self {
             entry_aead,
             root_aead,
             lookup,
             nonce,
+            friend_aead,
         })
     }
 }
@@ -317,6 +324,71 @@ pub fn decrypt_root_publish(keys: &KeyTree, blob: &[u8]) -> Result<Vec<u8>, Cryp
         .map_err(|_| CryptoError::AeadDecrypt)
 }
 
+/// Domain-separated AAD base for friend-secret sealing; the friend's owner_id is
+/// appended so a sealed secret cannot be relocated into another friend's entry.
+const AAD_FRIEND_SECRET: &[u8] = b"friend-rendezvous-secret";
+
+/// Seal a 32-byte friendship secret for storage in a `FriendEntry`. Random
+/// nonce; layout `nonce(12) || ChaCha20-Poly1305 ciphertext+tag(48)`. AAD binds
+/// the ciphertext to the specific friendship (`friend_owner_id`).
+pub fn encrypt_friend_secret(
+    keys: &KeyTree,
+    friend_owner_id: &[u8; 16],
+    secret: &[u8; 32],
+) -> Result<Vec<u8>, CryptoError> {
+    let mut nonce_bytes = [0u8; 12];
+    OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|e| CryptoError::Rng(e.to_string()))?;
+    let cipher = ChaCha20Poly1305::new_from_slice(keys.friend_aead.as_ref())
+        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    let mut aad = AAD_FRIEND_SECRET.to_vec();
+    aad.extend_from_slice(friend_owner_id);
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: secret,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| CryptoError::AeadEncrypt)?;
+    let mut blob = Vec::with_capacity(12 + ciphertext.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ciphertext);
+    Ok(blob)
+}
+
+/// Open a blob produced by [`encrypt_friend_secret`]. Returns the 32-byte secret
+/// (zeroizing) or `CryptoError::AeadDecrypt` on wrong key/AAD/corruption.
+pub fn decrypt_friend_secret(
+    keys: &KeyTree,
+    friend_owner_id: &[u8; 16],
+    blob: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    if blob.len() != 12 + 32 + 16 {
+        return Err(CryptoError::AeadDecrypt);
+    }
+    let (nonce_bytes, ciphertext) = blob.split_at(12);
+    let cipher = ChaCha20Poly1305::new_from_slice(keys.friend_aead.as_ref())
+        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    let mut aad = AAD_FRIEND_SECRET.to_vec();
+    aad.extend_from_slice(friend_owner_id);
+    let mut plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| CryptoError::AeadDecrypt)?;
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&plaintext);
+    plaintext.zeroize();
+    Ok(out)
+}
+
 /// Per-publisher HLC tracker for state-root replay protection.
 ///
 /// Per ZEB-211 round-5: "last accepted" is keyed by `at.device_id`,
@@ -458,6 +530,7 @@ mod tests {
         assert_eq!(kt1.root_aead.as_ref(), kt2.root_aead.as_ref());
         assert_eq!(kt1.lookup.as_ref(), kt2.lookup.as_ref());
         assert_eq!(kt1.nonce.as_ref(), kt2.nonce.as_ref());
+        assert_eq!(kt1.friend_aead.as_ref(), kt2.friend_aead.as_ref());
 
         // The four keys must be distinct (domain separation).
         assert_ne!(kt1.entry_aead.as_ref(), kt1.root_aead.as_ref());
@@ -466,6 +539,41 @@ mod tests {
         assert_ne!(kt1.root_aead.as_ref(), kt1.lookup.as_ref());
         assert_ne!(kt1.root_aead.as_ref(), kt1.nonce.as_ref());
         assert_ne!(kt1.lookup.as_ref(), kt1.nonce.as_ref());
+    }
+
+    #[test]
+    fn friend_secret_seal_round_trip() {
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        let friend = [0x33u8; 16];
+        let secret = [0xABu8; 32];
+        let blob = encrypt_friend_secret(&kt, &friend, &secret).expect("seal");
+        assert_eq!(blob.len(), 12 + 32 + 16);
+        assert_ne!(
+            &blob[12..44],
+            &secret[..],
+            "must be ciphertext, not plaintext"
+        );
+        let back = decrypt_friend_secret(&kt, &friend, &blob).expect("open");
+        assert_eq!(back.as_ref(), &secret);
+    }
+
+    #[test]
+    fn friend_secret_seal_binds_to_friend_owner_id() {
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        let blob = encrypt_friend_secret(&kt, &[1u8; 16], &[7u8; 32]).expect("seal");
+        assert!(matches!(
+            decrypt_friend_secret(&kt, &[2u8; 16], &blob),
+            Err(CryptoError::AeadDecrypt)
+        ));
+    }
+
+    #[test]
+    fn friend_aead_key_distinct_from_other_subkeys() {
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        assert_ne!(kt.friend_aead.as_ref(), kt.entry_aead.as_ref());
+        assert_ne!(kt.friend_aead.as_ref(), kt.root_aead.as_ref());
+        assert_ne!(kt.friend_aead.as_ref(), kt.lookup.as_ref());
+        assert_ne!(kt.friend_aead.as_ref(), kt.nonce.as_ref());
     }
 
     #[test]

@@ -3940,6 +3940,7 @@ mod friend_graph_tests {
                 logical: 0,
                 device_id: "d".into(),
             },
+            sealed_secret: None,
         }
     }
 

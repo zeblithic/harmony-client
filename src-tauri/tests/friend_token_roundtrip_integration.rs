@@ -180,6 +180,11 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
         // ── 3. Alice's owner-state + hlc tracker (acceptor dependencies). ─
         let alice_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
         let alice_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+        // ZEB-371: each node has its OWN owner KeyTree (per-owner master seed). A
+        // seals friend secrets under hers, B under his; the SHARED thing is the
+        // 32-byte plaintext secret each side derives via ECDH.
+        let alice_keytree =
+            Arc::new(harmony_app::owner_state_crypto::KeyTree::derive(&[0xA1; 32]).expect("kt"));
 
         // ── 4. Mock pkarr relay + Case-A friend-token publisher. ────────
         let relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
@@ -236,6 +241,7 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
             Some("alice".to_string()),
             alice.cert.clone(),
             Arc::clone(&alice_device2),
+            Arc::clone(&alice_keytree),
             None,
             Some(Arc::clone(&friend_pub)),
         ));
@@ -282,6 +288,8 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
         // ── 7. Bob redeems. ─────────────────────────────────────────────
         let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
         let bob_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+        let bob_keytree =
+            Arc::new(harmony_app::owner_state_crypto::KeyTree::derive(&[0xB2; 32]).expect("kt"));
 
         let outcome = harmony_app::connectivity_link_friend_iroh_inner(
             token_url.clone(),
@@ -294,6 +302,7 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
             Arc::clone(&bob_crdt_state),
             Arc::clone(&bob_hlc_tracker),
             "bob-dev".to_string(),
+            Arc::clone(&bob_keytree),
             harmony_app::HandshakeDialConfig {
                 connect_timeout: Duration::from_millis(10_000),
                 open_bi_timeout: Duration::from_millis(10_000),
@@ -317,7 +326,8 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
 
         // ── 8. Load-bearing assertions. ─────────────────────────────────
         // (a) Bob's owner-state has FriendEntry{Alice, Active, Token}.
-        {
+        // Capture Bob's sealed friendship secret (opened with Bob's KeyTree).
+        let bob_secret = {
             let g = bob_crdt_state.lock().await;
             let entry = g
                 .friend_graph
@@ -332,11 +342,22 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
             );
             assert!(!entry.referrable, "friend must default referrable=false");
             assert_eq!(entry.display.as_deref(), Some("alice"));
-        }
+            let sealed = entry
+                .sealed_secret
+                .as_ref()
+                .expect("ZEB-371: Bob must seal the friendship secret on his side");
+            harmony_app::owner_state_crypto::decrypt_friend_secret(
+                &bob_keytree,
+                &alice.owner.0,
+                sealed,
+            )
+            .expect("Bob opens his own sealed friend secret")
+        };
 
         // (b) Alice's owner-state has FriendEntry{Bob, Active, Token}, written by
-        //     the acceptor's process_friend_request.
-        {
+        //     the acceptor's process_friend_request. Capture Alice's sealed
+        //     friendship secret (opened with Alice's KeyTree).
+        let alice_secret = {
             let g = alice_crdt_state.lock().await;
             let entry = g
                 .friend_graph
@@ -355,7 +376,25 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
                 Some("bob"),
                 "Bob's advertised display propagates into Alice's FriendEntry"
             );
-        }
+            let sealed = entry
+                .sealed_secret
+                .as_ref()
+                .expect("ZEB-371: Alice must seal the friendship secret on her side");
+            harmony_app::owner_state_crypto::decrypt_friend_secret(
+                &alice_keytree,
+                &bob.owner.0,
+                sealed,
+            )
+            .expect("Alice opens her own sealed friend secret")
+        };
+
+        // (ZEB-371) Each node sealed under ITS OWN KeyTree, so the blobs differ,
+        // but the ECDH-derived 32-byte PLAINTEXT secret MUST match on both sides.
+        assert_eq!(
+            alice_secret.as_ref(),
+            bob_secret.as_ref(),
+            "ZEB-371: both handshake sides must establish the SAME friendship secret"
+        );
 
         // (c) Alice unregistered the consumed Case-A friend handle.
         let friend_handle = format!("friend:{}", hex::encode(token_sig));
@@ -408,6 +447,7 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
             Arc::clone(&bob_crdt_state),
             Arc::clone(&bob_hlc_tracker),
             "bob-dev".to_string(),
+            Arc::clone(&bob_keytree),
             harmony_app::HandshakeDialConfig {
                 connect_timeout: Duration::from_millis(10_000),
                 open_bi_timeout: Duration::from_millis(10_000),

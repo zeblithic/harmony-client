@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { FriendService, type FriendDto } from './friend-service';
+import { FriendService, type FriendDto, type AddFriendOutcome } from './friend-service';
 import type { TauriAdapter } from './zenoh-service';
 
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
@@ -137,5 +137,176 @@ describe('FriendService', () => {
 
   it('throws when invoked before an adapter is connected', async () => {
     await expect(service.listFriends()).rejects.toThrow('adapter not connected');
+  });
+
+  // ── Phase 1b: pending requests, add-by-key, auto-accept ──────────────────
+
+  it('listPendingRequests invokes list_pending_friend_requests and returns the array', async () => {
+    await service.connectAdapter(adapter);
+    const pending = [
+      { ownerIdHex: 'aabbccdd00112233aabbccdd00112233', display: 'Alice', receivedAtMs: 1_700_000_000_000 },
+    ];
+    (adapter.invoke as any).mockResolvedValue(pending);
+    const r = await service.listPendingRequests();
+    expect(adapter.invoke).toHaveBeenCalledWith('list_pending_friend_requests', {});
+    expect(r).toEqual(pending);
+  });
+
+  it('acceptRequest invokes accept_friend_request with the ownerIdHex arg', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.acceptRequest('deadbeefdeadbeefdeadbeefdeadbeef');
+    expect(adapter.invoke).toHaveBeenCalledWith('accept_friend_request', {
+      ownerIdHex: 'deadbeefdeadbeefdeadbeefdeadbeef',
+    });
+  });
+
+  it('declineRequest invokes decline_friend_request with the ownerIdHex arg', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.declineRequest('deadbeefdeadbeefdeadbeefdeadbeef');
+    expect(adapter.invoke).toHaveBeenCalledWith('decline_friend_request', {
+      ownerIdHex: 'deadbeefdeadbeefdeadbeefdeadbeef',
+    });
+  });
+
+  it('addByKey invokes add_friend_by_key with identityPubHex and returns a linked outcome', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({
+      linked: { ownerIdHex: 'aabbccdd00112233aabbccdd00112233', display: 'Alice' },
+    });
+    const result = await service.addByKey('aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233');
+    expect(adapter.invoke).toHaveBeenCalledWith('add_friend_by_key', {
+      identityPubHex: 'aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233',
+    });
+    expect(result).toEqual<AddFriendOutcome>({
+      kind: 'linked',
+      ownerIdHex: 'aabbccdd00112233aabbccdd00112233',
+      display: 'Alice',
+    });
+  });
+
+  it('addByKey returns a pending outcome when the backend returns "pending"', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('pending');
+    const result = await service.addByKey('aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233');
+    expect(result).toEqual<AddFriendOutcome>({ kind: 'pending' });
+  });
+
+  it('addByKey returns an unreachable outcome when the backend returns "unreachable"', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('unreachable');
+    const result = await service.addByKey('aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233');
+    expect(result).toEqual<AddFriendOutcome>({ kind: 'unreachable' });
+  });
+
+  it('addByKey throws a descriptive error on an unknown backend outcome', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({ unknown_variant: 'oops' });
+    await expect(
+      service.addByKey('aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233'),
+    ).rejects.toThrow('unexpected add_friend_by_key outcome:');
+  });
+
+  it('addByKey rejects a malformed linked payload (missing ownerIdHex)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({ linked: {} });
+    await expect(
+      service.addByKey('aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233'),
+    ).rejects.toThrow('unexpected add_friend_by_key outcome:');
+  });
+
+  it('addByKey rejects a linked payload whose ownerIdHex is not a string', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({ linked: { ownerIdHex: 7 } });
+    await expect(
+      service.addByKey('aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233'),
+    ).rejects.toThrow('unexpected add_friend_by_key outcome:');
+  });
+
+  it('addByKey accepts a linked payload with no display (→ null)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({
+      linked: { ownerIdHex: 'aabbccdd00112233aabbccdd00112233' },
+    });
+    const result = await service.addByKey(
+      'aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233',
+    );
+    expect(result).toEqual<AddFriendOutcome>({
+      kind: 'linked',
+      ownerIdHex: 'aabbccdd00112233aabbccdd00112233',
+      display: null,
+    });
+  });
+
+  it('setAutoAccept invokes set_friend_auto_accept with enabled', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.setAutoAccept(true);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_friend_auto_accept', { enabled: true });
+    await service.setAutoAccept(false);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_friend_auto_accept', { enabled: false });
+  });
+
+  it('getAutoAccept invokes get_friend_auto_accept and returns the boolean', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(true);
+    const result = await service.getAutoAccept();
+    expect(adapter.invoke).toHaveBeenCalledWith('get_friend_auto_accept', {});
+    expect(result).toBe(true);
+  });
+
+  it('connectAdapter installs the friend-request-received listener', async () => {
+    await service.connectAdapter(adapter);
+    expect(adapter.listeners.has('friend-request-received')).toBe(true);
+  });
+
+  it('a friend-request-received event fires all registered onPendingRequestsChanged listeners', async () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    service.onPendingRequestsChanged(first);
+    service.onPendingRequestsChanged(second);
+    await service.connectAdapter(adapter);
+    adapter.listeners.get('friend-request-received')!({ payload: null });
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+    adapter.listeners.get('friend-request-received')!({ payload: null });
+    expect(first).toHaveBeenCalledTimes(2);
+    expect(second).toHaveBeenCalledTimes(2);
+  });
+
+  it('a friend-list-changed event also fires onPendingRequestsChanged listeners', async () => {
+    const pendingCb = vi.fn();
+    service.onPendingRequestsChanged(pendingCb);
+    await service.connectAdapter(adapter);
+    adapter.listeners.get('friend-list-changed')!({ payload: null });
+    expect(pendingCb).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unsubscribed onPendingRequestsChanged listener no longer fires', async () => {
+    const stays = vi.fn();
+    const leaves = vi.fn();
+    service.onPendingRequestsChanged(stays);
+    const unsubscribe = service.onPendingRequestsChanged(leaves);
+    await service.connectAdapter(adapter);
+
+    adapter.listeners.get('friend-request-received')!({ payload: null });
+    expect(stays).toHaveBeenCalledTimes(1);
+    expect(leaves).toHaveBeenCalledTimes(1);
+
+    unsubscribe();
+    adapter.listeners.get('friend-request-received')!({ payload: null });
+    expect(stays).toHaveBeenCalledTimes(2);
+    expect(leaves).toHaveBeenCalledTimes(1);
+  });
+
+  it('destroy() clears all onPendingRequestsChanged listeners', async () => {
+    const pendingCb = vi.fn();
+    service.onPendingRequestsChanged(pendingCb);
+    await service.connectAdapter(adapter);
+    service.destroy();
+    await service.connectAdapter(adapter);
+    adapter.listeners.get('friend-request-received')!({ payload: null });
+    expect(pendingCb).not.toHaveBeenCalled();
   });
 });

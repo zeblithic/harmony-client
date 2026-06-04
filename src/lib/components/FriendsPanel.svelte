@@ -1,19 +1,26 @@
 <script lang="ts">
   /**
-   * ZEB-370 Phase 1: minimal Friends settings sub-panel.
+   * ZEB-370 Phase 1 + ZEB-371 Phase 1b: Friends settings sub-panel.
    *
+   * Phase 1:
    * - Lists active friends (display + short owner_id) via `list_friends`.
    * - "Generate friend link" mints a `harmony://friend/...` URL to copy.
    * - "Add friend" redeems a pasted URL.
    * - Per-row "Unfriend" writes a Revoked tombstone.
    *
+   * Phase 1b (new):
+   * - "Friend requests" inbox: list pending inbound requests with Accept/Decline.
+   * - "Add friend by key" input: paste a 64-byte transport identity pub hex.
+   * - "Auto-accept" toggle for peers already known to the local identity.
+   *
    * Backed by `FriendService` (passed in so it shares the app's single adapter
-   * + event wiring); re-fetches the list on the `friend-list-changed` event.
+   * + event wiring); re-fetches on `friend-list-changed` and
+   * `friend-request-received` events.
    * Mirrors `NetworkDiscoverabilitySettings.svelte`'s self-contained,
    * runes-based settings-panel shape.
    */
   import { onMount, onDestroy } from 'svelte';
-  import type { FriendService, FriendDto } from '../friend-service';
+  import type { FriendService, FriendDto, PendingFriendRequestDto } from '../friend-service';
 
   let { service }: { service: FriendService } = $props();
 
@@ -25,7 +32,7 @@
   let generatedUrl = $state<string | null>(null);
   let generating = $state(false);
 
-  // Add-friend state.
+  // Add-friend (token redeem) state.
   let pasteUrl = $state('');
   let redeeming = $state(false);
   let addStatus = $state<string | null>(null);
@@ -33,8 +40,30 @@
   // Per-row in-flight unfriend guard (by owner_id hex).
   let unfriending = $state<Set<string>>(new Set());
 
-  // Unsubscribe handle for our `friend-list-changed` listener (set in onMount).
+  // ── Phase 1b state ────────────────────────────────────────────────────────
+
+  // Pending friend requests inbox.
+  let pendingRequests = $state<PendingFriendRequestDto[]>([]);
+  let pendingLoading = $state(true);
+  let pendingError = $state<string | null>(null);
+
+  // Per-row in-flight accept/decline guard.
+  let requestInFlight = $state<Set<string>>(new Set());
+
+  // Add-by-key state.
+  let addByKeyInput = $state('');
+  let addingByKey = $state(false);
+  let addByKeyStatus = $state<string | null>(null);
+
+  // Auto-accept toggle.
+  let autoAccept = $state(false);
+  let autoAcceptLoading = $state(true);
+  let autoAcceptSaving = $state(false);
+  let autoAcceptError = $state<string | null>(null);
+
+  // Unsubscribe handles for our event listeners (set in onMount).
   let unsubscribeChanged: (() => void) | null = null;
+  let unsubscribePendingChanged: (() => void) | null = null;
 
   async function refresh(): Promise<void> {
     try {
@@ -47,21 +76,47 @@
     }
   }
 
+  async function refreshPending(): Promise<void> {
+    try {
+      pendingRequests = await service.listPendingRequests();
+      pendingError = null;
+    } catch (e) {
+      pendingError = e instanceof Error ? e.message : String(e);
+    } finally {
+      pendingLoading = false;
+    }
+  }
+
+  async function loadAutoAccept(): Promise<void> {
+    try {
+      autoAccept = await service.getAutoAccept();
+      autoAcceptError = null;
+    } catch (e) {
+      autoAcceptError = e instanceof Error ? e.message : String(e);
+    } finally {
+      autoAcceptLoading = false;
+    }
+  }
+
   onMount(() => {
-    // Re-fetch whenever the backend signals a change (redeem / accept /
-    // unfriend, possibly on another device). Register our OWN listener and
-    // keep the returned unsubscribe so unmounting only removes ours — a
-    // second concurrently-mounted panel keeps its own subscription.
+    // Re-fetch friends whenever the backend signals a change.
     unsubscribeChanged = service.onFriendsChanged(() => {
       void refresh();
     });
+    // Re-fetch pending requests on new inbound request or list mutation.
+    unsubscribePendingChanged = service.onPendingRequestsChanged(() => {
+      void refreshPending();
+    });
     void refresh();
+    void refreshPending();
+    void loadAutoAccept();
   });
 
   onDestroy(() => {
-    // Remove only this panel's listener (no shared-slot to null out).
     unsubscribeChanged?.();
     unsubscribeChanged = null;
+    unsubscribePendingChanged?.();
+    unsubscribePendingChanged = null;
   });
 
   async function handleGenerate(): Promise<void> {
@@ -116,6 +171,78 @@
       const next = new Set(unfriending);
       next.delete(ownerIdHex);
       unfriending = next;
+    }
+  }
+
+  // ── Phase 1b handlers ─────────────────────────────────────────────────────
+
+  async function handleAccept(ownerIdHex: string): Promise<void> {
+    if (requestInFlight.has(ownerIdHex)) return;
+    requestInFlight = new Set(requestInFlight).add(ownerIdHex);
+    try {
+      await service.acceptRequest(ownerIdHex);
+      await Promise.all([refresh(), refreshPending()]);
+    } catch (e) {
+      pendingError = e instanceof Error ? e.message : String(e);
+    } finally {
+      const next = new Set(requestInFlight);
+      next.delete(ownerIdHex);
+      requestInFlight = next;
+    }
+  }
+
+  async function handleDecline(ownerIdHex: string): Promise<void> {
+    if (requestInFlight.has(ownerIdHex)) return;
+    requestInFlight = new Set(requestInFlight).add(ownerIdHex);
+    try {
+      await service.declineRequest(ownerIdHex);
+      await refreshPending();
+    } catch (e) {
+      pendingError = e instanceof Error ? e.message : String(e);
+    } finally {
+      const next = new Set(requestInFlight);
+      next.delete(ownerIdHex);
+      requestInFlight = next;
+    }
+  }
+
+  async function handleAddByKey(): Promise<void> {
+    const key = addByKeyInput.trim();
+    if (addingByKey || key.length === 0) return;
+    addingByKey = true;
+    addByKeyStatus = null;
+    try {
+      const outcome = await service.addByKey(key);
+      if (outcome.kind === 'linked') {
+        addByKeyStatus = `Connected with ${outcome.display ?? shortId(outcome.ownerIdHex)}`;
+        addByKeyInput = '';
+        await refresh();
+      } else if (outcome.kind === 'pending') {
+        addByKeyStatus = 'Request sent — they\'ll need to accept';
+        addByKeyInput = '';
+        await refreshPending();
+      } else {
+        addByKeyStatus = 'Couldn\'t reach them — ask for a friend token instead';
+      }
+    } catch (e) {
+      addByKeyStatus = `Failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      addingByKey = false;
+    }
+  }
+
+  async function handleAutoAcceptToggle(): Promise<void> {
+    if (autoAcceptSaving) return;
+    const next = !autoAccept;
+    autoAcceptSaving = true;
+    try {
+      await service.setAutoAccept(next);
+      autoAccept = next;
+      autoAcceptError = null;
+    } catch (e) {
+      autoAcceptError = e instanceof Error ? e.message : String(e);
+    } finally {
+      autoAcceptSaving = false;
     }
   }
 
@@ -213,6 +340,97 @@
     {#if addStatus}
       <p class="muted" data-testid="add-status">{addStatus}</p>
     {/if}
+  </div>
+
+  <!-- ── Phase 1b: Friend requests inbox ────────────────────────────────── -->
+  <div class="subsection" data-testid="friend-requests-section">
+    <h5 class="subsection-title">Friend requests</h5>
+
+    {#if pendingError}
+      <p class="error-text" data-testid="pending-error">{pendingError}</p>
+    {/if}
+
+    {#if pendingLoading}
+      <p class="muted">Loading…</p>
+    {:else if pendingRequests.length === 0}
+      <p class="muted" data-testid="pending-empty">No pending requests.</p>
+    {:else}
+      <ul class="friend-list" data-testid="pending-list">
+        {#each pendingRequests as req (req.ownerIdHex)}
+          <li class="friend-row">
+            <div class="friend-id">
+              <span class="friend-name">{req.display ?? shortId(req.ownerIdHex)}</span>
+              <span class="friend-addr" title={req.ownerIdHex}>{shortId(req.ownerIdHex)}</span>
+            </div>
+            <div class="request-actions">
+              <button
+                type="button"
+                class="accept-btn"
+                disabled={requestInFlight.has(req.ownerIdHex)}
+                onclick={() => handleAccept(req.ownerIdHex)}
+                data-testid="accept-btn"
+              >
+                {requestInFlight.has(req.ownerIdHex) ? '…' : 'Accept'}
+              </button>
+              <button
+                type="button"
+                class="unfriend-btn"
+                disabled={requestInFlight.has(req.ownerIdHex)}
+                onclick={() => handleDecline(req.ownerIdHex)}
+                data-testid="decline-btn"
+              >
+                {requestInFlight.has(req.ownerIdHex) ? '…' : 'Decline'}
+              </button>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </div>
+
+  <!-- ── Phase 1b: Add friend by public key ─────────────────────────────── -->
+  <div class="action-block" data-testid="add-by-key-section">
+    <label class="add-label" for="add-by-key-input">Add friend by key</label>
+    <div class="add-row">
+      <input
+        id="add-by-key-input"
+        type="text"
+        class="url-input"
+        placeholder="64-byte identity public key (hex)…"
+        bind:value={addByKeyInput}
+        data-testid="add-by-key-input"
+      />
+      <button
+        type="button"
+        class="primary-btn"
+        disabled={addingByKey || addByKeyInput.trim().length === 0}
+        onclick={handleAddByKey}
+        data-testid="add-by-key-btn"
+      >
+        {addingByKey ? 'Connecting…' : 'Connect'}
+      </button>
+    </div>
+    {#if addByKeyStatus}
+      <p class="muted" data-testid="add-by-key-status">{addByKeyStatus}</p>
+    {/if}
+  </div>
+
+  <!-- ── Phase 1b: Auto-accept toggle ───────────────────────────────────── -->
+  <div class="action-block" data-testid="auto-accept-section">
+    {#if autoAcceptError}
+      <p class="error-text" data-testid="auto-accept-error">{autoAcceptError}</p>
+    {/if}
+    <label class="toggle-row" data-testid="auto-accept-toggle-label">
+      <input
+        type="checkbox"
+        class="toggle-checkbox"
+        checked={autoAccept}
+        disabled={autoAcceptLoading || autoAcceptSaving}
+        onchange={handleAutoAcceptToggle}
+        data-testid="auto-accept-checkbox"
+      />
+      <span class="toggle-label-text">Auto-accept friends I already know</span>
+    </label>
   </div>
 </div>
 
@@ -356,5 +574,74 @@
     font-size: 12px;
     color: #d83c3e;
     margin: 4px 0 8px;
+  }
+
+  /* Phase 1b additions */
+
+  .subsection {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border, #2a2a2a);
+  }
+
+  .subsection-title {
+    margin: 0 0 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+
+  .request-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .accept-btn {
+    flex-shrink: 0;
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 4px;
+    border: 1px solid var(--accent, #5865f2);
+    background: transparent;
+    color: var(--accent, #5865f2);
+    cursor: pointer;
+  }
+
+  .accept-btn:hover:not(:disabled) {
+    background: var(--accent, #5865f2);
+    color: #fff;
+  }
+
+  .accept-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .toggle-checkbox {
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .toggle-checkbox:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .toggle-label-text {
+    font-size: 12px;
+    color: var(--text-primary);
   }
 </style>
