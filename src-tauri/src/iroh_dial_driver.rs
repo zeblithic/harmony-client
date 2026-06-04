@@ -70,6 +70,11 @@ pub async fn run_dial_driver(
                 );
             } else {
                 telemetry.record_failed(hint.node_id, hint.owner.0);
+                // Re-arm: drop the node-id so a *future first-learn* dials it again.
+                // Note the resolver emits a DialHint only on first-learn of a
+                // (owner, node_id) — so this re-arm fires only when the SAME node-id
+                // is announced under a different owner, or re-learned after eviction.
+                // A repeat announce of the same (owner, node_id) does NOT re-dial.
                 dialed
                     .lock()
                     .expect("dialed set lock")

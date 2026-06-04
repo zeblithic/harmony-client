@@ -7573,6 +7573,13 @@ mod pin_cascade_tests {
 /// Replaces `zenoh::open(config)` — the `internal` feature exposes
 /// `RuntimeBuilder` + `session::init`, which `zenoh::open` uses under the hood.
 ///
+/// Order MUST mirror `zenoh::open` (`Session::new`, zenoh-1.9.0
+/// api/session.rs:1431): `build()` → `session::init` (register the session face)
+/// → `runtime.start()` (bind listeners + dial the static `connect/endpoints`
+/// seed). Starting before init would bind/dial before the face exists, opening a
+/// window where a declaration/sample on a freshly-formed transport lands before
+/// `new_primitives` registers us — i.e. it would NOT be parity with ZEB-368.
+///
 /// `pub` so the ZEB-373 acceptance integration test
 /// (`tests/zeb_373_dynamic_dial_integration.rs`) can build a real Runtime through
 /// the same path production uses; integration tests compile against the public API.
@@ -7582,7 +7589,8 @@ pub async fn open_session_with_runtime(
     let mut runtime = zenoh::internal::runtime::RuntimeBuilder::new(config)
         .build()
         .await?;
-    runtime.start().await?;
+    // Register the session face BEFORE starting (binding listeners + dialing).
     let session = zenoh::session::init(runtime.clone().into()).await?;
+    runtime.start().await?;
     Ok((runtime, session))
 }

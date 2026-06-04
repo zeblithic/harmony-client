@@ -105,8 +105,10 @@ async fn open_session_with_runtime(
     let mut runtime = zenoh::internal::runtime::RuntimeBuilder::new(config)
         .build()
         .await?;
-    runtime.start().await?;
+    // Order mirrors `zenoh::open` (Session::new, api/session.rs:1431): register the
+    // session face BEFORE starting (binding listeners + dialing the static seed).
     let session = zenoh::session::init(runtime.clone().into()).await?;
+    runtime.start().await?;
     Ok((runtime, session))
 }
 ```

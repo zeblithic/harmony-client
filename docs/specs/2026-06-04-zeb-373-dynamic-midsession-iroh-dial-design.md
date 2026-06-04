@@ -39,9 +39,13 @@ and `zenoh::session::init` — both verified present in 1.9.0). Replace the term
 
 ```rust
 let mut runtime = zenoh::internal::runtime::RuntimeBuilder::new(config).build().await?;
-runtime.start().await?;                              // Runtime::start(&mut self) — orchestrator.rs:125
-let session = zenoh::session::init(runtime.clone().into()).await?;  // init(GenericRuntime); Runtime: Into<GenericRuntime>
+let session = zenoh::session::init(runtime.clone().into()).await?;  // register face FIRST (init(GenericRuntime))
+runtime.start().await?;                                             // THEN bind listeners + dial seed (orchestrator.rs:125)
 ```
+
+Order MUST mirror `zenoh::open` (`Session::new`, api/session.rs:1431): `build` →
+`init` → `start`. Starting before init binds/dials before the session face exists,
+which is not parity with ZEB-368.
 
 On a resolver update introducing a not-yet-dialed peer, dial through the un-filtered path:
 
