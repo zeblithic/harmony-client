@@ -1047,6 +1047,12 @@ where
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
+                // Drop any stale pending-inbox entry: this requester may have
+                // received `Pending` before obtaining (and now redeeming) the
+                // token, which would otherwise leave a ghost request in the UI.
+                if let Some(pending) = self.pending_requests.as_ref() {
+                    pending.clear_completed(&req.from_addr);
+                }
                 self.emit_friend_added(&req);
                 accepted
             }
@@ -1069,9 +1075,12 @@ where
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
-                // Consume the one-shot approval now the link completed.
+                // Link completed: consume the one-shot approval AND drop any
+                // stale pending-inbox entry. The requester may have first
+                // received `Pending` (recorded in the inbox) before becoming
+                // known/approved — clear it so the UI shows no ghost request.
                 if let Some(pending) = self.pending_requests.as_ref() {
-                    pending.take_approved(&req.from_addr);
+                    pending.clear_completed(&req.from_addr);
                 }
                 self.emit_friend_added(&req);
                 accepted

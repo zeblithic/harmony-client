@@ -126,6 +126,22 @@ impl PendingFriendRequests {
             .remove(addr)
     }
 
+    /// A link with `addr` completed (via token redeem OR inline accept): drop
+    /// any lingering pending-inbox entry AND consume any approval, atomically.
+    ///
+    /// This is the completion-cleanup the acceptor calls on EVERY path that
+    /// writes an Active friend. Without it, a requester who earlier received
+    /// `Pending` (recorded in the inbox) and then became an active friend
+    /// through a *different* path — e.g. redeeming a friend token (`TokenPath`)
+    /// or being added by key — would linger as a "ghost" request in
+    /// `list_pending_friend_requests` even though they are already a friend.
+    /// Idempotent: a no-op when neither set holds `addr`.
+    pub fn clear_completed(&self, addr: &OwnerAddr) {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        inner.inbound.remove(addr);
+        inner.approved.remove(addr);
+    }
+
     /// Decline `addr`: drop any recorded inbound request AND any approval.
     pub fn decline(&self, addr: &OwnerAddr) {
         let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
@@ -218,6 +234,35 @@ mod tests {
     fn take_approved_on_unknown_is_false() {
         let store = PendingFriendRequests::new();
         assert!(!store.take_approved(&addr(5)));
+    }
+
+    #[test]
+    fn clear_completed_drops_stale_inbox_entry() {
+        // Regression (Cursor "Stale pending after link completes"): a requester
+        // recorded as Pending who later becomes an active friend via another
+        // path (e.g. token redeem) must NOT linger in the pending inbox.
+        let store = PendingFriendRequests::new();
+        store.record_inbound(addr(7), Some("dora".into()), 1_000);
+        assert_eq!(store.list().len(), 1, "precondition: recorded as pending");
+        store.clear_completed(&addr(7));
+        assert!(
+            store.list().is_empty(),
+            "completed link must clear the stale inbox entry (no ghost request)"
+        );
+    }
+
+    #[test]
+    fn clear_completed_consumes_approval_and_is_idempotent() {
+        let store = PendingFriendRequests::new();
+        store.approve(addr(9)); // user tapped Accept → approved (inbox already cleared)
+        store.clear_completed(&addr(9));
+        assert!(
+            !store.is_approved(&addr(9)),
+            "completion consumes the one-shot approval"
+        );
+        // Idempotent: a second call on an unknown addr is a harmless no-op.
+        store.clear_completed(&addr(9));
+        assert!(store.list().is_empty());
     }
 
     #[test]

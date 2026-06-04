@@ -11,6 +11,7 @@ use harmony_pkarr::{
     PkarrRoutingRecord, RecordBuilder,
 };
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 pub struct PkarrFriendPublisher {
     publisher: Arc<PkarrPublisher>,
@@ -39,19 +40,27 @@ impl PkarrFriendPublisher {
     /// Begin (or refresh) Case-D publication for one active friend, keyed on the
     /// shared `secret`. Idempotent: re-registering the same friend replaces the
     /// builders (e.g. to pick up a changed reachability blob).
-    pub async fn register_friend(&self, friend_owner: [u8; 16], secret: [u8; 32]) {
+    ///
+    /// `secret` stays wrapped in `Zeroizing` the whole way through — including
+    /// inside the two long-lived closure captures via a shared `Arc` — so the
+    /// friendship key material is scrubbed on drop and never lands in a plain
+    /// `[u8; 32]` copy (which would never be zeroized).
+    pub async fn register_friend(&self, friend_owner: [u8; 16], secret: Zeroizing<[u8; 32]>) {
         let self_owner = self.self_owner;
+        let secret = Arc::new(secret);
+        let key_secret = Arc::clone(&secret);
         let key_builder: EphemeralKeyBuilder = Arc::new(move |at_ms| {
-            case_d_publish_key(&secret, current_epoch_id(at_ms), &self_owner)
+            case_d_publish_key(&key_secret, current_epoch_id(at_ms), &self_owner)
         });
         let blob_builder = Arc::clone(&self.routing_blob_builder);
+        let payload_secret = Arc::clone(&secret);
         let builder: RecordBuilder = Arc::new(move |at_ms| {
             let epoch = current_epoch_id(at_ms);
-            let cd_key = case_d_publish_key(&secret, epoch, &self_owner);
+            let cd_key = case_d_publish_key(&payload_secret, epoch, &self_owner);
             let mut id_pub = [0u8; 64];
             id_pub[32..].copy_from_slice(&cd_key.verifying_key().to_bytes());
-            let sealed =
-                seal_case_d_payload(&secret, epoch, &blob_builder()).expect("case-d payload seal");
+            let sealed = seal_case_d_payload(&payload_secret, epoch, &blob_builder())
+                .expect("case-d payload seal");
             PkarrRoutingRecord::sign_new(sealed, id_pub, at_ms, &cd_key)
                 .expect("sign — derived key matches embedded id_pub by construction")
         });
@@ -107,7 +116,9 @@ pub async fn sync_case_d_handles(
             None
         };
         match secret {
-            Some(secret) => friend_pub.register_friend(owner.0, *secret).await,
+            // Move the `Zeroizing` wrapper through — never deref into a plain
+            // `[u8; 32]` copy that would escape zeroization.
+            Some(secret) => friend_pub.register_friend(owner.0, secret).await,
             None => friend_pub.unregister_friend(&owner.0).await,
         }
     }
@@ -153,6 +164,7 @@ mod tests {
     use harmony_pkarr::testing::MockPkarrRelay;
     use harmony_pkarr::{PkarrPublisher, PkarrResolver, RelayClient, RelayPool};
     use std::sync::Arc;
+    use zeroize::Zeroizing;
 
     #[tokio::test]
     async fn case_d_publish_then_resolve_round_trip() {
@@ -173,7 +185,7 @@ mod tests {
         );
         // A publishes its own Case-D slot (info = a_owner). The friend_owner handle
         // key is arbitrary here; A is making itself findable.
-        fp.register_friend([0xBB; 16], secret).await;
+        fp.register_friend([0xBB; 16], Zeroizing::new(secret)).await;
 
         // B (who shares `secret`) resolves A under info = a_owner, unseals, gets raw.
         let mut attempts = 0;
@@ -207,7 +219,7 @@ mod tests {
             self_owner,
             Arc::new(|| b"routing".to_vec()),
         );
-        fp.register_friend(friend, secret).await;
+        fp.register_friend(friend, Zeroizing::new(secret)).await;
         assert!(publisher
             .active_handles()
             .await

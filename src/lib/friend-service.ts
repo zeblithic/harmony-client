@@ -210,9 +210,19 @@ export class FriendService {
   private static parseAddFriendOutcome(raw: RawAddFriendOutcome): AddFriendOutcome {
     if (raw === 'pending') return { kind: 'pending' };
     if (raw === 'unreachable') return { kind: 'unreachable' };
-    // Externally-tagged object variant: { linked: { ownerIdHex, display } }
+    // Externally-tagged object variant: { linked: { ownerIdHex, display } }.
+    // Validate the inner payload's field types — this parser is the runtime
+    // guard at the IPC boundary, so a malformed `{ linked: {} }` or
+    // `{ linked: { ownerIdHex: 7 } }` must be rejected, not coerced into an
+    // invalid AddFriendOutcome.
     if (raw && typeof raw === 'object' && 'linked' in raw && raw.linked && typeof raw.linked === 'object') {
-      return { kind: 'linked', ownerIdHex: raw.linked.ownerIdHex, display: raw.linked.display ?? null };
+      const linked = raw.linked as Record<string, unknown>;
+      if (
+        typeof linked.ownerIdHex === 'string' &&
+        (linked.display === undefined || linked.display === null || typeof linked.display === 'string')
+      ) {
+        return { kind: 'linked', ownerIdHex: linked.ownerIdHex, display: linked.display ?? null };
+      }
     }
     throw new Error(`unexpected add_friend_by_key outcome: ${JSON.stringify(raw)}`);
   }

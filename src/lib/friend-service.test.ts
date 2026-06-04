@@ -208,6 +208,37 @@ describe('FriendService', () => {
     ).rejects.toThrow('unexpected add_friend_by_key outcome:');
   });
 
+  it('addByKey rejects a malformed linked payload (missing ownerIdHex)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({ linked: {} });
+    await expect(
+      service.addByKey('aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233'),
+    ).rejects.toThrow('unexpected add_friend_by_key outcome:');
+  });
+
+  it('addByKey rejects a linked payload whose ownerIdHex is not a string', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({ linked: { ownerIdHex: 7 } });
+    await expect(
+      service.addByKey('aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233'),
+    ).rejects.toThrow('unexpected add_friend_by_key outcome:');
+  });
+
+  it('addByKey accepts a linked payload with no display (→ null)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({
+      linked: { ownerIdHex: 'aabbccdd00112233aabbccdd00112233' },
+    });
+    const result = await service.addByKey(
+      'aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233',
+    );
+    expect(result).toEqual<AddFriendOutcome>({
+      kind: 'linked',
+      ownerIdHex: 'aabbccdd00112233aabbccdd00112233',
+      display: null,
+    });
+  });
+
   it('setAutoAccept invokes set_friend_auto_accept with enabled', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue(undefined);
