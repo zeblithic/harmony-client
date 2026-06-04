@@ -547,6 +547,7 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         owner_device_cache,
         libraries,
         outbox_tombstones,
+        friend_graph,
     } = remote;
 
     // ZEB-243: apply remote outbox tombstones FIRST. LWW per id by HLC;
@@ -643,6 +644,32 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         };
         if should_replace {
             local.libraries.insert(addr, remote_entry);
+        }
+    }
+    // ZEB-370 Phase 1: per-entry LWW merge of the friend graph. Each
+    // `FriendEntry` is keyed by the friend's OwnerAddr and merged on its
+    // `learned_at` HLC (newer wins; `Revoked` is a tombstone). Independent
+    // of the other sub-CRDTs (keyed by OwnerAddr, not SpaceId), so its
+    // merge order doesn't matter — placed last. Closes the snapshot-merge
+    // path so the friend graph replicates across the owner's own devices.
+    //
+    // A synced entry whose `owner_id` does NOT match
+    // `identity_hash(master_ed25519)` is rejected as
+    // `InvariantFail` by `apply_friend_update` and vanishes; surface it
+    // via `tracing::warn!` so a divergent (potentially malicious) remote
+    // snapshot leaves a trace rather than silently dropping. `StaleHlc`
+    // is normal LWW and `Inserted`/`Merged` are the success paths — only
+    // `InvariantFail` is logged.
+    for (addr, entry) in friend_graph.friends {
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(
+            reason @ crate::owner_state_crdt::RejectionReason::InvariantFail(_),
+        ) = local.apply_friend_update(addr, entry)
+        {
+            tracing::warn!(
+                addr = %hex::encode(addr.0),
+                reason = %reason,
+                "friend-graph merge rejected entry on invariant violation"
+            );
         }
     }
 }
@@ -1217,6 +1244,84 @@ mod subscriber_tests {
             local.spaces.contains_key(&SpaceId([42; 16])),
             "remote folder must merge into local"
         );
+        drop(local);
+
+        let _ = engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscriber_merges_friend_graph_entries() {
+        use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+        let (pub_tx, _pub_rx) = mpsc::channel(16);
+        let (sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let kt = make_kt();
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let local_state = Arc::new(Mutex::new(OwnerState::default()));
+        let engine = SyncEngine::new(
+            Arc::clone(&kt),
+            "self-device".into(),
+            Arc::clone(&local_state),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::clone(&store),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000,
+        );
+
+        // Build a remote OwnerState that has befriended a peer. The friend's
+        // OwnerAddr (their owner_id) MUST derive from their master_ed25519
+        // (apply_friend_update enforces that correspondence), so use a real
+        // seeded master signing key.
+        let friend_master = ed25519_dalek::SigningKey::from_bytes(&[0xe5; 32])
+            .verifying_key()
+            .to_bytes();
+        let friend_addr = crate::friend_graph::owner_id_from_master_ed25519(&friend_master);
+        let mut remote = OwnerState::default();
+        let outcome = remote.apply_friend_update(
+            friend_addr,
+            FriendEntry {
+                master_ed25519: friend_master,
+                display: Some("eve".into()),
+                status: FriendStatus::Active,
+                established_via: FriendOrigin::Token,
+                referrable: false,
+                learned_at: Hlc {
+                    wall_ms: 100,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+            },
+        );
+        assert!(matches!(
+            outcome,
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+
+        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0).await;
+        sub_tx.send(wire).await.unwrap();
+        let converged = wait_until(
+            || async {
+                let local = local_state.lock().await;
+                local.friend_graph.friends.contains_key(&friend_addr)
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            converged,
+            "subscriber did not merge friend_graph entry within 2s"
+        );
+
+        let local = local_state.lock().await;
+        let entry = local
+            .friend_graph
+            .friends
+            .get(&friend_addr)
+            .expect("friend entry present after merge");
+        assert_eq!(entry.status, FriendStatus::Active);
+        assert_eq!(entry.established_via, FriendOrigin::Token);
         drop(local);
 
         let _ = engine.shutdown().await;
@@ -2091,6 +2196,71 @@ mod integration_tests {
             local.outbox_tombstones.get(&id),
             Some(&tomb_hlc),
             "merged tombstone HLC must equal the remote tombstone HLC"
+        );
+    }
+
+    /// ZEB-370 (Greptile silent-failure fix): a synced `FriendEntry`
+    /// whose `owner_id` (map key) does NOT derive from its
+    /// `master_ed25519` violates the key↔master-key correspondence
+    /// invariant. `apply_friend_update` returns
+    /// `Rejected(InvariantFail)`, the merge loop logs a
+    /// `tracing::warn!`, and the bad entry must NOT enter the local
+    /// CRDT. (The warn is a side effect; we assert the observable
+    /// non-insertion + the direct rejection here.)
+    #[test]
+    fn merge_remote_friend_graph_drops_invariant_violating_entry() {
+        use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+        use crate::owner_state_crdt::{ApplyOutcome, RejectionReason};
+
+        // A real master key whose derived OwnerAddr is `derived_addr`.
+        let friend_master = ed25519_dalek::SigningKey::from_bytes(&[0xe5; 32])
+            .verifying_key()
+            .to_bytes();
+        let derived_addr = crate::friend_graph::owner_id_from_master_ed25519(&friend_master);
+        // A DIFFERENT addr that the master key does NOT derive to.
+        let wrong_addr = crate::owner_state_types::OwnerAddr([0xab; 16]);
+        assert_ne!(derived_addr, wrong_addr);
+
+        let bad_entry = FriendEntry {
+            master_ed25519: friend_master,
+            display: Some("mallory".into()),
+            status: FriendStatus::Active,
+            established_via: FriendOrigin::Token,
+            referrable: false,
+            learned_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "peer".into(),
+            },
+        };
+
+        // Direct apply: confirms the exact rejection variant the merge
+        // loop matches on (must NOT be a StaleHlc / success outcome).
+        let mut probe = OwnerState::default();
+        assert!(
+            matches!(
+                probe.apply_friend_update(wrong_addr, bad_entry.clone()),
+                ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+            ),
+            "mismatched addr↔master_ed25519 must be Rejected(InvariantFail)"
+        );
+
+        // Build a malicious remote snapshot by inserting the divergent
+        // entry directly (bypassing apply_friend_update, which would
+        // itself reject it) so the merge loop is the thing under test.
+        let mut remote = OwnerState::default();
+        remote.friend_graph.friends.insert(wrong_addr, bad_entry);
+
+        let mut local = OwnerState::default();
+        merge_remote_into_local(&mut local, remote);
+
+        assert!(
+            !local.friend_graph.friends.contains_key(&wrong_addr),
+            "invariant-violating friend entry must NOT enter the local CRDT"
+        );
+        assert!(
+            local.friend_graph.friends.is_empty(),
+            "no friend entry should have been merged"
         );
     }
 

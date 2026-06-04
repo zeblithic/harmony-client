@@ -43,11 +43,14 @@ pub mod event_loop;
 pub mod folder_ingest;
 pub mod folders;
 mod follows;
+pub mod friend_graph;
+pub mod friend_token;
 pub mod identity;
 pub mod identity_commands;
 pub mod inbound_packet;
 pub mod invite_mint;
 pub mod iroh_endpoint;
+pub mod iroh_friend_acceptor;
 pub mod iroh_invite_acceptor;
 pub mod library_directory;
 pub mod mail;
@@ -114,6 +117,17 @@ impl<R: tauri::Runtime> crate::community_invite::AppHandleEmit for tauri::AppHan
                 "reason": reason_tag,
             }),
         );
+    }
+}
+
+/// ZEB-370: production impl of `iroh_friend_acceptor::FriendEventEmit` on
+/// `tauri::AppHandle<R>`. Lets the friend handshake acceptor signal the UI a
+/// friend was added without depending on `tauri` directly (the trait + unit-
+/// type stub live in `iroh_friend_acceptor.rs` so tests compile without a
+/// Tauri runtime).
+impl<R: tauri::Runtime> crate::iroh_friend_acceptor::FriendEventEmit for tauri::AppHandle<R> {
+    fn emit_friend_list_changed(&self) {
+        let _ = self.emit("friend-list-changed", ());
     }
 }
 
@@ -2659,6 +2673,11 @@ pub(crate) async fn start_node_inner(
                         .ok_or_else(|| {
                             "owner state missing this device's enrollment cert".to_string()
                         })?;
+                    // ZEB-370 Task 9: keep a clone for the friend-handshake
+                    // acceptor wired below. `own_enrollment_cert` itself is
+                    // moved into `DmOutbox::new` further down, so capture the
+                    // cert (cheap `Clone`) here while it's still in scope.
+                    let own_enrollment_cert_for_friend = own_enrollment_cert.clone();
 
                     let crdt_path = identity_dir.join("owner_state_crdt.cbor");
                     let replay_path = identity_dir.join("state_root_replay.cbor");
@@ -4427,7 +4446,9 @@ pub(crate) async fn start_node_inner(
                     // (link manager Arc is None) — those sessions have no
                     // inbound iroh traffic to dispatch.
                     if let Some(ref link_mgr) = iroh_link_mgr_for_handshake {
-                        let acceptor = std::sync::Arc::new(
+                        let invite_acceptor: std::sync::Arc<
+                            dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
+                        > = std::sync::Arc::new(
                             crate::iroh_invite_acceptor::IrohInviteHandshakeAcceptor::<
                                 tauri::AppHandle<tauri::Wry>,
                             >::with_config(
@@ -4439,8 +4460,59 @@ pub(crate) async fn start_node_inner(
                                 crate::iroh_invite_acceptor::HandshakeAcceptorConfig::from_env(),
                             ),
                         );
+
+                        // ZEB-370 Task 9: build the friend-handshake acceptor
+                        // from the SAME sources the invite acceptor uses
+                        // (crdt_state, hlc_tracker, self_owner, this device's
+                        // own EnrollmentCert + device-#2 signing key, the
+                        // AppHandle for `friend-list-changed`, and the case-A
+                        // pkarr publisher so a consumed friend token is
+                        // unregistered). `self_display = None`: the node's own
+                        // profile display name isn't persisted at start_node
+                        // time (it arrives per `publish_profile` IPC), and the
+                        // field is only a UX hint on the friend's side.
+                        let friend_acceptor: std::sync::Arc<
+                            dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
+                        > = std::sync::Arc::new(
+                            crate::iroh_friend_acceptor::IrohFriendHandshakeAcceptor::<
+                                tauri::AppHandle<tauri::Wry>,
+                            >::new(
+                                std::sync::Arc::clone(&crdt_state),
+                                std::sync::Arc::clone(&tracker),
+                                device_id.clone(),
+                                self_owner,
+                                None,
+                                own_enrollment_cert_for_friend.clone(),
+                                std::sync::Arc::clone(&community_signing_key_arc),
+                                Some(std::sync::Arc::new(app.clone())),
+                                pkarr_invite_publisher_for_state.clone(),
+                            )
+                            // ZEB-370 (cursor review): wire the SAME owner-state
+                            // SyncEngine built above (`engine`, the value this
+                            // block returns as `sync_engine_arc`) so a successful
+                            // inbound friend write arms a debounced publish +
+                            // persist (otherwise new friends never reach the
+                            // user's other devices and a clean shutdown skips the
+                            // publish). Arc-clone — `engine` is still returned via
+                            // `Some(engine)` at the tail of this block.
+                            .with_owner_sync_engine(Some(std::sync::Arc::clone(&engine))),
+                        );
+
+                        // Multiplex both acceptors behind the single dispatcher
+                        // slot the accept loop drives. The accept loop forwards
+                        // BOTH `harmony/handshake/v1` and `harmony/friend/v1`
+                        // here; the multiplexer re-reads `conn.alpn()` and
+                        // routes friend → friend_acceptor, else → invite.
+                        let dispatcher: std::sync::Arc<
+                            dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
+                        > = std::sync::Arc::new(
+                            crate::iroh_friend_acceptor::MultiplexHandshakeDispatcher::new(
+                                invite_acceptor,
+                                friend_acceptor,
+                            ),
+                        );
                         if let Err(_dispatcher_back) =
-                            link_mgr.install_handshake_dispatcher(acceptor).await
+                            link_mgr.install_handshake_dispatcher(dispatcher).await
                         {
                             // Pre-installed (idempotent restart? OnceCell
                             // refused the second set). Production
@@ -32989,6 +33061,411 @@ where
     }
 }
 
+/// Outcome of a successful outbound friend-link redeem
+/// ([`connectivity_link_friend_iroh_inner`]): the newly-added friend's master
+/// `owner_id` and the display name recorded for them. The Phase-4 IPC wrapper
+/// maps this into a frontend DTO; tests assert on it directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FriendLinkOutcome {
+    /// The friend's (inviter's) 16-byte master `OwnerAddr` — the key under which
+    /// the new `FriendEntry` was written into local owner-state.
+    pub friend_addr: crate::owner_state_types::OwnerAddr,
+    /// The display name recorded on the new `FriendEntry` (the accept's display,
+    /// falling back to the token's `display_hint`). `None` when neither was set.
+    pub display: Option<String>,
+}
+
+/// ZEB-370 Phase 1 (Task 10): the OUTBOUND side of the friend handshake — decode
+/// a `harmony://friend/<token>` URL, resolve the inviter's reachability via
+/// Case-A pkarr (keyed on `token.sig`, exactly like an invite redeem), connect
+/// on the `harmony/friend/v1` ALPN, exchange a signed `FriendLinkRequest` /
+/// `FriendLinkAccepted`, and write the inviter into local owner-state as an
+/// `Active`/`Token` friend.
+///
+/// Split out as a reusable `pub` inner (the Phase-4 IPC wrapper snapshots
+/// `NodeState` and delegates) so integration tests can drive it with explicit
+/// resources. Structural template: [`connectivity_redeem_invite_iroh_inner`].
+///
+/// On a genuine *unreachable* condition (no pkarr record, dial/open_bi failure,
+/// IO timeout) this returns `Err(String)` describing the failure — unlike the
+/// invite redeem, the friend path has no "soft outcome" DTO, so the caller maps
+/// the `Err` into a user-facing diagnostic. Crypto/authentication failures
+/// (cert invalid, signature mismatch, apply rejected) also surface as `Err`.
+#[allow(clippy::too_many_arguments)]
+pub async fn connectivity_link_friend_iroh_inner(
+    token_url: String,
+    pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
+    iroh_endpoint: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    self_enrollment: harmony_owner::certs::EnrollmentCert,
+    self_device2_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    self_display: Option<String>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    dial_config: HandshakeDialConfig,
+) -> Result<FriendLinkOutcome, String> {
+    use crate::iroh_friend_acceptor::{
+        decode_friend_accepted, encode_friend_request, friend_accept_sig_preimage,
+        friend_request_sig_preimage, master_ed25519_from_cert, verify_enrolled_device,
+        FriendLinkRequest, FRIEND_MAX_PACKET_LEN,
+    };
+    use ed25519_dalek::{Signature, Signer, VerifyingKey};
+
+    // 1. Decode the friend-token URL (structural addr↔cert check happens inside
+    //    decode_friend_token_url) + verify the inviter.
+    let payload = crate::friend_token::decode_friend_token_url(&token_url)
+        .map_err(|e| format!("decode friend token URL: {e}"))?;
+
+    // 1a. Verify the inviter's EnrollmentCert binds the claimed owner_id, and
+    //     recover the inviter's enrolled device-#2 key.
+    let inviter_device_key =
+        verify_enrolled_device(&payload.inviter_enrollment, payload.inviter_addr)
+            .map_err(|e| format!("verify inviter enrollment: {e}"))?;
+
+    // 1b. Verify the friend token's device-#2 signature against that key (the
+    //     token is `InviteToken`-shaped, minted by `mint_friend_token`).
+    crate::community_invite::verify_invite_token_sig_device_key(
+        &payload.token,
+        &inviter_device_key,
+    )
+    .map_err(|e| format!("verify friend token sig: {e:?}"))?;
+
+    // 1c. Redeemer-side expiry fail-fast (ZEB-370): if the minted token already
+    //     expired, bail before doing any pkarr/iroh work. The acceptor's consent
+    //     gate (`is_friend_token_active`) also rejects expired tokens server-side;
+    //     this is the cheap client-side mirror so a redeemer never burns a dial
+    //     on a token that can't be accepted.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if let Some(expires_at) = payload.token.expires_at {
+        if expires_at <= now_ms {
+            return Err("friend token expired".to_string());
+        }
+    }
+
+    // 2. Resolve the inviter's reachability via Case-A pkarr, keyed on
+    //    `token.sig` — SAME mechanism as the invite redeem (friend tokens
+    //    publish under a `friend:`-namespaced handle but derive the ephemeral
+    //    key from `token.sig` under `PkarrCase::Invite`, exactly like invites).
+    let Some(resolver) = pkarr_resolver else {
+        return Err("pkarr resolver unavailable — cannot resolve inviter".to_string());
+    };
+    let Some(iroh_endpoint) = iroh_endpoint else {
+        return Err("iroh endpoint unavailable — cannot dial inviter".to_string());
+    };
+
+    // Reuse `now_ms` from the expiry check above — the pkarr epoch window only
+    // needs a near-current clock, and the two reads are microseconds apart.
+    let epoch_window = harmony_pkarr::epoch_tolerance_window(now_ms);
+    let verifying_keys: Vec<_> = epoch_window
+        .iter()
+        .map(|&epoch| {
+            harmony_pkarr::derive_ephemeral_key(
+                harmony_pkarr::PkarrCase::Invite,
+                &payload.token.sig,
+                &epoch.to_be_bytes(),
+            )
+            .verifying_key()
+        })
+        .collect();
+
+    // `resolve_window` internally verifies the record's inner sig + skew and
+    // returns the freshest valid record. We skip `verify_identity_match` —
+    // unlike an invite, the friend token does not carry the inviter's transport
+    // composite pub; the friend handshake authenticates the inviter
+    // cryptographically via their EnrollmentCert + accept signature below.
+    let rec = resolver
+        .resolve_window(&verifying_keys)
+        .await
+        .map_err(|e| format!("pkarr resolve: {e}"))?;
+    let Some(rec) = rec else {
+        return Err("inviter_unreachable: no pkarr record for friend token".to_string());
+    };
+
+    // 3. Decode the inner routing payload + synthesize an EndpointAddr.
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(rec.routing_blob.as_slice())
+            .map_err(|e| format!("decode routing_blob: {e}"))?;
+
+    let inviter_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode inviter iroh_node_id: {e}"))?;
+    let mut inviter_addr = iroh::EndpointAddr::new(inviter_iroh_id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => inviter_addr = inviter_addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        inviter_addr = inviter_addr.with_ip_addr(*da);
+    }
+
+    // 4. Connect on the friend ALPN + open a bi-stream, bounded by dial_config.
+    let conn = match tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint
+            .inner()
+            .connect(inviter_addr, crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("inviter_unreachable: iroh connect failed: {e}")),
+        Err(_elapsed) => {
+            return Err(format!(
+                "inviter_unreachable: iroh connect timeout after {}ms",
+                dial_config.connect_timeout.as_millis()
+            ));
+        }
+    };
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Err(format!("inviter_unreachable: open_bi failed: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Err(format!(
+                    "inviter_unreachable: open_bi timeout after {}ms",
+                    dial_config.open_bi_timeout.as_millis()
+                ));
+            }
+        };
+
+    // 5. Build + device-#2-sign the FriendLinkRequest.
+    let req_sig = self_device2_signing_key
+        .sign(&friend_request_sig_preimage(self_owner, &payload.token.sig))
+        .to_bytes();
+    let request = FriendLinkRequest {
+        from_addr: self_owner,
+        display: self_display,
+        token_sig: payload.token.sig,
+        enrollment: self_enrollment,
+        sig: req_sig,
+    };
+    let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
+    let wire_len = wire.len() as u32;
+
+    // Write [u32 LE length-prefix][body], each bounded by write_timeout.
+    let write_prefix = async {
+        send.write_all(&wire_len.to_le_bytes())
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("inviter_unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("inviter_unreachable: request length-prefix write timeout".to_string());
+        }
+    }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write request body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("inviter_unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("inviter_unreachable: request body write timeout".to_string());
+        }
+    }
+    if let Err(e) = send.finish() {
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Err(format!("inviter_unreachable: send.finish failed: {e}"));
+    }
+
+    // 6. Read [u32 LE length-prefix][FriendLinkAccepted], bounded by
+    //    response_read_timeout.
+    let read_response = async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("read length-prefix: {e}"))?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > FRIEND_MAX_PACKET_LEN {
+            return Err(format!(
+                "response length out of bounds: len={len} max={FRIEND_MAX_PACKET_LEN}"
+            ));
+        }
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read response body: {e}"))?;
+        Ok::<Vec<u8>, String>(body)
+    };
+    let response_bytes =
+        match tokio::time::timeout(dial_config.response_read_timeout, read_response).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"response-read-failed");
+                return Err(format!("inviter_unreachable: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"response-read-timeout");
+                return Err("inviter_unreachable: friend accept response timeout".to_string());
+            }
+        };
+
+    // The acceptor already has our request bytes (it could not have produced an
+    // accept otherwise), so close immediately — the friend acceptor's
+    // `conn.closed()` wait is bounded by its own io_deadline.
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"friend-handshake-complete");
+    drop(conn);
+
+    let accepted =
+        decode_friend_accepted(&response_bytes).map_err(|e| format!("decode accepted: {e}"))?;
+
+    // 7. Verify the accept: it must be from the inviter (cert binds
+    //    payload.inviter_addr) and signed over the accept preimage.
+    let accept_device_key = verify_enrolled_device(&accepted.enrollment, payload.inviter_addr)
+        .map_err(|e| format!("verify accept enrollment: {e}"))?;
+    let accept_vk =
+        VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
+    accept_vk
+        .verify_strict(
+            &friend_accept_sig_preimage(payload.inviter_addr, &payload.token.sig),
+            &Signature::from_bytes(&accepted.sig),
+        )
+        .map_err(|_| "friend accept signature invalid".to_string())?;
+
+    // 8. Extract the inviter's master key (their friend-graph anchor) + apply
+    //    them as an Active/Token friend to local owner-state.
+    let master_ed25519 = master_ed25519_from_cert(&accepted.enrollment)
+        .map_err(|e| format!("extract inviter master key: {e}"))?;
+    let display = accepted.display.clone().or(payload.display_hint.clone());
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let learned_at =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let entry = crate::friend_graph::FriendEntry {
+        master_ed25519,
+        display: display.clone(),
+        status: crate::friend_graph::FriendStatus::Active,
+        established_via: crate::friend_graph::FriendOrigin::Token,
+        referrable: false,
+        learned_at,
+    };
+    {
+        let mut state = crdt_state.lock().await;
+        match state.apply_friend_update(payload.inviter_addr, entry) {
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+            | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {}
+            crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+                return Err(format!("friend-graph apply rejected: {reason:?}"));
+            }
+        }
+    }
+
+    tracing::info!(
+        friend = %hex::encode(payload.inviter_addr.0),
+        "ZEB-370: friend link established (inviter added as Active/Token friend)"
+    );
+
+    Ok(FriendLinkOutcome {
+        friend_addr: payload.inviter_addr,
+        display,
+    })
+}
+
+#[cfg(test)]
+mod friend_redeem_expiry_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// FIX 2 (redeemer-side expiry fail-fast): redeeming a friend token whose
+    /// `expires_at` is already in the past must return `Err("friend token
+    /// expired")` BEFORE any pkarr/iroh work — proven here by passing `None` for
+    /// both the resolver and the endpoint (which would otherwise error first):
+    /// the expiry check runs ahead of those `Some(...)` guards, so an expired
+    /// token surfaces the expiry error rather than "pkarr resolver unavailable".
+    #[tokio::test]
+    async fn connectivity_link_friend_rejects_expired_token() {
+        let owner = crate::community_membership::mint_test_owner(0x71);
+        let device2 = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &owner.device_key.to_bytes(),
+        ));
+        let minted_at = crate::owner_state_types::Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        // expires_at = 1 ms after epoch → long expired against the real clock.
+        let payload = crate::friend_token::mint_friend_token(
+            owner.owner,
+            Some("inviter".into()),
+            minted_at,
+            Some(1),
+            owner.cert.clone(),
+            &device2,
+        )
+        .expect("mint");
+        let url = crate::friend_token::encode_friend_token_url(&payload).expect("encode");
+
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let hlc_tracker = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+
+        let err = connectivity_link_friend_iroh_inner(
+            url,
+            None, // pkarr_resolver — would error AFTER the expiry check
+            None, // iroh_endpoint — likewise
+            owner.owner,
+            owner.cert.clone(),
+            device2,
+            Some("me".into()),
+            crdt_state.clone(),
+            hlc_tracker,
+            "redeem-dev".to_string(),
+            HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(100),
+                open_bi_timeout: Duration::from_millis(100),
+                response_read_timeout: Duration::from_millis(100),
+                write_timeout: Duration::from_millis(100),
+            },
+        )
+        .await
+        .expect_err("an expired friend token must be rejected before dialing");
+        assert_eq!(
+            err, "friend token expired",
+            "expired token must fail-fast with the expiry error, not a downstream \
+             resolver/endpoint error"
+        );
+        assert!(
+            crdt_state.lock().await.friend_graph.friends.is_empty(),
+            "a rejected expired redeem must not write a friend entry"
+        );
+    }
+}
+
 /// Toggle case-B "Make me discoverable" setting. Persists the toggle to
 /// `connectivity-settings.json` and registers / unregisters the pkarr
 /// identity publication accordingly.
@@ -33164,6 +33641,615 @@ async fn connectivity_pkarr_publication_status(
             .filter(|h| h.starts_with("community:"))
             .count(),
     })
+}
+
+// ── ZEB-370 Phase 1 Task 11: friend IPCs ─────────────────────────────
+//
+// Four Tauri commands surfacing the friend graph + token peering to the
+// frontend FriendsPanel:
+//
+//   * `generate_friend_token` — mint a `harmony://friend/...` URL + publish
+//     the inviter's Case-A reachability so a redeemer can locate us.
+//   * `redeem_friend_token` — decode + redeem a pasted URL (outbound friend
+//     handshake), adding the inviter as an Active/Token friend.
+//   * `list_friends` — project the non-`Revoked` friend graph to DTOs.
+//   * `unfriend` — write a `Revoked` tombstone for a peer.
+//
+// Each command snapshots NodeState handles under the std `Mutex`, drops the
+// lock, then `.await`s — the lock-snapshot-drop pattern (a `std::sync::Mutex`
+// guard held across `.await` would block the executor). Testable inner cores
+// (`list_friends_inner`, `unfriend_inner`) are unit-tested without a Tauri
+// harness; the command wrappers are thin.
+
+/// Friend row surfaced to the frontend `FriendsPanel`. `status` /
+/// `established_via` serialize as their existing lowercase strings
+/// (`FriendStatus` / `FriendOrigin` carry `#[serde(rename = ...)]`), so the
+/// frontend sees `"active"` / `"token"` etc.; the other fields are camelCased.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FriendDto {
+    /// The friend's 16-byte master `owner_id`, hex-encoded.
+    pub owner_id_hex: String,
+    /// Human display name recorded at link time (may be absent).
+    pub display: Option<String>,
+    /// Lifecycle (`"pending"` / `"active"`; `"revoked"` rows are filtered out
+    /// by `list_friends_inner`, so this is never `"revoked"` in practice).
+    pub status: crate::friend_graph::FriendStatus,
+    /// Provenance (`"token"` in Phase 1).
+    pub established_via: crate::friend_graph::FriendOrigin,
+    /// Whether this friend may be surfaced in our referral catalog (Phase 2).
+    pub referrable: bool,
+}
+
+/// Result of a successful `redeem_friend_token`: the newly-added friend's
+/// master `owner_id` (hex) + the display recorded for them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FriendLinkResultDto {
+    /// The friend's (inviter's) 16-byte master `owner_id`, hex-encoded.
+    pub owner_id_hex: String,
+    /// Display recorded on the new `FriendEntry` (accept display, else the
+    /// token's `display_hint`). `None` when neither was set.
+    pub display: Option<String>,
+}
+
+/// Project the friend graph into the frontend DTO list, hiding `Revoked`
+/// tombstones (an unfriended peer must not reappear in the UI). Pure over an
+/// `&OwnerState` so it's unit-testable without a NodeState harness.
+pub fn list_friends_inner(state: &crate::owner_state_crdt::OwnerState) -> Vec<FriendDto> {
+    state
+        .friend_graph
+        .friends
+        .iter()
+        .filter(|(_, entry)| entry.status != crate::friend_graph::FriendStatus::Revoked)
+        .map(|(addr, entry)| FriendDto {
+            owner_id_hex: hex::encode(addr.0),
+            display: entry.display.clone(),
+            status: entry.status,
+            established_via: entry.established_via,
+            referrable: entry.referrable,
+        })
+        .collect()
+}
+
+/// Write a `Revoked` tombstone for `peer_addr` into local owner-state, using a
+/// fresh `learned_at` HLC so the revoke wins LWW over any prior `Active`. The
+/// existing entry's `master_ed25519` is preserved so the addr↔master-key
+/// invariant `apply_friend_update` enforces still holds. Returns `Err` when the
+/// peer isn't a known friend (nothing to revoke) or the apply is rejected.
+///
+/// Pure over the resources it's handed (no NodeState / Tauri), so it's
+/// unit-testable; the IPC wrapper snapshots `crdt_state` + `hlc_tracker` +
+/// `device_id` and delegates.
+/// Returns `Ok(true)` when a fresh tombstone was written (owner-state changed and
+/// the caller should `notify_dirty` the sync engine), `Ok(false)` for the
+/// idempotent no-op on an already-`Revoked` peer (nothing changed — skip the
+/// notify so we don't churn an owner-state re-sync).
+pub async fn unfriend_inner(
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: &std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: &str,
+    peer_addr: crate::owner_state_types::OwnerAddr,
+) -> Result<bool, String> {
+    // Read the existing entry so we keep its master key (the addr↔key invariant
+    // must still hold for the tombstone) and only flip status/learned_at.
+    let existing = {
+        let state = crdt_state.lock().await;
+        state.friend_graph.friends.get(&peer_addr).cloned()
+    };
+    let Some(existing) = existing else {
+        return Err(format!(
+            "not a friend: no entry for {}",
+            hex::encode(peer_addr.0)
+        ));
+    };
+    // Idempotent no-op: an already-Revoked entry is left untouched. Writing a
+    // fresh tombstone here would churn the CRDT (newer HLC) and trigger an
+    // unnecessary owner-state re-sync, so re-unfriending must short-circuit
+    // without reserving an HLC.
+    if existing.status == crate::friend_graph::FriendStatus::Revoked {
+        return Ok(false);
+    }
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let learned_at =
+        crate::dm_outbox::reserve_next_hlc_for_device(hlc_tracker, device_id, wall_now_ms).await;
+    let tombstone = crate::friend_graph::FriendEntry {
+        master_ed25519: existing.master_ed25519,
+        display: existing.display.clone(),
+        status: crate::friend_graph::FriendStatus::Revoked,
+        established_via: existing.established_via,
+        referrable: existing.referrable,
+        learned_at,
+    };
+    let mut state = crdt_state.lock().await;
+    match state.apply_friend_update(peer_addr, tombstone) {
+        crate::owner_state_crdt::ApplyOutcome::Inserted
+        | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => Ok(true),
+        crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+            Err(format!("unfriend apply rejected: {reason:?}"))
+        }
+    }
+}
+
+/// ZEB-370 consent-gate guard for `generate_friend_token`, factored out so it's
+/// unit-testable without a NodeState/Tauri harness.
+///
+/// A minted friend token is only redeemable if its `token.sig` is registered in
+/// the live-token map that lives on the `PkarrInvitePublisher` — the inbound
+/// consent gate (`is_friend_token_active`, ZEB-370 d60927a) fails CLOSED when no
+/// publisher is present, so a URL handed out without a live publisher can NEVER
+/// pass the gate (un-redeemable, even on-LAN). Mirroring ZEB-367's
+/// hard-fail-when-publish-unavailable decision (`generate_invite`), we refuse to
+/// mint at all when the publisher is absent rather than return a misleading URL.
+fn friend_token_publish_guard(
+    pkarr_invite_publisher: Option<
+        &std::sync::Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>,
+    >,
+) -> Result<(), String> {
+    if pkarr_invite_publisher.is_none() {
+        return Err(
+            "cannot mint friend token: peer publisher unavailable (iroh routing not ready)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Generate a `harmony://friend/...` URL for sharing. Mints a device-#2-signed
+/// friend token (reusing the ZEB-367 invite-token machinery), publishes the
+/// inviter's Case-A reachability under `friend:{token.sig}` so a redeemer can
+/// locate us before any shared session exists, and returns the URL.
+///
+/// `display_hint = None`: the node's own profile display name isn't persisted
+/// at this layer (it arrives per `publish_profile`), matching the friend
+/// acceptor's `self_display = None` convention (lib.rs:4470). It's only a UX
+/// hint on the redeemer's side.
+///
+/// Errors: `OWNER_NOT_LOADED_MSG` when the node isn't booted; the mint /
+/// encode error string otherwise.
+#[tauri::command(rename_all = "snake_case")]
+async fn generate_friend_token(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    expires_at: Option<u64>,
+) -> Result<String, String> {
+    // Snapshot handles under the std lock, then drop it before any `.await`.
+    let (dm_outbox, hlc_tracker, pkarr_invite_publisher) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.pkarr_invite_publisher.clone(),
+        )
+    };
+
+    // Fail fast (before any mint/encode work) if we can't publish a live token:
+    // the inbound consent gate fails closed without the publisher's live-token
+    // map, so a URL minted here would be un-redeemable. See guard doc comment.
+    friend_token_publish_guard(pkarr_invite_publisher.as_ref())?;
+
+    // The inviter is the local owner: self_owner + device-#2 signing key +
+    // EnrollmentCert all come from the outbox. `community_signing_key` IS the
+    // enrolled device-#2 key (DmOutbox asserts it matches the cert's device
+    // pubkey), the same key `mint_friend_token` must sign with.
+    let (self_owner, device2_key, enrollment_cert, device_id) = {
+        let o = dm_outbox.lock().await;
+        (
+            o.self_owner,
+            std::sync::Arc::clone(&o.community_signing_key),
+            o.enrollment_cert.clone(),
+            o.device_id.clone(),
+        )
+    };
+
+    // Reserve a fresh HLC for `minted_at` (the same helper generate_invite uses).
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let minted_at =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let payload = crate::friend_token::mint_friend_token(
+        self_owner,
+        None, // display_hint — see doc comment.
+        minted_at,
+        expires_at,
+        enrollment_cert,
+        &device2_key,
+    )?;
+
+    // Encode the URL FIRST so we never publish a Case-A record for a token whose
+    // URL the caller never received (mirrors generate_invite's ordering).
+    let url = crate::friend_token::encode_friend_token_url(&payload)
+        .map_err(|e| format!("encode friend token URL: {e}"))?;
+
+    // Publish Case-A reachability keyed on the token sig so a redeemer can
+    // resolve our iroh routing. The publisher is guaranteed present here — the
+    // `friend_token_publish_guard` above already returned `Err` when it was
+    // `None`, because the inbound consent gate (`is_friend_token_active`) keeps
+    // its live-token map ON the publisher and fails closed without it, making a
+    // token minted with no publisher un-redeemable (NOT redeemable on-LAN).
+    let inv_pub = pkarr_invite_publisher
+        .expect("publisher presence enforced by friend_token_publish_guard above");
+    // Record the token's expiry alongside the publish so the inbound
+    // acceptor's consent gate (`is_friend_token_active`) rejects an expired
+    // or never-minted `token_sig` (ZEB-370 consent gate). `payload.token
+    // .expires_at` is the same value passed into `mint_friend_token`.
+    inv_pub
+        .register_friend_token(&payload.token.sig, payload.token.expires_at)
+        .await;
+
+    Ok(url)
+}
+
+/// Redeem a pasted `harmony://friend/...` URL: run the outbound friend
+/// handshake (`connectivity_link_friend_iroh_inner`), adding the inviter as an
+/// Active/Token friend in local owner-state, emit `friend-list-changed`, and
+/// return the new friend's `owner_id` + display.
+///
+/// Gathers the SAME NodeState handles `connectivity_redeem_invite_iroh` does
+/// (pkarr_resolver / iroh_endpoint / crdt_state / hlc_tracker / dm_device_id /
+/// dm_self_owner / dm_outbox), then reads the device-#2 signing key
+/// (`community_signing_key`) + `enrollment_cert` from the outbox — exactly the
+/// inputs `connectivity_link_friend_iroh_inner` requires.
+#[tauri::command(rename_all = "snake_case")]
+async fn redeem_friend_token(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    url: String,
+) -> Result<FriendLinkResultDto, String> {
+    let (
+        pkarr_resolver,
+        iroh_endpoint,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        dm_outbox,
+        sync_engine,
+    ) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pkarr_resolver.clone(),
+            g.iroh_endpoint.clone(),
+            g.crdt_state.clone(),
+            g.hlc_tracker.clone(),
+            g.dm_device_id.clone(),
+            g.dm_self_owner,
+            g.dm_outbox.clone(),
+            g.sync_engine.clone(),
+        )
+    };
+
+    let (Some(crdt_state), Some(hlc_tracker), Some(device_id), Some(self_owner), Some(dm_outbox)) =
+        (crdt_state, hlc_tracker, device_id, self_owner, dm_outbox)
+    else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+
+    // The redeemer signs its FriendLinkRequest with its enrolled device-#2 key
+    // and carries its own EnrollmentCert (same shape as the invite redeem).
+    let (device2_key, enrollment_cert) = {
+        let o = dm_outbox.lock().await;
+        (
+            std::sync::Arc::clone(&o.community_signing_key),
+            o.enrollment_cert.clone(),
+        )
+    };
+
+    let outcome = connectivity_link_friend_iroh_inner(
+        url,
+        pkarr_resolver,
+        iroh_endpoint,
+        self_owner,
+        enrollment_cert,
+        device2_key,
+        None, // self_display — not persisted at this layer (see acceptor note).
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        HandshakeDialConfig::from_env(),
+    )
+    .await?;
+
+    // The redeem wrote a new Active/Token FriendEntry into owner-state → arm the
+    // debounced publish-root + persist on the owner-state SyncEngine so the new
+    // friend reaches the user's other devices and survives a clean shutdown.
+    // Done in the IPC wrapper (not `connectivity_link_friend_iroh_inner`) so the
+    // integration test that drives the inner directly is unaffected. Mirrors
+    // mint.rs's `notify_mint_dirty` lock-snapshot-drop pattern.
+    if let Some(engine) = sync_engine {
+        engine.notify_dirty();
+    }
+
+    // Notify the UI so it re-fetches the friend list.
+    let _ = app.emit("friend-list-changed", ());
+
+    Ok(FriendLinkResultDto {
+        owner_id_hex: hex::encode(outcome.friend_addr.0),
+        display: outcome.display,
+    })
+}
+
+/// List the local owner's friends (non-`Revoked` entries) for the
+/// `FriendsPanel`. Read-only snapshot of the friend-graph sub-CRDT.
+#[tauri::command(rename_all = "snake_case")]
+async fn list_friends(state: tauri::State<'_, Mutex<NodeState>>) -> Result<Vec<FriendDto>, String> {
+    let crdt_state = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    let dtos = {
+        let s = crdt_state.lock().await;
+        list_friends_inner(&s)
+    };
+    Ok(dtos)
+}
+
+/// Unfriend a peer: write a `Revoked` tombstone (LWW, so it can't be silently
+/// resurrected by a stale `Active`) and emit `friend-list-changed`.
+/// `peer_addr` is the friend's 16-byte master `owner_id` in hex.
+#[tauri::command(rename_all = "snake_case")]
+async fn unfriend(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    peer_addr: String,
+) -> Result<(), String> {
+    let addr_bytes: [u8; 16] = hex::decode(&peer_addr)
+        .map_err(|e| format!("invalid peer_addr hex: {e}"))?
+        .try_into()
+        .map_err(|_| "peer_addr must be 16 bytes (32 hex chars)".to_string())?;
+    let peer = crate::owner_state_types::OwnerAddr(addr_bytes);
+
+    let (crdt_state, hlc_tracker, device_id, sync_engine) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.sync_engine.clone(),
+        )
+    };
+
+    let changed = unfriend_inner(&crdt_state, &hlc_tracker, &device_id, peer).await?;
+
+    // Owner-state mutated → arm the debounced publish-root + persist on the
+    // owner-state SyncEngine so the tombstone reaches the user's other devices
+    // and survives a clean shutdown. Skipped for the idempotent no-op (already
+    // Revoked) so we don't churn an unnecessary re-sync. Mirrors mint.rs's
+    // `notify_mint_dirty` lock-snapshot-drop pattern.
+    if changed {
+        if let Some(engine) = sync_engine {
+            engine.notify_dirty();
+        }
+    }
+
+    let _ = app.emit("friend-list-changed", ());
+    Ok(())
+}
+
+#[cfg(test)]
+mod friend_ipc_tests {
+    use super::*;
+    use crate::friend_graph::{
+        owner_id_from_master_ed25519, FriendEntry, FriendOrigin, FriendStatus,
+    };
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{Hlc, OwnerAddr};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "d".into(),
+        }
+    }
+
+    /// A friend entry whose `master_ed25519` derives to `addr` (so
+    /// `apply_friend_update` accepts it — it enforces the addr↔key invariant).
+    fn friend_entry(master_seed: u8, status: FriendStatus, w: u64) -> (OwnerAddr, FriendEntry) {
+        let master_ed25519 = ed25519_dalek::SigningKey::from_bytes(&[master_seed; 32])
+            .verifying_key()
+            .to_bytes();
+        let addr = owner_id_from_master_ed25519(&master_ed25519);
+        (
+            addr,
+            FriendEntry {
+                master_ed25519,
+                display: Some(format!("friend-{master_seed}")),
+                status,
+                established_via: FriendOrigin::Token,
+                referrable: false,
+                learned_at: hlc(w),
+            },
+        )
+    }
+
+    #[test]
+    fn list_friends_inner_hides_revoked_surfaces_active() {
+        let mut s = OwnerState::default();
+        let (active_addr, active) = friend_entry(0x11, FriendStatus::Active, 10);
+        let (revoked_addr, revoked) = friend_entry(0x22, FriendStatus::Revoked, 10);
+        assert!(matches!(
+            s.apply_friend_update(active_addr, active),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+        assert!(matches!(
+            s.apply_friend_update(revoked_addr, revoked),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+
+        let dtos = list_friends_inner(&s);
+        assert_eq!(dtos.len(), 1, "only the active friend is surfaced");
+        assert_eq!(dtos[0].owner_id_hex, hex::encode(active_addr.0));
+        assert_eq!(dtos[0].status, FriendStatus::Active);
+        assert_eq!(dtos[0].established_via, FriendOrigin::Token);
+    }
+
+    #[tokio::test]
+    async fn unfriend_inner_tombstones_active_then_list_hides_it() {
+        let (addr, active) = friend_entry(0x33, FriendStatus::Active, 5);
+        let mut state = OwnerState::default();
+        assert!(matches!(
+            state.apply_friend_update(addr, active.clone()),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+        let crdt_state = Arc::new(TokioMutex::new(state));
+        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
+            Arc::new(TokioMutex::new(BTreeMap::new()));
+
+        // Seed the tracker so the revoke HLC is strictly newer than learned_at=5.
+        {
+            let mut t = hlc_tracker.lock().await;
+            t.insert("d".to_string(), hlc(5));
+        }
+
+        let changed = unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
+            .await
+            .expect("unfriend succeeds for an active friend");
+        assert!(
+            changed,
+            "tombstoning an active friend changed owner-state (must signal notify_dirty)"
+        );
+
+        // The entry is now a Revoked tombstone…
+        {
+            let s = crdt_state.lock().await;
+            assert_eq!(
+                s.friend_graph.friends[&addr].status,
+                FriendStatus::Revoked,
+                "active friend becomes Revoked"
+            );
+            // …and list_friends_inner hides it.
+            assert!(
+                list_friends_inner(&s).is_empty(),
+                "revoked friend is hidden from the list"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unfriend_inner_errors_for_unknown_peer() {
+        let crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
+            Arc::new(TokioMutex::new(BTreeMap::new()));
+        let unknown = OwnerAddr([0xEE; 16]);
+        let err = unfriend_inner(&crdt_state, &hlc_tracker, "d", unknown)
+            .await
+            .expect_err("unfriending a non-friend errors");
+        assert!(err.contains("not a friend"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn unfriend_inner_is_idempotent_noop_for_already_revoked() {
+        // Re-unfriending an already-Revoked peer must be a true no-op: no new
+        // tombstone, no fresh HLC — otherwise we churn the CRDT and trigger an
+        // unnecessary owner-state re-sync.
+        let (addr, revoked) = friend_entry(0x44, FriendStatus::Revoked, 7);
+        let mut state = OwnerState::default();
+        assert!(matches!(
+            state.apply_friend_update(addr, revoked.clone()),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+        let crdt_state = Arc::new(TokioMutex::new(state));
+        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
+            Arc::new(TokioMutex::new(BTreeMap::new()));
+
+        // Seed the tracker so that, were a tombstone (wrongly) written, its HLC
+        // would be strictly newer than learned_at=7 and thus detectably change
+        // the stored entry.
+        {
+            let mut t = hlc_tracker.lock().await;
+            t.insert("d".to_string(), hlc(7));
+        }
+
+        let changed = unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
+            .await
+            .expect("re-unfriending an already-revoked peer is Ok(false)");
+        assert!(
+            !changed,
+            "idempotent no-op must report no change (caller skips notify_dirty)"
+        );
+
+        // The stored entry is untouched — same status and, crucially, the same
+        // learned_at HLC (no new tombstone was written).
+        {
+            let s = crdt_state.lock().await;
+            let entry = &s.friend_graph.friends[&addr];
+            assert_eq!(
+                entry.status,
+                FriendStatus::Revoked,
+                "already-revoked entry stays Revoked"
+            );
+            assert_eq!(
+                entry.learned_at,
+                hlc(7),
+                "no new tombstone — learned_at HLC is unchanged"
+            );
+        }
+    }
+
+    // ── ZEB-370 (cursor review): generate_friend_token publisher requirement ──
+
+    /// A real `PkarrInvitePublisher` backed by a mock relay. The guard only
+    /// checks presence (never touches the network), so this is just a non-`None`
+    /// `Arc` for the "publisher present" assertion.
+    async fn test_publisher() -> Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher> {
+        use ed25519_dalek::SigningKey;
+        use harmony_pkarr::testing::MockPkarrRelay;
+        use harmony_pkarr::{PkarrPublisher, RelayClient, RelayPool};
+        use rand::rngs::OsRng;
+        let relay = MockPkarrRelay::start().await;
+        Box::leak(Box::new(relay));
+        let pool = RelayPool::new(vec!["http://127.0.0.1:1/".to_string()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&sk.verifying_key().to_bytes());
+        Arc::new(crate::pkarr_invite_publisher::PkarrInvitePublisher::new(
+            publisher,
+            sk,
+            id_pub,
+            Arc::new(|| b"routing".to_vec()),
+        ))
+    }
+
+    #[test]
+    fn friend_token_publish_guard_errors_when_publisher_absent() {
+        // No publisher → the consent gate would fail closed → minting must be
+        // refused (the URL would otherwise be un-redeemable).
+        let err = super::friend_token_publish_guard(None)
+            .expect_err("a missing publisher must hard-fail token minting");
+        assert!(
+            err.contains("peer publisher unavailable"),
+            "error should explain the missing publisher; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn friend_token_publish_guard_ok_when_publisher_present() {
+        let publisher = test_publisher().await;
+        super::friend_token_publish_guard(Some(&publisher))
+            .expect("a present publisher must pass the guard");
+    }
 }
 
 // ── ZEB-321 Phase 1 Task 9: connectivity IPCs ────────────────────────
@@ -33814,6 +34900,11 @@ pub fn run() {
             connectivity_get_identity_discoverable,
             connectivity_discover_identity,
             connectivity_pkarr_publication_status,
+            // ZEB-370 Phase 1 Task 11: friend IPCs.
+            generate_friend_token,
+            redeem_friend_token,
+            list_friends,
+            unfriend,
             // ZEB-329: Network Health IPCs.
             network_health_snapshot,
             network_health_run_self_test,

@@ -111,6 +111,16 @@ struct CrdtFileV2 {
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     outbox_tombstones:
         BTreeMap<crate::owner_state_types::OutboxEntryId, crate::owner_state_types::Hlc>,
+    /// ZEB-370 Phase 1: persisted Friend Graph sub-CRDT. Absent in
+    /// pre-ZEB-370 V2 files; `serde(default)` loads those as an empty
+    /// graph (no schema-version bump needed — absent == empty).
+    /// `skip_serializing_if` omits the field when empty so existing file
+    /// shapes stay compact.
+    #[serde(
+        skip_serializing_if = "crate::friend_graph::FriendGraph::is_empty",
+        default
+    )]
+    friend_graph: crate::friend_graph::FriendGraph,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -124,6 +134,7 @@ impl From<&OwnerState> for CrdtFileV2 {
             owner_device_cache: s.owner_device_cache.clone(),
             libraries: s.libraries.clone(),
             outbox_tombstones: s.outbox_tombstones.clone(),
+            friend_graph: s.friend_graph.clone(),
         }
     }
 }
@@ -139,6 +150,7 @@ impl From<CrdtFileV2> for OwnerState {
             owner_device_cache: f.owner_device_cache,
             libraries: f.libraries,
             outbox_tombstones: f.outbox_tombstones,
+            friend_graph: f.friend_graph,
         }
     }
 }
@@ -249,7 +261,7 @@ pub fn load_replay(path: &Path) -> Result<BTreeMap<String, Hlc>, PersistError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_crdt::{ApplyOutcome, OwnerState};
     use crate::owner_state_types::{
         ContentId, DeliveryStatus, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, ReadMarker, Space,
         SpaceId, SpaceKind, TransportBinding,
@@ -368,6 +380,52 @@ mod tests {
         let path = dir.path().join("never_written.cbor");
         let loaded = load_crdt(&path).unwrap();
         assert_eq!(loaded, OwnerState::default());
+    }
+
+    #[test]
+    fn crdt_file_v2_round_trips_friend_graph() {
+        use crate::friend_graph::{
+            owner_id_from_master_ed25519, FriendEntry, FriendOrigin, FriendStatus,
+        };
+        // Derive a valid (addr, master_ed25519) pair so apply_friend_update's
+        // key↔master-key correspondence invariant is satisfied (an arbitrary
+        // addr would be rejected and the graph would stay empty).
+        let master_ed25519 = ed25519_dalek::SigningKey::from_bytes(&[0xd1; 32])
+            .verifying_key()
+            .to_bytes();
+        let friend_addr = owner_id_from_master_ed25519(&master_ed25519);
+        let mut s = OwnerState::default();
+        let outcome = s.apply_friend_update(
+            friend_addr,
+            FriendEntry {
+                master_ed25519,
+                display: Some("dave".into()),
+                status: FriendStatus::Active,
+                established_via: FriendOrigin::Token,
+                referrable: true,
+                learned_at: hlc(42),
+            },
+        );
+        assert!(matches!(outcome, ApplyOutcome::Inserted));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert_eq!(loaded.friend_graph, s.friend_graph);
+        assert!(!loaded.friend_graph.is_empty());
+    }
+
+    #[test]
+    fn pre_friendgraph_snapshot_loads_empty() {
+        // A V2 file serialized WITHOUT any friend graph (the field is
+        // skipped on the wire when empty) must load to an empty graph —
+        // backward-compat with pre-ZEB-370 snapshots.
+        let s = OwnerState::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert!(loaded.friend_graph.is_empty());
     }
 
     #[test]

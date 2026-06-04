@@ -62,6 +62,18 @@ pub struct OwnerState {
     /// timer, so tombstone growth remains low. See spec §4.1 + §8.
     #[serde(rename = "ot", skip_serializing_if = "BTreeMap::is_empty", default)]
     pub outbox_tombstones: BTreeMap<OutboxEntryId, Hlc>,
+    /// ZEB-370 Phase 1: the owner's Friend Graph sub-CRDT. Replicates across
+    /// the owner's own devices via Flow A (owner-state sync). LWW-merged per
+    /// entry on `learned_at` via [`Self::apply_friend_update`]; `Revoked`
+    /// entries are tombstones (kept, not deleted). Absent on the wire when
+    /// empty (`skip_serializing_if` + `default`), so pre-ZEB-370 snapshots
+    /// load to an empty graph.
+    #[serde(
+        rename = "fg",
+        skip_serializing_if = "crate::friend_graph::FriendGraph::is_empty",
+        default
+    )]
+    pub friend_graph: crate::friend_graph::FriendGraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -782,6 +794,71 @@ impl OwnerState {
                 learned_at,
             },
         );
+        if was_present {
+            ApplyOutcome::Merged { old_id: None }
+        } else {
+            ApplyOutcome::Inserted
+        }
+    }
+
+    /// LWW-apply a friend entry for an `OwnerAddr`. Newer `learned_at` HLC
+    /// wins; an equal HLC with an identical payload is idempotent; an equal
+    /// HLC with a diverging payload is rejected (two replicas concurrently
+    /// issuing different entries under the same HLC would otherwise diverge
+    /// silently); an older HLC is rejected as stale.
+    ///
+    /// Equal-HLC semantics mirror `apply_owner_device_update`: `FriendEntry`
+    /// carries a payload separate from its HLC, so equal-HLC replay must
+    /// additionally check payload equality before treating it as idempotent.
+    /// `Revoked` is a tombstone (kept as state), so a strictly-newer revoke
+    /// cannot be silently resurrected by a stale `Active` from another device.
+    ///
+    /// See ZEB-370 §4.1 and the spec's "Revocation" note in §7.
+    pub fn apply_friend_update(
+        &mut self,
+        addr: crate::owner_state_types::OwnerAddr,
+        entry: crate::friend_graph::FriendEntry,
+    ) -> ApplyOutcome {
+        // Key↔master-key correspondence invariant. A `FriendEntry` is keyed by
+        // the friend's master `OwnerAddr` (their `owner_id`) AND carries their
+        // 32-byte `master_ed25519`; the two MUST refer to the same principal. A
+        // divergent entry (owner_id X paired with peer Y's master key) would
+        // make Phase-2 key establishment silently use the wrong identity.
+        // Re-derive the expected `owner_id` from the master key via the SAME
+        // primitive the rest of the codebase uses (`PubKeyBundle::
+        // classical_only(..).identity_hash()`, behind
+        // `friend_graph::owner_id_from_master_ed25519`) and reject any mismatch
+        // before LWW, so a bad entry never enters the CRDT (mirrors the
+        // identity-pub→device-hash gate in `apply_owner_device_update`).
+        if crate::friend_graph::owner_id_from_master_ed25519(&entry.master_ed25519) != addr {
+            return ApplyOutcome::Rejected(RejectionReason::InvariantFail(
+                "master_ed25519 does not derive to addr".into(),
+            ));
+        }
+        if let Some(existing) = self.friend_graph.friends.get(&addr) {
+            if existing
+                .learned_at
+                .is_strictly_newer_than(&entry.learned_at)
+            {
+                return ApplyOutcome::Rejected(RejectionReason::StaleHlc {
+                    kind: "friend_entry",
+                    device_id: entry.learned_at.device_id.clone(),
+                });
+            }
+            if existing.learned_at == entry.learned_at {
+                // Equal HLC — idempotent only if the full payload matches.
+                if existing == &entry {
+                    return ApplyOutcome::Merged { old_id: None };
+                }
+                return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                    "friend_entry for {:?} diverges at identical learned_at \
+                     (concurrent updates with same HLC but different payload)",
+                    addr
+                )));
+            }
+        }
+        let was_present = self.friend_graph.friends.contains_key(&addr);
+        self.friend_graph.friends.insert(addr, entry);
         if was_present {
             ApplyOutcome::Merged { old_id: None }
         } else {
@@ -3827,6 +3904,124 @@ mod outbox_tombstones_tests {
         assert!(
             recovered.outbox_tombstones.is_empty(),
             "fresh OwnerState must have empty outbox_tombstones"
+        );
+    }
+}
+
+#[cfg(test)]
+mod friend_graph_tests {
+    use super::*;
+    use crate::friend_graph::{
+        owner_id_from_master_ed25519, FriendEntry, FriendOrigin, FriendStatus,
+    };
+    use crate::owner_state_types::{Hlc, OwnerAddr};
+
+    /// A real `(OwnerAddr, master_ed25519)` pair derived from a seeded
+    /// `ed25519_dalek::SigningKey`, so the key↔master-key correspondence
+    /// invariant in `apply_friend_update` is satisfied. `apply_friend_update`
+    /// re-derives the `owner_id` from `master_ed25519`, so tests MUST key
+    /// entries by the derived addr (an arbitrary `[9u8; 16]` is rejected).
+    fn friend_pair(seed: u8) -> (OwnerAddr, [u8; 32]) {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let master_ed25519 = sk.verifying_key().to_bytes();
+        let addr = owner_id_from_master_ed25519(&master_ed25519);
+        (addr, master_ed25519)
+    }
+
+    fn entry(master_ed25519: [u8; 32], w: u64, st: FriendStatus) -> FriendEntry {
+        FriendEntry {
+            master_ed25519,
+            display: None,
+            status: st,
+            established_via: FriendOrigin::Token,
+            referrable: false,
+            learned_at: Hlc {
+                wall_ms: w,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn friend_lww_newer_wins_and_tombstone_sticks() {
+        let mut s = OwnerState::default();
+        let (addr, p) = friend_pair(0x91);
+        // First active → Inserted.
+        assert!(matches!(
+            s.apply_friend_update(addr, entry(p, 10, FriendStatus::Active)),
+            ApplyOutcome::Inserted
+        ));
+        // Newer revoke wins (tombstone) → Merged.
+        assert!(matches!(
+            s.apply_friend_update(addr, entry(p, 20, FriendStatus::Revoked)),
+            ApplyOutcome::Merged { old_id: None }
+        ));
+        assert_eq!(s.friend_graph.friends[&addr].status, FriendStatus::Revoked);
+        // Stale active (older HLC) must NOT resurrect → Rejected(StaleHlc).
+        assert!(matches!(
+            s.apply_friend_update(addr, entry(p, 15, FriendStatus::Active)),
+            ApplyOutcome::Rejected(RejectionReason::StaleHlc { .. })
+        ));
+        assert_eq!(s.friend_graph.friends[&addr].status, FriendStatus::Revoked);
+    }
+
+    #[test]
+    fn friend_equal_hlc_identical_is_idempotent() {
+        let mut s = OwnerState::default();
+        let (addr, p) = friend_pair(0x55);
+        assert!(matches!(
+            s.apply_friend_update(addr, entry(p, 10, FriendStatus::Active)),
+            ApplyOutcome::Inserted
+        ));
+        // Same HLC, identical payload → idempotent Merged.
+        assert!(matches!(
+            s.apply_friend_update(addr, entry(p, 10, FriendStatus::Active)),
+            ApplyOutcome::Merged { old_id: None }
+        ));
+    }
+
+    #[test]
+    fn friend_equal_hlc_diverging_payload_rejected() {
+        let mut s = OwnerState::default();
+        let (addr, p) = friend_pair(0x55);
+        assert!(matches!(
+            s.apply_friend_update(addr, entry(p, 10, FriendStatus::Active)),
+            ApplyOutcome::Inserted
+        ));
+        // Same HLC but a different status (diverging payload) → InvariantFail.
+        assert!(matches!(
+            s.apply_friend_update(addr, entry(p, 10, FriendStatus::Revoked)),
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+        ));
+    }
+
+    #[test]
+    fn friend_apply_rejects_addr_master_key_mismatch() {
+        let mut s = OwnerState::default();
+        let (addr_a, master_a) = friend_pair(0xa1);
+        let (addr_b, _master_b) = friend_pair(0xb2);
+        assert_ne!(addr_a, addr_b);
+
+        // Correctly-derived (addr, master_ed25519) pair → Inserted.
+        assert!(matches!(
+            s.apply_friend_update(addr_a, entry(master_a, 10, FriendStatus::Active)),
+            ApplyOutcome::Inserted
+        ));
+
+        // Mismatched pair: key by addr_b but carry peer A's master key → Rejected.
+        match s.apply_friend_update(addr_b, entry(master_a, 10, FriendStatus::Active)) {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("master_ed25519 does not derive to addr"),
+                    "expected addr↔master-key mismatch rejection; got: {msg}"
+                );
+            }
+            other => panic!("expected InvariantFail rejection, got {other:?}"),
+        }
+        assert!(
+            !s.friend_graph.friends.contains_key(&addr_b),
+            "mismatched entry must NOT enter the CRDT"
         );
     }
 }

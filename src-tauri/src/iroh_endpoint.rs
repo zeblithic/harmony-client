@@ -50,6 +50,10 @@ pub mod alpn {
     /// ZEB-329: self-test only — peer ping with 1-byte echo. Produces
     /// no app-level state; safe to ignore for all non-self-test code.
     pub const HARMONY_PING_V1: &[u8] = b"harmony/ping/v1";
+    /// ZEB-370: friend-link control protocol (`FriendLinkRequest` /
+    /// `FriendLinkAccepted`). Dispatched by the accept loop the same way
+    /// `HARMONY_HANDSHAKE_V1` is (see `iroh_friend_acceptor`).
+    pub const HARMONY_FRIEND_V1: &[u8] = b"harmony/friend/v1";
 }
 
 /// OS keychain coordinates for the persistent iroh `SecretKey`.
@@ -90,6 +94,7 @@ impl IrohEndpoint {
                 alpn::HARMONY_ZENOH_V1.to_vec(),
                 alpn::HARMONY_HANDSHAKE_V1.to_vec(),
                 alpn::HARMONY_PING_V1.to_vec(),
+                alpn::HARMONY_FRIEND_V1.to_vec(),
             ])
             .bind()
             .await
@@ -270,6 +275,7 @@ mod tests {
                 alpn::HARMONY_ZENOH_V1.to_vec(),
                 alpn::HARMONY_HANDSHAKE_V1.to_vec(),
                 alpn::HARMONY_PING_V1.to_vec(),
+                alpn::HARMONY_FRIEND_V1.to_vec(),
             ])
             .relay_mode(RelayMode::Disabled)
             .bind()
@@ -295,5 +301,6 @@ mod tests {
         assert_eq!(alpn::HARMONY_ZENOH_V1, b"harmony/zenoh/v1");
         assert_eq!(alpn::HARMONY_HANDSHAKE_V1, b"harmony/handshake/v1");
         assert_eq!(alpn::HARMONY_PING_V1, b"harmony/ping/v1");
+        assert_eq!(alpn::HARMONY_FRIEND_V1, b"harmony/friend/v1");
     }
 }
