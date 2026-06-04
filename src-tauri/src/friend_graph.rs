@@ -50,7 +50,11 @@ pub(crate) const MAX_FRIEND_DISPLAY_LEN: usize = 256;
 ///
 /// Infallible: any 32-byte value is a valid input to `identity_hash` (the
 /// classical bundle hashes the raw bytes; no point-decoding is performed).
-pub(crate) fn owner_id_from_master_ed25519(master_ed25519: &[u8; 32]) -> OwnerAddr {
+///
+/// `pub` so the ZEB-370 wire-format pinning fixtures (`tests/`) can derive the
+/// map key (the friend's `owner_id`) for a `FriendEntry` from a fixed master
+/// Ed25519 key — exactly the binding `apply_friend_update` enforces.
+pub fn owner_id_from_master_ed25519(master_ed25519: &[u8; 32]) -> OwnerAddr {
     OwnerAddr(PubKeyBundle::classical_only(*master_ed25519).identity_hash())
 }
 
