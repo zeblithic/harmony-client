@@ -34,6 +34,33 @@ use crate::owner_state_types::{deserialize_bytes_from_bstr, serialize_bytes_as_b
 use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
 use serde::{Deserialize, Serialize};
 
+/// Serde for `Option<[u8; 64]>` as an optional CBOR bstr (None → CBOR null /
+/// absent via skip_serializing_if; Some → bstr(64)). Lets `token_sig` be absent
+/// for Path A (no token) while keeping the Some-encoding byte-identical to a
+/// bare bstr(64).
+mod opt_bstr64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<[u8; 64]>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(b) => s.serialize_some(serde_bytes::Bytes::new(b)),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 64]>, D::Error> {
+        let opt: Option<serde_bytes::ByteBuf> = Option::deserialize(d)?;
+        match opt {
+            Some(b) => {
+                let arr: [u8; 64] = b
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom("token_sig must be 64 bytes"))?;
+                Ok(Some(arr))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 /// Maximum bytes the acceptor reads per friend-handshake packet. The wire shape
 /// is `[u32 LE length-prefix][body]`; any prefix exceeding this is rejected to
 /// defend against memory-exhaustion by an adversarial dialer. 256 KiB matches
@@ -51,10 +78,19 @@ pub const FRIEND_MAX_PACKET_LEN: usize = 256 * 1024;
 /// the request to a specific minted friend token (the ZEB-367 `InviteToken.sig`
 /// the inviter published Case-A), so an acceptor can `unregister_friend_token`
 /// the consumed one-shot.
+//
+// ZEB-371: this struct (and `FriendLinkAccepted`) gets EXPLICIT single-char
+// `#[serde(rename)]` on EVERY field. The struct went from field-name keys to
+// single-char keys to keep every map key equal-length (one byte) at this level,
+// which is what the codebase's canonical-CBOR convention wants and avoids any
+// length-driven key reordering surprises now that an optional field
+// (`token_sig`) can be absent. Renames: from_addr "a", display "n",
+// token_sig "t", eph_x25519_pub "e", enrollment "c", sig "s".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FriendLinkRequest {
     /// The requester's master `OwnerAddr` (their `owner_id`). MUST equal
     /// `enrollment.owner_id` (checked by `verify_enrolled_device`).
+    #[serde(rename = "a")]
     pub from_addr: OwnerAddr,
     /// The requester's advertised display name (UX hint). `None` when unset.
     ///
@@ -65,6 +101,7 @@ pub struct FriendLinkRequest {
     /// which would then fail to deserialize on the owner's other devices during
     /// owner-state sync.
     #[serde(
+        rename = "n",
         default,
         deserialize_with = "crate::friend_graph::deserialize_capped_display"
     )]
@@ -72,17 +109,33 @@ pub struct FriendLinkRequest {
     /// The friend-token signature being redeemed (the inviter's published
     /// `InviteToken.sig`). Bound into the request preimage; lets the acceptor
     /// unregister the consumed Case-A one-shot. Stored as a CBOR bstr(64).
+    ///
+    /// `Option` (ZEB-371): absent for the future Path-A (no-token) friend flow.
+    /// The `Some(_)` encoding is byte-identical to the old bare bstr(64) so only
+    /// the new `eph_x25519_pub` field changes the request hex.
     #[serde(
+        rename = "t",
+        with = "opt_bstr64",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub token_sig: Option<[u8; 64]>,
+    /// ZEB-371: requester's ephemeral X25519 public for the rendezvous-secret
+    /// ECDH. Stored as a CBOR bstr(32).
+    #[serde(
+        rename = "e",
         serialize_with = "serialize_bytes_as_bstr",
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
-    pub token_sig: [u8; 64],
+    pub eph_x25519_pub: [u8; 32],
     /// The requester's Master `EnrollmentCert` (their owner→device-#2 binding).
+    #[serde(rename = "c")]
     pub enrollment: EnrollmentCert,
     /// Requester's device-#2 Ed25519 signature over
-    /// `friend_request_sig_preimage(from_addr, token_sig)`. Stored as a CBOR
-    /// bstr(64).
+    /// `friend_request_sig_preimage(from_addr, token_sig, eph_x25519_pub)`.
+    /// Stored as a CBOR bstr(64).
     #[serde(
+        rename = "s",
         serialize_with = "serialize_bytes_as_bstr",
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
@@ -96,10 +149,15 @@ pub struct FriendLinkRequest {
 /// [`friend_accept_sig_preimage`]`(from_addr, token_sig)`, where `token_sig` is
 /// the same token signature from the originating request (binding the accept to
 /// the request it answers).
+//
+// ZEB-371: single-char renames on every field, consistent with
+// `FriendLinkRequest`: from_addr "a", display "n", eph_x25519_pub "e",
+// enrollment "c", sig "s".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FriendLinkAccepted {
     /// The accepter's master `OwnerAddr` (their `owner_id`). MUST equal
     /// `enrollment.owner_id`.
+    #[serde(rename = "a")]
     pub from_addr: OwnerAddr,
     /// The accepter's advertised display name (UX hint). `None` when unset.
     ///
@@ -107,16 +165,27 @@ pub struct FriendLinkAccepted {
     /// `FriendLinkRequest.display` — matters for the future Task-10 redeem path
     /// that turns an accept into a local `FriendEntry`.
     #[serde(
+        rename = "n",
         default,
         deserialize_with = "crate::friend_graph::deserialize_capped_display"
     )]
     pub display: Option<String>,
+    /// ZEB-371: accepter's ephemeral X25519 public for the rendezvous-secret
+    /// ECDH. Stored as a CBOR bstr(32).
+    #[serde(
+        rename = "e",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub eph_x25519_pub: [u8; 32],
     /// The accepter's Master `EnrollmentCert`.
+    #[serde(rename = "c")]
     pub enrollment: EnrollmentCert,
     /// Accepter's device-#2 Ed25519 signature over
-    /// `friend_accept_sig_preimage(from_addr, token_sig)`. Stored as a CBOR
-    /// bstr(64).
+    /// `friend_accept_sig_preimage(from_addr, token_sig, eph_x25519_pub)`.
+    /// Stored as a CBOR bstr(64).
     #[serde(
+        rename = "s",
         serialize_with = "serialize_bytes_as_bstr",
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
@@ -125,29 +194,46 @@ pub struct FriendLinkAccepted {
 
 /// Canonical preimage bytes the requester's device-#2 key signs for a
 /// [`FriendLinkRequest`]. A small CBOR-encoded tuple `("hfr1", from_addr,
-/// token_sig)` — the `"hfr1"` domain tag makes a friend-request signature
-/// unmistakable for any other Ed25519 signature this device produces.
-pub fn friend_request_sig_preimage(from_addr: OwnerAddr, token_sig: &[u8; 64]) -> Vec<u8> {
-    sig_preimage("hfr1", from_addr, token_sig)
+/// token_sig, eph)` — the `"hfr1"` domain tag makes a friend-request signature
+/// unmistakable for any other Ed25519 signature this device produces. ZEB-371:
+/// the signature now binds the requester's ephemeral X25519 public key (so an
+/// attacker can't swap the rendezvous key) and the optional token.
+pub fn friend_request_sig_preimage(
+    from_addr: OwnerAddr,
+    token_sig: Option<&[u8; 64]>,
+    eph_x25519_pub: &[u8; 32],
+) -> Vec<u8> {
+    sig_preimage("hfr1", from_addr, token_sig, eph_x25519_pub)
 }
 
 /// Canonical preimage bytes the accepter's device-#2 key signs for a
 /// [`FriendLinkAccepted`]. Domain-separated from the request preimage by the
 /// `"hfa1"` tag so a request signature can never be replayed as an accept.
-pub fn friend_accept_sig_preimage(from_addr: OwnerAddr, token_sig: &[u8; 64]) -> Vec<u8> {
-    sig_preimage("hfa1", from_addr, token_sig)
+/// ZEB-371: binds the accepter's ephemeral X25519 public key + optional token.
+pub fn friend_accept_sig_preimage(
+    from_addr: OwnerAddr,
+    token_sig: Option<&[u8; 64]>,
+    eph_x25519_pub: &[u8; 32],
+) -> Vec<u8> {
+    sig_preimage("hfa1", from_addr, token_sig, eph_x25519_pub)
 }
 
-/// Shared preimage builder. The `[u8;64]` is wrapped via `serde_bytes` so it
-/// encodes as a CBOR bstr (not a 64-element array), keeping the preimage compact
-/// and stable.
-fn sig_preimage(domain: &'static str, from_addr: OwnerAddr, token_sig: &[u8; 64]) -> Vec<u8> {
+/// Shared preimage builder. The byte arrays are wrapped via `serde_bytes` so
+/// they encode as CBOR bstrs (not N-element arrays), keeping the preimage
+/// compact and stable. `token_sig` is `Option` (absent for the future Path-A
+/// no-token flow); `None` vs `Some` produces a distinct preimage.
+fn sig_preimage(
+    domain: &'static str,
+    from_addr: OwnerAddr,
+    token_sig: Option<&[u8; 64]>,
+    eph_x25519_pub: &[u8; 32],
+) -> Vec<u8> {
     #[derive(Serialize)]
     struct Preimage<'a> {
         domain: &'a str,
         from_addr: OwnerAddr,
-        #[serde(with = "serde_bytes")]
-        token_sig: &'a [u8; 64],
+        token_sig: Option<&'a serde_bytes::Bytes>,
+        eph: &'a serde_bytes::Bytes,
     }
     let mut out = Vec::new();
     // Infallible for this fixed-shape value; an encode error would be a logic
@@ -156,7 +242,8 @@ fn sig_preimage(domain: &'static str, from_addr: OwnerAddr, token_sig: &[u8; 64]
         &Preimage {
             domain,
             from_addr,
-            token_sig,
+            token_sig: token_sig.map(|t| serde_bytes::Bytes::new(t)),
+            eph: serde_bytes::Bytes::new(eph_x25519_pub),
         },
         &mut out,
     )
@@ -382,12 +469,19 @@ pub fn process_friend_request(
     // 1. Authenticate the requester's cert → enrolled device-#2 key.
     let device_key = verify_enrolled_device(&req.enrollment, req.from_addr)?;
 
-    // 2. Verify the request signature over the canonical preimage.
+    // 2. Verify the request signature over the canonical preimage (now binds the
+    // requester's ephemeral X25519 key + optional token).
     let vk = VerifyingKey::from_bytes(&device_key)
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
-    let preimage = friend_request_sig_preimage(req.from_addr, &req.token_sig);
+    let preimage =
+        friend_request_sig_preimage(req.from_addr, req.token_sig.as_ref(), &req.eph_x25519_pub);
     vk.verify_strict(&preimage, &Signature::from_bytes(&req.sig))
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
+
+    // ZEB-371: generate this side's ephemeral X25519 keypair for the rendezvous
+    // secret. The secret half is unused THIS task (sealed_secret stays None);
+    // it's consumed in the next task to derive + seal the friendship secret.
+    let (_self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
 
     // 3. Extract the requester's master key (their friend-graph anchor).
     let master_ed25519 = master_ed25519_from_cert(&req.enrollment)?;
@@ -401,6 +495,8 @@ pub fn process_friend_request(
         established_via: FriendOrigin::Token,
         referrable: false,
         learned_at,
+        // ZEB-371 Task 7: derive + seal the secret from (_self_eph_sk,
+        // req.eph_x25519_pub) here.
         sealed_secret: None,
     };
     match state.apply_friend_update(req.from_addr, entry) {
@@ -411,12 +507,15 @@ pub fn process_friend_request(
     }
 
     // 6. Build + sign the mutual accept reply. The accept sig binds to the same
-    // token_sig as the request it answers (domain-separated from the request).
-    let accept_preimage = friend_accept_sig_preimage(self_owner, &req.token_sig);
+    // token_sig as the request it answers (domain-separated from the request)
+    // plus this side's ephemeral X25519 public.
+    let accept_preimage =
+        friend_accept_sig_preimage(self_owner, req.token_sig.as_ref(), &self_eph_pub);
     let sig = self_device2.sign(&accept_preimage).to_bytes();
     Ok(FriendLinkAccepted {
         from_addr: self_owner,
         display: self_display,
+        eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment.clone(),
         sig,
     })
@@ -636,7 +735,14 @@ where
         // token THIS node actually minted + published and currently has live. A
         // self-signed request carrying an arbitrary `token_sig` we never minted
         // is rejected here — no friend written, no accept sent.
-        self.token_gate_open(&req.token_sig).await?;
+        //
+        // ZEB-371: `token_sig` is now optional on the wire (Path-A no-token flow
+        // is future work). This token-gated path REQUIRES a token, so an absent
+        // one fails closed exactly like an unminted one.
+        let token_sig = req.token_sig.ok_or(FriendAcceptError::TokenNotLive {
+            reason: "request carried no token_sig (token-gated path requires one)",
+        })?;
+        self.token_gate_open(&token_sig).await?;
 
         // Run the pure core under the CRDT lock with a fresh HLC.
         let learned_at = self.next_hlc().await;
@@ -856,24 +962,31 @@ mod tests {
     use ed25519_dalek::Signer;
 
     /// Build a signed, well-formed `FriendLinkRequest` from a test owner.
-    fn signed_request(owner_seed: u8, token_sig: [u8; 64]) -> (FriendLinkRequest, [u8; 32]) {
+    /// Returns the request, the requester's enrolled device verify-key, and the
+    /// (deterministic-per-run) ephemeral X25519 public key it committed to.
+    fn signed_request(
+        owner_seed: u8,
+        token_sig: [u8; 64],
+    ) -> (FriendLinkRequest, [u8; 32], [u8; 32]) {
         let owner = mint_test_owner(owner_seed);
         let device_key = owner.cert.device_pubkeys.classical.ed25519_verify;
-        let preimage = friend_request_sig_preimage(owner.owner, &token_sig);
+        let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+        let preimage = friend_request_sig_preimage(owner.owner, Some(&token_sig), &eph_pub);
         let sig = owner.device_key.sign(&preimage).to_bytes();
         let req = FriendLinkRequest {
             from_addr: owner.owner,
             display: Some("alice".into()),
-            token_sig,
+            token_sig: Some(token_sig),
+            eph_x25519_pub: eph_pub,
             enrollment: owner.cert,
             sig,
         };
-        (req, device_key)
+        (req, device_key, eph_pub)
     }
 
     #[test]
     fn friend_request_round_trips() {
-        let (req, _) = signed_request(0x21, [9u8; 64]);
+        let (req, _, _) = signed_request(0x21, [9u8; 64]);
         let bytes = encode_friend_request(&req).expect("encode");
         let back = decode_friend_request(&bytes).expect("decode");
         assert_eq!(req, back);
@@ -885,6 +998,7 @@ mod tests {
         let acc = FriendLinkAccepted {
             from_addr: owner.owner,
             display: None,
+            eph_x25519_pub: [0x77; 32],
             enrollment: owner.cert,
             sig: [4u8; 64],
         };
@@ -912,7 +1026,7 @@ mod tests {
         // than MAX_FRIEND_DISPLAY_LEN through the handshake. The cap is enforced
         // at decode (wire ingress), mirroring FriendEntry.display.
         use crate::friend_graph::MAX_FRIEND_DISPLAY_LEN;
-        let (mut req, _) = signed_request(0x40, [3u8; 64]);
+        let (mut req, _, _) = signed_request(0x40, [3u8; 64]);
 
         // 257-byte display → must FAIL to decode.
         req.display = Some("x".repeat(MAX_FRIEND_DISPLAY_LEN + 1));
@@ -939,6 +1053,7 @@ mod tests {
         let mut acc = FriendLinkAccepted {
             from_addr: owner.owner,
             display: Some("x".repeat(MAX_FRIEND_DISPLAY_LEN + 1)),
+            eph_x25519_pub: [0x77; 32],
             enrollment: owner.cert,
             sig: [4u8; 64],
         };
@@ -963,7 +1078,7 @@ mod tests {
         // FIX 2: a valid request packet with extra trailing bytes appended (still
         // within FRIEND_MAX_PACKET_LEN) must be rejected; the clean packet still
         // round-trips.
-        let (req, _) = signed_request(0x42, [5u8; 64]);
+        let (req, _, _) = signed_request(0x42, [5u8; 64]);
         let bytes = encode_friend_request(&req).expect("encode");
 
         // Clean packet round-trips.
@@ -988,6 +1103,7 @@ mod tests {
         let acc = FriendLinkAccepted {
             from_addr: owner.owner,
             display: None,
+            eph_x25519_pub: [0x77; 32],
             enrollment: owner.cert,
             sig: [6u8; 64],
         };
@@ -1063,22 +1179,39 @@ mod tests {
     fn request_signature_verifies_against_enrolled_key_and_tamper_fails() {
         use ed25519_dalek::{Signature, VerifyingKey};
         let token_sig = [7u8; 64];
-        let (req, device_key) = signed_request(0x36, token_sig);
+        let (req, device_key, _eph_pub) = signed_request(0x36, token_sig);
 
         // The enrolled device key resolved from the cert must verify the sig
         // over the request preimage.
         let resolved = verify_enrolled_device(&req.enrollment, req.from_addr).expect("valid cert");
         assert_eq!(resolved, device_key);
         let vk = VerifyingKey::from_bytes(&resolved).expect("vk");
-        let preimage = friend_request_sig_preimage(req.from_addr, &req.token_sig);
+        let preimage =
+            friend_request_sig_preimage(req.from_addr, req.token_sig.as_ref(), &req.eph_x25519_pub);
         vk.verify_strict(&preimage, &Signature::from_bytes(&req.sig))
             .expect("untampered sig verifies");
 
         // A tampered sig (or a preimage over a different token_sig) must fail.
-        let bad_preimage = friend_request_sig_preimage(req.from_addr, &[0u8; 64]);
+        let bad_preimage =
+            friend_request_sig_preimage(req.from_addr, Some(&[0u8; 64]), &req.eph_x25519_pub);
         assert!(vk
             .verify_strict(&bad_preimage, &Signature::from_bytes(&req.sig))
             .is_err());
+    }
+
+    #[test]
+    fn request_preimage_binds_ephemeral_key() {
+        let eph = [0x42u8; 32];
+        let p1 = friend_request_sig_preimage(OwnerAddr([1; 16]), Some(&[9u8; 64]), &eph);
+        let mut eph2 = eph;
+        eph2[0] ^= 1;
+        let p2 = friend_request_sig_preimage(OwnerAddr([1; 16]), Some(&[9u8; 64]), &eph2);
+        assert_ne!(
+            p1, p2,
+            "a different ephemeral key must change the signed preimage"
+        );
+        let p3 = friend_request_sig_preimage(OwnerAddr([1; 16]), None, &eph);
+        assert_ne!(p1, p3, "None vs Some(token) must differ");
     }
 
     #[test]
@@ -1106,7 +1239,7 @@ mod tests {
         use ed25519_dalek::{Signature, VerifyingKey};
         let me = mint_test_owner(0x60); // the acceptor (self)
         let token_sig = [0x5a; 64];
-        let (req, _requester_device) = signed_request(0x61, token_sig);
+        let (req, _requester_device, _req_eph) = signed_request(0x61, token_sig);
 
         let mut state = OwnerState::default();
         let accepted = process_friend_request(
@@ -1143,7 +1276,13 @@ mod tests {
         let self_device_key = verify_enrolled_device(&accepted.enrollment, accepted.from_addr)
             .expect("self cert verifies");
         let vk = VerifyingKey::from_bytes(&self_device_key).expect("vk");
-        let accept_preimage = friend_accept_sig_preimage(accepted.from_addr, &token_sig);
+        // The accept binds the accepter's own (randomly-generated) ephemeral key,
+        // which we read back off the returned accept.
+        let accept_preimage = friend_accept_sig_preimage(
+            accepted.from_addr,
+            Some(&token_sig),
+            &accepted.eph_x25519_pub,
+        );
         vk.verify_strict(&accept_preimage, &Signature::from_bytes(&accepted.sig))
             .expect("accept sig verifies against self enrolled device key");
     }
@@ -1151,7 +1290,7 @@ mod tests {
     #[test]
     fn process_friend_request_rejects_bad_signature_and_writes_nothing() {
         let me = mint_test_owner(0x62);
-        let (mut req, _) = signed_request(0x63, [0x11; 64]);
+        let (mut req, _, _) = signed_request(0x63, [0x11; 64]);
         // Corrupt the request signature.
         req.sig[0] ^= 0xFF;
 
@@ -1181,14 +1320,16 @@ mod tests {
         let requester = mint_test_owner(0x65);
         let imposter = mint_test_owner(0x66);
         let token_sig = [0x22; 64];
+        let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
         // Sign with the imposter's owner addr in the preimage so the request is
         // internally consistent except for the cert↔from_addr binding.
-        let preimage = friend_request_sig_preimage(imposter.owner, &token_sig);
+        let preimage = friend_request_sig_preimage(imposter.owner, Some(&token_sig), &eph_pub);
         let sig = imposter.device_key.sign(&preimage).to_bytes();
         let req = FriendLinkRequest {
             from_addr: imposter.owner, // claims to be imposter…
             display: None,
-            token_sig,
+            token_sig: Some(token_sig),
+            eph_x25519_pub: eph_pub,
             enrollment: requester.cert, // …but presents requester's cert
             sig,
         };

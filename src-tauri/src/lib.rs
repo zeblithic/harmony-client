@@ -33243,14 +33243,23 @@ pub async fn connectivity_link_friend_iroh_inner(
             }
         };
 
-    // 5. Build + device-#2-sign the FriendLinkRequest.
+    // 5. Build + device-#2-sign the FriendLinkRequest. ZEB-371: generate this
+    // side's ephemeral X25519 keypair for the rendezvous secret. The secret half
+    // is unused THIS task (we leave the friend entry's sealed_secret None below);
+    // it's consumed in the next task to derive + seal the friendship secret.
+    let (_self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
     let req_sig = self_device2_signing_key
-        .sign(&friend_request_sig_preimage(self_owner, &payload.token.sig))
+        .sign(&friend_request_sig_preimage(
+            self_owner,
+            Some(&payload.token.sig),
+            &self_eph_pub,
+        ))
         .to_bytes();
     let request = FriendLinkRequest {
         from_addr: self_owner,
         display: self_display,
-        token_sig: payload.token.sig,
+        token_sig: Some(payload.token.sig),
+        eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment,
         sig: req_sig,
     };
@@ -33346,7 +33355,11 @@ pub async fn connectivity_link_friend_iroh_inner(
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
     accept_vk
         .verify_strict(
-            &friend_accept_sig_preimage(payload.inviter_addr, &payload.token.sig),
+            &friend_accept_sig_preimage(
+                payload.inviter_addr,
+                Some(&payload.token.sig),
+                &accepted.eph_x25519_pub,
+            ),
             &Signature::from_bytes(&accepted.sig),
         )
         .map_err(|_| "friend accept signature invalid".to_string())?;
@@ -33371,6 +33384,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         established_via: crate::friend_graph::FriendOrigin::Token,
         referrable: false,
         learned_at,
+        // ZEB-371 Task 7: derive+seal from (_self_eph_sk, accepted.eph_x25519_pub).
         sealed_secret: None,
     };
     {
