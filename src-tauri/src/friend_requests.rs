@@ -5,7 +5,8 @@
 //! until the user explicitly accepts. The user-facing accept/decline/add IPCs
 //! (the NEXT task) reach this store via the `Arc<PendingFriendRequests>` parked
 //! on `NodeState`:
-//!   * accept → [`PendingFriendRequests::mark_approved`] (so the requester's
+//!   * accept → [`PendingFriendRequests::approve`] (atomically removes the
+//!     inbound entry from the inbox AND marks the requester approved so their
 //!     NEXT dial passes the consent gate via `prior_accept`),
 //!   * decline → [`PendingFriendRequests::decline`] (drop the inbound + any
 //!     approval),
@@ -77,7 +78,25 @@ impl PendingFriendRequests {
     /// Mark `addr` as approved (the user tapped Accept). The approval persists
     /// until the link completes ([`take_approved`](Self::take_approved)) or the
     /// user declines ([`decline`](Self::decline)).
+    ///
+    /// Prefer [`approve`](Self::approve) for the accept-IPC path — it also
+    /// removes the entry from the pending inbox atomically.
     pub fn mark_approved(&self, addr: OwnerAddr) {
+        self.approved
+            .lock()
+            .expect("pending approved mutex poisoned")
+            .insert(addr);
+    }
+
+    /// The user accepted `addr`: drop it from the pending inbox AND record the
+    /// approval (so the requester's next dial completes via `prior_accept`). The
+    /// inbox no longer shows it; the friend appears in the friends list once the
+    /// link completes.
+    pub fn approve(&self, addr: OwnerAddr) {
+        self.inbound
+            .lock()
+            .expect("pending inbound mutex poisoned")
+            .remove(&addr);
         self.approved
             .lock()
             .expect("pending approved mutex poisoned")
@@ -148,13 +167,31 @@ mod tests {
     fn approve_then_take_consumes_once() {
         let store = PendingFriendRequests::new();
         assert!(!store.is_approved(&addr(3)), "unknown addr is not approved");
-        store.mark_approved(addr(3));
+        store.approve(addr(3));
         assert!(store.is_approved(&addr(3)));
         // take_approved removes + returns true the first time…
         assert!(store.take_approved(&addr(3)));
         // …and false thereafter (consumed).
         assert!(!store.take_approved(&addr(3)));
         assert!(!store.is_approved(&addr(3)));
+    }
+
+    #[test]
+    fn approve_clears_inbox_and_records_approval() {
+        let store = PendingFriendRequests::new();
+        store.record_inbound(addr(8), Some("bob".into()), 1_000);
+        store.approve(addr(8));
+        assert!(
+            store.list().is_empty(),
+            "approved request leaves the pending inbox"
+        );
+        assert!(
+            store.is_approved(&addr(8)),
+            "approval recorded for the next dial"
+        );
+        // one-shot completion still consumes the approval
+        assert!(store.take_approved(&addr(8)));
+        assert!(!store.take_approved(&addr(8)));
     }
 
     #[test]

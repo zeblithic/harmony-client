@@ -34523,7 +34523,7 @@ async fn accept_friend_request(
     let Some(store) = store else {
         return Err(OWNER_NOT_LOADED_MSG.into());
     };
-    store.mark_approved(addr);
+    store.approve(addr);
     // Refresh the UI (friend list + pending inbox both re-fetch on this event).
     let _ = app.emit("friend-list-changed", ());
     Ok(())
@@ -34667,6 +34667,12 @@ fn classify_pending_outcome() -> AddFriendOutcome {
 /// `Ok(AddFriendOutcome::Unreachable)`. A dial/IO failure returns `Err(String)`.
 /// A garbage/unauthenticated `Accepted` reply returns `Err` — it MUST NOT write
 /// a friend.
+///
+/// Like [`connectivity_link_friend_iroh_inner`], this function writes the
+/// `FriendEntry` on a `Linked` outcome but the CALLER (the `add_friend_by_key`
+/// IPC wrapper) is responsible for `notify_dirty()` (owner-state sync) and
+/// `sync_case_d_handles` (Case-D publication) — a direct caller such as an
+/// integration test must trigger those itself.
 #[allow(clippy::too_many_arguments)]
 pub async fn connectivity_add_friend_by_key_inner(
     identity_pub_hex: String,
