@@ -170,8 +170,13 @@ pub struct FriendEntry {
     /// ZEB-371: the per-friendship rendezvous secret, KeyTree-sealed
     /// (`owner_state_crypto::encrypt_friend_secret`). `None` for legacy Phase-1
     /// entries and for `Pending`/`Revoked` entries. Opaque bytes; never stored
-    /// or logged in the clear.
-    #[serde(rename = "k", skip_serializing_if = "Option::is_none", default)]
+    /// or logged in the clear. Stored as a CBOR bstr (major type 2) per spec §3.3.
+    #[serde(
+        rename = "k",
+        with = "serde_bytes",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub sealed_secret: Option<Vec<u8>>,
 }
 
