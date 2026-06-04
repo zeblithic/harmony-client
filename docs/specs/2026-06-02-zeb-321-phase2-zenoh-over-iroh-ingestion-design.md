@@ -87,10 +87,11 @@ deliverable, not throwaway.
 
 Keep the **one existing Zenoh session**; make iroh "just another link." A vendored `zenoh-link`
 fork adds `iroh/<hex>` to Zenoh's own closed dispatch, routed to a harmony-registered factory that
-builds the already-complete `IrohZenohLinkManager` with **Zenoh's own** `NewLinkChannelSender`.
-Inbound iroh links then surface as real Zenoh peer transports; `session.open_link("iroh/<hex>")`
-routes through the existing `new_link()` dialer. This is the clean end state the original spec
-wanted (vs. per-peer sessions or a loopback byte-bridge, the considered fallbacks).
+returns the already-complete `IrohZenohLinkManager`; a forwarder feeds accepted inbound links into
+**Zenoh's own** `NewLinkChannelSender`. Inbound iroh links then surface as real Zenoh peer
+transports; outbound peers seeded into `connect/endpoints` route through the existing `new_link()`
+dialer. This is the clean end state the original spec wanted (vs. per-peer sessions or a loopback
+byte-bridge, the considered fallbacks).
 
 ## What already exists (Phase 1, reusable as-is)
 
@@ -133,43 +134,68 @@ unit test in the vendored crate (`try_from("iroh/<hex>") == Iroh`; `make` with a
 returns the dummy; `make` without a registered factory errors rather than panics), and a short
 `vendor/zenoh-link/README` note explaining the fork + re-vendor procedure.
 
-## Task 2 — harmony-side registration + delete the drain
+## Task 2 — harmony-side registration + inbound forwarder (replace the drain)
 
-Replace the Phase-1 placeholder (lib.rs:2523-2575, 5078) with the real wiring:
+**Design constraint (from code exploration):** harmony's iroh accept loop handles ALL ALPNs on one
+endpoint — `HARMONY_ZENOH_V1` *and* the device-handshake / friend / ping ALPNs. So we must NOT
+rebuild the manager inside the factory (that would entangle the handshake path). Instead keep
+Phase-1's `IrohZenohLinkManager` + `spawn_accept_loop` unchanged, and **replace the drain with a
+forwarder** that feeds Zenoh's real sender.
 
-- **Register the factory before `zenoh::open`.** The factory closure must NOT capture a specific
-  iroh `Endpoint`/resolver directly — harmony restarts the node (identity switch) with a fresh
-  endpoint each cycle, and the `OnceLock` is set once for the process. Instead the closure reads a
-  **swappable context slot** (e.g. `Arc<ArcSwapOption<IrohSessionCtx>>` holding the current
-  `Endpoint` + `ReachabilityResolver`), which `start_node` updates on each start. Zenoh invokes the
-  factory once per session (per `zenoh::open`), so each session picks up the current context. *(This
-  avoids the identity-switch staleness bug class — cf. ZEB-352/353 getCallSession/getVoiceSession.)*
-- **The factory builds `IrohZenohLinkManager::new(ctx.endpoint, ctx.resolver, zenoh_sender)`** with
-  **Zenoh's** `NewLinkChannelSender` (the `make` argument), not a hand-created one — so accepted
-  links land in Zenoh's transport-accept queue.
-- **Delete** the hand-created channel (lib.rs:2543), the drain task (lib.rs:2559-2560), the
-  `iroh_inbound_drain_handle` field + its abort/move plumbing (lib.rs:755, 844, 999, 2523, 5078,
-  38335). Inbound iroh links become live peer transports carrying state-root pub/sub.
+- **Keep** the Phase-1 manager build (lib.rs:2545-2551) + accept loop (lib.rs:2575). Keep
+  `new_link_rx` (do NOT drop it) — the accept loop pushes `HARMONY_ZENOH_V1` links into it.
+- **Register the factory once, before `zenoh::open`.** Because `IROH_LINK_MANAGER_FACTORY` is a
+  process-global `OnceLock` but the node restarts (identity switch) with a fresh endpoint/manager
+  each cycle, the closure reads a **swappable context slot** — a module-level
+  `static IROH_SESSION_CTX: OnceLock<Arc<Mutex<Option<IrohSessionCtx>>>>` (std `Mutex`, not
+  `arc-swap` — not a dep) holding `{ manager: Arc<IrohZenohLinkManager>, new_link_rx:
+  flume::Receiver<LinkUnicast> }`. `start_node` fills it; `stop_node` clears it. *(Reading a
+  swappable slot, not capturing the endpoint, avoids the identity-switch staleness bug class — cf.
+  ZEB-352/353 getCallSession/getVoiceSession.)*
+- **The factory** (invoked once per session by Zenoh): reads the ctx; **spawns the forwarder** task
+  `while let Ok(link) = new_link_rx.recv_async().await { if zenoh_sender.send_async(link).await
+  .is_err() { break } }` (`zenoh_sender` is the `make` argument — Zenoh's real
+  `NewLinkChannelSender`); and **returns `ctx.manager.clone()` as the `LinkManagerUnicast`** so Zenoh
+  uses harmony's existing manager for outbound `new_link`. The forwarder exits when its send fails
+  (old session's sender dropped) — clean across restarts.
+- **Delete** the drain task (lib.rs:2559-2567) + the `iroh_inbound_drain_handle` field and its
+  abort/move plumbing (lib.rs:750-755, 844-845, 999, 2523, 5078, 38335). Inbound iroh links now flow
+  accept loop → `new_link_rx` → forwarder → Zenoh's accept queue → live peer transport.
 
-## Task 3 — outbound link driver
+## Task 3 — outbound dial via static `connect/endpoints` seeding
 
-`new_link()` exists but nothing calls it for peers. Add a small event-loop task:
-- Trigger: `ReachabilityResolver` updates (the `connectivity-reachability-changed` signal already
-  fires from the delta consumer).
-- Action: for each peer in communities I belong to, if no live Zenoh link to their iroh `NodeId`
-  exists, `session.open_link("iroh/<hex node id>")` (routes through the now-registered `new_link()`).
-  De-dup against existing links; back off + retry on dial failure (reuse the iroh dial timeouts).
-- Closes the loop: discovery (resolver) → dial (`new_link`) → Zenoh peer link → CRDT sync.
+**Dial-mechanism finding (ZEB-368 spike):** zenoh 1.9.0 has NO public on-demand dial —
+`session.open_link` does not exist; a runtime `connect/endpoints` insert is rejected (only
+`plugins/` keys) and unwatched; the live `TransportManager` is `pub(crate)`. The one PROVEN public
+path is **static `connect/endpoints` seeded before `zenoh::open`**, which dials through our manager
+via the orchestrator's startup connect (`connect_peers` → `peer_connector` →
+`open_transport_unicast` → `new_link_manager_unicast` → `LinkKind::try_from("iroh")` → our factory
+manager → `new_link`). Truly-dynamic mid-session dial is deferred to
+[ZEB-373](https://linear.app/zeblith/issue/ZEB-373) (needs zenoh's `internal` feature or a 2nd
+vendored patch).
+
+- In `event_loop::run`, **before** `zenoh::open` (event_loop.rs:585-603): enumerate community peers
+  — `community_registry.known_ids()` → per community materialized `members` filtered to `Joined` →
+  per joined `OwnerAddr` `resolver.resolve(owner)` → each `payload.iroh_node_id` →
+  `iroh/<hex(node_id)>` locator. De-dup node-ids (a member may appear in several communities); skip
+  our own node-id.
+- Seed all such locators into `connect/endpoints` the same way the existing LAN endpoint is set:
+  `config.insert_json5("connect/endpoints", "[\"iroh/<hex>\", ...]")`, merged with any existing
+  connect endpoint.
+- Runs once per session; on node restart the set is recomputed from the current resolver. Since a
+  zenoh transport is bidirectional once formed, one side dialing suffices — combined with inbound
+  accept, the known-peer graph connects and heals on each reconnect.
 
 ## Task 4 — inbound listener trigger + locator protocol + lifecycle
 
-- **Accept-loop trigger (replaces the manual `spawn_accept_loop`).** Add `iroh/<self EndpointId
-  64-hex>` to the Zenoh `Config` `listen/endpoints` (alongside the existing `connect/endpoints` set
-  at event_loop.rs:585-603). Zenoh then creates the iroh manager via the factory and calls
-  `IrohZenohLinkManager::new_listener("iroh/<self>")`, which **starts the accept loop** (harmony's
-  iroh `Endpoint` is already bound; `new_listener` only begins accepting `HARMONY_ZENOH_V1` streams
-  and pushing them into Zenoh's sender). This makes inbound-only nodes (that never dial) still create
-  the manager and accept — the gap a lazy, dial-only trigger would leave.
+- **Factory-invocation trigger (NOT a new accept loop).** Add `iroh/<self EndpointId 64-hex>` to the
+  Zenoh `Config` `listen/endpoints` (alongside the `connect/endpoints` set at event_loop.rs:585-603).
+  This forces Zenoh to create the iroh manager via the factory at `zenoh::open` — which **starts the
+  forwarder and registers harmony's manager** — even on inbound-only / no-known-peer nodes that would
+  otherwise never invoke it (no `connect/endpoints` iroh entries). harmony's existing
+  `spawn_accept_loop` still owns the accept loop (unchanged from Phase 1);
+  `IrohZenohLinkManager::new_listener("iroh/<self>")` is a no-op returning the locator (the iroh
+  `Endpoint` is already bound), so Zenoh records the listener locator without double-binding.
 - **Locator protocol.** `iroh/<64-hex>` is registered by the Task-1 fork (`IROH_LOCATOR_PREFIX` +
   `try_from`); the scheme matches what `new_link()` already parses.
 - **Lifecycle.** Give `del_listener` / link teardown real behavior: close iroh QUIC streams cleanly
@@ -213,10 +239,16 @@ CRDT pub/sub end-to-end.** Spec B adds:
   transport/listener in its locator set.
 - **Inbound:** an inbound `IrohZenohLink` handed to the registered manager surfaces as a Zenoh peer
   transport (not dropped).
-- **Two-node, LAN-disabled integration test (the acceptance test for the arc):** nodes A and B with
-  LAN/mDNS scouting disabled, `ReachabilityResolver` seeded with each other's iroh routing; A
-  `open_link`s B over iroh; a community state-root published on A merges on B (and vice-versa). This
-  is the proof that cross-WAN sync works.
+- **Seam tests (in-process, automated):** (a) a single zenoh session opened with the factory
+  registered + an `iroh/<self>` listen endpoint reports the iroh listener in its locator set
+  (registration); (b) the inbound forwarder moves a link from `new_link_rx` into a stand-in
+  `NewLinkChannelSender` (forwarder); (c) the `connect/endpoints` seeding builder produces the
+  expected `iroh/<hex>` set from a seeded resolver (outbound). The existing
+  `community_reachability_two_engine_integration` continues to cover the iroh link layer.
+- **Full two-node cross-WAN sync** (A dials B, state-root merges both ways) is validated as a
+  **two-machine smoke** (ZEB-330 / Koya↔KRILE bring-up), NOT in one process: the factory + swappable
+  ctx are a process-global singleton (correct for production's one-node-per-process model), so two
+  live sessions can't share them in a single test process.
 
 ## Relationship to Spec A & sequencing
 
@@ -230,13 +262,15 @@ loop for ZEB-330. DM-over-iroh remains a separate, later track.
 - DM transport migration to iroh (DMs stay on Reticulum; separate track).
 - pkarr discovery changes (cases A/B/C already shipped in ZEB-323).
 - The per-peer-session / loopback-bridge fallbacks (only revisited if the fork is later abandoned).
+- **Dynamic mid-session outbound dial** — deferred to [ZEB-373](https://linear.app/zeblith/issue/ZEB-373).
+  This PR dials only peers known at `zenoh::open` (static `connect/endpoints`); see Task 3.
 
-## Open questions for review
+## Resolved decisions (Jake, 2026-06-04)
 
-1. **Vendored-crate location & form.** `src-tauri/vendor/zenoh-link/` (in-repo path patch) vs. a
-   separate git fork referenced by `[patch]`. The spec assumes **in-repo vendor** (self-contained,
-   no second repo to maintain, diffs in the same PR). Confirm.
-2. **`listen/endpoints` vs factory-starts-accept-loop** for the inbound trigger. The spec picks
-   `listen/endpoints` (zenoh-native, covers inbound-only nodes). If `new_listener` wiring proves
-   awkward, the fallback is to start the accept loop inside the factory and additionally force-create
-   the manager at boot — noted but not preferred.
+1. **Vendored-crate form:** in-repo vendor at `src-tauri/vendor/zenoh-link/` (self-contained, one
+   PR, no second repo). ✅
+2. **Inbound trigger:** the `listen/endpoints` iroh entry forces the factory (→ forwarder + manager
+   registration) to run at `zenoh::open` even for inbound-only / no-known-peer nodes; harmony's
+   existing `spawn_accept_loop` still owns the accept loop. ✅
+3. **Outbound dial:** static `connect/endpoints` seeding now; dynamic mid-session dial deferred to
+   ZEB-373. ✅
