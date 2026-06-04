@@ -45,6 +45,21 @@ export interface PkarrHealthSummary {
   recentFallbackEvents: PkarrFallbackHit[];
 }
 
+export interface DynamicDialHit {
+  nodeIdShort: string;
+  ownerShort: string;
+  outcome: string; // "succeeded" | "failed"
+  capturedAtMs: number;
+}
+
+export interface DialHealthSummary {
+  attempts: number;
+  succeeded: number;
+  failed: number;
+  skippedDuplicate: number;
+  recent: DynamicDialHit[];
+}
+
 export interface NetworkHealthSnapshot {
   schemaVersion: number;
   capturedAtMs: number;
@@ -53,6 +68,8 @@ export interface NetworkHealthSnapshot {
   myNetwork: MyNetworkSummary | null;
   peers: PeerHealth[];
   pkarrStatus: PkarrHealthSummary;
+  /** ZEB-373: dial telemetry — present from schema v2 onward. */
+  dialStatus?: DialHealthSummary;
 }
 
 export type StepOutcome =
