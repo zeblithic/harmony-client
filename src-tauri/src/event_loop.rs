@@ -629,8 +629,13 @@ pub async fn run<R: Runtime>(
     // open even on inbound-only / no-known-peer nodes. new_listener is a no-op that
     // returns the locator (harmony's spawn_accept_loop already owns the accept loop).
     if let Some(ref ih) = iroh_handles {
-        let self_loc = format!("\"iroh/{}\"", hex::encode(ih.endpoint.node_id().as_bytes()));
-        if let Err(e) = config.insert_json5("listen/endpoints", &format!("[{self_loc}]")) {
+        // MERGE iroh into the listen set: insert_json5 overwrites (no merge), so we
+        // must re-include Zenoh's default peer TCP listener (`tcp/[::]:0`) or the LAN
+        // transport is silently dropped (CodeRabbit PR#188). Helper keeps both.
+        let eps = crate::iroh_zenoh_registration::iroh_listen_endpoints_json(
+            ih.endpoint.node_id().as_bytes(),
+        );
+        if let Err(e) = config.insert_json5("listen/endpoints", &eps) {
             let e = format!("zenoh config error (listen/endpoints): {e}");
             let _ = ready_tx.send(Err(e));
             return;

@@ -40,9 +40,12 @@ async fn forward_inbound_links(
     while let Ok(link) = rx.recv_async().await {
         if zenoh_sender.send_async(link).await.is_err() {
             tracing::debug!("ZEB-368: iroh inbound forwarder stopping (zenoh sender closed)");
-            break;
+            return;
         }
     }
+    // rx errored → harmony's accept-loop sender was dropped (node stop). Log the
+    // other shutdown edge too so a hung/early-exiting forwarder is diagnosable.
+    tracing::debug!("ZEB-368: iroh inbound forwarder stopping (harmony sender closed)");
 }
 
 /// Register the global iroh link-manager factory exactly once per process.
@@ -65,8 +68,13 @@ pub fn ensure_iroh_factory_registered() {
             tokio::spawn(forward_inbound_links(rx, zenoh_sender));
             Ok(manager)
         });
-        // Ignore "already registered" — within one process this runs once.
-        let _ = zenoh_link::register_iroh_link_manager_factory(factory);
+        // Our local REGISTERED OnceLock guarantees this closure runs once per
+        // process, so register() is expected to succeed. An Err means something
+        // else already claimed the global factory slot — unexpected; surface it
+        // rather than silently masking a double-registration bug.
+        if let Err(e) = zenoh_link::register_iroh_link_manager_factory(factory) {
+            tracing::warn!("ZEB-368: unexpected iroh factory registration failure: {e}");
+        }
     });
 }
 
@@ -88,4 +96,40 @@ pub fn iroh_connect_locators(
         }
     }
     out
+}
+
+/// Build the `listen/endpoints` JSON array that ADDS our own `iroh/<hex>` listener
+/// locator (which forces the factory to run at `zenoh::open`, starting the inbound
+/// forwarder even on inbound-only nodes) while PRESERVING Zenoh's default peer TCP
+/// listener `tcp/[::]:0`.
+///
+/// `Config::insert_json5` OVERWRITES the path — it does not merge — so emitting an
+/// iroh-only array here would silently drop the default TCP listener and kill the
+/// existing LAN zenoh transport. Keep both. (CodeRabbit, PR #188.)
+pub fn iroh_listen_endpoints_json(self_node_id: &[u8; 32]) -> String {
+    format!("[\"tcp/[::]:0\", \"iroh/{}\"]", hex::encode(self_node_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listen_endpoints_preserve_default_tcp_listener() {
+        let nid = [0xABu8; 32];
+        let json = iroh_listen_endpoints_json(&nid);
+        // Must keep Zenoh's default peer TCP listener so the LAN transport survives…
+        assert!(
+            json.contains("tcp/[::]:0"),
+            "listen endpoints must preserve the default TCP peer listener: {json}"
+        );
+        // …and add our own iroh listener locator to trigger the factory at open.
+        assert!(
+            json.contains(&format!("iroh/{}", hex::encode(nid))),
+            "listen endpoints must include the self iroh locator: {json}"
+        );
+        // Valid JSON array of exactly those two endpoints.
+        let parsed: Vec<String> = serde_json::from_str(&json).expect("valid JSON array");
+        assert_eq!(parsed.len(), 2, "exactly tcp + iroh: {json}");
+    }
 }

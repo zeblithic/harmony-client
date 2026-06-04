@@ -121,6 +121,7 @@ In `src-tauri/vendor/zenoh-link/` (verbatim copy of `zenoh-link` 1.9.0, version 
    route.
 7. `LocatorInspector::is_multicast`: `LinkKind::Iroh => Ok(false)` (iroh is unicast).
 8. `LinkManagerBuilderUnicast::make`: `LinkKind::Iroh =>` dispatch to the registered factory:
+
    ```rust
    pub type IrohLinkManagerFactory =
        Arc<dyn Fn(NewLinkChannelSender) -> ZResult<LinkManagerUnicast> + Send + Sync>;
