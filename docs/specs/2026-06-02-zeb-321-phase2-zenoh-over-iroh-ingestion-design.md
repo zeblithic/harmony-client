@@ -1,75 +1,242 @@
 # ZEB-321 Phase 2 — iroh as a first-class Zenoh transport (cross-WAN sync)
 
-- **Status:** design approved 2026-06-02
-- **Spec B of the cross-WAN community arc** (Spec A = Phase 4 invite-only `generate_invite`, separate doc — ships first)
+- **Status:** design approved 2026-06-02; **revised 2026-06-04** after the Task-1 de-risking spike (see revision note)
+- **Ticket:** [ZEB-368](https://linear.app/zeblith/issue/ZEB-368)
+- **Branch:** `zeb-368-register-iroh-zenoh-transport` (off `origin/main` `2cc2b35`)
+- **Spec B of the cross-WAN community arc** (Spec A = Phase 4 invite-only `generate_invite`, shipped — ZEB-367 PR #184)
 - **Unblocks:** ongoing cross-WAN CRDT sync after a join; completes [ZEB-330](https://linear.app/zeblith/issue/ZEB-330) cross-device validation alongside Spec A
 - **Builds on:** ZEB-321 Phase 1 (iroh endpoint + `IrohZenohLinkManager`/`IrohZenohLink` + accept loop + `ReachabilityResolver`, all shipped)
 
+> **Revision note (2026-06-04).** The original spec proposed registering `IrohZenohLinkManager`
+> with Zenoh's `TransportManager` via one of two in-process seams (candidate 1: a `TransportManager`
+> builder / `zenoh::init`; candidate 2: a transport plugin). The Task-1 de-risking spike **proved
+> both impossible at zenoh 1.9.0** — Zenoh has no public *or* `#[internal]`-gated API to register a
+> custom unicast transport, and its locator→transport dispatch is a **closed `LinkKind` enum** that
+> rejects any unknown scheme before a manager ever runs. Jake chose the **vendored-fork** path. This
+> document is rewritten around that approach, whose feasibility is now **empirically proven** (see
+> "Spike result"). See also `reference_zenoh_no_custom_transport` in agent memory.
+
+---
+
 ## Problem
 
-ZEB-321 Phase 1 built the iroh transport plumbing but **never connected it to the running Zenoh session**. Inbound iroh→Zenoh links are accepted by the accept loop and then **discarded** by a drain task:
+ZEB-321 Phase 1 built the iroh transport plumbing but **never connected it to the running Zenoh
+session**. Inbound iroh→Zenoh links are accepted by the accept loop and then **discarded** by a
+drain task:
 
 ```rust
-// lib.rs:2544-2552 — Phase 1 placeholder
-// "ZEB-321 Phase 1: discarding inbound iroh/zenoh link (Zenoh session ingestion deferred to Phase 2)"
-tokio::spawn(async move { while let Ok(_link) = new_link_rx.recv_async().await { /* drop */ } });
+// lib.rs:2543 — Phase 1 hand-created channel (NOT Zenoh's)
+let (new_link_tx, new_link_rx) = flume::unbounded::<zenoh_link::LinkUnicast>();
+// lib.rs:2546 — manager built with that hand-created sender
+let link_mgr = IrohZenohLinkManager::new(/* ep */, /* resolver */, new_link_tx);
+// lib.rs:2559-2560 — Phase 1 placeholder: the accept loop's output is dropped
+iroh_inbound_drain_handle = Some(tokio::spawn(async move {
+    while let Ok(_link) = new_link_rx.recv_async().await { /* drop */ }
+}));
+// lib.rs:2575 — accept loop runs but feeds the drain
+iroh_accept_handle = Some(link_mgr.spawn_accept_loop());
 ```
 
-Root cause: `zenoh::open(config)` (zenoh 1.9.0) exposes **no public API to register a custom `LinkManagerUnicastTrait`**. `IrohZenohLinkManager` is fully implemented and holds a `NewLinkChannelSender`, but that channel was **hand-created** in `lib.rs:2528` — it is *not* the channel Zenoh's internal `TransportManager` owns and polls. So inbound links cannot reach the session, and outbound `iroh/<hex>` locators aren't routed. Cross-WAN community state sync therefore does not work even after a join.
+Root cause: `zenoh::open(config)` (zenoh 1.9.0) exposes **no public API to register a custom
+`LinkManagerUnicastTrait`**. `IrohZenohLinkManager` is fully implemented and holds a
+`NewLinkChannelSender`, but that channel was **hand-created** — it is *not* the channel Zenoh's
+internal `TransportManager` owns and polls. So inbound links cannot reach the session, and outbound
+`iroh/<hex>` locators aren't routed. Cross-WAN community state sync therefore does not work even
+after a join.
 
-## Approach — register iroh as a real Zenoh unicast transport
+---
 
-Make the **existing** Zenoh session own the iroh transport, so iroh is "just another link": inbound iroh links become real peer transports, and `session.open_link("iroh/<hex>")` routes through the already-built `IrohZenohLinkManager::new_link()` dialer. The community engines keep publishing to the one session unchanged; Zenoh simply has more links. This is the clean end state (vs. per-peer sessions or a loopback byte-bridge, which were the considered fallbacks).
+## Spike result — why we fork `zenoh-link` (the proven facts)
+
+The spike read the zenoh 1.9.0 registry source and built a proof-of-concept. Findings (each with a
+source citation, all verified):
+
+1. **Locator dispatch is a closed enum.** `zenoh-link 1.9.0` `LinkKind`
+   (`src/lib.rs:84-96`) has variants only for tcp/udp/tls/quic/ws/serial/unixpipe/vsock.
+   `LinkKind::try_from` (`lib.rs:136-189`) ends in `_ => bail!("Unicast not supported for {}
+   protocol")`. An `iroh/<hex>` locator is rejected **there**, before any link manager runs, on both
+   the accept and `open_link` paths.
+2. **No injection seam.** `zenoh::open` builds the `TransportManager` privately inside
+   `RuntimeBuilder::build()`; neither it, `TransportManagerBuilder`, nor `TransportManager` exposes
+   any "add a custom `LinkManagerUnicast`" method, and the live managers map is `pub(super)`, filled
+   only by the closed `LinkManagerBuilderUnicast::make`. `#[zenoh_macros::internal]` makes
+   `zenoh::init`/`RuntimeBuilder` *reachable* but opens no link-registration seam. The plugin trait
+   (`zenoh-plugin-trait`) has zero transport/link hooks.
+3. **The fork works — proven empirically.** `zenoh-link` is a **single-file crate** (`src/lib.rs`).
+   A `[patch.crates-io] zenoh-link = { path = "vendor/zenoh-link" }` replaces it **graph-wide** —
+   `cargo tree` confirms `zenoh-transport`'s own edge resolves to our vendored copy, so
+   *zenoh-transport's own dispatch compiles against and runs our code*. We don't inject a manager;
+   **we become the dispatch.**
+4. **The fork stays a single crate.** Every `LinkKind` consumer *outside* `zenoh-link` (in
+   `zenoh-transport`) uses it only as a `HashMap` key / `Vec` element or as the output of
+   `try_from`/`new_supported_links` (both in the crate we patch). There is **no exhaustive `match`
+   on `LinkKind` variants anywhere but `zenoh-link` itself**, so adding `LinkKind::Iroh` cannot
+   cascade compile errors into any crate we don't already own.
+5. **No dependency cycle.** The patched `make` can't import harmony types (cycle). Instead the
+   vendored crate exposes a process-global **factory `OnceLock`**; harmony-app registers a closure
+   (capturing its iroh `Endpoint` + `ReachabilityResolver`) *before* `zenoh::open`, and the patched
+   `make` calls it. zenoh-link depends on nothing of harmony's.
+
+The PoC (`vendor/zenoh-link/`, **already on the branch**) adds the `Iroh` variant + the factory and
+**compiles clean** (`cargo build -p zenoh-link` → `Finished`, exit 0). It is the real Task-1
+deliverable, not throwaway.
+
+---
+
+## Approach — vendored fork of `zenoh-link` that teaches Zenoh the `iroh` scheme
+
+Keep the **one existing Zenoh session**; make iroh "just another link." A vendored `zenoh-link`
+fork adds `iroh/<hex>` to Zenoh's own closed dispatch, routed to a harmony-registered factory that
+builds the already-complete `IrohZenohLinkManager` with **Zenoh's own** `NewLinkChannelSender`.
+Inbound iroh links then surface as real Zenoh peer transports; `session.open_link("iroh/<hex>")`
+routes through the existing `new_link()` dialer. This is the clean end state the original spec
+wanted (vs. per-peer sessions or a loopback byte-bridge, the considered fallbacks).
 
 ## What already exists (Phase 1, reusable as-is)
 
-`IrohZenohLink` (full `LinkUnicastTrait` over an iroh QUIC bidi stream, `zenoh_iroh_link.rs`); `IrohZenohLinkManager` (full `LinkManagerUnicastTrait`, `zenoh_iroh_transport.rs:129`) including a **complete outbound `new_link()`** that resolves a peer's iroh routing via `ReachabilityResolver` and dials `HARMONY_ZENOH_V1`; the accept loop (`spawn_accept_loop`); the boot-window handshake queue; the live `ReachabilityResolver` (fed by `ReachabilityAnnounce` CRDT deltas at `lib.rs:3427` + boot replay at `lib.rs:3915`). **The only missing pieces are the session-integration seam and the outbound driver.**
+`IrohZenohLink` (full `LinkUnicastTrait` over an iroh QUIC bidi stream, `zenoh_iroh_link.rs`);
+`IrohZenohLinkManager` (full `LinkManagerUnicastTrait`, `zenoh_iroh_transport.rs:129`) including a
+**complete outbound `new_link()`** that resolves a peer's iroh routing via `ReachabilityResolver`
+and dials `HARMONY_ZENOH_V1`; the accept loop (`spawn_accept_loop`); the boot-window handshake
+queue; the live `ReachabilityResolver` (fed by `ReachabilityAnnounce` CRDT deltas + boot replay).
+**The only missing pieces are the session-integration seam (now the fork) and the outbound driver.**
 
-## Task 1 — de-risking spike: confirm the registration seam (the known-unknown)
+---
 
-The whole spec rests on getting `IrohZenohLinkManager` registered with Zenoh's `TransportManager`. Zenoh 1.9.0 has no documented public injection point, so Task 1 establishes the seam, trying candidates in order of cleanliness:
+## Task 1 — vendored `zenoh-link` fork + iroh dispatch + factory seam  *(DONE — spike artifact)*
 
-1. **`zenoh-transport` `TransportManager` builder.** harmony already depends on `zenoh-link` (it implements `LinkManagerUnicastTrait`). Check whether it can depend on `zenoh-transport` and construct/open the session via a `TransportManager` that has the iroh `LinkManagerUnicast` added — replacing bare `zenoh::open(config)` with the lower-level builder path (if `zenoh` re-exports or feature-gates it).
-2. **Compiled-in transport plugin** via `zenoh-plugin-trait` (already a transitive dep, `Cargo.lock`): register the iroh transport through Zenoh's plugin/config initialization before `open()` completes, so Zenoh hands the manager its own internal `NewLinkChannelSender`.
-3. **Blocked at 1.9.0 → escalate.** If neither in-process path is reachable, stop and re-evaluate the **per-peer-session fallback** (open a `zenoh::Session` over each iroh connection + bridge pub/sub into the engines) before proceeding. The fallback is a materially different spec, so this gate prevents discovering the blocker mid-build.
+In `src-tauri/vendor/zenoh-link/` (verbatim copy of `zenoh-link` 1.9.0, version kept at `1.9.0` so
+`[patch]` satisfies zenoh/zenoh-transport's `=1.9.0` pin), with `[patch.crates-io]` in
+`src-tauri/Cargo.toml`. Eight coordinated additions teach the crate the `iroh` scheme **panic-safely**:
 
-**Deliverable:** the concrete registration call site + which candidate worked. Everything below assumes Task 1 succeeded with candidate 1 or 2.
+1. `pub const IROH_LOCATOR_PREFIX: &str = "iroh";`
+2. `LinkKind::Iroh` enum variant.
+3. `LinkKind::try_from`: `IROH_LOCATOR_PREFIX => Ok(LinkKind::Iroh)` (ungated — always present).
+4. `LinkKind::new_supported_links`: push `Iroh` for `"iroh"`.
+5. `ALL_SUPPORTED_LINKS`: include `LinkKind::Iroh` (so the default supported-link set carries iroh).
+6. `LocatorInspector::is_reliable`: `LinkKind::Iroh => Ok(true)` (iroh QUIC streams are reliable).
+   **Critical:** this and (7) have `_ => unreachable!()` catch-alls; `is_multicast` is called on
+   every locator during routing, so an unhandled `Iroh` would *panic the session*, not just fail to
+   route.
+7. `LocatorInspector::is_multicast`: `LinkKind::Iroh => Ok(false)` (iroh is unicast).
+8. `LinkManagerBuilderUnicast::make`: `LinkKind::Iroh =>` dispatch to the registered factory:
+   ```rust
+   pub type IrohLinkManagerFactory =
+       Arc<dyn Fn(NewLinkChannelSender) -> ZResult<LinkManagerUnicast> + Send + Sync>;
+   static IROH_LINK_MANAGER_FACTORY: OnceLock<IrohLinkManagerFactory> = OnceLock::new();
+   pub fn register_iroh_link_manager_factory(f: IrohLinkManagerFactory) -> ZResult<()>; // set-once
+   // in make(): LinkKind::Iroh => factory(manager_sender), else bail "factory not registered"
+   ```
 
-## Task 2 — inbound ingestion (delete the drain)
+**Status: implemented and compiling on the branch** (the spike). Remaining Task-1 polish: a
+unit test in the vendored crate (`try_from("iroh/<hex>") == Iroh`; `make` with a dummy factory
+returns the dummy; `make` without a registered factory errors rather than panics), and a short
+`vendor/zenoh-link/README` note explaining the fork + re-vendor procedure.
 
-Once registered, **Zenoh's `TransportManager` supplies its own `NewLinkChannelSender`** to `IrohZenohLinkManager` at construction (replacing the hand-created channel at `lib.rs:2528`). The accept loop already sends each established `IrohZenohLink` into that sender — so it now lands in Zenoh's transport-accept queue. **Delete the `lib.rs:2544-2552` drain task** and the manual channel. Inbound iroh links become live peer transports carrying state-root pub/sub.
+## Task 2 — harmony-side registration + delete the drain
+
+Replace the Phase-1 placeholder (lib.rs:2523-2575, 5078) with the real wiring:
+
+- **Register the factory before `zenoh::open`.** The factory closure must NOT capture a specific
+  iroh `Endpoint`/resolver directly — harmony restarts the node (identity switch) with a fresh
+  endpoint each cycle, and the `OnceLock` is set once for the process. Instead the closure reads a
+  **swappable context slot** (e.g. `Arc<ArcSwapOption<IrohSessionCtx>>` holding the current
+  `Endpoint` + `ReachabilityResolver`), which `start_node` updates on each start. Zenoh invokes the
+  factory once per session (per `zenoh::open`), so each session picks up the current context. *(This
+  avoids the identity-switch staleness bug class — cf. ZEB-352/353 getCallSession/getVoiceSession.)*
+- **The factory builds `IrohZenohLinkManager::new(ctx.endpoint, ctx.resolver, zenoh_sender)`** with
+  **Zenoh's** `NewLinkChannelSender` (the `make` argument), not a hand-created one — so accepted
+  links land in Zenoh's transport-accept queue.
+- **Delete** the hand-created channel (lib.rs:2543), the drain task (lib.rs:2559-2560), the
+  `iroh_inbound_drain_handle` field + its abort/move plumbing (lib.rs:755, 844, 999, 2523, 5078,
+  38335). Inbound iroh links become live peer transports carrying state-root pub/sub.
 
 ## Task 3 — outbound link driver
 
-`new_link()` exists but nothing calls it for peers, and the manager wasn't registered. Add a small event-loop task:
-- Trigger: `ReachabilityResolver` updates (the `connectivity-reachability-changed` signal already fires from the delta consumer at `lib.rs:3427`).
-- Action: for each peer in communities I belong to, if no live Zenoh link to their iroh `NodeId` exists, `session.open_link("iroh/<hex node id>")` (routes through the now-registered `new_link()`). De-dup against existing links; back off + retry on dial failure (reuse the iroh dial timeouts).
-- This closes the loop: discovery (resolver) → dial (new_link) → Zenoh peer link → CRDT sync.
+`new_link()` exists but nothing calls it for peers. Add a small event-loop task:
+- Trigger: `ReachabilityResolver` updates (the `connectivity-reachability-changed` signal already
+  fires from the delta consumer).
+- Action: for each peer in communities I belong to, if no live Zenoh link to their iroh `NodeId`
+  exists, `session.open_link("iroh/<hex node id>")` (routes through the now-registered `new_link()`).
+  De-dup against existing links; back off + retry on dial failure (reuse the iroh dial timeouts).
+- Closes the loop: discovery (resolver) → dial (`new_link`) → Zenoh peer link → CRDT sync.
 
-## Task 4 — locator protocol + lifecycle
+## Task 4 — inbound listener trigger + locator protocol + lifecycle
 
-- Register the `iroh/<64-hex>` locator protocol so Zenoh's config/locator parser accepts and dispatches it to the iroh manager (part of Task 1's registration, called out separately because the locator scheme must match what `new_link()` already parses — a 64-char hex `EndpointId`).
-- Lifecycle: give `del_listener` / link teardown real behavior — close iroh QUIC streams cleanly on session shutdown and when a peer drops out of the resolver, so links don't leak.
+- **Accept-loop trigger (replaces the manual `spawn_accept_loop`).** Add `iroh/<self EndpointId
+  64-hex>` to the Zenoh `Config` `listen/endpoints` (alongside the existing `connect/endpoints` set
+  at event_loop.rs:585-603). Zenoh then creates the iroh manager via the factory and calls
+  `IrohZenohLinkManager::new_listener("iroh/<self>")`, which **starts the accept loop** (harmony's
+  iroh `Endpoint` is already bound; `new_listener` only begins accepting `HARMONY_ZENOH_V1` streams
+  and pushing them into Zenoh's sender). This makes inbound-only nodes (that never dial) still create
+  the manager and accept — the gap a lazy, dial-only trigger would leave.
+- **Locator protocol.** `iroh/<64-hex>` is registered by the Task-1 fork (`IROH_LOCATOR_PREFIX` +
+  `try_from`); the scheme matches what `new_link()` already parses.
+- **Lifecycle.** Give `del_listener` / link teardown real behavior: close iroh QUIC streams cleanly
+  on session shutdown and when a peer drops out of the resolver, so links don't leak.
+
+---
+
+## Maintenance & risk (the fork tax — explicit)
+
+- **The vendored crate is pinned to zenoh 1.9.0.** On any zenoh upgrade we must re-vendor
+  `zenoh-link` at the new version and re-apply the 8 additions (one file, ~40 added lines). A
+  `vendor/zenoh-link/README` documents the procedure and the diff. The version stays exactly
+  matched so `[patch]` keeps satisfying zenoh/zenoh-transport's `=X.Y.Z` pin.
+- **CI/build:** the `[patch]` invalidates the cached zenoh-link sub-chain once (the spike's 8m11s
+  cold recompile); steady-state builds are normal. `clippy -p harmony-app` does **not** lint the
+  patched dependency, so the fork can't trip the harmony `-D warnings` gate; the vendored crate
+  nonetheless compiles warning-clean. MSRV: vendored crate `rust-version = 1.75` and it uses only
+  `std::sync::OnceLock` (stable 1.70) — within harmony's 1.88 MSRV gate.
+- **Security posture:** we now carry a fork of a networking dependency. Mitigation: the diff is
+  tiny and additive (a new scheme + a factory hook; no change to existing transports), and the
+  README pins the upstream commit so a reviewer can diff our copy against pristine 1.9.0.
 
 ## Error handling
 
-- Spike escalation (Task 1 candidate failure) → hard stop + documented fallback decision, not a silent partial wiring.
-- Outbound dial failure (peer unreachable / pkarr miss) → logged, backed-off retry; never blocks the session or LAN links.
-- A malformed `iroh/<hex>` locator → reject at parse (existing `new_link` behavior), surfaced as a Zenoh link error.
+- A missing factory registration → the patched `make` returns a Zenoh link error (NOT a panic) so a
+  misconfigured boot surfaces cleanly.
+- Outbound dial failure (peer unreachable / pkarr miss) → logged, backed-off retry; never blocks the
+  session or LAN links.
+- A malformed `iroh/<hex>` locator → reject at parse (existing `new_link` behavior), surfaced as a
+  Zenoh link error.
 
 ## Testing (closes a real coverage gap)
 
-Today the only iroh-transport test drives the link trait directly (`paired_stream_roundtrip_via_loopback`); **nothing exercises `zenoh::open` + the iroh transport + CRDT pub/sub end-to-end.** Spec B adds:
-- **Registration test:** a session opened via the Task 1 seam reports the iroh transport/listener in its locator set.
-- **Inbound:** an inbound `IrohZenohLink` handed to the registered manager surfaces as a Zenoh peer transport (not dropped).
-- **Two-node, LAN-disabled integration test (the acceptance test for the arc):** nodes A and B with LAN/mDNS scouting disabled, `ReachabilityResolver` seeded with each other's iroh routing; A `open_link`s B over iroh; a community state-root published on A merges on B (and vice-versa). This is the proof that cross-WAN sync works.
+Today the only iroh-transport test drives the link trait directly
+(`paired_stream_roundtrip_via_loopback`); **nothing exercises `zenoh::open` + the iroh transport +
+CRDT pub/sub end-to-end.** Spec B adds:
+- **Vendored-crate unit tests:** `LinkKind::try_from("iroh/<hex>") == Iroh`; `make` dispatches to a
+  registered dummy factory; `make` without registration errors (no panic); `is_multicast`/`is_reliable`
+  return `Ok(false)`/`Ok(true)` for iroh (the panic-safety guard).
+- **Registration test:** a session opened with an `iroh/<self>` listen endpoint reports the iroh
+  transport/listener in its locator set.
+- **Inbound:** an inbound `IrohZenohLink` handed to the registered manager surfaces as a Zenoh peer
+  transport (not dropped).
+- **Two-node, LAN-disabled integration test (the acceptance test for the arc):** nodes A and B with
+  LAN/mDNS scouting disabled, `ReachabilityResolver` seeded with each other's iroh routing; A
+  `open_link`s B over iroh; a community state-root published on A merges on B (and vice-versa). This
+  is the proof that cross-WAN sync works.
 
 ## Relationship to Spec A & sequencing
 
-Spec A (invite-only generate) makes a cross-WAN **join** succeed (snapshot embedded in the invite + iroh-handshake countersign). Spec B makes **ongoing** messages flow afterward. Ship order is forced: **A → B**. Together they close the cross-WAN community loop for ZEB-330. DM-over-iroh remains a separate, later track.
+Spec A (invite-only generate, ZEB-367) makes a cross-WAN **join** succeed (snapshot embedded in the
+invite + iroh-handshake countersign). Spec B makes **ongoing** messages flow afterward. Ship order
+was forced: **A → B**; A is merged, so B is unblocked. Together they close the cross-WAN community
+loop for ZEB-330. DM-over-iroh remains a separate, later track.
 
 ## Out of scope
 
 - DM transport migration to iroh (DMs stay on Reticulum; separate track).
 - pkarr discovery changes (cases A/B/C already shipped in ZEB-323).
-- The per-peer-session / loopback-bridge fallbacks (only revisited if Task 1 escalates).
+- The per-peer-session / loopback-bridge fallbacks (only revisited if the fork is later abandoned).
+
+## Open questions for review
+
+1. **Vendored-crate location & form.** `src-tauri/vendor/zenoh-link/` (in-repo path patch) vs. a
+   separate git fork referenced by `[patch]`. The spec assumes **in-repo vendor** (self-contained,
+   no second repo to maintain, diffs in the same PR). Confirm.
+2. **`listen/endpoints` vs factory-starts-accept-loop** for the inbound trigger. The spec picks
+   `listen/endpoints` (zenoh-native, covers inbound-only nodes). If `new_listener` wiring proves
+   awkward, the fallback is to start the accept loop inside the factory and additionally force-create
+   the manager at boot — noted but not preferred.
