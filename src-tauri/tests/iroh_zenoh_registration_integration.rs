@@ -309,7 +309,7 @@ async fn forwarder_inner() {
     ));
     let _accept_b = mgr_b.spawn_accept_loop();
 
-    let dial_ep = EndPoint::new("iroh", &hex::encode(ep_a.node_id().as_bytes()), "", "")
+    let dial_ep = EndPoint::new("iroh", hex::encode(ep_a.node_id().as_bytes()), "", "")
         .expect("construct dial locator for ep_a");
     let link_b = mgr_b
         .new_link(dial_ep)
