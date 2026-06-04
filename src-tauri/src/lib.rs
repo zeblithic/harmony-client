@@ -4680,17 +4680,41 @@ pub(crate) async fn start_node_inner(
                             .with_auto_accept_known(friend_auto_accept_known_for_state),
                         );
 
-                        // Multiplex both acceptors behind the single dispatcher
-                        // slot the accept loop drives. The accept loop forwards
-                        // BOTH `harmony/handshake/v1` and `harmony/friend/v1`
-                        // here; the multiplexer re-reads `conn.alpn()` and
-                        // routes friend → friend_acceptor, else → invite.
+                        // ZEB-375 (Friends Phase 2a): build the friend-PEX
+                        // referral-catalog acceptor from the SAME read-only
+                        // sources the friend acceptor uses (crdt_state,
+                        // hlc_tracker, self_owner, this device's own
+                        // EnrollmentCert + device-#2 signing key). It is strictly
+                        // read-only — no app handle, no pkarr publisher, no
+                        // keytree — and serves a signed catalog on the
+                        // `harmony/friend-pex/v1` ALPN.
+                        let pex_acceptor: std::sync::Arc<
+                            dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
+                        > = std::sync::Arc::new(
+                            crate::iroh_pex_acceptor::IrohFriendPexAcceptor::new(
+                                std::sync::Arc::clone(&crdt_state),
+                                std::sync::Arc::clone(&tracker),
+                                device_id.clone(),
+                                self_owner,
+                                own_enrollment_cert_for_friend.clone(),
+                                std::sync::Arc::clone(&community_signing_key_arc),
+                            ),
+                        );
+
+                        // Multiplex all three acceptors behind the single
+                        // dispatcher slot the accept loop drives. The accept loop
+                        // forwards `harmony/handshake/v1`, `harmony/friend/v1`,
+                        // and `harmony/friend-pex/v1` here; the multiplexer
+                        // re-reads `conn.alpn()` and routes friend →
+                        // friend_acceptor, friend-pex → pex_acceptor, else →
+                        // invite.
                         let dispatcher: std::sync::Arc<
                             dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
                         > = std::sync::Arc::new(
                             crate::iroh_friend_acceptor::MultiplexHandshakeDispatcher::new(
                                 invite_acceptor,
                                 friend_acceptor,
+                                pex_acceptor,
                             ),
                         );
                         if let Err(_dispatcher_back) =

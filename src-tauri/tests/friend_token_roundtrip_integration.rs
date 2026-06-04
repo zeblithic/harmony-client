@@ -245,14 +245,18 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
             None,
             Some(Arc::clone(&friend_pub)),
         ));
-        // No invite traffic in this test; a stub invite dispatcher satisfies the
-        // multiplexer's invite slot (only the friend ALPN is ever dialed here).
+        // No invite or PEX traffic in this test; stub dispatchers satisfy the
+        // multiplexer's invite + PEX slots (only the friend ALPN is ever dialed
+        // here).
         let invite_stub: Arc<dyn harmony_app::iroh_invite_acceptor::IrohHandshakeDispatcher> =
+            Arc::new(NoopDispatcher);
+        let pex_stub: Arc<dyn harmony_app::iroh_invite_acceptor::IrohHandshakeDispatcher> =
             Arc::new(NoopDispatcher);
         let alice_dispatcher: Arc<dyn harmony_app::iroh_invite_acceptor::IrohHandshakeDispatcher> =
             Arc::new(MultiplexHandshakeDispatcher::new(
                 invite_stub,
                 alice_friend_acceptor,
+                pex_stub,
             ));
         if alice_link_mgr
             .install_handshake_dispatcher(alice_dispatcher)

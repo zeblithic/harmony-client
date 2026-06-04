@@ -54,6 +54,11 @@ pub mod alpn {
     /// `FriendLinkAccepted`). Dispatched by the accept loop the same way
     /// `HARMONY_HANDSHAKE_V1` is (see `iroh_friend_acceptor`).
     pub const HARMONY_FRIEND_V1: &[u8] = b"harmony/friend/v1";
+    /// ZEB-375 (Friends Phase 2a): friend-PEX referral-catalog protocol
+    /// (`CatalogRequest` / signed `ReferralCatalog`). Dispatched by the accept
+    /// loop the same way `HARMONY_FRIEND_V1` is (see `iroh_friend_acceptor`'s
+    /// `MultiplexHandshakeDispatcher`, which routes it to the PEX acceptor).
+    pub const HARMONY_FRIEND_PEX_V1: &[u8] = b"harmony/friend-pex/v1";
 }
 
 /// OS keychain coordinates for the persistent iroh `SecretKey`.
@@ -95,6 +100,7 @@ impl IrohEndpoint {
                 alpn::HARMONY_HANDSHAKE_V1.to_vec(),
                 alpn::HARMONY_PING_V1.to_vec(),
                 alpn::HARMONY_FRIEND_V1.to_vec(),
+                alpn::HARMONY_FRIEND_PEX_V1.to_vec(),
             ])
             .bind()
             .await
@@ -319,6 +325,7 @@ mod tests {
                 alpn::HARMONY_HANDSHAKE_V1.to_vec(),
                 alpn::HARMONY_PING_V1.to_vec(),
                 alpn::HARMONY_FRIEND_V1.to_vec(),
+                alpn::HARMONY_FRIEND_PEX_V1.to_vec(),
             ])
             .relay_mode(RelayMode::Disabled)
             .bind()
@@ -345,5 +352,6 @@ mod tests {
         assert_eq!(alpn::HARMONY_HANDSHAKE_V1, b"harmony/handshake/v1");
         assert_eq!(alpn::HARMONY_PING_V1, b"harmony/ping/v1");
         assert_eq!(alpn::HARMONY_FRIEND_V1, b"harmony/friend/v1");
+        assert_eq!(alpn::HARMONY_FRIEND_PEX_V1, b"harmony/friend-pex/v1");
     }
 }

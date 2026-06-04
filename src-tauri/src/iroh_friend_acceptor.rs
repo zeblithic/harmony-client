@@ -1243,13 +1243,19 @@ pub enum FriendDispatchTarget {
     /// of the two handshake ALPNs, so the invite acceptor is the correct
     /// default for "not the friend ALPN".
     Invite,
+    /// ZEB-375 `harmony/friend-pex/v1` → the friend-PEX referral-catalog
+    /// acceptor (`iroh_pex_acceptor::IrohFriendPexAcceptor`).
+    Pex,
 }
 
-/// Pure ALPN → target decision. `HARMONY_FRIEND_V1` routes to the friend
-/// acceptor; everything else (the accept loop only forwards
-/// `HARMONY_HANDSHAKE_V1` besides friend) routes to the invite acceptor.
+/// Pure ALPN → target decision. `HARMONY_FRIEND_PEX_V1` routes to the friend-PEX
+/// acceptor; `HARMONY_FRIEND_V1` routes to the friend acceptor; everything else
+/// (the accept loop only forwards `HARMONY_HANDSHAKE_V1` besides the two friend
+/// ALPNs) routes to the invite acceptor. The PEX ALPN is matched FIRST.
 pub fn route_handshake_alpn(alpn: &[u8]) -> FriendDispatchTarget {
-    if alpn == crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1 {
+    if alpn == crate::iroh_endpoint::alpn::HARMONY_FRIEND_PEX_V1 {
+        FriendDispatchTarget::Pex
+    } else if alpn == crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1 {
         FriendDispatchTarget::Friend
     } else {
         FriendDispatchTarget::Invite
@@ -1267,15 +1273,22 @@ pub struct MultiplexHandshakeDispatcher {
     invite: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
     /// Receives `harmony/friend/v1` connections (friend-link handshake).
     friend: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+    /// ZEB-375: receives `harmony/friend-pex/v1` connections (referral catalog).
+    pex: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
 }
 
 impl MultiplexHandshakeDispatcher {
-    /// Build a multiplexer over the invite + friend acceptors.
+    /// Build a multiplexer over the invite + friend + friend-PEX acceptors.
     pub fn new(
         invite: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
         friend: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+        pex: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
     ) -> Self {
-        Self { invite, friend }
+        Self {
+            invite,
+            friend,
+            pex,
+        }
     }
 }
 
@@ -1292,6 +1305,7 @@ impl MultiplexHandshakeDispatcher {
         match route_handshake_alpn(alpn) {
             FriendDispatchTarget::Friend => &self.friend,
             FriendDispatchTarget::Invite => &self.invite,
+            FriendDispatchTarget::Pex => &self.pex,
         }
     }
 }
@@ -2028,6 +2042,23 @@ mod tests {
     }
 
     #[test]
+    fn route_pex_alpn_targets_pex() {
+        use crate::iroh_endpoint::alpn;
+        assert_eq!(
+            route_handshake_alpn(alpn::HARMONY_FRIEND_PEX_V1),
+            FriendDispatchTarget::Pex
+        );
+        assert_eq!(
+            route_handshake_alpn(alpn::HARMONY_FRIEND_V1),
+            FriendDispatchTarget::Friend
+        );
+        assert_eq!(
+            route_handshake_alpn(alpn::HARMONY_HANDSHAKE_V1),
+            FriendDispatchTarget::Invite
+        );
+    }
+
+    #[test]
     fn multiplexer_selects_friend_stub_for_friend_alpn_and_invite_stub_otherwise() {
         let invite: Arc<dyn IrohHandshakeDispatcher> = Arc::new(RecordingDispatcher {
             called: AtomicBool::new(false),
@@ -2035,7 +2066,14 @@ mod tests {
         let friend: Arc<dyn IrohHandshakeDispatcher> = Arc::new(RecordingDispatcher {
             called: AtomicBool::new(false),
         });
-        let mux = MultiplexHandshakeDispatcher::new(Arc::clone(&invite), Arc::clone(&friend));
+        let pex: Arc<dyn IrohHandshakeDispatcher> = Arc::new(RecordingDispatcher {
+            called: AtomicBool::new(false),
+        });
+        let mux = MultiplexHandshakeDispatcher::new(
+            Arc::clone(&invite),
+            Arc::clone(&friend),
+            Arc::clone(&pex),
+        );
 
         // A connection reporting `harmony/friend/v1` selects the friend stub…
         assert!(
@@ -2046,6 +2084,11 @@ mod tests {
         assert!(
             Arc::ptr_eq(mux.select_for_alpn(alpn::HARMONY_HANDSHAKE_V1), &invite),
             "handshake ALPN must select the invite acceptor"
+        );
+        // …and `harmony/friend-pex/v1` selects the PEX stub.
+        assert!(
+            Arc::ptr_eq(mux.select_for_alpn(alpn::HARMONY_FRIEND_PEX_V1), &pex),
+            "friend-pex ALPN must select the PEX acceptor"
         );
     }
 

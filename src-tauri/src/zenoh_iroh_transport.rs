@@ -336,6 +336,7 @@ impl IrohZenohLinkManager {
                         }
                     } else if alpn_used == alpn::HARMONY_HANDSHAKE_V1
                         || alpn_used == alpn::HARMONY_FRIEND_V1
+                        || alpn_used == alpn::HARMONY_FRIEND_PEX_V1
                     {
                         // ZEB-325 Phase 2c (option A) + PR #159 R2:
                         // inbound invite handshake. ZEB-370 Task 9: the
