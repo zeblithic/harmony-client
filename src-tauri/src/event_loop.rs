@@ -7572,7 +7572,11 @@ mod pin_cascade_tests {
 /// Runtime handle (for dynamic `connect_peer` dialing) alongside the Session.
 /// Replaces `zenoh::open(config)` — the `internal` feature exposes
 /// `RuntimeBuilder` + `session::init`, which `zenoh::open` uses under the hood.
-async fn open_session_with_runtime(
+///
+/// `pub` so the ZEB-373 acceptance integration test
+/// (`tests/zeb_373_dynamic_dial_integration.rs`) can build a real Runtime through
+/// the same path production uses; integration tests compile against the public API.
+pub async fn open_session_with_runtime(
     config: zenoh::Config,
 ) -> zenoh::Result<(zenoh::internal::runtime::Runtime, zenoh::Session)> {
     let mut runtime = zenoh::internal::runtime::RuntimeBuilder::new(config)
