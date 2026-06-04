@@ -86,6 +86,20 @@
     try {
       friends = await service.listFriends();
       error = null;
+      // ZEB-375 Phase 2a: browse is Active-only, so drop any per-row referral
+      // state for friends that are no longer Active (now Pending, or absent).
+      // Without this, a friend that was browsed while Active and later shows as
+      // Pending would still render its prior catalog even though the controls
+      // are hidden — `refresh()` is the single point where `friends` changes.
+      const activeIds = new Set(
+        friends.filter((f) => f.status === 'active').map((f) => f.ownerIdHex),
+      );
+      referralsResults = new Map(
+        [...referralsResults].filter(([ownerIdHex]) => activeIds.has(ownerIdHex)),
+      );
+      referralsError = new Map(
+        [...referralsError].filter(([ownerIdHex]) => activeIds.has(ownerIdHex)),
+      );
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -373,15 +387,16 @@
         </li>
         <!-- ZEB-375 Phase 2a: read-only referral catalog for this friend. Shown
              only once browsed (an error, or a results entry — possibly empty).
-             Active-only: the browse action that populates these maps is itself
-             gated on `f.status === 'active'`. -->
+             Active-only and consistently gated: BOTH branches check
+             `f.status === 'active'`, and `refresh()` prunes these maps to Active
+             friends, so a stale catalog can't render after a status change. -->
         {#if f.status === 'active' && referralsError.has(f.ownerIdHex)}
           <li class="referrals-row" data-testid="referrals-error-row">
             <p class="error-text" data-testid="referrals-error">
               {referralsError.get(f.ownerIdHex)}
             </p>
           </li>
-        {:else if referralsResults.has(f.ownerIdHex)}
+        {:else if f.status === 'active' && referralsResults.has(f.ownerIdHex)}
           <li class="referrals-row" data-testid="referrals-row">
             {#if referralsResults.get(f.ownerIdHex)!.length === 0}
               <p class="muted" data-testid="referrals-empty">
