@@ -188,6 +188,13 @@ impl IrohZenohLinkManager {
         }
     }
 
+    /// ZEB-368: expose the resolver so the event loop can enumerate known peers
+    /// for static `connect/endpoints` seeding. `ReachabilityResolver` is a cheap
+    /// Arc-backed handle (`Clone`).
+    pub fn resolver(&self) -> crate::reachability_resolver::ReachabilityResolver {
+        self.resolver.clone()
+    }
+
     /// ZEB-325 Phase 2c (option A) + PR #159 R2: install the
     /// `IrohHandshakeDispatcher` used by the accept loop to route
     /// inbound `harmony/handshake/v1` connections, AND drain any
