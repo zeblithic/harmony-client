@@ -54,6 +54,7 @@ pub mod invite_mint;
 pub mod iroh_endpoint;
 pub mod iroh_friend_acceptor;
 pub mod iroh_invite_acceptor;
+pub mod iroh_pex_acceptor;
 pub mod library_directory;
 pub mod mail;
 pub mod mail_sync;
