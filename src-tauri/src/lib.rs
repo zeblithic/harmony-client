@@ -33112,6 +33112,13 @@ pub async fn unfriend_inner(
             hex::encode(peer_addr.0)
         ));
     };
+    // Idempotent no-op: an already-Revoked entry is left untouched. Writing a
+    // fresh tombstone here would churn the CRDT (newer HLC) and trigger an
+    // unnecessary owner-state re-sync, so re-unfriending must short-circuit
+    // without reserving an HLC.
+    if existing.status == crate::friend_graph::FriendStatus::Revoked {
+        return Ok(());
+    }
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -33441,6 +33448,51 @@ mod friend_ipc_tests {
             .await
             .expect_err("unfriending a non-friend errors");
         assert!(err.contains("not a friend"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn unfriend_inner_is_idempotent_noop_for_already_revoked() {
+        // Re-unfriending an already-Revoked peer must be a true no-op: no new
+        // tombstone, no fresh HLC — otherwise we churn the CRDT and trigger an
+        // unnecessary owner-state re-sync.
+        let (addr, revoked) = friend_entry(0x44, FriendStatus::Revoked, 7);
+        let mut state = OwnerState::default();
+        assert!(matches!(
+            state.apply_friend_update(addr, revoked.clone()),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+        let crdt_state = Arc::new(TokioMutex::new(state));
+        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
+            Arc::new(TokioMutex::new(BTreeMap::new()));
+
+        // Seed the tracker so that, were a tombstone (wrongly) written, its HLC
+        // would be strictly newer than learned_at=7 and thus detectably change
+        // the stored entry.
+        {
+            let mut t = hlc_tracker.lock().await;
+            t.insert("d".to_string(), hlc(7));
+        }
+
+        unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
+            .await
+            .expect("re-unfriending an already-revoked peer is Ok(())");
+
+        // The stored entry is untouched — same status and, crucially, the same
+        // learned_at HLC (no new tombstone was written).
+        {
+            let s = crdt_state.lock().await;
+            let entry = &s.friend_graph.friends[&addr];
+            assert_eq!(
+                entry.status,
+                FriendStatus::Revoked,
+                "already-revoked entry stays Revoked"
+            );
+            assert_eq!(
+                entry.learned_at,
+                hlc(7),
+                "no new tombstone — learned_at HLC is unchanged"
+            );
+        }
     }
 }
 
