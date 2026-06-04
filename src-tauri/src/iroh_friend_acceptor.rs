@@ -574,6 +574,12 @@ where
     /// owner-state sync isn't running) — the field is optional so the friend
     /// write still succeeds locally without it. NOT the community sync engine.
     owner_sync_engine: Option<Arc<crate::owner_state_sync::SyncEngine>>,
+    /// ZEB-371: `Some` reconciles this node's Case-D pkarr slots with the friend
+    /// graph after a successful inbound accept, so a just-added friend's
+    /// reachability slot is published immediately (not on the next reachability
+    /// tick). `None` in tests and when pkarr isn't running — the friend write
+    /// still succeeds locally without it.
+    friend_publisher: Option<Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
     config: FriendAcceptorConfig,
 }
 
@@ -635,6 +641,7 @@ where
             app,
             pkarr_invite_publisher,
             owner_sync_engine: None,
+            friend_publisher: None,
             config,
         }
     }
@@ -649,6 +656,36 @@ where
     ) -> Self {
         self.owner_sync_engine = engine;
         self
+    }
+
+    /// ZEB-371: wire in this node's Case-D friend publisher so a successful
+    /// inbound accept immediately reconciles the published friend slots (the
+    /// just-accepted friend starts publishing without waiting for the next
+    /// reachability tick). Fluent setter (default `None`) so existing call
+    /// sites — including tests — keep compiling without an explicit `None`.
+    pub fn with_friend_publisher(
+        mut self,
+        friend_publisher: Option<Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
+    ) -> Self {
+        self.friend_publisher = friend_publisher;
+        self
+    }
+
+    /// Reconcile the published Case-D friend slots with the current friend graph
+    /// after an inbound accept. No-op when no friend publisher is wired in
+    /// (tests / pkarr disabled). Snapshots the friend map under the CRDT lock and
+    /// drops the guard BEFORE the network `.await`s in `sync_case_d_handles`, so
+    /// the owner-state lock is never held across pkarr IO.
+    async fn reconcile_case_d_slots(&self) {
+        let Some(friend_pub) = self.friend_publisher.as_ref() else {
+            return;
+        };
+        let friends = {
+            let state = self.crdt_state.lock().await;
+            state.friend_graph.friends.clone()
+        };
+        crate::pkarr_friend_publisher::sync_case_d_handles(friend_pub, &friends, &self.keytree)
+            .await;
     }
 
     /// Arm the owner-state debounced publish + persist after a friend write.
@@ -845,6 +882,12 @@ where
         // above succeeded-then-something-later-failed because the local CRDT
         // mutation is already committed (see the unregister rationale).
         self.notify_owner_state_dirty();
+
+        // ZEB-371: publish the just-accepted friend's Case-D reachability slot
+        // immediately (rather than waiting for the next reachability tick) so the
+        // new friend can resolve us right away. No-op when pkarr isn't running.
+        // Snapshots the friend graph under the lock, drops it, THEN does pkarr IO.
+        self.reconcile_case_d_slots().await;
         Ok(())
     }
 }

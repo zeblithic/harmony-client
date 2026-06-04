@@ -781,6 +781,14 @@ pub struct NodeState {
     /// that keeps case-A / B / C entries fresh on the Mainline DHT.
     pub pkarr_publisher: Option<std::sync::Arc<harmony_pkarr::PkarrPublisher>>,
 
+    /// ZEB-371: Case-D friend publisher. Holds one registered pkarr handle per
+    /// `Active` friend with a sealed rendezvous secret, keyed on that secret, so
+    /// each friend can resolve this node's iroh reachability across WAN without
+    /// global discoverability. Reconciled with the friend graph on the
+    /// reachability cadence and on friend writes (`sync_case_d_handles`).
+    pub pkarr_friend_publisher:
+        Option<std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
+
     /// Shared pkarr resolver. Used by `connectivity_discover_identity` IPC
     /// and wired into the `ReachabilityResolver` as the case-C fallback.
     pub pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
@@ -864,6 +872,9 @@ impl NodeState {
             h.abort();
         }
         self.pkarr_publisher = None;
+        // ZEB-371: drop the Case-D friend publisher so a restart rebuilds it
+        // against the fresh pkarr publisher / blob builder.
+        self.pkarr_friend_publisher = None;
         self.pkarr_resolver = None;
         self.pkarr_invite_publisher = None;
         self.pkarr_identity_publisher = None;
@@ -1011,6 +1022,7 @@ impl Default for NodeState {
             // ZEB-323 Phase 2b: pkarr policy handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
             pkarr_publisher: None,
+            pkarr_friend_publisher: None,
             pkarr_resolver: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
@@ -2452,6 +2464,10 @@ pub(crate) async fn start_node_inner(
         // NodeState assignment can reach them regardless of branch.
         let mut pkarr_publisher_for_state: Option<std::sync::Arc<harmony_pkarr::PkarrPublisher>> =
             None;
+        // ZEB-371: lifted Case-D friend publisher (built in the pkarr setup block).
+        let mut pkarr_friend_publisher_for_state: Option<
+            std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>,
+        > = None;
         let mut pkarr_resolver_for_state: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>> =
             None;
         let mut pkarr_invite_publisher_for_state: Option<
@@ -4077,9 +4093,28 @@ pub(crate) async fn start_node_inner(
                     // endpoint to snapshot). When NO communities are
                     // joined, the loop body is a no-op (still cheap —
                     // happens on startup + idle-60min + force).
+                    // ZEB-371: deferred slot for the Case-D friend publisher.
+                    // `publish_fn` is built HERE but the friend publisher is
+                    // constructed later (in the pkarr block below), so the
+                    // closure captures this `OnceCell` and the pkarr block sets
+                    // it once it exists. On each reachability tick, if the cell
+                    // is populated, the closure reconciles the friend slots
+                    // AFTER the per-community reachability publish — this picks
+                    // up address changes (re-register refreshes the blob) AND
+                    // friend-graph changes on every tick.
+                    let friend_pub_cell: std::sync::Arc<
+                        tokio::sync::OnceCell<
+                            std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>,
+                        >,
+                    > = std::sync::Arc::new(tokio::sync::OnceCell::new());
                     if let Some(ep_arc_for_publisher) = iroh_endpoint_arc.as_ref() {
                         let ep_for_cb = std::sync::Arc::clone(ep_arc_for_publisher);
                         let registry_for_cb = std::sync::Arc::clone(&registry);
+                        // ZEB-371: captures for the Case-D friend-slot reconcile
+                        // appended to the end of the reachability publish.
+                        let friend_pub_cell_for_cb = std::sync::Arc::clone(&friend_pub_cell);
+                        let crdt_state_for_cb = std::sync::Arc::clone(&crdt_state);
+                        let kt_for_cb = std::sync::Arc::clone(&kt);
                         // ZEB-339: ReachabilityAnnounce is a community-membership
                         // event. T4 rewired RCH2 verify to check BOTH the outer
                         // event sig AND the inner `identity_signature` against the
@@ -4103,6 +4138,11 @@ pub(crate) async fn start_node_inner(
                                 let actor = self_owner_for_cb;
                                 let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_cb);
                                 let device_id = device_id_for_cb.clone();
+                                // ZEB-371 per-invocation clones for the friend reconcile.
+                                let friend_pub_cell =
+                                    std::sync::Arc::clone(&friend_pub_cell_for_cb);
+                                let crdt_state = std::sync::Arc::clone(&crdt_state_for_cb);
+                                let kt = std::sync::Arc::clone(&kt_for_cb);
                                 Box::pin(async move {
                                     // 1. Snapshot iroh state ONCE.
                                     let node_id_bytes: [u8; 32] = *ep.node_id().as_bytes();
@@ -4115,14 +4155,12 @@ pub(crate) async fn start_node_inner(
                                         .as_millis()
                                         as u64;
 
-                                    // 2. Iterate joined communities.
+                                    // 2. Iterate joined communities. When NONE
+                                    // are joined this loop is skipped, but the
+                                    // ZEB-371 friend reconcile below still runs
+                                    // (friends can exist with zero communities) —
+                                    // so this is NO LONGER an early `return`.
                                     let community_ids = registry.known_ids().await;
-                                    if community_ids.is_empty() {
-                                        // No-op publish: no communities
-                                        // to announce into. Common
-                                        // pre-pair state.
-                                        return;
-                                    }
                                     for community_id in community_ids {
                                         // 3a. Reserve an HLC for this
                                         //     event. Each community
@@ -4231,6 +4269,31 @@ pub(crate) async fn start_node_inner(
                                                 );
                                             }
                                         }
+                                    }
+
+                                    // ── ZEB-371: reconcile Case-D friend slots ──
+                                    //
+                                    // After the per-community reachability
+                                    // publish, refresh the friend-keyed Case-D
+                                    // slots. Re-registering picks up an address
+                                    // change (the blob builder snapshots the
+                                    // current reachability) AND any friend-graph
+                                    // change since the last tick. No-op until the
+                                    // pkarr block populates the cell. Snapshot the
+                                    // friend map under the CRDT lock, drop the
+                                    // guard, THEN do pkarr IO — never hold the
+                                    // owner-state lock across network awaits.
+                                    if let Some(friend_pub) = friend_pub_cell.get() {
+                                        let friends_snapshot = {
+                                            let state = crdt_state.lock().await;
+                                            state.friend_graph.friends.clone()
+                                        };
+                                        crate::pkarr_friend_publisher::sync_case_d_handles(
+                                            friend_pub,
+                                            &friends_snapshot,
+                                            &kt,
+                                        )
+                                        .await;
                                     }
                                 })
                                     as futures::future::BoxFuture<'static, ()>
@@ -4375,6 +4438,51 @@ pub(crate) async fn start_node_inner(
                         ),
                     );
 
+                    // ZEB-371: Case-D friend publisher. Reuses the SAME shared
+                    // pkarr publisher and reachability `blob_builder` as the
+                    // other case managers, so a re-register refreshes the
+                    // friend's published blob with the current reachability.
+                    // `self_owner` (this node's master OwnerAddr) keys the
+                    // published slot so friends — who know it — can resolve us.
+                    let pkarr_friend_pub = std::sync::Arc::new(
+                        crate::pkarr_friend_publisher::PkarrFriendPublisher::new(
+                            std::sync::Arc::clone(&pkarr_publisher_arc),
+                            self_owner.0,
+                            std::sync::Arc::clone(&blob_builder),
+                        ),
+                    );
+
+                    // ZEB-371: hand the friend publisher to the reachability
+                    // `publish_fn` closure (built earlier) so each reachability
+                    // tick reconciles the Case-D slots. Set-once; ignore the
+                    // Err (the cell is only set here, exactly once per boot).
+                    let _ = friend_pub_cell.set(std::sync::Arc::clone(&pkarr_friend_pub));
+
+                    // ZEB-371: publish existing Active friends' Case-D slots once
+                    // at startup so they start resolving immediately (rather than
+                    // waiting for the first reachability tick). Snapshot the
+                    // friend graph under the CRDT lock, drop the guard, THEN do
+                    // pkarr IO — never hold the owner-state lock across network
+                    // awaits.
+                    {
+                        let friends_snapshot = {
+                            let state = crdt_state.lock().await;
+                            state.friend_graph.friends.clone()
+                        };
+                        if !friends_snapshot.is_empty() {
+                            crate::pkarr_friend_publisher::sync_case_d_handles(
+                                &pkarr_friend_pub,
+                                &friends_snapshot,
+                                &kt,
+                            )
+                            .await;
+                            tracing::info!(
+                                count = friends_snapshot.len(),
+                                "ZEB-371: reconciled Case-D friend slots at startup"
+                            );
+                        }
+                    }
+
                     // Resolve settings path and restore case-B if enabled.
                     let pkarr_settings_path = app_data_dir.join("connectivity-settings.json");
                     let pkarr_settings =
@@ -4406,6 +4514,8 @@ pub(crate) async fn start_node_inner(
                     // Stash all pkarr handles on lifted state so NodeState
                     // assignment below can pick them up.
                     pkarr_publisher_for_state = Some(pkarr_publisher_arc);
+                    pkarr_friend_publisher_for_state =
+                        Some(std::sync::Arc::clone(&pkarr_friend_pub));
                     pkarr_resolver_for_state = Some(pkarr_resolver_arc);
                     pkarr_invite_publisher_for_state = Some(pkarr_invite_pub);
                     pkarr_identity_publisher_for_state = Some(pkarr_identity_pub);
@@ -4515,7 +4625,12 @@ pub(crate) async fn start_node_inner(
                             // user's other devices and a clean shutdown skips the
                             // publish). Arc-clone — `engine` is still returned via
                             // `Some(engine)` at the tail of this block.
-                            .with_owner_sync_engine(Some(std::sync::Arc::clone(&engine))),
+                            .with_owner_sync_engine(Some(std::sync::Arc::clone(&engine)))
+                            // ZEB-371: wire the Case-D friend publisher so a
+                            // successful inbound accept immediately publishes the
+                            // just-added friend's reachability slot (no wait for
+                            // the next reachability tick).
+                            .with_friend_publisher(Some(std::sync::Arc::clone(&pkarr_friend_pub))),
                         );
 
                         // Multiplex both acceptors behind the single dispatcher
@@ -5101,6 +5216,7 @@ pub(crate) async fn start_node_inner(
                         guard.iroh_accept_handle = iroh_accept_handle.take();
                         // ZEB-323 Phase 2b: stash pkarr policy handles.
                         guard.pkarr_publisher = pkarr_publisher_for_state.take();
+                        guard.pkarr_friend_publisher = pkarr_friend_publisher_for_state.take();
                         guard.pkarr_resolver = pkarr_resolver_for_state.take();
                         guard.pkarr_invite_publisher = pkarr_invite_publisher_for_state.take();
                         guard.pkarr_identity_publisher = pkarr_identity_publisher_for_state.take();
@@ -33974,6 +34090,7 @@ async fn redeem_friend_token(
         dm_outbox,
         sync_engine,
         owner_keytree,
+        friend_publisher,
     ) = {
         let g = state
             .lock()
@@ -33988,6 +34105,7 @@ async fn redeem_friend_token(
             g.dm_outbox.clone(),
             g.sync_engine.clone(),
             g.owner_keytree.clone(),
+            g.pkarr_friend_publisher.clone(),
         )
     };
 
@@ -34020,6 +34138,11 @@ async fn redeem_friend_token(
         )
     };
 
+    // ZEB-371: clone the handles needed for the post-redeem Case-D reconcile
+    // before they move into the inner call below.
+    let crdt_state_for_reconcile = std::sync::Arc::clone(&crdt_state);
+    let keytree_for_reconcile = std::sync::Arc::clone(&owner_keytree);
+
     let outcome = connectivity_link_friend_iroh_inner(
         url,
         pkarr_resolver,
@@ -34044,6 +34167,24 @@ async fn redeem_friend_token(
     // mint.rs's `notify_mint_dirty` lock-snapshot-drop pattern.
     if let Some(engine) = sync_engine {
         engine.notify_dirty();
+    }
+
+    // ZEB-371: publish the just-added friend's Case-D reachability slot
+    // immediately (don't wait for the next reachability tick). Snapshot the
+    // friend graph under the CRDT lock, drop the guard, THEN do pkarr IO — the
+    // owner-state lock is never held across a network await. No-op when pkarr
+    // isn't running (`pkarr_friend_publisher` is `None`).
+    if let Some(friend_pub) = friend_publisher {
+        let friends_snapshot = {
+            let s = crdt_state_for_reconcile.lock().await;
+            s.friend_graph.friends.clone()
+        };
+        crate::pkarr_friend_publisher::sync_case_d_handles(
+            &friend_pub,
+            &friends_snapshot,
+            &keytree_for_reconcile,
+        )
+        .await;
     }
 
     // Notify the UI so it re-fetches the friend list.
@@ -34087,7 +34228,7 @@ async fn unfriend(
         .map_err(|_| "peer_addr must be 16 bytes (32 hex chars)".to_string())?;
     let peer = crate::owner_state_types::OwnerAddr(addr_bytes);
 
-    let (crdt_state, hlc_tracker, device_id, sync_engine) = {
+    let (crdt_state, hlc_tracker, device_id, sync_engine, friend_publisher, owner_keytree) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -34096,6 +34237,8 @@ async fn unfriend(
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.sync_engine.clone(),
+            g.pkarr_friend_publisher.clone(),
+            g.owner_keytree.clone(),
         )
     };
 
@@ -34110,10 +34253,120 @@ async fn unfriend(
         if let Some(engine) = sync_engine {
             engine.notify_dirty();
         }
+
+        // ZEB-371: drop the now-revoked friend's Case-D slot immediately (don't
+        // wait for the next reachability tick). Snapshot the friend graph under
+        // the CRDT lock, drop the guard, THEN do pkarr IO — the owner-state lock
+        // is never held across a network await. No-op when pkarr isn't running
+        // or the keytree is absent. Only when `changed` (the revoke actually
+        // wrote a tombstone) — the idempotent no-op leaves slots untouched.
+        if let (Some(friend_pub), Some(keytree)) = (friend_publisher, owner_keytree) {
+            let friends_snapshot = {
+                let s = crdt_state.lock().await;
+                s.friend_graph.friends.clone()
+            };
+            crate::pkarr_friend_publisher::sync_case_d_handles(
+                &friend_pub,
+                &friends_snapshot,
+                &keytree,
+            )
+            .await;
+        }
     }
 
     let _ = app.emit("friend-list-changed", ());
     Ok(())
+}
+
+/// ZEB-371 resolve-on-connect: resolve a friend's current iroh reachability via
+/// their private Case-D pkarr slot, so we can (re)dial them across WAN without
+/// any shared session or global discoverability.
+///
+/// Loads the friend's `FriendEntry` from owner-state; requires the link be
+/// `Active` with a sealed rendezvous secret. Opens the secret with the node's
+/// KeyTree, resolves the friend's Case-D slot keyed on it, decodes the returned
+/// (already-unsealed) routing blob into a `ReachabilityAnnouncePayload`, and
+/// returns a `DiscoveredRecord` DTO. Returns `Ok(None)` when: pkarr/keytree
+/// aren't running, the peer isn't an Active friend, the entry has no sealed
+/// secret, the secret won't open, the slot isn't currently published, or the
+/// blob is empty/undecodable (an empty blob is what the publisher emits when
+/// iroh is down — un-dial-able, treated as "not reachable").
+///
+/// `peer_addr` is the friend's 16-byte master `owner_id` in hex.
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_resolve_friend(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+) -> Result<Option<DiscoveredRecord>, String> {
+    let addr_bytes: [u8; 16] = hex::decode(&owner_id_hex)
+        .map_err(|e| format!("invalid owner_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "owner_id must be 16 bytes (32 hex chars)".to_string())?;
+
+    let (resolver, crdt_state, owner_keytree) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pkarr_resolver.clone(),
+            g.crdt_state.clone(),
+            g.owner_keytree.clone(),
+        )
+    };
+    let (Some(resolver), Some(crdt_state), Some(keytree)) = (resolver, crdt_state, owner_keytree)
+    else {
+        return Ok(None);
+    };
+
+    // Load the friend entry; require Active + a sealed secret.
+    let sealed_secret = {
+        let s = crdt_state.lock().await;
+        let Some(entry) = s
+            .friend_graph
+            .friends
+            .get(&crate::owner_state_types::OwnerAddr(addr_bytes))
+        else {
+            return Ok(None);
+        };
+        if entry.status != crate::friend_graph::FriendStatus::Active {
+            return Ok(None);
+        }
+        match &entry.sealed_secret {
+            Some(blob) => blob.clone(),
+            None => return Ok(None),
+        }
+    };
+
+    // Open the sealed secret with the node's KeyTree (bound to this friend's id).
+    let secret = match crate::owner_state_crypto::decrypt_friend_secret(
+        &keytree,
+        &addr_bytes,
+        &sealed_secret,
+    ) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+
+    // Resolve the friend's Case-D slot — `resolve_friend_case_d` returns the
+    // already-UNSEALED routing blob (or None on miss / unseal failure).
+    let Some(blob) =
+        crate::pkarr_friend_publisher::resolve_friend_case_d(&resolver, &secret, &addr_bytes)
+            .await?
+    else {
+        return Ok(None);
+    };
+    if blob.is_empty() {
+        // Publisher emits an empty blob when iroh is down (un-dial-able).
+        return Ok(None);
+    }
+
+    // Decode the routing blob into the reachability payload (same decode the
+    // identity-discovery IPC uses on its unsealed routing_blob).
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(blob.as_slice())
+            .map_err(|e| format!("decode case-d routing blob: {e}"))?;
+
+    Ok(Some(DiscoveredRecord::from(routing)))
 }
 
 #[cfg(test)]
@@ -35007,6 +35260,8 @@ pub fn run() {
             redeem_friend_token,
             list_friends,
             unfriend,
+            // ZEB-371: resolve a friend's reachability via their Case-D slot.
+            connectivity_resolve_friend,
             // ZEB-329: Network Health IPCs.
             network_health_snapshot,
             network_health_run_self_test,
@@ -38439,6 +38694,7 @@ mod start_node_race_tests {
             iroh_accept_handle: None,
             // ZEB-323 Phase 2b: pkarr handles unused in race tests.
             pkarr_publisher: None,
+            pkarr_friend_publisher: None,
             pkarr_resolver: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,

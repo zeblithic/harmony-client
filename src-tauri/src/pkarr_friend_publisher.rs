@@ -68,6 +68,40 @@ impl PkarrFriendPublisher {
     }
 }
 
+/// Reconcile the friend publisher's active Case-D handles with the friend graph:
+/// register every `Active` friend that has a `sealed_secret` (opened with `kt`),
+/// unregister everyone else (`Pending`/`Revoked`, missing secret, or a secret that
+/// fails to open). Idempotent; safe to call on every reachability tick.
+///
+/// `register_friend` re-registers with the current `routing_blob_builder`, so
+/// re-calling this on an address change refreshes every active friend's published
+/// blob. The caller is responsible for snapshotting `friends` out from under any
+/// owner-state lock BEFORE calling this — it performs network `.await`s.
+pub async fn sync_case_d_handles(
+    friend_pub: &PkarrFriendPublisher,
+    friends: &std::collections::BTreeMap<
+        crate::owner_state_types::OwnerAddr,
+        crate::friend_graph::FriendEntry,
+    >,
+    kt: &crate::owner_state_crypto::KeyTree,
+) {
+    use crate::friend_graph::FriendStatus;
+    for (owner, entry) in friends.iter() {
+        let should_publish = entry.status == FriendStatus::Active;
+        let secret = if should_publish {
+            entry.sealed_secret.as_deref().and_then(|sealed| {
+                crate::owner_state_crypto::decrypt_friend_secret(kt, &owner.0, sealed).ok()
+            })
+        } else {
+            None
+        };
+        match secret {
+            Some(secret) => friend_pub.register_friend(owner.0, *secret).await,
+            None => friend_pub.unregister_friend(&owner.0).await,
+        }
+    }
+}
+
 /// Resolve `friend_owner`'s current Case-D routing blob (UNSEALED) using the
 /// shared `secret`. Queries the ±1 epoch tolerance window in parallel; on a hit,
 /// tries each window epoch to unseal (the record could be from any of the three).
@@ -174,5 +208,109 @@ mod tests {
             .await
             .iter()
             .any(|h| h.starts_with("friend:")));
+    }
+
+    #[tokio::test]
+    async fn sync_case_d_handles_registers_only_active_with_secret() {
+        use crate::friend_graph::{FriendEntry, FriendGraph, FriendOrigin, FriendStatus};
+        use crate::owner_state_crypto::{encrypt_friend_secret, KeyTree};
+        use crate::owner_state_types::{Hlc, OwnerAddr};
+        use std::collections::BTreeMap;
+
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+
+        let self_owner = [0xAA; 16];
+        let fp = PkarrFriendPublisher::new(
+            Arc::clone(&publisher),
+            self_owner,
+            Arc::new(|| b"routing".to_vec()),
+        );
+        let kt = KeyTree::derive(&[0x42; 32]).expect("derive keytree");
+
+        fn entry(status: FriendStatus, sealed_secret: Option<Vec<u8>>) -> FriendEntry {
+            FriendEntry {
+                master_ed25519: [0x11; 32],
+                display: None,
+                status,
+                established_via: FriendOrigin::Token,
+                referrable: false,
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+                sealed_secret,
+            }
+        }
+
+        // (a) Active WITH a sealed secret → should publish.
+        let a_owner = OwnerAddr([0xA1; 16]);
+        let a_secret = [0xCC; 32];
+        let a_sealed = encrypt_friend_secret(&kt, &a_owner.0, &a_secret).expect("seal a");
+        // (b) Active WITHOUT a secret → must NOT publish.
+        let b_owner = OwnerAddr([0xB2; 16]);
+        // (c) Revoked WITH a (stale) secret → must NOT publish.
+        let c_owner = OwnerAddr([0xC3; 16]);
+        let c_sealed = encrypt_friend_secret(&kt, &c_owner.0, &[0xDD; 32]).expect("seal c");
+
+        let mut friends: BTreeMap<OwnerAddr, FriendEntry> = FriendGraph::default().friends;
+        friends.insert(a_owner, entry(FriendStatus::Active, Some(a_sealed)));
+        friends.insert(b_owner, entry(FriendStatus::Active, None));
+        friends.insert(c_owner, entry(FriendStatus::Revoked, Some(c_sealed)));
+
+        sync_case_d_handles(&fp, &friends, &kt).await;
+
+        let a_handle = friend_handle(&a_owner.0);
+        let b_handle = friend_handle(&b_owner.0);
+        let c_handle = friend_handle(&c_owner.0);
+        let handles = publisher.active_handles().await;
+        assert!(
+            handles.contains(&a_handle),
+            "Active+secret friend (a) must be published; got {handles:?}"
+        );
+        assert!(
+            !handles.contains(&b_handle),
+            "Active-without-secret friend (b) must NOT be published; got {handles:?}"
+        );
+        assert!(
+            !handles.contains(&c_handle),
+            "Revoked friend (c) must NOT be published; got {handles:?}"
+        );
+        assert_eq!(
+            handles.iter().filter(|h| h.starts_with("friend:")).count(),
+            1,
+            "exactly one friend slot (only a) must be active; got {handles:?}"
+        );
+
+        // Idempotent: re-syncing the same map leaves exactly (a) published.
+        sync_case_d_handles(&fp, &friends, &kt).await;
+        let handles = publisher.active_handles().await;
+        assert_eq!(
+            handles.iter().filter(|h| h.starts_with("friend:")).count(),
+            1,
+            "re-sync must be idempotent; got {handles:?}"
+        );
+        assert!(handles.contains(&a_handle));
+
+        // Flip (a) to Revoked and re-sync → its handle is dropped. (Re-seal
+        // because encrypt_friend_secret moved the earlier blob into the map;
+        // the secret bytes are what matter, not the specific ciphertext.)
+        let a_resealed = encrypt_friend_secret(&kt, &a_owner.0, &a_secret).expect("re-seal a");
+        friends.insert(a_owner, entry(FriendStatus::Revoked, Some(a_resealed)));
+        sync_case_d_handles(&fp, &friends, &kt).await;
+        let handles = publisher.active_handles().await;
+        assert!(
+            !handles.contains(&a_handle),
+            "after flipping (a) to Revoked its slot must be gone; got {handles:?}"
+        );
+        assert_eq!(
+            handles.iter().filter(|h| h.starts_with("friend:")).count(),
+            0,
+            "no friend slots should remain after revoking (a); got {handles:?}"
+        );
     }
 }
