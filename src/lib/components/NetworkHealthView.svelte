@@ -165,6 +165,49 @@
       {/if}
     </section>
 
+    {#if snap.dialStatus}
+      {@const dial = snap.dialStatus}
+      {@const recentHits = [...dial.recent].sort(
+        (a, b) => b.capturedAtMs - a.capturedAtMs,
+      )}
+      <section class="dynamic-dials" data-testid="nh-dynamic-dials">
+        <h2>Dynamic dials</h2>
+        <p class="muted dial-explain">
+          Proactive iroh dials to peers learned mid-session.
+        </p>
+        <ul class="dial-counters">
+          <li data-testid="nh-dial-attempts">
+            Attempts: <strong>{dial.attempts}</strong>
+          </li>
+          <li class="dial-ok" data-testid="nh-dial-succeeded">
+            Succeeded: <strong>{dial.succeeded}</strong>
+          </li>
+          <li class="dial-fail" data-testid="nh-dial-failed">
+            Failed: <strong>{dial.failed}</strong>
+          </li>
+          <li class="muted" data-testid="nh-dial-skipped">
+            Skipped (dup): <strong>{dial.skippedDuplicate}</strong>
+          </li>
+        </ul>
+        {#if recentHits.length === 0}
+          <p class="muted" data-testid="nh-dial-empty">No dynamic dials yet.</p>
+        {:else}
+          <ul class="dial-recent">
+            {#each recentHits as hit (`${hit.capturedAtMs}-${hit.nodeIdShort}-${hit.ownerShort}`)}
+              <li data-testid="nh-dial-hit">
+                {hit.outcome === 'succeeded' ? '✓' : '✗'}
+                <code>{hit.nodeIdShort}</code>
+                <span class="muted">owner {hit.ownerShort}</span>
+                <span class="muted"
+                  >{Math.floor((Date.now() - hit.capturedAtMs) / 1000)}s ago</span
+                >
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </section>
+    {/if}
+
     <section class="self-test" data-testid="nh-self-test">
       <h2>Self-test</h2>
       <button
@@ -240,6 +283,24 @@
     color: crimson;
   }
   .self-test-steps {
+    list-style: none;
+    padding-left: 0;
+    font-family: monospace;
+  }
+  .dial-counters {
+    list-style: none;
+    padding-left: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+  }
+  .dial-ok {
+    color: green;
+  }
+  .dial-fail {
+    color: crimson;
+  }
+  .dial-recent {
     list-style: none;
     padding-left: 0;
     font-family: monospace;

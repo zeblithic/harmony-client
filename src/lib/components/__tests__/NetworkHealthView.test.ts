@@ -48,6 +48,51 @@ function readySnap(): NetworkHealthSnapshot {
   };
 }
 
+// ZEB-377: snapshot carrying ZEB-373 dial telemetry. The `recent` ring is
+// intentionally NOT newest-first so the view's sort (capturedAtMs descending)
+// is actually exercised.
+function readySnapWithDials(): NetworkHealthSnapshot {
+  const now = Date.now();
+  return {
+    ...readySnap(),
+    dialStatus: {
+      attempts: 3,
+      succeeded: 2,
+      failed: 1,
+      skippedDuplicate: 0,
+      recent: [
+        {
+          nodeIdShort: 'dead5678',
+          ownerShort: 'cc22dd33',
+          outcome: 'failed',
+          capturedAtMs: now - 41000,
+        },
+        {
+          nodeIdShort: 'a3f9e1c2',
+          ownerShort: '4b2c0011',
+          outcome: 'succeeded',
+          capturedAtMs: now - 8000,
+        },
+      ],
+    },
+  };
+}
+
+// ZEB-377: dial telemetry present but no dials have happened (steady idle
+// state — the surface must still render with an explicit empty message).
+function readySnapIdleDials(): NetworkHealthSnapshot {
+  return {
+    ...readySnap(),
+    dialStatus: {
+      attempts: 0,
+      succeeded: 0,
+      failed: 0,
+      skippedDuplicate: 0,
+      recent: [],
+    },
+  };
+}
+
 describe('NetworkHealthView', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -74,6 +119,26 @@ describe('NetworkHealthView', () => {
     render(NetworkHealthView);
     await waitFor(() => screen.getByTestId('nh-peers-empty'));
     expect(screen.getByTestId('nh-peers-empty')).toBeTruthy();
+  });
+
+  it('renders dial counters and recent hits when dialStatus is present', async () => {
+    mockInvoke.mockResolvedValue(readySnapWithDials());
+    render(NetworkHealthView);
+    await waitFor(() => screen.getByTestId('nh-dynamic-dials'));
+    expect(screen.getByTestId('nh-dial-attempts').textContent).toContain('3');
+    expect(screen.getByTestId('nh-dial-succeeded').textContent).toContain('2');
+    expect(screen.getByTestId('nh-dial-failed').textContent).toContain('1');
+    const hits = screen.getAllByTestId('nh-dial-hit');
+    expect(hits.length).toBe(2);
+    // Newest-first: the 8s-ago succeeded hit must sort above the 41s-ago one.
+    expect(hits[0].textContent).toContain('a3f9e1c2');
+  });
+
+  it('renders idle dial state when there are no recent hits', async () => {
+    mockInvoke.mockResolvedValue(readySnapIdleDials());
+    render(NetworkHealthView);
+    await waitFor(() => screen.getByTestId('nh-dial-empty'));
+    expect(screen.getByTestId('nh-dial-empty')).toBeTruthy();
   });
 
   it('self-test button disables while running', async () => {
