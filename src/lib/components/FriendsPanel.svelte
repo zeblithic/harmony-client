@@ -40,6 +40,9 @@
   // Per-row in-flight unfriend guard (by owner_id hex).
   let unfriending = $state<Set<string>>(new Set());
 
+  // Per-row in-flight referrable-toggle guard (by owner_id hex). ZEB-375 Phase 2a.
+  let referrableSaving = $state<Set<string>>(new Set());
+
   // ── Phase 1b state ────────────────────────────────────────────────────────
 
   // Pending friend requests inbox.
@@ -174,6 +177,25 @@
     }
   }
 
+  // ZEB-375 Phase 2a: flip a friend's referral-catalog opt-in. `next` is the
+  // desired new value (the inverse of the current `referrable`). The backend
+  // re-syncs and emits `friend-list-changed`, but we also `refresh()` so the
+  // checkbox reflects the new value immediately.
+  async function handleToggleReferrable(ownerIdHex: string, next: boolean): Promise<void> {
+    if (referrableSaving.has(ownerIdHex)) return;
+    referrableSaving = new Set(referrableSaving).add(ownerIdHex);
+    try {
+      await service.setReferrable(ownerIdHex, next);
+      await refresh();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      const nextSet = new Set(referrableSaving);
+      nextSet.delete(ownerIdHex);
+      referrableSaving = nextSet;
+    }
+  }
+
   // ── Phase 1b handlers ─────────────────────────────────────────────────────
 
   async function handleAccept(ownerIdHex: string): Promise<void> {
@@ -273,6 +295,17 @@
             <span class="friend-name">{f.display ?? shortId(f.ownerIdHex)}</span>
             <span class="friend-addr" title={f.ownerIdHex}>{shortId(f.ownerIdHex)}</span>
           </div>
+          <label class="referrable-toggle" data-testid="referrable-toggle-label">
+            <input
+              type="checkbox"
+              class="referrable-checkbox"
+              checked={f.referrable}
+              disabled={referrableSaving.has(f.ownerIdHex)}
+              onchange={() => handleToggleReferrable(f.ownerIdHex, !f.referrable)}
+              data-testid="referrable-checkbox"
+            />
+            <span class="referrable-label-text">Referrable</span>
+          </label>
           <button
             type="button"
             class="unfriend-btn"
@@ -472,6 +505,33 @@
     flex-direction: column;
     gap: 2px;
     min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .referrable-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .referrable-checkbox {
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .referrable-checkbox:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .referrable-label-text {
+    font-size: 12px;
+    color: var(--text-secondary);
   }
 
   .friend-name {

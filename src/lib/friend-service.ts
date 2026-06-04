@@ -20,6 +20,9 @@ import type { TauriAdapter } from './zenoh-service';
  *   - `set_friend_auto_accept`      → void
  *   - `get_friend_auto_accept`      → boolean
  *
+ * Phase 2a IPCs:
+ *   - `set_friend_referrable`       → void (toggle a friend's referral-catalog opt-in)
+ *
  * Events:
  *   - `friend-list-changed`              → re-fetch friends + pending
  *   - `friend-request-received`          → re-fetch pending
@@ -235,6 +238,16 @@ export class FriendService {
   /** Retrieve the current auto-accept setting. */
   async getAutoAccept(): Promise<boolean> {
     return this.invoke<boolean>('get_friend_auto_accept', {});
+  }
+
+  /**
+   * Toggle whether a friend (by their 16-byte master owner_id hex) may be
+   * surfaced in our referral catalog to others (the ZEB-375 Phase 2a sharer-side
+   * opt-in). The backend stamps a fresh HLC and re-syncs to the user's other
+   * devices; the UI refreshes on the resulting `friend-list-changed` event.
+   */
+  async setReferrable(ownerIdHex: string, referrable: boolean): Promise<void> {
+    await this.invoke<void>('set_friend_referrable', { ownerIdHex, referrable });
   }
 
   destroy(): void {

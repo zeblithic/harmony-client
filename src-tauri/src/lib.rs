@@ -33987,6 +33987,29 @@ pub fn list_friends_inner(state: &crate::owner_state_crdt::OwnerState) -> Vec<Fr
 /// the caller should `notify_dirty` the sync engine), `Ok(false)` for the
 /// idempotent no-op on an already-`Revoked` peer (nothing changed — skip the
 /// notify so we don't churn an owner-state re-sync).
+/// ZEB-375 Phase 2a Task 6: pure core for `set_friend_referrable`.
+///
+/// Looks up the existing `FriendEntry` for `owner` and returns a CLONE with
+/// `referrable` set to the new value and `learned_at` bumped to `at`,
+/// PRESERVING every other field (`master_ed25519`, `display`, `status`,
+/// `established_via`, `sealed_secret`). The caller LWW-applies the returned
+/// entry. Errors when `owner` is not a known friend (mirrors `unfriend_inner`'s
+/// unknown-peer guard) — there is nothing to mark referrable.
+fn apply_set_referrable(
+    fg: &crate::friend_graph::FriendGraph,
+    owner: crate::owner_state_types::OwnerAddr,
+    referrable: bool,
+    at: crate::owner_state_types::Hlc,
+) -> Result<crate::friend_graph::FriendEntry, String> {
+    let Some(existing) = fg.friends.get(&owner) else {
+        return Err(format!("unknown friend: {}", hex::encode(owner.0)));
+    };
+    let mut updated = existing.clone();
+    updated.referrable = referrable;
+    updated.learned_at = at;
+    Ok(updated)
+}
+
 pub async fn unfriend_inner(
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: &std::sync::Arc<
@@ -34361,6 +34384,71 @@ async fn unfriend(
             )
             .await;
         }
+    }
+
+    let _ = app.emit("friend-list-changed", ());
+    Ok(())
+}
+
+/// ZEB-375 Phase 2a Task 6: toggle a friend's `referrable` flag — the sharer-side
+/// opt-in that governs whether this friend may be surfaced in our referral
+/// catalog to others (the Phase 2 awareness layer). `owner_id_hex` is the
+/// friend's 16-byte master `owner_id` in hex.
+///
+/// Mirrors `unfriend`: snapshot the `Arc` handles out of `NodeState` under the
+/// std `Mutex`, drop the lock before any `.await`, stamp a fresh `learned_at`
+/// HLC, LWW-apply the updated entry via `apply_friend_update` (so other devices
+/// converge), arm the debounced publish-root + persist on the owner-state
+/// SyncEngine, and emit `friend-list-changed` so the UI refreshes.
+#[tauri::command(rename_all = "snake_case")]
+async fn set_friend_referrable(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+    referrable: bool,
+) -> Result<(), String> {
+    let addr_bytes: [u8; 16] = hex::decode(&owner_id_hex)
+        .map_err(|e| format!("invalid owner_id_hex hex: {e}"))?
+        .try_into()
+        .map_err(|_| "owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
+    let owner = crate::owner_state_types::OwnerAddr(addr_bytes);
+
+    let (crdt_state, hlc_tracker, device_id, sync_engine) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.sync_engine.clone(),
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let at =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    {
+        let mut s = crdt_state.lock().await;
+        let updated = apply_set_referrable(&s.friend_graph, owner, referrable, at)?;
+        match s.apply_friend_update(owner, updated) {
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+            | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {}
+            crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+                return Err(format!("set_friend_referrable apply rejected: {reason:?}"));
+            }
+        }
+    }
+
+    // Owner-state mutated → arm the debounced publish-root + persist on the
+    // owner-state SyncEngine so the new flag reaches the user's other devices
+    // and survives a clean shutdown (mirrors `unfriend`).
+    if let Some(engine) = sync_engine {
+        engine.notify_dirty();
     }
 
     let _ = app.emit("friend-list-changed", ());
@@ -35135,7 +35223,7 @@ async fn add_friend_by_key(
 mod friend_ipc_tests {
     use super::*;
     use crate::friend_graph::{
-        owner_id_from_master_ed25519, FriendEntry, FriendOrigin, FriendStatus,
+        owner_id_from_master_ed25519, FriendEntry, FriendGraph, FriendOrigin, FriendStatus,
     };
     use crate::owner_state_crdt::OwnerState;
     use crate::owner_state_types::{Hlc, OwnerAddr};
@@ -35359,6 +35447,52 @@ mod friend_ipc_tests {
             entry.sealed_secret, None,
             "revoke must clear the rendezvous secret"
         );
+    }
+
+    // ── ZEB-375 Phase 2a Task 6: set_friend_referrable pure core ──────────────
+
+    #[test]
+    fn apply_set_referrable_flips_and_bumps() {
+        // An Active friend with referrable=false…
+        let (addr, mut active) = friend_entry(0x55, FriendStatus::Active, 3);
+        active.referrable = false;
+        let mut fg = FriendGraph::default();
+        fg.friends.insert(addr, active.clone());
+
+        // …flipped to referrable=true at a strictly-newer HLC.
+        let updated = apply_set_referrable(&fg, addr, true, hlc(9))
+            .expect("setting referrable on a known friend succeeds");
+
+        assert!(updated.referrable, "referrable flag is flipped on");
+        assert_eq!(updated.learned_at, hlc(9), "learned_at is bumped to `at`");
+        // ALL other fields are preserved verbatim.
+        assert_eq!(
+            updated.status,
+            FriendStatus::Active,
+            "status is preserved (only referrable + learned_at change)"
+        );
+        assert_eq!(
+            updated.master_ed25519, active.master_ed25519,
+            "master key is preserved (the addr↔key invariant must still hold)"
+        );
+        assert_eq!(updated.display, active.display, "display is preserved");
+        assert_eq!(
+            updated.established_via, active.established_via,
+            "provenance is preserved"
+        );
+        assert_eq!(
+            updated.sealed_secret, active.sealed_secret,
+            "sealed_secret is preserved"
+        );
+    }
+
+    #[test]
+    fn apply_set_referrable_unknown_is_error() {
+        let fg = FriendGraph::default();
+        let unknown = OwnerAddr([0xEE; 16]);
+        let err = apply_set_referrable(&fg, unknown, true, hlc(9))
+            .expect_err("setting referrable on a non-friend errors");
+        assert!(err.contains("unknown friend"), "got: {err}");
     }
 
     // ── ZEB-370 (cursor review): generate_friend_token publisher requirement ──
@@ -36191,6 +36325,8 @@ pub fn run() {
             redeem_friend_token,
             list_friends,
             unfriend,
+            // ZEB-375 Phase 2a: toggle a friend's referral-catalog opt-in.
+            set_friend_referrable,
             // ZEB-371: resolve a friend's reachability via their Case-D slot.
             connectivity_resolve_friend,
             // ZEB-371 Task 13: Path A user-facing friend IPCs.
