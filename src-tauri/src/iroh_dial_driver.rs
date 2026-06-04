@@ -60,13 +60,13 @@ pub async fn run_dial_driver(
                 attempts += 1;
             }
             if ok {
-                telemetry.record_succeeded(hint.node_id, hint.owner);
+                telemetry.record_succeeded(hint.node_id, hint.owner.0);
                 tracing::info!(
                     "ZEB-373: dialed iroh peer {}",
                     hex::encode(&hint.node_id[..4])
                 );
             } else {
-                telemetry.record_failed(hint.node_id, hint.owner);
+                telemetry.record_failed(hint.node_id, hint.owner.0);
                 dialed
                     .lock()
                     .expect("dialed set lock")
@@ -84,6 +84,7 @@ pub async fn run_dial_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owner_state_types::OwnerAddr;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     struct MockDialer {
@@ -101,7 +102,7 @@ mod tests {
     fn hint(node_id: u8) -> DialHint {
         DialHint {
             node_id: [node_id; 32],
-            owner: [0xAA; 16],
+            owner: OwnerAddr([0xAA; 16]),
         }
     }
 
@@ -125,7 +126,7 @@ mod tests {
         tx.send(hint(0x11)).unwrap();
         tx.send(DialHint {
             node_id: self_id,
-            owner: [0xAA; 16],
+            owner: OwnerAddr([0xAA; 16]),
         })
         .unwrap();
         drop(tx);
