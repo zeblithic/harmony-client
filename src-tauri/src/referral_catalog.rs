@@ -480,8 +480,15 @@ mod tests {
         // fixture builds fine — but decode must reject it.
         let entries: Vec<ReferralEntry> = (0..=MAX_REFERRAL_ENTRIES)
             .map(|i| ReferralEntry {
-                // Distinct peer_owner per entry (16-byte addr seeded by index).
-                peer_owner: OwnerAddr([(i % 256) as u8; 16]),
+                // Distinct peer_owner per entry. The count exceeds 256, so a
+                // single index byte would collide (i=256 with i=0); spread the
+                // index across 2 bytes so every entry is unique.
+                peer_owner: {
+                    let mut key = [0u8; 16];
+                    key[0] = (i & 0xff) as u8;
+                    key[1] = (i >> 8) as u8;
+                    OwnerAddr(key)
+                },
                 display: None,
             })
             .collect();

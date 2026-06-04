@@ -334,26 +334,33 @@
             <span class="friend-name">{f.display ?? shortId(f.ownerIdHex)}</span>
             <span class="friend-addr" title={f.ownerIdHex}>{shortId(f.ownerIdHex)}</span>
           </div>
-          <label class="referrable-toggle" data-testid="referrable-toggle-label">
-            <input
-              type="checkbox"
-              class="referrable-checkbox"
-              checked={f.referrable}
-              disabled={referrableSaving.has(f.ownerIdHex)}
-              onchange={() => handleToggleReferrable(f.ownerIdHex, !f.referrable)}
-              data-testid="referrable-checkbox"
-            />
-            <span class="referrable-label-text">Referrable</span>
-          </label>
-          <button
-            type="button"
-            class="secondary-btn small-btn"
-            disabled={referralsLoading.has(f.ownerIdHex)}
-            onclick={() => handleBrowseReferrals(f.ownerIdHex)}
-            data-testid="browse-referrals-btn"
-          >
-            {referralsLoading.has(f.ownerIdHex) ? 'Loading…' : 'Browse referrals'}
-          </button>
+          <!-- ZEB-375 Phase 2a: the referrable opt-in + browse action only work
+               for Active friends — the backend returns a typed error for
+               non-Active links. `list_friends` also returns Pending rows, so
+               gate both controls on status to avoid surfacing functional-looking
+               controls that throw. -->
+          {#if f.status === 'active'}
+            <label class="referrable-toggle" data-testid="referrable-toggle-label">
+              <input
+                type="checkbox"
+                class="referrable-checkbox"
+                checked={f.referrable}
+                disabled={referrableSaving.has(f.ownerIdHex)}
+                onchange={() => handleToggleReferrable(f.ownerIdHex, !f.referrable)}
+                data-testid="referrable-checkbox"
+              />
+              <span class="referrable-label-text">Referrable</span>
+            </label>
+            <button
+              type="button"
+              class="secondary-btn small-btn"
+              disabled={referralsLoading.has(f.ownerIdHex)}
+              onclick={() => handleBrowseReferrals(f.ownerIdHex)}
+              data-testid="browse-referrals-btn"
+            >
+              {referralsLoading.has(f.ownerIdHex) ? 'Loading…' : 'Browse referrals'}
+            </button>
+          {/if}
           <button
             type="button"
             class="unfriend-btn"
@@ -365,8 +372,10 @@
           </button>
         </li>
         <!-- ZEB-375 Phase 2a: read-only referral catalog for this friend. Shown
-             only once browsed (an error, or a results entry — possibly empty). -->
-        {#if referralsError.has(f.ownerIdHex)}
+             only once browsed (an error, or a results entry — possibly empty).
+             Active-only: the browse action that populates these maps is itself
+             gated on `f.status === 'active'`. -->
+        {#if f.status === 'active' && referralsError.has(f.ownerIdHex)}
           <li class="referrals-row" data-testid="referrals-error-row">
             <p class="error-text" data-testid="referrals-error">
               {referralsError.get(f.ownerIdHex)}

@@ -22,6 +22,7 @@ import type { TauriAdapter } from './zenoh-service';
  *
  * Phase 2a IPCs:
  *   - `set_friend_referrable`       → void (toggle a friend's referral-catalog opt-in)
+ *   - `browse_friend_referrals`     → ReferralView[] (fetch a verified friend referral catalog)
  *
  * Events:
  *   - `friend-list-changed`              → re-fetch friends + pending
