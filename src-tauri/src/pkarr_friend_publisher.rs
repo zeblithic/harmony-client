@@ -3,9 +3,12 @@
 //! resolve us across WAN without any global discoverability. One registered
 //! handle per active friend; mirrors `PkarrIdentityPublisher`.
 
-use crate::friend_rendezvous::{case_d_publish_key, seal_case_d_payload};
+use crate::friend_rendezvous::{
+    case_d_publish_key, case_d_resolve_key, open_case_d_payload, seal_case_d_payload,
+};
 use harmony_pkarr::{
-    current_epoch_id, EphemeralKeyBuilder, PkarrPublisher, PkarrRoutingRecord, RecordBuilder,
+    current_epoch_id, epoch_tolerance_window, EphemeralKeyBuilder, PkarrPublisher, PkarrResolver,
+    PkarrRoutingRecord, RecordBuilder,
 };
 use std::sync::Arc;
 
@@ -65,12 +68,83 @@ impl PkarrFriendPublisher {
     }
 }
 
+/// Resolve `friend_owner`'s current Case-D routing blob (UNSEALED) using the
+/// shared `secret`. Queries the ±1 epoch tolerance window in parallel; on a hit,
+/// tries each window epoch to unseal (the record could be from any of the three).
+/// Returns `Ok(None)` if no record is found OR a record is found but cannot be
+/// unsealed (wrong secret/epoch — treated as a miss, not an error).
+pub async fn resolve_friend_case_d(
+    resolver: &PkarrResolver,
+    secret: &[u8; 32],
+    friend_owner: &[u8; 16],
+) -> Result<Option<Vec<u8>>, String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let window = epoch_tolerance_window(now_ms);
+    let keys: Vec<_> = window
+        .iter()
+        .map(|&e| case_d_resolve_key(secret, e, friend_owner).verifying_key())
+        .collect();
+    let Some(rec) = resolver
+        .resolve_window(&keys)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    for &e in &window {
+        if let Ok(blob) = open_case_d_payload(secret, e, &rec.routing_blob) {
+            return Ok(Some(blob));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use harmony_pkarr::testing::MockPkarrRelay;
-    use harmony_pkarr::{PkarrPublisher, RelayClient, RelayPool};
+    use harmony_pkarr::{PkarrPublisher, PkarrResolver, RelayClient, RelayPool};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn case_d_publish_then_resolve_round_trip() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(Arc::clone(&client)));
+        let _ph = Arc::clone(&publisher).spawn();
+        let resolver = PkarrResolver::new(Arc::clone(&client));
+
+        let secret = [9u8; 32];
+        let a_owner = [0xAA; 16]; // the publisher's own owner_id
+        let raw = b"alice-iroh-routing".to_vec();
+        let fp = PkarrFriendPublisher::new(
+            Arc::clone(&publisher),
+            a_owner,
+            Arc::new(move || raw.clone()),
+        );
+        // A publishes its own Case-D slot (info = a_owner). The friend_owner handle
+        // key is arbitrary here; A is making itself findable.
+        fp.register_friend([0xBB; 16], secret).await;
+
+        // B (who shares `secret`) resolves A under info = a_owner, unseals, gets raw.
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(attempts < 80, "case-d resolve timed out");
+            if let Some(blob) = resolve_friend_case_d(&resolver, &secret, &a_owner)
+                .await
+                .expect("resolve")
+            {
+                assert_eq!(blob, b"alice-iroh-routing");
+                return;
+            }
+        }
+    }
 
     #[tokio::test]
     async fn register_then_unregister_friend_slot() {
