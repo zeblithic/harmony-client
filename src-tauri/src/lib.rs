@@ -845,7 +845,12 @@ impl NodeState {
         // ZEB-368: clear the process-global iroh session ctx so a restart
         // (or identity rebuild) re-populates a fresh manager + receiver.
         // The registered factory is process-wide and intentionally NOT
-        // cleared — it reads the ctx slot on each `make`.
+        // cleared — it reads the ctx slot on each `make`. Ordering is safe:
+        // the next `start_node`'s `zenoh::open` (which invokes the factory on
+        // the NEW ctx) can't run until `stop_handles` has joined the old
+        // event-loop thread, and old/new sessions use separate flume channels,
+        // so a still-draining old forwarder never touches the new channel
+        // (ZEB-368 review Finding 1).
         crate::iroh_zenoh_registration::clear_iroh_session_ctx();
         self.iroh_endpoint = None;
         self.reachability_resolver = None;
@@ -2561,7 +2566,11 @@ pub(crate) async fn start_node_inner(
                             crate::iroh_zenoh_registration::set_iroh_session_ctx(
                                 crate::iroh_zenoh_registration::IrohSessionCtx {
                                     manager: std::sync::Arc::clone(&link_mgr),
-                                    new_link_rx: new_link_rx.clone(),
+                                    // Move (not clone) the receiver: the ctx must be
+                                    // the ONLY consumer so the forwarder can't split
+                                    // the inbound-link stream with a stray stack clone
+                                    // (ZEB-368 review Finding 2).
+                                    new_link_rx,
                                 },
                             );
                             crate::iroh_zenoh_registration::ensure_iroh_factory_registered();
