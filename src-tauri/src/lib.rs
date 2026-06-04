@@ -4486,7 +4486,16 @@ pub(crate) async fn start_node_inner(
                                 std::sync::Arc::clone(&community_signing_key_arc),
                                 Some(std::sync::Arc::new(app.clone())),
                                 pkarr_invite_publisher_for_state.clone(),
-                            ),
+                            )
+                            // ZEB-370 (cursor review): wire the SAME owner-state
+                            // SyncEngine built above (`engine`, the value this
+                            // block returns as `sync_engine_arc`) so a successful
+                            // inbound friend write arms a debounced publish +
+                            // persist (otherwise new friends never reach the
+                            // user's other devices and a clean shutdown skips the
+                            // publish). Arc-clone — `engine` is still returned via
+                            // `Some(engine)` at the tail of this block.
+                            .with_owner_sync_engine(Some(std::sync::Arc::clone(&engine))),
                         );
 
                         // Multiplex both acceptors behind the single dispatcher
@@ -33178,6 +33187,10 @@ pub fn list_friends_inner(state: &crate::owner_state_crdt::OwnerState) -> Vec<Fr
 /// Pure over the resources it's handed (no NodeState / Tauri), so it's
 /// unit-testable; the IPC wrapper snapshots `crdt_state` + `hlc_tracker` +
 /// `device_id` and delegates.
+/// Returns `Ok(true)` when a fresh tombstone was written (owner-state changed and
+/// the caller should `notify_dirty` the sync engine), `Ok(false)` for the
+/// idempotent no-op on an already-`Revoked` peer (nothing changed — skip the
+/// notify so we don't churn an owner-state re-sync).
 pub async fn unfriend_inner(
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: &std::sync::Arc<
@@ -33185,7 +33198,7 @@ pub async fn unfriend_inner(
     >,
     device_id: &str,
     peer_addr: crate::owner_state_types::OwnerAddr,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // Read the existing entry so we keep its master key (the addr↔key invariant
     // must still hold for the tombstone) and only flip status/learned_at.
     let existing = {
@@ -33203,7 +33216,7 @@ pub async fn unfriend_inner(
     // unnecessary owner-state re-sync, so re-unfriending must short-circuit
     // without reserving an HLC.
     if existing.status == crate::friend_graph::FriendStatus::Revoked {
-        return Ok(());
+        return Ok(false);
     }
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -33222,11 +33235,35 @@ pub async fn unfriend_inner(
     let mut state = crdt_state.lock().await;
     match state.apply_friend_update(peer_addr, tombstone) {
         crate::owner_state_crdt::ApplyOutcome::Inserted
-        | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => Ok(()),
+        | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => Ok(true),
         crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
             Err(format!("unfriend apply rejected: {reason:?}"))
         }
     }
+}
+
+/// ZEB-370 consent-gate guard for `generate_friend_token`, factored out so it's
+/// unit-testable without a NodeState/Tauri harness.
+///
+/// A minted friend token is only redeemable if its `token.sig` is registered in
+/// the live-token map that lives on the `PkarrInvitePublisher` — the inbound
+/// consent gate (`is_friend_token_active`, ZEB-370 d60927a) fails CLOSED when no
+/// publisher is present, so a URL handed out without a live publisher can NEVER
+/// pass the gate (un-redeemable, even on-LAN). Mirroring ZEB-367's
+/// hard-fail-when-publish-unavailable decision (`generate_invite`), we refuse to
+/// mint at all when the publisher is absent rather than return a misleading URL.
+fn friend_token_publish_guard(
+    pkarr_invite_publisher: Option<
+        &std::sync::Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>,
+    >,
+) -> Result<(), String> {
+    if pkarr_invite_publisher.is_none() {
+        return Err(
+            "cannot mint friend token: peer publisher unavailable (iroh routing not ready)"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Generate a `harmony://friend/...` URL for sharing. Mints a device-#2-signed
@@ -33257,6 +33294,11 @@ async fn generate_friend_token(
             g.pkarr_invite_publisher.clone(),
         )
     };
+
+    // Fail fast (before any mint/encode work) if we can't publish a live token:
+    // the inbound consent gate fails closed without the publisher's live-token
+    // map, so a URL minted here would be un-redeemable. See guard doc comment.
+    friend_token_publish_guard(pkarr_invite_publisher.as_ref())?;
 
     // The inviter is the local owner: self_owner + device-#2 signing key +
     // EnrollmentCert all come from the outbox. `community_signing_key` IS the
@@ -33294,19 +33336,21 @@ async fn generate_friend_token(
     let url = crate::friend_token::encode_friend_token_url(&payload)
         .map_err(|e| format!("encode friend token URL: {e}"))?;
 
-    // Publish Case-A reachability keyed on the token sig so an off-LAN redeemer
-    // can resolve our iroh routing. A missing publisher (iroh not booted) is
-    // non-fatal here — unlike invite-only, a friend link can still be redeemed
-    // on-LAN; the redeemer surfaces `inviter_unreachable` if it can't resolve.
-    if let Some(inv_pub) = pkarr_invite_publisher {
-        // Record the token's expiry alongside the publish so the inbound
-        // acceptor's consent gate (`is_friend_token_active`) rejects an expired
-        // or never-minted `token_sig` (ZEB-370 consent gate). `payload.token
-        // .expires_at` is the same value passed into `mint_friend_token`.
-        inv_pub
-            .register_friend_token(&payload.token.sig, payload.token.expires_at)
-            .await;
-    }
+    // Publish Case-A reachability keyed on the token sig so a redeemer can
+    // resolve our iroh routing. The publisher is guaranteed present here — the
+    // `friend_token_publish_guard` above already returned `Err` when it was
+    // `None`, because the inbound consent gate (`is_friend_token_active`) keeps
+    // its live-token map ON the publisher and fails closed without it, making a
+    // token minted with no publisher un-redeemable (NOT redeemable on-LAN).
+    let inv_pub = pkarr_invite_publisher
+        .expect("publisher presence enforced by friend_token_publish_guard above");
+    // Record the token's expiry alongside the publish so the inbound
+    // acceptor's consent gate (`is_friend_token_active`) rejects an expired
+    // or never-minted `token_sig` (ZEB-370 consent gate). `payload.token
+    // .expires_at` is the same value passed into `mint_friend_token`.
+    inv_pub
+        .register_friend_token(&payload.token.sig, payload.token.expires_at)
+        .await;
 
     Ok(url)
 }
@@ -33327,7 +33371,16 @@ async fn redeem_friend_token(
     state: tauri::State<'_, Mutex<NodeState>>,
     url: String,
 ) -> Result<FriendLinkResultDto, String> {
-    let (pkarr_resolver, iroh_endpoint, crdt_state, hlc_tracker, device_id, self_owner, dm_outbox) = {
+    let (
+        pkarr_resolver,
+        iroh_endpoint,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        dm_outbox,
+        sync_engine,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -33339,6 +33392,7 @@ async fn redeem_friend_token(
             g.dm_device_id.clone(),
             g.dm_self_owner,
             g.dm_outbox.clone(),
+            g.sync_engine.clone(),
         )
     };
 
@@ -33372,6 +33426,16 @@ async fn redeem_friend_token(
         HandshakeDialConfig::from_env(),
     )
     .await?;
+
+    // The redeem wrote a new Active/Token FriendEntry into owner-state → arm the
+    // debounced publish-root + persist on the owner-state SyncEngine so the new
+    // friend reaches the user's other devices and survives a clean shutdown.
+    // Done in the IPC wrapper (not `connectivity_link_friend_iroh_inner`) so the
+    // integration test that drives the inner directly is unaffected. Mirrors
+    // mint.rs's `notify_mint_dirty` lock-snapshot-drop pattern.
+    if let Some(engine) = sync_engine {
+        engine.notify_dirty();
+    }
 
     // Notify the UI so it re-fetches the friend list.
     let _ = app.emit("friend-list-changed", ());
@@ -33414,7 +33478,7 @@ async fn unfriend(
         .map_err(|_| "peer_addr must be 16 bytes (32 hex chars)".to_string())?;
     let peer = crate::owner_state_types::OwnerAddr(addr_bytes);
 
-    let (crdt_state, hlc_tracker, device_id) = {
+    let (crdt_state, hlc_tracker, device_id, sync_engine) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -33422,10 +33486,22 @@ async fn unfriend(
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.sync_engine.clone(),
         )
     };
 
-    unfriend_inner(&crdt_state, &hlc_tracker, &device_id, peer).await?;
+    let changed = unfriend_inner(&crdt_state, &hlc_tracker, &device_id, peer).await?;
+
+    // Owner-state mutated → arm the debounced publish-root + persist on the
+    // owner-state SyncEngine so the tombstone reaches the user's other devices
+    // and survives a clean shutdown. Skipped for the idempotent no-op (already
+    // Revoked) so we don't churn an unnecessary re-sync. Mirrors mint.rs's
+    // `notify_mint_dirty` lock-snapshot-drop pattern.
+    if changed {
+        if let Some(engine) = sync_engine {
+            engine.notify_dirty();
+        }
+    }
 
     let _ = app.emit("friend-list-changed", ());
     Ok(())
@@ -33510,9 +33586,13 @@ mod friend_ipc_tests {
             t.insert("d".to_string(), hlc(5));
         }
 
-        unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
+        let changed = unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
             .await
             .expect("unfriend succeeds for an active friend");
+        assert!(
+            changed,
+            "tombstoning an active friend changed owner-state (must signal notify_dirty)"
+        );
 
         // The entry is now a Revoked tombstone…
         {
@@ -33565,9 +33645,13 @@ mod friend_ipc_tests {
             t.insert("d".to_string(), hlc(7));
         }
 
-        unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
+        let changed = unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
             .await
-            .expect("re-unfriending an already-revoked peer is Ok(())");
+            .expect("re-unfriending an already-revoked peer is Ok(false)");
+        assert!(
+            !changed,
+            "idempotent no-op must report no change (caller skips notify_dirty)"
+        );
 
         // The stored entry is untouched — same status and, crucially, the same
         // learned_at HLC (no new tombstone was written).
@@ -33585,6 +33669,52 @@ mod friend_ipc_tests {
                 "no new tombstone — learned_at HLC is unchanged"
             );
         }
+    }
+
+    // ── ZEB-370 (cursor review): generate_friend_token publisher requirement ──
+
+    /// A real `PkarrInvitePublisher` backed by a mock relay. The guard only
+    /// checks presence (never touches the network), so this is just a non-`None`
+    /// `Arc` for the "publisher present" assertion.
+    async fn test_publisher() -> Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher> {
+        use ed25519_dalek::SigningKey;
+        use harmony_pkarr::testing::MockPkarrRelay;
+        use harmony_pkarr::{PkarrPublisher, RelayClient, RelayPool};
+        use rand::rngs::OsRng;
+        let relay = MockPkarrRelay::start().await;
+        Box::leak(Box::new(relay));
+        let pool = RelayPool::new(vec!["http://127.0.0.1:1/".to_string()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&sk.verifying_key().to_bytes());
+        Arc::new(crate::pkarr_invite_publisher::PkarrInvitePublisher::new(
+            publisher,
+            sk,
+            id_pub,
+            Arc::new(|| b"routing".to_vec()),
+        ))
+    }
+
+    #[test]
+    fn friend_token_publish_guard_errors_when_publisher_absent() {
+        // No publisher → the consent gate would fail closed → minting must be
+        // refused (the URL would otherwise be un-redeemable).
+        let err = super::friend_token_publish_guard(None)
+            .expect_err("a missing publisher must hard-fail token minting");
+        assert!(
+            err.contains("peer publisher unavailable"),
+            "error should explain the missing publisher; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn friend_token_publish_guard_ok_when_publisher_present() {
+        let publisher = test_publisher().await;
+        super::friend_token_publish_guard(Some(&publisher))
+            .expect("a present publisher must pass the guard");
     }
 }
 

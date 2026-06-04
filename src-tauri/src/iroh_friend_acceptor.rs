@@ -443,6 +443,12 @@ where
     app: Option<Arc<H>>,
     /// `Some` unregisters the consumed Case-A friend-token one-shot on success.
     pkarr_invite_publisher: Option<Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>>,
+    /// `Some` arms the OWNER-state debounced publish-root + persist after a
+    /// successful inbound friend write, so the new friend reaches the user's
+    /// other devices and survives a clean shutdown. `None` in tests (and when
+    /// owner-state sync isn't running) — the field is optional so the friend
+    /// write still succeeds locally without it. NOT the community sync engine.
+    owner_sync_engine: Option<Arc<crate::owner_state_sync::SyncEngine>>,
     config: FriendAcceptorConfig,
 }
 
@@ -499,7 +505,30 @@ where
             device2_signing_key,
             app,
             pkarr_invite_publisher,
+            owner_sync_engine: None,
             config,
+        }
+    }
+
+    /// Wire in the OWNER-state `SyncEngine` so a successful inbound friend write
+    /// arms a debounced publish + persist. Fluent setter (rather than a 10th
+    /// constructor arg) so existing call sites — including tests that build via
+    /// `new`/`with_config` — keep compiling without an explicit `None`.
+    pub fn with_owner_sync_engine(
+        mut self,
+        engine: Option<Arc<crate::owner_state_sync::SyncEngine>>,
+    ) -> Self {
+        self.owner_sync_engine = engine;
+        self
+    }
+
+    /// Arm the owner-state debounced publish + persist after a friend write.
+    /// No-op when no engine is wired in. Split out so it's directly observable
+    /// in a unit test (a real `SyncEngine` sharing this acceptor's `crdt_state`
+    /// publishes after this fires).
+    fn notify_owner_state_dirty(&self) {
+        if let Some(engine) = self.owner_sync_engine.as_ref() {
+            engine.notify_dirty();
         }
     }
 
@@ -655,6 +684,16 @@ where
         if let Some(pub_) = self.pkarr_invite_publisher.as_ref() {
             pub_.unregister_friend_token(&req.token_sig).await;
         }
+
+        // The inbound handshake wrote a new Active/Token FriendEntry into
+        // owner-state (`process_friend_request` above). Arm the OWNER-state
+        // debounced publish-root + persist so the new friend reaches the user's
+        // other devices and survives a clean shutdown — otherwise the dirty flag
+        // is never set and a clean shutdown skips the publish entirely. No-op
+        // when no engine is wired in (tests). Fires even if the accept-write IO
+        // above succeeded-then-something-later-failed because the local CRDT
+        // mutation is already committed (see the unregister rationale).
+        self.notify_owner_state_dirty();
         Ok(())
     }
 }
@@ -1270,6 +1309,78 @@ mod tests {
             .await
             .expect_err("expired token must be rejected by the gate");
         assert!(matches!(err, FriendAcceptError::TokenNotLive { .. }));
+    }
+
+    // ── ZEB-370 (cursor review): owner-state sync trigger on friend write ──
+
+    /// A successful inbound friend write must arm the owner-state SyncEngine so
+    /// the new friend reaches the user's other devices AND persists on clean
+    /// shutdown. Here we wire a REAL `SyncEngine` (short debounce) sharing the
+    /// acceptor's `crdt_state`, invoke the same `notify_owner_state_dirty()` the
+    /// inbound handler calls on success, and assert a publish lands — proving the
+    /// acceptor's `owner_sync_engine` field is invoked end-to-end. Mirrors
+    /// owner_state_sync.rs's `single_notify_dirty_fires_one_publish`.
+    #[tokio::test]
+    async fn friend_write_arms_owner_state_sync_engine() {
+        use crate::content_store::InMemoryStub;
+        use crate::owner_state_crypto::KeyTree;
+        use crate::owner_state_sync::{PersistPaths, SyncEngine};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let shared_state = Arc::new(TokioMutex::new(OwnerState::default()));
+        let (pub_tx, mut pub_rx) = mpsc::channel(16);
+        let (_sub_tx, sub_rx) = mpsc::channel(16);
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(SyncEngine::new(
+            Arc::new(KeyTree::derive(&[7u8; 32]).expect("kt")),
+            "acceptor-test-dev".into(),
+            Arc::clone(&shared_state),
+            Arc::new(TokioMutex::new(std::collections::BTreeMap::new())),
+            Arc::new(InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            PersistPaths {
+                crdt: dir.path().join("crdt.cbor"),
+                replay: dir.path().join("replay.cbor"),
+            },
+            50, // short debounce for the test
+        ));
+
+        let me = mint_test_owner(0x71);
+        let acceptor = IrohFriendHandshakeAcceptor::<()>::new(
+            Arc::clone(&shared_state),
+            Arc::new(TokioMutex::new(std::collections::BTreeMap::new())),
+            "acceptor-test-dev".to_string(),
+            me.owner,
+            None,
+            me.cert,
+            Arc::new(ed25519_dalek::SigningKey::from_bytes(
+                &me.device_key.to_bytes(),
+            )),
+            None,
+            None,
+        )
+        .with_owner_sync_engine(Some(Arc::clone(&engine)));
+
+        // The success-path call the inbound handler makes after a friend write.
+        acceptor.notify_owner_state_dirty();
+
+        let bytes = tokio::time::timeout(Duration::from_millis(500), pub_rx.recv())
+            .await
+            .expect("a friend write must arm the owner-state publish within the debounce")
+            .expect("publish channel not closed");
+        assert!(!bytes.is_empty(), "publish payload should be non-empty");
+        let _ = engine.shutdown().await;
+    }
+
+    /// Without an engine wired in, `notify_owner_state_dirty()` is a safe no-op
+    /// (the friend write still succeeds locally). Guards the `Option` contract.
+    #[tokio::test]
+    async fn friend_write_without_engine_is_noop() {
+        let acceptor = acceptor_with_publisher(None);
+        // Must not panic; nothing to assert beyond "does not blow up".
+        acceptor.notify_owner_state_dirty();
     }
 
     // ── Task 9: ALPN dispatch multiplexer ────────────────────────────────
