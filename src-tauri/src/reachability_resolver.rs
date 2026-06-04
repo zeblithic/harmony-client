@@ -56,7 +56,7 @@ pub struct ReachabilityResolver {
     fallback_source: Arc<RwLock<Option<Arc<dyn ReachabilityFallback>>>>,
     // ZEB-373: optional notify seam to the dynamic dial driver. None until boot
     // installs it; behind Option so every existing caller/test is unaffected.
-    dial_hint_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<DialHint>>>>,
+    dial_hint_tx: Arc<RwLock<Option<tokio::sync::mpsc::Sender<DialHint>>>>,
 }
 
 impl std::fmt::Debug for ReachabilityResolver {
@@ -97,8 +97,8 @@ impl ReachabilityResolver {
     }
 
     /// Install the dial-hint sender. Called once at boot (event_loop) after the
-    /// dynamic dial driver's channel is created.
-    pub fn set_dial_hint_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<DialHint>) {
+    /// dynamic dial driver's bounded channel is created.
+    pub fn set_dial_hint_sender(&self, tx: tokio::sync::mpsc::Sender<DialHint>) {
         *self.dial_hint_tx.write().expect("dial hint tx lock") = Some(tx);
     }
 
@@ -121,6 +121,9 @@ impl ReachabilityResolver {
         }
         drop(map);
         // ZEB-373: notify the dial driver the FIRST time we learn this (owner,node_id).
+        // `try_send` (non-blocking, lossy) so this never blocks `update()` and the
+        // bounded channel can't grow unbounded under a flood; the driver dedups, so a
+        // dropped hint under back-pressure is not correctness-critical.
         if !was_present {
             if let Some(tx) = self
                 .dial_hint_tx
@@ -128,7 +131,7 @@ impl ReachabilityResolver {
                 .expect("dial hint tx lock")
                 .as_ref()
             {
-                let _ = tx.send(DialHint {
+                let _ = tx.try_send(DialHint {
                     node_id,
                     owner: actor,
                 });
@@ -592,7 +595,7 @@ mod tests {
     #[test]
     fn dial_hint_fires_once_on_first_learn() {
         let r = ReachabilityResolver::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         r.set_dial_hint_sender(tx);
         let owner = OwnerAddr([0xAA; 16]);
         let mut payload = make_payload(0x11, 1000);

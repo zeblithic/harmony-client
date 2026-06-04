@@ -2060,6 +2060,38 @@ mod tests {
     }
 
     #[test]
+    fn dial_ring_evicts_oldest_past_cap() {
+        let t = DialTelemetry::new();
+        // Push one more than the cap; the oldest must be evicted (FIFO).
+        for i in 0..(DIAL_RING_CAP + 1) {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+            t.record_succeeded(id, [0xAA; 16]);
+        }
+        let s = t.summary();
+        assert_eq!(s.recent.len(), DIAL_RING_CAP, "ring stays at cap");
+        // The first entry (node_id_short of byte 0x00) was evicted; the newest
+        // (byte = DIAL_RING_CAP) is present.
+        let newest_short = hex::encode([DIAL_RING_CAP as u8, 0, 0, 0]);
+        assert_eq!(
+            s.recent.last().map(|h| h.node_id_short.clone()),
+            Some(newest_short),
+            "newest entry retained at the back"
+        );
+        assert!(
+            s.recent
+                .iter()
+                .all(|h| h.node_id_short != hex::encode([0u8, 0, 0, 0])),
+            "oldest entry evicted"
+        );
+        assert_eq!(
+            s.succeeded,
+            (DIAL_RING_CAP + 1) as u64,
+            "counter not capped"
+        );
+    }
+
+    #[test]
     fn empty_snapshot_has_zeroed_dial_status() {
         let snap = NetworkHealthSnapshot::empty();
         assert_eq!(snap.dial_status.attempts, 0);

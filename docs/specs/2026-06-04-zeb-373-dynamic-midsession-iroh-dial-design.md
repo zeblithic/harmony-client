@@ -183,3 +183,37 @@ drops; liveness/rebinding; reconnection-after-offline. No transport-event hook i
 - `src-tauri/src/lib.rs` — hold the `DialTelemetry` `Arc` in shared app state; read it in
   the `network_health_snapshot` assembly.
 - `src-tauri/tests/` — the two-engine mid-session-dial acceptance test.
+
+## 11. Review revisions (PR #190 bot round)
+
+Adjustments from the PR #190 review (CodeRabbit / Cursor / Qodo / CodeAnt), folded
+into the design:
+
+- **Sender installed before `zenoh::open`.** The resolver's `DialHint` sender is
+  installed *before* `open_session_with_runtime`, with the driver spawned after, so a
+  peer learned during the open window (e.g. an inbound iroh link accepted mid-open) is
+  buffered rather than dropped. (CodeRabbit Major #1.)
+- **Bounded hint channel.** The resolver→driver channel is `mpsc::channel(1024)` with
+  `try_send` (lossy) — network-fed discovery can no longer grow the heap without bound;
+  the driver dedups, so a dropped hint under genuine flood is not correctness-critical.
+  (CodeRabbit Major #2.)
+- **Bounded dedup set.** "Already dialed this session" is a `HashSet` + FIFO `VecDeque`
+  capped at 4096, so memory stays bounded under long sessions / adversarial node-id
+  churn. (CodeAnt Major.)
+- **`attempts` counts each dial try.** `record_attempt()` fires per `connect_peer`
+  call (including retries), so the metric reflects real network operations. (CodeAnt
+  Major.)
+- **Failed dials are terminal for the session.** The earlier "re-arm on terminal
+  failure" was inert (the resolver only emits on first-learn, so the same
+  `(owner,node_id)` never re-emitted). Removed; a persistently-unreachable peer is
+  reconnected by **ZEB-321 Phase 3** (liveness/rebinding), not retried across the
+  session — keeping ZEB-373 strictly dial-once. (Cursor Medium, Qodo bug #1.)
+- **zenoh pinned `=1.9.0`.** Because we depend on the `internal` (unstable) surface, the
+  dep is pinned exactly so a semver-minor bump can't silently change it; upgrades are
+  deliberate. (Qodo bug #2.)
+- **Declined — driver/dial-task shutdown abort (Cursor Low).** The driver terminates on
+  hint-channel close (the resolver's sender is dropped in `clear_iroh_handles`), and all
+  in-flight dial sub-tasks are reaped when the per-node tokio runtime drops on stop
+  (`stop_handles` joins the runtime thread). A `connect_peer` racing the brief shutdown
+  window fails harmlessly. Consistent with how the inbound forwarder + accept loop are
+  reaped; no separate `JoinHandle` tracking added.

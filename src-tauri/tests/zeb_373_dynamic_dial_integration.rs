@@ -161,7 +161,8 @@ async fn inner() {
 
     // ── 4. Driver on A: install hint sender + spawn run_dial_driver. ───────
     let telemetry = Arc::new(DialTelemetry::new());
-    let (hint_tx, hint_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (hint_tx, hint_rx) =
+        tokio::sync::mpsc::channel(harmony_app::iroh_dial_driver::DIAL_HINT_CHANNEL_CAP);
     resolver_a.set_dial_hint_sender(hint_tx);
     let dialer = Arc::new(RuntimePeerDialer::new(rt_a.clone()));
     let self_nid = *ep_a.node_id().as_bytes();

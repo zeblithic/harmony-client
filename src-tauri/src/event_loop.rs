@@ -653,6 +653,17 @@ pub async fn run<R: Runtime>(
         }
     }
 
+    // ZEB-373: install the dial-hint sender on the resolver BEFORE opening Zenoh, so
+    // a peer learned during the open window (e.g. via an inbound iroh link accepted
+    // mid-open) is buffered in the bounded channel rather than dropped (CodeRabbit).
+    let mut dial_hint_rx = None;
+    if let (Some(ref ih), Some(_)) = (&iroh_handles, &dial_telemetry) {
+        let (hint_tx, hint_rx) =
+            tokio::sync::mpsc::channel(crate::iroh_dial_driver::DIAL_HINT_CHANNEL_CAP);
+        ih.link_manager.resolver().set_dial_hint_sender(hint_tx);
+        dial_hint_rx = Some(hint_rx);
+    }
+
     let (zenoh_runtime, session) =
         match cancellable!(open_session_with_runtime(config), "zenoh::open") {
             Ok(pair) => pair,
@@ -672,12 +683,12 @@ pub async fn run<R: Runtime>(
         };
     tracing::info!("Zenoh session opened");
 
-    // ZEB-373: dynamic mid-session dial. Create the hint channel, install the sender
-    // on the resolver, and spawn the driver to dial newly-learned peers via the live
-    // zenoh Runtime. Inbound + static-seed (ZEB-368) are unchanged.
-    if let (Some(ref ih), Some(ref telemetry)) = (&iroh_handles, &dial_telemetry) {
-        let (hint_tx, hint_rx) = tokio::sync::mpsc::unbounded_channel();
-        ih.link_manager.resolver().set_dial_hint_sender(hint_tx);
+    // ZEB-373: spawn the dial driver to dial newly-learned peers via the live zenoh
+    // Runtime. The hint sender was installed on the resolver BEFORE open (above);
+    // inbound + static-seed (ZEB-368) are unchanged.
+    if let (Some(ref ih), Some(ref telemetry), Some(hint_rx)) =
+        (&iroh_handles, &dial_telemetry, dial_hint_rx)
+    {
         let self_nid = *ih.endpoint.node_id().as_bytes();
         let dialer = std::sync::Arc::new(crate::iroh_dial_driver::RuntimePeerDialer::new(
             zenoh_runtime.clone(),
