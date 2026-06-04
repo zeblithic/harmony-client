@@ -1,0 +1,177 @@
+//! ZEB-371 Task 12: process-local pending inbound friend-request store.
+//!
+//! Path A (mutual-key, no token) records an inbound `FriendLinkRequest` from a
+//! NEW owner here and replies `FriendLinkResponse::Pending` (writing NO friend)
+//! until the user explicitly accepts. The user-facing accept/decline/add IPCs
+//! (the NEXT task) reach this store via the `Arc<PendingFriendRequests>` parked
+//! on `NodeState`:
+//!   * accept → [`PendingFriendRequests::mark_approved`] (so the requester's
+//!     NEXT dial passes the consent gate via `prior_accept`),
+//!   * decline → [`PendingFriendRequests::decline`] (drop the inbound + any
+//!     approval),
+//!   * the acceptor, on a re-dial it accepts inline, consumes the approval via
+//!     [`PendingFriendRequests::take_approved`].
+//!
+//! This is PROCESS-LOCAL (not owner-state CRDT) and intentionally ephemeral: a
+//! pending request that hasn't been accepted by shutdown is simply re-sent by
+//! the requester's next dial. No persistence, no replication.
+
+use crate::owner_state_types::OwnerAddr;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+
+/// One recorded inbound friend request awaiting the user's decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInbound {
+    /// The requester's advertised display name (UX hint), if any.
+    pub display: Option<String>,
+    /// Wall-clock epoch-ms the request was first recorded (idempotent: a
+    /// re-dial before acceptance does NOT bump this).
+    pub received_at_ms: u64,
+}
+
+/// Process-local store of pending inbound friend requests and the set of
+/// requesters the user has approved (but whose link hasn't completed yet).
+///
+/// Two independent `Mutex`-guarded maps so a `record_inbound` (acceptor thread)
+/// never blocks a `mark_approved` (IPC thread) and vice-versa. Locks are held
+/// only for the duration of a single map op — never across an `.await`.
+#[derive(Default)]
+pub struct PendingFriendRequests {
+    inbound: Mutex<HashMap<OwnerAddr, PendingInbound>>,
+    approved: Mutex<HashSet<OwnerAddr>>,
+}
+
+impl PendingFriendRequests {
+    /// Empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an inbound request from `addr`. IDEMPOTENT: a request already
+    /// recorded (and not yet declined/accepted) keeps its original
+    /// `received_at_ms` and display — a re-dial does not reset the entry.
+    pub fn record_inbound(&self, addr: OwnerAddr, display: Option<String>, now_ms: u64) {
+        let mut inbound = self.inbound.lock().expect("pending inbound mutex poisoned");
+        inbound.entry(addr).or_insert(PendingInbound {
+            display,
+            received_at_ms: now_ms,
+        });
+    }
+
+    /// Snapshot the currently-pending inbound requests (for the list IPC).
+    pub fn list(&self) -> Vec<(OwnerAddr, PendingInbound)> {
+        let inbound = self.inbound.lock().expect("pending inbound mutex poisoned");
+        inbound.iter().map(|(addr, p)| (*addr, p.clone())).collect()
+    }
+
+    /// True if the user has approved `addr` (so the requester's next dial can be
+    /// accepted inline via the consent decision's `prior_accept`).
+    pub fn is_approved(&self, addr: &OwnerAddr) -> bool {
+        self.approved
+            .lock()
+            .expect("pending approved mutex poisoned")
+            .contains(addr)
+    }
+
+    /// Mark `addr` as approved (the user tapped Accept). The approval persists
+    /// until the link completes ([`take_approved`](Self::take_approved)) or the
+    /// user declines ([`decline`](Self::decline)).
+    pub fn mark_approved(&self, addr: OwnerAddr) {
+        self.approved
+            .lock()
+            .expect("pending approved mutex poisoned")
+            .insert(addr);
+    }
+
+    /// Remove + return whether `addr` was approved. Called once the inbound
+    /// handshake actually completes the inline accept, so a single Accept tap
+    /// authorises exactly one completed link (re-arming requires a fresh tap).
+    pub fn take_approved(&self, addr: &OwnerAddr) -> bool {
+        self.approved
+            .lock()
+            .expect("pending approved mutex poisoned")
+            .remove(addr)
+    }
+
+    /// Decline `addr`: drop any recorded inbound request AND any approval.
+    pub fn decline(&self, addr: &OwnerAddr) {
+        self.inbound
+            .lock()
+            .expect("pending inbound mutex poisoned")
+            .remove(addr);
+        self.approved
+            .lock()
+            .expect("pending approved mutex poisoned")
+            .remove(addr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(b: u8) -> OwnerAddr {
+        OwnerAddr([b; 16])
+    }
+
+    #[test]
+    fn record_then_list_returns_inbound() {
+        let store = PendingFriendRequests::new();
+        store.record_inbound(addr(1), Some("alice".into()), 1_000);
+        let list = store.list();
+        assert_eq!(list.len(), 1);
+        let (a, p) = &list[0];
+        assert_eq!(*a, addr(1));
+        assert_eq!(p.display.as_deref(), Some("alice"));
+        assert_eq!(p.received_at_ms, 1_000);
+    }
+
+    #[test]
+    fn record_inbound_is_idempotent() {
+        let store = PendingFriendRequests::new();
+        store.record_inbound(addr(2), Some("first".into()), 1_000);
+        // A re-dial must NOT overwrite the original entry (display + timestamp).
+        store.record_inbound(addr(2), Some("second".into()), 9_999);
+        let list = store.list();
+        assert_eq!(
+            list.len(),
+            1,
+            "duplicate record must not create a 2nd entry"
+        );
+        let (_, p) = &list[0];
+        assert_eq!(p.display.as_deref(), Some("first"));
+        assert_eq!(p.received_at_ms, 1_000);
+    }
+
+    #[test]
+    fn approve_then_take_consumes_once() {
+        let store = PendingFriendRequests::new();
+        assert!(!store.is_approved(&addr(3)), "unknown addr is not approved");
+        store.mark_approved(addr(3));
+        assert!(store.is_approved(&addr(3)));
+        // take_approved removes + returns true the first time…
+        assert!(store.take_approved(&addr(3)));
+        // …and false thereafter (consumed).
+        assert!(!store.take_approved(&addr(3)));
+        assert!(!store.is_approved(&addr(3)));
+    }
+
+    #[test]
+    fn decline_drops_inbound_and_approval() {
+        let store = PendingFriendRequests::new();
+        store.record_inbound(addr(4), None, 5_000);
+        store.mark_approved(addr(4));
+        store.decline(&addr(4));
+        assert!(store.list().is_empty(), "decline drops the inbound request");
+        assert!(!store.is_approved(&addr(4)), "decline drops the approval");
+        // take_approved is now a no-op (returns false).
+        assert!(!store.take_approved(&addr(4)));
+    }
+
+    #[test]
+    fn take_approved_on_unknown_is_false() {
+        let store = PendingFriendRequests::new();
+        assert!(!store.take_approved(&addr(5)));
+    }
+}

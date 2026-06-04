@@ -45,6 +45,7 @@ pub mod folders;
 mod follows;
 pub mod friend_graph;
 pub mod friend_rendezvous;
+pub mod friend_requests;
 pub mod friend_token;
 pub mod identity;
 pub mod identity_commands;
@@ -130,6 +131,9 @@ impl<R: tauri::Runtime> crate::community_invite::AppHandleEmit for tauri::AppHan
 impl<R: tauri::Runtime> crate::iroh_friend_acceptor::FriendEventEmit for tauri::AppHandle<R> {
     fn emit_friend_list_changed(&self) {
         let _ = self.emit("friend-list-changed", ());
+    }
+    fn emit_friend_request_received(&self) {
+        let _ = self.emit("friend-request-received", ());
     }
 }
 
@@ -789,6 +793,14 @@ pub struct NodeState {
     pub pkarr_friend_publisher:
         Option<std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
 
+    /// ZEB-371 Task 12: process-local pending inbound friend-request store
+    /// (Path A). Shared with the friend acceptor (which records new-owner
+    /// requests + consumes prior approvals) so the next task's
+    /// accept/decline/add IPCs can reach the same store. `None` until
+    /// `start_node` wires it; cleared on stop/restart.
+    pub pending_friend_requests:
+        Option<std::sync::Arc<crate::friend_requests::PendingFriendRequests>>,
+
     /// Shared pkarr resolver. Used by `connectivity_discover_identity` IPC
     /// and wired into the `ReachabilityResolver` as the case-C fallback.
     pub pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
@@ -875,6 +887,10 @@ impl NodeState {
         // ZEB-371: drop the Case-D friend publisher so a restart rebuilds it
         // against the fresh pkarr publisher / blob builder.
         self.pkarr_friend_publisher = None;
+        // ZEB-371 Task 12: drop the Path-A pending-request store so a restart
+        // rebuilds a fresh one (process-local + ephemeral — pending requests are
+        // re-sent by the requester's next dial after a restart).
+        self.pending_friend_requests = None;
         self.pkarr_resolver = None;
         self.pkarr_invite_publisher = None;
         self.pkarr_identity_publisher = None;
@@ -1023,6 +1039,7 @@ impl Default for NodeState {
             // start_node wires them; cleared + aborted in stop_inner.
             pkarr_publisher: None,
             pkarr_friend_publisher: None,
+            pending_friend_requests: None,
             pkarr_resolver: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
@@ -2481,6 +2498,19 @@ pub(crate) async fn start_node_inner(
         > = None;
         let mut pkarr_settings_path_for_state: Option<std::path::PathBuf> = None;
         let mut pkarr_publisher_handle_for_state: Option<tokio::task::JoinHandle<()>> = None;
+
+        // ZEB-371 Task 12: process-local pending inbound friend-request store
+        // (Path A). Built unconditionally so the next task's accept/decline/add
+        // IPCs can reach it via NodeState even when pkarr is disabled. Cloned
+        // into the friend acceptor at its construction below.
+        let pending_friend_requests_for_state =
+            std::sync::Arc::new(crate::friend_requests::PendingFriendRequests::new());
+        // ZEB-371 Task 12 (spec §7.1): "auto-accept known requesters" toggle.
+        // Set from persisted `PkarrSettings` in the pkarr setup block. Declared
+        // without an initializer (the acceptor's read is always dominated by the
+        // pkarr-block assignment); a `let else` at the read site applies the spec
+        // default (ON) on the — currently unreachable — no-pkarr path.
+        let friend_auto_accept_known_for_state: bool;
 
         // ── ZEB-321 Phase 1 Task 8: iroh transport boot ──────────────────
         //
@@ -4490,6 +4520,9 @@ pub(crate) async fn start_node_inner(
                     if pkarr_settings.identity_discoverable {
                         pkarr_identity_pub.enable().await;
                     }
+                    // ZEB-371 Task 12: lift the persisted Path-A auto-accept
+                    // toggle so the friend acceptor (constructed below) reads it.
+                    friend_auto_accept_known_for_state = pkarr_settings.friend_auto_accept_known;
 
                     // Bootstrap case-C: register per-community publications for
                     // every community the device is currently a member of.
@@ -4630,7 +4663,15 @@ pub(crate) async fn start_node_inner(
                             // successful inbound accept immediately publishes the
                             // just-added friend's reachability slot (no wait for
                             // the next reachability tick).
-                            .with_friend_publisher(Some(std::sync::Arc::clone(&pkarr_friend_pub))),
+                            .with_friend_publisher(Some(std::sync::Arc::clone(&pkarr_friend_pub)))
+                            // ZEB-371 Task 12: wire the Path-A pending-request
+                            // store + the persisted auto-accept toggle so the
+                            // consent decision tree can record/approve requests
+                            // and prompt vs auto-accept known requesters.
+                            .with_pending_requests(Some(std::sync::Arc::clone(
+                                &pending_friend_requests_for_state,
+                            )))
+                            .with_auto_accept_known(friend_auto_accept_known_for_state),
                         );
 
                         // Multiplex both acceptors behind the single dispatcher
@@ -5217,6 +5258,12 @@ pub(crate) async fn start_node_inner(
                         // ZEB-323 Phase 2b: stash pkarr policy handles.
                         guard.pkarr_publisher = pkarr_publisher_for_state.take();
                         guard.pkarr_friend_publisher = pkarr_friend_publisher_for_state.take();
+                        // ZEB-371 Task 12: stash the Path-A pending-request store
+                        // so the next task's accept/decline/add IPCs can reach the
+                        // SAME store the friend acceptor records into. Clone — the
+                        // acceptor (built above) holds the other strong ref.
+                        guard.pending_friend_requests =
+                            Some(std::sync::Arc::clone(&pending_friend_requests_for_state));
                         guard.pkarr_resolver = pkarr_resolver_for_state.take();
                         guard.pkarr_invite_publisher = pkarr_invite_publisher_for_state.take();
                         guard.pkarr_identity_publisher = pkarr_identity_publisher_for_state.take();
@@ -33247,9 +33294,9 @@ pub async fn connectivity_link_friend_iroh_inner(
     dial_config: HandshakeDialConfig,
 ) -> Result<FriendLinkOutcome, String> {
     use crate::iroh_friend_acceptor::{
-        decode_friend_accepted, encode_friend_request, friend_accept_sig_preimage,
+        decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
         friend_request_sig_preimage, master_ed25519_from_cert, verify_enrolled_device,
-        FriendLinkRequest, FRIEND_MAX_PACKET_LEN,
+        FriendLinkRequest, FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
     };
     use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
@@ -33442,7 +33489,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         return Err(format!("inviter_unreachable: send.finish failed: {e}"));
     }
 
-    // 6. Read [u32 LE length-prefix][FriendLinkAccepted], bounded by
+    // 6. Read [u32 LE length-prefix][FriendLinkResponse], bounded by
     //    response_read_timeout.
     let read_response = async {
         let mut len_buf = [0u8; 4];
@@ -33482,8 +33529,19 @@ pub async fn connectivity_link_friend_iroh_inner(
     conn.close(0u32.into(), b"friend-handshake-complete");
     drop(conn);
 
-    let accepted =
-        decode_friend_accepted(&response_bytes).map_err(|e| format!("decode accepted: {e}"))?;
+    // ZEB-371 Task 12: the acceptor now replies with a `FriendLinkResponse`.
+    // The token (REDEEM) path should only ever receive `Accepted`; a `Pending`
+    // would mean the acceptor took the Path-A branch (it should not for a
+    // token-bearing request), so we surface it as a distinct error rather than
+    // silently treating it as success.
+    let accepted = match decode_friend_response(&response_bytes)
+        .map_err(|e| format!("decode response: {e}"))?
+    {
+        FriendLinkResponse::Accepted(a) => *a,
+        FriendLinkResponse::Pending => {
+            return Err("friend request pending acceptance".to_string());
+        }
+    };
 
     // 7. Verify the accept: it must be from the inviter (cert binds
     //    payload.inviter_addr) and signed over the accept preimage.
@@ -38695,6 +38753,7 @@ mod start_node_race_tests {
             // ZEB-323 Phase 2b: pkarr handles unused in race tests.
             pkarr_publisher: None,
             pkarr_friend_publisher: None,
+            pending_friend_requests: None,
             pkarr_resolver: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,

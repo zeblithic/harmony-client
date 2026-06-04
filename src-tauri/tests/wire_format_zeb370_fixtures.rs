@@ -47,7 +47,8 @@ use harmony_app::friend_graph::{
 };
 use harmony_app::friend_token::FriendTokenPayload;
 use harmony_app::iroh_friend_acceptor::{
-    encode_friend_accepted, encode_friend_request, FriendLinkAccepted, FriendLinkRequest,
+    encode_friend_accepted, encode_friend_request, encode_friend_response, FriendLinkAccepted,
+    FriendLinkRequest, FriendLinkResponse,
 };
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
 use harmony_app::owner_state_types::Hlc;
@@ -75,6 +76,11 @@ const EXPECTED_FRIEND_TOKEN_PAYLOAD_HEX: &str = "a46269615027e5774a6d3b6f6a32246
 // FILL_AFTER regen-on-first-run sentinel.
 const EXPECTED_FRIEND_LINK_REQUEST_HEX: &str = "a661615027e5774a6d3b6f6a32246db7518bae50616e65616c69636561745840070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707076165582055555555555555555555555555555555555555555555555555555555555555556163a86776657273696f6e01686f776e65725f69645027e5774a6d3b6f6a32246db7518bae50696465766963655f696450d39675728ecef89687069f489157d5d16e6465766963655f7075626b657973a269636c6173736963616ca26e656432353531395f7665726966795820623e770b1719760cffd2aff3955ee52843c9725d0e991826d50b8a5012368e706a7832353531395f707562582000000000000000000000000000000000000000000000000000000000000000006c706f73745f7175616e74756df6696973737565645f61741a6553f1006a657870697265735f6174f666697373756572a1664d6173746572a16d6d61737465725f7075626b6579a269636c6173736963616ca26e656432353531395f76657269667958202152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db126a7832353531395f707562582000000000000000000000000000000000000000000000000000000000000000006c706f73745f7175616e74756df6697369676e61747572655840f7aa268c3010a6649f3942757cf4036f4cb0a999ee3d1630565168c487c4e3487e3bc4bc2927f51190867ef24a1887814998c543c0e4805aeb9279d08ffd0b0a6173584009090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909";
 const EXPECTED_FRIEND_LINK_ACCEPTED_HEX: &str = "a561615027e5774a6d3b6f6a32246db7518bae50616e63626f626165582055555555555555555555555555555555555555555555555555555555555555556163a86776657273696f6e01686f776e65725f69645027e5774a6d3b6f6a32246db7518bae50696465766963655f696450d39675728ecef89687069f489157d5d16e6465766963655f7075626b657973a269636c6173736963616ca26e656432353531395f7665726966795820623e770b1719760cffd2aff3955ee52843c9725d0e991826d50b8a5012368e706a7832353531395f707562582000000000000000000000000000000000000000000000000000000000000000006c706f73745f7175616e74756df6696973737565645f61741a6553f1006a657870697265735f6174f666697373756572a1664d6173746572a16d6d61737465725f7075626b6579a269636c6173736963616ca26e656432353531395f76657269667958202152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db126a7832353531395f707562582000000000000000000000000000000000000000000000000000000000000000006c706f73745f7175616e74756df6697369676e61747572655840f7aa268c3010a6649f3942757cf4036f4cb0a999ee3d1630565168c487c4e3487e3bc4bc2927f51190867ef24a1887814998c543c0e4805aeb9279d08ffd0b0a617358400b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+// ZEB-371 Task 12: FriendLinkResponse is an externally-tagged enum
+// (`Accepted` renamed "ok", `Pending` renamed "pending"). Pinned via the
+// FILL_AFTER regen-on-first-run sentinel.
+const EXPECTED_FRIEND_LINK_RESPONSE_PENDING_HEX: &str = "6770656e64696e67";
+const EXPECTED_FRIEND_LINK_RESPONSE_ACCEPTED_HEX: &str = "a1626f6ba561615027e5774a6d3b6f6a32246db7518bae50616e63626f626165582055555555555555555555555555555555555555555555555555555555555555556163a86776657273696f6e01686f776e65725f69645027e5774a6d3b6f6a32246db7518bae50696465766963655f696450d39675728ecef89687069f489157d5d16e6465766963655f7075626b657973a269636c6173736963616ca26e656432353531395f7665726966795820623e770b1719760cffd2aff3955ee52843c9725d0e991826d50b8a5012368e706a7832353531395f707562582000000000000000000000000000000000000000000000000000000000000000006c706f73745f7175616e74756df6696973737565645f61741a6553f1006a657870697265735f6174f666697373756572a1664d6173746572a16d6d61737465725f7075626b6579a269636c6173736963616ca26e656432353531395f76657269667958202152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db126a7832353531395f707562582000000000000000000000000000000000000000000000000000000000000000006c706f73745f7175616e74756df6697369676e61747572655840f7aa268c3010a6649f3942757cf4036f4cb0a999ee3d1630565168c487c4e3487e3bc4bc2927f51190867ef24a1887814998c543c0e4805aeb9279d08ffd0b0a617358400b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
 
 fn hlc(w: u64) -> Hlc {
     Hlc {
@@ -336,5 +342,67 @@ fn friend_link_accepted_cbor() {
         map.len(),
         5,
         "FriendLinkAccepted should encode 5 keys (display present)"
+    );
+}
+
+#[test]
+fn friend_link_response_pending_cbor() {
+    // ZEB-371 Task 12: the Pending variant carries no data; pins its tag.
+    let encoded =
+        encode_friend_response(&FriendLinkResponse::Pending).expect("encode pending response");
+    pin_hex(
+        "EXPECTED_FRIEND_LINK_RESPONSE_PENDING_HEX",
+        &hex::encode(&encoded),
+        EXPECTED_FRIEND_LINK_RESPONSE_PENDING_HEX,
+    );
+
+    // Structural: externally-tagged unit variant → CBOR text string "pending".
+    let value: ciborium::Value = ciborium::de::from_reader(&encoded[..]).expect("decode as value");
+    assert_eq!(
+        value.as_text(),
+        Some("pending"),
+        "FriendLinkResponse::Pending must encode as the bare tag \"pending\""
+    );
+}
+
+#[test]
+fn friend_link_response_accepted_cbor() {
+    // ZEB-371 Task 12: the Accepted variant wraps a FriendLinkAccepted, encoded
+    // as the externally-tagged map {"ok": <accepted>}. eph_x25519_pub pinned to
+    // [0x55; 32] for deterministic bytes.
+    let owner = mint_test_owner(CERT_OWNER_SEED);
+    let acc = FriendLinkAccepted {
+        from_addr: owner.owner,
+        display: Some("bob".into()),
+        eph_x25519_pub: [0x55; 32],
+        enrollment: owner.cert,
+        sig: [0x0b; 64],
+    };
+    let encoded = encode_friend_response(&FriendLinkResponse::Accepted(Box::new(acc)))
+        .expect("encode accepted response");
+    pin_hex(
+        "EXPECTED_FRIEND_LINK_RESPONSE_ACCEPTED_HEX",
+        &hex::encode(&encoded),
+        EXPECTED_FRIEND_LINK_RESPONSE_ACCEPTED_HEX,
+    );
+
+    // Structural: externally-tagged variant → single-key map {"ok": ...}.
+    let value: ciborium::Value = ciborium::de::from_reader(&encoded[..]).expect("decode as value");
+    let map = value
+        .as_map()
+        .expect("FriendLinkResponse::Accepted is a CBOR map");
+    assert_eq!(
+        map.len(),
+        1,
+        "Accepted variant should encode a single-key map"
+    );
+    assert_eq!(
+        map[0].0.as_text(),
+        Some("ok"),
+        "FriendLinkResponse::Accepted outer key should be \"ok\""
+    );
+    assert!(
+        map[0].1.as_map().is_some(),
+        "the \"ok\" value should be the FriendLinkAccepted map"
     );
 }

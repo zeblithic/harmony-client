@@ -192,6 +192,31 @@ pub struct FriendLinkAccepted {
     pub sig: [u8; 64],
 }
 
+/// The acceptor's reply on the `harmony/friend/v1` ALPN. ZEB-371 Task 12:
+/// wraps the existing [`FriendLinkAccepted`] so the acceptor can also signal
+/// `Pending` for the Path-A (no-token) flow where a NEW owner's request is
+/// recorded and awaits the user's accept — in which case NO friend is written
+/// and NO `FriendLinkAccepted` proof is produced.
+///
+/// Length-prefix framing happens at the call site; the codec
+/// ([`encode_friend_response`]/[`decode_friend_response`]) is plain ciborium
+/// bounded by [`FRIEND_MAX_PACKET_LEN`] with strict trailing-byte rejection,
+/// mirroring [`encode_friend_accepted`]/[`decode_friend_accepted`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FriendLinkResponse {
+    /// Link complete; both sides derive the secret.
+    ///
+    /// `FriendLinkAccepted` is large (it embeds an `EnrollmentCert`), so it is
+    /// `Box`ed to keep the enum small (clippy `large_enum_variant`). `Box<T>`
+    /// serializes byte-identically to `T` via serde — the wire format is the
+    /// externally-tagged `{"ok": <accepted>}` map regardless.
+    #[serde(rename = "ok")]
+    Accepted(Box<FriendLinkAccepted>),
+    /// Request recorded; awaiting the user's accept (Path A, new owner).
+    #[serde(rename = "pending")]
+    Pending,
+}
+
 /// Canonical preimage bytes the requester's device-#2 key signs for a
 /// [`FriendLinkRequest`]. A small CBOR-encoded tuple `("hfr1", from_addr,
 /// token_sig, eph)` — the `"hfr1"` domain tag makes a friend-request signature
@@ -323,6 +348,27 @@ pub fn decode_friend_accepted(bytes: &[u8]) -> Result<FriendLinkAccepted, Friend
     decode_strict(bytes)
 }
 
+/// Encode a [`FriendLinkResponse`] to CBOR bytes (no length prefix). The caller
+/// frames it with a `u32 LE` length prefix on the wire.
+pub fn encode_friend_response(resp: &FriendLinkResponse) -> Result<Vec<u8>, FriendHandshakeError> {
+    let mut out = Vec::new();
+    ciborium::into_writer(resp, &mut out)
+        .map_err(|e| FriendHandshakeError::Encode(e.to_string()))?;
+    Ok(out)
+}
+
+/// Decode a [`FriendLinkResponse`] from CBOR bytes, bounding the input at
+/// [`FRIEND_MAX_PACKET_LEN`] before decoding (strict trailing-byte rejection).
+pub fn decode_friend_response(bytes: &[u8]) -> Result<FriendLinkResponse, FriendHandshakeError> {
+    if bytes.len() > FRIEND_MAX_PACKET_LEN {
+        return Err(FriendHandshakeError::TooLarge {
+            len: bytes.len(),
+            max: FRIEND_MAX_PACKET_LEN,
+        });
+    }
+    decode_strict(bytes)
+}
+
 /// Decode a single CBOR item from `bytes` and reject any trailing bytes.
 /// `ciborium::from_reader` reads the first item and silently ignores the rest;
 /// decoding via a cursor lets us assert the whole buffer was consumed, matching
@@ -381,6 +427,46 @@ pub fn master_ed25519_from_cert(cert: &EnrollmentCert) -> Result<[u8; 32], Frien
 }
 
 // =====================================================================
+// ZEB-371 Task 12 — Path A consent decision tree (spec §7.1)
+// =====================================================================
+
+/// Outcome of the inbound consent decision (spec §7.1). Pure; no I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentDecision {
+    /// Token path: caller runs the existing one-shot token gate.
+    TokenPath,
+    /// Accept now: write an Active/MutualKey friend + reply Accepted.
+    AcceptInline,
+    /// No token, unknown owner, no prior approval: record + reply Pending.
+    Pending,
+}
+
+/// Decide how to consent to an inbound friend request. `known` = requester is
+/// already an Active|Pending friend (or, later, a community co-member).
+/// `auto_accept_known` = the per-user toggle. `prior_accept` = the user already
+/// tapped Accept for this requester in a previous dial.
+///
+/// Authentication (cert + sig verify) ALWAYS runs BEFORE this decision —
+/// `known`/`auto_accept_known` only gate whether to PROMPT, never whether to
+/// authenticate. An unknown owner with `auto_accept_known` ON is still NOT
+/// auto-accepted: only KNOWN owners auto-accept; an unknown owner falls through
+/// to `Pending` (record + prompt the user).
+pub fn decide_consent(
+    token_sig: Option<&[u8; 64]>,
+    known: bool,
+    auto_accept_known: bool,
+    prior_accept: bool,
+) -> ConsentDecision {
+    if token_sig.is_some() {
+        return ConsentDecision::TokenPath;
+    }
+    if prior_accept || (known && auto_accept_known) {
+        return ConsentDecision::AcceptInline;
+    }
+    ConsentDecision::Pending
+}
+
+// =====================================================================
 // Task 8 — ALPN acceptor
 // =====================================================================
 
@@ -402,10 +488,15 @@ pub trait FriendEventEmit: Send + Sync + 'static {
     /// Emit a `friend-list-changed` Tauri event (no payload — the frontend
     /// re-fetches the friend list on receipt).
     fn emit_friend_list_changed(&self);
+    /// ZEB-371 Task 12: emit a `friend-request-received` Tauri event (no
+    /// payload — the frontend re-fetches the pending-request list on receipt)
+    /// when a Path-A request from a new owner is RECORDED (not yet accepted).
+    fn emit_friend_request_received(&self);
 }
 
 impl FriendEventEmit for () {
     fn emit_friend_list_changed(&self) {}
+    fn emit_friend_request_received(&self) {}
 }
 
 /// Default per-await IO deadline for the inbound friend handshake. Mirrors
@@ -439,6 +530,26 @@ impl Default for FriendAcceptorConfig {
             io_deadline: Duration::from_millis(DEFAULT_FRIEND_IO_DEADLINE_MS),
         }
     }
+}
+
+/// PURE authentication of an inbound [`FriendLinkRequest`] (no CRDT write, no
+/// I/O). ZEB-371 Task 12: split out of [`process_friend_request`] so the consent
+/// decision can authenticate a request it may decide NOT to accept (the Path-A
+/// `Pending` branch records a request but writes no friend — yet must still
+/// reject a request that fails auth). Verifies (1) the requester's cert →
+/// enrolled device-#2 key and (2) the handshake signature over the request
+/// preimage against that key. `process_friend_request` re-runs the same two
+/// checks (cheap; keeps it self-contained), so this is belt-and-suspenders on
+/// the accept paths and the sole gate on the Pending path.
+pub fn authenticate_friend_request(req: &FriendLinkRequest) -> Result<(), FriendHandshakeError> {
+    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr)?;
+    let vk = VerifyingKey::from_bytes(&device_key)
+        .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
+    let preimage =
+        friend_request_sig_preimage(req.from_addr, req.token_sig.as_ref(), &req.eph_x25519_pub);
+    vk.verify_strict(&preimage, &Signature::from_bytes(&req.sig))
+        .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
+    Ok(())
 }
 
 /// PURE, testable core of the friend handshake. Authenticates `req`, writes the
@@ -580,6 +691,17 @@ where
     /// tick). `None` in tests and when pkarr isn't running — the friend write
     /// still succeeds locally without it.
     friend_publisher: Option<Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
+    /// ZEB-371 Task 12: process-local pending inbound friend-request store. The
+    /// Path-A branch records a NEW owner's request here (reply `Pending`) and
+    /// consumes a prior approval here (`take_approved`). `None` in tests and
+    /// when the Path-A flow isn't wired — an absent store collapses the consent
+    /// tree to "token path or unknown→Pending-with-no-record".
+    pending_requests: Option<Arc<crate::friend_requests::PendingFriendRequests>>,
+    /// ZEB-371 Task 12: the per-user "auto-accept known requesters" toggle
+    /// (spec §7.1; Jake's "Both" choice, default ON). Only gates whether to
+    /// PROMPT a KNOWN requester — never relaxes authentication, and never
+    /// auto-accepts an UNKNOWN owner.
+    auto_accept_known: bool,
     config: FriendAcceptorConfig,
 }
 
@@ -642,6 +764,9 @@ where
             pkarr_invite_publisher,
             owner_sync_engine: None,
             friend_publisher: None,
+            pending_requests: None,
+            // ZEB-371 spec §7.1 default: auto-accept KNOWN requesters is ON.
+            auto_accept_known: true,
             config,
         }
     }
@@ -671,6 +796,25 @@ where
         self
     }
 
+    /// ZEB-371 Task 12: wire in the process-local pending inbound friend-request
+    /// store (Path A). Fluent setter (default `None`) so existing call sites —
+    /// including tests — keep compiling without an explicit `None`.
+    pub fn with_pending_requests(
+        mut self,
+        pending: Option<Arc<crate::friend_requests::PendingFriendRequests>>,
+    ) -> Self {
+        self.pending_requests = pending;
+        self
+    }
+
+    /// ZEB-371 Task 12: set the per-user "auto-accept known requesters" toggle
+    /// (spec §7.1). Default is ON (set in `with_config`); production reads the
+    /// persisted setting and passes it here.
+    pub fn with_auto_accept_known(mut self, auto_accept_known: bool) -> Self {
+        self.auto_accept_known = auto_accept_known;
+        self
+    }
+
     /// Reconcile the published Case-D friend slots with the current friend graph
     /// after an inbound accept. No-op when no friend publisher is wired in
     /// (tests / pkarr disabled). Snapshots the friend map under the CRDT lock and
@@ -696,6 +840,52 @@ where
         if let Some(engine) = self.owner_sync_engine.as_ref() {
             engine.notify_dirty();
         }
+    }
+
+    /// Signal the UI a friend was added (success side-effect of an accept). No
+    /// app handle (tests) → debug-log only.
+    fn emit_friend_added(&self, req: &FriendLinkRequest) {
+        match self.app.as_ref() {
+            Some(app) => app.emit_friend_list_changed(),
+            None => tracing::debug!(
+                from_addr = %hex::encode(req.from_addr.0),
+                "friend added (no app handle); not emitting friend-list-changed"
+            ),
+        }
+    }
+
+    /// Write a length-prefixed friend-handshake response (`[u32 LE len][body]`),
+    /// bounding the body at `FRIEND_MAX_PACKET_LEN` and timing out each await.
+    /// Shared by the Accepted and Pending reply paths.
+    async fn write_friend_response(
+        &self,
+        send: &mut iroh::endpoint::SendStream,
+        resp: &[u8],
+    ) -> Result<(), FriendAcceptError> {
+        if resp.len() > FRIEND_MAX_PACKET_LEN {
+            return Err(FriendAcceptError::ResponseTooLarge {
+                len: resp.len(),
+                max: FRIEND_MAX_PACKET_LEN,
+            });
+        }
+        let resp_len = resp.len() as u32;
+        tokio::time::timeout(
+            self.config.io_deadline,
+            send.write_all(&resp_len.to_le_bytes()),
+        )
+        .await
+        .map_err(|_| FriendAcceptError::IoTimeout {
+            step: "write length-prefix",
+        })?
+        .map_err(|e| FriendAcceptError::WritePrefix(e.to_string()))?;
+        tokio::time::timeout(self.config.io_deadline, send.write_all(resp))
+            .await
+            .map_err(|_| FriendAcceptError::IoTimeout { step: "write body" })?
+            .map_err(|e| FriendAcceptError::WriteBody(e.to_string()))?;
+        // `send.finish()` is sync — no timeout needed.
+        send.finish()
+            .map_err(|e| FriendAcceptError::Finish(e.to_string()))?;
+        Ok(())
     }
 
     /// Bump-and-return a fresh HLC stamped with this device's id. Mirrors
@@ -762,8 +952,11 @@ where
     }
 
     /// Inbound bi-stream handler: read the length-prefixed `FriendLinkRequest`,
-    /// run the pure core under the CRDT lock, side-effect (unregister token,
-    /// emit event), and write the length-prefixed `FriendLinkAccepted`.
+    /// AUTHENTICATE it (always), run the spec §7.1 consent decision tree, then
+    /// side-effect + write the length-prefixed `FriendLinkResponse`:
+    ///   * `TokenPath` → token gate + accept (reply `Accepted`),
+    ///   * `AcceptInline` → accept with no token gate (reply `Accepted`),
+    ///   * `Pending` → record the request + reply `Pending` (write NO friend).
     async fn handle_friend_handshake_inbound(
         &self,
         conn: &Connection,
@@ -796,74 +989,121 @@ where
 
         let req = decode_friend_request(&body).map_err(FriendAcceptError::Handshake)?;
 
-        // ZEB-370 consent gate (FAIL CLOSED): before authenticating the dialer
-        // and adding them as a friend, require that `req.token_sig` is a friend
-        // token THIS node actually minted + published and currently has live. A
-        // self-signed request carrying an arbitrary `token_sig` we never minted
-        // is rejected here — no friend written, no accept sent.
-        //
-        // ZEB-371: `token_sig` is now optional on the wire (Path-A no-token flow
-        // is future work). This token-gated path REQUIRES a token, so an absent
-        // one fails closed exactly like an unminted one.
-        let token_sig = req.token_sig.ok_or(FriendAcceptError::TokenNotLive {
-            reason: "request carried no token_sig (token-gated path requires one)",
-        })?;
-        self.token_gate_open(&token_sig).await?;
+        // ZEB-371 Task 12 (spec §7.1): AUTHENTICATE ALWAYS, then decide consent.
+        // Authentication (cert chain + handshake-sig verify) runs UNCONDITIONALLY
+        // here — the consent flags below only gate whether to PROMPT, never
+        // whether to authenticate. A request that fails auth is rejected before
+        // any consent branch (no friend written, no record kept, no accept sent).
+        authenticate_friend_request(&req).map_err(FriendAcceptError::Handshake)?;
 
-        // Run the pure core under the CRDT lock with a fresh HLC.
-        let learned_at = self.next_hlc().await;
-        let accepted = {
-            let mut state = self.crdt_state.lock().await;
-            process_friend_request(
-                &mut state,
-                learned_at,
-                &req,
-                self.self_owner,
-                self.self_display.clone(),
-                &self.self_enrollment,
-                &self.device2_signing_key,
-                &self.keytree,
-            )
-            .map_err(FriendAcceptError::Handshake)?
+        // Compute `known` under the CRDT lock: is the requester already an
+        // Active|Pending friend? Snapshot the boolean and DROP the guard before
+        // any network await (never hold the owner-state lock across IO).
+        // TODO Phase 2: community co-member also counts as `known`.
+        let known = {
+            let state = self.crdt_state.lock().await;
+            state
+                .friend_graph
+                .friends
+                .get(&req.from_addr)
+                .map(|e| matches!(e.status, FriendStatus::Active | FriendStatus::Pending))
+                .unwrap_or(false)
+        };
+        let prior_accept = self
+            .pending_requests
+            .as_ref()
+            .map(|p| p.is_approved(&req.from_addr))
+            .unwrap_or(false);
+
+        let accepted = match decide_consent(
+            req.token_sig.as_ref(),
+            known,
+            self.auto_accept_known,
+            prior_accept,
+        ) {
+            ConsentDecision::TokenPath => {
+                // ZEB-370 token gate (FAIL CLOSED): require `req.token_sig` is a
+                // friend token THIS node actually minted + published and still
+                // live. A self-signed request carrying an arbitrary `token_sig`
+                // we never minted is rejected here. `decide_consent` only returns
+                // TokenPath when `token_sig` is Some, so the unwrap-via-expect is
+                // unreachable in practice; we re-extract it defensively.
+                let token_sig = req.token_sig.ok_or(FriendAcceptError::TokenNotLive {
+                    reason: "token path reached without a token_sig (logic bug)",
+                })?;
+                self.token_gate_open(&token_sig).await?;
+                let learned_at = self.next_hlc().await;
+                let accepted = {
+                    let mut state = self.crdt_state.lock().await;
+                    process_friend_request(
+                        &mut state,
+                        learned_at,
+                        &req,
+                        self.self_owner,
+                        self.self_display.clone(),
+                        &self.self_enrollment,
+                        &self.device2_signing_key,
+                        &self.keytree,
+                    )
+                    .map_err(FriendAcceptError::Handshake)?
+                };
+                self.emit_friend_added(&req);
+                accepted
+            }
+            ConsentDecision::AcceptInline => {
+                // Path A, known-or-pre-approved: accept inline with NO token gate.
+                // `process_friend_request` resolves `established_via` to MutualKey
+                // because `req.token_sig` is None on this path.
+                let learned_at = self.next_hlc().await;
+                let accepted = {
+                    let mut state = self.crdt_state.lock().await;
+                    process_friend_request(
+                        &mut state,
+                        learned_at,
+                        &req,
+                        self.self_owner,
+                        self.self_display.clone(),
+                        &self.self_enrollment,
+                        &self.device2_signing_key,
+                        &self.keytree,
+                    )
+                    .map_err(FriendAcceptError::Handshake)?
+                };
+                // Consume the one-shot approval now the link completed.
+                if let Some(pending) = self.pending_requests.as_ref() {
+                    pending.take_approved(&req.from_addr);
+                }
+                self.emit_friend_added(&req);
+                accepted
+            }
+            ConsentDecision::Pending => {
+                // Path A, NEW owner: record the request + reply Pending. WRITE NO
+                // FRIEND. The user's accept (next task's IPC) marks it approved so
+                // the requester's NEXT dial is accepted inline.
+                let now_ms = wall_now_ms();
+                if let Some(pending) = self.pending_requests.as_ref() {
+                    pending.record_inbound(req.from_addr, req.display.clone(), now_ms);
+                }
+                match self.app.as_ref() {
+                    Some(app) => app.emit_friend_request_received(),
+                    None => tracing::debug!(
+                        from_addr = %hex::encode(req.from_addr.0),
+                        "friend request recorded (no app handle); not emitting friend-request-received"
+                    ),
+                }
+                // Reply Pending and return: no token cleanup, no owner-state
+                // dirty, no Case-D reconcile (no friend was written).
+                let resp = encode_friend_response(&FriendLinkResponse::Pending)
+                    .map_err(FriendAcceptError::Handshake)?;
+                self.write_friend_response(&mut send, &resp).await?;
+                return Ok(());
+            }
         };
 
-        // Success side-effect: signal the UI a friend was added. The Case-A
-        // one-shot token was already consumed + its DHT republish stopped at the
-        // gate (`token_gate_open` → `try_consume_friend_token` +
-        // `unregister_friend_token`), so there is nothing to unregister here.
-        match self.app.as_ref() {
-            Some(app) => app.emit_friend_list_changed(),
-            None => tracing::debug!(
-                from_addr = %hex::encode(req.from_addr.0),
-                "friend added (no app handle); not emitting friend-list-changed"
-            ),
-        }
-
-        // Write [u32 LE length-prefix][accepted CBOR].
-        let resp = encode_friend_accepted(&accepted).map_err(FriendAcceptError::Handshake)?;
-        if resp.len() > FRIEND_MAX_PACKET_LEN {
-            return Err(FriendAcceptError::ResponseTooLarge {
-                len: resp.len(),
-                max: FRIEND_MAX_PACKET_LEN,
-            });
-        }
-        let resp_len = resp.len() as u32;
-        tokio::time::timeout(
-            self.config.io_deadline,
-            send.write_all(&resp_len.to_le_bytes()),
-        )
-        .await
-        .map_err(|_| FriendAcceptError::IoTimeout {
-            step: "write length-prefix",
-        })?
-        .map_err(|e| FriendAcceptError::WritePrefix(e.to_string()))?;
-        tokio::time::timeout(self.config.io_deadline, send.write_all(&resp))
-            .await
-            .map_err(|_| FriendAcceptError::IoTimeout { step: "write body" })?
-            .map_err(|e| FriendAcceptError::WriteBody(e.to_string()))?;
-        // `send.finish()` is sync — no timeout needed.
-        send.finish()
-            .map_err(|e| FriendAcceptError::Finish(e.to_string()))?;
+        // Write [u32 LE length-prefix][FriendLinkResponse::Accepted CBOR].
+        let resp = encode_friend_response(&FriendLinkResponse::Accepted(Box::new(accepted)))
+            .map_err(FriendAcceptError::Handshake)?;
+        self.write_friend_response(&mut send, &resp).await?;
 
         // The Case-A one-shot was consumed + its DHT republish stopped atomically
         // at the gate (see `token_gate_open`), so there is no token cleanup to do
@@ -1767,6 +2007,138 @@ mod tests {
         assert!(
             Arc::ptr_eq(mux.select_for_alpn(alpn::HARMONY_HANDSHAKE_V1), &invite),
             "handshake ALPN must select the invite acceptor"
+        );
+    }
+
+    // ── ZEB-371 Task 12: consent decision tree ──────────────────────────
+
+    /// Build a signed no-token (Path A) request from a test owner.
+    fn signed_request_no_token(owner_seed: u8) -> FriendLinkRequest {
+        let owner = mint_test_owner(owner_seed);
+        let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+        let preimage = friend_request_sig_preimage(owner.owner, None, &eph_pub);
+        let sig = owner.device_key.sign(&preimage).to_bytes();
+        FriendLinkRequest {
+            from_addr: owner.owner,
+            display: Some("carol".into()),
+            token_sig: None,
+            eph_x25519_pub: eph_pub,
+            enrollment: owner.cert,
+            sig,
+        }
+    }
+
+    #[test]
+    fn authenticate_friend_request_accepts_valid_and_rejects_tampered() {
+        let req = signed_request_no_token(0x80);
+        authenticate_friend_request(&req).expect("a valid no-token request authenticates");
+
+        let mut bad = req.clone();
+        bad.sig[0] ^= 0xFF;
+        assert!(
+            matches!(
+                authenticate_friend_request(&bad),
+                Err(FriendHandshakeError::SignatureInvalid)
+            ),
+            "a tampered signature must fail authentication"
+        );
+    }
+
+    #[test]
+    fn process_no_token_request_yields_mutual_key_friend() {
+        // AcceptInline path: a no-token request resolves established_via to
+        // MutualKey (since token_sig is None) and writes an Active friend.
+        use crate::owner_state_crypto::KeyTree;
+        let me = mint_test_owner(0x81);
+        let req = signed_request_no_token(0x82);
+        let kt = KeyTree::derive(&[3u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        process_friend_request(
+            &mut state,
+            test_hlc(10),
+            &req,
+            me.owner,
+            None,
+            &me.cert,
+            &me.device_key,
+            &kt,
+        )
+        .expect("no-token request processed");
+        let entry = state
+            .friend_graph
+            .friends
+            .get(&req.from_addr)
+            .expect("friend inserted");
+        assert_eq!(entry.status, FriendStatus::Active);
+        assert_eq!(
+            entry.established_via,
+            FriendOrigin::MutualKey,
+            "a no-token (Path A) request must record established_via = MutualKey"
+        );
+    }
+
+    #[test]
+    fn friend_response_round_trips_both_variants() {
+        // Codec round-trip for both FriendLinkResponse variants (Box-transparent).
+        let owner = mint_test_owner(0x83);
+        let acc = FriendLinkAccepted {
+            from_addr: owner.owner,
+            display: Some("dave".into()),
+            eph_x25519_pub: [0x12; 32],
+            enrollment: owner.cert,
+            sig: [0x34; 64],
+        };
+        for resp in [
+            FriendLinkResponse::Accepted(Box::new(acc)),
+            FriendLinkResponse::Pending,
+        ] {
+            let bytes = encode_friend_response(&resp).expect("encode");
+            let back = decode_friend_response(&bytes).expect("decode");
+            assert_eq!(resp, back);
+        }
+    }
+
+    #[test]
+    fn decide_consent_truth_table() {
+        let tok = [0u8; 64];
+        // Some(token) → TokenPath, regardless of the other flags.
+        for &known in &[false, true] {
+            for &auto in &[false, true] {
+                for &prior in &[false, true] {
+                    assert_eq!(
+                        decide_consent(Some(&tok), known, auto, prior),
+                        ConsentDecision::TokenPath,
+                        "Some(token) must always take the token path \
+                         (known={known} auto={auto} prior={prior})"
+                    );
+                }
+            }
+        }
+
+        // None + known + auto-on → AcceptInline.
+        assert_eq!(
+            decide_consent(None, true, true, false),
+            ConsentDecision::AcceptInline,
+        );
+        // None + known + auto-off → Pending.
+        assert_eq!(
+            decide_consent(None, true, false, false),
+            ConsentDecision::Pending,
+        );
+        // None + unknown + auto-on → Pending (unknown is NEVER auto-accepted).
+        assert_eq!(
+            decide_consent(None, false, true, false),
+            ConsentDecision::Pending,
+        );
+        // None + unknown + prior_accept → AcceptInline (user already tapped Accept).
+        assert_eq!(
+            decide_consent(None, false, true, true),
+            ConsentDecision::AcceptInline,
+        );
+        // None + known + auto-off + prior_accept → AcceptInline.
+        assert_eq!(
+            decide_consent(None, true, false, true),
+            ConsentDecision::AcceptInline,
         );
     }
 }
