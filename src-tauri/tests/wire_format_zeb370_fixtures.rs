@@ -88,6 +88,7 @@ fn fixture_friend_entry() -> FriendEntry {
         established_via: FriendOrigin::Token,
         referrable: false,
         learned_at: hlc(7),
+        sealed_secret: None,
     }
 }
 

@@ -33371,6 +33371,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         established_via: crate::friend_graph::FriendOrigin::Token,
         referrable: false,
         learned_at,
+        sealed_secret: None,
     };
     {
         let mut state = crdt_state.lock().await;
@@ -33766,6 +33767,8 @@ pub async fn unfriend_inner(
         established_via: existing.established_via,
         referrable: existing.referrable,
         learned_at,
+        // ZEB-371: clear the rendezvous secret on revoke (spec §3.3).
+        sealed_secret: None,
     };
     let mut state = crdt_state.lock().await;
     match state.apply_friend_update(peer_addr, tombstone) {
@@ -34078,6 +34081,7 @@ mod friend_ipc_tests {
                 established_via: FriendOrigin::Token,
                 referrable: false,
                 learned_at: hlc(w),
+                sealed_secret: None,
             },
         )
     }

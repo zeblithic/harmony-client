@@ -404,6 +404,7 @@ mod tests {
                 established_via: FriendOrigin::Token,
                 referrable: true,
                 learned_at: hlc(42),
+                sealed_secret: None,
             },
         );
         assert!(matches!(outcome, ApplyOutcome::Inserted));

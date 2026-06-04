@@ -401,6 +401,7 @@ pub fn process_friend_request(
         established_via: FriendOrigin::Token,
         referrable: false,
         learned_at,
+        sealed_secret: None,
     };
     match state.apply_friend_update(req.from_addr, entry) {
         ApplyOutcome::Inserted | ApplyOutcome::Merged { .. } => {}

@@ -1292,6 +1292,7 @@ mod subscriber_tests {
                     logical: 0,
                     device_id: "peer".into(),
                 },
+                sealed_secret: None,
             },
         );
         assert!(matches!(
@@ -2232,6 +2233,7 @@ mod integration_tests {
                 logical: 0,
                 device_id: "peer".into(),
             },
+            sealed_secret: None,
         };
 
         // Direct apply: confirms the exact rejection variant the merge
