@@ -36,6 +36,7 @@ The two directions are **not** symmetric. Only one of them exercises ZEB-373:
 | **B → A** — joiner → inviter, during redeem | B obtains A's reachability *before* its event loop is up: invite-only → **pkarr case-A** pre-seed; open community → prior DM cache. Seeded as `was_present` → no `DialHint` | **NO — static seed.** |
 
 Consequences:
+
 - Designate the machine that comes up **first and sits idle** as the **dial observer (Node A)**.
 - The community invite carries only `community_id` + `admin_addr` (+ admin bootstrap/token for
   invite-only) — **no routing / node-id** (`community_invite.rs`). B's first contact to A is
@@ -74,6 +75,7 @@ Launch with dial logging on so the terminal narrates dials:
 # macOS (Koya)
 RUST_LOG=harmony_app::iroh_dial_driver=info npm run tauri dev
 ```
+
 ```powershell
 # Windows (Ildwyn), PowerShell
 $env:RUST_LOG="harmony_app::iroh_dial_driver=info"; npm run tauri dev
@@ -91,9 +93,11 @@ The frontend serves at `localhost:5173`; the desktop window is what you drive.
     (and `identity.enc`). New identity = new node_id = guaranteed fresh first-learn on Koya.
     B rejoins the community as a new member.
   - **Or wipe Koya's persisted peers** so its replay set is empty:
+
     ```bash
     rm -rf ~/Library/Application\ Support/net.zeblith.harmony   # forgets peers + membership → rejoin
     ```
+
     (Keep `~/.harmony` so Koya's own identity is stable.)
 
 ---
@@ -112,27 +116,32 @@ The frontend serves at `localhost:5173`; the desktop window is what you drive.
 ## 6. Observe (three independent channels)
 
 **(a) Koya terminal** — within a few seconds of B joining:
-```
+
+```text
 ZEB-373: dialed iroh peer <hex>          # success (info)
 ZEB-373: dial failed (3 attempts) for …  # failure (warn)
 ```
 
 **(b) Koya Network → Dynamic dials panel** (ZEB-377) — the panel shows:
+
 - counters: **Attempts / Succeeded / Failed / Skipped (dup)**;
 - recent hits (newest first): `✓/✗  <node-id-short>  owner <owner-short>  <age>s ago`.
 - Expected after one successful first-learn dial: **Attempts ≥ 1, Succeeded 1**, one `✓` hit.
 
 **(c) Koya dev console (F12)** — raw telemetry, useful for scripting/assertions:
+
 ```js
 await window.__TAURI__.core.invoke('network_health_snapshot').then(s => console.log(s.dialStatus))
 // { attempts: ≥1, succeeded: 1, failed: 0, skippedDuplicate: 0, recent: [{ outcome: "succeeded", … }] }
 ```
 
 **(d) Ildwyn via Playwright** (automatable; reads B's own snapshot):
+
 ```js
 const dial = await page.evaluate(() =>
   window.__TAURI__.core.invoke('network_health_snapshot').then(s => s.dialStatus));
 ```
+
 > Per §1, B→A is a static seed, so B's `dialStatus` may show **no** attempt for A. Treat A's
 > panel as the primary assertion.
 
@@ -141,6 +150,7 @@ const dial = await page.evaluate(() =>
 ## 7. Prove the connection carries real traffic
 
 `succeeded` only means the dial returned `true`. Confirm the link is real:
+
 - In Koya's **Network** panel, Ildwyn appears as a **peer with a live RTT** and
   `connectionMode: direct` (same-LAN).
 - Send a **DM** Koya ↔ Ildwyn and confirm bidirectional delivery (the

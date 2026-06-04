@@ -193,7 +193,7 @@
           <p class="muted" data-testid="nh-dial-empty">No dynamic dials yet.</p>
         {:else}
           <ul class="dial-recent">
-            {#each recentHits as hit, i (`${hit.capturedAtMs}-${hit.nodeIdShort}-${i}`)}
+            {#each recentHits as hit (`${hit.capturedAtMs}-${hit.nodeIdShort}-${hit.ownerShort}`)}
               <li data-testid="nh-dial-hit">
                 {hit.outcome === 'succeeded' ? '✓' : '✗'}
                 <code>{hit.nodeIdShort}</code>
