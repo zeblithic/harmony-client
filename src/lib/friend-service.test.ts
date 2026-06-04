@@ -82,13 +82,49 @@ describe('FriendService', () => {
     });
   });
 
-  it('a friend-list-changed event fires onFriendsChanged', async () => {
-    const changed = vi.fn();
-    service.onFriendsChanged = changed;
+  it('a friend-list-changed event fires all registered onFriendsChanged listeners', async () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    service.onFriendsChanged(first);
+    service.onFriendsChanged(second);
     await service.connectAdapter(adapter);
     // Simulate the backend emitting the event.
     adapter.listeners.get('friend-list-changed')!({ payload: null });
-    expect(changed).toHaveBeenCalledTimes(1);
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+    // A second emission fires both again (idempotent registration).
+    adapter.listeners.get('friend-list-changed')!({ payload: null });
+    expect(first).toHaveBeenCalledTimes(2);
+    expect(second).toHaveBeenCalledTimes(2);
+  });
+
+  it('an unsubscribed onFriendsChanged listener no longer fires', async () => {
+    const stays = vi.fn();
+    const leaves = vi.fn();
+    service.onFriendsChanged(stays);
+    const unsubscribe = service.onFriendsChanged(leaves);
+    await service.connectAdapter(adapter);
+
+    adapter.listeners.get('friend-list-changed')!({ payload: null });
+    expect(stays).toHaveBeenCalledTimes(1);
+    expect(leaves).toHaveBeenCalledTimes(1);
+
+    // Unsubscribe `leaves`; only `stays` should fire on the next emission.
+    unsubscribe();
+    adapter.listeners.get('friend-list-changed')!({ payload: null });
+    expect(stays).toHaveBeenCalledTimes(2);
+    expect(leaves).toHaveBeenCalledTimes(1);
+  });
+
+  it('destroy() clears all onFriendsChanged listeners', async () => {
+    const changed = vi.fn();
+    service.onFriendsChanged(changed);
+    await service.connectAdapter(adapter);
+    service.destroy();
+    // The listener registry is cleared even if some event source survived.
+    await service.connectAdapter(adapter);
+    adapter.listeners.get('friend-list-changed')!({ payload: null });
+    expect(changed).not.toHaveBeenCalled();
   });
 
   it('invoke normalizes a thrown Error into a fresh Error message', async () => {

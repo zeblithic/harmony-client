@@ -45,10 +45,11 @@ export interface FriendLinkResultDto {
 }
 
 export class FriendService {
-  /** Fired when the backend emits `friend-list-changed` (a friend was added or
-   *  removed, possibly on another device). Receivers should re-fetch
-   *  `listFriends()`. */
-  onFriendsChanged?: () => void;
+  /** Listeners notified when the backend emits `friend-list-changed` (a friend
+   *  was added or removed, possibly on another device). A registry (not a
+   *  single slot) so multiple `FriendsPanel` instances can each subscribe
+   *  without stomping one another — see `onFriendsChanged`. */
+  private friendsChangedListeners = new Set<() => void>();
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
@@ -58,9 +59,25 @@ export class FriendService {
     this.adapter = adapter;
 
     const unlistenChanged = await adapter.listen('friend-list-changed', () => {
-      this.onFriendsChanged?.();
+      // Snapshot before iterating so a listener that unsubscribes itself
+      // during notification doesn't mutate the live set mid-loop.
+      for (const cb of [...this.friendsChangedListeners]) cb();
     });
     this.unlisteners.push(unlistenChanged);
+  }
+
+  /**
+   * Register a callback fired when the backend emits `friend-list-changed`
+   * (a friend was added or removed, possibly on another device). Receivers
+   * should re-fetch `listFriends()`. Returns an unsubscribe function; call it
+   * (e.g. in a component's `onDestroy`) to remove ONLY this listener without
+   * disturbing others. Multiple subscribers are supported.
+   */
+  onFriendsChanged(cb: () => void): () => void {
+    this.friendsChangedListeners.add(cb);
+    return () => {
+      this.friendsChangedListeners.delete(cb);
+    };
   }
 
   /** List the local owner's active (non-Revoked) friends. */
@@ -94,6 +111,7 @@ export class FriendService {
   destroy(): void {
     for (const fn of this.unlisteners) fn();
     this.unlisteners = [];
+    this.friendsChangedListeners.clear();
     // Null the adapter so connectAdapter's duplicate-init guard doesn't no-op
     // on reconnect after destroy() (mirrors CommunityService.destroy()).
     this.adapter = null;

@@ -33,6 +33,9 @@
   // Per-row in-flight unfriend guard (by owner_id hex).
   let unfriending = $state<Set<string>>(new Set());
 
+  // Unsubscribe handle for our `friend-list-changed` listener (set in onMount).
+  let unsubscribeChanged: (() => void) | null = null;
+
   async function refresh(): Promise<void> {
     try {
       friends = await service.listFriends();
@@ -46,16 +49,19 @@
 
   onMount(() => {
     // Re-fetch whenever the backend signals a change (redeem / accept /
-    // unfriend, possibly on another device).
-    service.onFriendsChanged = () => {
+    // unfriend, possibly on another device). Register our OWN listener and
+    // keep the returned unsubscribe so unmounting only removes ours — a
+    // second concurrently-mounted panel keeps its own subscription.
+    unsubscribeChanged = service.onFriendsChanged(() => {
       void refresh();
-    };
+    });
     void refresh();
   });
 
   onDestroy(() => {
-    // Drop our callback so a re-mounted panel doesn't fire a stale closure.
-    if (service.onFriendsChanged) service.onFriendsChanged = undefined;
+    // Remove only this panel's listener (no shared-slot to null out).
+    unsubscribeChanged?.();
+    unsubscribeChanged = null;
   });
 
   async function handleGenerate(): Promise<void> {
