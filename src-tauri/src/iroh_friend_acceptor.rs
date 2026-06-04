@@ -504,11 +504,18 @@ pub fn process_friend_request(
 
     // 4-5. Apply the new friend entry to the CRDT. apply_friend_update re-checks
     // the key↔master-key invariant; a Rejected is a hard error here.
+    // established_via is Token when the requester supplied a token_sig (the
+    // normal token-invite path); MutualKey for the future Path-A (no-token)
+    // reuse path where no token is present.
     let entry = FriendEntry {
         master_ed25519,
         display: req.display.clone(),
         status: FriendStatus::Active,
-        established_via: FriendOrigin::Token,
+        established_via: if req.token_sig.is_some() {
+            FriendOrigin::Token
+        } else {
+            FriendOrigin::MutualKey
+        },
         referrable: false,
         learned_at,
         sealed_secret: Some(sealed),

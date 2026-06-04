@@ -34280,6 +34280,32 @@ mod friend_ipc_tests {
         }
     }
 
+    #[tokio::test]
+    async fn unfriend_inner_clears_present_sealed_secret() {
+        // An Active friend WITH a sealed secret must have it cleared to None on revoke (spec §3.3).
+        let (addr, mut active) = friend_entry(0x77, FriendStatus::Active, 5);
+        active.sealed_secret = Some(vec![0xAB; 12 + 32 + 16]);
+        let mut state = OwnerState::default();
+        assert!(matches!(
+            state.apply_friend_update(addr, active),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+        let crdt_state = Arc::new(TokioMutex::new(state));
+        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
+            Arc::new(TokioMutex::new(BTreeMap::new()));
+        let changed = unfriend_inner(&crdt_state, &hlc_tracker, "self", addr)
+            .await
+            .expect("unfriend ok");
+        assert!(changed, "revoking an Active friend returns Ok(true)");
+        let s = crdt_state.lock().await;
+        let entry = &s.friend_graph.friends[&addr];
+        assert_eq!(entry.status, FriendStatus::Revoked);
+        assert_eq!(
+            entry.sealed_secret, None,
+            "revoke must clear the rendezvous secret"
+        );
+    }
+
     // ── ZEB-370 (cursor review): generate_friend_token publisher requirement ──
 
     /// A real `PkarrInvitePublisher` backed by a mock relay. The guard only
