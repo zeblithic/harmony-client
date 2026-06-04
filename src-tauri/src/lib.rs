@@ -104,6 +104,9 @@ pub mod zenoh_iroh_transport;
 // ZEB-368: registers harmony's IrohZenohLinkManager with the vendored
 // zenoh-link factory and forwards accepted inbound links into Zenoh.
 pub mod iroh_zenoh_registration;
+// ZEB-373: dynamic mid-session iroh dial driver — consumes DialHints, dedups,
+// dials via PeerDialer with bounded backoff.
+pub mod iroh_dial_driver;
 
 /// ZEB-262 Phase 4 Task 9: production impl of
 /// `community_invite::AppHandleEmit` on `tauri::AppHandle<R>`. Lets
