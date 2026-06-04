@@ -95,6 +95,9 @@ async fn build_hermetic_endpoint() -> Arc<IrohEndpoint> {
 
 #[tokio::test]
 async fn two_engines_exchange_via_iroh_zenoh() {
+    // ZEB-347: prime the one-time process-global iroh bind init before the
+    // asserted timeout (see `iroh_endpoint::warm_up_iroh_global_init`).
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
     tokio::time::timeout(Duration::from_secs(30), inner())
         .await
         .expect("two_engines_exchange_via_iroh_zenoh must complete within 30s");

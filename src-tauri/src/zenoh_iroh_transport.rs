@@ -654,6 +654,9 @@ mod tests {
     /// second, assert the dispatcher receives the connection.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn handshake_connection_queued_pre_install_dispatched_on_install() {
+        // ZEB-347: prime the one-time process-global iroh bind init before
+        // the asserted timeout (see `iroh_endpoint::warm_up_iroh_global_init`).
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
         // 45s outer timeout — uses real iroh QUIC + hermetic
         // loopback bind; under heavy nextest contention each iroh
         // bind can take 10-15s. The existing integration test
@@ -829,6 +832,9 @@ mod tests {
     ///   - Release the gate, assert both complete.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn drain_dispatches_queued_connections_in_parallel() {
+        // ZEB-347: prime the one-time process-global iroh bind init before
+        // the asserted timeout (see `iroh_endpoint::warm_up_iroh_global_init`).
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
         tokio::time::timeout(
             std::time::Duration::from_secs(45),
             drain_dispatches_queued_connections_in_parallel_inner(),
