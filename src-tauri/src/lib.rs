@@ -33014,6 +33014,436 @@ async fn connectivity_pkarr_publication_status(
     })
 }
 
+// ── ZEB-370 Phase 1 Task 11: friend IPCs ─────────────────────────────
+//
+// Four Tauri commands surfacing the friend graph + token peering to the
+// frontend FriendsPanel:
+//
+//   * `generate_friend_token` — mint a `harmony://friend/...` URL + publish
+//     the inviter's Case-A reachability so a redeemer can locate us.
+//   * `redeem_friend_token` — decode + redeem a pasted URL (outbound friend
+//     handshake), adding the inviter as an Active/Token friend.
+//   * `list_friends` — project the non-`Revoked` friend graph to DTOs.
+//   * `unfriend` — write a `Revoked` tombstone for a peer.
+//
+// Each command snapshots NodeState handles under the std `Mutex`, drops the
+// lock, then `.await`s — the lock-snapshot-drop pattern (a `std::sync::Mutex`
+// guard held across `.await` would block the executor). Testable inner cores
+// (`list_friends_inner`, `unfriend_inner`) are unit-tested without a Tauri
+// harness; the command wrappers are thin.
+
+/// Friend row surfaced to the frontend `FriendsPanel`. `status` /
+/// `established_via` serialize as their existing lowercase strings
+/// (`FriendStatus` / `FriendOrigin` carry `#[serde(rename = ...)]`), so the
+/// frontend sees `"active"` / `"token"` etc.; the other fields are camelCased.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FriendDto {
+    /// The friend's 16-byte master `owner_id`, hex-encoded.
+    pub owner_id_hex: String,
+    /// Human display name recorded at link time (may be absent).
+    pub display: Option<String>,
+    /// Lifecycle (`"pending"` / `"active"`; `"revoked"` rows are filtered out
+    /// by `list_friends_inner`, so this is never `"revoked"` in practice).
+    pub status: crate::friend_graph::FriendStatus,
+    /// Provenance (`"token"` in Phase 1).
+    pub established_via: crate::friend_graph::FriendOrigin,
+    /// Whether this friend may be surfaced in our referral catalog (Phase 2).
+    pub referrable: bool,
+}
+
+/// Result of a successful `redeem_friend_token`: the newly-added friend's
+/// master `owner_id` (hex) + the display recorded for them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FriendLinkResultDto {
+    /// The friend's (inviter's) 16-byte master `owner_id`, hex-encoded.
+    pub owner_id_hex: String,
+    /// Display recorded on the new `FriendEntry` (accept display, else the
+    /// token's `display_hint`). `None` when neither was set.
+    pub display: Option<String>,
+}
+
+/// Project the friend graph into the frontend DTO list, hiding `Revoked`
+/// tombstones (an unfriended peer must not reappear in the UI). Pure over an
+/// `&OwnerState` so it's unit-testable without a NodeState harness.
+pub fn list_friends_inner(state: &crate::owner_state_crdt::OwnerState) -> Vec<FriendDto> {
+    state
+        .friend_graph
+        .friends
+        .iter()
+        .filter(|(_, entry)| entry.status != crate::friend_graph::FriendStatus::Revoked)
+        .map(|(addr, entry)| FriendDto {
+            owner_id_hex: hex::encode(addr.0),
+            display: entry.display.clone(),
+            status: entry.status,
+            established_via: entry.established_via,
+            referrable: entry.referrable,
+        })
+        .collect()
+}
+
+/// Write a `Revoked` tombstone for `peer_addr` into local owner-state, using a
+/// fresh `learned_at` HLC so the revoke wins LWW over any prior `Active`. The
+/// existing entry's `master_ed25519` is preserved so the addr↔master-key
+/// invariant `apply_friend_update` enforces still holds. Returns `Err` when the
+/// peer isn't a known friend (nothing to revoke) or the apply is rejected.
+///
+/// Pure over the resources it's handed (no NodeState / Tauri), so it's
+/// unit-testable; the IPC wrapper snapshots `crdt_state` + `hlc_tracker` +
+/// `device_id` and delegates.
+pub async fn unfriend_inner(
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: &std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: &str,
+    peer_addr: crate::owner_state_types::OwnerAddr,
+) -> Result<(), String> {
+    // Read the existing entry so we keep its master key (the addr↔key invariant
+    // must still hold for the tombstone) and only flip status/learned_at.
+    let existing = {
+        let state = crdt_state.lock().await;
+        state.friend_graph.friends.get(&peer_addr).cloned()
+    };
+    let Some(existing) = existing else {
+        return Err(format!(
+            "not a friend: no entry for {}",
+            hex::encode(peer_addr.0)
+        ));
+    };
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let learned_at =
+        crate::dm_outbox::reserve_next_hlc_for_device(hlc_tracker, device_id, wall_now_ms).await;
+    let tombstone = crate::friend_graph::FriendEntry {
+        master_ed25519: existing.master_ed25519,
+        display: existing.display.clone(),
+        status: crate::friend_graph::FriendStatus::Revoked,
+        established_via: existing.established_via,
+        referrable: existing.referrable,
+        learned_at,
+    };
+    let mut state = crdt_state.lock().await;
+    match state.apply_friend_update(peer_addr, tombstone) {
+        crate::owner_state_crdt::ApplyOutcome::Inserted
+        | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => Ok(()),
+        crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+            Err(format!("unfriend apply rejected: {reason:?}"))
+        }
+    }
+}
+
+/// Generate a `harmony://friend/...` URL for sharing. Mints a device-#2-signed
+/// friend token (reusing the ZEB-367 invite-token machinery), publishes the
+/// inviter's Case-A reachability under `friend:{token.sig}` so a redeemer can
+/// locate us before any shared session exists, and returns the URL.
+///
+/// `display_hint = None`: the node's own profile display name isn't persisted
+/// at this layer (it arrives per `publish_profile`), matching the friend
+/// acceptor's `self_display = None` convention (lib.rs:4470). It's only a UX
+/// hint on the redeemer's side.
+///
+/// Errors: `OWNER_NOT_LOADED_MSG` when the node isn't booted; the mint /
+/// encode error string otherwise.
+#[tauri::command(rename_all = "snake_case")]
+async fn generate_friend_token(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    expires_at: Option<u64>,
+) -> Result<String, String> {
+    // Snapshot handles under the std lock, then drop it before any `.await`.
+    let (dm_outbox, hlc_tracker, pkarr_invite_publisher) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.pkarr_invite_publisher.clone(),
+        )
+    };
+
+    // The inviter is the local owner: self_owner + device-#2 signing key +
+    // EnrollmentCert all come from the outbox. `community_signing_key` IS the
+    // enrolled device-#2 key (DmOutbox asserts it matches the cert's device
+    // pubkey), the same key `mint_friend_token` must sign with.
+    let (self_owner, device2_key, enrollment_cert, device_id) = {
+        let o = dm_outbox.lock().await;
+        (
+            o.self_owner,
+            std::sync::Arc::clone(&o.community_signing_key),
+            o.enrollment_cert.clone(),
+            o.device_id.clone(),
+        )
+    };
+
+    // Reserve a fresh HLC for `minted_at` (the same helper generate_invite uses).
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let minted_at =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let payload = crate::friend_token::mint_friend_token(
+        self_owner,
+        None, // display_hint — see doc comment.
+        minted_at,
+        expires_at,
+        enrollment_cert,
+        &device2_key,
+    )?;
+
+    // Encode the URL FIRST so we never publish a Case-A record for a token whose
+    // URL the caller never received (mirrors generate_invite's ordering).
+    let url = crate::friend_token::encode_friend_token_url(&payload)
+        .map_err(|e| format!("encode friend token URL: {e}"))?;
+
+    // Publish Case-A reachability keyed on the token sig so an off-LAN redeemer
+    // can resolve our iroh routing. A missing publisher (iroh not booted) is
+    // non-fatal here — unlike invite-only, a friend link can still be redeemed
+    // on-LAN; the redeemer surfaces `inviter_unreachable` if it can't resolve.
+    if let Some(inv_pub) = pkarr_invite_publisher {
+        inv_pub.register_friend_token(&payload.token.sig).await;
+    }
+
+    Ok(url)
+}
+
+/// Redeem a pasted `harmony://friend/...` URL: run the outbound friend
+/// handshake (`connectivity_link_friend_iroh_inner`), adding the inviter as an
+/// Active/Token friend in local owner-state, emit `friend-list-changed`, and
+/// return the new friend's `owner_id` + display.
+///
+/// Gathers the SAME NodeState handles `connectivity_redeem_invite_iroh` does
+/// (pkarr_resolver / iroh_endpoint / crdt_state / hlc_tracker / dm_device_id /
+/// dm_self_owner / dm_outbox), then reads the device-#2 signing key
+/// (`community_signing_key`) + `enrollment_cert` from the outbox — exactly the
+/// inputs `connectivity_link_friend_iroh_inner` requires.
+#[tauri::command(rename_all = "snake_case")]
+async fn redeem_friend_token(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    url: String,
+) -> Result<FriendLinkResultDto, String> {
+    let (pkarr_resolver, iroh_endpoint, crdt_state, hlc_tracker, device_id, self_owner, dm_outbox) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pkarr_resolver.clone(),
+            g.iroh_endpoint.clone(),
+            g.crdt_state.clone(),
+            g.hlc_tracker.clone(),
+            g.dm_device_id.clone(),
+            g.dm_self_owner,
+            g.dm_outbox.clone(),
+        )
+    };
+
+    let (Some(crdt_state), Some(hlc_tracker), Some(device_id), Some(self_owner), Some(dm_outbox)) =
+        (crdt_state, hlc_tracker, device_id, self_owner, dm_outbox)
+    else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+
+    // The redeemer signs its FriendLinkRequest with its enrolled device-#2 key
+    // and carries its own EnrollmentCert (same shape as the invite redeem).
+    let (device2_key, enrollment_cert) = {
+        let o = dm_outbox.lock().await;
+        (
+            std::sync::Arc::clone(&o.community_signing_key),
+            o.enrollment_cert.clone(),
+        )
+    };
+
+    let outcome = connectivity_link_friend_iroh_inner(
+        url,
+        pkarr_resolver,
+        iroh_endpoint,
+        self_owner,
+        enrollment_cert,
+        device2_key,
+        None, // self_display — not persisted at this layer (see acceptor note).
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        HandshakeDialConfig::from_env(),
+    )
+    .await?;
+
+    // Notify the UI so it re-fetches the friend list.
+    let _ = app.emit("friend-list-changed", ());
+
+    Ok(FriendLinkResultDto {
+        owner_id_hex: hex::encode(outcome.friend_addr.0),
+        display: outcome.display,
+    })
+}
+
+/// List the local owner's friends (non-`Revoked` entries) for the
+/// `FriendsPanel`. Read-only snapshot of the friend-graph sub-CRDT.
+#[tauri::command(rename_all = "snake_case")]
+async fn list_friends(state: tauri::State<'_, Mutex<NodeState>>) -> Result<Vec<FriendDto>, String> {
+    let crdt_state = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    let dtos = {
+        let s = crdt_state.lock().await;
+        list_friends_inner(&s)
+    };
+    Ok(dtos)
+}
+
+/// Unfriend a peer: write a `Revoked` tombstone (LWW, so it can't be silently
+/// resurrected by a stale `Active`) and emit `friend-list-changed`.
+/// `peer_addr` is the friend's 16-byte master `owner_id` in hex.
+#[tauri::command(rename_all = "snake_case")]
+async fn unfriend(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    peer_addr: String,
+) -> Result<(), String> {
+    let addr_bytes: [u8; 16] = hex::decode(&peer_addr)
+        .map_err(|e| format!("invalid peer_addr hex: {e}"))?
+        .try_into()
+        .map_err(|_| "peer_addr must be 16 bytes (32 hex chars)".to_string())?;
+    let peer = crate::owner_state_types::OwnerAddr(addr_bytes);
+
+    let (crdt_state, hlc_tracker, device_id) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+        )
+    };
+
+    unfriend_inner(&crdt_state, &hlc_tracker, &device_id, peer).await?;
+
+    let _ = app.emit("friend-list-changed", ());
+    Ok(())
+}
+
+#[cfg(test)]
+mod friend_ipc_tests {
+    use super::*;
+    use crate::friend_graph::{
+        owner_id_from_master_ed25519, FriendEntry, FriendOrigin, FriendStatus,
+    };
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{Hlc, OwnerAddr};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "d".into(),
+        }
+    }
+
+    /// A friend entry whose `master_ed25519` derives to `addr` (so
+    /// `apply_friend_update` accepts it — it enforces the addr↔key invariant).
+    fn friend_entry(master_seed: u8, status: FriendStatus, w: u64) -> (OwnerAddr, FriendEntry) {
+        let master_ed25519 = ed25519_dalek::SigningKey::from_bytes(&[master_seed; 32])
+            .verifying_key()
+            .to_bytes();
+        let addr = owner_id_from_master_ed25519(&master_ed25519);
+        (
+            addr,
+            FriendEntry {
+                master_ed25519,
+                display: Some(format!("friend-{master_seed}")),
+                status,
+                established_via: FriendOrigin::Token,
+                referrable: false,
+                learned_at: hlc(w),
+            },
+        )
+    }
+
+    #[test]
+    fn list_friends_inner_hides_revoked_surfaces_active() {
+        let mut s = OwnerState::default();
+        let (active_addr, active) = friend_entry(0x11, FriendStatus::Active, 10);
+        let (revoked_addr, revoked) = friend_entry(0x22, FriendStatus::Revoked, 10);
+        assert!(matches!(
+            s.apply_friend_update(active_addr, active),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+        assert!(matches!(
+            s.apply_friend_update(revoked_addr, revoked),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+
+        let dtos = list_friends_inner(&s);
+        assert_eq!(dtos.len(), 1, "only the active friend is surfaced");
+        assert_eq!(dtos[0].owner_id_hex, hex::encode(active_addr.0));
+        assert_eq!(dtos[0].status, FriendStatus::Active);
+        assert_eq!(dtos[0].established_via, FriendOrigin::Token);
+    }
+
+    #[tokio::test]
+    async fn unfriend_inner_tombstones_active_then_list_hides_it() {
+        let (addr, active) = friend_entry(0x33, FriendStatus::Active, 5);
+        let mut state = OwnerState::default();
+        assert!(matches!(
+            state.apply_friend_update(addr, active.clone()),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+        let crdt_state = Arc::new(TokioMutex::new(state));
+        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
+            Arc::new(TokioMutex::new(BTreeMap::new()));
+
+        // Seed the tracker so the revoke HLC is strictly newer than learned_at=5.
+        {
+            let mut t = hlc_tracker.lock().await;
+            t.insert("d".to_string(), hlc(5));
+        }
+
+        unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
+            .await
+            .expect("unfriend succeeds for an active friend");
+
+        // The entry is now a Revoked tombstone…
+        {
+            let s = crdt_state.lock().await;
+            assert_eq!(
+                s.friend_graph.friends[&addr].status,
+                FriendStatus::Revoked,
+                "active friend becomes Revoked"
+            );
+            // …and list_friends_inner hides it.
+            assert!(
+                list_friends_inner(&s).is_empty(),
+                "revoked friend is hidden from the list"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unfriend_inner_errors_for_unknown_peer() {
+        let crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
+            Arc::new(TokioMutex::new(BTreeMap::new()));
+        let unknown = OwnerAddr([0xEE; 16]);
+        let err = unfriend_inner(&crdt_state, &hlc_tracker, "d", unknown)
+            .await
+            .expect_err("unfriending a non-friend errors");
+        assert!(err.contains("not a friend"), "got: {err}");
+    }
+}
+
 // ── ZEB-321 Phase 1 Task 9: connectivity IPCs ────────────────────────
 //
 // Three Tauri commands surfacing the iroh transport + reachability
@@ -33652,6 +34082,11 @@ pub fn run() {
             connectivity_get_identity_discoverable,
             connectivity_discover_identity,
             connectivity_pkarr_publication_status,
+            // ZEB-370 Phase 1 Task 11: friend IPCs.
+            generate_friend_token,
+            redeem_friend_token,
+            list_friends,
+            unfriend,
             // ZEB-329: Network Health IPCs.
             network_health_snapshot,
             network_health_run_self_test,
