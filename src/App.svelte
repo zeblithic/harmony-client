@@ -10,6 +10,7 @@
   import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
   import NetworkDiscoverabilitySettings from './lib/components/NetworkDiscoverabilitySettings.svelte';
+  import FriendsPanel from './lib/components/FriendsPanel.svelte';
   import ProfileEditor from './lib/components/ProfileEditor.svelte';
   import IdentityPanel from './lib/components/IdentityPanel.svelte';
   import BackupStalenessWarning from './lib/components/BackupStalenessWarning.svelte';
@@ -39,6 +40,7 @@
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService } from './lib/community-service';
+  import { FriendService } from './lib/friend-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
   import { NotificationService } from './lib/notification-service';
@@ -892,6 +894,12 @@
   // unmount via $effect cleanup.
   const communityService = new CommunityService();
   $effect(() => () => communityService.destroy());
+  // ── Friend service (ZEB-370) ───────────────────────────────────────
+  // Same eager-construct / adapter-wired-in-IIFE / destroy-on-unmount
+  // pattern as CommunityService. Surfaced in the Settings panel via
+  // FriendsPanel.
+  const friendService = new FriendService();
+  $effect(() => () => friendService.destroy());
   const channelMessageService = new ChannelMessageService();
   $effect(() => () => channelMessageService.destroy());
 
@@ -1285,6 +1293,7 @@
       await tryConnect('vine.loadFollowed', vineService.loadFollowed());
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
       await tryConnect('community', communityService.connectAdapter(adapter));
+      await tryConnect('friend', friendService.connectAdapter(adapter));
       await tryConnect('channelMessage', channelMessageService.connectAdapter(adapter));
       avatarResolver.connectAdapter(adapter);
       // ZEB-345 Task 10: wire the lazy profile-page resolver so panel opens can
@@ -2353,6 +2362,7 @@
       onTrustChange={handleTrustChange}
     />
     <NetworkDiscoverabilitySettings />
+    <FriendsPanel service={friendService} />
   {/snippet}
   {#snippet vineFeed()}
     <VineFeed
