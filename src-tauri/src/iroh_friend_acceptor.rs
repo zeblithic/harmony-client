@@ -466,6 +466,37 @@ pub fn decide_consent(
     ConsentDecision::Pending
 }
 
+/// Resolve consent for an inbound request, consuming a one-shot user approval
+/// ATOMICALLY. [`decide_consent`] is the pure static policy (token / known +
+/// auto-accept); the prior-approval branch is layered here because it MUST be a
+/// single mutex op. Among concurrent handshakes from the same approved
+/// requester, EXACTLY ONE consumes the approval (`take_approved`) and gets
+/// [`ConsentDecision::AcceptInline`]; the rest get [`ConsentDecision::Pending`]
+/// and retry later. This closes the `is_approved` → `process_friend_request` →
+/// `clear` TOCTOU that otherwise let concurrent dials each derive a *different*
+/// friendship secret, leaving the two sides with mismatched Case-D rendezvous
+/// keys. `prior_accept` is passed `false` to `decide_consent` precisely so the
+/// approval is resolved HERE, atomically — never via a stale read.
+///
+/// Consuming the approval BEFORE the accept is safe: authentication already ran
+/// unconditionally upstream, and a (rare, post-auth) accept failure only costs
+/// the user a re-tap — the requester re-dials and lands back at `Pending`.
+fn resolve_consent_consuming_approval(
+    pending: Option<&crate::friend_requests::PendingFriendRequests>,
+    token_sig: Option<&[u8; 64]>,
+    known: bool,
+    auto_accept_known: bool,
+    from: &OwnerAddr,
+) -> ConsentDecision {
+    let decision = decide_consent(token_sig, known, auto_accept_known, false);
+    if matches!(decision, ConsentDecision::Pending)
+        && pending.map(|p| p.take_approved(from)).unwrap_or(false)
+    {
+        return ConsentDecision::AcceptInline;
+    }
+    decision
+}
+
 // =====================================================================
 // Task 8 — ALPN acceptor
 // =====================================================================
@@ -1009,17 +1040,16 @@ where
                 .map(|e| matches!(e.status, FriendStatus::Active | FriendStatus::Pending))
                 .unwrap_or(false)
         };
-        let prior_accept = self
-            .pending_requests
-            .as_ref()
-            .map(|p| p.is_approved(&req.from_addr))
-            .unwrap_or(false);
-
-        let accepted = match decide_consent(
+        // Resolve consent, consuming any one-shot approval ATOMICALLY so
+        // concurrent handshakes from the same approved requester cannot all
+        // inline-accept and derive mismatched Case-D secrets (see
+        // `resolve_consent_consuming_approval`).
+        let accepted = match resolve_consent_consuming_approval(
+            self.pending_requests.as_deref(),
             req.token_sig.as_ref(),
             known,
             self.auto_accept_known,
-            prior_accept,
+            &req.from_addr,
         ) {
             ConsentDecision::TokenPath => {
                 // ZEB-370 token gate (FAIL CLOSED): require `req.token_sig` is a
@@ -2147,6 +2177,57 @@ mod tests {
         // None + known + auto-off + prior_accept → AcceptInline.
         assert_eq!(
             decide_consent(None, true, false, true),
+            ConsentDecision::AcceptInline,
+        );
+    }
+
+    #[test]
+    fn resolve_consent_consumes_approval_once_under_concurrency() {
+        use crate::friend_requests::PendingFriendRequests;
+        let pending = PendingFriendRequests::new();
+        let from = OwnerAddr([0x4d; 16]);
+        pending.approve(from); // user tapped Accept once
+
+        // Two handshakes race on the single approval (no token, not known/auto).
+        // EXACTLY one wins AcceptInline; the loser falls back to Pending so it
+        // does NOT derive a second, mismatched friendship secret.
+        let first = resolve_consent_consuming_approval(Some(&pending), None, false, false, &from);
+        let second = resolve_consent_consuming_approval(Some(&pending), None, false, false, &from);
+        assert_eq!(
+            first,
+            ConsentDecision::AcceptInline,
+            "first handshake claims the one-shot approval"
+        );
+        assert_eq!(
+            second,
+            ConsentDecision::Pending,
+            "approval is one-shot: the racing handshake must NOT also inline-accept"
+        );
+    }
+
+    #[test]
+    fn resolve_consent_token_and_known_paths_preserve_approval() {
+        use crate::friend_requests::PendingFriendRequests;
+        let tok = [0u8; 64];
+        let from = OwnerAddr([0x4e; 16]);
+
+        // Token path authorises via the token gate, never the approval — so it
+        // must not consume a pending approval.
+        let pending = PendingFriendRequests::new();
+        pending.approve(from);
+        assert_eq!(
+            resolve_consent_consuming_approval(Some(&pending), Some(&tok), false, false, &from),
+            ConsentDecision::TokenPath,
+        );
+        assert!(
+            pending.is_approved(&from),
+            "token path must leave the approval intact"
+        );
+
+        // known + auto-accept → AcceptInline without needing/consuming an approval.
+        let empty = PendingFriendRequests::new();
+        assert_eq!(
+            resolve_consent_consuming_approval(Some(&empty), None, true, true, &from),
             ConsentDecision::AcceptInline,
         );
     }
