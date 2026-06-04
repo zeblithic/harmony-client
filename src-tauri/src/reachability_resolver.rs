@@ -20,6 +20,15 @@ use std::sync::{Arc, RwLock};
 use crate::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr};
 use crate::reachability_record::ReachabilityAnnouncePayload;
 
+/// ZEB-373: emitted the first time the resolver learns a `(owner, node_id)`, so the
+/// dynamic dial driver can dial a peer discovered strictly mid-session. Dedup of a
+/// node-id seen under multiple owners is the driver's responsibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialHint {
+    pub node_id: [u8; 32],
+    pub owner: OwnerAddr,
+}
+
 /// Async fallback called by `resolve_async` when the in-memory CRDT cache has
 /// no entry for a given owner. Implemented by `PkarrResolverAdapter` (case C)
 /// and by test stubs. The concrete impl is injected at boot via
@@ -45,6 +54,9 @@ pub struct ReachabilityResolver {
     /// `RwLock` — wiring the fallback via `set_fallback_source` on any
     /// clone is immediately visible to all others (CodeRabbit PR #158 round 2).
     fallback_source: Arc<RwLock<Option<Arc<dyn ReachabilityFallback>>>>,
+    // ZEB-373: optional notify seam to the dynamic dial driver. None until boot
+    // installs it; behind Option so every existing caller/test is unaffected.
+    dial_hint_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<DialHint>>>>,
 }
 
 impl std::fmt::Debug for ReachabilityResolver {
@@ -61,6 +73,7 @@ impl Default for ReachabilityResolver {
         Self {
             inner: Arc::new(RwLock::new(BTreeMap::new())),
             fallback_source: Arc::new(RwLock::new(None)),
+            dial_hint_tx: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -73,6 +86,7 @@ impl Clone for ReachabilityResolver {
             // Wiring the fallback on any clone is visible to all others
             // (CodeRabbit PR #158 round 2 correctness fix).
             fallback_source: Arc::clone(&self.fallback_source),
+            dial_hint_tx: Arc::clone(&self.dial_hint_tx),
         }
     }
 }
@@ -82,6 +96,12 @@ impl ReachabilityResolver {
         Self::default()
     }
 
+    /// Install the dial-hint sender. Called once at boot (event_loop) after the
+    /// dynamic dial driver's channel is created.
+    pub fn set_dial_hint_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<DialHint>) {
+        *self.dial_hint_tx.write().expect("dial hint tx lock") = Some(tx);
+    }
+
     /// LWW update — higher HLC wins; ties broken by announced_at_ms then
     /// lexicographic iroh_node_id. See spec §5.4.
     ///
@@ -89,12 +109,29 @@ impl ReachabilityResolver {
     /// same-owner-different-device announces don't overwrite each other.
     pub fn update(&self, actor: OwnerAddr, payload: ReachabilityAnnouncePayload, hlc: Hlc) {
         let key: ResolverKey = (actor, payload.iroh_node_id);
+        let node_id = payload.iroh_node_id;
         let mut map = self.inner.write().expect("resolver write lock");
+        let was_present = map.contains_key(&key);
         let next = ResolverEntry { payload, hlc };
         match map.get(&key) {
             Some(prev) if !should_replace(prev, &next) => { /* keep prev */ }
             _ => {
                 map.insert(key, next);
+            }
+        }
+        drop(map);
+        // ZEB-373: notify the dial driver the FIRST time we learn this (owner,node_id).
+        if !was_present {
+            if let Some(tx) = self
+                .dial_hint_tx
+                .read()
+                .expect("dial hint tx lock")
+                .as_ref()
+            {
+                let _ = tx.send(DialHint {
+                    node_id,
+                    owner: actor,
+                });
             }
         }
     }
@@ -550,6 +587,40 @@ mod tests {
         assert_eq!(r.remove_owner(&actor), 1);
         // Second remove is a no-op — also 0.
         assert_eq!(r.remove_owner(&actor), 0);
+    }
+
+    #[test]
+    fn dial_hint_fires_once_on_first_learn() {
+        let r = ReachabilityResolver::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_dial_hint_sender(tx);
+        let owner = OwnerAddr([0xAA; 16]);
+        let mut payload = make_payload(0x11, 1000);
+        payload.iroh_node_id = [0x11; 32];
+        let hlc = make_hlc(1, 0, "a");
+        r.update(owner, payload.clone(), hlc.clone());
+        let hint = rx.try_recv().expect("hint on first learn");
+        assert_eq!(hint.node_id, [0x11; 32]);
+        assert_eq!(hint.owner, owner);
+        // Second update with a higher HLC replaces the entry but must NOT
+        // fire another hint — the (owner, node_id) key was already known.
+        let hlc2 = make_hlc(2, 0, "a");
+        r.update(owner, payload, hlc2);
+        assert!(
+            rx.try_recv().is_err(),
+            "no hint on hlc-replace of known peer"
+        );
+    }
+
+    #[test]
+    fn dial_hint_silent_when_sender_unset() {
+        let r = ReachabilityResolver::new();
+        // No sender installed — must not panic.
+        r.update(
+            OwnerAddr([0xAA; 16]),
+            make_payload(0x11, 1000),
+            make_hlc(1, 0, "a"),
+        );
     }
 }
 
