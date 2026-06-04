@@ -176,6 +176,16 @@ impl IrohFriendPexAcceptor {
 
         let req = decode_catalog_request(&body).map_err(|e| format!("decode request: {e}"))?;
 
+        // Authenticate BEFORE bumping the HLC: an unauthenticated / wrong-target
+        // peer must not be able to increment the server's `hlc_tracker`. This is
+        // fail-closed — an `Err` here early-returns and closes the stream without
+        // touching either lock (no HLC bump, no catalog served). The pure
+        // `serve_catalog_for_request` below re-runs this same check internally;
+        // that redundant second verify is intentional defense-in-depth and keeps
+        // the pure fn self-contained.
+        crate::referral_catalog::authenticate_catalog_request(&req, self.self_owner)
+            .map_err(|e| format!("{e:?}"))?;
+
         // Stamp the catalog clock BEFORE taking the crdt lock so the two locks
         // (hlc_tracker, crdt_state) are never nested.
         let at = self.next_hlc().await;
@@ -358,5 +368,116 @@ mod tests {
             ReferralAuthError::WrongTarget,
             "a request addressed to a different owner must be rejected"
         );
+    }
+
+    #[test]
+    fn serves_empty_catalog_to_pending_requester() {
+        let f = mint_test_owner(0x11); // server
+        let requester = mint_test_owner(0x44); // present, but only Pending
+
+        let mut fg = FriendGraph::default();
+        // The requester is in the graph but NOT yet an Active friend.
+        fg.friends.insert(
+            requester.owner,
+            entry(FriendStatus::Pending, false, Some("p")),
+        );
+        // F has a referrable friend — a Pending requester must NOT see it.
+        fg.friends.insert(
+            OwnerAddr([7; 16]),
+            entry(FriendStatus::Active, true, Some("g")),
+        );
+
+        let req = sign_catalog_request(
+            &requester.device_key,
+            requester.owner,
+            f.owner,
+            requester.cert.clone(),
+        );
+        let cat =
+            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7))
+                .expect("a Pending requester still gets a (benign, empty) signed catalog");
+
+        // SECURITY: a non-Active friend leaks NOTHING about F's referrables.
+        assert!(
+            cat.entries.is_empty(),
+            "a Pending requester must not learn any referrable friends"
+        );
+        // Still a validly signed catalog, subject-bound to the requester.
+        assert!(verify_referral_catalog(&cat, f.owner, requester.owner).is_ok());
+    }
+
+    #[test]
+    fn serves_empty_catalog_to_revoked_requester() {
+        let f = mint_test_owner(0x11); // server
+        let requester = mint_test_owner(0x44); // present, but Revoked
+
+        let mut fg = FriendGraph::default();
+        // The requester was a friend, but has since been Revoked.
+        fg.friends.insert(
+            requester.owner,
+            entry(FriendStatus::Revoked, false, Some("x")),
+        );
+        // F has a referrable friend — a Revoked requester must NOT see it.
+        fg.friends.insert(
+            OwnerAddr([7; 16]),
+            entry(FriendStatus::Active, true, Some("g")),
+        );
+
+        let req = sign_catalog_request(
+            &requester.device_key,
+            requester.owner,
+            f.owner,
+            requester.cert.clone(),
+        );
+        let cat =
+            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7))
+                .expect("a Revoked requester still gets a (benign, empty) signed catalog");
+
+        // SECURITY: a Revoked friend leaks NOTHING about F's referrables.
+        assert!(
+            cat.entries.is_empty(),
+            "a Revoked requester must not learn any referrable friends"
+        );
+        // Still a validly signed catalog, subject-bound to the requester.
+        assert!(verify_referral_catalog(&cat, f.owner, requester.owner).is_ok());
+    }
+
+    #[test]
+    fn revoked_referrable_peer_is_not_served() {
+        let f = mint_test_owner(0x11); // server
+        let r = mint_test_owner(0x22); // requester (an active friend of F)
+
+        let mut fg = FriendGraph::default();
+        // R is an Active friend of F → entitled to F's referrable catalog.
+        fg.friends
+            .insert(r.owner, entry(FriendStatus::Active, false, Some("r")));
+        // An Active + referrable peer — this one SHOULD appear in the catalog.
+        let active_peer = OwnerAddr([7; 16]);
+        fg.friends
+            .insert(active_peer, entry(FriendStatus::Active, true, Some("g")));
+        // A Revoked peer that is ALSO flagged referrable — the Revoked status must
+        // win: it must NOT be served despite `referrable=true`.
+        let revoked_peer = OwnerAddr([8; 16]);
+        fg.friends
+            .insert(revoked_peer, entry(FriendStatus::Revoked, true, Some("z")));
+
+        let req = sign_catalog_request(&r.device_key, r.owner, f.owner, r.cert.clone());
+        let cat =
+            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7))
+                .expect("active friend is served a catalog");
+
+        // Only the Active+referrable peer is served; the Revoked one is excluded.
+        assert_eq!(
+            cat.entries.len(),
+            1,
+            "exactly one peer (the Active+referrable one) is served"
+        );
+        assert_eq!(cat.entries[0].peer_owner, active_peer);
+        assert!(
+            !cat.entries.iter().any(|e| e.peer_owner == revoked_peer),
+            "a Revoked peer must never be served even if flagged referrable"
+        );
+        // The catalog is validly signed by F and subject-bound to R.
+        assert!(verify_referral_catalog(&cat, f.owner, r.owner).is_ok());
     }
 }
