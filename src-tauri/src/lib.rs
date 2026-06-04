@@ -481,6 +481,13 @@ pub struct NodeState {
     /// time, snapshot for IPC handlers that mint OutboxEntry / HLC stamps.
     dm_device_id: Option<String>,
     dm_self_owner: Option<crate::owner_state_types::OwnerAddr>,
+    /// ZEB-371: this node's owner `KeyTree` (derived from the master seed,
+    /// same `Arc` the SyncEngine + friend acceptor were built with). Snapshot
+    /// here so the `redeem_friend_token` IPC can KeyTree-seal the friendship
+    /// secret derived on the redeem side of the handshake. `Some` while an owner
+    /// identity is loaded; nulled on identity-restore alongside the other owner
+    /// handles.
+    owner_keytree: Option<std::sync::Arc<crate::owner_state_crypto::KeyTree>>,
     /// ContentStore handle — same `Arc` SyncEngine was constructed with.
     /// Lifted onto NodeState so send_dm can write blobs through the same
     /// store SyncEngine uses for state-root publishes (RuntimeContentStore
@@ -921,6 +928,7 @@ impl Default for NodeState {
             hlc_tracker: None,
             dm_device_id: None,
             dm_self_owner: None,
+            owner_keytree: None,
             content_store: None,
             dm_send_inflight: None,
             dm_send_stopping: None,
@@ -1292,6 +1300,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // identity's invites. `[u8; 64]` is Copy, so just `take()` and
         // discard — no extra cleanup needed beyond the assignment.
         let _ = guard.dm_identity_pub_64.take();
+        // ZEB-371: drop the owner KeyTree so a restart (or identity switch)
+        // re-derives a fresh one from the new master seed rather than sealing
+        // friend secrets under the prior identity's keys.
+        let _ = guard.owner_keytree.take();
         // ZEB-217 Sub-C Phase 3 Task 9: drop the on-demand
         // adapter-request sender. The event_loop's matching receiver
         // gets None on next recv(); the select arm exits cleanly.
@@ -2294,6 +2306,11 @@ pub(crate) async fn start_node_inner(
         // outside the SyncEngine constructor.
         let mut device_id_for_state: Option<String> = None;
         let mut self_owner_for_state: Option<crate::owner_state_types::OwnerAddr> = None;
+        // ZEB-371: lift the owner KeyTree out for NodeState so the
+        // `redeem_friend_token` IPC can KeyTree-seal the redeem-side friendship
+        // secret. Reuses the SAME `kt` Arc the SyncEngine + friend acceptor share.
+        let mut keytree_for_state: Option<std::sync::Arc<crate::owner_state_crypto::KeyTree>> =
+            None;
         let mut crdt_state_for_state: Option<
             std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
         > = None;
@@ -4485,6 +4502,7 @@ pub(crate) async fn start_node_inner(
                                 None,
                                 own_enrollment_cert_for_friend.clone(),
                                 std::sync::Arc::clone(&community_signing_key_arc),
+                                std::sync::Arc::clone(&kt),
                                 Some(std::sync::Arc::new(app.clone())),
                                 pkarr_invite_publisher_for_state.clone(),
                             )
@@ -4531,6 +4549,7 @@ pub(crate) async fn start_node_inner(
                     // assignment below.
                     device_id_for_state = Some(device_id);
                     self_owner_for_state = Some(self_owner);
+                    keytree_for_state = Some(std::sync::Arc::clone(&kt));
                     crdt_state_for_state = Some(crdt_state);
                     tracker_for_state = Some(tracker);
                     content_store_for_state = Some(content_store);
@@ -4963,6 +4982,7 @@ pub(crate) async fn start_node_inner(
                         guard.hlc_tracker = tracker_for_state.clone();
                         guard.dm_device_id = device_id_for_state.clone();
                         guard.dm_self_owner = self_owner_for_state;
+                        guard.owner_keytree = keytree_for_state.clone();
                         guard.content_store = content_store_for_state.clone();
                         // ZEB-234: initialize the shutdown fence. Semaphore starts
                         // at DM_SEND_FENCE_CAPACITY permits (one per concurrent
@@ -33106,6 +33126,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
     dial_config: HandshakeDialConfig,
 ) -> Result<FriendLinkOutcome, String> {
     use crate::iroh_friend_acceptor::{
@@ -33244,10 +33265,10 @@ pub async fn connectivity_link_friend_iroh_inner(
         };
 
     // 5. Build + device-#2-sign the FriendLinkRequest. ZEB-371: generate this
-    // side's ephemeral X25519 keypair for the rendezvous secret. The secret half
-    // is unused THIS task (we leave the friend entry's sealed_secret None below);
-    // it's consumed in the next task to derive + seal the friendship secret.
-    let (_self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+    // side's ephemeral X25519 keypair for the rendezvous secret. `self_eph_sk` is
+    // consumed below (step 8) to derive + KeyTree-seal the friendship secret once
+    // the accept carries the inviter's ephemeral public.
+    let (self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
     let req_sig = self_device2_signing_key
         .sign(&friend_request_sig_preimage(
             self_owner,
@@ -33377,6 +33398,25 @@ pub async fn connectivity_link_friend_iroh_inner(
     let learned_at =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
+    // ZEB-371 Task 7: derive the shared friendship secret via ECDH (this side's
+    // ephemeral secret + the inviter's ephemeral public from the accept), then
+    // KeyTree-seal it under this node's owner keys, AAD-bound to the inviter's
+    // owner_id. The acceptor derives the SAME 32-byte plaintext from their secret
+    // + our `self_eph_pub` (carried in the request); each side seals with its OWN
+    // KeyTree, so the sealed blobs differ but the plaintext secret matches.
+    let secret = crate::friend_rendezvous::derive_friendship_secret(
+        self_eph_sk,
+        &accepted.eph_x25519_pub,
+        self_owner,
+        payload.inviter_addr,
+    );
+    let sealed = crate::owner_state_crypto::encrypt_friend_secret(
+        &keytree,
+        &payload.inviter_addr.0,
+        &secret,
+    )
+    .map_err(|e| format!("friend-secret seal failed: {e}"))?;
+
     let entry = crate::friend_graph::FriendEntry {
         master_ed25519,
         display: display.clone(),
@@ -33384,8 +33424,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         established_via: crate::friend_graph::FriendOrigin::Token,
         referrable: false,
         learned_at,
-        // ZEB-371 Task 7: derive+seal from (_self_eph_sk, accepted.eph_x25519_pub).
-        sealed_secret: None,
+        sealed_secret: Some(sealed),
     };
     {
         let mut state = crdt_state.lock().await;
@@ -33461,6 +33500,7 @@ mod friend_redeem_expiry_tests {
             crdt_state.clone(),
             hlc_tracker,
             "redeem-dev".to_string(),
+            Arc::new(crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt")),
             HandshakeDialConfig {
                 connect_timeout: Duration::from_millis(100),
                 open_bi_timeout: Duration::from_millis(100),
@@ -33932,6 +33972,7 @@ async fn redeem_friend_token(
         self_owner,
         dm_outbox,
         sync_engine,
+        owner_keytree,
     ) = {
         let g = state
             .lock()
@@ -33945,11 +33986,25 @@ async fn redeem_friend_token(
             g.dm_self_owner,
             g.dm_outbox.clone(),
             g.sync_engine.clone(),
+            g.owner_keytree.clone(),
         )
     };
 
-    let (Some(crdt_state), Some(hlc_tracker), Some(device_id), Some(self_owner), Some(dm_outbox)) =
-        (crdt_state, hlc_tracker, device_id, self_owner, dm_outbox)
+    let (
+        Some(crdt_state),
+        Some(hlc_tracker),
+        Some(device_id),
+        Some(self_owner),
+        Some(dm_outbox),
+        Some(owner_keytree),
+    ) = (
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        dm_outbox,
+        owner_keytree,
+    )
     else {
         return Err(OWNER_NOT_LOADED_MSG.into());
     };
@@ -33975,6 +34030,7 @@ async fn redeem_friend_token(
         crdt_state,
         hlc_tracker,
         device_id,
+        owner_keytree,
         HandshakeDialConfig::from_env(),
     )
     .await?;
@@ -38306,6 +38362,7 @@ mod start_node_race_tests {
             hlc_tracker: None,
             dm_device_id: None,
             dm_self_owner: None,
+            owner_keytree: None,
             content_store: None,
             unicast_send_tx: None,
             dm_send_inflight: None,

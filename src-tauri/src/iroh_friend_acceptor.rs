@@ -465,6 +465,7 @@ pub fn process_friend_request(
     self_display: Option<String>,
     self_enrollment: &EnrollmentCert,
     self_device2: &ed25519_dalek::SigningKey,
+    keytree: &crate::owner_state_crypto::KeyTree,
 ) -> Result<FriendLinkAccepted, FriendHandshakeError> {
     // 1. Authenticate the requester's cert → enrolled device-#2 key.
     let device_key = verify_enrolled_device(&req.enrollment, req.from_addr)?;
@@ -479,12 +480,27 @@ pub fn process_friend_request(
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
 
     // ZEB-371: generate this side's ephemeral X25519 keypair for the rendezvous
-    // secret. The secret half is unused THIS task (sealed_secret stays None);
-    // it's consumed in the next task to derive + seal the friendship secret.
-    let (_self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+    // secret.
+    let (self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
 
     // 3. Extract the requester's master key (their friend-graph anchor).
     let master_ed25519 = master_ed25519_from_cert(&req.enrollment)?;
+
+    // ZEB-371 Task 7: derive the shared friendship secret via ECDH (this side's
+    // ephemeral secret + the requester's ephemeral public), then KeyTree-seal it
+    // under this node's owner keys, AAD-bound to the requester's owner_id. The
+    // requester derives the SAME 32-byte plaintext from their secret + this
+    // side's `self_eph_pub` (returned in the accept). Derive BEFORE building the
+    // entry so the sealed blob can be stored on it.
+    let secret = crate::friend_rendezvous::derive_friendship_secret(
+        self_eph_sk,
+        &req.eph_x25519_pub,
+        self_owner,
+        req.from_addr,
+    );
+    let sealed =
+        crate::owner_state_crypto::encrypt_friend_secret(keytree, &req.from_addr.0, &secret)
+            .map_err(|_| FriendHandshakeError::ApplyRejected("friend-secret seal failed".into()))?;
 
     // 4-5. Apply the new friend entry to the CRDT. apply_friend_update re-checks
     // the key↔master-key invariant; a Rejected is a hard error here.
@@ -495,9 +511,7 @@ pub fn process_friend_request(
         established_via: FriendOrigin::Token,
         referrable: false,
         learned_at,
-        // ZEB-371 Task 7: derive + seal the secret from (_self_eph_sk,
-        // req.eph_x25519_pub) here.
-        sealed_secret: None,
+        sealed_secret: Some(sealed),
     };
     match state.apply_friend_update(req.from_addr, entry) {
         ApplyOutcome::Inserted | ApplyOutcome::Merged { .. } => {}
@@ -539,6 +553,10 @@ where
     self_display: Option<String>,
     self_enrollment: EnrollmentCert,
     device2_signing_key: Arc<ed25519_dalek::SigningKey>,
+    /// ZEB-371: this node's owner KeyTree (derived from the master seed). Used to
+    /// KeyTree-seal the per-friend rendezvous secret derived in
+    /// `process_friend_request` before it is written into the `FriendEntry`.
+    keytree: Arc<crate::owner_state_crypto::KeyTree>,
     /// `Some(app)` emits `friend-list-changed`; `None` warn-logs only (tests).
     app: Option<Arc<H>>,
     /// `Some` unregisters the consumed Case-A friend-token one-shot on success.
@@ -565,6 +583,7 @@ where
         self_display: Option<String>,
         self_enrollment: EnrollmentCert,
         device2_signing_key: Arc<ed25519_dalek::SigningKey>,
+        keytree: Arc<crate::owner_state_crypto::KeyTree>,
         app: Option<Arc<H>>,
         pkarr_invite_publisher: Option<Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>>,
     ) -> Self {
@@ -576,6 +595,7 @@ where
             self_display,
             self_enrollment,
             device2_signing_key,
+            keytree,
             app,
             pkarr_invite_publisher,
             FriendAcceptorConfig::default(),
@@ -591,6 +611,7 @@ where
         self_display: Option<String>,
         self_enrollment: EnrollmentCert,
         device2_signing_key: Arc<ed25519_dalek::SigningKey>,
+        keytree: Arc<crate::owner_state_crypto::KeyTree>,
         app: Option<Arc<H>>,
         pkarr_invite_publisher: Option<Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>>,
         config: FriendAcceptorConfig,
@@ -603,6 +624,7 @@ where
             self_display,
             self_enrollment,
             device2_signing_key,
+            keytree,
             app,
             pkarr_invite_publisher,
             owner_sync_engine: None,
@@ -756,6 +778,7 @@ where
                 self.self_display.clone(),
                 &self.self_enrollment,
                 &self.device2_signing_key,
+                &self.keytree,
             )
             .map_err(FriendAcceptError::Handshake)?
         };
@@ -1236,11 +1259,13 @@ mod tests {
 
     #[test]
     fn process_friend_request_adds_active_token_friend_and_returns_verifiable_accept() {
+        use crate::owner_state_crypto::KeyTree;
         use ed25519_dalek::{Signature, VerifyingKey};
         let me = mint_test_owner(0x60); // the acceptor (self)
         let token_sig = [0x5a; 64];
         let (req, _requester_device, _req_eph) = signed_request(0x61, token_sig);
 
+        let kt = KeyTree::derive(&[9u8; 32]).expect("kt");
         let mut state = OwnerState::default();
         let accepted = process_friend_request(
             &mut state,
@@ -1250,6 +1275,7 @@ mod tests {
             Some("me".into()),
             &me.cert,
             &me.device_key,
+            &kt,
         )
         .expect("valid request processed");
 
@@ -1288,12 +1314,65 @@ mod tests {
     }
 
     #[test]
+    fn process_friend_request_derives_secret_matching_requester() {
+        use crate::friend_rendezvous::{derive_friendship_secret, generate_ephemeral};
+        use crate::owner_state_crypto::{decrypt_friend_secret, KeyTree};
+
+        let me = mint_test_owner(0x60); // acceptor (self)
+        let requester = mint_test_owner(0x61);
+        let token_sig = [0x5a; 64];
+        let (req_eph_sk, req_eph_pub) = generate_ephemeral();
+        let preimage = friend_request_sig_preimage(requester.owner, Some(&token_sig), &req_eph_pub);
+        let sig = requester.device_key.sign(&preimage).to_bytes();
+        let req = FriendLinkRequest {
+            from_addr: requester.owner,
+            display: None,
+            token_sig: Some(token_sig),
+            eph_x25519_pub: req_eph_pub,
+            enrollment: requester.cert,
+            sig,
+        };
+
+        let kt = KeyTree::derive(&[9u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        let accepted = process_friend_request(
+            &mut state,
+            test_hlc(1000),
+            &req,
+            me.owner,
+            Some("me".into()),
+            &me.cert,
+            &me.device_key,
+            &kt,
+        )
+        .expect("processed");
+
+        // The requester derives the secret from the accept's ephemeral; it must
+        // equal what the acceptor sealed into the FriendEntry.
+        let requester_secret = derive_friendship_secret(
+            req_eph_sk,
+            &accepted.eph_x25519_pub,
+            requester.owner,
+            me.owner,
+        );
+        let entry = state
+            .friend_graph
+            .friends
+            .get(&requester.owner)
+            .expect("friend");
+        let sealed = entry.sealed_secret.as_ref().expect("secret stored");
+        let opened = decrypt_friend_secret(&kt, &requester.owner.0, sealed).expect("open");
+        assert_eq!(opened.as_ref(), requester_secret.as_ref());
+    }
+
+    #[test]
     fn process_friend_request_rejects_bad_signature_and_writes_nothing() {
         let me = mint_test_owner(0x62);
         let (mut req, _, _) = signed_request(0x63, [0x11; 64]);
         // Corrupt the request signature.
         req.sig[0] ^= 0xFF;
 
+        let kt = crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt");
         let mut state = OwnerState::default();
         let err = process_friend_request(
             &mut state,
@@ -1303,6 +1382,7 @@ mod tests {
             None,
             &me.cert,
             &me.device_key,
+            &kt,
         )
         .expect_err("bad sig rejected");
         assert!(matches!(err, FriendHandshakeError::SignatureInvalid));
@@ -1334,6 +1414,7 @@ mod tests {
             sig,
         };
 
+        let kt = crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt");
         let mut state = OwnerState::default();
         let err = process_friend_request(
             &mut state,
@@ -1343,6 +1424,7 @@ mod tests {
             None,
             &me.cert,
             &me.device_key,
+            &kt,
         )
         .expect_err("owner-mismatched cert rejected");
         assert!(matches!(err, FriendHandshakeError::EnrollmentOwnerMismatch));
@@ -1375,6 +1457,7 @@ mod tests {
             Arc::new(ed25519_dalek::SigningKey::from_bytes(
                 &me.device_key.to_bytes(),
             )),
+            Arc::new(crate::owner_state_crypto::KeyTree::derive(&[7u8; 32]).expect("kt")),
             None,
             publisher,
         )
@@ -1546,6 +1629,7 @@ mod tests {
             Arc::new(ed25519_dalek::SigningKey::from_bytes(
                 &me.device_key.to_bytes(),
             )),
+            Arc::new(KeyTree::derive(&[7u8; 32]).expect("kt")),
             None,
             None,
         )
