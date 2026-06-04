@@ -19,6 +19,9 @@
 //! between the two IPCs.
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 // ── Public data types (wire shape for IPC) ──────────────────────────
 
@@ -35,6 +38,7 @@ pub struct NetworkHealthSnapshot {
     /// Sorted by `last_seen_ms` desc, `None` values last.
     pub peers: Vec<PeerHealth>,
     pub pkarr_status: PkarrHealthSummary,
+    pub dial_status: DialHealthSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -77,6 +81,87 @@ pub struct PkarrFallbackHit {
     pub community_id_short: String,
     pub hit: bool,
     pub captured_at_ms: u64,
+}
+
+/// One recorded dial outcome for the Network Health panel (ZEB-373).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicDialHit {
+    pub node_id_short: String,
+    pub owner_short: String,
+    pub outcome: String, // "succeeded" | "failed"
+    pub captured_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DialHealthSummary {
+    pub attempts: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub skipped_duplicate: u64,
+    pub recent: Vec<DynamicDialHit>,
+}
+
+const DIAL_RING_CAP: usize = 32;
+
+/// Process-lifetime counters + a bounded ring of recent dial outcomes. Shared
+/// (`Arc`) between the dial driver (writer) and `network_health_snapshot` (reader).
+#[derive(Debug, Default)]
+pub struct DialTelemetry {
+    attempts: AtomicU64,
+    succeeded: AtomicU64,
+    failed: AtomicU64,
+    skipped_duplicate: AtomicU64,
+    recent: Mutex<VecDeque<DynamicDialHit>>,
+}
+
+impl DialTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn record_attempt(&self) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_skipped_duplicate(&self) {
+        self.skipped_duplicate.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_succeeded(&self, node_id: [u8; 32], owner: [u8; 16]) {
+        self.succeeded.fetch_add(1, Ordering::Relaxed);
+        self.push(node_id, owner, "succeeded");
+    }
+    pub fn record_failed(&self, node_id: [u8; 32], owner: [u8; 16]) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        self.push(node_id, owner, "failed");
+    }
+    fn push(&self, node_id: [u8; 32], owner: [u8; 16], outcome: &str) {
+        let hit = DynamicDialHit {
+            node_id_short: hex::encode(&node_id[..4]),
+            owner_short: hex::encode(&owner[..4]),
+            outcome: outcome.to_string(),
+            captured_at_ms: now_ms(),
+        };
+        let mut ring = self.recent.lock().expect("dial ring lock");
+        if ring.len() == DIAL_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(hit);
+    }
+    pub fn summary(&self) -> DialHealthSummary {
+        DialHealthSummary {
+            attempts: self.attempts.load(Ordering::Relaxed),
+            succeeded: self.succeeded.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            skipped_duplicate: self.skipped_duplicate.load(Ordering::Relaxed),
+            recent: self
+                .recent
+                .lock()
+                .expect("dial ring lock")
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,7 +229,7 @@ impl NetworkHealthSnapshot {
     /// `peers: []` → "no peers yet"; `pkarr_status` zeroed.
     pub fn empty() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             captured_at_ms: now_ms(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -156,6 +241,7 @@ impl NetworkHealthSnapshot {
                 community_publish_count: 0,
                 recent_fallback_events: Vec::new(),
             },
+            dial_status: DialHealthSummary::default(),
         }
     }
 }
@@ -313,6 +399,34 @@ pub trait ReachabilitySnapshot: Send + Sync {
     fn list_records(&self) -> Vec<ResolverPeerRecord>;
 }
 
+/// ZEB-373: source of dynamic-dial telemetry for the snapshot. Mirrors the
+/// existing `PkarrSnapshot`/`IrohSnapshot` source-trait pattern.
+pub trait DialSnapshot: Send + Sync {
+    fn dial_summary(&self) -> DialHealthSummary;
+}
+
+/// Production source: reads the shared `DialTelemetry` written by the dial
+/// driver (`crate::iroh_dial_driver::run_dial_driver`).
+pub struct ProdDialSnapshot {
+    pub telemetry: std::sync::Arc<DialTelemetry>,
+}
+impl DialSnapshot for ProdDialSnapshot {
+    fn dial_summary(&self) -> DialHealthSummary {
+        self.telemetry.summary()
+    }
+}
+
+/// ZEB-373: trivial `DialSnapshot` double for unit tests that don't exercise
+/// dial telemetry — always returns a zeroed summary.
+#[cfg(test)]
+pub struct EmptyDialSnapshot;
+#[cfg(test)]
+impl DialSnapshot for EmptyDialSnapshot {
+    fn dial_summary(&self) -> DialHealthSummary {
+        DialHealthSummary::default()
+    }
+}
+
 /// Spec §5.5: state coupling summary. NetworkHealthService owns the
 /// rate-limiter task handle + cached last self-test report; the iroh /
 /// resolver / pkarr handles come from AppState (already constructed).
@@ -321,6 +435,8 @@ pub struct NetworkHealthService {
     pkarr: std::sync::Arc<dyn PkarrSnapshot>,
     resolver: std::sync::Arc<dyn ReachabilitySnapshot>,
     membership: std::sync::Arc<dyn MyMembershipSet + Send + Sync>,
+    /// ZEB-373: dynamic-dial telemetry source.
+    dial: std::sync::Arc<dyn DialSnapshot>,
     last_self_test: std::sync::Arc<tokio::sync::RwLock<Option<SelfTestReport>>>,
     /// Channel into the rate-limiter task. `None` until `spawn_rate_limiter`
     /// is called at boot; `notify()` is a no-op while None so unit tests
@@ -334,12 +450,14 @@ impl NetworkHealthService {
         pkarr: std::sync::Arc<dyn PkarrSnapshot>,
         resolver: std::sync::Arc<dyn ReachabilitySnapshot>,
         membership: std::sync::Arc<dyn MyMembershipSet + Send + Sync>,
+        dial: std::sync::Arc<dyn DialSnapshot>,
     ) -> Self {
         Self {
             iroh,
             pkarr,
             resolver,
             membership,
+            dial,
             last_self_test: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             notify_tx: None,
         }
@@ -376,7 +494,7 @@ impl NetworkHealthService {
         });
 
         NetworkHealthSnapshot {
-            schema_version: 1,
+            schema_version: 2,
             captured_at_ms: now,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -388,6 +506,9 @@ impl NetworkHealthService {
                 community_publish_count: self.pkarr.community_publish_count(),
                 recent_fallback_events: self.pkarr.recent_fallback_events(),
             },
+            // ZEB-373 Task 5: real dynamic-dial telemetry, read from the
+            // shared DialTelemetry via the DialSnapshot source.
+            dial_status: self.dial.dial_summary(),
         }
     }
 
@@ -1375,7 +1496,7 @@ mod tests {
     #[test]
     fn network_health_snapshot_empty_is_well_formed() {
         let s = NetworkHealthSnapshot::empty();
-        assert_eq!(s.schema_version, 1);
+        assert_eq!(s.schema_version, 2);
         assert!(s.my_network.is_none());
         assert!(s.peers.is_empty());
         assert_eq!(s.pkarr_status.community_publish_count, 0);
@@ -1385,7 +1506,7 @@ mod tests {
 
     fn fixture_snapshot_with_full_ids() -> NetworkHealthSnapshot {
         NetworkHealthSnapshot {
-            schema_version: 1,
+            schema_version: 2,
             captured_at_ms: 1_700_000_000_000,
             app_version: "0.1.0-alpha.1".into(),
             platform: "darwin/aarch64".into(),
@@ -1414,6 +1535,7 @@ mod tests {
                 community_publish_count: 1,
                 recent_fallback_events: vec![],
             },
+            dial_status: DialHealthSummary::default(),
         }
     }
 
@@ -1532,7 +1654,7 @@ mod tests {
         // schemaVersion were omitted (captured_at_ms contains "1").
         // Bind to the literal emitted token.
         assert!(
-            md.contains("schemaVersion: 1"),
+            md.contains("schemaVersion: 2"),
             "schema version token must appear verbatim; output was:\n{}",
             md
         );
@@ -1615,11 +1737,12 @@ mod tests {
             std::sync::Arc::new(FakePkarr),
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
         );
         let snap = svc.snapshot().await;
         assert!(snap.my_network.is_none());
         assert!(snap.peers.is_empty());
-        assert_eq!(snap.schema_version, 1);
+        assert_eq!(snap.schema_version, 2);
     }
 
     #[tokio::test]
@@ -1629,6 +1752,7 @@ mod tests {
             std::sync::Arc::new(FakePkarr),
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
         );
         let snap = svc.snapshot().await;
         assert!(snap.my_network.is_some());
@@ -1656,6 +1780,7 @@ mod tests {
                 ],
             }),
             std::sync::Arc::new(FakeMembership { table }),
+            std::sync::Arc::new(EmptyDialSnapshot),
         );
         let snap = svc.snapshot().await;
         assert_eq!(snap.peers.len(), 3);
@@ -1689,6 +1814,7 @@ mod tests {
             std::sync::Arc::new(FakePkarr),
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
         );
         let counter = std::sync::Arc::new(AtomicUsize::new(0));
         let emitter = CountingEmitter { n: counter.clone() };
@@ -1787,6 +1913,7 @@ mod tests {
             std::sync::Arc::new(FakePkarr),
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
         )
     }
 
@@ -1910,5 +2037,64 @@ mod tests {
         let _ = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
         let cached = svc.cached_last_self_test().await;
         assert!(cached.is_some(), "cache populated after run");
+    }
+
+    // ── ZEB-373 Task 3: DialTelemetry tests ─────────────────────────
+
+    #[test]
+    fn dial_telemetry_counts_and_rings() {
+        let t = DialTelemetry::new();
+        t.record_attempt();
+        t.record_succeeded([0x11; 32], [0xAA; 16]);
+        t.record_attempt();
+        t.record_failed([0x22; 32], [0xBB; 16]);
+        t.record_skipped_duplicate();
+        let s = t.summary();
+        assert_eq!(s.attempts, 2);
+        assert_eq!(s.succeeded, 1);
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.skipped_duplicate, 1);
+        assert_eq!(s.recent.len(), 2);
+        assert!(s.recent.iter().any(|h| h.outcome == "succeeded"));
+        assert!(s.recent.iter().any(|h| h.outcome == "failed"));
+    }
+
+    #[test]
+    fn dial_ring_evicts_oldest_past_cap() {
+        let t = DialTelemetry::new();
+        // Push one more than the cap; the oldest must be evicted (FIFO).
+        for i in 0..(DIAL_RING_CAP + 1) {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+            t.record_succeeded(id, [0xAA; 16]);
+        }
+        let s = t.summary();
+        assert_eq!(s.recent.len(), DIAL_RING_CAP, "ring stays at cap");
+        // The first entry (node_id_short of byte 0x00) was evicted; the newest
+        // (byte = DIAL_RING_CAP) is present.
+        let newest_short = hex::encode([DIAL_RING_CAP as u8, 0, 0, 0]);
+        assert_eq!(
+            s.recent.last().map(|h| h.node_id_short.clone()),
+            Some(newest_short),
+            "newest entry retained at the back"
+        );
+        assert!(
+            s.recent
+                .iter()
+                .all(|h| h.node_id_short != hex::encode([0u8, 0, 0, 0])),
+            "oldest entry evicted"
+        );
+        assert_eq!(
+            s.succeeded,
+            (DIAL_RING_CAP + 1) as u64,
+            "counter not capped"
+        );
+    }
+
+    #[test]
+    fn empty_snapshot_has_zeroed_dial_status() {
+        let snap = NetworkHealthSnapshot::empty();
+        assert_eq!(snap.dial_status.attempts, 0);
+        assert!(snap.dial_status.recent.is_empty());
     }
 }

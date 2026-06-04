@@ -249,6 +249,7 @@ fn spawn_event_loop(
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
+                    None, // ZEB-373: dial telemetry not exercised in this test
                 )
                 .await;
             });

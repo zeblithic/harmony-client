@@ -544,6 +544,11 @@ pub async fn run<R: Runtime>(
     // unwired and the resolver simply never receives updates — the rest
     // of the event loop is unaffected.
     iroh_handles: Option<IrohRuntimeHandles>,
+    // ZEB-373: shared dynamic-dial telemetry. When `Some` (alongside
+    // `iroh_handles`), the event loop installs the resolver's dial-hint
+    // sender and spawns the dial driver to dial newly-learned peers via the
+    // live zenoh `Runtime`. `None` in test contexts that bypass `start_node`.
+    dial_telemetry: Option<std::sync::Arc<crate::network_health::DialTelemetry>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -581,6 +586,22 @@ pub async fn run<R: Runtime>(
         .parse()
         .expect("static broadcast addr");
     tracing::info!(port = RETICULUM_UDP_PORT, "UDP socket bound");
+
+    // ZEB-373: install the dial-hint sender on the resolver BEFORE the static-seed
+    // snapshot (`iroh_connect_locators` below) and before `zenoh::open`, so a peer
+    // learned during the whole config-build + open window is captured — either it
+    // lands before the snapshot (→ static seed) or after (→ buffered DialHint). The
+    // accept loop runs on its own task, so `resolver.update()` can race this
+    // synchronous build; installing first closes that window. A peer caught in the
+    // tiny overlap (after install, before snapshot) gets both a seed entry and a
+    // hint — harmless, the driver dedups by node-id. (Cursor, PR #190.)
+    let mut dial_hint_rx = None;
+    if let (Some(ref ih), Some(_)) = (&iroh_handles, &dial_telemetry) {
+        let (hint_tx, hint_rx) =
+            tokio::sync::mpsc::channel(crate::iroh_dial_driver::DIAL_HINT_CHANNEL_CAP);
+        ih.link_manager.resolver().set_dial_hint_sender(hint_tx);
+        dial_hint_rx = Some(hint_rx);
+    }
 
     let mut config = zenoh::Config::default();
     // ZEB-368: merge the LAN/Reticulum connect endpoint with every iroh peer the
@@ -648,23 +669,43 @@ pub async fn run<R: Runtime>(
         }
     }
 
-    let session = match cancellable!(zenoh::open(config), "zenoh::open") {
-        Ok(s) => s,
-        Err(e) => {
-            let e = format!("zenoh open failed: {e}");
-            let _ = ready_tx.send(Err(e.clone()));
-            let _ = app.emit(
-                "zenoh-status",
-                &crate::ZenohStatus {
-                    status: "error".to_string(),
-                    endpoint: None,
-                    error: Some(e),
-                },
-            );
-            return;
-        }
-    };
+    let (zenoh_runtime, session) =
+        match cancellable!(open_session_with_runtime(config), "zenoh::open") {
+            Ok(pair) => pair,
+            Err(e) => {
+                let e = format!("zenoh open failed: {e}");
+                let _ = ready_tx.send(Err(e.clone()));
+                let _ = app.emit(
+                    "zenoh-status",
+                    &crate::ZenohStatus {
+                        status: "error".to_string(),
+                        endpoint: None,
+                        error: Some(e),
+                    },
+                );
+                return;
+            }
+        };
     tracing::info!("Zenoh session opened");
+
+    // ZEB-373: spawn the dial driver to dial newly-learned peers via the live zenoh
+    // Runtime. The hint sender was installed on the resolver BEFORE open (above);
+    // inbound + static-seed (ZEB-368) are unchanged.
+    if let (Some(ref ih), Some(ref telemetry), Some(hint_rx)) =
+        (&iroh_handles, &dial_telemetry, dial_hint_rx)
+    {
+        let self_nid = *ih.endpoint.node_id().as_bytes();
+        let dialer = std::sync::Arc::new(crate::iroh_dial_driver::RuntimePeerDialer::new(
+            zenoh_runtime.clone(),
+        ));
+        tokio::spawn(crate::iroh_dial_driver::run_dial_driver(
+            hint_rx,
+            dialer,
+            std::sync::Arc::clone(telemetry),
+            self_nid,
+            std::time::Duration::from_secs(1),
+        ));
+    }
 
     // Own Zenoh session ID — attached to capacity publications so receivers
     // can determine hop distance by comparing against their peers_zid().
@@ -7541,4 +7582,31 @@ mod pin_cascade_tests {
             assert!(cache.get(&cid).is_none(), "{cid:?} evicted from cache");
         }
     }
+}
+
+/// ZEB-373: build a started zenoh Runtime + Session from `config`, returning the
+/// Runtime handle (for dynamic `connect_peer` dialing) alongside the Session.
+/// Replaces `zenoh::open(config)` — the `internal` feature exposes
+/// `RuntimeBuilder` + `session::init`, which `zenoh::open` uses under the hood.
+///
+/// Order MUST mirror `zenoh::open` (`Session::new`, zenoh-1.9.0
+/// api/session.rs:1431): `build()` → `session::init` (register the session face)
+/// → `runtime.start()` (bind listeners + dial the static `connect/endpoints`
+/// seed). Starting before init would bind/dial before the face exists, opening a
+/// window where a declaration/sample on a freshly-formed transport lands before
+/// `new_primitives` registers us — i.e. it would NOT be parity with ZEB-368.
+///
+/// `pub` so the ZEB-373 acceptance integration test
+/// (`tests/zeb_373_dynamic_dial_integration.rs`) can build a real Runtime through
+/// the same path production uses; integration tests compile against the public API.
+pub async fn open_session_with_runtime(
+    config: zenoh::Config,
+) -> zenoh::Result<(zenoh::internal::runtime::Runtime, zenoh::Session)> {
+    let mut runtime = zenoh::internal::runtime::RuntimeBuilder::new(config)
+        .build()
+        .await?;
+    // Register the session face BEFORE starting (binding listeners + dialing).
+    let session = zenoh::session::init(runtime.clone().into()).await?;
+    runtime.start().await?;
+    Ok((runtime, session))
 }
