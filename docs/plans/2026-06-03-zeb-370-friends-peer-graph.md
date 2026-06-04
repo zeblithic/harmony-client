@@ -1,5 +1,7 @@
 # ZEB-370 Friends & Peer Introductions — Phase 1 Implementation Plan
 
+> **⚠️ CORRECTION (identity model changed mid-build):** the inline Task-1–10 type snippets below predate a mid-build correction to the identity model and are **out of date**. Friends key on the master **`owner_id`** (16 bytes), and `FriendEntry` stores the friend's **`master_ed25519: [u8; 32]`** anchor — *not* a `friend_owner_pub`/`inviter_owner_pub: [u8; 64]` Reticulum combined-pub. Handshake/token auth is the **device-#2 signature + `EnrollmentCert`** model (no separate optional-enrollment field; the cert is required). See spec §3 and the refactor commits `e168e7e` / `72b12f3`. **The shipped code and the spec are authoritative** — where any snippet below disagrees (e.g. `friend_owner_pub`/`inviter_owner_pub`, optional enrollment), the snippet is stale and the shipped code/spec win.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship a first-class **Friend Graph** (owner-state CRDT) plus **token-based peering** in harmony-client — "send a friend a `harmony://friend/...` link, they redeem it, you're mutually peered and they appear in your Friends list" — entirely within harmony-client, reusing the merged ZEB-367 invite machinery.
@@ -65,7 +67,7 @@ mod tests {
 
     fn sample_entry() -> FriendEntry {
         FriendEntry {
-            friend_owner_pub: [0x11; 64],
+            master_ed25519: [0x11; 32],
             display: Some("alice".into()),
             status: FriendStatus::Active,
             established_via: FriendOrigin::Token,
@@ -320,9 +322,9 @@ fn pre_friendgraph_snapshot_loads_empty() {
 
   - `impl_canonical!`: extend the macro invocation to include `FriendGraph`, `FriendEntry`, and (for Task 4) `FriendTokenPayload` so they gain the sealed canonical-encode trait.
 
-- [ ] **Step 4: Run, watch pass.** Full sync test must converge.
-- [ ] **Step 5: clippy + fmt.**
-- [ ] **Step 6: Commit** — `feat(zeb-370): sync + persist FriendGraph sub-CRDT (auto-replicated across own devices)`
+  - [ ] **Step 4: Run, watch pass.** Full sync test must converge.
+  - [ ] **Step 5: clippy + fmt.**
+  - [ ] **Step 6: Commit** — `feat(zeb-370): sync + persist FriendGraph sub-CRDT (auto-replicated across own devices)`
 
 ---
 

@@ -111,6 +111,14 @@ pub enum FriendTokenError {
     /// internally inconsistent and rejected before any further processing.
     #[error("inviter_addr does not match inviter_enrollment.owner_id")]
     AddrCertMismatch,
+    /// The signed `token.inviter` field disagrees with the cert-backed
+    /// `inviter_addr`. The `InviteToken.sig` is bound to `token.inviter`, so if
+    /// it differs from `inviter_addr` (which the cert attests) the token is
+    /// internally inconsistent — a friend token whose redemption proof is signed
+    /// for a different inviter than the one the payload/cert claim. Rejected at
+    /// decode before any further processing.
+    #[error("token.inviter does not match inviter_addr")]
+    AddrTokenMismatch,
 }
 
 /// Canonical-CBOR-encode the payload, base64url-no-pad the result, and prefix
@@ -150,6 +158,14 @@ pub fn decode_friend_token_url(url: &str) -> Result<FriendTokenPayload, FriendTo
     // is deferred to handshake time (`verify_enrolled_device`).
     if payload.inviter_addr.0 != payload.inviter_enrollment.owner_id {
         return Err(FriendTokenError::AddrCertMismatch);
+    }
+    // Structural consistency #2: the signed `token.inviter` MUST equal the
+    // cert-backed `inviter_addr`. The `InviteToken.sig` is bound to
+    // `token.inviter`; a token signed for a DIFFERENT inviter than the payload's
+    // claimed (cert-attested) `inviter_addr` is internally inconsistent. Reject
+    // it here before any pkarr/handshake work.
+    if payload.token.inviter != payload.inviter_addr {
+        return Err(FriendTokenError::AddrTokenMismatch);
     }
     Ok(payload)
 }
@@ -255,6 +271,32 @@ mod tests {
             Err(FriendTokenError::AddrCertMismatch) => {}
             other => panic!("expected AddrCertMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_rejects_addr_token_mismatch() {
+        // A payload whose signed `token.inviter` disagrees with the cert-backed
+        // `inviter_addr` must be rejected at decode (structural consistency #2).
+        // We keep `inviter_addr == cert.owner_id` (so the AddrCertMismatch check
+        // passes) but re-point `token.inviter` at a different owner.
+        let mut p = sample();
+        let other = mint_test_owner(0x44);
+        assert_ne!(other.owner, p.inviter_addr);
+        p.token.inviter = other.owner;
+        let url = encode_friend_token_url(&p).expect("encode (no check on encode)");
+        match decode_friend_token_url(&url) {
+            Err(FriendTokenError::AddrTokenMismatch) => {}
+            other => panic!("expected AddrTokenMismatch, got {other:?}"),
+        }
+
+        // Sanity: the consistent sample (token.inviter == inviter_addr) still
+        // decodes cleanly.
+        let consistent = sample();
+        let url = encode_friend_token_url(&consistent).expect("encode");
+        assert_eq!(
+            decode_friend_token_url(&url).expect("consistent token decodes"),
+            consistent
+        );
     }
 
     #[test]
