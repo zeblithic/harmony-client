@@ -101,6 +101,9 @@ pub mod zenoh_iroh_link;
 // resolves outbound locators via ReachabilityResolver and opens iroh
 // QUIC bidi streams wrapped in IrohZenohLink.
 pub mod zenoh_iroh_transport;
+// ZEB-368: registers harmony's IrohZenohLinkManager with the vendored
+// zenoh-link factory and forwards accepted inbound links into Zenoh.
+pub mod iroh_zenoh_registration;
 
 /// ZEB-262 Phase 4 Task 9: production impl of
 /// `community_invite::AppHandleEmit` on `tauri::AppHandle<R>`. Lets
@@ -746,19 +749,14 @@ pub struct NodeState {
     /// stop_node, holds the iroh endpoint Arc alive, and continues firing
     /// if-watch / idle ticks across restart cycles.
     pub iroh_publisher_handle: Option<tokio::task::JoinHandle<()>>,
-    /// ZEB-321 Phase 1 PR #157 round 1 (Qodo + CodeAnt): `JoinHandle` of
-    /// the drain task that discards inbound iroh→zenoh links until Phase 2
-    /// wires them into the real `zenoh::Session` ingestion path. Without
-    /// this task the flume receiver would be dropped, the channel would
-    /// close, and `IrohZenohLinkManager::spawn_accept_loop`'s `send_async`
-    /// would fail on every accepted connection. Aborted on stop_inner.
-    pub iroh_inbound_drain_handle: Option<tokio::task::JoinHandle<()>>,
     /// ZEB-321 Phase 1 PR #157 round 4 (Greptile P1): `JoinHandle` of the
     /// iroh accept loop spawned via `IrohZenohLinkManager::spawn_accept_loop`.
     /// Previously dropped (detached) in event_loop.rs, which left the
     /// loop running across restart cycles. Now captured here so
-    /// `clear_iroh_handles` aborts it alongside the publisher + drain
-    /// tasks for symmetric teardown.
+    /// `clear_iroh_handles` aborts it alongside the publisher task for
+    /// symmetric teardown. (ZEB-368: the Phase-1 inbound drain task is
+    /// gone — accepted links are forwarded into Zenoh by the registration
+    /// factory's forwarder, which exits when the Zenoh session closes.)
     pub iroh_accept_handle: Option<tokio::task::JoinHandle<()>>,
 
     // ── ZEB-323 Phase 2b: pkarr policy handles ───────────────────────────
@@ -841,12 +839,19 @@ impl NodeState {
         if let Some(h) = self.iroh_publisher_handle.take() {
             h.abort();
         }
-        if let Some(h) = self.iroh_inbound_drain_handle.take() {
-            h.abort();
-        }
         if let Some(h) = self.iroh_accept_handle.take() {
             h.abort();
         }
+        // ZEB-368: clear the process-global iroh session ctx so a restart
+        // (or identity rebuild) re-populates a fresh manager + receiver.
+        // The registered factory is process-wide and intentionally NOT
+        // cleared — it reads the ctx slot on each `make`. Ordering is safe:
+        // the next `start_node`'s `zenoh::open` (which invokes the factory on
+        // the NEW ctx) can't run until `stop_handles` has joined the old
+        // event-loop thread, and old/new sessions use separate flume channels,
+        // so a still-draining old forwarder never touches the new channel
+        // (ZEB-368 review Finding 1).
+        crate::iroh_zenoh_registration::clear_iroh_session_ctx();
         self.iroh_endpoint = None;
         self.reachability_resolver = None;
         self.iroh_publisher_force = None;
@@ -996,7 +1001,6 @@ impl Default for NodeState {
             reachability_resolver: None,
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
-            iroh_inbound_drain_handle: None,
             iroh_accept_handle: None,
             // ZEB-323 Phase 2b: pkarr policy handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
@@ -2514,13 +2518,6 @@ pub(crate) async fn start_node_inner(
         let mut iroh_link_mgr_for_handshake: Option<
             std::sync::Arc<crate::zenoh_iroh_transport::IrohZenohLinkManager>,
         > = None;
-        // ZEB-321 Phase 1 PR #157 round 1 (Qodo + CodeAnt): JoinHandle of
-        // the drain task that discards inbound iroh→zenoh links. We must
-        // own a live receiver — otherwise `IrohZenohLinkManager`'s accept
-        // loop fails every `send_async` with "channel closed" and inbound
-        // links are silently lost. Phase 2 will replace this drain with
-        // the real `zenoh::Session` ingestion path.
-        let mut iroh_inbound_drain_handle: Option<tokio::task::JoinHandle<()>> = None;
         // ZEB-321 Phase 1 PR #157 round 4 (Greptile P1): JoinHandle of
         // the iroh accept loop. Captured here (not dropped via
         // `inspect()` inside event_loop as before) so `clear_iroh_handles`
@@ -2549,22 +2546,6 @@ pub(crate) async fn start_node_inner(
                                     new_link_tx,
                                 ),
                             );
-                            // Drain task: holds the receiver alive so the
-                            // accept loop's send_async succeeds, then
-                            // discards links until Phase 2 wires them
-                            // into a real Zenoh session. Throttled log
-                            // (one warn per accepted link) makes the
-                            // Phase-1 deferment visible in production
-                            // without spamming.
-                            iroh_inbound_drain_handle = Some(tokio::spawn(async move {
-                                while let Ok(_link) = new_link_rx.recv_async().await {
-                                    tracing::warn!(
-                                        "ZEB-321 Phase 1: discarding inbound \
-                                         iroh/zenoh link (Zenoh session \
-                                         ingestion deferred to Phase 2)"
-                                    );
-                                }
-                            }));
                             // PR #157 round 4 (Greptile P1): spawn the
                             // accept loop here (was previously dropped
                             // by `inspect()` inside event_loop) so we
@@ -2573,6 +2554,26 @@ pub(crate) async fn start_node_inner(
                             // cloned from `link_mgr` below — drop of
                             // our local `link_mgr` doesn't tear it down.
                             iroh_accept_handle = Some(link_mgr.spawn_accept_loop());
+                            // ZEB-368: hand harmony's iroh manager +
+                            // accept-loop receiver to the vendored
+                            // zenoh-link factory, and register the
+                            // factory, BEFORE event_loop's zenoh::open.
+                            // The factory returns `link_mgr` for outbound
+                            // `new_link` and spawns a forwarder that moves
+                            // accepted inbound links from `new_link_rx`
+                            // into Zenoh's real `NewLinkChannelSender`,
+                            // replacing the Phase-1 drain.
+                            crate::iroh_zenoh_registration::set_iroh_session_ctx(
+                                crate::iroh_zenoh_registration::IrohSessionCtx {
+                                    manager: std::sync::Arc::clone(&link_mgr),
+                                    // Move (not clone) the receiver: the ctx must be
+                                    // the ONLY consumer so the forwarder can't split
+                                    // the inbound-link stream with a stray stack clone
+                                    // (ZEB-368 review Finding 2).
+                                    new_link_rx,
+                                },
+                            );
+                            crate::iroh_zenoh_registration::ensure_iroh_factory_registered();
                             iroh_endpoint_arc = Some(std::sync::Arc::clone(&ep_arc));
                             // ZEB-325 Phase 2c: clone the link manager
                             // Arc for the post-owner-load handshake
@@ -5066,16 +5067,17 @@ pub(crate) async fn start_node_inner(
                         guard.reachability_resolver = Some(reachability_resolver.clone());
                         guard.iroh_publisher_force =
                             iroh_publisher_arc.as_ref().map(|p| p.force_handle());
-                        // ZEB-321 Phase 1 PR #157 round 1 + round 4:
-                        // move (take) the join handles into NodeState so
-                        // stop_inner's `clear_iroh_handles` can abort the
-                        // background tasks on shutdown. All three are
-                        // Option-shaped (one or more may be None when
-                        // iroh boot failed or no owner identity is
-                        // loaded — see prior blocks; the publisher in
-                        // particular is identity-gated).
+                        // ZEB-321 Phase 1 PR #157 round 1 + round 4
+                        // (ZEB-368: drain handle removed — inbound links
+                        // now forwarded into Zenoh by the registration
+                        // factory, not drained): move (take) the join
+                        // handles into NodeState so stop_inner's
+                        // `clear_iroh_handles` can abort the background
+                        // tasks on shutdown. Both are Option-shaped (one
+                        // or both may be None when iroh boot failed or no
+                        // owner identity is loaded — see prior blocks; the
+                        // publisher in particular is identity-gated).
                         guard.iroh_publisher_handle = iroh_publisher_handle.take();
-                        guard.iroh_inbound_drain_handle = iroh_inbound_drain_handle.take();
                         guard.iroh_accept_handle = iroh_accept_handle.take();
                         // ZEB-323 Phase 2b: stash pkarr policy handles.
                         guard.pkarr_publisher = pkarr_publisher_for_state.take();
@@ -38332,7 +38334,6 @@ mod start_node_race_tests {
             reachability_resolver: None,
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
-            iroh_inbound_drain_handle: None,
             iroh_accept_handle: None,
             // ZEB-323 Phase 2b: pkarr handles unused in race tests.
             pkarr_publisher: None,

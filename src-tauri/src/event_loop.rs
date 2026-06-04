@@ -583,20 +583,68 @@ pub async fn run<R: Runtime>(
     tracing::info!(port = RETICULUM_UDP_PORT, "UDP socket bound");
 
     let mut config = zenoh::Config::default();
+    // ZEB-368: merge the LAN/Reticulum connect endpoint with every iroh peer the
+    // resolver knows, so the orchestrator's startup connect dials them through our
+    // factory manager's new_link(). Dynamic mid-session dial is deferred to ZEB-373.
+    //
+    // Boot-ordering (ZEB-368, verified): the resolver read below is the SAME
+    // Arc-backed store that start_node's reachability boot-replay
+    // (lib.rs ReachabilityResolver bootstrap) populates from persisted
+    // ReachabilityAnnounce history. That replay runs in straight-line code BEFORE
+    // the runtime-thread spawn that invokes this `event_loop::run` → `zenoh::open`,
+    // so on warm/persisted boots the resolver is already populated and seeding is
+    // effective. On a cold first boot the resolver is empty (no persisted peers
+    // yet) → seeding is a no-op; the node still accepts inbound (Task 4 listener)
+    // and dials on the next boot once reachability persists + replays. Full
+    // dynamic mid-session dial is ZEB-373.
+    let mut connect_eps: Vec<String> = Vec::new();
     if let Some(ref ep) = endpoint {
         match serde_json::to_string(ep) {
-            Ok(ep_json) => {
-                if let Err(e) = config.insert_json5("connect/endpoints", &format!("[{ep_json}]")) {
-                    let e = format!("zenoh config error: {e}");
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
-            }
+            Ok(ep_json) => connect_eps.push(ep_json), // already JSON-quoted
             Err(e) => {
                 let e = format!("endpoint serialize error: {e}");
                 let _ = ready_tx.send(Err(e));
                 return;
             }
+        }
+    }
+    if let Some(ref ih) = iroh_handles {
+        let resolver = ih.link_manager.resolver();
+        let self_nid = *ih.endpoint.node_id().as_bytes();
+        for loc in crate::iroh_zenoh_registration::iroh_connect_locators(&resolver, &self_nid) {
+            connect_eps.push(format!("\"{loc}\"")); // JSON-quote the iroh locator
+        }
+    }
+    if !connect_eps.is_empty() {
+        let arr = format!("[{}]", connect_eps.join(","));
+        if let Err(e) = config.insert_json5("connect/endpoints", &arr) {
+            let e = format!("zenoh config error (connect/endpoints): {e}");
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    }
+
+    // ZEB-368: listen on our own iroh locator so Zenoh creates the iroh manager via
+    // the factory (→ starts the inbound forwarder, registers harmony's manager) at
+    // open even on inbound-only / no-known-peer nodes. new_listener is a no-op that
+    // returns the locator (harmony's spawn_accept_loop already owns the accept loop).
+    if let Some(ref ih) = iroh_handles {
+        // MERGE iroh into the listen set: insert_json5 overwrites (no merge), so we
+        // read listen/endpoints back and APPEND our locator, preserving every existing
+        // listener (default peer `tcp/[::]:0`, the router listener, any other path's).
+        // Overwriting iroh-only would silently drop the LAN zenoh transport (CodeRabbit
+        // + Qodo, PR#188).
+        let self_loc =
+            crate::iroh_zenoh_registration::iroh_listen_locator(ih.endpoint.node_id().as_bytes());
+        let current = config.get_json("listen/endpoints").ok();
+        let eps = crate::iroh_zenoh_registration::merge_iroh_listen_endpoints(
+            current.as_deref(),
+            &self_loc,
+        );
+        if let Err(e) = config.insert_json5("listen/endpoints", &eps) {
+            let e = format!("zenoh config error (listen/endpoints): {e}");
+            let _ = ready_tx.send(Err(e));
+            return;
         }
     }
 

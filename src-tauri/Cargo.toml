@@ -162,3 +162,12 @@ harmony-pkarr = { git = "https://github.com/zeblithic/harmony", rev = "6ac9b989d
 # `CARGO_PROFILE_DEV_DEBUG=2 cargo build`.
 [profile.dev]
 debug = "line-tables-only"
+
+# ZEB-368: vendored fork of zenoh-link 1.9.0 that teaches Zenoh's closed
+# locator→transport dispatch about the `iroh/<hex>` scheme (zenoh 1.9.0 exposes
+# no public/internal API to register a custom unicast transport — the LinkKind
+# enum + LinkManagerBuilderUnicast::make are a closed match). `[patch]` replaces
+# the crate graph-wide, so zenoh-transport's own dispatch compiles against our
+# copy. See docs/specs/2026-06-02-zeb-321-phase2-zenoh-over-iroh-ingestion-design.md.
+[patch.crates-io]
+zenoh-link = { path = "vendor/zenoh-link" }
