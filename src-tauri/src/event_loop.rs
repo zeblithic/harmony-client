@@ -648,22 +648,27 @@ pub async fn run<R: Runtime>(
         }
     }
 
-    let session = match cancellable!(zenoh::open(config), "zenoh::open") {
-        Ok(s) => s,
-        Err(e) => {
-            let e = format!("zenoh open failed: {e}");
-            let _ = ready_tx.send(Err(e.clone()));
-            let _ = app.emit(
-                "zenoh-status",
-                &crate::ZenohStatus {
-                    status: "error".to_string(),
-                    endpoint: None,
-                    error: Some(e),
-                },
-            );
-            return;
-        }
-    };
+    let (zenoh_runtime, session) =
+        match cancellable!(open_session_with_runtime(config), "zenoh::open") {
+            Ok(pair) => pair,
+            Err(e) => {
+                let e = format!("zenoh open failed: {e}");
+                let _ = ready_tx.send(Err(e.clone()));
+                let _ = app.emit(
+                    "zenoh-status",
+                    &crate::ZenohStatus {
+                        status: "error".to_string(),
+                        endpoint: None,
+                        error: Some(e),
+                    },
+                );
+                return;
+            }
+        };
+    // ZEB-373 Task 1: `zenoh_runtime` is retained for dynamic `connect_peer`
+    // dialing wired up in a later task (Task 5). Keep the binding name so that
+    // task can consume it; silence the unused-variable warning for now.
+    let _ = &zenoh_runtime;
     tracing::info!("Zenoh session opened");
 
     // Own Zenoh session ID — attached to capacity publications so receivers
@@ -7541,4 +7546,19 @@ mod pin_cascade_tests {
             assert!(cache.get(&cid).is_none(), "{cid:?} evicted from cache");
         }
     }
+}
+
+/// ZEB-373: build a started zenoh Runtime + Session from `config`, returning the
+/// Runtime handle (for dynamic `connect_peer` dialing) alongside the Session.
+/// Replaces `zenoh::open(config)` — the `internal` feature exposes
+/// `RuntimeBuilder` + `session::init`, which `zenoh::open` uses under the hood.
+async fn open_session_with_runtime(
+    config: zenoh::Config,
+) -> zenoh::Result<(zenoh::internal::runtime::Runtime, zenoh::Session)> {
+    let mut runtime = zenoh::internal::runtime::RuntimeBuilder::new(config)
+        .build()
+        .await?;
+    runtime.start().await?;
+    let session = zenoh::session::init(runtime.clone().into()).await?;
+    Ok((runtime, session))
 }

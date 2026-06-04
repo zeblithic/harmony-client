@@ -31,7 +31,7 @@ ciborium = "0.2"
 # Default features include TCP, UDP, QUIC, TLS, WebSocket transports.
 # A desktop app benefits from all transports. Disabling defaults breaks
 # TCP connectivity (previous review confirmed this).
-zenoh = "1"
+zenoh = { version = "1", features = ["internal"] }
 # ZEB-321 Phase 1 Task 5: zenoh's pluggable transport surface lives in
 # zenoh-link (LinkUnicastTrait, LinkAuthId, BatchSize, Locator) and
 # zenoh-result (ZResult, zerror!). Both are transitive deps of zenoh
