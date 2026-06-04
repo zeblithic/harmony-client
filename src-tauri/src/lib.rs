@@ -35123,6 +35123,45 @@ mod friend_ipc_tests {
         }
     }
 
+    /// Pin the EXACT JSON the `add_friend_by_key` IPC emits for each variant —
+    /// this is the contract `parseAddFriendOutcome` (friend-service.ts) parses.
+    /// serde's externally-tagged representation serializes UNIT variants as bare
+    /// strings (`"pending"`/`"unreachable"`), NOT objects like `{"pending":null}`;
+    /// only struct variants get the `{"linked": {…}}` wrapper. (Refutes the
+    /// Cursor "add-friend outcome parse mismatch" report — the bare-string shape
+    /// the TS parser checks IS what the backend produces.)
+    #[test]
+    fn add_friend_outcome_serializes_to_the_ipc_contract() {
+        use serde_json::json;
+        assert_eq!(
+            serde_json::to_value(AddFriendOutcome::Pending).unwrap(),
+            json!("pending"),
+            "unit variant must serialize as a bare string"
+        );
+        assert_eq!(
+            serde_json::to_value(AddFriendOutcome::Unreachable).unwrap(),
+            json!("unreachable"),
+            "unit variant must serialize as a bare string"
+        );
+        assert_eq!(
+            serde_json::to_value(AddFriendOutcome::Linked {
+                owner_id_hex: "aabb".into(),
+                display: Some("Alice".into()),
+            })
+            .unwrap(),
+            json!({ "linked": { "ownerIdHex": "aabb", "display": "Alice" } })
+        );
+        assert_eq!(
+            serde_json::to_value(AddFriendOutcome::Linked {
+                owner_id_hex: "ccdd".into(),
+                display: None,
+            })
+            .unwrap(),
+            json!({ "linked": { "ownerIdHex": "ccdd", "display": null } }),
+            "absent display serializes as null, matching `display ?? null`"
+        );
+    }
+
     /// A friend entry whose `master_ed25519` derives to `addr` (so
     /// `apply_friend_update` accepts it — it enforces the addr↔key invariant).
     fn friend_entry(master_seed: u8, status: FriendStatus, w: u64) -> (OwnerAddr, FriendEntry) {
