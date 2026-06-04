@@ -7,7 +7,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::friend_graph::deserialize_capped_display;
+use crate::friend_graph::{deserialize_capped_display, FriendGraph, FriendStatus};
 use crate::iroh_friend_acceptor::verify_enrolled_device;
 use crate::owner_state_types::{
     deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr,
@@ -303,10 +303,63 @@ pub fn verify_referral_catalog(
     Ok(())
 }
 
+/// Project a [`FriendGraph`] into the referral entries we are willing to serve:
+/// only `Active` friends the user has explicitly marked `referrable`. Yielded in
+/// the graph's deterministic `BTreeMap` key order and capped at
+/// [`MAX_REFERRAL_ENTRIES`]; any overflow beyond the cap is *logged* (never
+/// silently dropped). `Pending`/`Revoked` and non-`referrable` friends are
+/// excluded — the catalog is a sharer-side opt-in surface, not the full graph.
+pub fn collect_referrable_entries(fg: &FriendGraph) -> Vec<ReferralEntry> {
+    let mut out = Vec::new();
+    let mut dropped = 0usize;
+    for (owner, e) in fg.friends.iter() {
+        if e.status == FriendStatus::Active && e.referrable {
+            if out.len() < MAX_REFERRAL_ENTRIES {
+                out.push(ReferralEntry {
+                    peer_owner: *owner,
+                    display: e.display.clone(),
+                });
+            } else {
+                dropped += 1;
+            }
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            cap = MAX_REFERRAL_ENTRIES,
+            "referral catalog truncated"
+        );
+    }
+    out
+}
+
+/// Build a device-#2-signed [`ReferralCatalog`] addressed to `subject` from the
+/// caller's own `Active`+`referrable` friends. Convenience wrapper over
+/// [`collect_referrable_entries`] + [`sign_referral_catalog`].
+pub fn build_referral_catalog(
+    fg: &FriendGraph,
+    subject: OwnerAddr,
+    self_owner: OwnerAddr,
+    self_enrollment: EnrollmentCert,
+    device2: &SigningKey,
+    at: Hlc,
+) -> ReferralCatalog {
+    sign_referral_catalog(
+        device2,
+        self_owner,
+        subject,
+        collect_referrable_entries(fg),
+        at,
+        self_enrollment,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::community_membership::mint_test_owner;
+    use crate::friend_graph::{FriendEntry, FriendOrigin};
     use crate::owner_state_types::{Hlc, OwnerAddr};
 
     /// Deterministic HLC for fixtures.
@@ -469,5 +522,75 @@ mod tests {
         let mut bad = req.clone();
         bad.sig[0] ^= 1;
         assert!(authenticate_catalog_request(&bad, f_owner).is_err());
+    }
+
+    /// Build a FULL valid `FriendEntry` with deterministic field values, varying
+    /// only the lifecycle/opt-in/label the referral-collection logic keys on.
+    fn entry(status: FriendStatus, referrable: bool, display: Option<&str>) -> FriendEntry {
+        FriendEntry {
+            master_ed25519: [0x11; 32],
+            display: display.map(str::to_string),
+            status,
+            established_via: FriendOrigin::Token,
+            referrable,
+            learned_at: hlc(1),
+            sealed_secret: None,
+        }
+    }
+
+    #[test]
+    fn collect_referrable_includes_only_active_referrable() {
+        let mut fg = FriendGraph::default();
+        fg.friends.insert(
+            OwnerAddr([1; 16]),
+            entry(FriendStatus::Active, true, Some("yes")),
+        );
+        fg.friends.insert(
+            OwnerAddr([2; 16]),
+            entry(FriendStatus::Active, false, Some("not-referrable")),
+        );
+        fg.friends.insert(
+            OwnerAddr([3; 16]),
+            entry(FriendStatus::Pending, true, Some("pending")),
+        );
+        fg.friends.insert(
+            OwnerAddr([4; 16]),
+            entry(FriendStatus::Revoked, true, Some("revoked")),
+        );
+
+        let out = collect_referrable_entries(&fg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].peer_owner, OwnerAddr([1; 16]));
+    }
+
+    #[test]
+    fn collect_referrable_is_capped() {
+        let mut fg = FriendGraph::default();
+        for i in 0..(MAX_REFERRAL_ENTRIES + 5) {
+            // Distinct 16-byte keys (more than 256 entries → use 2 bytes of index).
+            let mut key = [0u8; 16];
+            key[0] = (i & 0xff) as u8;
+            key[1] = (i >> 8) as u8;
+            fg.friends
+                .insert(OwnerAddr(key), entry(FriendStatus::Active, true, None));
+        }
+        assert_eq!(collect_referrable_entries(&fg).len(), MAX_REFERRAL_ENTRIES);
+    }
+
+    #[test]
+    fn built_catalog_is_signed_for_subject() {
+        let f = mint_test_owner(0x11);
+        let subject = OwnerAddr([0x22; 16]);
+        let mut fg = FriendGraph::default();
+        fg.friends.insert(
+            OwnerAddr([1; 16]),
+            entry(FriendStatus::Active, true, Some("friend")),
+        );
+
+        let cat =
+            build_referral_catalog(&fg, subject, f.owner, f.cert.clone(), &f.device_key, hlc(7));
+
+        assert_eq!(cat.entries.len(), 1);
+        assert!(verify_referral_catalog(&cat, f.owner, subject).is_ok());
     }
 }
