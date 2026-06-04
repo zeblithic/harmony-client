@@ -40124,6 +40124,9 @@ mod zeb_321_connectivity_ipc_tests {
     /// correctness gates.
     #[tokio::test]
     async fn force_republish_wakes_publisher() {
+        // ZEB-347: prime the one-time process-global iroh bind init before
+        // the asserted timeout (see `iroh_endpoint::warm_up_iroh_global_init`).
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
         tokio::time::timeout(
             Duration::from_secs(60),
             force_republish_wakes_publisher_inner(),

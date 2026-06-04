@@ -189,6 +189,9 @@ mod tests {
     /// piece*, but downgrade the preset for full hermeticity.
     #[tokio::test]
     async fn paired_stream_roundtrip_via_loopback() {
+        // ZEB-347: prime the one-time process-global iroh bind init before
+        // the asserted timeout (see `iroh_endpoint::warm_up_iroh_global_init`).
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
         // Hard wall-clock cap so a future regression in the QUIC
         // teardown sequence can't strand the suite indefinitely
         // (we previously hung on `incoming.closed().await` after the

@@ -237,6 +237,9 @@ mod tests {
     /// fix in c089127). PR #157 round 5.
     #[tokio::test]
     async fn force_notify_triggers_publish() {
+        // ZEB-347: hoist the one-time process-global iroh bind init out of
+        // the asserted timeout below so it can't trip the budget under load.
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
         tokio::time::timeout(
             Duration::from_secs(30),
             force_notify_triggers_publish_inner(),

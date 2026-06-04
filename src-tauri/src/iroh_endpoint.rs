@@ -253,6 +253,49 @@ pub fn load_or_create_secret_key() -> Result<(SecretKey, bool), IrohEndpointErro
     }
 }
 
+/// ZEB-347: prime the one-time, process-global initialization that the
+/// FIRST `iroh::Endpoint::bind()` in a process pays (~10s on CI, ~30s on
+/// some macOS hosts); every subsequent bind in the same process is ~3ms.
+///
+/// `cargo nextest` runs each test in its own process, so every test that
+/// binds a hermetic iroh endpoint pays this init once. Call this ONCE at
+/// the top of such a test, OUTSIDE any `tokio::time::timeout` that guards
+/// the behavior under test. That timeout exists to catch a *hung
+/// behavior* (a lost wakeup, a deadlocked roundtrip), not slow hermetic
+/// setup; folding the one-time init into it makes the test flaky under CI
+/// parallelism (the init balloons past the budget) for zero real signal.
+/// After this returns, the test's own `bind()` is the fast cached path.
+///
+/// A generous 120s kill-switch still bounds the warm-up itself: the init is
+/// normally ~10s (CI) / ~30s (macOS) (~76s under heavy local parallelism), so
+/// 120s never fires under legitimate load, but a future iroh regression that
+/// makes the bind truly *hang* fails the test in ~2 min instead of stalling
+/// until the 30-min job timeout. This keeps a wall-clock bound on the warm-up
+/// even though it lives outside the per-test asserted timeout (Qodo + CodeAnt
+/// review).
+///
+/// Marked `pub` + feature-gated so integration tests (which see only the
+/// `--features test-fixtures` public surface) can call it too;
+/// `#[allow(dead_code)]` because the non-test lib target never calls it.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[allow(dead_code)]
+pub async fn warm_up_iroh_global_init() {
+    let builder = Endpoint::builder(presets::Minimal)
+        .relay_mode(iroh::endpoint::RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("warm-up bind_addr loopback");
+    let ep = tokio::time::timeout(std::time::Duration::from_secs(120), builder.bind())
+        .await
+        .expect(
+            "warm-up iroh bind exceeded its 120s kill-switch — the one-time bind \
+             init is normally ~10s (CI) / ~30s (macOS); a stall this long means an \
+             iroh bind regression, not normal slowness",
+        )
+        .expect("warm-up iroh bind");
+    ep.close().await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
