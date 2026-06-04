@@ -587,6 +587,22 @@ pub async fn run<R: Runtime>(
         .expect("static broadcast addr");
     tracing::info!(port = RETICULUM_UDP_PORT, "UDP socket bound");
 
+    // ZEB-373: install the dial-hint sender on the resolver BEFORE the static-seed
+    // snapshot (`iroh_connect_locators` below) and before `zenoh::open`, so a peer
+    // learned during the whole config-build + open window is captured — either it
+    // lands before the snapshot (→ static seed) or after (→ buffered DialHint). The
+    // accept loop runs on its own task, so `resolver.update()` can race this
+    // synchronous build; installing first closes that window. A peer caught in the
+    // tiny overlap (after install, before snapshot) gets both a seed entry and a
+    // hint — harmless, the driver dedups by node-id. (Cursor, PR #190.)
+    let mut dial_hint_rx = None;
+    if let (Some(ref ih), Some(_)) = (&iroh_handles, &dial_telemetry) {
+        let (hint_tx, hint_rx) =
+            tokio::sync::mpsc::channel(crate::iroh_dial_driver::DIAL_HINT_CHANNEL_CAP);
+        ih.link_manager.resolver().set_dial_hint_sender(hint_tx);
+        dial_hint_rx = Some(hint_rx);
+    }
+
     let mut config = zenoh::Config::default();
     // ZEB-368: merge the LAN/Reticulum connect endpoint with every iroh peer the
     // resolver knows, so the orchestrator's startup connect dials them through our
@@ -651,17 +667,6 @@ pub async fn run<R: Runtime>(
             let _ = ready_tx.send(Err(e));
             return;
         }
-    }
-
-    // ZEB-373: install the dial-hint sender on the resolver BEFORE opening Zenoh, so
-    // a peer learned during the open window (e.g. via an inbound iroh link accepted
-    // mid-open) is buffered in the bounded channel rather than dropped (CodeRabbit).
-    let mut dial_hint_rx = None;
-    if let (Some(ref ih), Some(_)) = (&iroh_handles, &dial_telemetry) {
-        let (hint_tx, hint_rx) =
-            tokio::sync::mpsc::channel(crate::iroh_dial_driver::DIAL_HINT_CHANNEL_CAP);
-        ih.link_manager.resolver().set_dial_hint_sender(hint_tx);
-        dial_hint_rx = Some(hint_rx);
     }
 
     let (zenoh_runtime, session) =

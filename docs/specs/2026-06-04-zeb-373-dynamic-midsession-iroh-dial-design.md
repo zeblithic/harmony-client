@@ -82,27 +82,30 @@ invocation, same inbound ingestion) before the dial driver is added.
 
 ### 4.2 Resolver notify seam — `reachability_resolver.rs`
 
-Add an optional `tokio::sync::mpsc::UnboundedSender<DialHint>` to `ReachabilityResolver`,
-set via a setter at boot. Inside `update()`, after the existing HLC merge, if the row makes
-an iroh node-id **newly active** (it was not active before this update), emit
-`DialHint { node_id: [u8; 32], owner: OwnerAddr }`. Behind `Option`, so every existing
-caller and test is unaffected (no hint channel → no-op).
+Add an optional bounded `tokio::sync::mpsc::Sender<DialHint>` to `ReachabilityResolver`,
+set via a setter at boot — installed **before the static-seed snapshot** so no peer learned
+during config-build/open is missed. Inside `update()`, after the existing HLC merge, if the
+row makes an iroh node-id **newly active** (it was not active before this update), emit
+`DialHint { node_id: [u8; 32], owner: OwnerAddr }` via `try_send` (lossy under
+back-pressure). Behind `Option`, so every existing caller and test is unaffected (no hint
+channel → no-op).
 
 `DialHint` carries the node-id (dedup key + locator source) and owner (telemetry/logging
 only).
 
 ### 4.3 Dial driver — new module `iroh_dial_driver.rs`
 
-`DynamicDialDriver`, spawned after session init, owns: the `Runtime` clone, a
-`HashSet<[u8; 32]>` dialed-set, the self node-id, and a `DialTelemetry` handle. Loop:
-receive `DialHint` → `skipped_self` if it is our node-id → `skipped_duplicate` if already
-in the dialed-set → otherwise insert, build the `iroh/<hex>` `Locator`, and spawn a bounded
-dial task.
+`DynamicDialDriver`, spawned after session init, owns: the `Runtime` clone, a **bounded**
+dialed-set (`HashSet` + FIFO `VecDeque`, capped — memory stays bounded under churn), the
+self node-id, and a `DialTelemetry` handle. Loop: receive `DialHint` → `skipped_self` if it
+is our node-id → `skipped_duplicate` if already claimed → otherwise claim, build the
+`iroh/<hex>` `Locator`, and spawn a dial task.
 
 Dial task: `connect_peer(fresh_zid, &[loc])` with bounded retry — **3 attempts, backoff
-1s → 2s → 4s**. On success → `succeeded`. On exhaustion → `failed` **and remove the node-id
-from the dialed-set**, so a later announce for the same peer re-arms a fresh dial. Never
-panics; never affects the session.
+1s → 2s** (`record_attempt` per try, so the metric counts real dial operations). On success
+→ `succeeded`. On exhaustion → `failed`; **terminal for the session** — the node-id stays
+claimed (no re-dial). Cross-refresh retry of a persistently-unreachable peer is liveness =
+ZEB-321 Phase 3. Never panics; never affects the session.
 
 ### 4.4 Telemetry — fold into `network_health.rs`
 
@@ -135,8 +138,11 @@ peer B's ReachabilityAnnounce arrives over an EXISTING link (LAN, or another iro
 - **Runtime `build`/`start`/`session::init` failure** → same `ready_tx.send(Err(..))` +
   `zenoh-status: error` emit as today's `zenoh::open` failure path. No new failure surface
   reaches the caller.
-- **`connect_peer` false/error** → retry-then-re-arm (4.3). Logged; session unaffected.
-- **Channel closed/full** → log and continue; an unbounded sender does not block `update()`.
+- **`connect_peer` false/error** → bounded retry, then terminal for the session (4.3).
+  Logged; session unaffected.
+- **Channel full/closed** → `try_send` drops and continues; the bounded sender never blocks
+  `update()` and can't grow the heap (the driver dedups, so a dropped hint isn't
+  correctness-critical).
 - **Teardown** → node-stop drops the `DialHint` sender (alongside the existing iroh-ctx
   clear) → driver task ends; `Runtime` drops with the session. Clean across restarts —
   matches the ZEB-368 ctx-swap lifecycle.
@@ -151,9 +157,9 @@ dial path.
 
 ## 8. Testing
 
-- **Unit:** dedup (skip-self, skip-duplicate); backoff state machine (3 attempts, re-arm on
-  exhaustion); resolver emits exactly one `DialHint` per newly-active node-id and **none**
-  for an HLC-stale or no-op re-update.
+- **Unit:** dedup (skip-self, skip-duplicate); backoff state machine (3 attempts, terminal
+  on exhaustion); bounded dialed-set FIFO eviction; resolver emits exactly one `DialHint` per
+  newly-active node-id and **none** for an HLC-stale or no-op re-update.
 - **Integration (two-engine, loopback iroh) — acceptance test:** engine A opens with an
   **empty** resolver (no static seed); engine B comes up; B's `ReachabilityAnnounce` is
   injected into A's community state **mid-session**; assert A dials B and a community
@@ -165,9 +171,10 @@ dial path.
 
 ## 9. Scope boundary
 
-In scope: dial-once per node-id per session; failed dials retried-then-re-armable;
-dial telemetry. **Out of scope (ZEB-321 Phase 3):** re-dial when an established transport
-drops; liveness/rebinding; reconnection-after-offline. No transport-event hook is added.
+In scope: dial-once per node-id per session; failed dials are terminal for the session after
+a bounded 3-attempt retry; dial telemetry. **Out of scope (ZEB-321 Phase 3):** re-dial when
+an established transport drops; cross-refresh retry of a failed/rejoining peer;
+liveness/rebinding; reconnection-after-offline. No transport-event hook is added.
 
 ## 10. Files
 
