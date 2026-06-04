@@ -263,6 +263,18 @@ describe('FriendService', () => {
     });
   });
 
+  it('browseReferrals invokes browse_friend_referrals with the ownerIdHex arg and returns the array', async () => {
+    await service.connectAdapter(adapter);
+    const referrals = [
+      { ownerIdHex: '11223344556677889900aabbccddeeff', display: 'Carol', alreadyFriend: false },
+      { ownerIdHex: 'ffeeddccbbaa00998877665544332211', display: null, alreadyFriend: true },
+    ];
+    (adapter.invoke as any).mockResolvedValue(referrals);
+    const r = await service.browseReferrals('aabb');
+    expect(adapter.invoke).toHaveBeenCalledWith('browse_friend_referrals', { ownerIdHex: 'aabb' });
+    expect(r).toEqual(referrals);
+  });
+
   it('getAutoAccept invokes get_friend_auto_accept and returns the boolean', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue(true);

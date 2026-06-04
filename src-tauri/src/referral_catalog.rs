@@ -355,6 +355,44 @@ pub fn build_referral_catalog(
     )
 }
 
+/// A single referral entry projected for the requester's browse view. `display`
+/// is the author's name hint for the referred peer; `already_friend` is `true`
+/// when the requester's OWN friend graph already holds that peer as an `Active`
+/// or `Pending` link (so the UI can mark it "already friends" and Phase 2b can
+/// suppress a redundant introduction). Owner-state types stay backend-only; the
+/// peer is surfaced as a hex string.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferralView {
+    /// The referred peer's 16-byte master `owner_id`, hex-encoded.
+    pub owner_id_hex: String,
+    /// The author's display-name hint for this peer, if any.
+    pub display: Option<String>,
+    /// Whether the requester already has this peer as an Active/Pending friend.
+    pub already_friend: bool,
+}
+
+/// Project a verified [`ReferralCatalog`] into the requester-facing browse view,
+/// cross-referencing each entry against the requester's OWN friend graph so the
+/// UI can flag peers we already know. Pure over the catalog + graph so it's
+/// unit-testable without a NodeState harness. Order mirrors the catalog's
+/// `entries` order (which the author produced in deterministic `BTreeMap` key
+/// order).
+pub fn project_referrals(cat: &ReferralCatalog, fg: &FriendGraph) -> Vec<ReferralView> {
+    cat.entries
+        .iter()
+        .map(|entry| ReferralView {
+            owner_id_hex: hex::encode(entry.peer_owner.0),
+            display: entry.display.clone(),
+            already_friend: fg
+                .friends
+                .get(&entry.peer_owner)
+                .map(|e| matches!(e.status, FriendStatus::Active | FriendStatus::Pending))
+                .unwrap_or(false),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +630,39 @@ mod tests {
 
         assert_eq!(cat.entries.len(), 1);
         assert!(verify_referral_catalog(&cat, f.owner, subject).is_ok());
+    }
+
+    #[test]
+    fn project_referrals_marks_already_friends() {
+        // Our local graph already has [1;16] as an Active friend.
+        let mut fg = FriendGraph::default();
+        fg.friends.insert(
+            OwnerAddr([1; 16]),
+            entry(FriendStatus::Active, false, Some("local-known")),
+        );
+
+        // The friend's catalog offers two entries: one we already know, one new.
+        let cat = ReferralCatalog {
+            author: OwnerAddr([0xaa; 16]),
+            entries: vec![
+                ReferralEntry {
+                    peer_owner: OwnerAddr([1; 16]),
+                    display: Some("known".to_string()),
+                },
+                ReferralEntry {
+                    peer_owner: OwnerAddr([2; 16]),
+                    display: Some("new".to_string()),
+                },
+            ],
+            at: hlc(7),
+            enrollment: mint_test_owner(0x42).cert,
+            sig: [9u8; 64],
+        };
+
+        let views = project_referrals(&cat, &fg);
+        assert_eq!(views.len(), 2);
+        assert!(views[0].already_friend);
+        assert!(!views[1].already_friend);
+        assert_eq!(views[0].owner_id_hex, hex::encode([1u8; 16]));
     }
 }

@@ -34546,6 +34546,273 @@ async fn connectivity_resolve_friend(
     Ok(Some(DiscoveredRecord::from(routing)))
 }
 
+/// ZEB-375 Phase 2a Task 7: browse an Active friend's referral catalog (the
+/// awareness layer). Resolves the friend via their private Case-D slot, dials
+/// the `harmony/friend-pex/v1` ALPN, sends a device-#2-signed `CatalogRequest`,
+/// VERIFIES the returned `ReferralCatalog` (author == the friend we asked,
+/// subject == us), and projects each entry into a `ReferralView` (flagging peers
+/// already in our own friend graph). A verify failure or unreachable friend
+/// rejects the whole call — no partial trust, no "request introduction" action
+/// (that is Phase 2b).
+///
+/// Reuses `connectivity_resolve_friend`'s Case-D resolve verbatim and mirrors
+/// `add_friend_by_key`'s dial+frame discipline (but on the PEX ALPN). `owner_id_hex`
+/// is the friend's 16-byte master `owner_id` in hex.
+#[tauri::command(rename_all = "snake_case")]
+async fn browse_friend_referrals(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+) -> Result<Vec<crate::referral_catalog::ReferralView>, String> {
+    // 1. Snapshot the resources we need out of NodeState under the std lock, then
+    //    drop the guard before any owner-state `.await` or network IO. Mirrors
+    //    `connectivity_resolve_friend` (resolver/crdt/keytree) + `add_friend_by_key`
+    //    (iroh endpoint, self owner/cert/device-#2 key via the DmOutbox).
+    let (resolver, crdt_state, owner_keytree, iroh_endpoint, self_owner, dm_outbox) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pkarr_resolver.clone(),
+            g.crdt_state.clone(),
+            g.owner_keytree.clone(),
+            g.iroh_endpoint.clone(),
+            g.dm_self_owner,
+            g.dm_outbox.clone(),
+        )
+    };
+    let (
+        Some(resolver),
+        Some(crdt_state),
+        Some(keytree),
+        Some(iroh_endpoint),
+        Some(self_owner),
+        Some(dm_outbox),
+    ) = (
+        resolver,
+        crdt_state,
+        owner_keytree,
+        iroh_endpoint,
+        self_owner,
+        dm_outbox,
+    )
+    else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+
+    // The SELF device-#2 signing key + SELF EnrollmentCert live on the DmOutbox
+    // (same source `add_friend_by_key` uses for the friend handshake).
+    let (self_device2_key, self_enrollment) = {
+        let o = dm_outbox.lock().await;
+        (
+            std::sync::Arc::clone(&o.community_signing_key),
+            o.enrollment_cert.clone(),
+        )
+    };
+
+    // 2. Parse the friend's owner_id hex → OwnerAddr (same inline pattern as
+    //    unfriend / set_friend_referrable).
+    let friend_owner_16: [u8; 16] = hex::decode(&owner_id_hex)
+        .map_err(|e| format!("invalid owner_id_hex hex: {e}"))?
+        .try_into()
+        .map_err(|_| "owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
+    let friend_owner = crate::owner_state_types::OwnerAddr(friend_owner_16);
+
+    // 3. Read the friend's entry under the CRDT lock: require Active + a sealed
+    //    rendezvous secret, and snapshot the friend graph for the projection
+    //    step. Drop the lock before any IO.
+    let (sealed_secret, friend_graph_snapshot) = {
+        let s = crdt_state.lock().await;
+        let Some(entry) = s.friend_graph.friends.get(&friend_owner) else {
+            return Err("not an active friend".to_string());
+        };
+        if entry.status != crate::friend_graph::FriendStatus::Active {
+            return Err("not an active friend".to_string());
+        }
+        let Some(blob) = entry.sealed_secret.clone() else {
+            return Err("friend has no rendezvous secret".to_string());
+        };
+        (blob, s.friend_graph.clone())
+    };
+
+    // 4. Decrypt the per-friendship secret + Case-D resolve the friend's current
+    //    reachability — REUSING `connectivity_resolve_friend`'s logic.
+    let secret = crate::owner_state_crypto::decrypt_friend_secret(
+        &keytree,
+        &friend_owner_16,
+        &sealed_secret,
+    )
+    .map_err(|_| "friend unreachable".to_string())?;
+
+    let Some(blob) =
+        crate::pkarr_friend_publisher::resolve_friend_case_d(&resolver, &secret, &friend_owner_16)
+            .await?
+    else {
+        return Err("friend unreachable".to_string());
+    };
+    if blob.is_empty() {
+        // Publisher emits an empty blob when iroh is down (un-dial-able).
+        return Err("friend unreachable".to_string());
+    }
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(blob.as_slice())
+            .map_err(|e| format!("decode case-d routing blob: {e}"))?;
+
+    // Synthesize an EndpointAddr from the verified routing record (same inline
+    // synthesis `add_friend_by_key` does from its Case-B routing payload).
+    let target_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode target iroh_node_id: {e}"))?;
+    let mut target_addr = iroh::EndpointAddr::new(target_iroh_id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => target_addr = target_addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        target_addr = target_addr.with_ip_addr(*da);
+    }
+
+    // 5. Dial the friend-PEX ALPN + open a bi-stream, bounded by the same dial
+    //    config `add_friend_by_key` uses.
+    let dial_config = HandshakeDialConfig::from_env();
+    let conn = match tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint.inner().connect(
+            target_addr,
+            crate::iroh_endpoint::alpn::HARMONY_FRIEND_PEX_V1,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("friend unreachable: iroh connect failed: {e}")),
+        Err(_elapsed) => {
+            return Err(format!(
+                "friend unreachable: iroh connect timeout after {}ms",
+                dial_config.connect_timeout.as_millis()
+            ));
+        }
+    };
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Err(format!("friend unreachable: open_bi failed: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Err(format!(
+                    "friend unreachable: open_bi timeout after {}ms",
+                    dial_config.open_bi_timeout.as_millis()
+                ));
+            }
+        };
+
+    // 6. Build + device-#2-sign a CatalogRequest from us (subject) to the friend
+    //    (target), encode it, and write [u32 LE len][body].
+    let req = crate::referral_catalog::sign_catalog_request(
+        &self_device2_key,
+        self_owner,
+        friend_owner,
+        self_enrollment.clone(),
+    );
+    let wire = crate::referral_catalog::encode_catalog_request(&req)
+        .map_err(|e| format!("encode catalog request: {e:?}"))?;
+    let wire_len = wire.len() as u32;
+
+    let write_prefix = async {
+        send.write_all(&wire_len.to_le_bytes())
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("friend unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("friend unreachable: request length-prefix write timeout".to_string());
+        }
+    }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write request body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("friend unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("friend unreachable: request body write timeout".to_string());
+        }
+    }
+    if let Err(e) = send.finish() {
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Err(format!("friend unreachable: send.finish failed: {e}"));
+    }
+
+    // 7. Read [u32 LE length-prefix][ReferralCatalog].
+    let read_response = async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("read length-prefix: {e}"))?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > crate::referral_catalog::PEX_MAX_PACKET_LEN {
+            return Err(format!(
+                "response length out of bounds: len={len} max={}",
+                crate::referral_catalog::PEX_MAX_PACKET_LEN
+            ));
+        }
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read response body: {e}"))?;
+        Ok::<Vec<u8>, String>(body)
+    };
+    let response_bytes =
+        match tokio::time::timeout(dial_config.response_read_timeout, read_response).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"response-read-failed");
+                return Err(format!("friend unreachable: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"response-read-timeout");
+                return Err("friend unreachable: catalog response timeout".to_string());
+            }
+        };
+
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"friend-pex-complete");
+    drop(conn);
+
+    let cat = crate::referral_catalog::decode_referral_catalog(&response_bytes)
+        .map_err(|e| format!("decode referral catalog: {e:?}"))?;
+
+    // 8. VERIFY the catalog: author MUST be the friend we asked, subject MUST be
+    //    us. A verify failure rejects the whole call — no partial trust.
+    crate::referral_catalog::verify_referral_catalog(&cat, friend_owner, self_owner)
+        .map_err(|e| format!("catalog verify failed: {e:?}"))?;
+
+    // 9. Project the verified entries against our own friend graph.
+    Ok(crate::referral_catalog::project_referrals(
+        &cat,
+        &friend_graph_snapshot,
+    ))
+}
+
 // ── ZEB-371 Task 13: Path A user-facing friend IPCs ──────────────────
 //
 // Five commands surfacing the Path-A (mutual-key, no-token) friend flow + the
@@ -36329,6 +36596,8 @@ pub fn run() {
             set_friend_referrable,
             // ZEB-371: resolve a friend's reachability via their Case-D slot.
             connectivity_resolve_friend,
+            // ZEB-375 Phase 2a Task 7: browse a friend's referral catalog.
+            browse_friend_referrals,
             // ZEB-371 Task 13: Path A user-facing friend IPCs.
             add_friend_by_key,
             list_pending_friend_requests,
