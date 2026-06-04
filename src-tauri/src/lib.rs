@@ -44,6 +44,7 @@ pub mod folder_ingest;
 pub mod folders;
 mod follows;
 pub mod friend_graph;
+pub mod friend_rendezvous;
 pub mod friend_token;
 pub mod identity;
 pub mod identity_commands;
