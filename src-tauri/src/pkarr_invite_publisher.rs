@@ -123,6 +123,39 @@ impl PkarrInvitePublisher {
         }
     }
 
+    /// ZEB-370 consent gate (ATOMIC one-shot consume). Under the SAME
+    /// `live_friend_tokens` lock, atomically: if `token_sig` is present AND
+    /// (`expires_at` is `None` OR `expires_at > now_ms`), REMOVE it from the map
+    /// and return `true`; otherwise leave the map unchanged and return `false`.
+    ///
+    /// This closes a TOCTOU race in the inbound consent gate: a read-only
+    /// `is_friend_token_active` check followed by a later removal lets two
+    /// concurrent handshakes redeeming the same `token_sig` BOTH pass. Because the
+    /// check-and-remove here happen under one lock with no `.await` in between,
+    /// exactly one concurrent caller can observe the token live and consume it; all
+    /// others see it already gone and get `false`. The read-only
+    /// [`Self::is_friend_token_active`] is retained for tests / call-site symmetry.
+    ///
+    /// `async` for call-site symmetry with the other publisher methods; the map is
+    /// a `std::sync::Mutex` and the lock is never held across an `.await`.
+    pub async fn try_consume_friend_token(&self, token_sig: &[u8; 64], now_ms: u64) -> bool {
+        let mut map = self
+            .live_friend_tokens
+            .lock()
+            .expect("live_friend_tokens mutex poisoned");
+        let live = match map.get(token_sig) {
+            Some(None) => true,                             // registered, no expiry
+            Some(Some(expires_at)) => *expires_at > now_ms, // registered, unexpired
+            None => false,                                  // never registered / consumed
+        };
+        if live {
+            // Atomic one-shot: remove under the same lock so a racing caller that
+            // also saw it live cannot also consume it.
+            map.remove(token_sig);
+        }
+        live
+    }
+
     /// Shared Case-A registration core for `register_invite` /
     /// `register_friend_token`. Publishes this node's routing blob (from the
     /// struct's `routing_blob_builder` field) under `handle`, keyed by an
@@ -298,6 +331,111 @@ mod tests {
         assert!(
             !inv_pub.is_friend_token_active(&unexpiring, now_ms).await,
             "an unregistered (consumed) token must not be active"
+        );
+    }
+
+    /// FIX (ZEB-370 cursor review — TOCTOU): `try_consume_friend_token` is the
+    /// ATOMIC one-shot consume the inbound consent gate uses. The first call for a
+    /// live, unexpired token returns `true` AND removes it from the live map; every
+    /// subsequent call (and unknown / expired tokens) returns `false`.
+    #[tokio::test]
+    async fn try_consume_friend_token_is_one_shot() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let id_pub = build_identity_pub(&sk);
+        let inv_pub = PkarrInvitePublisher::new(
+            publisher.clone(),
+            sk,
+            id_pub,
+            Arc::new(|| b"friend-routing".to_vec()),
+        );
+
+        let unknown = [0x01u8; 64];
+        let unexpiring = [0x02u8; 64];
+        let expiring = [0x03u8; 64];
+        let now_ms = 1_000_000u64;
+
+        // Unknown token → false (never registered).
+        assert!(
+            !inv_pub.try_consume_friend_token(&unknown, now_ms).await,
+            "a token this node never registered must not be consumable"
+        );
+
+        // Registered + unexpired → first consume true, second false (one-shot).
+        inv_pub.register_friend_token(&unexpiring, None).await;
+        assert!(
+            inv_pub.try_consume_friend_token(&unexpiring, now_ms).await,
+            "the first consume of a live token must succeed"
+        );
+        assert!(
+            !inv_pub.try_consume_friend_token(&unexpiring, now_ms).await,
+            "the second consume of the same token must fail (already consumed)"
+        );
+        // Consuming removed it from the live map: the read-only check agrees.
+        assert!(
+            !inv_pub.is_friend_token_active(&unexpiring, now_ms).await,
+            "a consumed token must no longer be active"
+        );
+
+        // Expired token → false, and it stays registered? It is removed only on a
+        // successful consume; an expired token is NOT consumed (returns false).
+        inv_pub.register_friend_token(&expiring, Some(now_ms)).await;
+        assert!(
+            !inv_pub.try_consume_friend_token(&expiring, now_ms).await,
+            "a token at/after its expiry must not be consumable"
+        );
+    }
+
+    /// FIX (ZEB-370 cursor review — TOCTOU concurrency): two concurrent handshakes
+    /// redeeming the SAME live token must not both pass the gate. Spawn two tasks
+    /// that both call `try_consume_friend_token` on the same registered token and
+    /// assert EXACTLY ONE wins — the one-shot guarantee under concurrency.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn try_consume_friend_token_exactly_one_winner_under_concurrency() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let id_pub = build_identity_pub(&sk);
+        let inv_pub = Arc::new(PkarrInvitePublisher::new(
+            publisher.clone(),
+            sk,
+            id_pub,
+            Arc::new(|| b"friend-routing".to_vec()),
+        ));
+
+        let token_sig = [0x55u8; 64];
+        let now_ms = 1_000_000u64;
+        inv_pub.register_friend_token(&token_sig, None).await;
+
+        let a = {
+            let inv_pub = Arc::clone(&inv_pub);
+            tokio::spawn(async move { inv_pub.try_consume_friend_token(&token_sig, now_ms).await })
+        };
+        let b = {
+            let inv_pub = Arc::clone(&inv_pub);
+            tokio::spawn(async move { inv_pub.try_consume_friend_token(&token_sig, now_ms).await })
+        };
+        let (ra, rb) = tokio::join!(a, b);
+        let won_a = ra.expect("task a joined");
+        let won_b = rb.expect("task b joined");
+
+        assert!(
+            won_a ^ won_b,
+            "exactly one of the two concurrent consumers must win (got a={won_a}, b={won_b})"
+        );
+        // And the token is fully consumed afterward.
+        assert!(
+            !inv_pub.try_consume_friend_token(&token_sig, now_ms).await,
+            "after the concurrent race the token must be consumed (no third winner)"
         );
     }
 

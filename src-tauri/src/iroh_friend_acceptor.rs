@@ -551,17 +551,26 @@ where
         entry.clone()
     }
 
-    /// ZEB-370 consent gate. Returns `Ok(())` iff `token_sig` corresponds to a
-    /// friend token THIS node minted + published and currently has live
-    /// (unexpired) — i.e. `self.pkarr_invite_publisher` is `Some(p)` AND
-    /// `p.is_friend_token_active(token_sig, now_ms)`. Otherwise returns
-    /// `Err(TokenNotLive { .. })` so the caller FAILS CLOSED: no friend is added
-    /// and no accept is sent.
+    /// ZEB-370 consent gate (ATOMIC check-and-consume). Returns `Ok(())` iff
+    /// `token_sig` corresponds to a friend token THIS node minted + published and
+    /// currently live (unexpired) — i.e. `self.pkarr_invite_publisher` is
+    /// `Some(p)` AND `p.try_consume_friend_token(token_sig, now_ms)` wins the
+    /// one-shot. Otherwise returns `Err(TokenNotLive { .. })` so the caller FAILS
+    /// CLOSED: no friend is added and no accept is sent.
     ///
-    /// Without this check, any peer reaching `harmony/friend/v1` with a
-    /// self-signed request and an arbitrary `token_sig` would be auto-friended,
-    /// bypassing the `harmony://friend/` token gate entirely. Split out as an
-    /// `async fn` (not requiring a `Connection`) so it is directly unit-testable.
+    /// On `Ok(())` the token is ALREADY CONSUMED from the publisher's live map
+    /// (atomically with the liveness check, so two concurrent handshakes redeeming
+    /// the same `token_sig` cannot both pass — closes the TOCTOU race). Having won
+    /// the consume, the gate also stops the Case-A `friend:{hex}` DHT republish via
+    /// `unregister_friend_token` (whose map-remove is now an idempotent no-op and
+    /// whose real job here is to halt the republish loop). The connection is
+    /// already established by this point, so stopping the publish now is safe even
+    /// if the later `process_friend_request` were to fail.
+    ///
+    /// Without this gate, any peer reaching `harmony/friend/v1` with a self-signed
+    /// request and an arbitrary `token_sig` would be auto-friended, bypassing the
+    /// `harmony://friend/` token gate entirely. Split out as an `async fn` (not
+    /// requiring a `Connection`) so it is directly unit-testable.
     async fn token_gate_open(&self, token_sig: &[u8; 64]) -> Result<(), FriendAcceptError> {
         let Some(publisher) = self.pkarr_invite_publisher.as_ref() else {
             // No publisher wired in → we cannot prove this node minted the token.
@@ -571,7 +580,13 @@ where
             });
         };
         let now_ms = wall_now_ms();
-        if publisher.is_friend_token_active(token_sig, now_ms).await {
+        if publisher.try_consume_friend_token(token_sig, now_ms).await {
+            // Won the one-shot: the token is now removed from the live map. Stop
+            // the Case-A DHT republish too (the map-remove inside is a no-op now;
+            // the republish-stop is the point). Doing this at the gate — rather
+            // than after process_friend_request — guarantees consume + DHT-stop
+            // happen exactly once, atomically w.r.t. concurrent redeems.
+            publisher.unregister_friend_token(token_sig).await;
             Ok(())
         } else {
             Err(FriendAcceptError::TokenNotLive {
@@ -638,8 +653,10 @@ where
             .map_err(FriendAcceptError::Handshake)?
         };
 
-        // Success side-effect: signal the UI a friend was added. The token is
-        // NOT unregistered yet — see below.
+        // Success side-effect: signal the UI a friend was added. The Case-A
+        // one-shot token was already consumed + its DHT republish stopped at the
+        // gate (`token_gate_open` → `try_consume_friend_token` +
+        // `unregister_friend_token`), so there is nothing to unregister here.
         match self.app.as_ref() {
             Some(app) => app.emit_friend_list_changed(),
             None => tracing::debug!(
@@ -674,16 +691,13 @@ where
         send.finish()
             .map_err(|e| FriendAcceptError::Finish(e.to_string()))?;
 
-        // Free the consumed Case-A one-shot ONLY after the accept has been fully
-        // handed off (write_all + finish succeeded). If the write/finish above
-        // fails, leaving the token live is benign — a re-redeem just re-applies
-        // the same `FriendEntry` (idempotent `Merged` via LWW, keyed on the same
-        // authenticated `owner_id`) — whereas unregistering early would leave the
-        // friend committed and the token consumed while the redeemer never got the
-        // accept, an asymmetric, non-recoverable state.
-        if let Some(pub_) = self.pkarr_invite_publisher.as_ref() {
-            pub_.unregister_friend_token(&req.token_sig).await;
-        }
+        // The Case-A one-shot was consumed + its DHT republish stopped atomically
+        // at the gate (see `token_gate_open`), so there is no token cleanup to do
+        // here. Consuming at the gate (rather than after a successful accept-write)
+        // is what closes the concurrent-redeem TOCTOU: two handshakes racing the
+        // same `token_sig` cannot both pass. The connection is already established
+        // by the time we consume, so stopping the publish early is safe even if a
+        // later step fails — a re-redeem would find the token already consumed.
 
         // The inbound handshake wrote a new Active/Token FriendEntry into
         // owner-state (`process_friend_request` above). Arm the OWNER-state
@@ -1289,6 +1303,38 @@ mod tests {
             .token_gate_open(&token_sig)
             .await
             .expect("a live, registered, non-expiring token must pass the gate");
+    }
+
+    #[tokio::test]
+    async fn token_gate_consumes_on_pass_so_replay_is_rejected() {
+        // FIX (ZEB-370 cursor review — TOCTOU): the gate now CONSUMES the token on
+        // a successful pass (atomic check-and-consume). A second `token_gate_open`
+        // for the same token_sig must therefore fail closed — enforcing the
+        // one-shot at the gate, before two concurrent handshakes could both be
+        // admitted.
+        let publisher = test_publisher().await;
+        let token_sig = [0x55; 64];
+        publisher.register_friend_token(&token_sig, None).await;
+        let acceptor = acceptor_with_publisher(Some(Arc::clone(&publisher)));
+
+        // First pass consumes.
+        acceptor
+            .token_gate_open(&token_sig)
+            .await
+            .expect("the first gate pass for a live token must succeed (and consume)");
+
+        // The token is now gone from the live map.
+        assert!(
+            !publisher.is_friend_token_active(&token_sig, 1_000).await,
+            "passing the gate must consume the token from the live map"
+        );
+
+        // Second pass for the same token is rejected (one-shot enforced at gate).
+        let err = acceptor
+            .token_gate_open(&token_sig)
+            .await
+            .expect_err("a second gate pass for a consumed token must fail closed");
+        assert!(matches!(err, FriendAcceptError::TokenNotLive { .. }));
     }
 
     #[tokio::test]
