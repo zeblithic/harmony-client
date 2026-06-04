@@ -71,6 +71,7 @@ pub mod owner_state_types;
 pub mod pairing;
 pub mod pairing_commands;
 pub mod pkarr_community_publisher;
+pub mod pkarr_friend_publisher;
 pub mod pkarr_identity_publisher;
 pub mod pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
