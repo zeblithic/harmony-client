@@ -484,7 +484,9 @@ impl LinkManagerUnicastTrait for IrohZenohLinkManager {
 
     async fn del_listener(&self, _endpoint: &EndPoint) -> ZResult<()> {
         // No-op — listener lifetime is bound to the underlying
-        // `IrohEndpoint`. Endpoint `.shutdown()` closes it.
+        // `IrohEndpoint`. ZEB-368: iroh-link teardown is handled by
+        // `endpoint.shutdown()` in stop_node, so this no-op is intentional
+        // (there is no per-listener resource to release here).
         Ok(())
     }
 
