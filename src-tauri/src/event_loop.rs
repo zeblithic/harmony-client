@@ -630,10 +630,16 @@ pub async fn run<R: Runtime>(
     // returns the locator (harmony's spawn_accept_loop already owns the accept loop).
     if let Some(ref ih) = iroh_handles {
         // MERGE iroh into the listen set: insert_json5 overwrites (no merge), so we
-        // must re-include Zenoh's default peer TCP listener (`tcp/[::]:0`) or the LAN
-        // transport is silently dropped (CodeRabbit PR#188). Helper keeps both.
-        let eps = crate::iroh_zenoh_registration::iroh_listen_endpoints_json(
-            ih.endpoint.node_id().as_bytes(),
+        // read listen/endpoints back and APPEND our locator, preserving every existing
+        // listener (default peer `tcp/[::]:0`, the router listener, any other path's).
+        // Overwriting iroh-only would silently drop the LAN zenoh transport (CodeRabbit
+        // + Qodo, PR#188).
+        let self_loc =
+            crate::iroh_zenoh_registration::iroh_listen_locator(ih.endpoint.node_id().as_bytes());
+        let current = config.get_json("listen/endpoints").ok();
+        let eps = crate::iroh_zenoh_registration::merge_iroh_listen_endpoints(
+            current.as_deref(),
+            &self_loc,
         );
         if let Err(e) = config.insert_json5("listen/endpoints", &eps) {
             let e = format!("zenoh config error (listen/endpoints): {e}");

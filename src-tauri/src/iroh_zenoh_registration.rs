@@ -98,38 +98,117 @@ pub fn iroh_connect_locators(
     out
 }
 
-/// Build the `listen/endpoints` JSON array that ADDS our own `iroh/<hex>` listener
-/// locator (which forces the factory to run at `zenoh::open`, starting the inbound
-/// forwarder even on inbound-only nodes) while PRESERVING Zenoh's default peer TCP
-/// listener `tcp/[::]:0`.
+/// Build the `iroh/<hex>` listener locator for this node — adding it to
+/// `listen/endpoints` forces Zenoh to invoke the factory at `zenoh::open`, which
+/// starts the inbound forwarder even on inbound-only / no-known-peer nodes.
+pub fn iroh_listen_locator(self_node_id: &[u8; 32]) -> String {
+    format!("iroh/{}", hex::encode(self_node_id))
+}
+
+/// MERGE `self_loc` into Zenoh's existing `listen/endpoints`, preserving every
+/// listener already configured (e.g. the default peer `tcp/[::]:0`) — never
+/// overwriting them. `Config::insert_json5` replaces the path with no merge, so we
+/// read the current value back (`Config::get_json("listen/endpoints")`), append our
+/// locator, and write the union.
 ///
-/// `Config::insert_json5` OVERWRITES the path — it does not merge — so emitting an
-/// iroh-only array here would silently drop the default TCP listener and kill the
-/// existing LAN zenoh transport. Keep both. (CodeRabbit, PR #188.)
-pub fn iroh_listen_endpoints_json(self_node_id: &[u8; 32]) -> String {
-    format!("[\"tcp/[::]:0\", \"iroh/{}\"]", hex::encode(self_node_id))
+/// `current_json` is that read-back value (`None` if unreadable). `listen/endpoints`
+/// may be the flat array form (`["tcp/[::]:0"]`) or the per-mode object form
+/// (`{"router": [...], "peer": [...]}`); we append to the `peer` list (we always run
+/// in peer mode) for the object form, or to the flat list for the array form, and
+/// dedupe. Falls back to `["tcp/[::]:0", self_loc]` if the value can't be parsed, so
+/// the default LAN listener is preserved even on the error path. (CodeRabbit + Qodo,
+/// PR #188.)
+pub fn merge_iroh_listen_endpoints(current_json: Option<&str>, self_loc: &str) -> String {
+    use serde_json::Value;
+    let fallback = || format!("[\"tcp/[::]:0\", \"{self_loc}\"]");
+    let append_if_missing = |arr: &mut Vec<Value>| {
+        if !arr.iter().any(|e| e.as_str() == Some(self_loc)) {
+            arr.push(Value::String(self_loc.to_string()));
+        }
+    };
+    let Some(cur) = current_json else {
+        return fallback();
+    };
+    let Ok(mut v) = serde_json::from_str::<Value>(cur) else {
+        return fallback();
+    };
+    match &mut v {
+        // Flat array form: append to the single shared listener list.
+        Value::Array(arr) => append_if_missing(arr),
+        // Per-mode object form: append to `peer` (our mode); create it if absent.
+        Value::Object(map) => match map.entry("peer").or_insert_with(|| Value::Array(vec![])) {
+            Value::Array(arr) => append_if_missing(arr),
+            _ => return fallback(),
+        },
+        _ => return fallback(),
+    }
+    serde_json::to_string(&v).unwrap_or_else(|_| fallback())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn self_loc() -> String {
+        iroh_listen_locator(&[0xABu8; 32])
+    }
+
     #[test]
-    fn listen_endpoints_preserve_default_tcp_listener() {
-        let nid = [0xABu8; 32];
-        let json = iroh_listen_endpoints_json(&nid);
-        // Must keep Zenoh's default peer TCP listener so the LAN transport survives…
+    fn merge_into_default_object_preserves_all_and_appends_peer() {
+        let loc = self_loc();
+        // Zenoh's Config::default() shape for listen/endpoints.
+        let cur = r#"{"router":["tcp/[::]:7447"],"peer":["tcp/[::]:0"]}"#;
+        let merged = merge_iroh_listen_endpoints(Some(cur), &loc);
+        let v: serde_json::Value = serde_json::from_str(&merged).expect("valid JSON");
+        let peer = v["peer"].as_array().expect("peer array");
+        // Default peer TCP listener survives (LAN transport intact)…
         assert!(
-            json.contains("tcp/[::]:0"),
-            "listen endpoints must preserve the default TCP peer listener: {json}"
+            peer.iter().any(|e| e == "tcp/[::]:0"),
+            "peer keeps tcp: {merged}"
         );
-        // …and add our own iroh listener locator to trigger the factory at open.
-        assert!(
-            json.contains(&format!("iroh/{}", hex::encode(nid))),
-            "listen endpoints must include the self iroh locator: {json}"
+        // …router listener untouched…
+        assert_eq!(
+            v["router"][0], "tcp/[::]:7447",
+            "router preserved: {merged}"
         );
-        // Valid JSON array of exactly those two endpoints.
-        let parsed: Vec<String> = serde_json::from_str(&json).expect("valid JSON array");
-        assert_eq!(parsed.len(), 2, "exactly tcp + iroh: {json}");
+        // …and the iroh locator is appended to peer.
+        assert!(peer.iter().any(|e| e == &loc), "peer gains iroh: {merged}");
+    }
+
+    #[test]
+    fn merge_into_flat_array_appends_and_preserves() {
+        let loc = self_loc();
+        let merged = merge_iroh_listen_endpoints(Some(r#"["tcp/[::]:0"]"#), &loc);
+        let arr: Vec<String> = serde_json::from_str(&merged).expect("valid JSON array");
+        assert!(arr.iter().any(|e| e == "tcp/[::]:0"), "keeps tcp: {merged}");
+        assert!(arr.iter().any(|e| e == &loc), "adds iroh: {merged}");
+    }
+
+    #[test]
+    fn merge_is_idempotent_no_duplicate_iroh() {
+        let loc = self_loc();
+        let cur = format!(r#"{{"peer":["tcp/[::]:0","{loc}"]}}"#);
+        let merged = merge_iroh_listen_endpoints(Some(&cur), &loc);
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let count = v["peer"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| *e == &loc)
+            .count();
+        assert_eq!(count, 1, "no duplicate iroh locator: {merged}");
+    }
+
+    #[test]
+    fn merge_unreadable_or_garbage_falls_back_to_tcp_plus_iroh() {
+        let loc = self_loc();
+        for cur in [None, Some("not json"), Some("42")] {
+            let merged = merge_iroh_listen_endpoints(cur, &loc);
+            assert!(
+                merged.contains("tcp/[::]:0"),
+                "fallback keeps tcp: {merged}"
+            );
+            assert!(merged.contains(&loc), "fallback adds iroh: {merged}");
+        }
     }
 }
