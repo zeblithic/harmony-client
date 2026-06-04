@@ -2506,10 +2506,13 @@ pub(crate) async fn start_node_inner(
         let pending_friend_requests_for_state =
             std::sync::Arc::new(crate::friend_requests::PendingFriendRequests::new());
         // ZEB-371 Task 12 (spec §7.1): "auto-accept known requesters" toggle.
-        // Set from persisted `PkarrSettings` in the pkarr setup block. Declared
-        // without an initializer (the acceptor's read is always dominated by the
-        // pkarr-block assignment); a `let else` at the read site applies the spec
-        // default (ON) on the — currently unreachable — no-pkarr path.
+        // Assigned from persisted `PkarrSettings` in the pkarr setup block
+        // (default ON when the setting is absent). The variable is declared
+        // here without an initializer because the pkarr block always runs
+        // before the acceptor constructor below; the compiler enforces this via
+        // definite-assignment analysis. The loaded (or defaulted) value is
+        // forwarded to `.with_auto_accept_known(friend_auto_accept_known_for_state)`
+        // at the acceptor constructor call site.
         let friend_auto_accept_known_for_state: bool;
 
         // ── ZEB-321 Phase 1 Task 8: iroh transport boot ──────────────────

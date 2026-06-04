@@ -200,6 +200,14 @@ describe('FriendService', () => {
     expect(result).toEqual<AddFriendOutcome>({ kind: 'unreachable' });
   });
 
+  it('addByKey throws a descriptive error on an unknown backend outcome', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({ unknown_variant: 'oops' });
+    await expect(
+      service.addByKey('aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233'),
+    ).rejects.toThrow('unexpected add_friend_by_key outcome:');
+  });
+
   it('setAutoAccept invokes set_friend_auto_accept with enabled', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue(undefined);

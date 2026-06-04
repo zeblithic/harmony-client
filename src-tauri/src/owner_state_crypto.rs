@@ -12,7 +12,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
 use std::collections::HashMap;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub use crate::owner_state_types::Hlc;
 
@@ -374,7 +374,7 @@ pub fn decrypt_friend_secret(
         .expect("ChaCha20-Poly1305 accepts a 32-byte key");
     let mut aad = AAD_FRIEND_SECRET.to_vec();
     aad.extend_from_slice(friend_owner_id);
-    let plaintext = cipher
+    let mut plaintext = cipher
         .decrypt(
             Nonce::from_slice(nonce_bytes),
             chacha20poly1305::aead::Payload {
@@ -385,6 +385,7 @@ pub fn decrypt_friend_secret(
         .map_err(|_| CryptoError::AeadDecrypt)?;
     let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&plaintext);
+    plaintext.zeroize();
     Ok(out)
 }
 

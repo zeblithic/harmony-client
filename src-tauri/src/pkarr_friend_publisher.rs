@@ -89,9 +89,20 @@ pub async fn sync_case_d_handles(
     for (owner, entry) in friends.iter() {
         let should_publish = entry.status == FriendStatus::Active;
         let secret = if should_publish {
-            entry.sealed_secret.as_deref().and_then(|sealed| {
-                crate::owner_state_crypto::decrypt_friend_secret(kt, &owner.0, sealed).ok()
-            })
+            if let Some(sealed) = entry.sealed_secret.as_deref() {
+                match crate::owner_state_crypto::decrypt_friend_secret(kt, &owner.0, sealed) {
+                    Ok(s) => Some(s),
+                    Err(_) => {
+                        tracing::warn!(
+                            friend = %hex::encode(owner.0),
+                            "ZEB-371: friend rendezvous secret failed to decrypt; skipping Case-D publish"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
         } else {
             None
         };

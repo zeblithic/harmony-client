@@ -50,7 +50,7 @@ Friends remain keyed on the master **`owner_id`** and authenticated by **device-
 
 Both `FriendLinkRequest` and `FriendLinkAccepted` carry a fresh, single-use **ephemeral X25519 public key**. Each side generates an ephemeral keypair per handshake, sends the public half, and computes:
 
-```
+```text
 shared = X25519(my_eph_sk, their_eph_pk)            // 32 bytes, identical both sides
 friendship_secret = HKDF-SHA256(
     salt = b"harmony.friend.v1.rendezvous",
@@ -157,7 +157,7 @@ struct FriendLinkAccepted {
 
 ### 6.1 Keying — one writer per slot
 
-```
+```text
 publish (I make myself findable to friend F):
     key = derive_ephemeral_key(Friend, ikm=friendship_secret, info = epoch_be ‖ self_owner_id)
 resolve (I look up friend F):

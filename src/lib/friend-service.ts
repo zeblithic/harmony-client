@@ -211,7 +211,10 @@ export class FriendService {
     if (raw === 'pending') return { kind: 'pending' };
     if (raw === 'unreachable') return { kind: 'unreachable' };
     // Externally-tagged object variant: { linked: { ownerIdHex, display } }
-    return { kind: 'linked', ownerIdHex: raw.linked.ownerIdHex, display: raw.linked.display };
+    if (raw && typeof raw === 'object' && 'linked' in raw && raw.linked && typeof raw.linked === 'object') {
+      return { kind: 'linked', ownerIdHex: raw.linked.ownerIdHex, display: raw.linked.display ?? null };
+    }
+    throw new Error(`unexpected add_friend_by_key outcome: ${JSON.stringify(raw)}`);
   }
 
   /** Enable or disable auto-accepting friend requests from known peers. */

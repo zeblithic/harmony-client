@@ -31,16 +31,22 @@ pub struct PendingInbound {
     pub received_at_ms: u64,
 }
 
+#[derive(Default)]
+struct Inner {
+    inbound: HashMap<OwnerAddr, PendingInbound>,
+    approved: HashSet<OwnerAddr>,
+}
+
 /// Process-local store of pending inbound friend requests and the set of
 /// requesters the user has approved (but whose link hasn't completed yet).
 ///
-/// Two independent `Mutex`-guarded maps so a `record_inbound` (acceptor thread)
-/// never blocks a `mark_approved` (IPC thread) and vice-versa. Locks are held
-/// only for the duration of a single map op — never across an `.await`.
+/// A single `Mutex<Inner>` makes `approve` (remove inbound + insert approved)
+/// atomic with respect to concurrent `record_inbound` calls, preventing a
+/// re-dial from resurrecting a just-approved request. The lock is held only
+/// for the duration of a single map op — never across an `.await`.
 #[derive(Default)]
 pub struct PendingFriendRequests {
-    inbound: Mutex<HashMap<OwnerAddr, PendingInbound>>,
-    approved: Mutex<HashSet<OwnerAddr>>,
+    inner: Mutex<Inner>,
 }
 
 impl PendingFriendRequests {
@@ -52,9 +58,14 @@ impl PendingFriendRequests {
     /// Record an inbound request from `addr`. IDEMPOTENT: a request already
     /// recorded (and not yet declined/accepted) keeps its original
     /// `received_at_ms` and display — a re-dial does not reset the entry.
+    /// If `addr` has already been approved, the call is a no-op (prevents
+    /// a concurrent re-dial from resurrecting the inbox entry).
     pub fn record_inbound(&self, addr: OwnerAddr, display: Option<String>, now_ms: u64) {
-        let mut inbound = self.inbound.lock().expect("pending inbound mutex poisoned");
-        inbound.entry(addr).or_insert(PendingInbound {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        if inner.approved.contains(&addr) {
+            return;
+        }
+        inner.inbound.entry(addr).or_insert(PendingInbound {
             display,
             received_at_ms: now_ms,
         });
@@ -62,16 +73,21 @@ impl PendingFriendRequests {
 
     /// Snapshot the currently-pending inbound requests (for the list IPC).
     pub fn list(&self) -> Vec<(OwnerAddr, PendingInbound)> {
-        let inbound = self.inbound.lock().expect("pending inbound mutex poisoned");
-        inbound.iter().map(|(addr, p)| (*addr, p.clone())).collect()
+        let inner = self.inner.lock().expect("pending inner mutex poisoned");
+        inner
+            .inbound
+            .iter()
+            .map(|(addr, p)| (*addr, p.clone()))
+            .collect()
     }
 
     /// True if the user has approved `addr` (so the requester's next dial can be
     /// accepted inline via the consent decision's `prior_accept`).
     pub fn is_approved(&self, addr: &OwnerAddr) -> bool {
-        self.approved
+        self.inner
             .lock()
-            .expect("pending approved mutex poisoned")
+            .expect("pending inner mutex poisoned")
+            .approved
             .contains(addr)
     }
 
@@ -82,47 +98,39 @@ impl PendingFriendRequests {
     /// Prefer [`approve`](Self::approve) for the accept-IPC path — it also
     /// removes the entry from the pending inbox atomically.
     pub fn mark_approved(&self, addr: OwnerAddr) {
-        self.approved
+        self.inner
             .lock()
-            .expect("pending approved mutex poisoned")
+            .expect("pending inner mutex poisoned")
+            .approved
             .insert(addr);
     }
 
     /// The user accepted `addr`: drop it from the pending inbox AND record the
-    /// approval (so the requester's next dial completes via `prior_accept`). The
-    /// inbox no longer shows it; the friend appears in the friends list once the
-    /// link completes.
+    /// approval atomically (so the requester's next dial completes via
+    /// `prior_accept`). The inbox no longer shows it; the friend appears in the
+    /// friends list once the link completes.
     pub fn approve(&self, addr: OwnerAddr) {
-        self.inbound
-            .lock()
-            .expect("pending inbound mutex poisoned")
-            .remove(&addr);
-        self.approved
-            .lock()
-            .expect("pending approved mutex poisoned")
-            .insert(addr);
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        inner.inbound.remove(&addr);
+        inner.approved.insert(addr);
     }
 
     /// Remove + return whether `addr` was approved. Called once the inbound
     /// handshake actually completes the inline accept, so a single Accept tap
     /// authorises exactly one completed link (re-arming requires a fresh tap).
     pub fn take_approved(&self, addr: &OwnerAddr) -> bool {
-        self.approved
+        self.inner
             .lock()
-            .expect("pending approved mutex poisoned")
+            .expect("pending inner mutex poisoned")
+            .approved
             .remove(addr)
     }
 
     /// Decline `addr`: drop any recorded inbound request AND any approval.
     pub fn decline(&self, addr: &OwnerAddr) {
-        self.inbound
-            .lock()
-            .expect("pending inbound mutex poisoned")
-            .remove(addr);
-        self.approved
-            .lock()
-            .expect("pending approved mutex poisoned")
-            .remove(addr);
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        inner.inbound.remove(addr);
+        inner.approved.remove(addr);
     }
 }
 
@@ -210,5 +218,18 @@ mod tests {
     fn take_approved_on_unknown_is_false() {
         let store = PendingFriendRequests::new();
         assert!(!store.take_approved(&addr(5)));
+    }
+
+    #[test]
+    fn record_inbound_skips_already_approved() {
+        // A re-dial from an already-approved peer must NOT resurrect the inbox
+        // entry — approve+record_inbound must be atomic via the single mutex.
+        let store = PendingFriendRequests::new();
+        store.approve(addr(6));
+        store.record_inbound(addr(6), Some("charlie".into()), 5_000);
+        assert!(
+            store.list().is_empty(),
+            "record_inbound must not add to inbox when addr is already approved"
+        );
     }
 }

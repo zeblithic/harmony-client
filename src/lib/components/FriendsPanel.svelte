@@ -58,6 +58,7 @@
   // Auto-accept toggle.
   let autoAccept = $state(false);
   let autoAcceptLoading = $state(true);
+  let autoAcceptSaving = $state(false);
   let autoAcceptError = $state<string | null>(null);
 
   // Unsubscribe handles for our event listeners (set in onMount).
@@ -231,13 +232,17 @@
   }
 
   async function handleAutoAcceptToggle(): Promise<void> {
+    if (autoAcceptSaving) return;
     const next = !autoAccept;
+    autoAcceptSaving = true;
     try {
       await service.setAutoAccept(next);
       autoAccept = next;
       autoAcceptError = null;
     } catch (e) {
       autoAcceptError = e instanceof Error ? e.message : String(e);
+    } finally {
+      autoAcceptSaving = false;
     }
   }
 
@@ -420,7 +425,7 @@
         type="checkbox"
         class="toggle-checkbox"
         checked={autoAccept}
-        disabled={autoAcceptLoading}
+        disabled={autoAcceptLoading || autoAcceptSaving}
         onchange={handleAutoAcceptToggle}
         data-testid="auto-accept-checkbox"
       />
