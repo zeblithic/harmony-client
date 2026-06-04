@@ -274,7 +274,9 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
         let token_sig = token_payload.token.sig;
         let token_url = encode_friend_token_url(&token_payload).expect("encode friend token url");
 
-        friend_pub.register_friend_token(&token_sig).await;
+        // None expiry → the consent gate (`is_friend_token_active`) treats this
+        // token as live until consumed; the acceptor's gate then passes.
+        friend_pub.register_friend_token(&token_sig, None).await;
         await_pkarr_record_visible(&pkarr_resolver, &token_sig).await;
 
         // ── 7. Bob redeems. ─────────────────────────────────────────────

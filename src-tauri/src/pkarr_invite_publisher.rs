@@ -8,7 +8,8 @@ use harmony_pkarr::{
     current_epoch_id, derive_ephemeral_key, EphemeralKeyBuilder, PkarrCase, PkarrPublisher,
     PkarrRoutingRecord, RecordBuilder,
 };
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::community_invite::CommunityInvitePayload;
 
@@ -17,6 +18,15 @@ pub struct PkarrInvitePublisher {
     identity_signing_key: ed25519_dalek::SigningKey,
     identity_pub: [u8; 64],
     routing_blob_builder: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
+    /// ZEB-370 consent gate: the friend tokens THIS node has minted + published
+    /// and not yet consumed, keyed on `token_sig`, with their optional expiry
+    /// (`expires_at` ms, `None` = no expiry). The inbound friend acceptor
+    /// consults [`Self::is_friend_token_active`] against this map BEFORE adding a
+    /// friend, so a self-signed request carrying an arbitrary `token_sig` this
+    /// node never minted is rejected (fail-closed). Held under a `std::sync`
+    /// mutex — the map is touched without holding the lock across any `.await`,
+    /// so no async mutex is warranted.
+    live_friend_tokens: Mutex<HashMap<[u8; 64], Option<u64>>>,
 }
 
 impl PkarrInvitePublisher {
@@ -31,6 +41,7 @@ impl PkarrInvitePublisher {
             identity_signing_key,
             identity_pub,
             routing_blob_builder,
+            live_friend_tokens: Mutex::new(HashMap::new()),
         }
     }
 
@@ -62,15 +73,54 @@ impl PkarrInvitePublisher {
     /// `PkarrCase::Invite` keying for now; Phase 1b switches this to
     /// `PkarrCase::Friend`. Called after `mint_friend_token` /
     /// `generate_friend_token` succeeds; unregistered on consume/expiry.
-    pub async fn register_friend_token(&self, token_sig: &[u8; 64]) {
+    ///
+    /// Records `(token_sig -> expires_at)` in the live-token map FIRST (so the
+    /// consent gate [`Self::is_friend_token_active`] sees it the instant the
+    /// pkarr handle goes live), then registers the Case-A pkarr handle.
+    pub async fn register_friend_token(&self, token_sig: &[u8; 64], expires_at: Option<u64>) {
+        // Record the live token before publishing so an inbound handshake racing
+        // the first publish still sees the gate as open.
+        self.live_friend_tokens
+            .lock()
+            .expect("live_friend_tokens mutex poisoned")
+            .insert(*token_sig, expires_at);
         let handle = format!("friend:{}", hex::encode(token_sig));
         self.register_case_a(handle, *token_sig).await;
     }
 
-    /// Called when the friend token is consumed, expires, or is revoked.
+    /// Called when the friend token is consumed, expires, or is revoked. Removes
+    /// the live-token map entry (closing the consent gate for it) AND stops the
+    /// Case-A pkarr republication.
     pub async fn unregister_friend_token(&self, token_sig: &[u8; 64]) {
+        self.live_friend_tokens
+            .lock()
+            .expect("live_friend_tokens mutex poisoned")
+            .remove(token_sig);
         let handle = format!("friend:{}", hex::encode(token_sig));
         self.publisher.unregister(&handle).await;
+    }
+
+    /// ZEB-370 consent gate: is `token_sig` a friend token THIS node minted +
+    /// published and has not yet consumed, AND is it unexpired at `now_ms`?
+    ///
+    /// True iff the token is present in the live-token map (registered, not yet
+    /// `unregister`ed) AND (`expires_at` is `None` OR `expires_at > now_ms`).
+    /// The inbound friend acceptor requires this before adding a friend, so a
+    /// peer presenting a self-signed request with an arbitrary `token_sig` that
+    /// does not correspond to a live minted token is rejected (fail-closed).
+    ///
+    /// `async` for call-site symmetry with the other publisher methods; the map
+    /// is a `std::sync::Mutex` and the lock is never held across an `.await`.
+    pub async fn is_friend_token_active(&self, token_sig: &[u8; 64], now_ms: u64) -> bool {
+        let map = self
+            .live_friend_tokens
+            .lock()
+            .expect("live_friend_tokens mutex poisoned");
+        match map.get(token_sig) {
+            Some(None) => true,                             // registered, no expiry
+            Some(Some(expires_at)) => *expires_at > now_ms, // registered, unexpired
+            None => false,                                  // never registered / consumed
+        }
     }
 
     /// Shared Case-A registration core for `register_invite` /
@@ -161,7 +211,7 @@ mod tests {
         let token_sig = [0x44u8; 64];
         let handle = format!("friend:{}", hex::encode(token_sig));
 
-        inv_pub.register_friend_token(&token_sig).await;
+        inv_pub.register_friend_token(&token_sig, None).await;
         assert!(
             publisher.active_handles().await.contains(&handle),
             "friend handle must be active after register"
@@ -171,6 +221,83 @@ mod tests {
         assert!(
             !publisher.active_handles().await.contains(&handle),
             "friend handle must be gone after unregister"
+        );
+    }
+
+    /// FIX (consent-gate): `is_friend_token_active` is the authority the inbound
+    /// friend acceptor consults before adding a friend — it must be true ONLY
+    /// for a token this node registered (minted + published) and has not yet
+    /// consumed, and only while unexpired.
+    #[tokio::test]
+    async fn is_friend_token_active_tracks_registration_and_expiry() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let id_pub = build_identity_pub(&sk);
+        let inv_pub = PkarrInvitePublisher::new(
+            publisher.clone(),
+            sk,
+            id_pub,
+            Arc::new(|| b"friend-routing".to_vec()),
+        );
+
+        let never_registered = [0x01u8; 64];
+        let unexpiring = [0x02u8; 64];
+        let expiring = [0x03u8; 64];
+
+        let now_ms = 1_000_000u64;
+
+        // never-registered → false.
+        assert!(
+            !inv_pub
+                .is_friend_token_active(&never_registered, now_ms)
+                .await,
+            "a token_sig this node never registered must not be active"
+        );
+
+        // registered with no expiry → active now and far in the future.
+        inv_pub.register_friend_token(&unexpiring, None).await;
+        assert!(
+            inv_pub.is_friend_token_active(&unexpiring, now_ms).await,
+            "a registered, non-expiring token must be active"
+        );
+        assert!(
+            inv_pub
+                .is_friend_token_active(&unexpiring, now_ms + 10_000_000)
+                .await,
+            "a non-expiring token stays active regardless of clock"
+        );
+
+        // registered with a future expiry → active before, inactive at/after.
+        inv_pub
+            .register_friend_token(&expiring, Some(now_ms + 5_000))
+            .await;
+        assert!(
+            inv_pub.is_friend_token_active(&expiring, now_ms).await,
+            "a registered token before its expiry must be active"
+        );
+        assert!(
+            !inv_pub
+                .is_friend_token_active(&expiring, now_ms + 5_000)
+                .await,
+            "a token at its expiry instant (expires_at <= now) must be inactive"
+        );
+        assert!(
+            !inv_pub
+                .is_friend_token_active(&expiring, now_ms + 6_000)
+                .await,
+            "a token past its expiry must be inactive"
+        );
+
+        // after unregister → false (consumed one-shot).
+        inv_pub.unregister_friend_token(&unexpiring).await;
+        assert!(
+            !inv_pub.is_friend_token_active(&unexpiring, now_ms).await,
+            "an unregistered (consumed) token must not be active"
         );
     }
 

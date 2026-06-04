@@ -32590,6 +32590,21 @@ pub async fn connectivity_link_friend_iroh_inner(
     )
     .map_err(|e| format!("verify friend token sig: {e:?}"))?;
 
+    // 1c. Redeemer-side expiry fail-fast (ZEB-370): if the minted token already
+    //     expired, bail before doing any pkarr/iroh work. The acceptor's consent
+    //     gate (`is_friend_token_active`) also rejects expired tokens server-side;
+    //     this is the cheap client-side mirror so a redeemer never burns a dial
+    //     on a token that can't be accepted.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if let Some(expires_at) = payload.token.expires_at {
+        if expires_at <= now_ms {
+            return Err("friend token expired".to_string());
+        }
+    }
+
     // 2. Resolve the inviter's reachability via Case-A pkarr, keyed on
     //    `token.sig` — SAME mechanism as the invite redeem (friend tokens
     //    publish under a `friend:`-namespaced handle but derive the ephemeral
@@ -32601,10 +32616,8 @@ pub async fn connectivity_link_friend_iroh_inner(
         return Err("iroh endpoint unavailable — cannot dial inviter".to_string());
     };
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // Reuse `now_ms` from the expiry check above — the pkarr epoch window only
+    // needs a near-current clock, and the two reads are microseconds apart.
     let epoch_window = harmony_pkarr::epoch_tolerance_window(now_ms);
     let verifying_keys: Vec<_> = epoch_window
         .iter()
@@ -32835,6 +32848,79 @@ pub async fn connectivity_link_friend_iroh_inner(
         friend_addr: payload.inviter_addr,
         display,
     })
+}
+
+#[cfg(test)]
+mod friend_redeem_expiry_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// FIX 2 (redeemer-side expiry fail-fast): redeeming a friend token whose
+    /// `expires_at` is already in the past must return `Err("friend token
+    /// expired")` BEFORE any pkarr/iroh work — proven here by passing `None` for
+    /// both the resolver and the endpoint (which would otherwise error first):
+    /// the expiry check runs ahead of those `Some(...)` guards, so an expired
+    /// token surfaces the expiry error rather than "pkarr resolver unavailable".
+    #[tokio::test]
+    async fn connectivity_link_friend_rejects_expired_token() {
+        let owner = crate::community_membership::mint_test_owner(0x71);
+        let device2 = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &owner.device_key.to_bytes(),
+        ));
+        let minted_at = crate::owner_state_types::Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        // expires_at = 1 ms after epoch → long expired against the real clock.
+        let payload = crate::friend_token::mint_friend_token(
+            owner.owner,
+            Some("inviter".into()),
+            minted_at,
+            Some(1),
+            owner.cert.clone(),
+            &device2,
+        )
+        .expect("mint");
+        let url = crate::friend_token::encode_friend_token_url(&payload).expect("encode");
+
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let hlc_tracker = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+
+        let err = connectivity_link_friend_iroh_inner(
+            url,
+            None, // pkarr_resolver — would error AFTER the expiry check
+            None, // iroh_endpoint — likewise
+            owner.owner,
+            owner.cert.clone(),
+            device2,
+            Some("me".into()),
+            crdt_state.clone(),
+            hlc_tracker,
+            "redeem-dev".to_string(),
+            HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(100),
+                open_bi_timeout: Duration::from_millis(100),
+                response_read_timeout: Duration::from_millis(100),
+                write_timeout: Duration::from_millis(100),
+            },
+        )
+        .await
+        .expect_err("an expired friend token must be rejected before dialing");
+        assert_eq!(
+            err, "friend token expired",
+            "expired token must fail-fast with the expiry error, not a downstream \
+             resolver/endpoint error"
+        );
+        assert!(
+            crdt_state.lock().await.friend_graph.friends.is_empty(),
+            "a rejected expired redeem must not write a friend entry"
+        );
+    }
 }
 
 /// Toggle case-B "Make me discoverable" setting. Persists the toggle to
@@ -33213,7 +33299,13 @@ async fn generate_friend_token(
     // non-fatal here — unlike invite-only, a friend link can still be redeemed
     // on-LAN; the redeemer surfaces `inviter_unreachable` if it can't resolve.
     if let Some(inv_pub) = pkarr_invite_publisher {
-        inv_pub.register_friend_token(&payload.token.sig).await;
+        // Record the token's expiry alongside the publish so the inbound
+        // acceptor's consent gate (`is_friend_token_active`) rejects an expired
+        // or never-minted `token_sig` (ZEB-370 consent gate). `payload.token
+        // .expires_at` is the same value passed into `mint_friend_token`.
+        inv_pub
+            .register_friend_token(&payload.token.sig, payload.token.expires_at)
+            .await;
     }
 
     Ok(url)

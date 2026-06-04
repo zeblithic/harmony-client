@@ -58,7 +58,19 @@ pub struct FriendTokenPayload {
 
     /// The inviter's advertised display name at mint time (UX hint; refreshable
     /// on accept). `None`/absent on the wire when unset.
-    #[serde(rename = "dn", skip_serializing_if = "Option::is_none", default)]
+    ///
+    /// Capped at `MAX_FRIEND_DISPLAY_LEN` at DECODE (oversized → hard decode
+    /// error, not truncation), via the same strict deserializer
+    /// `FriendEntry.display` and the handshake `display` fields use. Without this
+    /// cap an oversized hint would flow into a local `FriendEntry` on redeem and
+    /// then fail owner-state deserialize on the owner's other devices during
+    /// sync. The cap does not alter the ENCODED wire bytes of valid values.
+    #[serde(
+        rename = "dn",
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "crate::friend_graph::deserialize_capped_display"
+    )]
     pub display_hint: Option<String>,
 
     /// The device-#2-signed one-shot redemption token (`invitee_hint = None`).
@@ -243,6 +255,32 @@ mod tests {
             Err(FriendTokenError::AddrCertMismatch) => {}
             other => panic!("expected AddrCertMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_rejects_oversized_display_hint() {
+        // FIX 3: an oversized `display_hint` must be REJECTED at
+        // decode_friend_token_url (wire ingress), mirroring FriendEntry.display /
+        // the handshake display fields. Otherwise it would flow into a local
+        // FriendEntry on redeem and fail owner-state deserialize on other devices.
+        use crate::friend_graph::MAX_FRIEND_DISPLAY_LEN;
+        let mut p = sample();
+
+        // 257-byte hint → must FAIL to decode (serialize is uncapped).
+        p.display_hint = Some("x".repeat(MAX_FRIEND_DISPLAY_LEN + 1));
+        let url = encode_friend_token_url(&p).expect("encode (serialize is uncapped)");
+        match decode_friend_token_url(&url) {
+            Err(FriendTokenError::Cbor(_)) => {}
+            other => panic!("expected Cbor decode error for oversized hint, got {other:?}"),
+        }
+
+        // 256-byte hint (exactly at the cap) → still decodes round-trip.
+        p.display_hint = Some("y".repeat(MAX_FRIEND_DISPLAY_LEN));
+        let url = encode_friend_token_url(&p).expect("encode");
+        assert_eq!(
+            decode_friend_token_url(&url).expect("at-cap hint decodes"),
+            p
+        );
     }
 
     #[test]

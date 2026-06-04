@@ -325,6 +325,17 @@ impl FriendEventEmit for () {
 /// `iroh_invite_acceptor::DEFAULT_ACCEPTOR_IO_DEADLINE_MS`.
 pub const DEFAULT_FRIEND_IO_DEADLINE_MS: u64 = 30_000;
 
+/// Wall-clock now in epoch-milliseconds — the same one-syscall pattern used
+/// throughout `lib.rs` (`generate_invite`/HLC reservation) and `next_hlc`.
+/// Saturates to `0` if the clock is before the epoch.
+fn wall_now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Tunable timeouts for the friend handshake handler. Tests construct this
 /// directly with sub-second values; production uses [`Self::default`] (or an
 /// env override at the call site).
@@ -495,11 +506,7 @@ where
     /// Bump-and-return a fresh HLC stamped with this device's id. Mirrors
     /// `profile_broadcast::OwnerStateBroadcastSource::next_hlc`.
     async fn next_hlc(&self) -> Hlc {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = wall_now_ms();
         let mut tracker = self.hlc_tracker.lock().await;
         let entry = tracker.entry(self.device_id.clone()).or_insert(Hlc {
             wall_ms: 0,
@@ -513,6 +520,35 @@ where
             entry.logical = entry.logical.saturating_add(1);
         }
         entry.clone()
+    }
+
+    /// ZEB-370 consent gate. Returns `Ok(())` iff `token_sig` corresponds to a
+    /// friend token THIS node minted + published and currently has live
+    /// (unexpired) — i.e. `self.pkarr_invite_publisher` is `Some(p)` AND
+    /// `p.is_friend_token_active(token_sig, now_ms)`. Otherwise returns
+    /// `Err(TokenNotLive { .. })` so the caller FAILS CLOSED: no friend is added
+    /// and no accept is sent.
+    ///
+    /// Without this check, any peer reaching `harmony/friend/v1` with a
+    /// self-signed request and an arbitrary `token_sig` would be auto-friended,
+    /// bypassing the `harmony://friend/` token gate entirely. Split out as an
+    /// `async fn` (not requiring a `Connection`) so it is directly unit-testable.
+    async fn token_gate_open(&self, token_sig: &[u8; 64]) -> Result<(), FriendAcceptError> {
+        let Some(publisher) = self.pkarr_invite_publisher.as_ref() else {
+            // No publisher wired in → we cannot prove this node minted the token.
+            // Fail closed.
+            return Err(FriendAcceptError::TokenNotLive {
+                reason: "no friend-token publisher to verify against",
+            });
+        };
+        let now_ms = wall_now_ms();
+        if publisher.is_friend_token_active(token_sig, now_ms).await {
+            Ok(())
+        } else {
+            Err(FriendAcceptError::TokenNotLive {
+                reason: "token_sig is not a live minted friend token (unregistered or expired)",
+            })
+        }
     }
 
     /// Inbound bi-stream handler: read the length-prefixed `FriendLinkRequest`,
@@ -549,6 +585,13 @@ where
             .map_err(|e| FriendAcceptError::ReadBody(e.to_string()))?;
 
         let req = decode_friend_request(&body).map_err(FriendAcceptError::Handshake)?;
+
+        // ZEB-370 consent gate (FAIL CLOSED): before authenticating the dialer
+        // and adding them as a friend, require that `req.token_sig` is a friend
+        // token THIS node actually minted + published and currently has live. A
+        // self-signed request carrying an arbitrary `token_sig` we never minted
+        // is rejected here — no friend written, no accept sent.
+        self.token_gate_open(&req.token_sig).await?;
 
         // Run the pure core under the CRDT lock with a fresh HLC.
         let learned_at = self.next_hlc().await;
@@ -653,6 +696,12 @@ pub enum FriendAcceptError {
     ReadBody(String),
     #[error("handshake: {0}")]
     Handshake(#[source] FriendHandshakeError),
+    /// ZEB-370 consent gate (FAIL CLOSED): the request's `token_sig` is not a
+    /// live friend token this node minted + published — either no
+    /// `pkarr_invite_publisher` is wired in, or the token was never registered,
+    /// or it has expired. The friend is NOT added and no accept is sent.
+    #[error("friend token not live (consent gate): {reason}")]
+    TokenNotLive { reason: &'static str },
     #[error("response too large: len={len} max={max}")]
     ResponseTooLarge { len: usize, max: usize },
     #[error("write length-prefix: {0}")]
@@ -1106,6 +1155,121 @@ mod tests {
             state.friend_graph.friends.is_empty(),
             "a rejected request must not write a friend entry"
         );
+    }
+
+    // ── ZEB-370 consent gate: token_gate_open ────────────────────────────
+
+    use crate::pkarr_invite_publisher::PkarrInvitePublisher;
+    use harmony_pkarr::testing::MockPkarrRelay;
+    use harmony_pkarr::{PkarrPublisher, RelayClient, RelayPool};
+
+    /// Build a friend acceptor wired to `publisher` (may be `None`). All the
+    /// crypto/CRDT deps are stub-defaultable since the gate tests never reach
+    /// `process_friend_request`.
+    fn acceptor_with_publisher(
+        publisher: Option<Arc<PkarrInvitePublisher>>,
+    ) -> IrohFriendHandshakeAcceptor<()> {
+        let me = mint_test_owner(0x70);
+        IrohFriendHandshakeAcceptor::<()>::new(
+            Arc::new(TokioMutex::new(OwnerState::default())),
+            Arc::new(TokioMutex::new(std::collections::BTreeMap::new())),
+            "gate-test-dev".to_string(),
+            me.owner,
+            Some("me".to_string()),
+            me.cert,
+            Arc::new(ed25519_dalek::SigningKey::from_bytes(
+                &me.device_key.to_bytes(),
+            )),
+            None,
+            publisher,
+        )
+    }
+
+    /// A real `PkarrInvitePublisher` backed by a mock relay (no records actually
+    /// resolved — we only exercise the in-memory live-token map).
+    async fn test_publisher() -> Arc<PkarrInvitePublisher> {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let relay = MockPkarrRelay::start().await;
+        // Keep the relay alive for the lifetime of the publisher by leaking it —
+        // these unit tests are short-lived and never touch the network path.
+        Box::leak(Box::new(relay));
+        let pool = RelayPool::new(vec!["http://127.0.0.1:1/".to_string()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&sk.verifying_key().to_bytes());
+        Arc::new(PkarrInvitePublisher::new(
+            publisher,
+            sk,
+            id_pub,
+            Arc::new(|| b"routing".to_vec()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn token_gate_rejects_when_no_publisher() {
+        // No publisher wired in → cannot prove the token was minted here → REJECT
+        // (fail-closed). This is the consent-bypass closure: a peer with a
+        // structurally-valid request but no proof of a minted token is refused.
+        let acceptor = acceptor_with_publisher(None);
+        let err = acceptor
+            .token_gate_open(&[0x11; 64])
+            .await
+            .expect_err("no publisher must fail closed");
+        assert!(matches!(err, FriendAcceptError::TokenNotLive { .. }));
+    }
+
+    #[tokio::test]
+    async fn token_gate_rejects_never_registered_token() {
+        // FIX 1 (consent bypass): a structurally-valid request whose token_sig
+        // was NEVER registered (this node never minted it) is rejected — the gate
+        // returns early, so process_friend_request is never reached, no friend is
+        // written, and no accept is sent.
+        let publisher = test_publisher().await;
+        let acceptor = acceptor_with_publisher(Some(Arc::clone(&publisher)));
+        let unknown = [0x22; 64];
+        // Sanity: the publisher agrees this token is not active.
+        assert!(!publisher.is_friend_token_active(&unknown, 1_000).await);
+        let err = acceptor
+            .token_gate_open(&unknown)
+            .await
+            .expect_err("never-registered token_sig must be rejected");
+        assert!(matches!(err, FriendAcceptError::TokenNotLive { .. }));
+    }
+
+    #[tokio::test]
+    async fn token_gate_accepts_live_registered_token() {
+        let publisher = test_publisher().await;
+        let token_sig = [0x33; 64];
+        publisher.register_friend_token(&token_sig, None).await;
+        let acceptor = acceptor_with_publisher(Some(Arc::clone(&publisher)));
+        acceptor
+            .token_gate_open(&token_sig)
+            .await
+            .expect("a live, registered, non-expiring token must pass the gate");
+    }
+
+    #[tokio::test]
+    async fn token_gate_rejects_expired_registered_token() {
+        // FIX 1/2 (expiry): a token registered with an expiry already in the past
+        // must be rejected by the gate even though it IS in the live map.
+        let publisher = test_publisher().await;
+        let token_sig = [0x44; 64];
+        // expires_at = 1 ms after epoch → expired against any realistic wall clock.
+        publisher.register_friend_token(&token_sig, Some(1)).await;
+        // Confirm the underlying check sees it as expired at a current-ish clock.
+        let now_ms = wall_now_ms();
+        assert!(now_ms > 1, "wall clock should be well past epoch+1ms");
+        assert!(!publisher.is_friend_token_active(&token_sig, now_ms).await);
+        let acceptor = acceptor_with_publisher(Some(Arc::clone(&publisher)));
+        let err = acceptor
+            .token_gate_open(&token_sig)
+            .await
+            .expect_err("expired token must be rejected by the gate");
+        assert!(matches!(err, FriendAcceptError::TokenNotLive { .. }));
     }
 
     // ── Task 9: ALPN dispatch multiplexer ────────────────────────────────
