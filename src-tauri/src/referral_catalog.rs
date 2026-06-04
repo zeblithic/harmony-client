@@ -442,6 +442,18 @@ mod tests {
     }
 
     #[test]
+    fn catalog_request_with_mismatched_cert_owner_is_rejected() {
+        // A request signed by R but carrying a DIFFERENT owner's (S's) cert must
+        // fail: verify_enrolled_device checks cert.owner_id == from_addr.
+        let r = mint_test_owner(0x21);
+        let s = mint_test_owner(0x22);
+        let f_owner = OwnerAddr([0x42; 16]);
+        let mut req = sign_catalog_request(&r.device_key, r.owner, f_owner, r.cert.clone());
+        req.enrollment = s.cert.clone();
+        assert!(authenticate_catalog_request(&req, f_owner).is_err());
+    }
+
+    #[test]
     fn catalog_request_auth_enforces_to_addr_and_sig() {
         let r = mint_test_owner(0x21);
         let f_owner = OwnerAddr([0x42; 16]);
