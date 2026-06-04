@@ -35,6 +35,12 @@ const MAX_DIAL_ATTEMPTS: u32 = 3;
 /// insertion order is tracked in a `VecDeque` so the oldest node-id evicts once the
 /// cap is exceeded, keeping memory bounded regardless of how many distinct peers are
 /// seen.
+///
+/// Eviction is PURELY a memory bound — it does NOT create a re-dial path. The
+/// resolver emits a `DialHint` only on first-learn of a `(owner, node_id)`, so an
+/// already-known peer that re-announces does not re-emit, and an evicted node-id is
+/// not re-dialed in practice (a left-then-rejoined member that we should re-dial is
+/// re-dial-after-drop → ZEB-321 Phase 3, out of scope here). (Greptile, PR #190.)
 struct DialedSet {
     seen: HashSet<[u8; 32]>,
     order: VecDeque<[u8; 32]>,
@@ -208,7 +214,10 @@ mod tests {
         let overflow = [0xFFu8; 32];
         assert!(d.claim(overflow), "overflow id is new");
         assert_eq!(d.seen.len(), DIALED_SET_CAP, "size stays capped");
-        // The oldest (first) was evicted, so it can be claimed afresh.
+        // The oldest (first) was evicted, so it can be claimed afresh at the set
+        // level. (This is the memory-bound contract only — in production the
+        // resolver's first-learn guard means a known peer won't re-emit a hint, so
+        // eviction does not re-dial; see the DialedSet doc comment.)
         assert!(d.claim(first), "oldest evicted → reclaimable");
     }
 

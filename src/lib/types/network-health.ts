@@ -68,7 +68,12 @@ export interface NetworkHealthSnapshot {
   myNetwork: MyNetworkSummary | null;
   peers: PeerHealth[];
   pkarrStatus: PkarrHealthSummary;
-  /** ZEB-373: dial telemetry — present from schema v2 onward. */
+  /**
+   * ZEB-373: dial telemetry. Always present in schema v2+ responses (Rust
+   * serializes `dial_status` unconditionally). Kept optional only for
+   * forward-compat with any pre-v2 (schema v1) snapshot that predates the field;
+   * live `network_health_snapshot` responses always include it. (Greptile, PR #190.)
+   */
   dialStatus?: DialHealthSummary;
 }
 
