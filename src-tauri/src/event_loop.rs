@@ -544,6 +544,11 @@ pub async fn run<R: Runtime>(
     // unwired and the resolver simply never receives updates — the rest
     // of the event loop is unaffected.
     iroh_handles: Option<IrohRuntimeHandles>,
+    // ZEB-373: shared dynamic-dial telemetry. When `Some` (alongside
+    // `iroh_handles`), the event loop installs the resolver's dial-hint
+    // sender and spawns the dial driver to dial newly-learned peers via the
+    // live zenoh `Runtime`. `None` in test contexts that bypass `start_node`.
+    dial_telemetry: Option<std::sync::Arc<crate::network_health::DialTelemetry>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -665,11 +670,26 @@ pub async fn run<R: Runtime>(
                 return;
             }
         };
-    // ZEB-373 Task 1: `zenoh_runtime` is retained for dynamic `connect_peer`
-    // dialing wired up in a later task (Task 5). Keep the binding name so that
-    // task can consume it; silence the unused-variable warning for now.
-    let _ = &zenoh_runtime;
     tracing::info!("Zenoh session opened");
+
+    // ZEB-373: dynamic mid-session dial. Create the hint channel, install the sender
+    // on the resolver, and spawn the driver to dial newly-learned peers via the live
+    // zenoh Runtime. Inbound + static-seed (ZEB-368) are unchanged.
+    if let (Some(ref ih), Some(ref telemetry)) = (&iroh_handles, &dial_telemetry) {
+        let (hint_tx, hint_rx) = tokio::sync::mpsc::unbounded_channel();
+        ih.link_manager.resolver().set_dial_hint_sender(hint_tx);
+        let self_nid = *ih.endpoint.node_id().as_bytes();
+        let dialer = std::sync::Arc::new(crate::iroh_dial_driver::RuntimePeerDialer::new(
+            zenoh_runtime.clone(),
+        ));
+        tokio::spawn(crate::iroh_dial_driver::run_dial_driver(
+            hint_rx,
+            dialer,
+            std::sync::Arc::clone(telemetry),
+            self_nid,
+            std::time::Duration::from_secs(1),
+        ));
+    }
 
     // Own Zenoh session ID — attached to capacity publications so receivers
     // can determine hop distance by comparing against their peers_zid().

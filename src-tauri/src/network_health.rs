@@ -399,6 +399,34 @@ pub trait ReachabilitySnapshot: Send + Sync {
     fn list_records(&self) -> Vec<ResolverPeerRecord>;
 }
 
+/// ZEB-373: source of dynamic-dial telemetry for the snapshot. Mirrors the
+/// existing `PkarrSnapshot`/`IrohSnapshot` source-trait pattern.
+pub trait DialSnapshot: Send + Sync {
+    fn dial_summary(&self) -> DialHealthSummary;
+}
+
+/// Production source: reads the shared `DialTelemetry` written by the dial
+/// driver (`crate::iroh_dial_driver::run_dial_driver`).
+pub struct ProdDialSnapshot {
+    pub telemetry: std::sync::Arc<DialTelemetry>,
+}
+impl DialSnapshot for ProdDialSnapshot {
+    fn dial_summary(&self) -> DialHealthSummary {
+        self.telemetry.summary()
+    }
+}
+
+/// ZEB-373: trivial `DialSnapshot` double for unit tests that don't exercise
+/// dial telemetry — always returns a zeroed summary.
+#[cfg(test)]
+pub struct EmptyDialSnapshot;
+#[cfg(test)]
+impl DialSnapshot for EmptyDialSnapshot {
+    fn dial_summary(&self) -> DialHealthSummary {
+        DialHealthSummary::default()
+    }
+}
+
 /// Spec §5.5: state coupling summary. NetworkHealthService owns the
 /// rate-limiter task handle + cached last self-test report; the iroh /
 /// resolver / pkarr handles come from AppState (already constructed).
@@ -407,6 +435,8 @@ pub struct NetworkHealthService {
     pkarr: std::sync::Arc<dyn PkarrSnapshot>,
     resolver: std::sync::Arc<dyn ReachabilitySnapshot>,
     membership: std::sync::Arc<dyn MyMembershipSet + Send + Sync>,
+    /// ZEB-373: dynamic-dial telemetry source.
+    dial: std::sync::Arc<dyn DialSnapshot>,
     last_self_test: std::sync::Arc<tokio::sync::RwLock<Option<SelfTestReport>>>,
     /// Channel into the rate-limiter task. `None` until `spawn_rate_limiter`
     /// is called at boot; `notify()` is a no-op while None so unit tests
@@ -420,12 +450,14 @@ impl NetworkHealthService {
         pkarr: std::sync::Arc<dyn PkarrSnapshot>,
         resolver: std::sync::Arc<dyn ReachabilitySnapshot>,
         membership: std::sync::Arc<dyn MyMembershipSet + Send + Sync>,
+        dial: std::sync::Arc<dyn DialSnapshot>,
     ) -> Self {
         Self {
             iroh,
             pkarr,
             resolver,
             membership,
+            dial,
             last_self_test: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             notify_tx: None,
         }
@@ -474,8 +506,9 @@ impl NetworkHealthService {
                 community_publish_count: self.pkarr.community_publish_count(),
                 recent_fallback_events: self.pkarr.recent_fallback_events(),
             },
-            // PLACEHOLDER — Task 5 replaces this with the real DialTelemetry source.
-            dial_status: DialHealthSummary::default(),
+            // ZEB-373 Task 5: real dynamic-dial telemetry, read from the
+            // shared DialTelemetry via the DialSnapshot source.
+            dial_status: self.dial.dial_summary(),
         }
     }
 
@@ -1704,6 +1737,7 @@ mod tests {
             std::sync::Arc::new(FakePkarr),
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
         );
         let snap = svc.snapshot().await;
         assert!(snap.my_network.is_none());
@@ -1718,6 +1752,7 @@ mod tests {
             std::sync::Arc::new(FakePkarr),
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
         );
         let snap = svc.snapshot().await;
         assert!(snap.my_network.is_some());
@@ -1745,6 +1780,7 @@ mod tests {
                 ],
             }),
             std::sync::Arc::new(FakeMembership { table }),
+            std::sync::Arc::new(EmptyDialSnapshot),
         );
         let snap = svc.snapshot().await;
         assert_eq!(snap.peers.len(), 3);
@@ -1778,6 +1814,7 @@ mod tests {
             std::sync::Arc::new(FakePkarr),
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
         );
         let counter = std::sync::Arc::new(AtomicUsize::new(0));
         let emitter = CountingEmitter { n: counter.clone() };
@@ -1876,6 +1913,7 @@ mod tests {
             std::sync::Arc::new(FakePkarr),
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
         )
     }
 

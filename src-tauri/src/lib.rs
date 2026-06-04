@@ -740,6 +740,13 @@ pub struct NodeState {
     /// runs (resolver construction is infallible); `None` only on a default
     /// (pre-start_node) NodeState.
     pub reachability_resolver: Option<crate::reachability_resolver::ReachabilityResolver>,
+    /// ZEB-373: shared dynamic-dial telemetry. Written by the dial driver
+    /// (spawned in `event_loop::run`), read by the production
+    /// `NetworkHealthService` via `ProdDialSnapshot`. The SAME `Arc` is
+    /// handed to both, so the Network Health panel reflects live dial
+    /// outcomes. `Some` once `start_node_inner` constructs it (after iroh
+    /// boots); `None` on a default NodeState or after `clear_iroh_handles`.
+    pub dial_telemetry: Option<std::sync::Arc<crate::network_health::DialTelemetry>>,
     /// ZEB-321 Phase 1 Task 8: `force_handle` of the publisher's `Notify`,
     /// stashed here so the `connectivity_force_republish` IPC (Task 9) can
     /// wake the publisher loop without holding the whole publisher Arc.
@@ -857,6 +864,9 @@ impl NodeState {
         crate::iroh_zenoh_registration::clear_iroh_session_ctx();
         self.iroh_endpoint = None;
         self.reachability_resolver = None;
+        // ZEB-373: drop the shared dial telemetry so a restart rebuilds a
+        // fresh Arc shared between the new driver and new NetworkHealthService.
+        self.dial_telemetry = None;
         self.iroh_publisher_force = None;
         // ZEB-323 Phase 2b: abort the pkarr publisher task and drop Arcs.
         if let Some(h) = self.pkarr_publisher_handle.take() {
@@ -1002,6 +1012,8 @@ impl Default for NodeState {
             // start_node wires them; cleared + aborted in stop_inner.
             iroh_endpoint: None,
             reachability_resolver: None,
+            // ZEB-373: shared dial telemetry stays None until start_node wires it.
+            dial_telemetry: None,
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
             iroh_accept_handle: None,
@@ -2532,6 +2544,12 @@ pub(crate) async fn start_node_inner(
         // Defaults to false so the welcome modal does not fire on keychain
         // read failure or when the iroh endpoint is disabled.
         let mut freshly_created = false;
+        // ZEB-373: shared dynamic-dial telemetry. Created here (alongside the
+        // resolver) so the SAME Arc is threaded into BOTH the dial driver
+        // (spawned inside `event_loop::run` below) and the production
+        // `NetworkHealthService`'s `ProdDialSnapshot` (constructed in the
+        // install block). The driver writes; the snapshot reads.
+        let dial_telemetry = std::sync::Arc::new(crate::network_health::DialTelemetry::new());
         {
             reachability_resolver = crate::reachability_resolver::ReachabilityResolver::new();
             match crate::iroh_endpoint::load_or_create_secret_key() {
@@ -4799,6 +4817,11 @@ pub(crate) async fn start_node_inner(
                 // ownership without disturbing the iroh_endpoint_arc /
                 // iroh_publisher_arc Arcs that NodeState will hold.
                 let iroh_handles_into_loop = iroh_handles_for_loop;
+                // ZEB-373: clone the shared dial telemetry Arc for the event
+                // loop's dial driver. The original `dial_telemetry` stays in
+                // scope for the NetworkHealthService install block below so
+                // both share the same counters/ring.
+                let dial_telemetry_into_loop = Some(std::sync::Arc::clone(&dial_telemetry));
                 let thread_result = thread::Builder::new()
                     .name("harmony-runtime".to_string())
                     // Windows debug builds overflow the default ~2 MiB stack inside
@@ -4906,6 +4929,7 @@ pub(crate) async fn start_node_inner(
                                 profile_card_request_rx_for_loop,
                                 mint_sync_handles_for_loop,
                                 iroh_handles_into_loop,
+                                dial_telemetry_into_loop,
                             )
                             .await;
                         });
@@ -5068,6 +5092,10 @@ pub(crate) async fn start_node_inner(
                         // handlers no-op when these are None.
                         guard.iroh_endpoint = iroh_endpoint_arc.clone();
                         guard.reachability_resolver = Some(reachability_resolver.clone());
+                        // ZEB-373: stash the shared dial telemetry Arc so the
+                        // production ProdDialSnapshot below reads the SAME
+                        // counters the event-loop dial driver writes.
+                        guard.dial_telemetry = Some(std::sync::Arc::clone(&dial_telemetry));
                         guard.iroh_publisher_force =
                             iroh_publisher_arc.as_ref().map(|p| p.force_handle());
                         // ZEB-321 Phase 1 PR #157 round 1 + round 4
@@ -5144,12 +5172,19 @@ pub(crate) async fn start_node_inner(
                             let prod_membership: std::sync::Arc<
                                 dyn crate::network_health::MyMembershipSet + Send + Sync,
                             > = std::sync::Arc::new(crate::network_health::ProdMembership);
+                            // ZEB-373: dial-telemetry source reads the shared Arc
+                            // stashed above; the event-loop dial driver writes it.
+                            let prod_dial: std::sync::Arc<dyn crate::network_health::DialSnapshot> =
+                                std::sync::Arc::new(crate::network_health::ProdDialSnapshot {
+                                    telemetry: std::sync::Arc::clone(&dial_telemetry),
+                                });
 
                             let mut nh = crate::network_health::NetworkHealthService::new(
                                 prod_iroh,
                                 prod_pkarr,
                                 prod_resolver,
                                 prod_membership,
+                                prod_dial,
                             );
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
@@ -38335,6 +38370,8 @@ mod start_node_race_tests {
             // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.
             iroh_endpoint: None,
             reachability_resolver: None,
+            // ZEB-373: dial telemetry unused in race tests.
+            dial_telemetry: None,
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
             iroh_accept_handle: None,

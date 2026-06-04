@@ -9,6 +9,9 @@ use std::time::Duration;
 use crate::network_health::DialTelemetry;
 use crate::reachability_resolver::DialHint;
 
+use zenoh::internal::runtime::Runtime;
+use zenoh_protocol::core::{Locator, ZenohIdProto};
+
 /// Abstraction over "dial this iroh peer". Production wraps a zenoh `Runtime`
 /// (`connect_peer`); tests use a mock. `locator` is `iroh/<hex>`.
 #[async_trait::async_trait]
@@ -79,6 +82,32 @@ pub async fn run_dial_driver(
         });
     }
     tracing::debug!("ZEB-373: dial driver stopping (hint channel closed)");
+}
+
+/// Production `PeerDialer`: dials through the live zenoh `Runtime` via the
+/// un-filtered `connect_peer` path. The placeholder zid is FRESH per dial (zenoh
+/// uses it only for pre-dial dedup; the real peer zid is negotiated on the wire).
+pub struct RuntimePeerDialer {
+    runtime: Runtime,
+}
+impl RuntimePeerDialer {
+    pub fn new(runtime: Runtime) -> Self {
+        Self { runtime }
+    }
+}
+#[async_trait::async_trait]
+impl PeerDialer for RuntimePeerDialer {
+    async fn dial(&self, _node_id: [u8; 32], locator: String) -> bool {
+        let loc = match locator.parse::<Locator>() {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("ZEB-373: bad iroh locator {locator}: {e}");
+                return false;
+            }
+        };
+        let placeholder = ZenohIdProto::rand();
+        self.runtime.connect_peer(&placeholder, &[loc]).await
+    }
 }
 
 #[cfg(test)]
