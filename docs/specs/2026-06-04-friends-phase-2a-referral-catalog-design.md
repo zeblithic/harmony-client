@@ -118,7 +118,7 @@ A new `IrohFriendPexAcceptor` (structural sibling of `IrohFriendHandshakeAccepto
 Read-only: the serve path **never mutates** owner-state.
 
 ### 5.2 Browse (you fetch F's catalog)
-New IPC `list_friend_referrals(friend_owner_hex) -> Vec<ReferralView>`:
+New IPC `browse_friend_referrals(friend_owner_hex) -> Vec<ReferralView>`:
 1. Look up `F` in the local `FriendGraph`; require `status == Active` (else error — you can only browse an established friend).
 2. **Case-D resolve** F's current reachability (same resolver Phase-1b reconnection uses; the per-friendship `sealed_secret` yields the resolve key). Unresolvable → typed "friend unreachable" error.
 3. Dial the resolved address on `HARMONY_FRIEND_PEX_V1`; send a signed `CatalogRequest { from_addr=self, to_addr=F, … }`.
@@ -153,7 +153,7 @@ New IPC `set_friend_referrable(friend_owner_hex, referrable: bool)`:
 - `set_friend_referrable`: flips the flag, bumps `learned_at`, LWW-merges, survives owner-state serde round-trip; unknown friend → error; idempotent.
 
 **Integration (reuse the iroh harness; heed ZEB-347 / ZEB-374 load-flake guidance — generous timeouts, serial, avoid port contention)**
-- Two-node browse: A marks one friend `referrable`, B (an Active friend of A) calls `list_friend_referrals(A)`, receives and verifies a catalog containing exactly that one entry; a non-referrable friend of A is absent.
+- Two-node browse: A marks one friend `referrable`, B (an Active friend of A) calls `browse_friend_referrals(A)`, receives and verifies a catalog containing exactly that one entry; a non-referrable friend of A is absent.
 - A non-friend C dialing A's PEX ALPN receives an empty catalog (no leak).
 
 ---

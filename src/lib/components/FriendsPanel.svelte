@@ -202,7 +202,8 @@
       await service.setReferrable(ownerIdHex, next);
       await refresh();
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      const msg = e instanceof Error ? e.message : String(e);
+      error = msg;
     } finally {
       const nextSet = new Set(referrableSaving);
       nextSet.delete(ownerIdHex);
@@ -225,10 +226,8 @@
       const views = await service.browseReferrals(ownerIdHex);
       referralsResults = new Map(referralsResults).set(ownerIdHex, views);
     } catch (e) {
-      referralsError = new Map(referralsError).set(
-        ownerIdHex,
-        e instanceof Error ? e.message : String(e),
-      );
+      const msg = e instanceof Error ? e.message : String(e);
+      referralsError = new Map(referralsError).set(ownerIdHex, msg);
     } finally {
       const next = new Set(referralsLoading);
       next.delete(ownerIdHex);

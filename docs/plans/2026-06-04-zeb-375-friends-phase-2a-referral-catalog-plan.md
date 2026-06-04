@@ -100,7 +100,7 @@ fn request_and_catalog_preimages_are_domain_separated() {
 
 Add test helpers `sample_request()`, `sample_catalog()`, `hlc(n)` building deterministic values (fixed `OwnerAddr`, `sig: [9u8;64]`, a `mint_test_owner(0x42).cert` for the embedded `EnrollmentCert`).
 
-- [ ] **Step 2: Run, verify it fails to compile** (`cd src-tauri && cargo nextest run --features test-fixtures -E 'test(referral_catalog)'`) — expected: module/types not defined.
+- [ ] **Step 2: Run, verify it fails to compile** (`cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(referral_catalog)'`) — expected: module/types not defined.
 
 - [ ] **Step 3: Implement the module**
 
@@ -221,7 +221,7 @@ pub fn referral_catalog_sig_preimage(author: OwnerAddr, subject: OwnerAddr, entr
 
 Resolve `<enrollment_cert_path>` by copying the exact `use … EnrollmentCert;` line from `iroh_friend_acceptor.rs`. Add `pub mod referral_catalog;` in `lib.rs`.
 
-- [ ] **Step 4: Run, verify pass** (`cargo nextest run --features test-fixtures -E 'test(referral_catalog)'` → all pass) and `cargo fmt --all`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`.
+- [ ] **Step 4: Run, verify pass** (`cargo nextest run --locked --features test-fixtures -E 'test(referral_catalog)'` → all pass) and `cargo fmt --all`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`.
 
 - [ ] **Step 5: Commit** (also stage the spec + this plan)
 
@@ -700,7 +700,7 @@ fn pex_alpn_constant_is_correct() {
 
 - [ ] **Step 1: Write fixtures** mirroring `tests/wire_format_zeb370_fixtures.rs`: `EXPECTED_*_HEX = "FILL_AFTER"` sentinels + `pin_hex` helper; deterministic constructors for `ReferralEntry`, `ReferralCatalog`, `CatalogRequest` (`mint_test_owner(0x42)` cert, `sig: [9u8;64]`, `at: hlc(7)`, fixed owners); encode via `encode_referral_catalog`/`encode_catalog_request`; structural assertions on CBOR map keys.
 - [ ] **Step 2: Run** → fixtures panic printing the real hex (FILL_AFTER). Paste the hex into the constants.
-- [ ] **Step 3: Re-run** → pins pass. Also run `cargo nextest run -E 'test(wire_format_zeb370)'` and confirm the existing handshake fixtures are **unchanged/green** — the proof that the PEX ALPN left the Phase-1b handshake wire format byte-for-byte intact.
+- [ ] **Step 3: Re-run** → pins pass. Also run `cargo nextest run --locked -E 'test(wire_format_zeb370)'` and confirm the existing handshake fixtures are **unchanged/green** — the proof that the PEX ALPN left the Phase-1b handshake wire format byte-for-byte intact.
 - [ ] **Step 4: Full gates green.**
 - [ ] **Step 5: Commit** — `test(zeb-375): pin referral-catalog wire format; confirm handshake fixtures unchanged`
 
