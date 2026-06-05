@@ -20,7 +20,12 @@
    * runes-based settings-panel shape.
    */
   import { onMount, onDestroy } from 'svelte';
-  import type { FriendService, FriendDto, PendingFriendRequestDto } from '../friend-service';
+  import type {
+    FriendService,
+    FriendDto,
+    PendingFriendRequestDto,
+    ReferralView,
+  } from '../friend-service';
 
   let { service }: { service: FriendService } = $props();
 
@@ -39,6 +44,18 @@
 
   // Per-row in-flight unfriend guard (by owner_id hex).
   let unfriending = $state<Set<string>>(new Set());
+
+  // Per-row in-flight referrable-toggle guard (by owner_id hex). ZEB-375 Phase 2a.
+  let referrableSaving = $state<Set<string>>(new Set());
+
+  // ZEB-375 Phase 2a Task 7: per-row "browse referrals" state, keyed by the
+  // friend's owner_id hex. `loading` is the in-flight guard; `results` holds the
+  // last verified ReferralView[] (an empty array renders an "empty" line);
+  // `error` is the per-row failure message. A friend with no entry in any map
+  // has never been browsed (the panel is collapsed).
+  let referralsLoading = $state<Set<string>>(new Set());
+  let referralsResults = $state<Map<string, ReferralView[]>>(new Map());
+  let referralsError = $state<Map<string, string>>(new Map());
 
   // ── Phase 1b state ────────────────────────────────────────────────────────
 
@@ -69,6 +86,20 @@
     try {
       friends = await service.listFriends();
       error = null;
+      // ZEB-375 Phase 2a: browse is Active-only, so drop any per-row referral
+      // state for friends that are no longer Active (now Pending, or absent).
+      // Without this, a friend that was browsed while Active and later shows as
+      // Pending would still render its prior catalog even though the controls
+      // are hidden — `refresh()` is the single point where `friends` changes.
+      const activeIds = new Set(
+        friends.filter((f) => f.status === 'active').map((f) => f.ownerIdHex),
+      );
+      referralsResults = new Map(
+        [...referralsResults].filter(([ownerIdHex]) => activeIds.has(ownerIdHex)),
+      );
+      referralsError = new Map(
+        [...referralsError].filter(([ownerIdHex]) => activeIds.has(ownerIdHex)),
+      );
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -174,6 +205,50 @@
     }
   }
 
+  // ZEB-375 Phase 2a: flip a friend's referral-catalog opt-in. `next` is the
+  // desired new value (the inverse of the current `referrable`). The backend
+  // re-syncs and emits `friend-list-changed`, but we also `refresh()` so the
+  // checkbox reflects the new value immediately.
+  async function handleToggleReferrable(ownerIdHex: string, next: boolean): Promise<void> {
+    if (referrableSaving.has(ownerIdHex)) return;
+    referrableSaving = new Set(referrableSaving).add(ownerIdHex);
+    try {
+      await service.setReferrable(ownerIdHex, next);
+      await refresh();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      error = msg;
+    } finally {
+      const nextSet = new Set(referrableSaving);
+      nextSet.delete(ownerIdHex);
+      referrableSaving = nextSet;
+    }
+  }
+
+  // ZEB-375 Phase 2a Task 7: browse a friend's referral catalog. The backend
+  // resolves + dials the friend, sends a signed request, VERIFIES the returned
+  // catalog, and projects each entry; we only render the verified result (or the
+  // per-row error). Read-only — Phase 2a has no "request introduction" action.
+  async function handleBrowseReferrals(ownerIdHex: string): Promise<void> {
+    if (referralsLoading.has(ownerIdHex)) return;
+    referralsLoading = new Set(referralsLoading).add(ownerIdHex);
+    // Clear any prior error for this row so the loading state shows cleanly.
+    const clearedErr = new Map(referralsError);
+    clearedErr.delete(ownerIdHex);
+    referralsError = clearedErr;
+    try {
+      const views = await service.browseReferrals(ownerIdHex);
+      referralsResults = new Map(referralsResults).set(ownerIdHex, views);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      referralsError = new Map(referralsError).set(ownerIdHex, msg);
+    } finally {
+      const next = new Set(referralsLoading);
+      next.delete(ownerIdHex);
+      referralsLoading = next;
+    }
+  }
+
   // ── Phase 1b handlers ─────────────────────────────────────────────────────
 
   async function handleAccept(ownerIdHex: string): Promise<void> {
@@ -273,6 +348,33 @@
             <span class="friend-name">{f.display ?? shortId(f.ownerIdHex)}</span>
             <span class="friend-addr" title={f.ownerIdHex}>{shortId(f.ownerIdHex)}</span>
           </div>
+          <!-- ZEB-375 Phase 2a: the referrable opt-in + browse action only work
+               for Active friends — the backend returns a typed error for
+               non-Active links. `list_friends` also returns Pending rows, so
+               gate both controls on status to avoid surfacing functional-looking
+               controls that throw. -->
+          {#if f.status === 'active'}
+            <label class="referrable-toggle" data-testid="referrable-toggle-label">
+              <input
+                type="checkbox"
+                class="referrable-checkbox"
+                checked={f.referrable}
+                disabled={referrableSaving.has(f.ownerIdHex)}
+                onchange={() => handleToggleReferrable(f.ownerIdHex, !f.referrable)}
+                data-testid="referrable-checkbox"
+              />
+              <span class="referrable-label-text">Referrable</span>
+            </label>
+            <button
+              type="button"
+              class="secondary-btn small-btn"
+              disabled={referralsLoading.has(f.ownerIdHex)}
+              onclick={() => handleBrowseReferrals(f.ownerIdHex)}
+              data-testid="browse-referrals-btn"
+            >
+              {referralsLoading.has(f.ownerIdHex) ? 'Loading…' : 'Browse referrals'}
+            </button>
+          {/if}
           <button
             type="button"
             class="unfriend-btn"
@@ -283,6 +385,41 @@
             {unfriending.has(f.ownerIdHex) ? '…' : 'Unfriend'}
           </button>
         </li>
+        <!-- ZEB-375 Phase 2a: read-only referral catalog for this friend. Shown
+             only once browsed (an error, or a results entry — possibly empty).
+             Active-only and consistently gated: BOTH branches check
+             `f.status === 'active'`, and `refresh()` prunes these maps to Active
+             friends, so a stale catalog can't render after a status change. -->
+        {#if f.status === 'active' && referralsError.has(f.ownerIdHex)}
+          <li class="referrals-row" data-testid="referrals-error-row">
+            <p class="error-text" data-testid="referrals-error">
+              {referralsError.get(f.ownerIdHex)}
+            </p>
+          </li>
+        {:else if f.status === 'active' && referralsResults.has(f.ownerIdHex)}
+          <li class="referrals-row" data-testid="referrals-row">
+            {#if referralsResults.get(f.ownerIdHex)!.length === 0}
+              <p class="muted" data-testid="referrals-empty">
+                No referrals shared.
+              </p>
+            {:else}
+              <ul class="referrals-list" data-testid="referrals-list">
+                {#each referralsResults.get(f.ownerIdHex)! as r (r.ownerIdHex)}
+                  <li class="referral-item" data-testid="referral-item">
+                    <span class="referral-name" title={r.ownerIdHex}>
+                      {r.display ?? shortId(r.ownerIdHex)}
+                    </span>
+                    {#if r.alreadyFriend}
+                      <span class="already-friend-badge" data-testid="already-friend-badge">
+                        already friends
+                      </span>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </li>
+        {/if}
       {/each}
     </ul>
   {/if}
@@ -472,6 +609,78 @@
     flex-direction: column;
     gap: 2px;
     min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .referrable-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .referrable-checkbox {
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .referrable-checkbox:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .referrable-label-text {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  /* ZEB-375 Phase 2a: per-friend read-only referral list. */
+
+  .small-btn {
+    flex-shrink: 0;
+    font-size: 12px;
+    padding: 4px 10px;
+  }
+
+  .referrals-row {
+    list-style: none;
+    padding: 4px 0 8px 12px;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+  }
+
+  .referrals-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .referral-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+  }
+
+  .referral-name {
+    font-size: 12px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .already-friend-badge {
+    flex-shrink: 0;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: var(--bg-tertiary, #1e1e1e);
+    color: var(--text-secondary);
+    border: 1px solid var(--border, #2a2a2a);
   }
 
   .friend-name {

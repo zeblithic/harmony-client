@@ -248,6 +248,33 @@ describe('FriendService', () => {
     expect(adapter.invoke).toHaveBeenCalledWith('set_friend_auto_accept', { enabled: false });
   });
 
+  it('setReferrable invokes set_friend_referrable with the ownerIdHex + referrable args', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.setReferrable('aabb', true);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_friend_referrable', {
+      ownerIdHex: 'aabb',
+      referrable: true,
+    });
+    await service.setReferrable('ccdd', false);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_friend_referrable', {
+      ownerIdHex: 'ccdd',
+      referrable: false,
+    });
+  });
+
+  it('browseReferrals invokes browse_friend_referrals with the ownerIdHex arg and returns the array', async () => {
+    await service.connectAdapter(adapter);
+    const referrals = [
+      { ownerIdHex: '11223344556677889900aabbccddeeff', display: 'Carol', alreadyFriend: false },
+      { ownerIdHex: 'ffeeddccbbaa00998877665544332211', display: null, alreadyFriend: true },
+    ];
+    (adapter.invoke as any).mockResolvedValue(referrals);
+    const r = await service.browseReferrals('aabb');
+    expect(adapter.invoke).toHaveBeenCalledWith('browse_friend_referrals', { ownerIdHex: 'aabb' });
+    expect(r).toEqual(referrals);
+  });
+
   it('getAutoAccept invokes get_friend_auto_accept and returns the boolean', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue(true);

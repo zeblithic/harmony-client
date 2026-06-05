@@ -20,6 +20,10 @@ import type { TauriAdapter } from './zenoh-service';
  *   - `set_friend_auto_accept`      → void
  *   - `get_friend_auto_accept`      → boolean
  *
+ * Phase 2a IPCs:
+ *   - `set_friend_referrable`       → void (toggle a friend's referral-catalog opt-in)
+ *   - `browse_friend_referrals`     → ReferralView[] (fetch a verified friend referral catalog)
+ *
  * Events:
  *   - `friend-list-changed`              → re-fetch friends + pending
  *   - `friend-request-received`          → re-fetch pending
@@ -83,6 +87,23 @@ type RawAddFriendOutcome =
   | { linked: { ownerIdHex: string; display: string | null } }
   | 'pending'
   | 'unreachable';
+
+/**
+ * One referral entry surfaced by `browse_friend_referrals` (mirrors Rust
+ * `ReferralView`, `#[serde(rename_all = "camelCase")]`). The backend has already
+ * VERIFIED the catalog signature + author/subject binding before projecting, so
+ * each entry is an authenticated referral from the friend we asked.
+ * `alreadyFriend` is true when this peer is already an Active/Pending friend of
+ * ours (the UI flags it; there is no introduction action in Phase 2a).
+ */
+export interface ReferralView {
+  /** The referred peer's 16-byte master owner_id, hex-encoded. */
+  ownerIdHex: string;
+  /** The author's display-name hint for this peer, if any. */
+  display: string | null;
+  /** Whether we already have this peer as an Active/Pending friend. */
+  alreadyFriend: boolean;
+}
 
 export class FriendService {
   /** Listeners notified when the backend emits `friend-list-changed` (a friend
@@ -235,6 +256,29 @@ export class FriendService {
   /** Retrieve the current auto-accept setting. */
   async getAutoAccept(): Promise<boolean> {
     return this.invoke<boolean>('get_friend_auto_accept', {});
+  }
+
+  /**
+   * Toggle whether a friend (by their 16-byte master owner_id hex) may be
+   * surfaced in our referral catalog to others (the ZEB-375 Phase 2a sharer-side
+   * opt-in). The backend stamps a fresh HLC and re-syncs to the user's other
+   * devices; the UI refreshes on the resulting `friend-list-changed` event.
+   */
+  async setReferrable(ownerIdHex: string, referrable: boolean): Promise<void> {
+    await this.invoke<void>('set_friend_referrable', { ownerIdHex, referrable });
+  }
+
+  /**
+   * Browse an Active friend's referral catalog (by their 16-byte master
+   * owner_id hex). The backend resolves the friend via their Case-D slot, dials
+   * the `harmony/friend-pex/v1` ALPN, sends a signed `CatalogRequest`, VERIFIES
+   * the returned `ReferralCatalog` (author == the friend, subject == us), and
+   * projects each entry into a `ReferralView`. A verify failure or unreachable
+   * friend rejects the whole call (no partial trust). Read-only: Phase 2a has no
+   * "request introduction" action.
+   */
+  async browseReferrals(ownerIdHex: string): Promise<ReferralView[]> {
+    return this.invoke<ReferralView[]>('browse_friend_referrals', { ownerIdHex });
   }
 
   destroy(): void {

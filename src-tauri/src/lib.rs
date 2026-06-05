@@ -54,6 +54,7 @@ pub mod invite_mint;
 pub mod iroh_endpoint;
 pub mod iroh_friend_acceptor;
 pub mod iroh_invite_acceptor;
+pub mod iroh_pex_acceptor;
 pub mod library_directory;
 pub mod mail;
 pub mod mail_sync;
@@ -80,6 +81,7 @@ pub mod pkarr_settings;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;
 pub mod profile_page_doc;
+pub mod referral_catalog;
 // ZEB-321 Phase 1 Task 7: debounced background task that re-emits this
 // device's ReachabilityAnnounce on startup / network change / idle tick /
 // manual force-notify. Wired into the event loop by Task 8.
@@ -4699,17 +4701,41 @@ pub(crate) async fn start_node_inner(
                             .with_auto_accept_known(friend_auto_accept_known_for_state),
                         );
 
-                        // Multiplex both acceptors behind the single dispatcher
-                        // slot the accept loop drives. The accept loop forwards
-                        // BOTH `harmony/handshake/v1` and `harmony/friend/v1`
-                        // here; the multiplexer re-reads `conn.alpn()` and
-                        // routes friend → friend_acceptor, else → invite.
+                        // ZEB-375 (Friends Phase 2a): build the friend-PEX
+                        // referral-catalog acceptor from the SAME read-only
+                        // sources the friend acceptor uses (crdt_state,
+                        // hlc_tracker, self_owner, this device's own
+                        // EnrollmentCert + device-#2 signing key). It is strictly
+                        // read-only — no app handle, no pkarr publisher, no
+                        // keytree — and serves a signed catalog on the
+                        // `harmony/friend-pex/v1` ALPN.
+                        let pex_acceptor: std::sync::Arc<
+                            dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
+                        > = std::sync::Arc::new(
+                            crate::iroh_pex_acceptor::IrohFriendPexAcceptor::new(
+                                std::sync::Arc::clone(&crdt_state),
+                                std::sync::Arc::clone(&tracker),
+                                device_id.clone(),
+                                self_owner,
+                                own_enrollment_cert_for_friend.clone(),
+                                std::sync::Arc::clone(&community_signing_key_arc),
+                            ),
+                        );
+
+                        // Multiplex all three acceptors behind the single
+                        // dispatcher slot the accept loop drives. The accept loop
+                        // forwards `harmony/handshake/v1`, `harmony/friend/v1`,
+                        // and `harmony/friend-pex/v1` here; the multiplexer
+                        // re-reads `conn.alpn()` and routes friend →
+                        // friend_acceptor, friend-pex → pex_acceptor, else →
+                        // invite.
                         let dispatcher: std::sync::Arc<
                             dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
                         > = std::sync::Arc::new(
                             crate::iroh_friend_acceptor::MultiplexHandshakeDispatcher::new(
                                 invite_acceptor,
                                 friend_acceptor,
+                                pex_acceptor,
                             ),
                         );
                         if let Err(_dispatcher_back) =
@@ -33999,6 +34025,39 @@ pub fn list_friends_inner(state: &crate::owner_state_crdt::OwnerState) -> Vec<Fr
 /// the caller should `notify_dirty` the sync engine), `Ok(false)` for the
 /// idempotent no-op on an already-`Revoked` peer (nothing changed — skip the
 /// notify so we don't churn an owner-state re-sync).
+/// ZEB-375 Phase 2a Task 6: pure core for `set_friend_referrable`.
+///
+/// Looks up the existing `FriendEntry` for `owner`. On a real change, returns
+/// `Ok(Some(clone))` with `referrable` set to the new value and `learned_at`
+/// bumped to `at`, PRESERVING every other field (`master_ed25519`, `display`,
+/// `status`, `established_via`, `sealed_secret`); the caller LWW-applies it.
+/// Returns `Ok(None)` when the value is unchanged — an idempotent no-op that
+/// skips the LWW bump so a redundant write can't clobber a concurrent toggle or
+/// churn an owner-state re-sync. Errors when `owner` is not a known friend
+/// (mirrors `unfriend_inner`'s unknown-peer guard), or when the friend is not
+/// `Active` (Pending/Revoked links can't be made referrable — mirrors
+/// `browse_friend_referrals`'s active-only contract).
+fn apply_set_referrable(
+    fg: &crate::friend_graph::FriendGraph,
+    owner: crate::owner_state_types::OwnerAddr,
+    referrable: bool,
+    at: crate::owner_state_types::Hlc,
+) -> Result<Option<crate::friend_graph::FriendEntry>, String> {
+    let Some(existing) = fg.friends.get(&owner) else {
+        return Err(format!("unknown friend: {}", hex::encode(owner.0)));
+    };
+    if existing.status != crate::friend_graph::FriendStatus::Active {
+        return Err(format!("friend is not active: {}", hex::encode(owner.0)));
+    }
+    if existing.referrable == referrable {
+        return Ok(None); // idempotent no-op: no LWW bump, no sync churn
+    }
+    let mut updated = existing.clone();
+    updated.referrable = referrable;
+    updated.learned_at = at;
+    Ok(Some(updated))
+}
+
 pub async fn unfriend_inner(
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: &std::sync::Arc<
@@ -34379,6 +34438,78 @@ async fn unfriend(
     Ok(())
 }
 
+/// ZEB-375 Phase 2a Task 6: toggle a friend's `referrable` flag — the sharer-side
+/// opt-in that governs whether this friend may be surfaced in our referral
+/// catalog to others (the Phase 2 awareness layer). `owner_id_hex` is the
+/// friend's 16-byte master `owner_id` in hex.
+///
+/// Mirrors `unfriend`: snapshot the `Arc` handles out of `NodeState` under the
+/// std `Mutex`, drop the lock before any `.await`, stamp a fresh `learned_at`
+/// HLC, LWW-apply the updated entry via `apply_friend_update` (so other devices
+/// converge), arm the debounced publish-root + persist on the owner-state
+/// SyncEngine, and emit `friend-list-changed` so the UI refreshes.
+#[tauri::command(rename_all = "snake_case")]
+async fn set_friend_referrable(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+    referrable: bool,
+) -> Result<(), String> {
+    let addr_bytes: [u8; 16] = hex::decode(&owner_id_hex)
+        .map_err(|e| format!("invalid owner_id_hex hex: {e}"))?
+        .try_into()
+        .map_err(|_| "owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
+    let owner = crate::owner_state_types::OwnerAddr(addr_bytes);
+
+    let (crdt_state, hlc_tracker, device_id, sync_engine) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.sync_engine.clone(),
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let at =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    {
+        let mut s = crdt_state.lock().await;
+        // `Ok(None)` ⇒ the flag already had the requested value: idempotent
+        // no-op. Skip the LWW write + notify + emit so we don't churn an
+        // owner-state re-sync or risk clobbering a concurrent toggle. The
+        // wasted HLC reservation above is harmless. A non-Active friend (or an
+        // unknown one) surfaces as `Err` to the UI.
+        let Some(updated) = apply_set_referrable(&s.friend_graph, owner, referrable, at)? else {
+            return Ok(());
+        };
+        match s.apply_friend_update(owner, updated) {
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+            | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {}
+            crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+                return Err(format!("set_friend_referrable apply rejected: {reason:?}"));
+            }
+        }
+    }
+
+    // Owner-state mutated → arm the debounced publish-root + persist on the
+    // owner-state SyncEngine so the new flag reaches the user's other devices
+    // and survives a clean shutdown (mirrors `unfriend`).
+    if let Some(engine) = sync_engine {
+        engine.notify_dirty();
+    }
+
+    let _ = app.emit("friend-list-changed", ());
+    Ok(())
+}
+
 /// ZEB-371 resolve-on-connect: resolve a friend's current iroh reachability via
 /// their private Case-D pkarr slot, so we can (re)dial them across WAN without
 /// any shared session or global discoverability.
@@ -34468,6 +34599,273 @@ async fn connectivity_resolve_friend(
             .map_err(|e| format!("decode case-d routing blob: {e}"))?;
 
     Ok(Some(DiscoveredRecord::from(routing)))
+}
+
+/// ZEB-375 Phase 2a Task 7: browse an Active friend's referral catalog (the
+/// awareness layer). Resolves the friend via their private Case-D slot, dials
+/// the `harmony/friend-pex/v1` ALPN, sends a device-#2-signed `CatalogRequest`,
+/// VERIFIES the returned `ReferralCatalog` (author == the friend we asked,
+/// subject == us), and projects each entry into a `ReferralView` (flagging peers
+/// already in our own friend graph). A verify failure or unreachable friend
+/// rejects the whole call — no partial trust, no "request introduction" action
+/// (that is Phase 2b).
+///
+/// Reuses `connectivity_resolve_friend`'s Case-D resolve verbatim and mirrors
+/// `add_friend_by_key`'s dial+frame discipline (but on the PEX ALPN). `owner_id_hex`
+/// is the friend's 16-byte master `owner_id` in hex.
+#[tauri::command(rename_all = "snake_case")]
+async fn browse_friend_referrals(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+) -> Result<Vec<crate::referral_catalog::ReferralView>, String> {
+    // 1. Snapshot the resources we need out of NodeState under the std lock, then
+    //    drop the guard before any owner-state `.await` or network IO. Mirrors
+    //    `connectivity_resolve_friend` (resolver/crdt/keytree) + `add_friend_by_key`
+    //    (iroh endpoint, self owner/cert/device-#2 key via the DmOutbox).
+    let (resolver, crdt_state, owner_keytree, iroh_endpoint, self_owner, dm_outbox) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pkarr_resolver.clone(),
+            g.crdt_state.clone(),
+            g.owner_keytree.clone(),
+            g.iroh_endpoint.clone(),
+            g.dm_self_owner,
+            g.dm_outbox.clone(),
+        )
+    };
+    let (
+        Some(resolver),
+        Some(crdt_state),
+        Some(keytree),
+        Some(iroh_endpoint),
+        Some(self_owner),
+        Some(dm_outbox),
+    ) = (
+        resolver,
+        crdt_state,
+        owner_keytree,
+        iroh_endpoint,
+        self_owner,
+        dm_outbox,
+    )
+    else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+
+    // The SELF device-#2 signing key + SELF EnrollmentCert live on the DmOutbox
+    // (same source `add_friend_by_key` uses for the friend handshake).
+    let (self_device2_key, self_enrollment) = {
+        let o = dm_outbox.lock().await;
+        (
+            std::sync::Arc::clone(&o.community_signing_key),
+            o.enrollment_cert.clone(),
+        )
+    };
+
+    // 2. Parse the friend's owner_id hex → OwnerAddr (same inline pattern as
+    //    unfriend / set_friend_referrable).
+    let friend_owner_16: [u8; 16] = hex::decode(&owner_id_hex)
+        .map_err(|e| format!("invalid owner_id_hex hex: {e}"))?
+        .try_into()
+        .map_err(|_| "owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
+    let friend_owner = crate::owner_state_types::OwnerAddr(friend_owner_16);
+
+    // 3. Read the friend's entry under the CRDT lock: require Active + a sealed
+    //    rendezvous secret, and snapshot the friend graph for the projection
+    //    step. Drop the lock before any IO.
+    let (sealed_secret, friend_graph_snapshot) = {
+        let s = crdt_state.lock().await;
+        let Some(entry) = s.friend_graph.friends.get(&friend_owner) else {
+            return Err("not an active friend".to_string());
+        };
+        if entry.status != crate::friend_graph::FriendStatus::Active {
+            return Err("not an active friend".to_string());
+        }
+        let Some(blob) = entry.sealed_secret.clone() else {
+            return Err("friend has no rendezvous secret".to_string());
+        };
+        (blob, s.friend_graph.clone())
+    };
+
+    // 4. Decrypt the per-friendship secret + Case-D resolve the friend's current
+    //    reachability — REUSING `connectivity_resolve_friend`'s logic.
+    let secret = crate::owner_state_crypto::decrypt_friend_secret(
+        &keytree,
+        &friend_owner_16,
+        &sealed_secret,
+    )
+    .map_err(|_| "friend unreachable".to_string())?;
+
+    let Some(blob) =
+        crate::pkarr_friend_publisher::resolve_friend_case_d(&resolver, &secret, &friend_owner_16)
+            .await?
+    else {
+        return Err("friend unreachable".to_string());
+    };
+    if blob.is_empty() {
+        // Publisher emits an empty blob when iroh is down (un-dial-able).
+        return Err("friend unreachable".to_string());
+    }
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(blob.as_slice())
+            .map_err(|e| format!("decode case-d routing blob: {e}"))?;
+
+    // Synthesize an EndpointAddr from the verified routing record (same inline
+    // synthesis `add_friend_by_key` does from its Case-B routing payload).
+    let target_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode target iroh_node_id: {e}"))?;
+    let mut target_addr = iroh::EndpointAddr::new(target_iroh_id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => target_addr = target_addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        target_addr = target_addr.with_ip_addr(*da);
+    }
+
+    // 5. Dial the friend-PEX ALPN + open a bi-stream, bounded by the same dial
+    //    config `add_friend_by_key` uses.
+    let dial_config = HandshakeDialConfig::from_env();
+    let conn = match tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint.inner().connect(
+            target_addr,
+            crate::iroh_endpoint::alpn::HARMONY_FRIEND_PEX_V1,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("friend unreachable: iroh connect failed: {e}")),
+        Err(_elapsed) => {
+            return Err(format!(
+                "friend unreachable: iroh connect timeout after {}ms",
+                dial_config.connect_timeout.as_millis()
+            ));
+        }
+    };
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Err(format!("friend unreachable: open_bi failed: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Err(format!(
+                    "friend unreachable: open_bi timeout after {}ms",
+                    dial_config.open_bi_timeout.as_millis()
+                ));
+            }
+        };
+
+    // 6. Build + device-#2-sign a CatalogRequest from us (subject) to the friend
+    //    (target), encode it, and write [u32 LE len][body].
+    let req = crate::referral_catalog::sign_catalog_request(
+        &self_device2_key,
+        self_owner,
+        friend_owner,
+        self_enrollment.clone(),
+    );
+    let wire = crate::referral_catalog::encode_catalog_request(&req)
+        .map_err(|e| format!("encode catalog request: {e:?}"))?;
+    let wire_len = wire.len() as u32;
+
+    let write_prefix = async {
+        send.write_all(&wire_len.to_le_bytes())
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("friend unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("friend unreachable: request length-prefix write timeout".to_string());
+        }
+    }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write request body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("friend unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("friend unreachable: request body write timeout".to_string());
+        }
+    }
+    if let Err(e) = send.finish() {
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Err(format!("friend unreachable: send.finish failed: {e}"));
+    }
+
+    // 7. Read [u32 LE length-prefix][ReferralCatalog].
+    let read_response = async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("read length-prefix: {e}"))?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > crate::referral_catalog::PEX_MAX_PACKET_LEN {
+            return Err(format!(
+                "response length out of bounds: len={len} max={}",
+                crate::referral_catalog::PEX_MAX_PACKET_LEN
+            ));
+        }
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read response body: {e}"))?;
+        Ok::<Vec<u8>, String>(body)
+    };
+    let response_bytes =
+        match tokio::time::timeout(dial_config.response_read_timeout, read_response).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"response-read-failed");
+                return Err(format!("friend unreachable: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"response-read-timeout");
+                return Err("friend unreachable: catalog response timeout".to_string());
+            }
+        };
+
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"friend-pex-complete");
+    drop(conn);
+
+    let cat = crate::referral_catalog::decode_referral_catalog(&response_bytes)
+        .map_err(|e| format!("decode referral catalog: {e:?}"))?;
+
+    // 8. VERIFY the catalog: author MUST be the friend we asked, subject MUST be
+    //    us. A verify failure rejects the whole call — no partial trust.
+    crate::referral_catalog::verify_referral_catalog(&cat, friend_owner, self_owner)
+        .map_err(|e| format!("catalog verify failed: {e:?}"))?;
+
+    // 9. Project the verified entries against our own friend graph.
+    Ok(crate::referral_catalog::project_referrals(
+        &cat,
+        &friend_graph_snapshot,
+    ))
 }
 
 // ── ZEB-371 Task 13: Path A user-facing friend IPCs ──────────────────
@@ -35147,7 +35545,7 @@ async fn add_friend_by_key(
 mod friend_ipc_tests {
     use super::*;
     use crate::friend_graph::{
-        owner_id_from_master_ed25519, FriendEntry, FriendOrigin, FriendStatus,
+        owner_id_from_master_ed25519, FriendEntry, FriendGraph, FriendOrigin, FriendStatus,
     };
     use crate::owner_state_crdt::OwnerState;
     use crate::owner_state_types::{Hlc, OwnerAddr};
@@ -35371,6 +35769,93 @@ mod friend_ipc_tests {
             entry.sealed_secret, None,
             "revoke must clear the rendezvous secret"
         );
+    }
+
+    // ── ZEB-375 Phase 2a Task 6: set_friend_referrable pure core ──────────────
+
+    #[test]
+    fn apply_set_referrable_flips_and_bumps() {
+        // An Active friend with referrable=false…
+        let (addr, mut active) = friend_entry(0x55, FriendStatus::Active, 3);
+        active.referrable = false;
+        let mut fg = FriendGraph::default();
+        fg.friends.insert(addr, active.clone());
+
+        // …flipped to referrable=true at a strictly-newer HLC.
+        let updated = apply_set_referrable(&fg, addr, true, hlc(9))
+            .expect("setting referrable on a known friend succeeds")
+            .expect("a real change returns Some(updated)");
+
+        assert!(updated.referrable, "referrable flag is flipped on");
+        assert_eq!(updated.learned_at, hlc(9), "learned_at is bumped to `at`");
+        // ALL other fields are preserved verbatim.
+        assert_eq!(
+            updated.status,
+            FriendStatus::Active,
+            "status is preserved (only referrable + learned_at change)"
+        );
+        assert_eq!(
+            updated.master_ed25519, active.master_ed25519,
+            "master key is preserved (the addr↔key invariant must still hold)"
+        );
+        assert_eq!(updated.display, active.display, "display is preserved");
+        assert_eq!(
+            updated.established_via, active.established_via,
+            "provenance is preserved"
+        );
+        assert_eq!(
+            updated.sealed_secret, active.sealed_secret,
+            "sealed_secret is preserved"
+        );
+    }
+
+    #[test]
+    fn apply_set_referrable_unknown_is_error() {
+        let fg = FriendGraph::default();
+        let unknown = OwnerAddr([0xEE; 16]);
+        let err = apply_set_referrable(&fg, unknown, true, hlc(9))
+            .expect_err("setting referrable on a non-friend errors");
+        assert!(err.contains("unknown friend"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_set_referrable_same_value_is_noop() {
+        // An Active friend already at referrable=false…
+        let (addr, mut active) = friend_entry(0x55, FriendStatus::Active, 3);
+        active.referrable = false;
+        let mut fg = FriendGraph::default();
+        fg.friends.insert(addr, active);
+
+        // …setting it to the SAME value is an idempotent no-op: `Ok(None)`,
+        // so the caller skips the LWW bump (no sync churn, no clobber).
+        let outcome = apply_set_referrable(&fg, addr, false, hlc(9))
+            .expect("setting referrable to its current value succeeds");
+        assert!(
+            outcome.is_none(),
+            "unchanged value returns Ok(None) — no LWW write, no learned_at bump"
+        );
+    }
+
+    #[test]
+    fn apply_set_referrable_non_active_is_error() {
+        // A Pending friend cannot be made referrable — only Active links can.
+        let (pending_addr, pending) = friend_entry(0x77, FriendStatus::Pending, 3);
+        let mut fg = FriendGraph::default();
+        fg.friends.insert(pending_addr, pending);
+        let err = apply_set_referrable(&fg, pending_addr, true, hlc(9))
+            .expect_err("setting referrable on a Pending friend errors");
+        assert!(err.contains("not active"), "got: {err}");
+        // …and so is unsetting it (any value errors on a non-Active link).
+        let err = apply_set_referrable(&fg, pending_addr, false, hlc(9))
+            .expect_err("unsetting referrable on a Pending friend errors");
+        assert!(err.contains("not active"), "got: {err}");
+
+        // A Revoked friend is equally rejected.
+        let (revoked_addr, revoked) = friend_entry(0x88, FriendStatus::Revoked, 3);
+        fg.friends.insert(revoked_addr, revoked);
+        let err = apply_set_referrable(&fg, revoked_addr, true, hlc(9))
+            .expect_err("setting referrable on a Revoked friend errors");
+        assert!(err.contains("not active"), "got: {err}");
     }
 
     // ── ZEB-370 (cursor review): generate_friend_token publisher requirement ──
@@ -36203,8 +36688,12 @@ pub fn run() {
             redeem_friend_token,
             list_friends,
             unfriend,
+            // ZEB-375 Phase 2a: toggle a friend's referral-catalog opt-in.
+            set_friend_referrable,
             // ZEB-371: resolve a friend's reachability via their Case-D slot.
             connectivity_resolve_friend,
+            // ZEB-375 Phase 2a Task 7: browse a friend's referral catalog.
+            browse_friend_referrals,
             // ZEB-371 Task 13: Path A user-facing friend IPCs.
             add_friend_by_key,
             list_pending_friend_requests,
