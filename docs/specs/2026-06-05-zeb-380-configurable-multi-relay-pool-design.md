@@ -71,8 +71,12 @@ Add a synchronous accessor so the health flows through `NetworkHealthService::sn
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RelayState { Healthy, CoolingDown { until_ms: u64 } }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum RelayOutcome { Success, Timeout, Http(u16) }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RelayOutcome { Success, Timeout, Transport, Http(u16) }
+// `Transport` (added during PR-1 impl) = a non-timeout transport failure
+// (connection refused / DNS / TLS), split from `Timeout` via
+// `reqwest::Error::is_timeout()` so the health badge is honest. PR-2's
+// `RelayOutcomeWire` + TS type mirror all four variants.
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RelayHealth {
