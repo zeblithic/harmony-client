@@ -85,13 +85,12 @@ harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "044
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
 harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
 harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a", features = ["recovery"] }
-# ZEB-323 Phase 2b: pkarr-based discovery policies; bumped past the PR #270 crate
-# to the PR #271 squash-merge on harmony main (3822fc73, ZEB-371 PkarrCase::Friend)
-# for Case-D friend rendezvous. (#271 was squash-merged, so the prior branch-SHA
-# pin was NOT an ancestor of main — re-pinned to the main commit.) test-fixtures
-# feature is activated only for dev-dependencies below so MockPkarrRelay is
-# excluded from release binaries (round-1 review fix).
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony", rev = "3822fc7309accd935c762e35dc63194575aea689" }
+# ZEB-323 Phase 2b: pkarr-based discovery policies. Pinned to harmony main
+# 2f9541f (ZEB-381: webpki relay-TLS fix, harmony#272), which sits directly atop
+# the PR #271 squash-merge (3822fc73, ZEB-371 PkarrCase::Friend for Case-D friend
+# rendezvous). test-fixtures feature is activated only for the dev-dependency
+# below so MockPkarrRelay is excluded from release binaries (round-1 review fix).
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony", rev = "2f9541ffe29eae3a45830038e76afbcda97ae13d" }
 blake3 = "1"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
@@ -153,7 +152,7 @@ tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
 # Activate test-fixtures feature for harmony-pkarr in dev/test builds only,
 # so MockPkarrRelay (an axum HTTP server) is excluded from release binaries.
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony", rev = "3822fc7309accd935c762e35dc63194575aea689", features = ["test-fixtures"] }
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony", rev = "2f9541ffe29eae3a45830038e76afbcda97ae13d", features = ["test-fixtures"] }
 
 # ZEB-156: the rev above (04449d60) is harmony main after PR #269 merged
 # — it includes the narrow `NodeRuntime::remove_content` +
