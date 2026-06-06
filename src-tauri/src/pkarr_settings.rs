@@ -57,9 +57,12 @@ pub const MAX_RELAYS: usize = 8;
 
 /// Validate + normalize a user-submitted relay list. Rejects an empty list,
 /// blank/malformed URLs, non-`https` remote schemes (`http` allowed only for
-/// loopback / private hosts — pkarr's local-relay-on-:6881 guidance), and more
-/// than [`MAX_RELAYS`]. Dedups on the trailing-slash-normalized URL, preserving
-/// first-seen order. Returns the normalized list on success.
+/// loopback / private hosts — pkarr's local-relay-on-:6881 guidance), URLs
+/// carrying a path/query/fragment (a relay is a `scheme://host` base — pkarr
+/// builds requests as `{base}/{z32_key}`, so a path-bearing base would silently
+/// misroute every publish/resolve), and more than [`MAX_RELAYS`]. Dedups on the
+/// trailing-slash-normalized URL, preserving first-seen order. Returns the
+/// normalized list on success.
 pub fn validate_relay_urls(input: Vec<String>) -> Result<Vec<String>, String> {
     if input.is_empty() {
         return Err("at least one relay is required".to_string());
@@ -84,6 +87,19 @@ pub fn validate_relay_urls(input: Vec<String>) -> Result<Vec<String>, String> {
                 }
             }
             other => return Err(format!("unsupported relay scheme '{other}': {trimmed}")),
+        }
+        // A relay is a `scheme://host[:port]` base; pkarr appends `/{z32_key}`.
+        // A path (other than the root `/`), query, or fragment on the base would
+        // silently misroute every request and quietly cooldown the relay — reject
+        // it up front for a clear error instead of a mysterious dead relay.
+        let path = parsed.path();
+        if (!path.is_empty() && path != "/")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(format!(
+                "relay URL must be scheme://host only (no path/query/fragment): {trimmed}"
+            ));
         }
         let normalized = trimmed.trim_end_matches('/').to_string();
         if seen.insert(normalized.clone()) {
@@ -255,6 +271,22 @@ mod tests {
             .map(|i| format!("https://r{i}.example.com"))
             .collect();
         assert!(validate_relay_urls(many).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_path_query_fragment() {
+        // A relay base must be scheme://host only — a path/query/fragment would
+        // silently misroute pkarr's `{base}/{z32_key}` requests.
+        assert!(validate_relay_urls(vec!["https://relay.pkarr.org/foo".into()]).is_err());
+        assert!(validate_relay_urls(vec!["https://relay.pkarr.org/?x=1".into()]).is_err());
+        assert!(validate_relay_urls(vec!["https://relay.pkarr.org/#frag".into()]).is_err());
+        // A bare host (with or without a single trailing slash) is still accepted
+        // and normalized.
+        assert_eq!(
+            validate_relay_urls(vec!["https://relay.pkarr.org/".into()])
+                .expect("trailing slash ok"),
+            vec!["https://relay.pkarr.org".to_string()]
+        );
     }
 
     #[test]
