@@ -4,6 +4,7 @@
 //! peer whose dial failed, or whose transport later drops, is out of scope — that is
 //! liveness/reconnection (ZEB-321 Phase 3).
 use std::collections::{HashSet, VecDeque};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -81,6 +82,23 @@ fn iroh_locator(node_id: &[u8; 32]) -> String {
     format!("iroh/{}", hex::encode(node_id))
 }
 
+/// ZEB-390: derive the deterministic zenoh `ZenohIdProto` **hex string** for a
+/// node from its 32-byte iroh `EndpointId`. A `ZenohId` is at most 16 bytes
+/// ([`ZenohIdProto::MAX_SIZE`]), so we take the first 16 bytes of the node-id —
+/// an Ed25519 public key, uniformly random, so a 16-byte-prefix collision across
+/// a community is ~2^-128.
+///
+/// Both a node's OWN zenoh session id (`config["id"]`, set in `event_loop::run`
+/// before `zenoh::open`) and the dialer's `connect_peer` target zid (below) are
+/// derived through THIS function and parsed via the SAME `ZenohIdProto::from_str`
+/// (zenoh's `config::ZenohId::from_str` delegates straight to it), so the two
+/// sides are byte-identical regardless of zenoh's internal id endianness. That
+/// equality is what makes `connect_peer`'s post-handshake
+/// `get_transport_unicast(zid)` lookup actually find the peer.
+pub fn deterministic_zid_hex(node_id: &[u8; 32]) -> String {
+    hex::encode(&node_id[..16])
+}
+
 /// Run the dial driver until the hint channel closes (node stop drops the resolver's
 /// sender). `backoff_base` is the first retry delay (doubles each retry); tests pass
 /// ZERO.
@@ -141,9 +159,16 @@ pub async fn run_dial_driver(
     tracing::debug!("ZEB-373: dial driver stopping (hint channel closed)");
 }
 
-/// Production `PeerDialer`: dials through the live zenoh `Runtime` via the
-/// un-filtered `connect_peer` path. The placeholder zid is FRESH per dial (zenoh
-/// uses it only for pre-dial dedup; the real peer zid is negotiated on the wire).
+/// Production `PeerDialer`: dials through the live zenoh `Runtime`'s
+/// `connect_peer`. ZEB-390: the target zid is DETERMINISTIC — derived from the
+/// peer's iroh node-id via [`deterministic_zid_hex`] — not a random placeholder.
+/// `connect_peer` reports success by looking up a transport under the zid we pass
+/// AFTER the link handshake (zenoh registers the transport under the peer's
+/// wire-negotiated zid), so the zid we pass MUST equal the zid the peer set for
+/// itself (every node sets `config["id"]` from its own node-id; see
+/// `event_loop::run`). The previous `ZenohIdProto::rand()` placeholder never
+/// matched the wire zid, so `connect_peer` always returned `false` — the dial
+/// was reported as failed even when the iroh link opened cleanly.
 pub struct RuntimePeerDialer {
     runtime: Runtime,
 }
@@ -154,7 +179,7 @@ impl RuntimePeerDialer {
 }
 #[async_trait::async_trait]
 impl PeerDialer for RuntimePeerDialer {
-    async fn dial(&self, _node_id: [u8; 32], locator: String) -> bool {
+    async fn dial(&self, node_id: [u8; 32], locator: String) -> bool {
         let loc = match locator.parse::<Locator>() {
             Ok(l) => l,
             Err(e) => {
@@ -162,8 +187,17 @@ impl PeerDialer for RuntimePeerDialer {
                 return false;
             }
         };
-        let placeholder = ZenohIdProto::rand();
-        self.runtime.connect_peer(&placeholder, &[loc]).await
+        // ZEB-390: target the peer's DETERMINISTIC zid (derived from its iroh
+        // node-id), not a random placeholder — see `deterministic_zid_hex`.
+        let zid_hex = deterministic_zid_hex(&node_id);
+        let zid = match ZenohIdProto::from_str(&zid_hex) {
+            Ok(z) => z,
+            Err(e) => {
+                tracing::warn!("ZEB-390: bad derived zid {zid_hex}: {e}");
+                return false;
+            }
+        };
+        self.runtime.connect_peer(&zid, &[loc]).await
     }
 }
 
@@ -311,5 +345,63 @@ mod tests {
         assert_eq!(s.skipped_duplicate, 1, "second hint skipped as duplicate");
         assert_eq!(s.attempts, 3, "3 dial attempts from the single round");
         assert_eq!(dialer.calls.load(Ordering::SeqCst), 3, "no re-dial");
+    }
+
+    /// ZEB-390: the derived zid hex is deterministic (stable per node-id),
+    /// exactly 16 bytes wide, and distinct for node-ids that differ within their
+    /// first 16 bytes.
+    #[test]
+    fn deterministic_zid_hex_is_stable_and_distinct() {
+        let a = [0x11u8; 32];
+        let mut b = [0x11u8; 32];
+        b[15] = 0x22; // differs within the first 16 bytes
+        let mut tail_only = [0x11u8; 32];
+        tail_only[16] = 0x99; // differs ONLY past byte 16 → same 16-byte prefix
+
+        assert_eq!(
+            deterministic_zid_hex(&a),
+            deterministic_zid_hex(&a),
+            "stable for the same node-id"
+        );
+        assert_eq!(
+            deterministic_zid_hex(&a).len(),
+            32,
+            "16 bytes -> 32 hex chars (ZenohIdProto::MAX_SIZE)"
+        );
+        assert_ne!(
+            deterministic_zid_hex(&a),
+            deterministic_zid_hex(&b),
+            "differing 16-byte prefixes must yield distinct zids"
+        );
+        assert_eq!(
+            deterministic_zid_hex(&a),
+            deterministic_zid_hex(&tail_only),
+            "only the first 16 bytes are significant"
+        );
+    }
+
+    /// ZEB-390 load-bearing invariant: the zid the dialer passes to
+    /// `connect_peer` (via `ZenohIdProto::from_str`) must equal the zid a node
+    /// derives for its own `config["id"]` (via `zenoh::config::ZenohId::from_str`,
+    /// which delegates to the same `ZenohIdProto::from_str`). If these ever
+    /// diverged, `connect_peer`'s post-handshake transport lookup would miss and
+    /// every dynamic dial would be reported as failed — the original ZEB-390 bug.
+    #[test]
+    fn config_id_and_dialer_derive_equal_zids() {
+        let node_id = [0xABu8; 32];
+        let hex = deterministic_zid_hex(&node_id);
+
+        // What the dialer passes to connect_peer:
+        let dialer_zid = ZenohIdProto::from_str(&hex).expect("dialer zid parses");
+
+        // What zenoh derives from config["id"] = "<hex>":
+        let config_zid: ZenohIdProto = zenoh::config::ZenohId::from_str(&hex)
+            .expect("config zid parses")
+            .into();
+
+        assert_eq!(
+            dialer_zid, config_zid,
+            "config-derived zid must equal the dialer's connect_peer target"
+        );
     }
 }

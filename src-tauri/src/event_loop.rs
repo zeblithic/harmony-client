@@ -604,6 +604,22 @@ pub async fn run<R: Runtime>(
     }
 
     let mut config = zenoh::Config::default();
+    // ZEB-390: give this session a DETERMINISTIC zenoh id derived from our own
+    // iroh node-id, so a peer dialing us via the dynamic dial driver can compute
+    // the SAME zid and `connect_peer`'s post-handshake transport lookup actually
+    // matches. Previously every node took a random per-boot zid, so the dialer's
+    // `connect_peer(ZenohIdProto::rand(), ...)` could never find the established
+    // transport and ALWAYS reported failure → no Zenoh sync after a join. Must be
+    // set BEFORE `zenoh::open`. See `iroh_dial_driver::deterministic_zid_hex`.
+    if let Some(ref ih) = iroh_handles {
+        let zid_hex =
+            crate::iroh_dial_driver::deterministic_zid_hex(ih.endpoint.node_id().as_bytes());
+        if let Err(e) = config.insert_json5("id", &format!("\"{zid_hex}\"")) {
+            let e = format!("zenoh config error (id): {e}");
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    }
     // ZEB-368: merge the LAN/Reticulum connect endpoint with every iroh peer the
     // resolver knows, so the orchestrator's startup connect dials them through our
     // factory manager's new_link(). Dynamic mid-session dial is deferred to ZEB-373.
