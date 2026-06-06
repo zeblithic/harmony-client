@@ -198,7 +198,10 @@ describe('NetworkHealthView', () => {
     await waitFor(() => screen.getByTestId('nh-relay-badge'));
     const badge = screen.getByTestId('nh-relay-badge');
     expect(badge.textContent).toContain('Cooling down');
-    expect(badge.textContent).toContain('s)');
+    // ZEB-384: the countdown must be a real number, not NaN (the wire field is
+    // `untilMs`; a snake_case `until_ms` regression renders `(NaNs)`).
+    expect(badge.textContent).toMatch(/Cooling down \(\d+s\)/);
+    expect(badge.textContent).not.toContain('NaN');
   });
 
   it('renders Last error: http 503 for a relay with an http outcome', async () => {
