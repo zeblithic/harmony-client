@@ -19,7 +19,7 @@ const mockInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 
 function emptySnap(): NetworkHealthSnapshot {
   return {
-    schemaVersion: 1,
+    schemaVersion: 3,
     capturedAtMs: 0,
     appVersion: 'test',
     platform: 'test',
@@ -30,6 +30,7 @@ function emptySnap(): NetworkHealthSnapshot {
       identityLastPublishMs: null,
       communityPublishCount: 0,
       recentFallbackEvents: [],
+      relays: [],
     },
   };
 }
@@ -105,6 +106,38 @@ describe('NetworkHealthView', () => {
     expect(screen.getByTestId('nh-starting-up')).toBeTruthy();
   });
 
+  it('renders pkarr-relays section during startup (myNetwork null) — Cursor round-4 Medium fix', async () => {
+    // Snapshot with myNetwork=null but a populated relay list — the relay
+    // health section must be visible while the network is still starting up.
+    const snap: NetworkHealthSnapshot = {
+      ...emptySnap(),
+      myNetwork: null,
+      pkarrStatus: {
+        identityPublished: false,
+        identityLastPublishMs: null,
+        communityPublishCount: 0,
+        recentFallbackEvents: [],
+        relays: [
+          {
+            url: 'https://relay.pkarr.org',
+            state: { kind: 'healthy' },
+            lastOutcome: null,
+            lastSuccessMs: null,
+          },
+        ],
+      },
+    };
+    mockInvoke.mockResolvedValue(snap);
+    render(NetworkHealthView);
+
+    // Starting-up banner must still appear (myNetwork is null).
+    await waitFor(() => screen.getByTestId('nh-starting-up'));
+
+    // AND the pkarr-relays section must also be visible with its relay row.
+    expect(screen.getByTestId('nh-pkarr-relays')).toBeTruthy();
+    expect(screen.getByTestId('nh-relay-row')).toBeTruthy();
+  });
+
   it('renders summary card when my_network is populated', async () => {
     mockInvoke.mockResolvedValue(readySnap());
     render(NetworkHealthView);
@@ -139,6 +172,58 @@ describe('NetworkHealthView', () => {
     render(NetworkHealthView);
     await waitFor(() => screen.getByTestId('nh-dial-empty'));
     expect(screen.getByTestId('nh-dial-empty')).toBeTruthy();
+  });
+
+  it('renders a Cooling down badge for a coolingDown relay', async () => {
+    const snap: NetworkHealthSnapshot = {
+      ...readySnap(),
+      pkarrStatus: {
+        identityPublished: false,
+        identityLastPublishMs: null,
+        communityPublishCount: 0,
+        recentFallbackEvents: [],
+        relays: [
+          {
+            url: 'https://relay.pkarr.org',
+            // untilMs far in the future so seconds count is well above 0
+            state: { kind: 'coolingDown', untilMs: Date.now() + 90_000 },
+            lastOutcome: null,
+            lastSuccessMs: null,
+          },
+        ],
+      },
+    };
+    mockInvoke.mockResolvedValue(snap);
+    render(NetworkHealthView);
+    await waitFor(() => screen.getByTestId('nh-relay-badge'));
+    const badge = screen.getByTestId('nh-relay-badge');
+    expect(badge.textContent).toContain('Cooling down');
+    expect(badge.textContent).toContain('s)');
+  });
+
+  it('renders Last error: http 503 for a relay with an http outcome', async () => {
+    const snap: NetworkHealthSnapshot = {
+      ...readySnap(),
+      pkarrStatus: {
+        identityPublished: false,
+        identityLastPublishMs: null,
+        communityPublishCount: 0,
+        recentFallbackEvents: [],
+        relays: [
+          {
+            url: 'https://relay.pkarr.org',
+            state: { kind: 'healthy' },
+            lastOutcome: { kind: 'http', status: 503 },
+            lastSuccessMs: null,
+          },
+        ],
+      },
+    };
+    mockInvoke.mockResolvedValue(snap);
+    render(NetworkHealthView);
+    await waitFor(() => screen.getByTestId('nh-relay-last-error'));
+    const errEl = screen.getByTestId('nh-relay-last-error');
+    expect(errEl.textContent).toContain('Last error: http 503');
   });
 
   it('self-test button disables while running', async () => {

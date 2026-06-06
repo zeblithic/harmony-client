@@ -23,6 +23,7 @@ import type {
   RedemptionOutcome,
   ResolutionProgressEvent,
 } from './types/connectivity';
+import type { RelayHealth } from './types/network-health';
 
 /**
  * Returns this device's reachability snapshot, or `null` when the iroh
@@ -258,6 +259,91 @@ export function onIdentityDiscoverableChanged(cb: (enabled: boolean) => void): (
     destroyed = true;
     unlisten?.();
   };
+}
+
+// ---------------------------------------------------------------------------
+// ZEB-380: pkarr relay pool management IPCs
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the current pkarr relay pool with per-relay health snapshots.
+ *
+ * Each entry is a `RelayHealth` DTO (url + state + lastOutcome + lastSuccessMs).
+ */
+export async function getPkarrRelays(): Promise<RelayHealth[]> {
+  try {
+    return await invoke<RelayHealth[]>('get_pkarr_relays');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`get_pkarr_relays: ${msg}`);
+  }
+}
+
+/**
+ * Replaces the live pkarr relay pool with the provided URL list.
+ *
+ * The backend validates, persists, and hot-swaps the pool. On success it
+ * emits `connectivity-relays-changed` so any listener can re-fetch. Throws
+ * with a descriptive error string on invalid input (bad scheme, duplicate
+ * URLs, exceeds cap of 8, etc.).
+ */
+export async function setPkarrRelays(relays: string[]): Promise<RelayHealth[]> {
+  try {
+    // Returns the NEW authoritative list (same shape as getPkarrRelays), so the
+    // caller updates its view from the result with no separate refetch.
+    return await invoke<RelayHealth[]>('set_pkarr_relays', { relays });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`set_pkarr_relays: ${msg}`);
+  }
+}
+
+/**
+ * Resets the pkarr relay pool to the backend's recommended default set
+ * (`default_relays()`), persisted + hot-swapped live. Server-authoritative —
+ * the frontend does not need to know the default URL list.
+ */
+export async function resetPkarrRelays(): Promise<RelayHealth[]> {
+  try {
+    // Returns the NEW authoritative list (the recommended defaults), so the
+    // caller updates its view from the result with no separate refetch.
+    return await invoke<RelayHealth[]>('reset_pkarr_relays');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`reset_pkarr_relays: ${msg}`);
+  }
+}
+
+/**
+ * ZEB-380: add a single relay to the persisted pool (server-authoritative
+ * read-modify-write). The backend appends `url` to the CURRENT persisted list
+ * and re-validates, so a stale client view can never clobber a fresher pool.
+ */
+export async function addPkarrRelay(url: string): Promise<RelayHealth[]> {
+  try {
+    // Returns the NEW authoritative list (same shape as getPkarrRelays), so the
+    // caller updates its view from the result with no separate refetch.
+    return await invoke<RelayHealth[]>('add_pkarr_relay', { url });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`add_pkarr_relay: ${msg}`);
+  }
+}
+
+/**
+ * ZEB-380: remove a single relay from the persisted pool (server-authoritative
+ * read-modify-write). The backend filters the URL from the CURRENT persisted
+ * list and re-validates; removing the last relay is rejected server-side.
+ */
+export async function removePkarrRelay(url: string): Promise<RelayHealth[]> {
+  try {
+    // Returns the NEW authoritative list (same shape as getPkarrRelays), so the
+    // caller updates its view from the result with no separate refetch.
+    return await invoke<RelayHealth[]>('remove_pkarr_relay', { url });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`remove_pkarr_relay: ${msg}`);
+  }
 }
 
 /**

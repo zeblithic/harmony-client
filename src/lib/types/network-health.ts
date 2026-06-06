@@ -38,11 +38,32 @@ export interface PkarrFallbackHit {
   capturedAtMs: number;
 }
 
+// ZEB-380: per-relay health types. Rust uses serde internally-tagged enums
+// with rename_all = "camelCase", so wire shapes use `kind` discriminant.
+export type RelayState =
+  | { kind: 'healthy' }
+  | { kind: 'coolingDown'; untilMs: number };
+
+export type RelayOutcome =
+  | { kind: 'success' }
+  | { kind: 'timeout' }
+  | { kind: 'transport' }
+  | { kind: 'http'; status: number };
+
+export interface RelayHealth {
+  url: string;
+  state: RelayState;
+  lastOutcome: RelayOutcome | null;
+  lastSuccessMs: number | null;
+}
+
 export interface PkarrHealthSummary {
   identityPublished: boolean;
   identityLastPublishMs: number | null;
   communityPublishCount: number;
   recentFallbackEvents: PkarrFallbackHit[];
+  /** ZEB-380: per-relay health. Always present in schema v3+. */
+  relays: RelayHealth[];
 }
 
 export interface DynamicDialHit {

@@ -17,7 +17,13 @@
     getIdentityDiscoverable,
     setIdentityDiscoverable,
     onIdentityDiscoverableChanged,
+    getPkarrRelays,
+    addPkarrRelay,
+    removePkarrRelay,
+    resetPkarrRelays,
   } from '../connectivity-adapter';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import type { RelayHealth } from '../types/network-health';
 
   // Current persisted value — loaded on mount, updated on toggle.
   let enabled = $state(false);
@@ -29,6 +35,141 @@
 
   // Cleanup for the event listener.
   let stopListener: (() => void) | null = null;
+
+  // ZEB-380: relay manager state.
+  let relays = $state<RelayHealth[]>([]);
+  let newRelayUrl = $state('');
+  let relayError = $state<string | null>(null);
+  let relayPending = $state(false);
+  // True once the initial get_pkarr_relays fetch succeeds. Guards Add/Remove
+  // so they can never submit a payload built from an empty/unknown base list,
+  // which would clobber the persisted pool (Cursor Bugbot round-4 HIGH finding).
+  let relayLoaded = $state(false);
+  // Monotonic token to drop stale in-flight get_pkarr_relays responses: if a
+  // newer fetch starts before an older one resolves (e.g. a mutation-triggered
+  // refetch racing a connectivity-relays-changed refetch), only the newest
+  // result is applied (Cursor Bugbot round-5 Medium — out-of-order responses
+  // overwriting a fresher list).
+  let relayFetchSeq = 0;
+  // Unlisten for connectivity-relays-changed event.
+  let relaysUnlisten: UnlistenFn | null = null;
+  let relaysListenerDestroyed = false;
+
+  // ZEB-380 Fix 3: ticking `now` for cooling-down countdown badges.
+  let now = $state(Date.now());
+  let nowTimer: ReturnType<typeof setInterval> | null = null;
+  // Reactive: start/stop the 1s tick depending on whether any relay is cooling down.
+  $effect(() => {
+    const hasCooling = relays.some((r) => r.state.kind === 'coolingDown');
+    if (hasCooling && nowTimer === null) {
+      nowTimer = setInterval(() => {
+        now = Date.now();
+      }, 1000);
+    } else if (!hasCooling && nowTimer !== null) {
+      clearInterval(nowTimer);
+      nowTimer = null;
+    }
+  });
+
+  async function fetchRelays(): Promise<void> {
+    const seq = ++relayFetchSeq;
+    try {
+      const next = (await getPkarrRelays()) ?? [];
+      // Drop the result if a newer fetch superseded this one in flight.
+      if (seq !== relayFetchSeq) return;
+      relays = next;
+      relayError = null;
+      relayLoaded = true;
+    } catch (e) {
+      // Stale failures must not clobber a newer fetch's state either.
+      if (seq !== relayFetchSeq) return;
+      // fetchRelays is a REFRESH (onMount + the connectivity-relays-changed
+      // listener). Once a list is loaded — including one a mutation just
+      // applied authoritatively — a failed refresh must NOT surface an error
+      // over a list that is still current (the mutation already succeeded and
+      // persisted). Only an INITIAL load failure (no list yet) is user-facing.
+      if (!relayLoaded) {
+        relayError = e instanceof Error ? e.message : String(e);
+      }
+      // Do NOT set relayLoaded on failure — the base list is still unknown.
+    }
+  }
+
+  // Apply an authoritative relay list returned by a mutation (add/remove/reset).
+  // Unlike fetchRelays this can't fail — the list is already in hand — so it
+  // closes the "mutation succeeded but the follow-up refetch failed, leaving a
+  // stale list" gap (Cursor round-10 Medium). Claims the latest fetch token so
+  // an in-flight refetch can't later overwrite it with a stale read.
+  function applyAuthoritativeRelays(next: RelayHealth[]): void {
+    relayFetchSeq++;
+    relays = next ?? [];
+    relayError = null;
+    relayLoaded = true;
+  }
+
+  async function handleAddRelay(): Promise<void> {
+    const trimmed = newRelayUrl.trim();
+    // Guard: never submit an Add before the initial fetch succeeds (relayLoaded
+    // is defense-in-depth; the button is also disabled until then).
+    if (!relayLoaded) return;
+    if (!trimmed || relayPending) return;
+    relayPending = true;
+    relayError = null;
+    try {
+      // Server-authoritative read-modify-write: send only the new URL.
+      // The backend appends it to the CURRENT persisted list and re-validates,
+      // so a stale in-memory `relays` view can never clobber a fresher pool.
+      // It returns the new authoritative list, so we apply it directly — no
+      // refetch that could fail and strand a stale view.
+      const next = await addPkarrRelay(trimmed);
+      newRelayUrl = '';
+      applyAuthoritativeRelays(next);
+    } catch (e) {
+      relayError = e instanceof Error ? e.message : String(e);
+    } finally {
+      relayPending = false;
+    }
+  }
+
+  async function handleRemoveRelay(url: string): Promise<void> {
+    if (relayPending) return;
+    relayPending = true;
+    relayError = null;
+    try {
+      // Server-authoritative read-modify-write: send only the URL to remove.
+      // The backend filters the CURRENT persisted list and re-validates,
+      // guarding the >=1 invariant server-side as well. It returns the new
+      // authoritative list, applied directly — no refetch that could fail.
+      const next = await removePkarrRelay(url);
+      applyAuthoritativeRelays(next);
+    } catch (e) {
+      relayError = e instanceof Error ? e.message : String(e);
+    } finally {
+      relayPending = false;
+    }
+  }
+
+  async function handleRestoreRecommended(): Promise<void> {
+    if (relayPending) return;
+    relayPending = true;
+    relayError = null;
+    try {
+      // Server-authoritative reset returns the new authoritative list (the
+      // recommended defaults), applied directly — no refetch that could fail.
+      const next = await resetPkarrRelays();
+      applyAuthoritativeRelays(next);
+    } catch (e) {
+      relayError = e instanceof Error ? e.message : String(e);
+    } finally {
+      relayPending = false;
+    }
+  }
+
+  function relayStateLabel(relay: RelayHealth): string {
+    if (relay.state.kind === 'healthy') return 'Healthy';
+    const secsLeft = Math.max(0, Math.ceil((relay.state.untilMs - now) / 1000));
+    return `Cooling down (${secsLeft}s)`;
+  }
 
   onMount(async () => {
     // Subscribe to backend-side change events so that if another window
@@ -45,10 +186,35 @@
     } finally {
       loading = false;
     }
+
+    // ZEB-380: load relay pool and subscribe to live changes.
+    await fetchRelays();
+    // Race-safe: if destroyed before listen() resolves, immediately call
+    // the returned unlisten (mirrors onReachabilityChanged pattern).
+    // Wrap in try/catch so a failed Tauri event subscription (e.g. during
+    // tests or early teardown) does not produce an unhandled rejection.
+    try {
+      const resolved = await listen<null>('connectivity-relays-changed', () => {
+        void fetchRelays();
+      });
+      if (relaysListenerDestroyed) {
+        resolved();
+      } else {
+        relaysUnlisten = resolved;
+      }
+    } catch (e) {
+      console.error('NetworkDiscoverabilitySettings: failed to subscribe to relay changes', e);
+    }
   });
 
   onDestroy(() => {
     stopListener?.();
+    relaysListenerDestroyed = true;
+    relaysUnlisten?.();
+    if (nowTimer !== null) {
+      clearInterval(nowTimer);
+      nowTimer = null;
+    }
   });
 
   async function handleToggle(e: Event) {
@@ -109,6 +275,72 @@
       </span>
     </div>
   </label>
+</div>
+
+<!-- ZEB-380: relay manager -->
+<div class="discoverability-section" data-testid="relay-manager">
+  <div class="section-header">
+    <h4 class="section-title">Discovery Relays</h4>
+  </div>
+  <p class="toggle-hint">
+    Pkarr relays used for identity publishing and lookup. Changes apply live — no restart needed.
+  </p>
+
+  {#if relayError}
+    <p class="error-text" data-testid="relay-error">{relayError}</p>
+  {/if}
+
+  <ul class="relay-list" data-testid="relay-list">
+    {#each relays as relay (relay.url)}
+      <li class="relay-row" data-testid="relay-row">
+        <code class="relay-url" data-testid="relay-url">{relay.url}</code>
+        <span
+          class="relay-badge {relay.state.kind === 'healthy' ? 'badge-healthy' : 'badge-cooling'}"
+          data-testid="relay-badge"
+        >
+          {relayStateLabel(relay)}
+        </span>
+        <button
+          class="relay-remove"
+          data-testid="relay-remove"
+          disabled={!relayLoaded || relays.length <= 1 || relayPending}
+          onclick={() => handleRemoveRelay(relay.url)}
+          aria-label={`Remove relay ${relay.url}`}
+        >
+          Remove
+        </button>
+      </li>
+    {/each}
+  </ul>
+
+  <div class="relay-add-row" data-testid="relay-add-row">
+    <input
+      type="url"
+      class="relay-input"
+      placeholder="https://relay.example.com"
+      bind:value={newRelayUrl}
+      disabled={!relayLoaded || relayPending}
+      data-testid="relay-url-input"
+      aria-label="New relay URL"
+    />
+    <button
+      class="relay-add-btn"
+      disabled={!relayLoaded || !newRelayUrl.trim() || relayPending}
+      onclick={handleAddRelay}
+      data-testid="relay-add-button"
+    >
+      Add
+    </button>
+  </div>
+
+  <button
+    class="relay-restore-btn"
+    onclick={handleRestoreRecommended}
+    disabled={relayPending}
+    data-testid="relay-restore-button"
+  >
+    Restore recommended
+  </button>
 </div>
 
 <style>
@@ -218,5 +450,78 @@
     font-size: 12px;
     color: #d83c3e;
     margin: 4px 0 8px;
+  }
+
+  /* ZEB-380: relay manager */
+  .relay-list {
+    list-style: none;
+    padding: 0;
+    margin: 8px 0;
+  }
+
+  .relay-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    flex-wrap: wrap;
+  }
+
+  .relay-url {
+    font-size: 11px;
+    flex: 1;
+    word-break: break-all;
+  }
+
+  .relay-badge {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+
+  .badge-healthy {
+    background: #1a4a1a;
+    color: #5cb85c;
+  }
+
+  .badge-cooling {
+    background: #4a3a00;
+    color: #f0a020;
+  }
+
+  .relay-remove {
+    font-size: 11px;
+    padding: 1px 6px;
+    cursor: pointer;
+  }
+
+  .relay-add-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  .relay-input {
+    flex: 1;
+    font-size: 12px;
+    padding: 3px 6px;
+    background: var(--bg-tertiary, #333);
+    color: var(--text-primary, #eee);
+    border: 1px solid var(--border, #555);
+    border-radius: 3px;
+  }
+
+  .relay-add-btn,
+  .relay-restore-btn {
+    font-size: 11px;
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+
+  .relay-restore-btn {
+    margin-top: 6px;
+    display: block;
   }
 </style>

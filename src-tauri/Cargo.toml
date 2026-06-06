@@ -86,13 +86,17 @@ harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "0
 harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
 harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a", features = ["recovery"] }
 # ZEB-323 Phase 2b: pkarr-based discovery policies. Pinned to harmony main
-# eccf85b (ZEB-382: real pkarr wire format — z-base-32 keys + BEP44 big-endian
-# seq + DNS-packet payload via the upstream pkarr 3.10.0 codec, harmony#273;
-# proven live against relay.pkarr.org). Supersedes the prior 2f9541f pin
-# (ZEB-381 webpki relay-TLS fix, harmony#272). test-fixtures feature is activated
-# only for the dev-dependency below so MockPkarrRelay is excluded from release
-# binaries (round-1 review fix).
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "eccf85baf673f39a7729aa6db87cc3b0cd0e0215" }
+# 2aaf403 (ZEB-380 PR1, harmony#274: hot-swappable RelayPool + per-relay health —
+# RelayConfig / RelayHealth / RelayState / RelayOutcome + RelayClient::{set_relays,
+# relay_health, with_config}). Contains eccf85b (ZEB-382: real pkarr wire format —
+# z-base-32 keys + BEP44 big-endian seq + DNS-packet payload via the upstream
+# pkarr 3.10.0 codec, harmony#273; proven live against relay.pkarr.org), which it
+# supersedes. test-fixtures feature is activated only for the dev-dependency below
+# so MockPkarrRelay is excluded from release binaries (round-1 review fix).
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "2aaf403bbb90e064892a08737fca7ed0fd30ff79" }
+# ZEB-380: relay-URL validation (scheme + host checks) in pkarr_settings.rs.
+# Already in the lock transitively (reqwest/iroh); a direct entry just makes it importable.
+url = "2"
 blake3 = "1"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
@@ -154,7 +158,7 @@ tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
 # Activate test-fixtures feature for harmony-pkarr in dev/test builds only,
 # so MockPkarrRelay (an axum HTTP server) is excluded from release binaries.
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "eccf85baf673f39a7729aa6db87cc3b0cd0e0215", features = ["test-fixtures"] }
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "2aaf403bbb90e064892a08737fca7ed0fd30ff79", features = ["test-fixtures"] }
 
 # ZEB-156: harmony-runtime (pinned 04449d60 above) provides the narrow
 # `NodeRuntime::remove_content` + `StorageTier::remove` delegates this

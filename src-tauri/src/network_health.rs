@@ -72,6 +72,8 @@ pub struct PkarrHealthSummary {
     pub identity_last_publish_ms: Option<u64>,
     pub community_publish_count: u32,
     pub recent_fallback_events: Vec<PkarrFallbackHit>,
+    /// ZEB-380: per-relay health for the configured pool. Empty pre-wiring.
+    pub relays: Vec<RelayHealthWire>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -81,6 +83,56 @@ pub struct PkarrFallbackHit {
     pub community_id_short: String,
     pub hit: bool,
     pub captured_at_ms: u64,
+}
+
+/// ZEB-380: camelCase wire shape of one relay's health (maps from
+/// `harmony_pkarr::RelayHealth`, whose core type stays idiomatic snake_case).
+/// Owned client-side so the IPC contract lives in the consumer repo, same as
+/// `DialHealthSummary`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayHealthWire {
+    pub url: String,
+    pub state: RelayStateWire,
+    pub last_outcome: Option<RelayOutcomeWire>,
+    pub last_success_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RelayStateWire {
+    Healthy,
+    CoolingDown { until_ms: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RelayOutcomeWire {
+    Success,
+    Timeout,
+    Transport,
+    Http { status: u16 },
+}
+
+impl From<harmony_pkarr::RelayHealth> for RelayHealthWire {
+    fn from(h: harmony_pkarr::RelayHealth) -> Self {
+        RelayHealthWire {
+            url: h.url,
+            state: match h.state {
+                harmony_pkarr::RelayState::Healthy => RelayStateWire::Healthy,
+                harmony_pkarr::RelayState::CoolingDown { until_ms } => {
+                    RelayStateWire::CoolingDown { until_ms }
+                }
+            },
+            last_outcome: h.last_outcome.map(|o| match o {
+                harmony_pkarr::RelayOutcome::Success => RelayOutcomeWire::Success,
+                harmony_pkarr::RelayOutcome::Timeout => RelayOutcomeWire::Timeout,
+                harmony_pkarr::RelayOutcome::Transport => RelayOutcomeWire::Transport,
+                harmony_pkarr::RelayOutcome::Http(status) => RelayOutcomeWire::Http { status },
+            }),
+            last_success_ms: h.last_success_ms,
+        }
+    }
 }
 
 /// One recorded dial outcome for the Network Health panel (ZEB-373).
@@ -229,7 +281,7 @@ impl NetworkHealthSnapshot {
     /// `peers: []` → "no peers yet"; `pkarr_status` zeroed.
     pub fn empty() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             captured_at_ms: now_ms(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -240,6 +292,7 @@ impl NetworkHealthSnapshot {
                 identity_last_publish_ms: None,
                 community_publish_count: 0,
                 recent_fallback_events: Vec::new(),
+                relays: Vec::new(),
             },
             dial_status: DialHealthSummary::default(),
         }
@@ -427,6 +480,30 @@ impl DialSnapshot for EmptyDialSnapshot {
     }
 }
 
+/// ZEB-380: per-relay health source for the snapshot. Mirrors `DialSnapshot`.
+/// Returns the core `harmony_pkarr::RelayHealth`; `snapshot()` maps it to the
+/// camelCase wire DTO.
+pub trait RelaySnapshot: Send + Sync {
+    fn relay_health(&self) -> Vec<harmony_pkarr::RelayHealth>;
+}
+
+/// Production source: reads the live `Arc<RelayClient>` retained in NodeState.
+pub struct ProdRelaySnapshot(pub std::sync::Arc<harmony_pkarr::RelayClient>);
+impl RelaySnapshot for ProdRelaySnapshot {
+    fn relay_health(&self) -> Vec<harmony_pkarr::RelayHealth> {
+        self.0.relay_health()
+    }
+}
+
+#[cfg(test)]
+pub struct EmptyRelaySnapshot;
+#[cfg(test)]
+impl RelaySnapshot for EmptyRelaySnapshot {
+    fn relay_health(&self) -> Vec<harmony_pkarr::RelayHealth> {
+        Vec::new()
+    }
+}
+
 /// Spec §5.5: state coupling summary. NetworkHealthService owns the
 /// rate-limiter task handle + cached last self-test report; the iroh /
 /// resolver / pkarr handles come from AppState (already constructed).
@@ -437,6 +514,8 @@ pub struct NetworkHealthService {
     membership: std::sync::Arc<dyn MyMembershipSet + Send + Sync>,
     /// ZEB-373: dynamic-dial telemetry source.
     dial: std::sync::Arc<dyn DialSnapshot>,
+    /// ZEB-380: per-relay health source.
+    relay: std::sync::Arc<dyn RelaySnapshot>,
     last_self_test: std::sync::Arc<tokio::sync::RwLock<Option<SelfTestReport>>>,
     /// Channel into the rate-limiter task. `None` until `spawn_rate_limiter`
     /// is called at boot; `notify()` is a no-op while None so unit tests
@@ -451,6 +530,7 @@ impl NetworkHealthService {
         resolver: std::sync::Arc<dyn ReachabilitySnapshot>,
         membership: std::sync::Arc<dyn MyMembershipSet + Send + Sync>,
         dial: std::sync::Arc<dyn DialSnapshot>,
+        relay: std::sync::Arc<dyn RelaySnapshot>,
     ) -> Self {
         Self {
             iroh,
@@ -458,6 +538,7 @@ impl NetworkHealthService {
             resolver,
             membership,
             dial,
+            relay,
             last_self_test: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             notify_tx: None,
         }
@@ -494,7 +575,7 @@ impl NetworkHealthService {
         });
 
         NetworkHealthSnapshot {
-            schema_version: 2,
+            schema_version: 3,
             captured_at_ms: now,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -505,6 +586,12 @@ impl NetworkHealthService {
                 identity_last_publish_ms: self.pkarr.identity_last_publish_ms(),
                 community_publish_count: self.pkarr.community_publish_count(),
                 recent_fallback_events: self.pkarr.recent_fallback_events(),
+                relays: self
+                    .relay
+                    .relay_health()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
             },
             // ZEB-373 Task 5: real dynamic-dial telemetry, read from the
             // shared DialTelemetry via the DialSnapshot source.
@@ -668,6 +755,28 @@ pub fn format_export_markdown(
             r(&hit.community_id_short),
             if hit.hit { "hit" } else { "miss" }
         );
+    }
+    for relay in &snapshot.pkarr_status.relays {
+        // Redact loopback/private/link-local relay hosts — public relays are
+        // fine verbatim, but a shared export shouldn't leak a user's LAN relay.
+        let display_url = match url::Url::parse(&relay.url) {
+            Ok(u) if crate::pkarr_settings::is_local_host(u.host_str().unwrap_or("")) => {
+                format!("{}://<local-relay>", u.scheme())
+            }
+            _ => relay.url.clone(),
+        };
+        let state = match &relay.state {
+            RelayStateWire::Healthy => "healthy".to_string(),
+            RelayStateWire::CoolingDown { until_ms } => format!("coolingDown(until={until_ms})"),
+        };
+        let last = match &relay.last_outcome {
+            None => String::new(),
+            Some(RelayOutcomeWire::Success) => " lastOutcome=success".to_string(),
+            Some(RelayOutcomeWire::Timeout) => " lastOutcome=timeout".to_string(),
+            Some(RelayOutcomeWire::Transport) => " lastOutcome=transport".to_string(),
+            Some(RelayOutcomeWire::Http { status }) => format!(" lastOutcome=http:{status}"),
+        };
+        let _ = writeln!(out, "relay {} [{}]{}", display_url, state, last);
     }
 
     out
@@ -1496,7 +1605,7 @@ mod tests {
     #[test]
     fn network_health_snapshot_empty_is_well_formed() {
         let s = NetworkHealthSnapshot::empty();
-        assert_eq!(s.schema_version, 2);
+        assert_eq!(s.schema_version, 3);
         assert!(s.my_network.is_none());
         assert!(s.peers.is_empty());
         assert_eq!(s.pkarr_status.community_publish_count, 0);
@@ -1506,7 +1615,7 @@ mod tests {
 
     fn fixture_snapshot_with_full_ids() -> NetworkHealthSnapshot {
         NetworkHealthSnapshot {
-            schema_version: 2,
+            schema_version: 3,
             captured_at_ms: 1_700_000_000_000,
             app_version: "0.1.0-alpha.1".into(),
             platform: "darwin/aarch64".into(),
@@ -1534,6 +1643,7 @@ mod tests {
                 identity_last_publish_ms: Some(1_700_000_000_000 - 60_000),
                 community_publish_count: 1,
                 recent_fallback_events: vec![],
+                relays: Vec::new(),
             },
             dial_status: DialHealthSummary::default(),
         }
@@ -1654,9 +1764,45 @@ mod tests {
         // schemaVersion were omitted (captured_at_ms contains "1").
         // Bind to the literal emitted token.
         assert!(
-            md.contains("schemaVersion: 2"),
+            md.contains("schemaVersion: 3"),
             "schema version token must appear verbatim; output was:\n{}",
             md
+        );
+    }
+
+    #[test]
+    fn format_export_redacts_local_relay_url() {
+        // A user may configure a loopback or LAN relay; a shared export must
+        // not leak the host — replace it with `scheme://<local-relay>`.
+        let mut snap = fixture_snapshot_with_full_ids();
+        snap.pkarr_status.relays = vec![
+            RelayHealthWire {
+                url: "http://192.168.1.5:6881".into(),
+                state: RelayStateWire::Healthy,
+                last_outcome: None,
+                last_success_ms: None,
+            },
+            RelayHealthWire {
+                url: "https://relay.pkarr.org".into(),
+                state: RelayStateWire::Healthy,
+                last_outcome: None,
+                last_success_ms: None,
+            },
+        ];
+        let md = format_export_markdown(&snap, None, false);
+        // Local relay must be redacted.
+        assert!(
+            md.contains("http://<local-relay>"),
+            "local relay host must be redacted; output:\n{md}"
+        );
+        assert!(
+            !md.contains("192.168.1.5"),
+            "raw private IP must not appear; output:\n{md}"
+        );
+        // Public relay must appear verbatim.
+        assert!(
+            md.contains("relay.pkarr.org"),
+            "public relay must not be redacted; output:\n{md}"
         );
     }
 
@@ -1738,11 +1884,12 @@ mod tests {
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
             std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
         );
         let snap = svc.snapshot().await;
         assert!(snap.my_network.is_none());
         assert!(snap.peers.is_empty());
-        assert_eq!(snap.schema_version, 2);
+        assert_eq!(snap.schema_version, 3);
     }
 
     #[tokio::test]
@@ -1753,6 +1900,7 @@ mod tests {
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
             std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
         );
         let snap = svc.snapshot().await;
         assert!(snap.my_network.is_some());
@@ -1781,6 +1929,7 @@ mod tests {
             }),
             std::sync::Arc::new(FakeMembership { table }),
             std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
         );
         let snap = svc.snapshot().await;
         assert_eq!(snap.peers.len(), 3);
@@ -1815,6 +1964,7 @@ mod tests {
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
             std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
         );
         let counter = std::sync::Arc::new(AtomicUsize::new(0));
         let emitter = CountingEmitter { n: counter.clone() };
@@ -1914,6 +2064,7 @@ mod tests {
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
             std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
         )
     }
 
@@ -2096,5 +2247,44 @@ mod tests {
         let snap = NetworkHealthSnapshot::empty();
         assert_eq!(snap.dial_status.attempts, 0);
         assert!(snap.dial_status.recent.is_empty());
+    }
+
+    // ── ZEB-380: RelaySnapshot tests ────────────────────────────────
+
+    struct FakeRelaySnapshot(Vec<harmony_pkarr::RelayHealth>);
+    impl RelaySnapshot for FakeRelaySnapshot {
+        fn relay_health(&self) -> Vec<harmony_pkarr::RelayHealth> {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_populates_relay_health() {
+        let relay = harmony_pkarr::RelayHealth {
+            url: "https://relay.pkarr.org".to_string(),
+            state: harmony_pkarr::RelayState::CoolingDown { until_ms: 123 },
+            last_outcome: Some(harmony_pkarr::RelayOutcome::Http(503)),
+            last_success_ms: Some(42),
+        };
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(FakeRelaySnapshot(vec![relay.clone()])),
+        );
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.schema_version, 3);
+        assert_eq!(snap.pkarr_status.relays.len(), 1);
+        assert_eq!(snap.pkarr_status.relays[0].url, "https://relay.pkarr.org");
+        assert_eq!(
+            snap.pkarr_status.relays[0].state,
+            RelayStateWire::CoolingDown { until_ms: 123 }
+        );
+        assert_eq!(
+            snap.pkarr_status.relays[0].last_outcome,
+            Some(RelayOutcomeWire::Http { status: 503 })
+        );
     }
 }
