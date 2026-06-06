@@ -4418,8 +4418,22 @@ pub(crate) async fn start_node_inner(
                     // valid remains, rather than booting a broken/empty pool.
                     let pool_relays = effective_pkarr_relays(pkarr_settings.relays.clone());
                     let pkarr_relay_pool = harmony_pkarr::RelayPool::new(pool_relays);
+                    // ZEB-387: a valid pkarr PUT triggers a synchronous mainline-DHT
+                    // write on the relay that routinely exceeds the 5s default
+                    // request_timeout, so publish PUTs time out and — because PUT and
+                    // GET share one timeout + one cooldown map — a timed-out PUT also
+                    // starves resolve (GET) until the 30s cooldown expires. Raise the
+                    // HTTP request timeout to 20s so DHT-writing PUTs land. (Separate
+                    // PUT/GET timeouts + decoupling GET availability from PUT-induced
+                    // cooldown are the cleaner harmony-pkarr-side follow-ups in ZEB-387.)
                     let pkarr_relay_client =
-                        std::sync::Arc::new(harmony_pkarr::RelayClient::new(pkarr_relay_pool));
+                        std::sync::Arc::new(harmony_pkarr::RelayClient::with_config(
+                            pkarr_relay_pool,
+                            harmony_pkarr::RelayConfig {
+                                request_timeout: std::time::Duration::from_secs(20),
+                                ..Default::default()
+                            },
+                        ));
                     let pkarr_publisher_arc =
                         std::sync::Arc::new(harmony_pkarr::PkarrPublisher::new(
                             std::sync::Arc::clone(&pkarr_relay_client),
