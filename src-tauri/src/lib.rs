@@ -33980,13 +33980,14 @@ async fn get_pkarr_relays<R: tauri::Runtime>(
         return Ok(rc.relay_health().into_iter().map(Into::into).collect());
     }
     let path = connectivity_settings_path(&app, settings_path)?;
-    let relays = pkarr_settings::PkarrSettings::load_or_default(&path).relays;
-    // Empty persisted list → recommended set, matching start_node boot behavior.
-    let relays = if relays.is_empty() {
-        crate::pkarr_settings::default_relays()
-    } else {
-        relays
-    };
+    let persisted = pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+    // Validate the persisted list exactly as start_node boot does, so this
+    // pre-wiring view shows what the pool would ACTUALLY use: an empty or
+    // invalid (e.g. hand-edited) settings file resolves to the recommended set
+    // rather than surfacing junk relays as "Healthy". (validate_relay_urls
+    // rejects an empty list, so the empty case also falls back to defaults.)
+    let relays = crate::pkarr_settings::validate_relay_urls(persisted)
+        .unwrap_or_else(|_| crate::pkarr_settings::default_relays());
     Ok(relays
         .into_iter()
         .map(|url| crate::network_health::RelayHealthWire {
