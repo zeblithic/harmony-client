@@ -34032,6 +34032,18 @@ fn effective_pkarr_relays(persisted: Vec<String>) -> Vec<String> {
     }
 }
 
+/// ZEB-380: the EFFECTIVE persisted relay URLs read from a settings-file path
+/// (None or unreadable → empty → defaults). The single source the pre-wiring
+/// fallbacks — `PersistedRelaySnapshot` and the no-`NetworkHealthService` branch
+/// of `network_health_snapshot` — share so both agree with `get_pkarr_relays`.
+fn effective_persisted_relays(settings_path: Option<&std::path::Path>) -> Vec<String> {
+    let persisted = settings_path
+        // load_or_default takes &PathBuf; cheap to_path_buf on this cold path.
+        .map(|p| pkarr_settings::PkarrSettings::load_or_default(&p.to_path_buf()).relays)
+        .unwrap_or_default();
+    effective_pkarr_relays(persisted)
+}
+
 /// ZEB-380: serializes all pkarr-relay settings mutations (add/remove/set/reset)
 /// so a concurrent read-modify-write from another window can't lose an update.
 /// Process-global because connectivity-settings.json is a single per-process
@@ -36601,6 +36613,47 @@ mod friend_ipc_tests {
     }
 
     #[test]
+    fn no_service_snapshot_relays_match_get_pkarr_relays() {
+        // ZEB-380 (Cursor round-12): the no-NetworkHealthService branch of
+        // network_health_snapshot builds its relay list as
+        // healthy_placeholder_wires(effective_persisted_relays(path)). Assert
+        // that composition agrees with the configured set so the panel can't
+        // claim "No relays configured" while Settings lists them.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        std::fs::write(
+            &path,
+            r#"{"relays":["https://a.example","https://b.example"]}"#,
+        )
+        .expect("write");
+        let wires = healthy_placeholder_wires(effective_persisted_relays(Some(path.as_path())));
+        let urls: Vec<String> = wires.iter().map(|w| w.url.clone()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
+        );
+
+        // Empty file → defaults (never an empty panel).
+        std::fs::write(&path, r#"{"relays":[]}"#).expect("write empty");
+        let urls_empty: Vec<String> =
+            healthy_placeholder_wires(effective_persisted_relays(Some(path.as_path())))
+                .into_iter()
+                .map(|w| w.url)
+                .collect();
+        assert_eq!(urls_empty, crate::pkarr_settings::default_relays());
+
+        // No resolvable path → defaults.
+        let urls_none: Vec<String> = healthy_placeholder_wires(effective_persisted_relays(None))
+            .into_iter()
+            .map(|w| w.url)
+            .collect();
+        assert_eq!(urls_none, crate::pkarr_settings::default_relays());
+    }
+
+    #[test]
     fn add_friend_outcome_serializes_camelcase() {
         // The DTO contract the frontend depends on: externally-tagged enum with
         // camelCase variant names + fields.
@@ -36795,12 +36848,7 @@ struct PersistedRelaySnapshot {
 }
 impl crate::network_health::RelaySnapshot for PersistedRelaySnapshot {
     fn relay_health(&self) -> Vec<harmony_pkarr::RelayHealth> {
-        let persisted = self
-            .settings_path
-            .as_ref()
-            .map(|p| pkarr_settings::PkarrSettings::load_or_default(p).relays)
-            .unwrap_or_default();
-        effective_pkarr_relays(persisted)
+        effective_persisted_relays(self.settings_path.as_deref())
             .into_iter()
             .map(|url| harmony_pkarr::RelayHealth {
                 url,
@@ -36846,18 +36894,31 @@ impl crate::network_health::PkarrSnapshot for StubEmptyPkarrSnapshot {
 /// hasn't been wired yet (boot ordering / pre-start_node) — the panel
 /// renders gracefully on the empty shape.
 #[tauri::command(rename_all = "snake_case")]
-async fn network_health_snapshot(
+async fn network_health_snapshot<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<crate::network_health::NetworkHealthSnapshot, String> {
-    let svc = {
+    let (svc, settings_path) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.network_health.clone()
+        (g.network_health.clone(), g.pkarr_settings_path.clone())
     };
     let snap = match svc {
         Some(s) => s.snapshot().await,
-        None => crate::network_health::NetworkHealthSnapshot::empty(),
+        None => {
+            // No NetworkHealthService wired (iroh bind failed / no owner
+            // identity / pre-start_node): the rest of the snapshot is empty, but
+            // still surface the CONFIGURED relays so the panel agrees with
+            // get_pkarr_relays instead of claiming "No relays configured"
+            // (Cursor round-12). Resolve the path exactly as get_pkarr_relays
+            // does — NodeState path, else the app-data-dir fallback.
+            let mut snap = crate::network_health::NetworkHealthSnapshot::empty();
+            let path = connectivity_settings_path(&app, settings_path).ok();
+            snap.pkarr_status.relays =
+                healthy_placeholder_wires(effective_persisted_relays(path.as_deref()));
+            snap
+        }
     };
     Ok(snap)
 }
