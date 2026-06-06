@@ -5423,6 +5423,7 @@ pub(crate) async fn start_node_inner(
                                 prod_resolver,
                                 prod_membership,
                                 prod_dial,
+                                std::sync::Arc::new(StubEmptyRelaySnapshot),
                             );
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
@@ -36217,6 +36218,17 @@ async fn connectivity_force_republish(
 /// Mirrors `ProdPkarrSnapshot`'s Phase-1 conservative defaults so the
 /// Network Health panel renders without an "unknown publisher" toast.
 struct StubEmptyPkarrSnapshot;
+
+/// ZEB-380: production `RelaySnapshot` stub for when the relay client isn't
+/// wired (pre-start_node / pkarr unavailable). Empty list — panel shows no
+/// relays. (Swapped for `ProdRelaySnapshot` when the relay client exists, in a
+/// later task.)
+struct StubEmptyRelaySnapshot;
+impl crate::network_health::RelaySnapshot for StubEmptyRelaySnapshot {
+    fn relay_health(&self) -> Vec<harmony_pkarr::RelayHealth> {
+        Vec::new()
+    }
+}
 
 impl crate::network_health::PkarrSnapshot for StubEmptyPkarrSnapshot {
     fn identity_published(&self) -> bool {
