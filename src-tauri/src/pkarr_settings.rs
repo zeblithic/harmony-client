@@ -121,11 +121,20 @@ pub fn validate_relay_urls(input: Vec<String>) -> Result<Vec<String>, String> {
 /// IPv6 coverage: loopback (`::1`), ULA (`fc00::/7`), link-local (`fe80::/10`).
 /// The `is_unique_local` / `is_unicast_link_local` methods are unstable, so we
 /// use stable bit-mask checks on the first 16-bit segment instead.
+///
+/// Note: `url::Url::host_str()` returns IPv6 addresses bracketed as `[::1]`
+/// per the URL spec; we strip the brackets before parsing.
 pub(crate) fn is_local_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    match host.parse::<std::net::IpAddr>() {
+    // `url::Url::host_str()` wraps IPv6 in `[…]` brackets per URL spec — strip
+    // them so `str::parse::<IpAddr>()` can handle the address.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    match bare.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         Ok(std::net::IpAddr::V6(v6)) => {
             let seg0 = v6.segments()[0];
