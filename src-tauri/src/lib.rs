@@ -4411,19 +4411,12 @@ pub(crate) async fn start_node_inner(
                     let pkarr_settings =
                         pkarr_settings::PkarrSettings::load_or_default(&pkarr_settings_path);
                     // ZEB-380: build the pool from the persisted user-configurable
-                    // relay list, but VALIDATE it first — a hand-edited settings
-                    // file could contain junk; fall back to the recommended set on
-                    // empty or invalid input rather than booting a broken pool.
-                    let pool_relays = crate::pkarr_settings::validate_relay_urls(
-                        pkarr_settings.relays.clone(),
-                    )
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "ZEB-380: persisted relay list invalid; falling back to defaults"
-                        );
-                        crate::pkarr_settings::default_relays()
-                    });
+                    // relay list via the SAME lenient reader the IPCs + boot
+                    // reconcile use — drops only malformed entries (a single bad
+                    // hand-edited URL must not nuke an otherwise-good custom pool)
+                    // and falls back to the recommended set only when nothing
+                    // valid remains, rather than booting a broken/empty pool.
+                    let pool_relays = effective_pkarr_relays(pkarr_settings.relays.clone());
                     let pkarr_relay_pool = harmony_pkarr::RelayPool::new(pool_relays);
                     let pkarr_relay_client =
                         std::sync::Arc::new(harmony_pkarr::RelayClient::new(pkarr_relay_pool));
@@ -5681,6 +5674,13 @@ pub(crate) async fn start_node_inner(
                              reconciling live pool to persisted set"
                         );
                         rc.set_relays(effective);
+                        // Mirror the mutators (`apply_pkarr_relays`): a pool
+                        // change must emit so the Settings + Network Health
+                        // listeners refetch, otherwise they'd show the
+                        // pre-reconcile list until the next manual refresh.
+                        if let Err(e) = app.emit("connectivity-relays-changed", ()) {
+                            tracing::warn!(error = %e, "boot relay reconcile: emit failed");
+                        }
                     }
                 }
             }
@@ -33984,15 +33984,21 @@ fn apply_pkarr_relays<R: tauri::Runtime>(
     Ok(())
 }
 
-/// ZEB-380: the EFFECTIVE relay pool from a persisted list — the same
-/// validate-with-defaults-fallback that `start_node` boot and `get_pkarr_relays`
-/// apply, so every reader/mutator agrees on the live pool. An empty or invalid
-/// persisted list resolves to `default_relays()` (the pool that is actually live
-/// and shown in the UI), so add/remove mutate the live set rather than a raw
-/// possibly-empty file value.
+/// ZEB-380: the EFFECTIVE relay pool from a persisted list — the same lenient
+/// sanitize-with-defaults-fallback that `start_node` boot and `get_pkarr_relays`
+/// apply, so every reader/mutator agrees on the live pool. Drops only the
+/// malformed entries (a single bad URL in a hand-edited file must not discard an
+/// otherwise-good custom pool — see `sanitize_relay_urls`); resolves to
+/// `default_relays()` only when NOTHING valid remains (empty or all-invalid),
+/// which is the pool that is actually live and shown in the UI, so add/remove
+/// mutate the live set rather than a raw possibly-empty file value.
 fn effective_pkarr_relays(persisted: Vec<String>) -> Vec<String> {
-    crate::pkarr_settings::validate_relay_urls(persisted)
-        .unwrap_or_else(|_| crate::pkarr_settings::default_relays())
+    let sanitized = crate::pkarr_settings::sanitize_relay_urls(persisted);
+    if sanitized.is_empty() {
+        crate::pkarr_settings::default_relays()
+    } else {
+        sanitized
+    }
 }
 
 /// ZEB-380: serializes all pkarr-relay settings mutations (add/remove/set/reset)
@@ -36482,6 +36488,35 @@ mod friend_ipc_tests {
         assert_eq!(
             effective_from_file, defaults,
             "effective from empty-relays file == default_relays()"
+        );
+    }
+
+    #[test]
+    fn effective_pkarr_relays_keeps_good_drops_bad() {
+        // ZEB-380 (Cursor Medium "One bad URL drops all relays"): a single
+        // malformed entry in an otherwise-valid persisted list must NOT collapse
+        // the whole pool to defaults — only the bad entry is dropped.
+        let effective = effective_pkarr_relays(vec![
+            "https://relay.pkarr.org".into(),
+            "ftp://bogus.example".into(), // invalid scheme — dropped
+            "https://pkarr.pubky.app".into(),
+        ]);
+        assert_eq!(
+            effective,
+            vec![
+                "https://relay.pkarr.org".to_string(),
+                "https://pkarr.pubky.app".to_string(),
+            ],
+            "good relays preserved, only the malformed entry dropped"
+        );
+
+        // But a list with NOTHING valid still falls back to defaults (never an
+        // empty live pool).
+        let all_bad = effective_pkarr_relays(vec!["garbage".into(), "ftp://x".into()]);
+        assert_eq!(
+            all_bad,
+            crate::pkarr_settings::default_relays(),
+            "all-invalid persisted list resolves to default_relays()"
         );
     }
 

@@ -71,40 +71,7 @@ pub fn validate_relay_urls(input: Vec<String>) -> Result<Vec<String>, String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for raw in input {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err("relay URL must not be empty".to_string());
-        }
-        let parsed =
-            url::Url::parse(trimmed).map_err(|_| format!("invalid relay URL: {trimmed}"))?;
-        match parsed.scheme() {
-            "https" => {}
-            "http" => {
-                let host = parsed.host_str().unwrap_or("");
-                if !is_local_host(host) {
-                    return Err(format!(
-                        "http:// is only allowed for localhost relays: {trimmed}"
-                    ));
-                }
-            }
-            other => return Err(format!("unsupported relay scheme '{other}': {trimmed}")),
-        }
-        // A relay is a bare `scheme://host[:port]` base; pkarr appends
-        // `/{z32_key}`. A path (beyond root `/`), query, fragment, or userinfo
-        // (`user:pass@`) on the base would either silently misroute every request
-        // or persist credentials into connectivity-settings.json — reject up front.
-        let path = parsed.path();
-        let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
-        if (!path.is_empty() && path != "/")
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-            || has_userinfo
-        {
-            return Err(format!(
-                "relay URL must be scheme://host only (no path/query/fragment/userinfo): {trimmed}"
-            ));
-        }
-        let normalized = trimmed.trim_end_matches('/').to_string();
+        let normalized = validate_single_relay(raw.trim())?;
         if seen.insert(normalized.clone()) {
             out.push(normalized);
         }
@@ -113,6 +80,76 @@ pub fn validate_relay_urls(input: Vec<String>) -> Result<Vec<String>, String> {
         return Err(format!("too many relays (max {MAX_RELAYS})"));
     }
     Ok(out)
+}
+
+/// Validate ONE trimmed relay URL, returning its trailing-slash-normalized form
+/// or a human-readable error. The shared per-entry rule behind both the strict
+/// [`validate_relay_urls`] (rejects the whole list on any failure — correct for
+/// user input) and the lenient [`sanitize_relay_urls`] (drops only the bad
+/// entries — correct for reading a possibly hand-edited persisted list).
+fn validate_single_relay(trimmed: &str) -> Result<String, String> {
+    if trimmed.is_empty() {
+        return Err("relay URL must not be empty".to_string());
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|_| format!("invalid relay URL: {trimmed}"))?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            let host = parsed.host_str().unwrap_or("");
+            if !is_local_host(host) {
+                return Err(format!(
+                    "http:// is only allowed for localhost relays: {trimmed}"
+                ));
+            }
+        }
+        other => return Err(format!("unsupported relay scheme '{other}': {trimmed}")),
+    }
+    // A relay is a bare `scheme://host[:port]` base; pkarr appends
+    // `/{z32_key}`. A path (beyond root `/`), query, fragment, or userinfo
+    // (`user:pass@`) on the base would either silently misroute every request
+    // or persist credentials into connectivity-settings.json — reject up front.
+    let path = parsed.path();
+    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    if (!path.is_empty() && path != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || has_userinfo
+    {
+        return Err(format!(
+            "relay URL must be scheme://host only (no path/query/fragment/userinfo): {trimmed}"
+        ));
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+/// ZEB-380: lenient reader-side sanitizer for a *persisted* relay list. Unlike
+/// [`validate_relay_urls`] (which rejects the entire list on any bad entry —
+/// correct for surfacing an error to a user typing into Settings), this keeps
+/// every valid relay and silently drops only the malformed ones, so a single
+/// bad entry in a hand-edited `connectivity-settings.json` can't discard an
+/// otherwise-good custom pool. Dedups (trailing-slash-normalized, first wins)
+/// and truncates to [`MAX_RELAYS`]. May return an empty vec (input empty or all
+/// entries invalid); the caller decides the empty fallback (callers use
+/// [`default_relays`]).
+pub fn sanitize_relay_urls(input: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for raw in input {
+        match validate_single_relay(raw.trim()) {
+            Ok(normalized) => {
+                if seen.insert(normalized.clone()) {
+                    out.push(normalized);
+                    if out.len() == MAX_RELAYS {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "ZEB-380: dropping invalid persisted relay URL");
+            }
+        }
+    }
+    out
 }
 
 /// True for loopback / private / link-local hosts where a plaintext `http://`
@@ -329,5 +366,48 @@ mod tests {
         std::fs::write(&path, "not json {{").expect("write");
         let settings = PkarrSettings::load_or_default(&path);
         assert!(!settings.identity_discoverable);
+    }
+
+    #[test]
+    fn sanitize_keeps_valid_drops_only_invalid() {
+        // ZEB-380: one bad entry in a hand-edited list must NOT discard the good
+        // relays — unlike strict validate_relay_urls (all-or-nothing).
+        let out = sanitize_relay_urls(vec![
+            "https://good1.example".into(),
+            "not a url".into(), // dropped: unparseable
+            "https://good2.example".into(),
+            "ftp://nope.example".into(),     // dropped: bad scheme
+            "https://good1.example/".into(), // dropped: dedup of good1
+            "https://creds:pw@good3.example".into(), // dropped: userinfo
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                "https://good1.example".to_string(),
+                "https://good2.example".to_string(),
+            ],
+            "keeps every valid relay (deduped), drops only the malformed ones"
+        );
+    }
+
+    #[test]
+    fn sanitize_all_invalid_or_empty_returns_empty() {
+        // The caller (effective_pkarr_relays) maps empty → default_relays().
+        assert!(sanitize_relay_urls(vec![]).is_empty());
+        assert!(
+            sanitize_relay_urls(vec!["garbage".into(), "ftp://x".into(), "".into()]).is_empty()
+        );
+    }
+
+    #[test]
+    fn sanitize_truncates_to_max_relays() {
+        // More than MAX_RELAYS valid entries: strict validate errors, lenient
+        // sanitize keeps the first MAX_RELAYS rather than discarding everything.
+        let many: Vec<String> = (0..(MAX_RELAYS + 3))
+            .map(|i| format!("https://r{i}.example.com"))
+            .collect();
+        let out = sanitize_relay_urls(many);
+        assert_eq!(out.len(), MAX_RELAYS, "sanitize caps at MAX_RELAYS");
+        assert_eq!(out[0], "https://r0.example.com", "keeps the first entries");
     }
 }
