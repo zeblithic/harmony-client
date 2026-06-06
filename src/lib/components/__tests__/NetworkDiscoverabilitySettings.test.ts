@@ -37,6 +37,8 @@ function setupDefaultMocks(
     if (cmd === 'get_pkarr_relays') return Promise.resolve(relayList);
     if (cmd === 'set_pkarr_relays') return Promise.resolve(undefined);
     if (cmd === 'reset_pkarr_relays') return Promise.resolve(undefined);
+    if (cmd === 'add_pkarr_relay') return Promise.resolve(undefined);
+    if (cmd === 'remove_pkarr_relay') return Promise.resolve(undefined);
     return Promise.resolve(null);
   });
 }
@@ -236,7 +238,7 @@ describe('NetworkDiscoverabilitySettings', () => {
       });
     });
 
-    it('Add submits setPkarrRelays with the new list', async () => {
+    it('Add submits add_pkarr_relay with only the new URL (server-authoritative RMW)', async () => {
       setupDefaultMocks();
       render(NetworkDiscoverabilitySettings);
 
@@ -249,17 +251,26 @@ describe('NetworkDiscoverabilitySettings', () => {
       await fireEvent.click(addBtn);
 
       await waitFor(() => {
-        expect(mockInvoke).toHaveBeenCalledWith('set_pkarr_relays', {
-          relays: [...DEFAULT_RELAYS, 'https://new.relay.example'],
+        // ZEB-380: convergence refactor — client sends only the single URL;
+        // the backend appends to the CURRENT persisted list (kills stale-full-list race).
+        expect(mockInvoke).toHaveBeenCalledWith('add_pkarr_relay', {
+          url: 'https://new.relay.example',
         });
       });
+
+      // Ensure set_pkarr_relays was NOT called with a client-built full list.
+      const setPkarrCalls = (mockInvoke as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (call) => call[0] === 'set_pkarr_relays',
+      );
+      expect(setPkarrCalls.length).toBe(0);
     });
 
     it('shows inline error and leaves list unchanged on invalid-URL rejection', async () => {
       mockInvoke.mockImplementation((cmd: string) => {
         if (cmd === 'connectivity_get_identity_discoverable') return Promise.resolve(false);
         if (cmd === 'get_pkarr_relays') return Promise.resolve(DEFAULT_RELAYS.map((u) => makeRelay(u)));
-        if (cmd === 'set_pkarr_relays') return Promise.reject(new Error('invalid URL: missing scheme'));
+        // ZEB-380: Add now calls add_pkarr_relay, not set_pkarr_relays.
+        if (cmd === 'add_pkarr_relay') return Promise.reject(new Error('invalid URL: missing scheme'));
         return Promise.resolve(null);
       });
       render(NetworkDiscoverabilitySettings);
@@ -279,6 +290,31 @@ describe('NetworkDiscoverabilitySettings', () => {
       // List must remain unchanged (2 default relays).
       const rows = screen.getAllByTestId('relay-row');
       expect(rows.length).toBe(2);
+    });
+
+    it('Remove submits remove_pkarr_relay with only the target URL (server-authoritative RMW)', async () => {
+      setupDefaultMocks();
+      render(NetworkDiscoverabilitySettings);
+
+      await waitFor(() => screen.getAllByTestId('relay-remove'));
+
+      // Click the first Remove button (relay.pkarr.org).
+      const removeBtns = screen.getAllByTestId('relay-remove') as HTMLButtonElement[];
+      await fireEvent.click(removeBtns[0]);
+
+      await waitFor(() => {
+        // ZEB-380: convergence refactor — client sends only the target URL;
+        // the backend filters the CURRENT persisted list (kills stale-full-list race).
+        expect(mockInvoke).toHaveBeenCalledWith('remove_pkarr_relay', {
+          url: DEFAULT_RELAYS[0],
+        });
+      });
+
+      // Ensure set_pkarr_relays was NOT called with a client-built list.
+      const setPkarrCalls = (mockInvoke as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (call) => call[0] === 'set_pkarr_relays',
+      );
+      expect(setPkarrCalls.length).toBe(0);
     });
 
     it('Remove is disabled when only one relay remains', async () => {
@@ -333,13 +369,14 @@ describe('NetworkDiscoverabilitySettings', () => {
       expect(input.disabled).toBe(true);
       expect(addBtn.disabled).toBe(true);
 
-      // Even if we try to fire the click directly, set_pkarr_relays must not be called.
+      // Even if we try to fire the click directly, neither add_pkarr_relay nor
+      // set_pkarr_relays must be called while the pool is unknown.
       await fireEvent.click(addBtn);
 
-      const setPkarrCalls = (mockInvoke as ReturnType<typeof vi.fn>).mock.calls.filter(
-        (call) => call[0] === 'set_pkarr_relays',
+      const mutationCalls = (mockInvoke as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (call) => call[0] === 'add_pkarr_relay' || call[0] === 'set_pkarr_relays',
       );
-      expect(setPkarrCalls.length).toBe(0);
+      expect(mutationCalls.length).toBe(0);
     });
 
     it('clears relay error banner after a successful reload (Fix E)', async () => {

@@ -18,7 +18,8 @@
     setIdentityDiscoverable,
     onIdentityDiscoverableChanged,
     getPkarrRelays,
-    setPkarrRelays,
+    addPkarrRelay,
+    removePkarrRelay,
     resetPkarrRelays,
   } from '../connectivity-adapter';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -89,15 +90,17 @@
 
   async function handleAddRelay(): Promise<void> {
     const trimmed = newRelayUrl.trim();
-    // Guard: never submit an Add whose payload would clobber an unknown/empty
-    // base pool (i.e. if the initial fetch hasn't succeeded yet).
+    // Guard: never submit an Add before the initial fetch succeeds (relayLoaded
+    // is defense-in-depth; the button is also disabled until then).
     if (!relayLoaded) return;
     if (!trimmed || relayPending) return;
     relayPending = true;
     relayError = null;
     try {
-      const currentUrls = relays.map((r) => r.url);
-      await setPkarrRelays([...currentUrls, trimmed]);
+      // Server-authoritative read-modify-write: send only the new URL.
+      // The backend appends it to the CURRENT persisted list and re-validates,
+      // so a stale in-memory `relays` view can never clobber a fresher pool.
+      await addPkarrRelay(trimmed);
       newRelayUrl = '';
       await fetchRelays();
     } catch (e) {
@@ -112,8 +115,10 @@
     relayPending = true;
     relayError = null;
     try {
-      const newList = relays.map((r) => r.url).filter((u) => u !== url);
-      await setPkarrRelays(newList);
+      // Server-authoritative read-modify-write: send only the URL to remove.
+      // The backend filters the CURRENT persisted list and re-validates,
+      // guarding the >=1 invariant server-side as well.
+      await removePkarrRelay(url);
       await fetchRelays();
     } catch (e) {
       relayError = e instanceof Error ? e.message : String(e);

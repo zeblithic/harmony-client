@@ -33959,6 +33959,59 @@ async fn reset_pkarr_relays<R: tauri::Runtime>(
     apply_pkarr_relays(&app, &state, validated)
 }
 
+/// ZEB-380: add a single relay to the persisted pool (server-authoritative
+/// read-modify-write). The client sends only the URL — the backend appends it
+/// to the CURRENT persisted list and re-validates, so a stale client view can
+/// never clobber a fresher pool (another window / a concurrent change).
+#[tauri::command(rename_all = "snake_case")]
+async fn add_pkarr_relay<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    url: String,
+) -> Result<(), String> {
+    let settings_path = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard.pkarr_settings_path.clone()
+    };
+    let path = connectivity_settings_path(&app, settings_path)?;
+    let mut relays = pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+    relays.push(url);
+    // validate_relay_urls dedups (so re-adding an existing relay is a no-op),
+    // caps at 8, and rejects invalid input — returning a clear Err to the UI.
+    let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
+    apply_pkarr_relays(&app, &state, validated)
+}
+
+/// ZEB-380: remove a single relay from the persisted pool (server-authoritative
+/// read-modify-write). Removing the last relay fails (validate_relay_urls
+/// rejects an empty list), preserving the >=1 invariant server-side.
+#[tauri::command(rename_all = "snake_case")]
+async fn remove_pkarr_relay<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    url: String,
+) -> Result<(), String> {
+    let settings_path = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard.pkarr_settings_path.clone()
+    };
+    let path = connectivity_settings_path(&app, settings_path)?;
+    let target = url.trim().trim_end_matches('/');
+    let relays: Vec<String> = pkarr_settings::PkarrSettings::load_or_default(&path)
+        .relays
+        .into_iter()
+        .filter(|r| r.trim_end_matches('/') != target)
+        .collect();
+    // Empty → validate_relay_urls errors ("at least one relay is required"),
+    // which guards against removing the final relay.
+    let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
+    apply_pkarr_relays(&app, &state, validated)
+}
+
 /// ZEB-380: current relay list + per-relay health. Prefers the live client's
 /// health; falls back to the persisted list (Healthy placeholders) pre-wiring
 /// so the Settings UI can render + edit before/without a running node.
@@ -36199,6 +36252,93 @@ mod friend_ipc_tests {
     }
 
     #[test]
+    fn add_remove_pkarr_relay_read_modify_write() {
+        // Exercises the pure read-modify-write pieces of the two new IPCs
+        // (add_pkarr_relay / remove_pkarr_relay) against a temp settings file,
+        // mirroring the pattern of set_pkarr_relays_validation_and_persist_round_trip.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        let initial = vec![
+            "https://relay.pkarr.org".to_string(),
+            "https://pkarr.pubky.app".to_string(),
+        ];
+
+        // Seed the file.
+        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        settings.relays = initial.clone();
+        settings.save(&path).expect("save initial");
+
+        // --- Simulate add ---
+        let mut relays = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        relays.push("https://new.relay.example".to_string());
+        let validated =
+            crate::pkarr_settings::validate_relay_urls(relays).expect("valid after add");
+        let mut s = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        s.relays = validated.clone();
+        s.save(&path).expect("save after add");
+        let reloaded = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        assert_eq!(reloaded.len(), 3, "add: three relays persisted");
+        assert!(
+            reloaded.contains(&"https://new.relay.example".to_string()),
+            "add: new URL present"
+        );
+
+        // Re-adding the same URL is a no-op (validate_relay_urls dedups).
+        let mut relays2 = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        relays2.push("https://new.relay.example".to_string());
+        let validated2 = crate::pkarr_settings::validate_relay_urls(relays2).expect("valid dedup");
+        assert_eq!(
+            validated2.len(),
+            3,
+            "dedup: still three relays after re-add"
+        );
+
+        // --- Simulate remove of one relay ---
+        let target = "https://new.relay.example";
+        let relays_after_remove: Vec<String> =
+            crate::pkarr_settings::PkarrSettings::load_or_default(&path)
+                .relays
+                .into_iter()
+                .filter(|r| r.trim_end_matches('/') != target.trim_end_matches('/'))
+                .collect();
+        let validated3 = crate::pkarr_settings::validate_relay_urls(relays_after_remove)
+            .expect("valid after remove");
+        let mut s3 = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        s3.relays = validated3;
+        s3.save(&path).expect("save after remove");
+        let reloaded3 = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        assert_eq!(reloaded3.len(), 2, "remove: back to two relays");
+        assert!(
+            !reloaded3.contains(&"https://new.relay.example".to_string()),
+            "remove: URL gone"
+        );
+
+        // --- Simulate remove of a relay down to one ---
+        let target2 = "https://pkarr.pubky.app";
+        let relays_one: Vec<String> = crate::pkarr_settings::PkarrSettings::load_or_default(&path)
+            .relays
+            .into_iter()
+            .filter(|r| r.trim_end_matches('/') != target2.trim_end_matches('/'))
+            .collect();
+        assert_eq!(
+            relays_one.len(),
+            1,
+            "one relay remaining before final remove attempt"
+        );
+        let validated_one =
+            crate::pkarr_settings::validate_relay_urls(relays_one).expect("one relay is valid");
+        assert_eq!(validated_one.len(), 1);
+
+        // --- Simulate remove of the LAST relay → validate_relay_urls must error ---
+        let result = crate::pkarr_settings::validate_relay_urls(vec![]);
+        assert!(
+            result.is_err(),
+            "remove-last: empty list is rejected by validator"
+        );
+    }
+
+    #[test]
     fn add_friend_outcome_serializes_camelcase() {
         // The DTO contract the frontend depends on: externally-tagged enum with
         // camelCase variant names + fields.
@@ -36904,6 +37044,8 @@ pub fn run() {
             set_pkarr_relays,
             get_pkarr_relays,
             reset_pkarr_relays,
+            add_pkarr_relay,
+            remove_pkarr_relay,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -36989,6 +37131,8 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         set_pkarr_relays,
         get_pkarr_relays,
         reset_pkarr_relays,
+        add_pkarr_relay,
+        remove_pkarr_relay,
     ])
 }
 

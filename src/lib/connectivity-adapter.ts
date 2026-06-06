@@ -311,6 +311,34 @@ export async function resetPkarrRelays(): Promise<void> {
 }
 
 /**
+ * ZEB-380: add a single relay to the persisted pool (server-authoritative
+ * read-modify-write). The backend appends `url` to the CURRENT persisted list
+ * and re-validates, so a stale client view can never clobber a fresher pool.
+ */
+export async function addPkarrRelay(url: string): Promise<void> {
+  try {
+    await invoke('add_pkarr_relay', { url });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`add_pkarr_relay: ${msg}`);
+  }
+}
+
+/**
+ * ZEB-380: remove a single relay from the persisted pool (server-authoritative
+ * read-modify-write). The backend filters the URL from the CURRENT persisted
+ * list and re-validates; removing the last relay is rejected server-side.
+ */
+export async function removePkarrRelay(url: string): Promise<void> {
+  try {
+    await invoke('remove_pkarr_relay', { url });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`remove_pkarr_relay: ${msg}`);
+  }
+}
+
+/**
  * Subscribe to `connectivity-pkarr-fallback-fired` events.
  *
  * Emitted by the backend whenever `ReachabilityResolver::resolve_async`
