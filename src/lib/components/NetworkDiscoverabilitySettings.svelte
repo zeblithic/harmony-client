@@ -40,6 +40,10 @@
   let newRelayUrl = $state('');
   let relayError = $state<string | null>(null);
   let relayPending = $state(false);
+  // True once the initial get_pkarr_relays fetch succeeds. Guards Add/Remove
+  // so they can never submit a payload built from an empty/unknown base list,
+  // which would clobber the persisted pool (Cursor Bugbot round-4 HIGH finding).
+  let relayLoaded = $state(false);
   // Unlisten for connectivity-relays-changed event.
   let relaysUnlisten: UnlistenFn | null = null;
   let relaysListenerDestroyed = false;
@@ -64,13 +68,18 @@
     try {
       relays = (await getPkarrRelays()) ?? [];
       relayError = null;
+      relayLoaded = true;
     } catch (e) {
       relayError = e instanceof Error ? e.message : String(e);
+      // Do NOT set relayLoaded on failure — the base list is still unknown.
     }
   }
 
   async function handleAddRelay(): Promise<void> {
     const trimmed = newRelayUrl.trim();
+    // Guard: never submit an Add whose payload would clobber an unknown/empty
+    // base pool (i.e. if the initial fetch hasn't succeeded yet).
+    if (!relayLoaded) return;
     if (!trimmed || relayPending) return;
     relayPending = true;
     relayError = null;
@@ -253,7 +262,7 @@
         <button
           class="relay-remove"
           data-testid="relay-remove"
-          disabled={relays.length <= 1 || relayPending}
+          disabled={!relayLoaded || relays.length <= 1 || relayPending}
           onclick={() => handleRemoveRelay(relay.url)}
           aria-label={`Remove relay ${relay.url}`}
         >
@@ -269,13 +278,13 @@
       class="relay-input"
       placeholder="https://relay.example.com"
       bind:value={newRelayUrl}
-      disabled={relayPending}
+      disabled={!relayLoaded || relayPending}
       data-testid="relay-url-input"
       aria-label="New relay URL"
     />
     <button
       class="relay-add-btn"
-      disabled={!newRelayUrl.trim() || relayPending}
+      disabled={!relayLoaded || !newRelayUrl.trim() || relayPending}
       onclick={handleAddRelay}
       data-testid="relay-add-button"
     >

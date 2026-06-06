@@ -106,6 +106,38 @@ describe('NetworkHealthView', () => {
     expect(screen.getByTestId('nh-starting-up')).toBeTruthy();
   });
 
+  it('renders pkarr-relays section during startup (myNetwork null) — Cursor round-4 Medium fix', async () => {
+    // Snapshot with myNetwork=null but a populated relay list — the relay
+    // health section must be visible while the network is still starting up.
+    const snap: NetworkHealthSnapshot = {
+      ...emptySnap(),
+      myNetwork: null,
+      pkarrStatus: {
+        identityPublished: false,
+        identityLastPublishMs: null,
+        communityPublishCount: 0,
+        recentFallbackEvents: [],
+        relays: [
+          {
+            url: 'https://relay.pkarr.org',
+            state: { kind: 'healthy' },
+            lastOutcome: null,
+            lastSuccessMs: null,
+          },
+        ],
+      },
+    };
+    mockInvoke.mockResolvedValue(snap);
+    render(NetworkHealthView);
+
+    // Starting-up banner must still appear (myNetwork is null).
+    await waitFor(() => screen.getByTestId('nh-starting-up'));
+
+    // AND the pkarr-relays section must also be visible with its relay row.
+    expect(screen.getByTestId('nh-pkarr-relays')).toBeTruthy();
+    expect(screen.getByTestId('nh-relay-row')).toBeTruthy();
+  });
+
   it('renders summary card when my_network is populated', async () => {
     mockInvoke.mockResolvedValue(readySnap());
     render(NetworkHealthView);

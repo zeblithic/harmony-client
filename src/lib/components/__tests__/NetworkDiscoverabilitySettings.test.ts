@@ -308,6 +308,40 @@ describe('NetworkDiscoverabilitySettings', () => {
       expect(setPkarrCalls.length).toBe(0);
     });
 
+    it('Add button is disabled and does not call set_pkarr_relays before get_pkarr_relays resolves', async () => {
+      // get_pkarr_relays never resolves → relayLoaded stays false → Add must be
+      // disabled and the handler must be a no-op (Cursor round-4 HIGH fix).
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'connectivity_get_identity_discoverable') return Promise.resolve(false);
+        if (cmd === 'get_pkarr_relays') return new Promise(() => {}); // never resolves
+        if (cmd === 'set_pkarr_relays') return Promise.resolve(undefined);
+        return Promise.resolve(null);
+      });
+
+      render(NetworkDiscoverabilitySettings);
+
+      // Wait for the component to stabilise (discoverable IPC resolves, relay stays pending).
+      await waitFor(() => {
+        const val = screen.getByTestId('discoverability-value');
+        expect(val.textContent?.trim()).toBe('Off');
+      });
+
+      const input = screen.getByTestId('relay-url-input') as HTMLInputElement;
+      const addBtn = screen.getByTestId('relay-add-button') as HTMLButtonElement;
+
+      // Input and Add button must be disabled while the pool is unknown.
+      expect(input.disabled).toBe(true);
+      expect(addBtn.disabled).toBe(true);
+
+      // Even if we try to fire the click directly, set_pkarr_relays must not be called.
+      await fireEvent.click(addBtn);
+
+      const setPkarrCalls = (mockInvoke as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (call) => call[0] === 'set_pkarr_relays',
+      );
+      expect(setPkarrCalls.length).toBe(0);
+    });
+
     it('clears relay error banner after a successful reload (Fix E)', async () => {
       // First call to get_pkarr_relays fails, then succeeds on retry.
       let callCount = 0;
