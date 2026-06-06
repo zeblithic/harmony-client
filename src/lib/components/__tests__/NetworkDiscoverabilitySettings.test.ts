@@ -11,6 +11,7 @@ vi.mock('@tauri-apps/api/event', () => ({
 }));
 
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import NetworkDiscoverabilitySettings from '../NetworkDiscoverabilitySettings.svelte';
 import type { RelayHealth } from '../../types/network-health';
 
@@ -408,6 +409,51 @@ describe('NetworkDiscoverabilitySettings', () => {
       await waitFor(() => {
         expect(screen.queryByTestId('relay-error')).toBeNull();
       });
+    });
+
+    it('a failed event-driven refresh after load keeps the list and shows no error', async () => {
+      // ZEB-380 (Cursor round-11): apply_pkarr_relays still emits
+      // connectivity-relays-changed after a mutation, which triggers a refresh
+      // refetch. If that refetch fails, it must NOT surface an error over a
+      // list that is already current — only an INITIAL load failure is fatal.
+      // Capture the relays-changed listener so we can fire it manually.
+      let relayChangedCb: (() => void) | undefined;
+      (listen as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+        (event: string, cb: () => void) => {
+          if (event === 'connectivity-relays-changed') relayChangedCb = cb;
+          return Promise.resolve(() => {});
+        },
+      );
+      let failRefresh = false;
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'connectivity_get_identity_discoverable') return Promise.resolve(false);
+        if (cmd === 'get_pkarr_relays') {
+          return failRefresh
+            ? Promise.reject(new Error('transient refresh failure'))
+            : Promise.resolve(DEFAULT_RELAYS.map((u) => makeRelay(u)));
+        }
+        return Promise.resolve(null);
+      });
+
+      render(NetworkDiscoverabilitySettings);
+
+      // Initial load succeeds: both relays render, no error.
+      await waitFor(() => expect(screen.getAllByTestId('relay-row')).toHaveLength(2));
+      expect(screen.queryByTestId('relay-error')).toBeNull();
+
+      // A subsequent event-driven refresh fails.
+      failRefresh = true;
+      expect(relayChangedCb).toBeDefined();
+      relayChangedCb?.();
+
+      // Wait for the failing refetch to have been attempted + settled, then
+      // assert the error stayed absent and the list is intact.
+      await waitFor(() => {
+        const getCalls = mockInvoke.mock.calls.filter((c) => c[0] === 'get_pkarr_relays');
+        expect(getCalls.length).toBeGreaterThanOrEqual(2);
+      });
+      expect(screen.queryByTestId('relay-error')).toBeNull();
+      expect(screen.getAllByTestId('relay-row')).toHaveLength(2);
     });
   });
 });

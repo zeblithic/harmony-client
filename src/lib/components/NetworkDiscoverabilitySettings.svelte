@@ -83,7 +83,14 @@
     } catch (e) {
       // Stale failures must not clobber a newer fetch's state either.
       if (seq !== relayFetchSeq) return;
-      relayError = e instanceof Error ? e.message : String(e);
+      // fetchRelays is a REFRESH (onMount + the connectivity-relays-changed
+      // listener). Once a list is loaded — including one a mutation just
+      // applied authoritatively — a failed refresh must NOT surface an error
+      // over a list that is still current (the mutation already succeeded and
+      // persisted). Only an INITIAL load failure (no list yet) is user-facing.
+      if (!relayLoaded) {
+        relayError = e instanceof Error ? e.message : String(e);
+      }
       // Do NOT set relayLoaded on failure — the base list is still unknown.
     }
   }

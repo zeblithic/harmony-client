@@ -5423,7 +5423,16 @@ pub(crate) async fn start_node_inner(
                                     std::sync::Arc::clone(rc),
                                 ))
                             } else {
-                                std::sync::Arc::new(StubEmptyRelaySnapshot)
+                                // No live client yet — show the SAME effective
+                                // persisted relays Settings shows (Healthy
+                                // placeholders), resolving the path exactly as
+                                // get_pkarr_relays does so the two surfaces agree.
+                                let settings_path = connectivity_settings_path(
+                                    app,
+                                    guard.pkarr_settings_path.clone(),
+                                )
+                                .ok();
+                                std::sync::Arc::new(PersistedRelaySnapshot { settings_path })
                             };
                             let mut nh = crate::network_health::NetworkHealthService::new(
                                 prod_iroh,
@@ -36534,6 +36543,64 @@ mod friend_ipc_tests {
     }
 
     #[test]
+    fn persisted_relay_snapshot_matches_get_pkarr_relays_pre_wiring() {
+        use crate::network_health::RelaySnapshot;
+        // ZEB-380 (Cursor round-11): pre-wiring (no live RelayClient) the Health
+        // panel must show the SAME effective persisted relays get_pkarr_relays
+        // shows Settings — not "No relays configured" while Settings lists them.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        std::fs::write(
+            &path,
+            r#"{"relays":["https://r1.example","https://r2.example"]}"#,
+        )
+        .expect("write");
+        let snap = PersistedRelaySnapshot {
+            settings_path: Some(path.clone()),
+        };
+        let health = snap.relay_health();
+        let urls: Vec<String> = health.iter().map(|h| h.url.clone()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://r1.example".to_string(),
+                "https://r2.example".to_string()
+            ]
+        );
+        assert!(
+            health
+                .iter()
+                .all(|h| h.state == harmony_pkarr::RelayState::Healthy
+                    && h.last_outcome.is_none()
+                    && h.last_success_ms.is_none()),
+            "pre-wiring relays are Healthy placeholders with no recorded outcome"
+        );
+
+        // Empty persisted list → defaults (never an empty panel).
+        std::fs::write(&path, r#"{"relays":[]}"#).expect("write empty");
+        let snap_empty = PersistedRelaySnapshot {
+            settings_path: Some(path),
+        };
+        let urls_empty: Vec<String> = snap_empty
+            .relay_health()
+            .into_iter()
+            .map(|h| h.url)
+            .collect();
+        assert_eq!(urls_empty, crate::pkarr_settings::default_relays());
+
+        // No resolvable path (degraded) → defaults, not an empty panel.
+        let snap_none = PersistedRelaySnapshot {
+            settings_path: None,
+        };
+        let urls_none: Vec<String> = snap_none
+            .relay_health()
+            .into_iter()
+            .map(|h| h.url)
+            .collect();
+        assert_eq!(urls_none, crate::pkarr_settings::default_relays());
+    }
+
+    #[test]
     fn add_friend_outcome_serializes_camelcase() {
         // The DTO contract the frontend depends on: externally-tagged enum with
         // camelCase variant names + fields.
@@ -36714,13 +36781,34 @@ async fn connectivity_force_republish(
 struct StubEmptyPkarrSnapshot;
 
 /// ZEB-380: production `RelaySnapshot` stub for when the relay client isn't
-/// wired (pre-start_node / pkarr unavailable). Empty list — panel shows no
-/// relays. (Swapped for `ProdRelaySnapshot` when the relay client exists, in a
-/// later task.)
-struct StubEmptyRelaySnapshot;
-impl crate::network_health::RelaySnapshot for StubEmptyRelaySnapshot {
+/// wired (pre-start_node / pkarr unavailable). Reads the EFFECTIVE persisted
+/// relay list from `connectivity-settings.json` and reports each as a `Healthy`
+/// placeholder — the SAME view `get_pkarr_relays` shows the Settings relay
+/// manager pre-wiring — so the Network Health panel and Settings agree on the
+/// configured set rather than the panel claiming "No relays configured" while
+/// Settings lists the defaults (Cursor round-11 Medium). Swapped for
+/// `ProdRelaySnapshot` once the live relay client exists.
+struct PersistedRelaySnapshot {
+    /// Resolved via `connectivity_settings_path` at construction (NodeState path
+    /// when set, else the app-data-dir fallback), matching `get_pkarr_relays`.
+    settings_path: Option<std::path::PathBuf>,
+}
+impl crate::network_health::RelaySnapshot for PersistedRelaySnapshot {
     fn relay_health(&self) -> Vec<harmony_pkarr::RelayHealth> {
-        Vec::new()
+        let persisted = self
+            .settings_path
+            .as_ref()
+            .map(|p| pkarr_settings::PkarrSettings::load_or_default(p).relays)
+            .unwrap_or_default();
+        effective_pkarr_relays(persisted)
+            .into_iter()
+            .map(|url| harmony_pkarr::RelayHealth {
+                url,
+                state: harmony_pkarr::RelayState::Healthy,
+                last_outcome: None,
+                last_success_ms: None,
+            })
+            .collect()
     }
 }
 
