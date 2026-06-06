@@ -33932,6 +33932,29 @@ fn apply_pkarr_relays<R: tauri::Runtime>(
     Ok(())
 }
 
+/// ZEB-380: the EFFECTIVE relay pool from a persisted list — the same
+/// validate-with-defaults-fallback that `start_node` boot and `get_pkarr_relays`
+/// apply, so every reader/mutator agrees on the live pool. An empty or invalid
+/// persisted list resolves to `default_relays()` (the pool that is actually live
+/// and shown in the UI), so add/remove mutate the live set rather than a raw
+/// possibly-empty file value.
+fn effective_pkarr_relays(persisted: Vec<String>) -> Vec<String> {
+    crate::pkarr_settings::validate_relay_urls(persisted)
+        .unwrap_or_else(|_| crate::pkarr_settings::default_relays())
+}
+
+/// ZEB-380: serializes all pkarr-relay settings mutations (add/remove/set/reset)
+/// so a concurrent read-modify-write from another window can't lose an update.
+/// Process-global because connectivity-settings.json is a single per-process
+/// file. Separate from the NodeState mutex (which `apply_pkarr_relays` takes),
+/// so there is no lock-ordering/deadlock concern.
+static PKARR_RELAY_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn pkarr_relay_write_lock() -> &'static tokio::sync::Mutex<()> {
+    PKARR_RELAY_WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// ZEB-380: replace the user-configurable pkarr relay list. Validates, persists
 /// to `connectivity-settings.json`, then hot-swaps the live pool (no restart).
 #[tauri::command(rename_all = "snake_case")]
@@ -33940,6 +33963,7 @@ async fn set_pkarr_relays<R: tauri::Runtime>(
     state: tauri::State<'_, Mutex<NodeState>>,
     relays: Vec<String>,
 ) -> Result<(), String> {
+    let _relay_write_guard = pkarr_relay_write_lock().lock().await;
     let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
     apply_pkarr_relays(&app, &state, validated)
 }
@@ -33952,6 +33976,7 @@ async fn reset_pkarr_relays<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
+    let _relay_write_guard = pkarr_relay_write_lock().lock().await;
     // default_relays() is always valid; run it through the validator anyway so
     // any future change to the defaults is held to the same contract.
     let validated =
@@ -33961,14 +33986,17 @@ async fn reset_pkarr_relays<R: tauri::Runtime>(
 
 /// ZEB-380: add a single relay to the persisted pool (server-authoritative
 /// read-modify-write). The client sends only the URL — the backend appends it
-/// to the CURRENT persisted list and re-validates, so a stale client view can
-/// never clobber a fresher pool (another window / a concurrent change).
+/// to the EFFECTIVE relay pool (defaulting to `default_relays()` when the
+/// persisted list is empty/invalid) and re-validates, so adding to a fresh
+/// install preserves the live defaults rather than replacing them with just
+/// the new URL.
 #[tauri::command(rename_all = "snake_case")]
 async fn add_pkarr_relay<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
     url: String,
 ) -> Result<(), String> {
+    let _relay_write_guard = pkarr_relay_write_lock().lock().await;
     let settings_path = {
         let guard = state
             .lock()
@@ -33976,7 +34004,8 @@ async fn add_pkarr_relay<R: tauri::Runtime>(
         guard.pkarr_settings_path.clone()
     };
     let path = connectivity_settings_path(&app, settings_path)?;
-    let mut relays = pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+    let mut relays =
+        effective_pkarr_relays(pkarr_settings::PkarrSettings::load_or_default(&path).relays);
     relays.push(url);
     // validate_relay_urls dedups (so re-adding an existing relay is a no-op),
     // caps at 8, and rejects invalid input — returning a clear Err to the UI.
@@ -33985,14 +34014,18 @@ async fn add_pkarr_relay<R: tauri::Runtime>(
 }
 
 /// ZEB-380: remove a single relay from the persisted pool (server-authoritative
-/// read-modify-write). Removing the last relay fails (validate_relay_urls
-/// rejects an empty list), preserving the >=1 invariant server-side.
+/// read-modify-write). Filters from the EFFECTIVE pool (defaulting to
+/// `default_relays()` when the persisted list is empty/invalid), so a fresh
+/// install can remove an unwanted default. Removing the last relay fails
+/// (validate_relay_urls rejects an empty list), preserving the >=1 invariant
+/// server-side.
 #[tauri::command(rename_all = "snake_case")]
 async fn remove_pkarr_relay<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
     url: String,
 ) -> Result<(), String> {
+    let _relay_write_guard = pkarr_relay_write_lock().lock().await;
     let settings_path = {
         let guard = state
             .lock()
@@ -34001,11 +34034,11 @@ async fn remove_pkarr_relay<R: tauri::Runtime>(
     };
     let path = connectivity_settings_path(&app, settings_path)?;
     let target = url.trim().trim_end_matches('/');
-    let relays: Vec<String> = pkarr_settings::PkarrSettings::load_or_default(&path)
-        .relays
-        .into_iter()
-        .filter(|r| r.trim_end_matches('/') != target)
-        .collect();
+    let relays: Vec<String> =
+        effective_pkarr_relays(pkarr_settings::PkarrSettings::load_or_default(&path).relays)
+            .into_iter()
+            .filter(|r| r.trim_end_matches('/') != target)
+            .collect();
     // Empty → validate_relay_urls errors ("at least one relay is required"),
     // which guards against removing the final relay.
     let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
@@ -34034,13 +34067,12 @@ async fn get_pkarr_relays<R: tauri::Runtime>(
     }
     let path = connectivity_settings_path(&app, settings_path)?;
     let persisted = pkarr_settings::PkarrSettings::load_or_default(&path).relays;
-    // Validate the persisted list exactly as start_node boot does, so this
-    // pre-wiring view shows what the pool would ACTUALLY use: an empty or
-    // invalid (e.g. hand-edited) settings file resolves to the recommended set
-    // rather than surfacing junk relays as "Healthy". (validate_relay_urls
-    // rejects an empty list, so the empty case also falls back to defaults.)
-    let relays = crate::pkarr_settings::validate_relay_urls(persisted)
-        .unwrap_or_else(|_| crate::pkarr_settings::default_relays());
+    // Resolve through effective_pkarr_relays exactly as start_node boot and
+    // add/remove do: an empty or invalid (e.g. hand-edited) settings file
+    // resolves to the recommended set rather than surfacing junk relays as
+    // "Healthy". (validate_relay_urls rejects an empty list, so the empty
+    // case also falls back to defaults.)
+    let relays = effective_pkarr_relays(persisted);
     Ok(relays
         .into_iter()
         .map(|url| crate::network_health::RelayHealthWire {
@@ -36335,6 +36367,66 @@ mod friend_ipc_tests {
         assert!(
             result.is_err(),
             "remove-last: empty list is rejected by validator"
+        );
+    }
+
+    #[test]
+    fn effective_pkarr_relays_empty_persisted_resolves_to_defaults() {
+        // FIX 1 (ZEB-380): effective_pkarr_relays() on an empty persisted list
+        // must return default_relays(), not [].  Simulates a fresh install where
+        // the settings file has no relays written yet — the live pool is the
+        // defaults, so add/remove must operate on that set, not [].
+        let defaults = crate::pkarr_settings::default_relays();
+        assert!(
+            !defaults.is_empty(),
+            "precondition: default_relays() is non-empty"
+        );
+
+        // Empty persisted list → defaults.
+        let effective = effective_pkarr_relays(vec![]);
+        assert_eq!(
+            effective, defaults,
+            "empty persisted resolves to default_relays()"
+        );
+
+        // Simulate add on a fresh install (empty file) — result must be
+        // defaults + new URL, NOT just [new URL].
+        let new_url = "https://new.relay.example".to_string();
+        let mut relays = effective_pkarr_relays(vec![]);
+        relays.push(new_url.clone());
+        let validated =
+            crate::pkarr_settings::validate_relay_urls(relays).expect("valid after add");
+        assert!(
+            validated.contains(&new_url),
+            "add on fresh install: new URL present"
+        );
+        for d in &defaults {
+            assert!(
+                validated.contains(d),
+                "add on fresh install: default relay {d} preserved"
+            );
+        }
+        assert_eq!(
+            validated.len(),
+            defaults.len() + 1,
+            "add on fresh install: defaults + 1 new relay"
+        );
+
+        // Persist + reload: a settings file with an empty relays array (e.g.
+        // produced by a bug or hand-editing) should also resolve to defaults.
+        // `load_or_default` on a MISSING file returns the struct Default (which
+        // itself contains default_relays()), so to get an empty list we must
+        // explicitly write `{"relays":[]}` — the serde field default only fills
+        // in ABSENT keys, not empty arrays.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        std::fs::write(&path, r#"{"relays":[]}"#).expect("write empty relays file");
+        let from_file = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        assert!(from_file.is_empty(), "explicitly-written empty relays parses as []");
+        let effective_from_file = effective_pkarr_relays(from_file);
+        assert_eq!(
+            effective_from_file, defaults,
+            "effective from empty-relays file == default_relays()"
         );
     }
 
