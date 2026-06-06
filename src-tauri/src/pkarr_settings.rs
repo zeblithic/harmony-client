@@ -354,7 +354,14 @@ mod tests {
     fn validate_allows_http_for_ipv6_local() {
         assert!(validate_relay_urls(vec!["http://[::1]:6881".into()]).is_ok());
         assert!(validate_relay_urls(vec!["http://[fe80::1]:6881".into()]).is_ok());
+        // ULA is fc00::/7 — covers BOTH the fc00::/8 and fd00::/8 halves. Real
+        // locally-assigned ULAs live in fd00::/8, so assert both; the `0xfe00`
+        // mask in is_local_host is a /7 (top 7 bits), not /9.
         assert!(validate_relay_urls(vec!["http://[fc00::1]:6881".into()]).is_ok());
+        assert!(validate_relay_urls(vec!["http://[fd12::1]:6881".into()]).is_ok());
+        assert!(validate_relay_urls(vec!["http://[fdff:ffff::1]:6881".into()]).is_ok());
+        // Just below the ULA range (fbff::/16) must NOT be treated as local.
+        assert!(validate_relay_urls(vec!["http://[fbff::1]:6881".into()]).is_err());
         // A global IPv6 over http is still rejected.
         assert!(validate_relay_urls(vec!["http://[2606:4700::1111]:6881".into()]).is_err());
     }
