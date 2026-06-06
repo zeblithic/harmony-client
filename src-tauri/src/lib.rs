@@ -5417,13 +5417,22 @@ pub(crate) async fn start_node_inner(
                                     telemetry: std::sync::Arc::clone(&dial_telemetry),
                                 });
 
+                            let prod_relay: std::sync::Arc<
+                                dyn crate::network_health::RelaySnapshot,
+                            > = if let Some(rc) = guard.pkarr_relay_client.as_ref() {
+                                std::sync::Arc::new(crate::network_health::ProdRelaySnapshot(
+                                    std::sync::Arc::clone(rc),
+                                ))
+                            } else {
+                                std::sync::Arc::new(StubEmptyRelaySnapshot)
+                            };
                             let mut nh = crate::network_health::NetworkHealthService::new(
                                 prod_iroh,
                                 prod_pkarr,
                                 prod_resolver,
                                 prod_membership,
                                 prod_dial,
-                                std::sync::Arc::new(StubEmptyRelaySnapshot),
+                                prod_relay,
                             );
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
@@ -33866,6 +33875,77 @@ async fn connectivity_get_identity_discoverable(
     Ok(pkarr_settings::PkarrSettings::load_or_default(&path).identity_discoverable)
 }
 
+/// ZEB-380: replace the user-configurable pkarr relay list. Validates, persists
+/// to `connectivity-settings.json`, then hot-swaps the live pool (no restart).
+#[tauri::command(rename_all = "snake_case")]
+async fn set_pkarr_relays<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    relays: Vec<String>,
+) -> Result<(), String> {
+    let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
+    let (settings_path, relay_client) = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            guard.pkarr_settings_path.clone(),
+            guard.pkarr_relay_client.clone(),
+        )
+    };
+    let Some(path) = settings_path else {
+        return Err("pkarr_settings_path missing".into());
+    };
+    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
+    settings.relays = validated.clone();
+    settings
+        .save(&path)
+        .map_err(|e| format!("save connectivity-settings: {e}"))?;
+    // Live-swap. No-op if pkarr isn't wired yet — the persisted list is read at
+    // the next boot.
+    if let Some(rc) = relay_client {
+        rc.set_relays(validated);
+    }
+    if let Err(e) = app.emit("connectivity-relays-changed", ()) {
+        tracing::warn!(error = %e, "set_pkarr_relays: emit failed");
+    }
+    Ok(())
+}
+
+/// ZEB-380: current relay list + per-relay health. Prefers the live client's
+/// health; falls back to the persisted list (Healthy placeholders) pre-wiring
+/// so the Settings UI can render + edit before/without a running node.
+#[tauri::command(rename_all = "snake_case")]
+async fn get_pkarr_relays(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
+    let (settings_path, relay_client) = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            guard.pkarr_settings_path.clone(),
+            guard.pkarr_relay_client.clone(),
+        )
+    };
+    if let Some(rc) = relay_client {
+        return Ok(rc.relay_health().into_iter().map(Into::into).collect());
+    }
+    let relays = match settings_path {
+        Some(p) => pkarr_settings::PkarrSettings::load_or_default(&p).relays,
+        None => crate::pkarr_settings::default_relays(),
+    };
+    Ok(relays
+        .into_iter()
+        .map(|url| crate::network_health::RelayHealthWire {
+            url,
+            state: crate::network_health::RelayStateWire::Healthy,
+            last_outcome: None,
+            last_success_ms: None,
+        })
+        .collect())
+}
+
 /// Look up a peer's current iroh routing via case-B (identity-keyed) pkarr
 /// lookup. `identity_pub_hex` is the 64-byte harmony identity pub in hex.
 ///
@@ -36040,6 +36120,32 @@ mod friend_ipc_tests {
     }
 
     #[test]
+    fn set_pkarr_relays_validation_and_persist_round_trip() {
+        // Mirrors the friend-auto-accept persistence test: the IPC's pure pieces
+        // (validate + PkarrSettings load/save) round-trip through a temp file.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        // Invalid input is rejected by the validator (no persist).
+        assert!(
+            crate::pkarr_settings::validate_relay_urls(vec!["http://relay.pkarr.org".into()])
+                .is_err()
+        );
+
+        // Valid input persists + reloads.
+        let validated =
+            crate::pkarr_settings::validate_relay_urls(vec!["https://relay.pkarr.org".into()])
+                .expect("valid");
+        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        settings.relays = validated.clone();
+        settings.save(&path).expect("save");
+        assert_eq!(
+            crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays,
+            validated
+        );
+    }
+
+    #[test]
     fn add_friend_outcome_serializes_camelcase() {
         // The DTO contract the frontend depends on: externally-tagged enum with
         // camelCase variant names + fields.
@@ -36741,6 +36847,9 @@ pub fn run() {
             network_health_snapshot,
             network_health_run_self_test,
             network_health_export_payload,
+            // ZEB-380: pkarr relay configuration IPCs.
+            set_pkarr_relays,
+            get_pkarr_relays,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -36822,6 +36931,9 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         leave_group_call,
         send_group_voice_frame,
         set_group_call_muted,
+        // ZEB-380: pkarr relay configuration IPCs.
+        set_pkarr_relays,
+        get_pkarr_relays,
     ])
 }
 
