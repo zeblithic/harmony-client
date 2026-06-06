@@ -33952,14 +33952,33 @@ fn connectivity_settings_path<R: tauri::Runtime>(
     Ok(dir.join("connectivity-settings.json"))
 }
 
+/// ZEB-380: build `RelayHealthWire` placeholders (all `Healthy`, no outcome) for
+/// a list of relay URLs — the pre-wiring / node-stopped representation where no
+/// live `RelayClient` health exists yet. Shared by `get_pkarr_relays` and
+/// `apply_pkarr_relays`' return path.
+fn healthy_placeholder_wires(urls: Vec<String>) -> Vec<crate::network_health::RelayHealthWire> {
+    urls.into_iter()
+        .map(|url| crate::network_health::RelayHealthWire {
+            url,
+            state: crate::network_health::RelayStateWire::Healthy,
+            last_outcome: None,
+            last_success_ms: None,
+        })
+        .collect()
+}
+
 /// ZEB-380: persist + hot-swap an ALREADY-VALIDATED relay list, then emit
 /// `connectivity-relays-changed`. Shared by `set_pkarr_relays` (user input) and
-/// `reset_pkarr_relays` (recommended defaults).
+/// `reset_pkarr_relays` (recommended defaults). Returns the NEW authoritative
+/// relay list (live `relay_health()` when wired, else `Healthy` placeholders),
+/// in the SAME shape as `get_pkarr_relays`, so a caller can update its view
+/// from the mutation's result without a separate refetch that could fail and
+/// leave a stale list (Cursor round-10 Medium).
 fn apply_pkarr_relays<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &tauri::State<'_, Mutex<NodeState>>,
     validated: Vec<String>,
-) -> Result<(), String> {
+) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
     let (settings_path, relay_client) = {
         let guard = state
             .lock()
@@ -33975,13 +33994,16 @@ fn apply_pkarr_relays<R: tauri::Runtime>(
     settings
         .save(&path)
         .map_err(|e| format!("save connectivity-settings: {e}"))?;
-    if let Some(rc) = relay_client {
+    let health = if let Some(rc) = relay_client {
         rc.set_relays(validated);
-    }
+        rc.relay_health().into_iter().map(Into::into).collect()
+    } else {
+        healthy_placeholder_wires(validated)
+    };
     if let Err(e) = app.emit("connectivity-relays-changed", ()) {
         tracing::warn!(error = %e, "apply_pkarr_relays: emit failed");
     }
-    Ok(())
+    Ok(health)
 }
 
 /// ZEB-380: the EFFECTIVE relay pool from a persisted list — the same lenient
@@ -34020,7 +34042,7 @@ async fn set_pkarr_relays<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
     relays: Vec<String>,
-) -> Result<(), String> {
+) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
     let _relay_write_guard = pkarr_relay_write_lock().lock().await;
     let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
     apply_pkarr_relays(&app, &state, validated)
@@ -34033,7 +34055,7 @@ async fn set_pkarr_relays<R: tauri::Runtime>(
 async fn reset_pkarr_relays<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<(), String> {
+) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
     let _relay_write_guard = pkarr_relay_write_lock().lock().await;
     // default_relays() is always valid; run it through the validator anyway so
     // any future change to the defaults is held to the same contract.
@@ -34053,7 +34075,7 @@ async fn add_pkarr_relay<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
     url: String,
-) -> Result<(), String> {
+) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
     let _relay_write_guard = pkarr_relay_write_lock().lock().await;
     let settings_path = {
         let guard = state
@@ -34082,7 +34104,7 @@ async fn remove_pkarr_relay<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
     url: String,
-) -> Result<(), String> {
+) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
     let _relay_write_guard = pkarr_relay_write_lock().lock().await;
     let settings_path = {
         let guard = state
@@ -34130,16 +34152,7 @@ async fn get_pkarr_relays<R: tauri::Runtime>(
     // resolves to the recommended set rather than surfacing junk relays as
     // "Healthy". (validate_relay_urls rejects an empty list, so the empty
     // case also falls back to defaults.)
-    let relays = effective_pkarr_relays(persisted);
-    Ok(relays
-        .into_iter()
-        .map(|url| crate::network_health::RelayHealthWire {
-            url,
-            state: crate::network_health::RelayStateWire::Healthy,
-            last_outcome: None,
-            last_success_ms: None,
-        })
-        .collect())
+    Ok(healthy_placeholder_wires(effective_pkarr_relays(persisted)))
 }
 
 /// Look up a peer's current iroh routing via case-B (identity-keyed) pkarr

@@ -88,6 +88,18 @@
     }
   }
 
+  // Apply an authoritative relay list returned by a mutation (add/remove/reset).
+  // Unlike fetchRelays this can't fail — the list is already in hand — so it
+  // closes the "mutation succeeded but the follow-up refetch failed, leaving a
+  // stale list" gap (Cursor round-10 Medium). Claims the latest fetch token so
+  // an in-flight refetch can't later overwrite it with a stale read.
+  function applyAuthoritativeRelays(next: RelayHealth[]): void {
+    relayFetchSeq++;
+    relays = next ?? [];
+    relayError = null;
+    relayLoaded = true;
+  }
+
   async function handleAddRelay(): Promise<void> {
     const trimmed = newRelayUrl.trim();
     // Guard: never submit an Add before the initial fetch succeeds (relayLoaded
@@ -100,9 +112,11 @@
       // Server-authoritative read-modify-write: send only the new URL.
       // The backend appends it to the CURRENT persisted list and re-validates,
       // so a stale in-memory `relays` view can never clobber a fresher pool.
-      await addPkarrRelay(trimmed);
+      // It returns the new authoritative list, so we apply it directly — no
+      // refetch that could fail and strand a stale view.
+      const next = await addPkarrRelay(trimmed);
       newRelayUrl = '';
-      await fetchRelays();
+      applyAuthoritativeRelays(next);
     } catch (e) {
       relayError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -117,9 +131,10 @@
     try {
       // Server-authoritative read-modify-write: send only the URL to remove.
       // The backend filters the CURRENT persisted list and re-validates,
-      // guarding the >=1 invariant server-side as well.
-      await removePkarrRelay(url);
-      await fetchRelays();
+      // guarding the >=1 invariant server-side as well. It returns the new
+      // authoritative list, applied directly — no refetch that could fail.
+      const next = await removePkarrRelay(url);
+      applyAuthoritativeRelays(next);
     } catch (e) {
       relayError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -132,8 +147,10 @@
     relayPending = true;
     relayError = null;
     try {
-      await resetPkarrRelays();
-      await fetchRelays();
+      // Server-authoritative reset returns the new authoritative list (the
+      // recommended defaults), applied directly — no refetch that could fail.
+      const next = await resetPkarrRelays();
+      applyAuthoritativeRelays(next);
     } catch (e) {
       relayError = e instanceof Error ? e.message : String(e);
     } finally {

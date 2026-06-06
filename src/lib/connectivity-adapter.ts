@@ -287,9 +287,11 @@ export async function getPkarrRelays(): Promise<RelayHealth[]> {
  * with a descriptive error string on invalid input (bad scheme, duplicate
  * URLs, exceeds cap of 8, etc.).
  */
-export async function setPkarrRelays(relays: string[]): Promise<void> {
+export async function setPkarrRelays(relays: string[]): Promise<RelayHealth[]> {
   try {
-    await invoke('set_pkarr_relays', { relays });
+    // Returns the NEW authoritative list (same shape as getPkarrRelays), so the
+    // caller updates its view from the result with no separate refetch.
+    return await invoke<RelayHealth[]>('set_pkarr_relays', { relays });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(`set_pkarr_relays: ${msg}`);
@@ -301,9 +303,11 @@ export async function setPkarrRelays(relays: string[]): Promise<void> {
  * (`default_relays()`), persisted + hot-swapped live. Server-authoritative —
  * the frontend does not need to know the default URL list.
  */
-export async function resetPkarrRelays(): Promise<void> {
+export async function resetPkarrRelays(): Promise<RelayHealth[]> {
   try {
-    await invoke('reset_pkarr_relays');
+    // Returns the NEW authoritative list (the recommended defaults), so the
+    // caller updates its view from the result with no separate refetch.
+    return await invoke<RelayHealth[]>('reset_pkarr_relays');
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(`reset_pkarr_relays: ${msg}`);
@@ -315,9 +319,11 @@ export async function resetPkarrRelays(): Promise<void> {
  * read-modify-write). The backend appends `url` to the CURRENT persisted list
  * and re-validates, so a stale client view can never clobber a fresher pool.
  */
-export async function addPkarrRelay(url: string): Promise<void> {
+export async function addPkarrRelay(url: string): Promise<RelayHealth[]> {
   try {
-    await invoke('add_pkarr_relay', { url });
+    // Returns the NEW authoritative list (same shape as getPkarrRelays), so the
+    // caller updates its view from the result with no separate refetch.
+    return await invoke<RelayHealth[]>('add_pkarr_relay', { url });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(`add_pkarr_relay: ${msg}`);
@@ -329,9 +335,11 @@ export async function addPkarrRelay(url: string): Promise<void> {
  * read-modify-write). The backend filters the URL from the CURRENT persisted
  * list and re-validates; removing the last relay is rejected server-side.
  */
-export async function removePkarrRelay(url: string): Promise<void> {
+export async function removePkarrRelay(url: string): Promise<RelayHealth[]> {
   try {
-    await invoke('remove_pkarr_relay', { url });
+    // Returns the NEW authoritative list (same shape as getPkarrRelays), so the
+    // caller updates its view from the result with no separate refetch.
+    return await invoke<RelayHealth[]>('remove_pkarr_relay', { url });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(`remove_pkarr_relay: ${msg}`);
