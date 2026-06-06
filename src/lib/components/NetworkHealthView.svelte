@@ -13,6 +13,7 @@
    * matches CodeRabbit PR #157 round 1.
    */
   import { onMount, onDestroy } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import {
     snapshot as fetchSnapshot,
     runSelfTest as runSelfTestIpc,
@@ -44,7 +45,12 @@
   let exportOpen = $state(false);
 
   let unlisten: (() => void) | null = null;
+  let unlistenRelays: (() => void) | null = null;
   let destroyed = false;
+
+  // ZEB-380 Fix 3: ticking `now` for cooling-down countdown badges.
+  let now = $state(Date.now());
+  let nowTimer: ReturnType<typeof setInterval> | null = null;
 
   // Edge case 6.4 #1: auto-retry every 2s for 30s when iroh isn't ready.
   let startupRetryHandle: ReturnType<typeof setInterval> | null = null;
@@ -89,6 +95,20 @@
     }, 2000);
   }
 
+  // ZEB-380 Fix 3: start/stop the 1s tick depending on whether any relay is cooling down.
+  $effect(() => {
+    const relayList = snap?.pkarrStatus?.relays ?? [];
+    const hasCooling = relayList.some((r) => r.state.kind === 'coolingDown');
+    if (hasCooling && nowTimer === null) {
+      nowTimer = setInterval(() => {
+        now = Date.now();
+      }, 1000);
+    } else if (!hasCooling && nowTimer !== null) {
+      clearInterval(nowTimer);
+      nowTimer = null;
+    }
+  });
+
   onMount(async () => {
     await refresh();
     if (!snap?.myNetwork) startStartupRetry();
@@ -104,12 +124,31 @@
     } else {
       unlisten = resolved;
     }
+    // ZEB-380 Fix 2: re-fetch snapshot when the relay pool is hot-swapped so
+    // the relay rows stay fresh after a live `set_pkarr_relays` / `reset_pkarr_relays`.
+    try {
+      const resolvedRelays = await listen<null>('connectivity-relays-changed', () => {
+        void refresh();
+      });
+      if (destroyed) {
+        resolvedRelays();
+      } else {
+        unlistenRelays = resolvedRelays;
+      }
+    } catch (e) {
+      console.error('[network-health] failed to subscribe to relay changes:', e);
+    }
   });
 
   onDestroy(() => {
     destroyed = true;
     if (unlisten) unlisten();
+    if (unlistenRelays) unlistenRelays();
     if (startupRetryHandle) clearInterval(startupRetryHandle);
+    if (nowTimer !== null) {
+      clearInterval(nowTimer);
+      nowTimer = null;
+    }
   });
 
   function peerStatusIcon(p: PeerHealth): string {
@@ -188,7 +227,7 @@
                 <span class="badge badge-cooling" data-testid="nh-relay-badge"
                   >Cooling down ({Math.max(
                     0,
-                    Math.ceil((relay.state.untilMs - Date.now()) / 1000),
+                    Math.ceil((relay.state.untilMs - now) / 1000),
                   )}s)</span
                 >
               {/if}

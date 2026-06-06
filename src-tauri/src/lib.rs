@@ -33900,15 +33900,14 @@ fn connectivity_settings_path<R: tauri::Runtime>(
     Ok(dir.join("connectivity-settings.json"))
 }
 
-/// ZEB-380: replace the user-configurable pkarr relay list. Validates, persists
-/// to `connectivity-settings.json`, then hot-swaps the live pool (no restart).
-#[tauri::command(rename_all = "snake_case")]
-async fn set_pkarr_relays<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    state: tauri::State<'_, Mutex<NodeState>>,
-    relays: Vec<String>,
+/// ZEB-380: persist + hot-swap an ALREADY-VALIDATED relay list, then emit
+/// `connectivity-relays-changed`. Shared by `set_pkarr_relays` (user input) and
+/// `reset_pkarr_relays` (recommended defaults).
+fn apply_pkarr_relays<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &tauri::State<'_, Mutex<NodeState>>,
+    validated: Vec<String>,
 ) -> Result<(), String> {
-    let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
     let (settings_path, relay_client) = {
         let guard = state
             .lock()
@@ -33918,21 +33917,46 @@ async fn set_pkarr_relays<R: tauri::Runtime>(
             guard.pkarr_relay_client.clone(),
         )
     };
-    let path = connectivity_settings_path(&app, settings_path)?;
+    let path = connectivity_settings_path(app, settings_path)?;
     let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
     settings.relays = validated.clone();
     settings
         .save(&path)
         .map_err(|e| format!("save connectivity-settings: {e}"))?;
-    // Live-swap. No-op if pkarr isn't wired yet — the persisted list is read at
-    // the next boot.
     if let Some(rc) = relay_client {
         rc.set_relays(validated);
     }
     if let Err(e) = app.emit("connectivity-relays-changed", ()) {
-        tracing::warn!(error = %e, "set_pkarr_relays: emit failed");
+        tracing::warn!(error = %e, "apply_pkarr_relays: emit failed");
     }
     Ok(())
+}
+
+/// ZEB-380: replace the user-configurable pkarr relay list. Validates, persists
+/// to `connectivity-settings.json`, then hot-swaps the live pool (no restart).
+#[tauri::command(rename_all = "snake_case")]
+async fn set_pkarr_relays<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    relays: Vec<String>,
+) -> Result<(), String> {
+    let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
+    apply_pkarr_relays(&app, &state, validated)
+}
+
+/// ZEB-380: reset the pkarr relay pool to the recommended default set
+/// (`default_relays()`), persisted + hot-swapped live. Server-authoritative so
+/// the frontend never hardcodes the default list ("Restore recommended").
+#[tauri::command(rename_all = "snake_case")]
+async fn reset_pkarr_relays<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    // default_relays() is always valid; run it through the validator anyway so
+    // any future change to the defaults is held to the same contract.
+    let validated =
+        crate::pkarr_settings::validate_relay_urls(crate::pkarr_settings::default_relays())?;
+    apply_pkarr_relays(&app, &state, validated)
 }
 
 /// ZEB-380: current relay list + per-relay health. Prefers the live client's
@@ -36878,6 +36902,7 @@ pub fn run() {
             // ZEB-380: pkarr relay configuration IPCs.
             set_pkarr_relays,
             get_pkarr_relays,
+            reset_pkarr_relays,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -36962,6 +36987,7 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         // ZEB-380: pkarr relay configuration IPCs.
         set_pkarr_relays,
         get_pkarr_relays,
+        reset_pkarr_relays,
     ])
 }
 

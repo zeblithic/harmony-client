@@ -36,6 +36,7 @@ function setupDefaultMocks(
     if (cmd === 'connectivity_get_identity_discoverable') return Promise.resolve(false);
     if (cmd === 'get_pkarr_relays') return Promise.resolve(relayList);
     if (cmd === 'set_pkarr_relays') return Promise.resolve(undefined);
+    if (cmd === 'reset_pkarr_relays') return Promise.resolve(undefined);
     return Promise.resolve(null);
   });
 }
@@ -289,7 +290,7 @@ describe('NetworkDiscoverabilitySettings', () => {
       expect(removeBtn.disabled).toBe(true);
     });
 
-    it('Restore recommended submits the default set', async () => {
+    it('Restore recommended invokes reset_pkarr_relays IPC (server-authoritative defaults)', async () => {
       setupDefaultMocks([makeRelay('https://custom.relay.example')]);
       render(NetworkDiscoverabilitySettings);
 
@@ -298,10 +299,13 @@ describe('NetworkDiscoverabilitySettings', () => {
       await fireEvent.click(restoreBtn);
 
       await waitFor(() => {
-        expect(mockInvoke).toHaveBeenCalledWith('set_pkarr_relays', {
-          relays: DEFAULT_RELAYS,
-        });
+        expect(mockInvoke).toHaveBeenCalledWith('reset_pkarr_relays');
       });
+      // Ensure set_pkarr_relays was NOT called with a hardcoded list.
+      const setPkarrCalls = (mockInvoke as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (call) => call[0] === 'set_pkarr_relays',
+      );
+      expect(setPkarrCalls.length).toBe(0);
     });
 
     it('clears relay error banner after a successful reload (Fix E)', async () => {
@@ -315,6 +319,7 @@ describe('NetworkDiscoverabilitySettings', () => {
           return Promise.resolve(DEFAULT_RELAYS.map((u) => makeRelay(u)));
         }
         if (cmd === 'set_pkarr_relays') return Promise.resolve(undefined);
+        if (cmd === 'reset_pkarr_relays') return Promise.resolve(undefined);
         return Promise.resolve(null);
       });
 

@@ -19,12 +19,10 @@
     onIdentityDiscoverableChanged,
     getPkarrRelays,
     setPkarrRelays,
+    resetPkarrRelays,
   } from '../connectivity-adapter';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import type { RelayHealth } from '../types/network-health';
-
-  // ZEB-380: default relay pool — must stay in sync with Rust `default_relays()`.
-  const DEFAULT_RELAYS = ['https://relay.pkarr.org', 'https://pkarr.pubky.app'];
 
   // Current persisted value — loaded on mount, updated on toggle.
   let enabled = $state(false);
@@ -45,6 +43,22 @@
   // Unlisten for connectivity-relays-changed event.
   let relaysUnlisten: UnlistenFn | null = null;
   let relaysListenerDestroyed = false;
+
+  // ZEB-380 Fix 3: ticking `now` for cooling-down countdown badges.
+  let now = $state(Date.now());
+  let nowTimer: ReturnType<typeof setInterval> | null = null;
+  // Reactive: start/stop the 1s tick depending on whether any relay is cooling down.
+  $effect(() => {
+    const hasCooling = relays.some((r) => r.state.kind === 'coolingDown');
+    if (hasCooling && nowTimer === null) {
+      nowTimer = setInterval(() => {
+        now = Date.now();
+      }, 1000);
+    } else if (!hasCooling && nowTimer !== null) {
+      clearInterval(nowTimer);
+      nowTimer = null;
+    }
+  });
 
   async function fetchRelays(): Promise<void> {
     try {
@@ -92,7 +106,7 @@
     relayPending = true;
     relayError = null;
     try {
-      await setPkarrRelays(DEFAULT_RELAYS);
+      await resetPkarrRelays();
       await fetchRelays();
     } catch (e) {
       relayError = e instanceof Error ? e.message : String(e);
@@ -103,7 +117,7 @@
 
   function relayStateLabel(relay: RelayHealth): string {
     if (relay.state.kind === 'healthy') return 'Healthy';
-    const secsLeft = Math.max(0, Math.ceil((relay.state.untilMs - Date.now()) / 1000));
+    const secsLeft = Math.max(0, Math.ceil((relay.state.untilMs - now) / 1000));
     return `Cooling down (${secsLeft}s)`;
   }
 
@@ -147,6 +161,10 @@
     stopListener?.();
     relaysListenerDestroyed = true;
     relaysUnlisten?.();
+    if (nowTimer !== null) {
+      clearInterval(nowTimer);
+      nowTimer = null;
+    }
   });
 
   async function handleToggle(e: Event) {

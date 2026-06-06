@@ -297,6 +297,20 @@ export async function setPkarrRelays(relays: string[]): Promise<void> {
 }
 
 /**
+ * Resets the pkarr relay pool to the backend's recommended default set
+ * (`default_relays()`), persisted + hot-swapped live. Server-authoritative —
+ * the frontend does not need to know the default URL list.
+ */
+export async function resetPkarrRelays(): Promise<void> {
+  try {
+    await invoke('reset_pkarr_relays');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`reset_pkarr_relays: ${msg}`);
+  }
+}
+
+/**
  * Subscribe to `connectivity-pkarr-fallback-fired` events.
  *
  * Emitted by the backend whenever `ReachabilityResolver::resolve_async`
