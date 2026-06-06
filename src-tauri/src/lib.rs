@@ -815,6 +815,12 @@ pub struct NodeState {
     /// and wired into the `ReachabilityResolver` as the case-C fallback.
     pub pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
 
+    /// ZEB-380: the live relay client, retained so `set_pkarr_relays` can
+    /// hot-swap the pool (and `get_pkarr_relays` can read per-relay health)
+    /// without a restart. `None` pre-start_node / when pkarr isn't wired;
+    /// cleared on stop alongside the other pkarr handles.
+    pub pkarr_relay_client: Option<std::sync::Arc<harmony_pkarr::RelayClient>>,
+
     /// Case A lifecycle manager — registers / unregisters per-invite pkarr
     /// publications keyed on HKDF(invite_token.sig, epoch).
     pub pkarr_invite_publisher:
@@ -912,6 +918,7 @@ impl NodeState {
         // re-sent by the requester's next dial after a restart).
         self.pending_friend_requests = None;
         self.pkarr_resolver = None;
+        self.pkarr_relay_client = None;
         self.pkarr_invite_publisher = None;
         self.pkarr_identity_publisher = None;
         self.pkarr_community_publisher = None;
@@ -1062,6 +1069,7 @@ impl Default for NodeState {
             pkarr_friend_publisher: None,
             pending_friend_requests: None,
             pkarr_resolver: None,
+            pkarr_relay_client: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
             pkarr_community_publisher: None,
@@ -2507,6 +2515,8 @@ pub(crate) async fn start_node_inner(
             std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>,
         > = None;
         let mut pkarr_resolver_for_state: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>> =
+            None;
+        let mut pkarr_relay_client_for_state: Option<std::sync::Arc<harmony_pkarr::RelayClient>> =
             None;
         let mut pkarr_invite_publisher_for_state: Option<
             std::sync::Arc<pkarr_invite_publisher::PkarrInvitePublisher>,
@@ -4392,10 +4402,23 @@ pub(crate) async fn start_node_inner(
                     // (endpoint is None) the blob builder produces an empty vec and the
                     // pkarr record will be un-dial-able, which is acceptable degraded
                     // behaviour.
-                    let pkarr_relay_pool = harmony_pkarr::RelayPool::new(vec![
-                        // n0-operated pkarr relay (Mainline DHT bridge).
-                        "https://relay.pkarr.org".to_string(),
-                    ]);
+                    // Resolve settings path and load settings here (hoisted from below
+                    // by ZEB-380) so the relay pool can be built from the persisted relay
+                    // list before constructing the RelayClient. The downstream readers
+                    // (identity_discoverable, friend_auto_accept_known, pkarr_settings_path
+                    // stash) all reference the same hoisted bindings.
+                    let pkarr_settings_path = app_data_dir.join("connectivity-settings.json");
+                    let pkarr_settings =
+                        pkarr_settings::PkarrSettings::load_or_default(&pkarr_settings_path);
+                    // ZEB-380: build the pool from the persisted user-configurable
+                    // relay list (>=2 by default). Empty/missing settings -> default set.
+                    let configured_relays = pkarr_settings.relays.clone();
+                    let pkarr_relay_pool =
+                        harmony_pkarr::RelayPool::new(if configured_relays.is_empty() {
+                            crate::pkarr_settings::default_relays()
+                        } else {
+                            configured_relays
+                        });
                     let pkarr_relay_client =
                         std::sync::Arc::new(harmony_pkarr::RelayClient::new(pkarr_relay_pool));
                     let pkarr_publisher_arc =
@@ -4404,7 +4427,9 @@ pub(crate) async fn start_node_inner(
                         ));
                     let pkarr_publisher_join = std::sync::Arc::clone(&pkarr_publisher_arc).spawn();
                     let pkarr_resolver_arc =
-                        std::sync::Arc::new(harmony_pkarr::PkarrResolver::new(pkarr_relay_client));
+                        std::sync::Arc::new(harmony_pkarr::PkarrResolver::new(
+                            std::sync::Arc::clone(&pkarr_relay_client),
+                        ));
 
                     // Wire case-C fallback into the ReachabilityResolver.
                     // The contexts_fn is a STUB returning empty Vec for now —
@@ -4540,10 +4565,7 @@ pub(crate) async fn start_node_inner(
                         }
                     }
 
-                    // Resolve settings path and restore case-B if enabled.
-                    let pkarr_settings_path = app_data_dir.join("connectivity-settings.json");
-                    let pkarr_settings =
-                        pkarr_settings::PkarrSettings::load_or_default(&pkarr_settings_path);
+                    // Restore case-B if enabled (pkarr_settings loaded above, hoisted by ZEB-380).
                     if pkarr_settings.identity_discoverable {
                         pkarr_identity_pub.enable().await;
                     }
@@ -4577,6 +4599,7 @@ pub(crate) async fn start_node_inner(
                     pkarr_friend_publisher_for_state =
                         Some(std::sync::Arc::clone(&pkarr_friend_pub));
                     pkarr_resolver_for_state = Some(pkarr_resolver_arc);
+                    pkarr_relay_client_for_state = Some(pkarr_relay_client);
                     pkarr_invite_publisher_for_state = Some(pkarr_invite_pub);
                     pkarr_identity_publisher_for_state = Some(pkarr_identity_pub);
                     pkarr_community_publisher_for_state = Some(pkarr_community_pub);
@@ -5327,6 +5350,7 @@ pub(crate) async fn start_node_inner(
                         guard.pending_friend_requests =
                             Some(std::sync::Arc::clone(&pending_friend_requests_for_state));
                         guard.pkarr_resolver = pkarr_resolver_for_state.take();
+                        guard.pkarr_relay_client = pkarr_relay_client_for_state.take();
                         guard.pkarr_invite_publisher = pkarr_invite_publisher_for_state.take();
                         guard.pkarr_identity_publisher = pkarr_identity_publisher_for_state.take();
                         guard.pkarr_community_publisher =
@@ -40137,6 +40161,7 @@ mod start_node_race_tests {
             pkarr_friend_publisher: None,
             pending_friend_requests: None,
             pkarr_resolver: None,
+            pkarr_relay_client: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
             pkarr_community_publisher: None,
