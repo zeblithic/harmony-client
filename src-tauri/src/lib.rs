@@ -5633,6 +5633,58 @@ pub(crate) async fn start_node_inner(
             // a clone of publish_tx (publishes go through the running
             // event loop) and the receiver half of pairing_in. Stash
             // the handle on NodeState so stop_node can drop it.
+
+            // ZEB-380: reconcile the live relay pool against persisted
+            // settings now that the RelayClient is stashed and visible.
+            // A relay set/add/remove IPC may have persisted a newer list
+            // while boot was still awaiting iroh/zenoh init — at that point
+            // `pkarr_relay_client` was still `None`, so that IPC's hot-swap
+            // was skipped and the live pool would otherwise lag
+            // connectivity-settings.json until the next mutation or restart.
+            // Hold the same relay write lock the mutators take so a
+            // concurrent mutation can't interleave between the disk read and
+            // `set_relays`; the generation guard skips a pool a newer
+            // start_node now owns. The `relay_health()` vs effective compare
+            // makes this a no-op when nothing changed (or a concurrent IPC
+            // already hot-swapped) — `set_relays` only fires on a genuinely
+            // stale boot pool, so the common path resets no per-relay health.
+            {
+                let _relay_boot_guard = pkarr_relay_write_lock().lock().await;
+                let target = {
+                    let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                    if guard.generation != our_gen {
+                        None
+                    } else {
+                        match (
+                            guard.pkarr_relay_client.as_ref(),
+                            guard.pkarr_settings_path.as_ref(),
+                        ) {
+                            (Some(rc), Some(path)) => {
+                                Some((std::sync::Arc::clone(rc), path.clone()))
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                if let Some((rc, path)) = target {
+                    let effective = effective_pkarr_relays(
+                        pkarr_settings::PkarrSettings::load_or_default(&path).relays,
+                    );
+                    let mut live: Vec<String> =
+                        rc.relay_health().into_iter().map(|h| h.url).collect();
+                    let mut want = effective.clone();
+                    live.sort();
+                    want.sort();
+                    if live != want {
+                        tracing::info!(
+                            "ZEB-380: relay settings changed during boot; \
+                             reconciling live pool to persisted set"
+                        );
+                        rc.set_relays(effective);
+                    }
+                }
+            }
+
             let install_pairing = {
                 let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
                 if guard.generation != our_gen {
@@ -36422,7 +36474,10 @@ mod friend_ipc_tests {
         let path = td.path().join("connectivity-settings.json");
         std::fs::write(&path, r#"{"relays":[]}"#).expect("write empty relays file");
         let from_file = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
-        assert!(from_file.is_empty(), "explicitly-written empty relays parses as []");
+        assert!(
+            from_file.is_empty(),
+            "explicitly-written empty relays parses as []"
+        );
         let effective_from_file = effective_pkarr_relays(from_file);
         assert_eq!(
             effective_from_file, defaults,
