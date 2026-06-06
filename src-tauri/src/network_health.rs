@@ -102,7 +102,14 @@ pub struct RelayHealthWire {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum RelayStateWire {
     Healthy,
-    CoolingDown { until_ms: u64 },
+    // `rename_all` on the enum renames the VARIANT (`coolingDown`) but NOT the
+    // struct-variant field. Without this per-variant attr the field serializes
+    // as snake_case `until_ms`, while the TS DTO reads `untilMs` — yielding a
+    // `NaN` cooldown countdown in the UI. ZEB-384.
+    #[serde(rename_all = "camelCase")]
+    CoolingDown {
+        until_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2286,5 +2293,30 @@ mod tests {
             snap.pkarr_status.relays[0].last_outcome,
             Some(RelayOutcomeWire::Http { status: 503 })
         );
+    }
+
+    #[test]
+    fn relay_state_wire_cooling_down_serializes_camelcase_field() {
+        // ZEB-384 regression guard: `rename_all` on the enum renames the
+        // variant but NOT the struct-variant field, so the field must carry its
+        // own `rename_all` to emit `untilMs`. The TS DTO reads `untilMs`; a
+        // snake_case `until_ms` regression silently breaks the cooldown
+        // countdown (renders `NaN`). Pin the serialized JSON so it can't return.
+        let json = serde_json::to_value(RelayStateWire::CoolingDown { until_ms: 123 }).unwrap();
+        assert_eq!(json["kind"], "coolingDown");
+        assert_eq!(json["untilMs"], 123);
+        assert!(
+            json.get("until_ms").is_none(),
+            "must not emit snake_case until_ms: {json}"
+        );
+    }
+
+    #[test]
+    fn relay_outcome_wire_http_serializes_camelcase() {
+        // Sibling tagged enum audited in ZEB-384: `status` is single-word so it
+        // is already correct, but pin the contract explicitly.
+        let json = serde_json::to_value(RelayOutcomeWire::Http { status: 503 }).unwrap();
+        assert_eq!(json["kind"], "http");
+        assert_eq!(json["status"], 503);
     }
 }

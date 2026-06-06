@@ -235,7 +235,11 @@ describe('NetworkDiscoverabilitySettings', () => {
 
       await waitFor(() => {
         const badges = screen.getAllByTestId('relay-badge');
-        expect(badges.some((b) => b.textContent?.includes('Cooling down'))).toBe(true);
+        const cooling = badges.find((b) => b.textContent?.includes('Cooling down'));
+        expect(cooling).toBeTruthy();
+        // ZEB-384: countdown must render a real number, never `(NaNs)`.
+        expect(cooling?.textContent).toMatch(/Cooling down \(\d+s\)/);
+        expect(cooling?.textContent).not.toContain('NaN');
       });
     });
 
