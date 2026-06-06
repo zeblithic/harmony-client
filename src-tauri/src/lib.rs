@@ -4411,14 +4411,20 @@ pub(crate) async fn start_node_inner(
                     let pkarr_settings =
                         pkarr_settings::PkarrSettings::load_or_default(&pkarr_settings_path);
                     // ZEB-380: build the pool from the persisted user-configurable
-                    // relay list (>=2 by default). Empty/missing settings -> default set.
-                    let configured_relays = pkarr_settings.relays.clone();
-                    let pkarr_relay_pool =
-                        harmony_pkarr::RelayPool::new(if configured_relays.is_empty() {
-                            crate::pkarr_settings::default_relays()
-                        } else {
-                            configured_relays
-                        });
+                    // relay list, but VALIDATE it first — a hand-edited settings
+                    // file could contain junk; fall back to the recommended set on
+                    // empty or invalid input rather than booting a broken pool.
+                    let pool_relays = crate::pkarr_settings::validate_relay_urls(
+                        pkarr_settings.relays.clone(),
+                    )
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "ZEB-380: persisted relay list invalid; falling back to defaults"
+                        );
+                        crate::pkarr_settings::default_relays()
+                    });
+                    let pkarr_relay_pool = harmony_pkarr::RelayPool::new(pool_relays);
                     let pkarr_relay_client =
                         std::sync::Arc::new(harmony_pkarr::RelayClient::new(pkarr_relay_pool));
                     let pkarr_publisher_arc =
@@ -33875,6 +33881,25 @@ async fn connectivity_get_identity_discoverable(
     Ok(pkarr_settings::PkarrSettings::load_or_default(&path).identity_discoverable)
 }
 
+/// ZEB-380: resolve `connectivity-settings.json` even when the node is stopped.
+/// `NodeState.pkarr_settings_path` is cleared on stop, but the relay manager
+/// must still read/write the user's persisted relays pre-start / post-stop —
+/// fall back to the app-data-dir-derived path.
+fn connectivity_settings_path<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state_path: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(p) = state_path {
+        return Ok(p);
+    }
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    Ok(dir.join("connectivity-settings.json"))
+}
+
 /// ZEB-380: replace the user-configurable pkarr relay list. Validates, persists
 /// to `connectivity-settings.json`, then hot-swaps the live pool (no restart).
 #[tauri::command(rename_all = "snake_case")]
@@ -33893,9 +33918,7 @@ async fn set_pkarr_relays<R: tauri::Runtime>(
             guard.pkarr_relay_client.clone(),
         )
     };
-    let Some(path) = settings_path else {
-        return Err("pkarr_settings_path missing".into());
-    };
+    let path = connectivity_settings_path(&app, settings_path)?;
     let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
     settings.relays = validated.clone();
     settings
@@ -33916,7 +33939,8 @@ async fn set_pkarr_relays<R: tauri::Runtime>(
 /// health; falls back to the persisted list (Healthy placeholders) pre-wiring
 /// so the Settings UI can render + edit before/without a running node.
 #[tauri::command(rename_all = "snake_case")]
-async fn get_pkarr_relays(
+async fn get_pkarr_relays<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
     let (settings_path, relay_client) = {
@@ -33931,9 +33955,13 @@ async fn get_pkarr_relays(
     if let Some(rc) = relay_client {
         return Ok(rc.relay_health().into_iter().map(Into::into).collect());
     }
-    let relays = match settings_path {
-        Some(p) => pkarr_settings::PkarrSettings::load_or_default(&p).relays,
-        None => crate::pkarr_settings::default_relays(),
+    let path = connectivity_settings_path(&app, settings_path)?;
+    let relays = pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+    // Empty persisted list → recommended set, matching start_node boot behavior.
+    let relays = if relays.is_empty() {
+        crate::pkarr_settings::default_relays()
+    } else {
+        relays
     };
     Ok(relays
         .into_iter()

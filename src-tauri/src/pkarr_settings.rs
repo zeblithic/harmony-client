@@ -58,11 +58,12 @@ pub const MAX_RELAYS: usize = 8;
 /// Validate + normalize a user-submitted relay list. Rejects an empty list,
 /// blank/malformed URLs, non-`https` remote schemes (`http` allowed only for
 /// loopback / private hosts — pkarr's local-relay-on-:6881 guidance), URLs
-/// carrying a path/query/fragment (a relay is a `scheme://host` base — pkarr
-/// builds requests as `{base}/{z32_key}`, so a path-bearing base would silently
-/// misroute every publish/resolve), and more than [`MAX_RELAYS`]. Dedups on the
-/// trailing-slash-normalized URL, preserving first-seen order. Returns the
-/// normalized list on success.
+/// carrying a path/query/fragment/userinfo (a relay is a `scheme://host` base —
+/// pkarr builds requests as `{base}/{z32_key}`, so a path-bearing base would
+/// silently misroute every publish/resolve; userinfo (`user:pass@`) would
+/// persist credentials into `connectivity-settings.json`), and more than
+/// [`MAX_RELAYS`]. Dedups on the trailing-slash-normalized URL, preserving
+/// first-seen order. Returns the normalized list on success.
 pub fn validate_relay_urls(input: Vec<String>) -> Result<Vec<String>, String> {
     if input.is_empty() {
         return Err("at least one relay is required".to_string());
@@ -88,17 +89,19 @@ pub fn validate_relay_urls(input: Vec<String>) -> Result<Vec<String>, String> {
             }
             other => return Err(format!("unsupported relay scheme '{other}': {trimmed}")),
         }
-        // A relay is a `scheme://host[:port]` base; pkarr appends `/{z32_key}`.
-        // A path (other than the root `/`), query, or fragment on the base would
-        // silently misroute every request and quietly cooldown the relay — reject
-        // it up front for a clear error instead of a mysterious dead relay.
+        // A relay is a bare `scheme://host[:port]` base; pkarr appends
+        // `/{z32_key}`. A path (beyond root `/`), query, fragment, or userinfo
+        // (`user:pass@`) on the base would either silently misroute every request
+        // or persist credentials into connectivity-settings.json — reject up front.
         let path = parsed.path();
+        let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
         if (!path.is_empty() && path != "/")
             || parsed.query().is_some()
             || parsed.fragment().is_some()
+            || has_userinfo
         {
             return Err(format!(
-                "relay URL must be scheme://host only (no path/query/fragment): {trimmed}"
+                "relay URL must be scheme://host only (no path/query/fragment/userinfo): {trimmed}"
             ));
         }
         let normalized = trimmed.trim_end_matches('/').to_string();
@@ -114,13 +117,21 @@ pub fn validate_relay_urls(input: Vec<String>) -> Result<Vec<String>, String> {
 
 /// True for loopback / private / link-local hosts where a plaintext `http://`
 /// relay is acceptable (a local pkarr relay on :6881).
-fn is_local_host(host: &str) -> bool {
+///
+/// IPv6 coverage: loopback (`::1`), ULA (`fc00::/7`), link-local (`fe80::/10`).
+/// The `is_unique_local` / `is_unicast_link_local` methods are unstable, so we
+/// use stable bit-mask checks on the first 16-bit segment instead.
+pub(crate) fn is_local_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
     match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let seg0 = v6.segments()[0];
+            // loopback ::1, ULA fc00::/7, link-local fe80::/10
+            v6.is_loopback() || (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
+        }
         Err(_) => false,
     }
 }
@@ -280,6 +291,10 @@ mod tests {
         assert!(validate_relay_urls(vec!["https://relay.pkarr.org/foo".into()]).is_err());
         assert!(validate_relay_urls(vec!["https://relay.pkarr.org/?x=1".into()]).is_err());
         assert!(validate_relay_urls(vec!["https://relay.pkarr.org/#frag".into()]).is_err());
+        // Userinfo (credentials) must also be rejected — persisting them into
+        // connectivity-settings.json would be a credential leak.
+        assert!(validate_relay_urls(vec!["https://user:pass@relay.pkarr.org".into()]).is_err());
+        assert!(validate_relay_urls(vec!["https://user@relay.pkarr.org".into()]).is_err());
         // A bare host (with or without a single trailing slash) is still accepted
         // and normalized.
         assert_eq!(
@@ -287,6 +302,15 @@ mod tests {
                 .expect("trailing slash ok"),
             vec!["https://relay.pkarr.org".to_string()]
         );
+    }
+
+    #[test]
+    fn validate_allows_http_for_ipv6_local() {
+        assert!(validate_relay_urls(vec!["http://[::1]:6881".into()]).is_ok());
+        assert!(validate_relay_urls(vec!["http://[fe80::1]:6881".into()]).is_ok());
+        assert!(validate_relay_urls(vec!["http://[fc00::1]:6881".into()]).is_ok());
+        // A global IPv6 over http is still rejected.
+        assert!(validate_relay_urls(vec!["http://[2606:4700::1111]:6881".into()]).is_err());
     }
 
     #[test]

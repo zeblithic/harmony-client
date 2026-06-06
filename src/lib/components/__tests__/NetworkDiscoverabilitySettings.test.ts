@@ -303,5 +303,35 @@ describe('NetworkDiscoverabilitySettings', () => {
         });
       });
     });
+
+    it('clears relay error banner after a successful reload (Fix E)', async () => {
+      // First call to get_pkarr_relays fails, then succeeds on retry.
+      let callCount = 0;
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'connectivity_get_identity_discoverable') return Promise.resolve(false);
+        if (cmd === 'get_pkarr_relays') {
+          callCount++;
+          if (callCount === 1) return Promise.reject(new Error('network error'));
+          return Promise.resolve(DEFAULT_RELAYS.map((u) => makeRelay(u)));
+        }
+        if (cmd === 'set_pkarr_relays') return Promise.resolve(undefined);
+        return Promise.resolve(null);
+      });
+
+      render(NetworkDiscoverabilitySettings);
+
+      // Wait for the initial error to appear.
+      await waitFor(() => screen.getByTestId('relay-error'));
+      expect(screen.getByTestId('relay-error').textContent).toContain('network error');
+
+      // Trigger a reload via "Restore recommended" (which calls fetchRelays on success).
+      await waitFor(() => screen.getByTestId('relay-restore-button'));
+      await fireEvent.click(screen.getByTestId('relay-restore-button'));
+
+      // After the successful fetchRelays, the error banner must clear.
+      await waitFor(() => {
+        expect(screen.queryByTestId('relay-error')).toBeNull();
+      });
+    });
   });
 });

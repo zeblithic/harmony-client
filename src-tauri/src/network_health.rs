@@ -757,7 +757,14 @@ pub fn format_export_markdown(
         );
     }
     for relay in &snapshot.pkarr_status.relays {
-        // Relay URLs are public infrastructure — no redaction needed.
+        // Redact loopback/private/link-local relay hosts — public relays are
+        // fine verbatim, but a shared export shouldn't leak a user's LAN relay.
+        let display_url = match url::Url::parse(&relay.url) {
+            Ok(u) if crate::pkarr_settings::is_local_host(u.host_str().unwrap_or("")) => {
+                format!("{}://<local-relay>", u.scheme())
+            }
+            _ => relay.url.clone(),
+        };
         let state = match &relay.state {
             RelayStateWire::Healthy => "healthy".to_string(),
             RelayStateWire::CoolingDown { until_ms } => format!("coolingDown(until={until_ms})"),
@@ -769,7 +776,7 @@ pub fn format_export_markdown(
             Some(RelayOutcomeWire::Transport) => " lastOutcome=transport".to_string(),
             Some(RelayOutcomeWire::Http { status }) => format!(" lastOutcome=http:{status}"),
         };
-        let _ = writeln!(out, "relay {} [{}]{}", relay.url, state, last);
+        let _ = writeln!(out, "relay {} [{}]{}", display_url, state, last);
     }
 
     out
@@ -1760,6 +1767,42 @@ mod tests {
             md.contains("schemaVersion: 3"),
             "schema version token must appear verbatim; output was:\n{}",
             md
+        );
+    }
+
+    #[test]
+    fn format_export_redacts_local_relay_url() {
+        // A user may configure a loopback or LAN relay; a shared export must
+        // not leak the host — replace it with `scheme://<local-relay>`.
+        let mut snap = fixture_snapshot_with_full_ids();
+        snap.pkarr_status.relays = vec![
+            RelayHealthWire {
+                url: "http://192.168.1.5:6881".into(),
+                state: RelayStateWire::Healthy,
+                last_outcome: None,
+                last_success_ms: None,
+            },
+            RelayHealthWire {
+                url: "https://relay.pkarr.org".into(),
+                state: RelayStateWire::Healthy,
+                last_outcome: None,
+                last_success_ms: None,
+            },
+        ];
+        let md = format_export_markdown(&snap, None, false);
+        // Local relay must be redacted.
+        assert!(
+            md.contains("http://<local-relay>"),
+            "local relay host must be redacted; output:\n{md}"
+        );
+        assert!(
+            !md.contains("192.168.1.5"),
+            "raw private IP must not appear; output:\n{md}"
+        );
+        // Public relay must appear verbatim.
+        assert!(
+            md.contains("relay.pkarr.org"),
+            "public relay must not be redacted; output:\n{md}"
         );
     }
 

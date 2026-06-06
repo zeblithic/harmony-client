@@ -49,6 +49,7 @@
   async function fetchRelays(): Promise<void> {
     try {
       relays = (await getPkarrRelays()) ?? [];
+      relayError = null;
     } catch (e) {
       relayError = e instanceof Error ? e.message : String(e);
     }
@@ -126,13 +127,19 @@
     await fetchRelays();
     // Race-safe: if destroyed before listen() resolves, immediately call
     // the returned unlisten (mirrors onReachabilityChanged pattern).
-    const resolved = await listen<null>('connectivity-relays-changed', () => {
-      void fetchRelays();
-    });
-    if (relaysListenerDestroyed) {
-      resolved();
-    } else {
-      relaysUnlisten = resolved;
+    // Wrap in try/catch so a failed Tauri event subscription (e.g. during
+    // tests or early teardown) does not produce an unhandled rejection.
+    try {
+      const resolved = await listen<null>('connectivity-relays-changed', () => {
+        void fetchRelays();
+      });
+      if (relaysListenerDestroyed) {
+        resolved();
+      } else {
+        relaysUnlisten = resolved;
+      }
+    } catch (e) {
+      console.error('NetworkDiscoverabilitySettings: failed to subscribe to relay changes', e);
     }
   });
 
