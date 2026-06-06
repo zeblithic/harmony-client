@@ -44,6 +44,12 @@
   // so they can never submit a payload built from an empty/unknown base list,
   // which would clobber the persisted pool (Cursor Bugbot round-4 HIGH finding).
   let relayLoaded = $state(false);
+  // Monotonic token to drop stale in-flight get_pkarr_relays responses: if a
+  // newer fetch starts before an older one resolves (e.g. a mutation-triggered
+  // refetch racing a connectivity-relays-changed refetch), only the newest
+  // result is applied (Cursor Bugbot round-5 Medium — out-of-order responses
+  // overwriting a fresher list).
+  let relayFetchSeq = 0;
   // Unlisten for connectivity-relays-changed event.
   let relaysUnlisten: UnlistenFn | null = null;
   let relaysListenerDestroyed = false;
@@ -65,11 +71,17 @@
   });
 
   async function fetchRelays(): Promise<void> {
+    const seq = ++relayFetchSeq;
     try {
-      relays = (await getPkarrRelays()) ?? [];
+      const next = (await getPkarrRelays()) ?? [];
+      // Drop the result if a newer fetch superseded this one in flight.
+      if (seq !== relayFetchSeq) return;
+      relays = next;
       relayError = null;
       relayLoaded = true;
     } catch (e) {
+      // Stale failures must not clobber a newer fetch's state either.
+      if (seq !== relayFetchSeq) return;
       relayError = e instanceof Error ? e.message : String(e);
       // Do NOT set relayLoaded on failure — the base list is still unknown.
     }
