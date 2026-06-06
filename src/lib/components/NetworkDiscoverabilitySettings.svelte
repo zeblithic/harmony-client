@@ -17,7 +17,14 @@
     getIdentityDiscoverable,
     setIdentityDiscoverable,
     onIdentityDiscoverableChanged,
+    getPkarrRelays,
+    setPkarrRelays,
   } from '../connectivity-adapter';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import type { RelayHealth } from '../types/network-health';
+
+  // ZEB-380: default relay pool — must stay in sync with Rust `default_relays()`.
+  const DEFAULT_RELAYS = ['https://relay.pkarr.org', 'https://pkarr.pubky.app'];
 
   // Current persisted value — loaded on mount, updated on toggle.
   let enabled = $state(false);
@@ -29,6 +36,75 @@
 
   // Cleanup for the event listener.
   let stopListener: (() => void) | null = null;
+
+  // ZEB-380: relay manager state.
+  let relays = $state<RelayHealth[]>([]);
+  let newRelayUrl = $state('');
+  let relayError = $state<string | null>(null);
+  let relayPending = $state(false);
+  // Unlisten for connectivity-relays-changed event.
+  let relaysUnlisten: UnlistenFn | null = null;
+  let relaysListenerDestroyed = false;
+
+  async function fetchRelays(): Promise<void> {
+    try {
+      relays = (await getPkarrRelays()) ?? [];
+    } catch (e) {
+      relayError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function handleAddRelay(): Promise<void> {
+    const trimmed = newRelayUrl.trim();
+    if (!trimmed || relayPending) return;
+    relayPending = true;
+    relayError = null;
+    try {
+      const currentUrls = relays.map((r) => r.url);
+      await setPkarrRelays([...currentUrls, trimmed]);
+      newRelayUrl = '';
+      await fetchRelays();
+    } catch (e) {
+      relayError = e instanceof Error ? e.message : String(e);
+    } finally {
+      relayPending = false;
+    }
+  }
+
+  async function handleRemoveRelay(url: string): Promise<void> {
+    if (relayPending) return;
+    relayPending = true;
+    relayError = null;
+    try {
+      const newList = relays.map((r) => r.url).filter((u) => u !== url);
+      await setPkarrRelays(newList);
+      await fetchRelays();
+    } catch (e) {
+      relayError = e instanceof Error ? e.message : String(e);
+    } finally {
+      relayPending = false;
+    }
+  }
+
+  async function handleRestoreRecommended(): Promise<void> {
+    if (relayPending) return;
+    relayPending = true;
+    relayError = null;
+    try {
+      await setPkarrRelays(DEFAULT_RELAYS);
+      await fetchRelays();
+    } catch (e) {
+      relayError = e instanceof Error ? e.message : String(e);
+    } finally {
+      relayPending = false;
+    }
+  }
+
+  function relayStateLabel(relay: RelayHealth): string {
+    if (relay.state.kind === 'healthy') return 'Healthy';
+    const secsLeft = Math.max(0, Math.ceil((relay.state.untilMs - Date.now()) / 1000));
+    return `Cooling down (${secsLeft}s)`;
+  }
 
   onMount(async () => {
     // Subscribe to backend-side change events so that if another window
@@ -45,10 +121,25 @@
     } finally {
       loading = false;
     }
+
+    // ZEB-380: load relay pool and subscribe to live changes.
+    await fetchRelays();
+    // Race-safe: if destroyed before listen() resolves, immediately call
+    // the returned unlisten (mirrors onReachabilityChanged pattern).
+    const resolved = await listen<null>('connectivity-relays-changed', () => {
+      void fetchRelays();
+    });
+    if (relaysListenerDestroyed) {
+      resolved();
+    } else {
+      relaysUnlisten = resolved;
+    }
   });
 
   onDestroy(() => {
     stopListener?.();
+    relaysListenerDestroyed = true;
+    relaysUnlisten?.();
   });
 
   async function handleToggle(e: Event) {
@@ -109,6 +200,72 @@
       </span>
     </div>
   </label>
+</div>
+
+<!-- ZEB-380: relay manager -->
+<div class="discoverability-section" data-testid="relay-manager">
+  <div class="section-header">
+    <h4 class="section-title">Discovery Relays</h4>
+  </div>
+  <p class="toggle-hint">
+    Pkarr relays used for identity publishing and lookup. Changes apply live — no restart needed.
+  </p>
+
+  {#if relayError}
+    <p class="error-text" data-testid="relay-error">{relayError}</p>
+  {/if}
+
+  <ul class="relay-list" data-testid="relay-list">
+    {#each relays as relay (relay.url)}
+      <li class="relay-row" data-testid="relay-row">
+        <code class="relay-url" data-testid="relay-url">{relay.url}</code>
+        <span
+          class="relay-badge {relay.state.kind === 'healthy' ? 'badge-healthy' : 'badge-cooling'}"
+          data-testid="relay-badge"
+        >
+          {relayStateLabel(relay)}
+        </span>
+        <button
+          class="relay-remove"
+          data-testid="relay-remove"
+          disabled={relays.length <= 1 || relayPending}
+          onclick={() => handleRemoveRelay(relay.url)}
+          aria-label={`Remove relay ${relay.url}`}
+        >
+          Remove
+        </button>
+      </li>
+    {/each}
+  </ul>
+
+  <div class="relay-add-row" data-testid="relay-add-row">
+    <input
+      type="url"
+      class="relay-input"
+      placeholder="https://relay.example.com"
+      bind:value={newRelayUrl}
+      disabled={relayPending}
+      data-testid="relay-url-input"
+      aria-label="New relay URL"
+    />
+    <button
+      class="relay-add-btn"
+      disabled={!newRelayUrl.trim() || relayPending}
+      onclick={handleAddRelay}
+      data-testid="relay-add-button"
+    >
+      Add
+    </button>
+  </div>
+
+  <button
+    class="relay-restore-btn"
+    onclick={handleRestoreRecommended}
+    disabled={relayPending}
+    data-testid="relay-restore-button"
+  >
+    Restore recommended
+  </button>
 </div>
 
 <style>
@@ -218,5 +375,78 @@
     font-size: 12px;
     color: #d83c3e;
     margin: 4px 0 8px;
+  }
+
+  /* ZEB-380: relay manager */
+  .relay-list {
+    list-style: none;
+    padding: 0;
+    margin: 8px 0;
+  }
+
+  .relay-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    flex-wrap: wrap;
+  }
+
+  .relay-url {
+    font-size: 11px;
+    flex: 1;
+    word-break: break-all;
+  }
+
+  .relay-badge {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+
+  .badge-healthy {
+    background: #1a4a1a;
+    color: #5cb85c;
+  }
+
+  .badge-cooling {
+    background: #4a3a00;
+    color: #f0a020;
+  }
+
+  .relay-remove {
+    font-size: 11px;
+    padding: 1px 6px;
+    cursor: pointer;
+  }
+
+  .relay-add-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  .relay-input {
+    flex: 1;
+    font-size: 12px;
+    padding: 3px 6px;
+    background: var(--bg-tertiary, #333);
+    color: var(--text-primary, #eee);
+    border: 1px solid var(--border, #555);
+    border-radius: 3px;
+  }
+
+  .relay-add-btn,
+  .relay-restore-btn {
+    font-size: 11px;
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+
+  .relay-restore-btn {
+    margin-top: 6px;
+    display: block;
   }
 </style>

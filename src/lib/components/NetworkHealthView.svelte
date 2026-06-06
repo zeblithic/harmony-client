@@ -24,7 +24,15 @@
     NetworkHealthSnapshot,
     SelfTestReport,
     PeerHealth,
+    RelayOutcome,
   } from '../types/network-health';
+
+  function relayOutcomeLabel(outcome: RelayOutcome): string {
+    if (outcome.kind === 'timeout') return 'Last error: timeout';
+    if (outcome.kind === 'transport') return 'Last error: transport';
+    if (outcome.kind === 'http') return `Last error: http ${outcome.status}`;
+    return '';
+  }
   import DiagnosticExportModal from './DiagnosticExportModal.svelte';
 
   let snap = $state<NetworkHealthSnapshot | null>(null);
@@ -157,6 +165,36 @@
                   >last seen {Math.floor(
                     (Date.now() - p.lastSeenMs) / 1000,
                   )}s ago</span
+                >
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
+
+    <section class="pkarr-relays" data-testid="nh-pkarr-relays">
+      <h2>Discovery (pkarr) relays</h2>
+      {#if (snap.pkarrStatus.relays ?? []).length === 0}
+        <p class="muted" data-testid="nh-relays-empty">No relays configured.</p>
+      {:else}
+        <ul>
+          {#each snap.pkarrStatus.relays ?? [] as relay (relay.url)}
+            <li data-testid="nh-relay-row">
+              <code>{relay.url}</code>
+              {#if relay.state.kind === 'healthy'}
+                <span class="badge badge-healthy" data-testid="nh-relay-badge">Healthy</span>
+              {:else}
+                <span class="badge badge-cooling" data-testid="nh-relay-badge"
+                  >Cooling down ({Math.max(
+                    0,
+                    Math.ceil((relay.state.untilMs - Date.now()) / 1000),
+                  )}s)</span
+                >
+              {/if}
+              {#if relay.lastOutcome && relay.lastOutcome.kind !== 'success'}
+                <span class="muted" data-testid="nh-relay-last-error"
+                  >{relayOutcomeLabel(relay.lastOutcome)}</span
                 >
               {/if}
             </li>
@@ -304,5 +342,32 @@
     list-style: none;
     padding-left: 0;
     font-family: monospace;
+  }
+  .badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-left: 6px;
+  }
+  .badge-healthy {
+    background: #1a4a1a;
+    color: #5cb85c;
+  }
+  .badge-cooling {
+    background: #4a3a00;
+    color: #f0a020;
+  }
+  .pkarr-relays ul {
+    list-style: none;
+    padding-left: 0;
+  }
+  .pkarr-relays li {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.2rem 0;
+    flex-wrap: wrap;
   }
 </style>

@@ -23,6 +23,7 @@ import type {
   RedemptionOutcome,
   ResolutionProgressEvent,
 } from './types/connectivity';
+import type { RelayHealth } from './types/network-health';
 
 /**
  * Returns this device's reachability snapshot, or `null` when the iroh
@@ -258,6 +259,41 @@ export function onIdentityDiscoverableChanged(cb: (enabled: boolean) => void): (
     destroyed = true;
     unlisten?.();
   };
+}
+
+// ---------------------------------------------------------------------------
+// ZEB-380: pkarr relay pool management IPCs
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the current pkarr relay pool with per-relay health snapshots.
+ *
+ * Each entry is a `RelayHealth` DTO (url + state + lastOutcome + lastSuccessMs).
+ */
+export async function getPkarrRelays(): Promise<RelayHealth[]> {
+  try {
+    return await invoke<RelayHealth[]>('get_pkarr_relays');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`get_pkarr_relays: ${msg}`);
+  }
+}
+
+/**
+ * Replaces the live pkarr relay pool with the provided URL list.
+ *
+ * The backend validates, persists, and hot-swaps the pool. On success it
+ * emits `connectivity-relays-changed` so any listener can re-fetch. Throws
+ * with a descriptive error string on invalid input (bad scheme, duplicate
+ * URLs, exceeds cap of 8, etc.).
+ */
+export async function setPkarrRelays(relays: string[]): Promise<void> {
+  try {
+    await invoke('set_pkarr_relays', { relays });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`set_pkarr_relays: ${msg}`);
+  }
 }
 
 /**

@@ -20,12 +20,15 @@ import {
   onReachabilityChanged,
   redeemInviteIroh,
   discoverIdentity,
+  getPkarrRelays,
+  setPkarrRelays,
 } from './connectivity-adapter';
 import type {
   ReachabilityRecord,
   PeerReachability,
   ConnectivityReachabilityChangedPayload,
 } from './types/connectivity';
+import type { RelayHealth } from './types/network-health';
 
 const mockInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 const mockListen = listen as unknown as ReturnType<typeof vi.fn>;
@@ -170,6 +173,63 @@ describe('connectivity-adapter', () => {
       capturedHandler!({ payload });
       expect(callback).toHaveBeenCalledWith(payload);
       expect(callback).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ZEB-380: relay pool IPCs.
+  describe('getPkarrRelays', () => {
+    it('returns the mocked relay list', async () => {
+      const fixture: RelayHealth[] = [
+        {
+          url: 'https://relay.pkarr.org',
+          state: { kind: 'healthy' },
+          lastOutcome: { kind: 'success' },
+          lastSuccessMs: 1_700_000_000_000,
+        },
+      ];
+      mockInvoke.mockResolvedValueOnce(fixture);
+      const result = await getPkarrRelays();
+      expect(result).toEqual(fixture);
+      expect(mockInvoke).toHaveBeenCalledWith('get_pkarr_relays');
+    });
+
+    it('wraps rejections with the IPC-name prefix', async () => {
+      mockInvoke.mockRejectedValueOnce(new Error('pool not running'));
+      await expect(getPkarrRelays()).rejects.toThrow('get_pkarr_relays: pool not running');
+    });
+
+    it('wraps plain-string rejections (production Tauri shape)', async () => {
+      mockInvoke.mockRejectedValueOnce('pool not running');
+      await expect(getPkarrRelays()).rejects.toThrow('get_pkarr_relays: pool not running');
+    });
+  });
+
+  describe('setPkarrRelays', () => {
+    it('passes the relays array as { relays } to invoke', async () => {
+      mockInvoke.mockResolvedValueOnce(undefined);
+      await setPkarrRelays(['https://relay.pkarr.org', 'https://pkarr.pubky.app']);
+      expect(mockInvoke).toHaveBeenCalledWith('set_pkarr_relays', {
+        relays: ['https://relay.pkarr.org', 'https://pkarr.pubky.app'],
+      });
+    });
+
+    it('resolves without a return value on success', async () => {
+      mockInvoke.mockResolvedValueOnce(undefined);
+      await expect(setPkarrRelays(['https://relay.pkarr.org'])).resolves.toBeUndefined();
+    });
+
+    it('wraps a rejected set_pkarr_relays and surfaces the error string', async () => {
+      mockInvoke.mockRejectedValueOnce('invalid URL: missing scheme');
+      await expect(setPkarrRelays(['not-a-url'])).rejects.toThrow(
+        'set_pkarr_relays: invalid URL: missing scheme',
+      );
+    });
+
+    it('wraps Error-object rejections as well', async () => {
+      mockInvoke.mockRejectedValueOnce(new Error('cap exceeded'));
+      await expect(setPkarrRelays(Array(9).fill('https://relay.pkarr.org'))).rejects.toThrow(
+        'set_pkarr_relays: cap exceeded',
+      );
     });
   });
 
