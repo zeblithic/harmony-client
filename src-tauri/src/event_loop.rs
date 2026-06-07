@@ -6707,11 +6707,10 @@ where
 /// engine↔adapter circular dep, exactly like channel-log's `read_for_query`
 /// (event_loop.rs:4073).
 ///
-/// Serve gate (ZEB-395): a CID is servable iff it is unencrypted OR it is an
-/// allowlisted community-root CID (`serve_allowlist.contains`). Private
-/// encrypted blobs (DMs, private profiles) are never allowlisted, so they keep
-/// getting no reply. The encrypted flag is intrinsic to the CID header; the
-/// allowlist is the publisher's explicit opt-in via `ContentStore::put_serveable`.
+/// Serve gate (ZEB-395): each request is filtered through `content_cid_servable`
+/// (see that fn) — encrypted CIDs are served only when allowlisted (community
+/// roots opted in via `ContentStore::put_serveable`); private encrypted blobs
+/// (DMs, private profiles) are never allowlisted and get no reply.
 ///
 /// Returned bytes are inherently integrity-safe: the local cache only admits
 /// bytes that passed `hash==cid` (StorageTier::verify_cid), so anything `lookup`

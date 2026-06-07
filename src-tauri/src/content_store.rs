@@ -35,9 +35,10 @@ impl CommunityServeAllowlist {
         Self::default()
     }
 
-    /// Mark a community-root CID serveable. Idempotent. A poisoned lock is
-    /// treated as "could not record" (the publish already succeeded; the next
-    /// publish re-registers), never a panic.
+    /// Mark a community-root CID serveable. Idempotent. The write guard is held
+    /// only across a non-panicking `HashSet::insert`, so poisoning cannot occur
+    /// in practice; a poisoned lock is nonetheless handled by skipping the insert
+    /// (best-effort, never a panic) rather than by promising later recovery.
     pub fn allow(&self, cid: ContentId) {
         if let Ok(mut g) = self.0.write() {
             g.insert(cid);
