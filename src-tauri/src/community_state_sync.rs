@@ -1293,29 +1293,14 @@ impl CommunitySyncEngine {
         })
     }
 
-    /// Returns a `ChannelIdentityResolver` adapter wrapping this
-    /// engine's `IdentityResolver`. ZEB-270 Phase 3 Task 4.5: the
-    /// channel-log engine's verify chain needs an OwnerAddr →
-    /// 64-byte composite resolver with the same shape as the existing
-    /// `IdentityResolver` (Phase 2 already shares a single
-    /// `OwnerDeviceCacheResolver` across all community engines via
-    /// `CommunityRegistryConfig.identity_resolver`).
-    ///
-    /// Returns `None` if the engine was constructed without an
-    /// identity_resolver (legacy unit tests pre-Task 8). Production
-    /// engines always have one (registry config carries the resolver
-    /// and clones it into every spawned engine — see `spawn_engine`).
-    pub(crate) fn identity_resolver(
-        &self,
-    ) -> Option<Arc<dyn crate::community_channel_log::ChannelIdentityResolver + Send + Sync>> {
-        self.identity_resolver
-            .as_ref()
-            .map(|inner| -> Arc<dyn crate::community_channel_log::ChannelIdentityResolver + Send + Sync> {
-                Arc::new(ChannelIdentityResolverAdapter {
-                    inner: Arc::clone(inner),
-                })
-            })
-    }
+    // ZEB-399: the channel-log engine no longer needs an identity
+    // resolver — `verify_channel_event` authenticates posts against the
+    // author's materialized `enrolled_device_keys` (the community
+    // membership trust root), not a DM-layer owner→identity cache. The
+    // former `identity_resolver()` accessor + `ChannelIdentityResolverAdapter`
+    // were removed. The engine's `identity_resolver` field remains for
+    // epoch-key / seal-to-owner resolution (see `CommunityRegistry::
+    // identity_resolver`).
 
     /// Insert a locally-minted event into the community CRDT, verify it
     /// using the engine's `identity_resolver`, fire the membership-delta
@@ -4610,27 +4595,22 @@ impl crate::community_channel_log::CommunityStateAtHlc for CommunityStateAtHlcAd
                     _ => None,
                 });
 
+        // ZEB-399: surface the author's enrolled device keys from the SAME
+        // materialization, so `verify_channel_event` can authenticate the
+        // post signature against the community membership trust root (the
+        // same `enrolled_device_keys` that `verify_publisher_sig` uses for
+        // root publishes) instead of a DM-layer owner→identity cache.
+        let author_enrolled_keys = materialized
+            .members
+            .get(author)
+            .map(|member| member.enrolled_device_keys.iter().copied().collect())
+            .unwrap_or_default();
+
         crate::community_channel_log::CommunityStateSnapshot {
             channel,
             author_power,
+            author_enrolled_keys,
         }
-    }
-}
-
-/// Adapts a generic `Arc<dyn IdentityResolver>` (the resolver shape
-/// already used by the per-community sync engine) to the channel-log
-/// `ChannelIdentityResolver` trait. Both expose the same `OwnerAddr →
-/// 64-byte composite (X25519 || Ed25519)` lookup; this wrapper exists
-/// only because the two traits live in different modules and can't
-/// directly impl each other without one depending on the other's crate.
-pub struct ChannelIdentityResolverAdapter {
-    pub inner: Arc<dyn IdentityResolver>,
-}
-
-#[async_trait::async_trait]
-impl crate::community_channel_log::ChannelIdentityResolver for ChannelIdentityResolverAdapter {
-    async fn resolve(&self, addr: &crate::owner_state_types::OwnerAddr) -> Option<[u8; 64]> {
-        self.inner.resolve(addr).await
     }
 }
 

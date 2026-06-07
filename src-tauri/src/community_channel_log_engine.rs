@@ -20,9 +20,9 @@ use tokio::task::JoinHandle;
 
 use crate::community_channel_log::{
     decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, sign_channel_event,
-    verify_channel_event, ChannelEventError, ChannelIdentityResolver, ChannelKey, ChannelLog,
-    ChannelLogConfig, ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload,
-    CommunityStateAtHlc, MessageId, SignedChannelEvent,
+    verify_channel_event, ChannelEventError, ChannelKey, ChannelLog, ChannelLogConfig,
+    ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc,
+    MessageId, SignedChannelEvent,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -88,7 +88,6 @@ struct DeferredSpawn {
     channel_id: ChannelId,
     channel_key: ChannelKey,
     state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
-    resolver: Arc<dyn ChannelIdentityResolver + Send + Sync>,
     hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
 }
 
@@ -270,7 +269,6 @@ pub struct ChannelLogEngineParams<R: tauri::Runtime> {
     pub channel_key: Arc<ChannelKey>,
     pub root_dir: PathBuf,
     pub state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
-    pub resolver: Arc<dyn ChannelIdentityResolver + Send + Sync>,
     pub self_owner: OwnerAddr,
     pub self_device_id: String,
     pub signing_key: Arc<SigningKey>,
@@ -300,7 +298,6 @@ pub struct ChannelLogEngine<R: tauri::Runtime> {
     log: Arc<Mutex<ChannelLog>>,
     replay_tracker: Arc<Mutex<ChannelLogReplayTracker>>,
     state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
-    resolver: Arc<dyn ChannelIdentityResolver + Send + Sync>,
     self_owner: OwnerAddr,
     self_device_id: String,
     signing_key: Arc<SigningKey>,
@@ -393,7 +390,6 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
             log: Arc::new(Mutex::new(log)),
             replay_tracker: Arc::new(Mutex::new(tracker)),
             state_at_hlc: params.state_at_hlc,
-            resolver: params.resolver,
             self_owner: params.self_owner,
             self_device_id: params.self_device_id,
             signing_key: params.signing_key,
@@ -823,7 +819,6 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
             &self.community_id,
             &self.channel_id,
             self.state_at_hlc.as_ref(),
-            self.resolver.as_ref(),
             &mut throwaway_tracker,
         )
         .await;
@@ -1411,7 +1406,6 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         channel_id: ChannelId,
         channel_key: ChannelKey,
         state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
-        resolver: Arc<dyn ChannelIdentityResolver + Send + Sync>,
         hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
     ) -> Result<SpawnOutcome<R>, ChannelLogEngineError> {
         // ZEB-271: queue iff an open transaction targets this community.
@@ -1426,7 +1420,6 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                     channel_id,
                     channel_key,
                     state_at_hlc,
-                    resolver,
                     hlc_tracker,
                 });
                 return Ok(SpawnOutcome::DeferredForCommit);
@@ -1439,7 +1432,6 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
             channel_id,
             channel_key,
             state_at_hlc,
-            resolver,
             hlc_tracker,
         };
         let engine = self.spawn_inner_now(community_id, ds).await?;
@@ -1490,7 +1482,6 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
             channel_key: Arc::new(ds.channel_key),
             root_dir,
             state_at_hlc: ds.state_at_hlc,
-            resolver: ds.resolver,
             self_owner: self.config.self_owner,
             self_device_id: self.config.self_device_id.clone(),
             signing_key: Arc::clone(&self.config.signing_key),
@@ -1791,7 +1782,6 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         materialized: &MaterializedMembership,
         membership_key: &EpochKey,
         state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
-        resolver: Arc<dyn ChannelIdentityResolver + Send + Sync>,
         hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
     ) -> Result<(), ChannelLogEngineError> {
         // Continue on error, accumulate the LAST error, return it after
@@ -1811,7 +1801,6 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                     *channel_id,
                     channel_key,
                     Arc::clone(&state_at_hlc),
-                    Arc::clone(&resolver),
                     Arc::clone(&hlc_tracker),
                 )
                 .await
@@ -1866,7 +1855,6 @@ mod tests {
     use crate::owner_state_types::EpochKey;
     use ed25519_dalek::SigningKey;
     use harmony_identity::PrivateIdentity;
-    use std::collections::HashMap;
     use tempfile::TempDir;
 
     /// State stub: returns a known channel with low write-power and the
@@ -1875,6 +1863,9 @@ mod tests {
     struct AlwaysJoinedState {
         channel_id: ChannelId,
         owner: OwnerAddr,
+        /// ZEB-399: the owner's enrolled device verifying key (ed25519),
+        /// surfaced so verify_channel_event can authenticate the post.
+        enrolled_key: [u8; 32],
     }
 
     #[async_trait::async_trait]
@@ -1905,22 +1896,16 @@ mod tests {
             } else {
                 None
             };
+            let author_enrolled_keys = if author == &self.owner {
+                vec![self.enrolled_key]
+            } else {
+                vec![]
+            };
             crate::community_channel_log::CommunityStateSnapshot {
                 channel,
                 author_power,
+                author_enrolled_keys,
             }
-        }
-    }
-
-    /// Resolver stub: maps OwnerAddr → 64-byte identity composite.
-    struct FixedIdentityResolver {
-        map: HashMap<OwnerAddr, [u8; 64]>,
-    }
-
-    #[async_trait::async_trait]
-    impl ChannelIdentityResolver for FixedIdentityResolver {
-        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
-            self.map.get(addr).copied()
         }
     }
 
@@ -1958,7 +1943,7 @@ mod tests {
     ) -> EngineFixture {
         let tmp = TempDir::new().expect("tempdir");
 
-        let (signing_key_raw, self_owner, identity_pub_64) = fixture_identity(0x42);
+        let (signing_key_raw, self_owner, _identity_pub_64) = fixture_identity(0x42);
         let signing_key = Arc::new(signing_key_raw);
 
         let community_id = SpaceId([0xc1; 16]);
@@ -1971,13 +1956,10 @@ mod tests {
             &channel_id,
         ));
 
-        let mut resolver_map = HashMap::new();
-        resolver_map.insert(self_owner, identity_pub_64);
-        let resolver = Arc::new(FixedIdentityResolver { map: resolver_map });
-
         let state = Arc::new(AlwaysJoinedState {
             channel_id,
             owner: self_owner,
+            enrolled_key: signing_key.verifying_key().to_bytes(),
         });
 
         let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
@@ -2003,7 +1985,6 @@ mod tests {
             channel_key: Arc::clone(&channel_key),
             root_dir: tmp.path().to_path_buf(),
             state_at_hlc: state,
-            resolver,
             self_owner,
             self_device_id: "test-device".to_string(),
             signing_key: Arc::clone(&signing_key),
@@ -2715,16 +2696,10 @@ mod tests {
         // Re-build dependencies for the respawned engine. Same identity,
         // same dir, same channel_key — different mpsc endpoints since
         // the originals were owned by the dropped fixture.
-        let resolver = {
-            let priv_id = harmony_identity::PrivateIdentity::from_seed(&[0x42u8; 32]);
-            let pub_64 = priv_id.identity.to_public_bytes();
-            let mut m = HashMap::new();
-            m.insert(self_owner, pub_64);
-            Arc::new(FixedIdentityResolver { map: m })
-        };
         let state = Arc::new(AlwaysJoinedState {
             channel_id,
             owner: self_owner,
+            enrolled_key: signing_key.verifying_key().to_bytes(),
         });
         let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let (publisher_tx, _publisher_rx) = mpsc::channel(64);
@@ -2745,7 +2720,6 @@ mod tests {
             channel_key: Arc::clone(&channel_key),
             root_dir: dir,
             state_at_hlc: state,
-            resolver,
             self_owner,
             self_device_id: "test-device".to_string(),
             signing_key: Arc::clone(&signing_key),
@@ -2916,7 +2890,6 @@ mod tests {
     struct RegistryFixture {
         registry: Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
         state: Arc<AlwaysJoinedState>,
-        resolver: Arc<FixedIdentityResolver>,
         hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
         membership_key: EpochKey,
         self_owner: OwnerAddr,
@@ -2950,7 +2923,7 @@ mod tests {
     async fn build_registry_fixture() -> RegistryFixture {
         let tmp = TempDir::new().expect("tempdir");
 
-        let (signing_key_raw, self_owner, identity_pub_64) = fixture_identity(0x42);
+        let (signing_key_raw, self_owner, _identity_pub_64) = fixture_identity(0x42);
         let signing_key = Arc::new(signing_key_raw);
 
         // The fixture's AlwaysJoinedState answers for one specific
@@ -2958,13 +2931,10 @@ mod tests {
         // works for every spawned engine. We use a sentinel id here;
         // tests that need different ids would need a wider stub.
         let stub_channel_id = ChannelId([0xff; 16]);
-        let mut resolver_map = HashMap::new();
-        resolver_map.insert(self_owner, identity_pub_64);
-        let resolver = Arc::new(FixedIdentityResolver { map: resolver_map });
-
         let state = Arc::new(AlwaysJoinedState {
             channel_id: stub_channel_id,
             owner: self_owner,
+            enrolled_key: signing_key.verifying_key().to_bytes(),
         });
 
         let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
@@ -3030,7 +3000,6 @@ mod tests {
         RegistryFixture {
             registry,
             state,
-            resolver,
             hlc_tracker,
             membership_key: EpochKey::new([0x55; 32]),
             self_owner,
@@ -3057,7 +3026,6 @@ mod tests {
                 channel_id,
                 key,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await
@@ -3177,7 +3145,6 @@ mod tests {
                 &materialized,
                 &fix.membership_key,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await
@@ -3226,7 +3193,6 @@ mod tests {
                 &materialized,
                 &fix.membership_key,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await
@@ -3239,7 +3205,6 @@ mod tests {
                 &materialized,
                 &fix.membership_key,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await
@@ -3282,15 +3247,11 @@ mod tests {
             let r1 = Arc::clone(&fix.registry);
             let r2 = Arc::clone(&fix.registry);
             let state = Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>;
-            let resolver =
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>;
             let tracker = Arc::clone(&fix.hlc_tracker);
             let key_for_spawn = key.clone();
 
             let handle1 = tokio::spawn(async move {
-                let _ = r1
-                    .spawn(cid, chid, key_for_spawn, state, resolver, tracker)
-                    .await;
+                let _ = r1.spawn(cid, chid, key_for_spawn, state, tracker).await;
             });
             let handle2 = tokio::spawn(async move {
                 let _ = r2.stop(&cid, &chid).await;
@@ -3374,7 +3335,6 @@ mod tests {
                 &materialized,
                 &fix.membership_key,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await;
@@ -3444,7 +3404,6 @@ mod tests {
                 channel_id,
                 key,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await
@@ -3496,7 +3455,6 @@ mod tests {
                 channel_id,
                 key,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await
@@ -3550,7 +3508,6 @@ mod tests {
                 channel_id,
                 key,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await
@@ -3609,7 +3566,6 @@ mod tests {
                     channel_id,
                     key,
                     Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                    Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                     Arc::clone(&fix.hlc_tracker),
                 )
                 .await
@@ -3675,7 +3631,6 @@ mod tests {
                 channel_id,
                 key,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await
@@ -3731,7 +3686,6 @@ mod tests {
                 channel_id,
                 key,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await
@@ -3771,7 +3725,6 @@ mod tests {
                 channel_a,
                 key_a,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await
@@ -3788,7 +3741,6 @@ mod tests {
                 channel_b,
                 key_b,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
             .await
@@ -3876,7 +3828,6 @@ mod tests {
                     *ch,
                     key,
                     Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                    Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                     Arc::clone(&fix.hlc_tracker),
                 )
                 .await
@@ -3930,7 +3881,6 @@ mod tests {
                     *ch,
                     key,
                     Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
-                    Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
                     Arc::clone(&fix.hlc_tracker),
                 )
                 .await
