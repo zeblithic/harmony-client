@@ -134,6 +134,9 @@ export class CommunityService {
 
   private adapter: TauriAdapter | null = null;
   private memberCache: Map<string, CommunityMember[]> = new Map();
+  // ZEB-404: in-flight member fetches per community, for single-flight
+  // coalescing (see listCommunityMembers).
+  private inFlightMemberFetches: Map<string, Promise<CommunityMember[]>> = new Map();
   private degraded: Map<string, boolean> = new Map();
   // Per-community kind. Populated by createCommunity (from the
   // user-supplied argument) and redeemInvite (from
@@ -362,10 +365,27 @@ export class CommunityService {
       const cached = this.memberCache.get(communityId);
       if (cached) return cached;
     }
-    const dtos = await this.invoke<MemberInfoDto[]>('list_community_members', { communityId });
-    const fresh = dtos.map(dtoToMember);
-    this.memberCache.set(communityId, fresh);
-    return fresh;
+    // ZEB-404: single-flight. Multiple triggers (the message-throttle,
+    // reconnect, and community-open refreshes) can request a fetch for the same
+    // community concurrently. Without coalescing, two overlapping IPCs could
+    // complete out of order and write the staler response into `memberCache`
+    // last — poisoning it for the next read. Sharing one in-flight promise
+    // makes the cache write single and ordered, and every caller observes the
+    // same fresh result, so there is no superseded-response race to guard.
+    const inFlight = this.inFlightMemberFetches.get(communityId);
+    if (inFlight) return inFlight;
+    const fetchPromise = (async () => {
+      try {
+        const dtos = await this.invoke<MemberInfoDto[]>('list_community_members', { communityId });
+        const fresh = dtos.map(dtoToMember);
+        this.memberCache.set(communityId, fresh);
+        return fresh;
+      } finally {
+        this.inFlightMemberFetches.delete(communityId);
+      }
+    })();
+    this.inFlightMemberFetches.set(communityId, fetchPromise);
+    return fetchPromise;
   }
 
   async listRecentModerationEvents(

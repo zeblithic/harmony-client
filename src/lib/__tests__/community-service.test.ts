@@ -192,6 +192,28 @@ describe('CommunityService', () => {
     expect(adapter.invoke).toHaveBeenCalledTimes(2);
   });
 
+  it('listCommunityMembers coalesces concurrent fetches per community (single-flight, ZEB-404)', async () => {
+    await service.connectAdapter(adapter);
+    let resolveFetch: (v: unknown) => void = () => {};
+    (adapter.invoke as any).mockImplementation(
+      () => new Promise((r) => { resolveFetch = r as (v: unknown) => void; }),
+    );
+
+    // Two overlapping forced fetches for the same community share one IPC.
+    const p1 = service.listCommunityMembers('aabbccdd', true);
+    const p2 = service.listCommunityMembers('aabbccdd', true);
+    expect(adapter.invoke).toHaveBeenCalledTimes(1);
+
+    resolveFetch([]);
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r2).toBe(r1); // same shared result, no out-of-order cache write
+
+    // In-flight entry cleared on completion: a later forced fetch re-fetches.
+    (adapter.invoke as any).mockResolvedValue([]);
+    await service.listCommunityMembers('aabbccdd', true);
+    expect(adapter.invoke).toHaveBeenCalledTimes(2);
+  });
+
   it('community-members-changed for a community invalidates its cache', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue([]);

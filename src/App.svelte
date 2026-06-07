@@ -889,23 +889,18 @@
     isCurrentCommunityDegraded = id != null ? communityService.isDegraded(id) : false;
   }
 
-  // ZEB-404: a monotonic token guards against out-of-order completion of
-  // concurrent same-community refreshes (the message throttle, reconnect, and
-  // community-open paths can overlap). Only the most recently ISSUED refresh
-  // applies its result, so a slower older fetch can't clobber a newer roster
-  // and re-drop a just-joined member — the very staleness this fix targets.
-  let communityMembersRefreshSeq = 0;
   async function refreshCommunityMembers(id: string) {
-    const refreshSeq = ++communityMembersRefreshSeq;
     try {
-      // Force-bypass the per-community member cache: an explicit refresh must
-      // return ground truth (the cache is invalidated only by the
+      // ZEB-404: force-bypass the per-community member cache — an explicit
+      // refresh must return ground truth (the cache is invalidated only by the
       // `community-members-changed` event, the very signal a missed-delta
-      // refresh compensates for).
+      // refresh compensates for). Concurrent same-community refreshes are
+      // coalesced inside CommunityService (single-flight), so overlapping
+      // triggers (message throttle, reconnect, community-open) can't race the
+      // cache or the roster.
       const fresh = await communityService.listCommunityMembers(id, true);
-      // Drop if the user switched communities, or a newer refresh superseded
-      // this one, while we were awaiting.
-      if (selectedCommunityId !== id || refreshSeq !== communityMembersRefreshSeq) return;
+      // Drop if the user switched communities while we were awaiting.
+      if (selectedCommunityId !== id) return;
       communityMembers = fresh;
     } catch (e) {
       // listCommunityMembers throws when the adapter isn't connected
