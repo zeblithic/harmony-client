@@ -115,42 +115,100 @@ impl CommunityServeAllowlist {
 `std::sync::RwLock` (not tokio) is correct: `allow`/`contains` lock, mutate/read, and
 drop the guard synchronously — no guard is ever held across an `.await`.
 
-### 4.2 Registration (one hook)
+### 4.2 Registration (one hook, via the ContentStore trait)
 
-The only production site that writes a community-root blob to CAS is
-`publish_root_now` (`community_state_sync.rs`, the `content_store.put(root_cid, …)`
-after `encrypt_blob` + `ContentId::for_book`). Immediately after the successful `put`,
-register the CID:
+`publish_root_now` (`community_state_sync.rs`) is the only production site that
+writes a community-root blob to CAS — `content_store.put(root_cid, …)` after
+`encrypt_blob` + `ContentId::for_book`. The fix changes that single call to a new
+trait method, `put_serveable`:
 
 ```rust
-ctx.content_store.put(root_cid, blob_ciphertext).await?;
-ctx.serve_allowlist.allow(root_cid); // ZEB-395
+// community_state_sync.rs, publish_root_now (replaces the bare `.put`):
+ctx.content_store
+    .put_serveable(root_cid, blob_ciphertext)
+    .await?;
 ```
 
-This single hook covers both lifecycles:
+`put_serveable` is added to the `ContentStore` trait with a **default
+implementation identical to `put`**, so `InMemoryStub` and every test store
+inherit it unchanged and only the production store overrides it:
+
+```rust
+// content_store.rs, trait ContentStore:
+/// Like `put`, but also marks `cid` serveable to peers even though it carries
+/// the `encrypted` flag (ZEB-395 community-root sharing). Default == `put`;
+/// only RuntimeContentStore registers the CID in its shared allowlist.
+async fn put_serveable(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {
+    self.put(cid, blob).await
+}
+```
+
+`RuntimeContentStore` (the production impl) overrides it — normal `put`, then on
+success register the CID in its (optional) shared allowlist handle:
+
+```rust
+async fn put_serveable(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {
+    self.put(cid, blob).await?;
+    if let Some(allowlist) = &self.serve_allowlist {
+        allowlist.allow(cid); // synchronous insert into the shared set
+    }
+    Ok(())
+}
+```
+
+This covers both lifecycles:
 - **On change:** every publish registers the new root.
 - **On boot/restart:** each engine performs an initial publish at spawn (observed in
   the instrumented logs), which re-registers the current root — so a freshly-booted node
   can serve its existing community root without special boot-load handling.
 
+**No race:** the allowlist insert completes inside `put_serveable`, which returns
+*before* `publish_root_now` builds and broadcasts the state-root envelope that
+announces `root_cid`. A peer can only learn the CID from that later publish, so the
+CID is always allowlisted before any peer can request it.
+
 (The test-only `build_signed_publish` helper at `community_state_sync.rs:~4664` is not a
-production put and needs no hook.)
+production put and needs no hook. `owner_state_sync`'s owner-root put stays on plain
+`put` — owner multi-device sync over CAS is out of scope for ZEB-395; see §7.)
 
-### 4.3 Threading the handle
+### 4.3 Threading the handle (Arc-shared, no config changes)
 
-`CommunityServeAllowlist` is created once in `event_loop::run` (where both the community
-registry and the content-serve queryable are set up) and shared by clone:
+`CommunityServeAllowlist` wraps an `Arc`, so a single instance is shared by clone
+between the two production sites that need it — with **no new fields on
+`CommunityRegistryConfig` / `CommunitySyncEngineConfig` / `InternalCtx`** and **no
+change to the `CasOp` enum**. (Config-threading was the original sketch; it was
+dropped because it would force ~43 mechanical `serve_allowlist: Default::default(),`
+edits across the community test suite, and extending `CasOp::PutLocal` would break
+~25 exhaustive match sites — a large, merge-conflict-prone diff for a one-line
+behavior change. The Arc-shared approach is behavior-identical and touches far
+fewer files.)
 
-- Add `serve_allowlist: CommunityServeAllowlist` to **`CommunityRegistryConfig`**
-  (`community_state_sync.rs:~3584`). The registry clones it into each spawned engine's
-  **`CommunitySyncEngineConfig`** (`:~777`), which carries it into the engine's
-  **`InternalCtx`** (`:~1715`, alongside `content_store`) so `publish_root_now` can call
-  `ctx.serve_allowlist.allow(...)`.
-- Pass the same clone to `spawn_content_serve_queryable` as a new parameter.
+The instance is created once in `lib.rs::start_node`, where both the production
+`RuntimeContentStore` and `event_loop::run` are already constructed:
+
+```rust
+let serve_allowlist = crate::content_store::CommunityServeAllowlist::new();
+
+let content_store: Arc<dyn ContentStore> = Arc::new(
+    RuntimeContentStore::new(cas_op_tx.clone(), fetch_timeout)
+        .with_serve_allowlist(serve_allowlist.clone()), // registration side
+);
+// ... later, passed as a new trailing argument:
+event_loop::run(/* … */, serve_allowlist.clone()).await;  // serve side
+```
+
+- `RuntimeContentStore::new` is **unchanged**; a new chained builder
+  `with_serve_allowlist(self, allowlist) -> Self` sets the optional handle, so the
+  ~10 `RuntimeContentStore::new(...)` test call sites need no edits.
+- `event_loop::run` gains **one** trailing parameter; it has exactly one
+  production call site and no test call sites, so this is a single-line edit.
+- `event_loop::run` passes the handle into `spawn_content_serve_queryable` (new
+  trailing parameter; its 5 test call sites pass an empty `CommunityServeAllowlist`).
 
 ### 4.4 Serve-handler gate change
 
-In `spawn_content_serve_queryable` (`event_loop.rs`), relax the encrypted refusal:
+`spawn_content_serve_queryable` (`event_loop.rs`) gains a `serve_allowlist:
+CommunityServeAllowlist` parameter, and the encrypted refusal is relaxed to consult it:
 
 ```rust
 // Before:
@@ -190,25 +248,38 @@ follow-up if a long-lived, high-churn session ever warrants it. Noted, not done.
 
 ## 6. Testing
 
-1. **Unit — serve gate (`event_loop` or a focused unit):**
+1. **Unit — `CommunityServeAllowlist` (`content_store.rs`):** `allow` then `contains`
+   returns true; `contains` on an un-added CID returns false; `Clone` shares state
+   (allow on one clone is visible via another). Cheap, no async.
+
+2. **Unit — `put_serveable` registration (`content_store.rs`):** a `RuntimeContentStore`
+   built `.with_serve_allowlist(a)` over a stub `cas_op` receiver, after
+   `put_serveable(cid, blob)`, leaves `a.contains(&cid) == true`; plain `put(cid2, …)`
+   leaves `a.contains(&cid2) == false`. The default trait impl (`InMemoryStub`) routes
+   `put_serveable` to `put` with no panic.
+
+3. **Unit — serve gate (`event_loop` or a focused unit):**
    - encrypted CID **in** allowlist → served (bytes returned).
    - encrypted CID **not** in allowlist → refused (empty final), as today.
    - unencrypted CID → served (unchanged behavior).
 
-2. **Integration — cross-store serve (regression; model on
+4. **Integration — cross-store serve (regression; model on
    `tests/cas_serve_two_node_integration.rs`):** two nodes with **separate** content
-   stores wired through `spawn_content_serve_queryable`. Node A puts an **encrypted**
-   blob and `allow()`s its CID; node B fetches it and succeeds. A second encrypted CID
-   that is *not* allowlisted must still fail. This is the test that would have caught the
-   bug (the existing community-sync test shares a CAS and cannot).
+   stores wired through `spawn_content_serve_queryable`. Node A’s queryable is passed a
+   `CommunityServeAllowlist` containing one **encrypted** CID; node B fetches that CID
+   and succeeds. A second encrypted CID that is *not* in the allowlist must still fail
+   (use a public control CID for the liveness proof, exactly like the existing
+   `does_not_serve_encrypted_cid` test). This is the test that would have caught the bug
+   (the existing community-sync test shares a CAS and cannot).
 
-3. **Integration — community sync over separate stores (end-to-end):** extend/add a
-   two-engine community-sync test that uses **separate** CAS instances routed through the
-   serve queryable (not `spawn_shared_cas`), publish a channel-config change on A, assert
-   B materializes it. Confirms the full membership/channel path, not just the byte fetch.
-   (If wiring a full second store through the registry is too heavy for one test, the
-   §6.2 focused regression plus the live re-test in §8 cover the gap; decide during
-   planning.)
+5. **Integration — community sync over separate stores (end-to-end): DEFERRED to the
+   §8 live re-test.** With the Arc-shared design, exercising the full
+   membership/channel path over separate stores requires standing up
+   `RuntimeContentStore` + a live `event_loop::run` per node — far heavier than the
+   `spawn_shared_cas` harness supports, and not worth a bespoke test fixture. The §6.4
+   focused cross-store serve regression proves the byte-fetch fix; the §8 two-machine
+   live re-test proves the full membership/channel propagation. (A future
+   separate-store community-sync harness is noted as a §7 follow-up.)
 
 4. **Gates:** `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets
    --features test-fixtures -- -D warnings`, `cargo nextest run --locked -p harmony-app`
@@ -223,7 +294,13 @@ follow-up if a long-lived, high-churn session ever warrants it. Noted, not done.
   GETs). File as a separate hardening ticket.
 - **Allowlist bounding** (§5) if needed.
 - **Serving other encrypted community content** (attachments, encrypted avatars) by
-  registering their CIDs through the same mechanism.
+  registering their CIDs through the same mechanism (call `put_serveable` instead of
+  `put` at those publish sites).
+- **Separate-store community-sync test harness** — the §6.5 end-to-end test, if a
+  reusable `RuntimeContentStore`-backed two-node fixture is built later.
+- **Owner-state multi-device sync over CAS** — `owner_state_sync`'s encrypted owner
+  root currently uses plain `put` (not serveable). If cross-device owner-state fetch
+  over CAS is ever needed, switch that site to `put_serveable` under its own ticket.
 
 ## 8. Re-test / rollout
 
