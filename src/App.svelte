@@ -844,11 +844,12 @@
   let sharedInProfileByCommunity = $state<Map<string, boolean>>(new Map());
   let selectedCommunityId = $state<string | null>(null);
   let communityMembers = $state<CommunityMember[]>([]);
-  // ZEB-404: authors we've already triggered a roster refetch for in the
-  // current community session. Bounds the message-driven refresh so a backfill
-  // — or a departed member's old posts (who never become 'joined') — can't
-  // spin repeated fetches. Cleared on community switch (changeSelectedCommunity).
-  let rosterRefetchTriedAuthors = new Set<string>();
+  // ZEB-404: timestamp throttle for the message-triggered roster refetch (see
+  // the channelMessageService.onMessage wiring). Time-based — a failed or
+  // too-early refresh self-heals on the next message rather than permanently
+  // suppressing an author. Reset on community switch so each community starts
+  // fresh.
+  let lastMessageRosterRefetchAt = 0;
   let myAddress = $state('');
   // Local mirror of communityService.isDegraded(selectedCommunityId).
   // Direct method calls in the template aren't reactive — we need a
@@ -876,8 +877,8 @@
   function changeSelectedCommunity(id: string | null) {
     if (selectedCommunityId !== id) {
       communityMembers = [];
-      // ZEB-404: new community session → reset the per-author refetch dedupe.
-      rosterRefetchTriedAuthors.clear();
+      // ZEB-404: new community session → reset the refetch throttle.
+      lastMessageRosterRefetchAt = 0;
     }
     // ZEB-334 (Cursor PR #180): selecting a real community leaves the Notes
     // space, so the nav highlights the community and the feed shows it. Passing
@@ -1258,28 +1259,22 @@
   // ZEB-404: a channel message from an author not in our roster means we
   // missed a live `community-members-changed` delta — the joiner announced
   // themselves by speaking. Re-fetch the roster (which also re-subscribes the
-  // joiner's profile card, so their nickname resolves). Coalesce bursts; the
-  // fetch targets whichever community is selected when the timer FIRES, so a
-  // mid-window community switch can't drop the active community's refresh.
-  let rosterRefetchTimer: ReturnType<typeof setTimeout> | null = null;
-  function scheduleRosterRefetch() {
-    if (rosterRefetchTimer !== null) return;
-    rosterRefetchTimer = setTimeout(() => {
-      rosterRefetchTimer = null;
-      const id = selectedCommunityId;
-      if (id !== null) void refreshCommunityMembers(id);
-    }, 400);
-  }
+  // joiner's profile card, so their nickname resolves). Throttle so a backfill
+  // (or a departed member's old posts, who never become 'joined') can't spin
+  // refetches: at most one message-triggered refresh per
+  // ROSTER_REFETCH_MIN_INTERVAL_MS. The throttle is time-based, not per-author,
+  // so a failed or too-early refresh self-heals on the next message after the
+  // window — it never permanently suppresses an author. We refetch the message's
+  // own community (== selectedCommunityId here); refreshCommunityMembers' own
+  // stale-response guard drops the result if the selection changed in-flight.
+  const ROSTER_REFETCH_MIN_INTERVAL_MS = 3000;
   channelMessageService.onMessage = (communityId, _channelId, message) => {
     if (communityId !== selectedCommunityId) return;
     if (rosterHasJoinedAuthor(communityMembers, message.author)) return;
-    // Dedupe per author so a backfill (or a departed member's old posts, who
-    // never become 'joined') triggers at most one fetch each per community
-    // session — the set is cleared on community switch.
-    const author = message.author.toLowerCase();
-    if (rosterRefetchTriedAuthors.has(author)) return;
-    rosterRefetchTriedAuthors.add(author);
-    scheduleRosterRefetch();
+    const now = Date.now();
+    if (now - lastMessageRosterRefetchAt < ROSTER_REFETCH_MIN_INTERVAL_MS) return;
+    lastMessageRosterRefetchAt = now;
+    void refreshCommunityMembers(communityId);
   };
 
   // Keep the display name on both services in sync with profile edits.
