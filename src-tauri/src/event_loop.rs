@@ -6698,25 +6698,6 @@ where
     })
 }
 
-/// ZEB-343: the peer-to-peer CAS serve primitive. Declares a single Zenoh
-/// queryable on `harmony/content/*/**` and answers content GETs for PUBLIC
-/// (unencrypted) CIDs held in the local store.
-///
-/// `lookup` is the local-store accessor (production wires it to a
-/// `CasOp::GetLocal` round-trip; tests wire a HashMap) — passed in to avoid an
-/// engine↔adapter circular dep, exactly like channel-log's `read_for_query`
-/// (event_loop.rs:4073).
-///
-/// Serve gate (ZEB-395): each request is filtered through `content_cid_servable`
-/// (see that fn) — encrypted CIDs are served only when allowlisted (community
-/// roots opted in via `ContentStore::put_serveable`); private encrypted blobs
-/// (DMs, private profiles) are never allowlisted and get no reply.
-///
-/// Returned bytes are inherently integrity-safe: the local cache only admits
-/// bytes that passed `hash==cid` (StorageTier::verify_cid), so anything `lookup`
-/// returns already verifies. We still re-check `cid.verify_hash` before replying
-/// as defense-in-depth (cheap; never serve corrupt bytes).
-///
 /// Serve-gate predicate (ZEB-395): a CID is servable iff it is unencrypted OR it
 /// is an allowlisted community-root CID. Shared by the queryable loop and its
 /// unit tests so the two can never drift.
@@ -6727,6 +6708,25 @@ fn content_cid_servable(
     !cid.flags().encrypted || serve_allowlist.contains(cid)
 }
 
+/// ZEB-343: the peer-to-peer CAS serve primitive. Declares a single Zenoh
+/// queryable on `harmony/content/*/**` and answers content GETs for servable
+/// CIDs held in the local store: all unencrypted CIDs plus allowlisted encrypted
+/// community-root CIDs (opted in via `ContentStore::put_serveable`). Private
+/// encrypted blobs (DMs, private profiles) are never allowlisted and get no
+/// reply.
+///
+/// `lookup` is the local-store accessor (production wires it to a
+/// `CasOp::GetLocal` round-trip; tests wire a HashMap) — passed in to avoid an
+/// engine↔adapter circular dep, exactly like channel-log's `read_for_query`
+/// (event_loop.rs:4073).
+///
+/// Serve gate (ZEB-395): each request is filtered through `content_cid_servable`
+/// (see that fn) before any reply.
+///
+/// Returned bytes are inherently integrity-safe: the local cache only admits
+/// bytes that passed `hash==cid` (StorageTier::verify_cid), so anything `lookup`
+/// returns already verifies. We still re-check `cid.verify_hash` before replying
+/// as defense-in-depth (cheap; never serve corrupt bytes).
 #[allow(clippy::type_complexity)]
 pub async fn spawn_content_serve_queryable<F>(
     session: Arc<zenoh::Session>,
