@@ -12,8 +12,44 @@
 
 use crate::owner_state_types::ContentId;
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
+
+/// Set of community state-root CIDs this node is willing to serve over CAS even
+/// though they carry the `encrypted` flag (ZEB-395). Community roots are
+/// epoch-key ciphertext shared among members; serving them by CID is safe (see
+/// `docs/specs/2026-06-07-zeb-395-community-content-serve-policy-design.md` §3).
+/// Private encrypted blobs (DMs, private profiles) are never inserted, so the
+/// content-serve queryable keeps refusing them.
+///
+/// `std::sync::RwLock` (not tokio) is intentional: `allow`/`contains` lock,
+/// mutate/read, and drop the guard synchronously — no guard is ever held across
+/// an `.await`. The handle is `Clone` (Arc bump) and shared between the
+/// production `RuntimeContentStore` (registration) and the content-serve
+/// queryable (lookup).
+#[derive(Clone, Default)]
+pub struct CommunityServeAllowlist(Arc<RwLock<HashSet<ContentId>>>);
+
+impl CommunityServeAllowlist {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark a community-root CID serveable. Idempotent. A poisoned lock is
+    /// treated as "could not record" (the publish already succeeded; the next
+    /// publish re-registers), never a panic.
+    pub fn allow(&self, cid: ContentId) {
+        if let Ok(mut g) = self.0.write() {
+            g.insert(cid);
+        }
+    }
+
+    /// True if `cid` is an allowlisted community-root CID. A poisoned lock reads
+    /// as "not allowlisted" (fail closed — never serve on a poisoned guard).
+    pub fn contains(&self, cid: &ContentId) -> bool {
+        self.0.read().map(|g| g.contains(cid)).unwrap_or(false)
+    }
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum ContentStoreError {
@@ -362,6 +398,26 @@ mod tests {
             }
         }
         stub.await.unwrap();
+    }
+
+    #[test]
+    fn allowlist_allow_then_contains() {
+        let a = CommunityServeAllowlist::new();
+        let c = cid(7);
+        assert!(!a.contains(&c), "fresh allowlist contains nothing");
+        a.allow(c);
+        assert!(a.contains(&c), "allowed CID is contained");
+        assert!(!a.contains(&cid(8)), "un-added CID is not contained");
+    }
+
+    #[test]
+    fn allowlist_clone_shares_state() {
+        // Arc-backed: a clone observes inserts made via the original.
+        let a = CommunityServeAllowlist::new();
+        let b = a.clone();
+        let c = cid(42);
+        a.allow(c);
+        assert!(b.contains(&c), "clone shares the underlying set");
     }
 
     /// Guard the `CasOp::GetLocal` enum shape and oneshot reply plumbing.
