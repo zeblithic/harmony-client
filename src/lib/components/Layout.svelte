@@ -1,8 +1,33 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import type { AppMode } from '../types';
+  import {
+    MEDIA_PANEL_MIN_WIDTH,
+    MEDIA_PANEL_MAX_WIDTH,
+    MEDIA_PANEL_DEFAULT_WIDTH,
+  } from '../media-panel-prefs';
 
-  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, mailInbox, mailDetail, mintLedger, networkPanel, settingsPanel, collapsed = false, showSettings = false, mode = 'messages', mailSelected = false }: {
+  let {
+    nav,
+    textFeed,
+    mediaFeed,
+    vineFeed,
+    fileBrowser,
+    fileDetailPanel,
+    spellbookContent,
+    spellbookDetail,
+    mailInbox,
+    mailDetail,
+    mintLedger,
+    networkPanel,
+    settingsPanel,
+    collapsed = false,
+    showSettings = false,
+    mode = 'messages',
+    mailSelected = false,
+    mediaPanelOpen = $bindable(false),
+    mediaPanelWidth = $bindable(MEDIA_PANEL_DEFAULT_WIDTH),
+  }: {
     nav: Snippet;
     textFeed: Snippet;
     mediaFeed: Snippet;
@@ -20,10 +45,86 @@
     showSettings?: boolean;
     mode?: AppMode;
     mailSelected?: boolean;
+    mediaPanelOpen?: boolean;
+    mediaPanelWidth?: number;
   } = $props();
+
+  // ZEB-405 (WS-C): the messages-mode right column has three states —
+  //   • responsive-collapsed (narrow screen): the existing `.collapsed` rule wins
+  //   • visible: media feed (resizable) OR the Settings panel (which shares the cell)
+  //   • closed: a slim edge rail to reveal the media feed
+  // Settings keeps the column whenever it's open, even if the media feed is hidden.
+  const isMessages = $derived(mode === 'messages');
+  const wantSettings = $derived(isMessages && showSettings && !!settingsPanel);
+  const rightColumnVisible = $derived(
+    isMessages && !collapsed && (wantSettings || mediaPanelOpen),
+  );
+  const showingSettings = $derived(rightColumnVisible && wantSettings);
+  const showingMedia = $derived(rightColumnVisible && !wantSettings);
+  const railVisible = $derived(isMessages && !collapsed && !rightColumnVisible);
+
+  // Live width during a drag, committed back to the bound prop on pointer-up so
+  // the parent persists once per resize, not once per animation frame.
+  const clampWidth = (px: number) =>
+    Math.min(MEDIA_PANEL_MAX_WIDTH, Math.max(MEDIA_PANEL_MIN_WIDTH, Math.round(px)));
+  const RESIZE_STEP = 16;
+
+  let dragging = $state(false);
+  let liveWidth = $state(mediaPanelWidth);
+  let dragStartX = 0;
+  let dragStartWidth = 0;
+
+  // Mirror the prop into liveWidth whenever we're not mid-drag.
+  $effect(() => {
+    if (!dragging) liveWidth = mediaPanelWidth;
+  });
+
+  function onResizeStart(e: PointerEvent) {
+    dragging = true;
+    dragStartX = e.clientX;
+    dragStartWidth = liveWidth;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    e.preventDefault();
+  }
+  function onResizeMove(e: PointerEvent) {
+    if (!dragging) return;
+    // The panel sits on the right edge: dragging the handle left widens it.
+    liveWidth = clampWidth(dragStartWidth + (dragStartX - e.clientX));
+  }
+  function onResizeEnd(e: PointerEvent) {
+    if (!dragging) return;
+    dragging = false;
+    mediaPanelWidth = clampWidth(liveWidth);
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {
+      // Pointer capture may already be released — non-fatal.
+    }
+  }
+  function onResizeKey(e: KeyboardEvent) {
+    if (e.key === 'ArrowLeft') {
+      mediaPanelWidth = clampWidth(mediaPanelWidth + RESIZE_STEP);
+      e.preventDefault();
+    } else if (e.key === 'ArrowRight') {
+      mediaPanelWidth = clampWidth(mediaPanelWidth - RESIZE_STEP);
+      e.preventDefault();
+    }
+  }
 </script>
 
-<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed} class:spellbook-mode={mode === 'spellbook' && spellbookContent} class:mail-mode={mode === 'mail' && mailInbox} class:mint-mode={mode === 'mint' && mintLedger} class:network-mode={mode === 'network' && networkPanel}>
+<div
+  class="layout"
+  class:collapsed
+  class:files-mode={mode === 'files' && fileBrowser}
+  class:vine-mode={mode === 'vines' && vineFeed}
+  class:spellbook-mode={mode === 'spellbook' && spellbookContent}
+  class:mail-mode={mode === 'mail' && mailInbox}
+  class:mint-mode={mode === 'mint' && mintLedger}
+  class:network-mode={mode === 'network' && networkPanel}
+  class:msg-media-open={showingMedia}
+  class:msg-media-closed={railVisible}
+  style="--media-width: {liveWidth}px"
+>
   <aside class="nav-area">
     {@render nav()}
   </aside>
@@ -76,14 +177,56 @@
     <main class="text-area">
       {@render textFeed()}
     </main>
-    {#if !collapsed}
+    {#if rightColumnVisible}
       <section class="media-area">
-        {#if showSettings && settingsPanel}
-          {@render settingsPanel()}
+        {#if showingSettings}
+          {@render settingsPanel?.()}
         {:else}
           {@render mediaFeed()}
         {/if}
       </section>
+      {#if showingMedia}
+        <!--
+          ARIA "window splitter": a focusable separator with aria-valuenow +
+          arrow-key resize. This role IS interactive, but Svelte's a11y lint
+          doesn't model it, so suppress its two false positives here.
+        -->
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+        <div
+          class="media-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize media panel"
+          aria-valuemin={MEDIA_PANEL_MIN_WIDTH}
+          aria-valuemax={MEDIA_PANEL_MAX_WIDTH}
+          aria-valuenow={liveWidth}
+          tabindex="0"
+          onpointerdown={onResizeStart}
+          onpointermove={onResizeMove}
+          onpointerup={onResizeEnd}
+          onpointercancel={onResizeEnd}
+          onkeydown={onResizeKey}
+        ></div>
+        <!-- Collapse control: a chevron tab on the panel's left edge, vertically
+             centered so it clears the app's top chrome (backup banner + Help
+             button), mirroring the reveal rail (‹ opens → › closes). -->
+        <button
+          type="button"
+          class="media-close-tab"
+          aria-label="Hide media panel"
+          title="Hide media panel"
+          onclick={() => (mediaPanelOpen = false)}
+        >›</button>
+      {/if}
+    {:else if railVisible}
+      <button
+        type="button"
+        class="media-rail"
+        aria-label="Show media panel"
+        title="Show media panel"
+        onclick={() => (mediaPanelOpen = true)}
+      >‹</button>
     {/if}
   {/if}
 </div>
@@ -95,11 +238,25 @@
     grid-template-areas: "nav text media";
     height: 100vh;
     overflow: hidden;
+    position: relative;
   }
 
   .layout.collapsed {
     grid-template-columns: var(--nav-width-collapsed) 1fr;
     grid-template-areas: "nav text";
+  }
+
+  /* ZEB-405 (WS-C): messages-mode media-column states. The base grid above is
+     the wide "settings/open" 3-column layout; these narrow or hide the media
+     column. The `:not(.collapsed)` guard lets the responsive `.collapsed` rule
+     win on narrow screens. */
+  .layout.msg-media-open:not(.collapsed) {
+    grid-template-columns: var(--nav-width) 1fr var(--media-width, 340px);
+    grid-template-areas: "nav text media";
+  }
+  .layout.msg-media-closed:not(.collapsed) {
+    grid-template-columns: var(--nav-width) 1fr 18px;
+    grid-template-areas: "nav text rail";
   }
 
   .nav-area {
@@ -123,6 +280,72 @@
     border-left: 1px solid var(--border);
     overflow-y: auto;
     padding: 12px;
+  }
+
+  /* Drag splitter — a direct child of `.layout` (never the scrolling cell), so
+     it stays pinned to the media column's left edge at any scroll position. */
+  .media-resizer {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: calc(var(--media-width, 340px) - 4px);
+    width: 8px;
+    cursor: col-resize;
+    z-index: 5;
+    background: transparent;
+    touch-action: none;
+  }
+  .media-resizer:hover,
+  .media-resizer:focus-visible {
+    background: var(--accent);
+    outline: none;
+  }
+
+  /* Collapse tab — straddles the panel's left edge, vertically centered (above
+     the splitter) so it never collides with the top banner or Help button. */
+  .media-close-tab {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    right: calc(var(--media-width, 340px) - 11px);
+    width: 22px;
+    height: 48px;
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 6px 0 0 6px;
+    background: var(--bg-secondary);
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.95rem;
+    line-height: 1;
+  }
+  .media-close-tab:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  /* Slim reveal rail shown when the media feed is collapsed. */
+  .media-rail {
+    grid-area: rail;
+    appearance: none;
+    border: none;
+    border-left: 1px solid var(--border);
+    background: var(--bg-secondary);
+    color: var(--text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    font-size: 0.9rem;
+  }
+  .media-rail:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
   }
 
   .layout.files-mode {
