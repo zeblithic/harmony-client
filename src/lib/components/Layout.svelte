@@ -74,6 +74,12 @@
   let dragStartX = 0;
   let dragStartWidth = 0;
 
+  // If the splitter unmounts mid-drag (panel hidden or Settings opens before
+  // pointerup fires), the pointerup is lost and `dragging` would stick true —
+  // clear it so the width re-syncs instead of freezing at the interrupted value.
+  $effect(() => {
+    if (!showingMedia && dragging) dragging = false;
+  });
   // Mirror the prop into liveWidth whenever we're not mid-drag.
   $effect(() => {
     if (!dragging) liveWidth = mediaPanelWidth;
@@ -83,7 +89,11 @@
     dragging = true;
     dragStartX = e.clientX;
     dragStartWidth = liveWidth;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      // setPointerCapture can throw for an invalid/already-released pointerId.
+    }
     e.preventDefault();
   }
   function onResizeMove(e: PointerEvent) {

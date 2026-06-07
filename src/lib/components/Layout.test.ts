@@ -88,6 +88,33 @@ describe('Layout media panel — ZEB-405 (WS-C)', () => {
     expect(sep).toHaveAttribute('aria-valuenow', '356');
   });
 
+  it('re-syncs width (does not freeze) when a drag is interrupted by hiding the splitter', async () => {
+    const settingsProps = (showSettings: boolean) => ({
+      ...baseSnippets,
+      settingsPanel: slot('settings', 'settings'),
+      mode: 'messages' as const,
+      collapsed: false,
+      mediaPanelOpen: true,
+      showSettings,
+      mediaPanelWidth: 340,
+    });
+    const { getByRole, rerender } = render(Layout, { props: settingsProps(false) });
+    const sep = getByRole('separator');
+    // Begin a drag and move so liveWidth diverges from the committed 340.
+    await fireEvent.pointerDown(sep, { pointerId: 1, clientX: 1000 });
+    await fireEvent.pointerMove(sep, { pointerId: 1, clientX: 940 });
+    await tick();
+    expect(Number(sep.getAttribute('aria-valuenow'))).toBeGreaterThan(340);
+
+    // Interrupt: Settings takes the column, unmounting the splitter (no pointerup).
+    await rerender(settingsProps(true));
+    await tick();
+    // Return to the media feed — width must re-sync to the committed 340.
+    await rerender(settingsProps(false));
+    await tick();
+    expect(getByRole('separator').getAttribute('aria-valuenow')).toBe('340');
+  });
+
   it('does not render the media column for non-messages modes', () => {
     const { queryByLabelText, getByTestId, queryByTestId } = render(Layout, {
       props: {
