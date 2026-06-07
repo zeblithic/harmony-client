@@ -184,6 +184,7 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test
+                    harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
                 )
                 .await;
             });

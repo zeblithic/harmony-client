@@ -549,6 +549,11 @@ pub async fn run<R: Runtime>(
     // sender and spawns the dial driver to dial newly-learned peers via the
     // live zenoh `Runtime`. `None` in test contexts that bypass `start_node`.
     dial_telemetry: Option<std::sync::Arc<crate::network_health::DialTelemetry>>,
+    // ZEB-395: shared serve-allowlist. The same handle is attached to the
+    // production RuntimeContentStore (so publish_root_now's put_serveable
+    // registers community-root CIDs) and consulted by the content-serve
+    // queryable below. Empty for any caller that doesn't publish community roots.
+    serve_allowlist: crate::content_store::CommunityServeAllowlist,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -1881,6 +1886,7 @@ pub async fn run<R: Runtime>(
             std::sync::Arc::clone(&session_arc),
             serve_lookup,
             std::sync::Arc::clone(&closing),
+            serve_allowlist.clone(),
         )
         .await
         {
@@ -6692,18 +6698,30 @@ where
     })
 }
 
+/// Serve-gate predicate (ZEB-395): a CID is servable iff it is unencrypted OR it
+/// is an allowlisted community-root CID. Shared by the queryable loop and its
+/// unit tests so the two can never drift.
+fn content_cid_servable(
+    cid: &ContentId,
+    serve_allowlist: &crate::content_store::CommunityServeAllowlist,
+) -> bool {
+    !cid.flags().encrypted || serve_allowlist.contains(cid)
+}
+
 /// ZEB-343: the peer-to-peer CAS serve primitive. Declares a single Zenoh
-/// queryable on `harmony/content/*/**` and answers content GETs for PUBLIC
-/// (unencrypted) CIDs held in the local store.
+/// queryable on `harmony/content/*/**` and answers content GETs for servable
+/// CIDs held in the local store: all unencrypted CIDs plus allowlisted encrypted
+/// community-root CIDs (opted in via `ContentStore::put_serveable`). Private
+/// encrypted blobs (DMs, private profiles) are never allowlisted and get no
+/// reply.
 ///
 /// `lookup` is the local-store accessor (production wires it to a
 /// `CasOp::GetLocal` round-trip; tests wire a HashMap) — passed in to avoid an
 /// engine↔adapter circular dep, exactly like channel-log's `read_for_query`
 /// (event_loop.rs:4073).
 ///
-/// Serve gate: a CID is servable iff `!cid.flags().encrypted` (spec §5.2). This
-/// is intrinsic to the CID (its header's leading bit) and holds per-chunk, so
-/// no public-membership registry is needed. Encrypted CIDs get no reply.
+/// Serve gate (ZEB-395): each request is filtered through `content_cid_servable`
+/// (see that fn) before any reply.
 ///
 /// Returned bytes are inherently integrity-safe: the local cache only admits
 /// bytes that passed `hash==cid` (StorageTier::verify_cid), so anything `lookup`
@@ -6714,6 +6732,7 @@ pub async fn spawn_content_serve_queryable<F>(
     session: Arc<zenoh::Session>,
     lookup: Arc<F>,
     closing: Arc<AtomicBool>,
+    serve_allowlist: crate::content_store::CommunityServeAllowlist,
 ) -> Result<tokio::task::JoinHandle<()>, String>
 where
     F: Fn(
@@ -6753,8 +6772,8 @@ where
                     let Some(cid) = parse_content_serve_cid(&qkey) else {
                         continue;
                     };
-                    if cid.flags().encrypted {
-                        continue;
+                    if !content_cid_servable(&cid, &serve_allowlist) {
+                        continue; // private encrypted content stays unservable
                     }
                     let Some(bytes) = (lookup)(cid).await else {
                         continue;
@@ -6841,6 +6860,41 @@ mod content_serve_parse_tests {
     fn five_segment_key_rejected() {
         let key = format!("harmony/content/3/{HEX64}/extra");
         assert!(parse_content_serve_cid(&key).is_none());
+    }
+}
+
+#[cfg(test)]
+mod content_serve_gate_tests {
+    // Exercise the PRODUCTION predicate `content_cid_servable` (the same fn the
+    // queryable loop calls), so the test can never drift from the real gate.
+    use super::content_cid_servable;
+    use crate::content_store::CommunityServeAllowlist;
+    use harmony_content::cid::{ContentFlags, ContentId};
+
+    #[test]
+    fn gate_serves_unencrypted_always() {
+        let cid = ContentId::for_book(b"pub", ContentFlags::default()).unwrap();
+        let allow = CommunityServeAllowlist::new();
+        assert!(content_cid_servable(&cid, &allow));
+    }
+
+    #[test]
+    fn gate_refuses_encrypted_unless_allowlisted() {
+        let enc = ContentFlags {
+            encrypted: true,
+            ..ContentFlags::default()
+        };
+        let cid = ContentId::for_book(b"sec", enc).unwrap();
+        let allow = CommunityServeAllowlist::new();
+        assert!(
+            !content_cid_servable(&cid, &allow),
+            "encrypted + not allowlisted => refuse"
+        );
+        allow.allow(cid);
+        assert!(
+            content_cid_servable(&cid, &allow),
+            "encrypted + allowlisted => serve"
+        );
     }
 }
 

@@ -2598,8 +2598,16 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
         CommunitySyncError::Crypto(CommunityCryptoError::ContentIdDerivation(e.to_string()))
     })?;
 
-    // 4. Put into ContentStore (routes through CasOp::PutLocal).
-    ctx.content_store.put(root_cid, blob_ciphertext).await?;
+    // 4. Put into ContentStore AND mark this community-root CID serveable to
+    //    peers (ZEB-395). put_serveable admits via CasOp::PutLocal exactly like
+    //    put, then (production RuntimeContentStore only) records root_cid in the
+    //    shared serve-allowlist so the content-serve queryable will serve it
+    //    despite the encrypted flag. Registration completes before the state-
+    //    root envelope announcing root_cid is published below, so no peer can
+    //    request the CID before it is allowlisted.
+    ctx.content_store
+        .put_serveable(root_cid, blob_ciphertext)
+        .await?;
 
     // 5. Build the SIGNED sub-payload with a strictly-newer HLC.
     let now = next_hlc(ctx).await;
