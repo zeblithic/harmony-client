@@ -117,17 +117,17 @@ if (selectedCommunityId !== null) {
 
 ---
 
-### Task 3: Backend regression test — membership change ⇒ delta emitted
+### Task 3: Backend regression test — RESOLVED as already-covered (no new test)
 
-**Files:** add a test (prefer an existing `community_state_sync.rs` `#[cfg(test)]` two-engine helper; otherwise a focused `src-tauri/tests/` integration test). Scope cargo to the single target to avoid the ~97-binary relink.
+**Finding (code-traced):** the "membership change applied via sync ⇒ `CommunityMembershipDelta` emitted" invariant is **already covered** and the emit path is correct:
 
-- [ ] **Step 1: Locate the closest existing pattern** — a test that builds a `CommunitySyncEngine` with a `delta_tx: Some(mpsc::channel)` and feeds an inbound publish/insert. Model on it.
+- The receive-path emit loop (`community_state_sync.rs:3393-3404`) iterates `inserted_events` and emits a delta for **every** inserted event, **kind-agnostically**.
+- `tests/community_channel_config_integration.rs::alice_creates_channel_bob_materializes_via_state_sync` already exercises this exact loop: Step 3 (line ~345) asserts Bob's engine receives a delta for Alice's event **via the sync forwarder**, and Alice's own local Join emits a delta (line ~277). A received `Join` flows through the identical `inserted_events` path as the proven `ChannelCreate`.
+- The only events excluded from emission are `pending_joins_for_recheck` (PendingJoin requests that returned `AlreadyKnown` — correctly excluded, as they are **not** membership changes).
 
-- [ ] **Step 2: Write the test** — admin engine learns of a new joiner (via the receive path that produced the live success), assert a `CommunityMembershipDelta` for that joiner is received on the `delta_tx` channel within a bounded `recv` timeout. This pins the "real membership transition ⇒ delta" invariant.
+The live ZEB-404 symptom was therefore a **frontend delivery/timing** miss (an on-screen roster not refreshed), not a backend emit gap. Adding a near-duplicate integration test would force the ~25-min harmony-app relink for no incremental invariant coverage and would falsely imply the backend was broken.
 
-- [ ] **Step 3: Run scoped** — `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(<test_name>)'`. If it FAILS, an emit-gap is real on that path → add the missing `delta_tx.try_send` next to the insert, re-run to green. If it PASSES, the invariant already holds (the live miss was pure delivery timing) — keep the test as a guard.
-
-- [ ] **Step 4: Commit** — `test(zeb-404): pin membership-change ⇒ delta-emitted invariant` (+ any emit fix folded in).
+**Decision:** no new backend test. The frontend triggers (Task 1 helper test + Tasks 1/2 wiring) are the genuine new guards; the backend invariant is referenced in the PR body. Keeps the PR **frontend-only**. If a reviewer wants an explicit member-Join receive-path delta assertion, it can be added by mirroring Test 1 with the countersign scaffolding as a follow-up — out of scope for the live-refresh fix.
 
 ---
 
