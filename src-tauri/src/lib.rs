@@ -2383,6 +2383,11 @@ pub(crate) async fn start_node_inner(
         let mut content_store_for_state: Option<
             std::sync::Arc<dyn crate::content_store::ContentStore>,
         > = None;
+        // ZEB-395: one shared serve-allowlist for this node. Attached
+        // to the production content store (registration via
+        // put_serveable) and to event_loop::run's serve queryable
+        // (lookup). Same Arc-backed handle on both sides.
+        let serve_allowlist = crate::content_store::CommunityServeAllowlist::new();
         let mut dm_outbox_arc: Option<
             std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
         > = None;
@@ -2796,12 +2801,15 @@ pub(crate) async fn start_node_inner(
                     // shared NodeRuntime + StorageTier. See spec
                     // §"Architecture / High-level flow".
                     let content_store: std::sync::Arc<dyn crate::content_store::ContentStore> =
-                        std::sync::Arc::new(crate::content_store::RuntimeContentStore::new(
-                            cas_op_tx.clone(),
-                            std::time::Duration::from_millis(
-                                crate::content_store::DEFAULT_FETCH_TIMEOUT_MS,
-                            ),
-                        ));
+                        std::sync::Arc::new(
+                            crate::content_store::RuntimeContentStore::new(
+                                cas_op_tx.clone(),
+                                std::time::Duration::from_millis(
+                                    crate::content_store::DEFAULT_FETCH_TIMEOUT_MS,
+                                ),
+                            )
+                            .with_serve_allowlist(serve_allowlist.clone()),
+                        );
 
                     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -5064,6 +5072,8 @@ pub(crate) async fn start_node_inner(
                 // scope for the NetworkHealthService install block below so
                 // both share the same counters/ring.
                 let dial_telemetry_into_loop = Some(std::sync::Arc::clone(&dial_telemetry));
+                // ZEB-395: pass the shared serve-allowlist clone into the event loop.
+                let serve_allowlist_for_loop = serve_allowlist.clone();
                 let thread_result = thread::Builder::new()
                     .name("harmony-runtime".to_string())
                     // Windows debug builds overflow the default ~2 MiB stack inside
@@ -5172,6 +5182,7 @@ pub(crate) async fn start_node_inner(
                                 mint_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                                 dial_telemetry_into_loop,
+                                serve_allowlist_for_loop,
                             )
                             .await;
                         });

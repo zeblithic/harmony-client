@@ -549,6 +549,11 @@ pub async fn run<R: Runtime>(
     // sender and spawns the dial driver to dial newly-learned peers via the
     // live zenoh `Runtime`. `None` in test contexts that bypass `start_node`.
     dial_telemetry: Option<std::sync::Arc<crate::network_health::DialTelemetry>>,
+    // ZEB-395: shared serve-allowlist. The same handle is attached to the
+    // production RuntimeContentStore (so publish_root_now's put_serveable
+    // registers community-root CIDs) and consulted by the content-serve
+    // queryable below. Empty for any caller that doesn't publish community roots.
+    serve_allowlist: crate::content_store::CommunityServeAllowlist,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -1881,8 +1886,7 @@ pub async fn run<R: Runtime>(
             std::sync::Arc::clone(&session_arc),
             serve_lookup,
             std::sync::Arc::clone(&closing),
-            // ZEB-395 Task 4 replaces this with the run()-level shared allowlist.
-            crate::content_store::CommunityServeAllowlist::new(),
+            serve_allowlist.clone(),
         )
         .await
         {
