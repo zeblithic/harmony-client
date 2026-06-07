@@ -1881,6 +1881,8 @@ pub async fn run<R: Runtime>(
             std::sync::Arc::clone(&session_arc),
             serve_lookup,
             std::sync::Arc::clone(&closing),
+            // ZEB-395 Task 4 replaces this with the run()-level shared allowlist.
+            crate::content_store::CommunityServeAllowlist::new(),
         )
         .await
         {
@@ -6701,9 +6703,11 @@ where
 /// engine↔adapter circular dep, exactly like channel-log's `read_for_query`
 /// (event_loop.rs:4073).
 ///
-/// Serve gate: a CID is servable iff `!cid.flags().encrypted` (spec §5.2). This
-/// is intrinsic to the CID (its header's leading bit) and holds per-chunk, so
-/// no public-membership registry is needed. Encrypted CIDs get no reply.
+/// Serve gate (ZEB-395): a CID is servable iff it is unencrypted OR it is an
+/// allowlisted community-root CID (`serve_allowlist.contains`). Private
+/// encrypted blobs (DMs, private profiles) are never allowlisted, so they keep
+/// getting no reply. The encrypted flag is intrinsic to the CID header; the
+/// allowlist is the publisher's explicit opt-in via `ContentStore::put_serveable`.
 ///
 /// Returned bytes are inherently integrity-safe: the local cache only admits
 /// bytes that passed `hash==cid` (StorageTier::verify_cid), so anything `lookup`
@@ -6714,6 +6718,7 @@ pub async fn spawn_content_serve_queryable<F>(
     session: Arc<zenoh::Session>,
     lookup: Arc<F>,
     closing: Arc<AtomicBool>,
+    serve_allowlist: crate::content_store::CommunityServeAllowlist,
 ) -> Result<tokio::task::JoinHandle<()>, String>
 where
     F: Fn(
@@ -6753,8 +6758,8 @@ where
                     let Some(cid) = parse_content_serve_cid(&qkey) else {
                         continue;
                     };
-                    if cid.flags().encrypted {
-                        continue;
+                    if cid.flags().encrypted && !serve_allowlist.contains(&cid) {
+                        continue; // private encrypted content stays unservable
                     }
                     let Some(bytes) = (lookup)(cid).await else {
                         continue;
@@ -6841,6 +6846,41 @@ mod content_serve_parse_tests {
     fn five_segment_key_rejected() {
         let key = format!("harmony/content/3/{HEX64}/extra");
         assert!(parse_content_serve_cid(&key).is_none());
+    }
+}
+
+#[cfg(test)]
+mod content_serve_gate_tests {
+    use crate::content_store::CommunityServeAllowlist;
+    use harmony_content::cid::{ContentFlags, ContentId};
+
+    /// The exact predicate used in the serve loop: serve iff unencrypted OR
+    /// allowlisted. Kept in lockstep with spawn_content_serve_queryable's gate.
+    fn servable(cid: &ContentId, allowlist: &CommunityServeAllowlist) -> bool {
+        !(cid.flags().encrypted && !allowlist.contains(cid))
+    }
+
+    #[test]
+    fn gate_serves_unencrypted_always() {
+        let cid = ContentId::for_book(b"pub", ContentFlags::default()).unwrap();
+        let allow = CommunityServeAllowlist::new();
+        assert!(servable(&cid, &allow));
+    }
+
+    #[test]
+    fn gate_refuses_encrypted_unless_allowlisted() {
+        let enc = ContentFlags {
+            encrypted: true,
+            ..ContentFlags::default()
+        };
+        let cid = ContentId::for_book(b"sec", enc).unwrap();
+        let allow = CommunityServeAllowlist::new();
+        assert!(
+            !servable(&cid, &allow),
+            "encrypted + not allowlisted => refuse"
+        );
+        allow.allow(cid);
+        assert!(servable(&cid, &allow), "encrypted + allowlisted => serve");
     }
 }
 

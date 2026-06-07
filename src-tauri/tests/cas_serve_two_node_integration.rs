@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use harmony_app::content_store::CommunityServeAllowlist;
 use harmony_app::event_loop::spawn_content_serve_queryable;
 use harmony_content::cid::{ContentFlags, ContentId};
 
@@ -40,10 +41,14 @@ async fn serve_inner() {
     };
 
     let closing = Arc::new(AtomicBool::new(false));
-    let _serve =
-        spawn_content_serve_queryable(Arc::clone(&session_a), lookup, Arc::clone(&closing))
-            .await
-            .expect("declare content-serve queryable");
+    let _serve = spawn_content_serve_queryable(
+        Arc::clone(&session_a),
+        lookup,
+        Arc::clone(&closing),
+        CommunityServeAllowlist::new(),
+    )
+    .await
+    .expect("declare content-serve queryable");
 
     let cid_hex = hex::encode(cid.to_bytes());
     let prefix = &cid_hex[1..2];
@@ -111,10 +116,14 @@ async fn encrypted_inner() {
         })
     };
     let closing = Arc::new(AtomicBool::new(false));
-    let _serve =
-        spawn_content_serve_queryable(Arc::clone(&session_a), lookup, Arc::clone(&closing))
-            .await
-            .expect("declare content-serve queryable");
+    let _serve = spawn_content_serve_queryable(
+        Arc::clone(&session_a),
+        lookup,
+        Arc::clone(&closing),
+        CommunityServeAllowlist::new(),
+    )
+    .await
+    .expect("declare content-serve queryable");
 
     // --- Step 1: Liveness proof ---
     // Retry-loop (mirrors serve_inner) until the PUBLIC control CID is served,
