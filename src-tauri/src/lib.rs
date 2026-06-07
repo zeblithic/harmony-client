@@ -9,6 +9,104 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_deep_link::DeepLinkExt;
 
+/// ZEB-398: content-storage policy for a community-member client node.
+///
+/// A member MUST locally persist its communities' epoch-encrypted state-root
+/// blobs (`ContentClass::EncryptedDurable`) so it can serve them to other
+/// members over CAS. harmony-content's default leaves `encrypted_durable_persist`
+/// off — correct for generic relay/router nodes, which must not retain others'
+/// encrypted content — and `StorageTier::handle_publish` SILENTLY DROPS
+/// EncryptedDurable content when the flag is off. That broke post-join community
+/// sync: a member's `put_serveable`'d community root was allowlisted (ZEB-395)
+/// but never admitted to the cache, so peer CAS GETs for it returned empty.
+///
+/// `encrypted_durable_announce` stays off: serving is by direct CID query through
+/// the serve-allowlist (ZEB-395), which needs no Bloom announce, and announcing
+/// would broadcast a filter of held encrypted CIDs.
+fn production_content_policy() -> ContentPolicy {
+    ContentPolicy {
+        encrypted_durable_persist: true,
+        // Pinned explicitly (rather than inherited from ..default()) so the
+        // privacy invariant in the doc comment above can't silently flip if
+        // ContentPolicy::default() changes upstream.
+        encrypted_durable_announce: false,
+        ..ContentPolicy::default()
+    }
+}
+
+#[cfg(test)]
+mod zeb398_content_policy_tests {
+    use super::production_content_policy;
+    use harmony_content::book::MemoryBookStore;
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use harmony_content::storage_tier::{
+        ContentPolicy, FilterBroadcastConfig, StorageBudget, StorageTier, StorageTierEvent,
+    };
+
+    fn budget() -> StorageBudget {
+        StorageBudget {
+            cache_capacity: 512,
+            max_pinned_bytes: 50_000_000,
+        }
+    }
+
+    /// ZEB-398 regression: the production content policy must ADMIT (persist) an
+    /// EncryptedDurable community-root blob through the real `StorageTier`, so a
+    /// member can later serve it to peers. The control half shows the
+    /// harmony-content default silently DROPS the identical publish — the exact
+    /// gap that broke Koya<->Ildwyn post-join sync (root allowlisted but uncached
+    /// -> peer GET returns empty). ZEB-395's integration test used a stub store,
+    /// so it never exercised the real admission policy; this drives it directly.
+    #[test]
+    fn production_policy_persists_encrypted_durable_community_root() {
+        let data = b"epoch-encrypted community state-root ciphertext";
+        let cid = ContentId::for_book(
+            data,
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("derive encrypted-durable cid");
+
+        // Production policy: admitted + stored.
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget(),
+            production_content_policy(),
+            FilterBroadcastConfig::default(),
+        );
+        tier.handle(StorageTierEvent::PublishContent {
+            cid,
+            data: data.to_vec(),
+        });
+        assert_eq!(
+            tier.metrics().publishes_stored,
+            1,
+            "prod policy must persist the EncryptedDurable community root"
+        );
+        assert_eq!(
+            tier.metrics().publishes_rejected,
+            0,
+            "prod policy must not reject the EncryptedDurable community root"
+        );
+
+        // Control: harmony-content default drops it (documents the bug guarded).
+        let (mut default_tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget(),
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
+        default_tier.handle(StorageTierEvent::PublishContent {
+            cid,
+            data: data.to_vec(),
+        });
+        assert_eq!(default_tier.metrics().publishes_stored, 0);
+        assert_eq!(default_tier.metrics().publishes_rejected, 1);
+    }
+}
+
 pub mod backup_state;
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
@@ -4814,7 +4912,9 @@ pub(crate) async fn start_node_inner(
             },
             compute_budget: InstructionBudget { fuel: 100_000 },
             schedule: Default::default(),
-            content_policy: ContentPolicy::default(),
+            // ZEB-398: persist EncryptedDurable content (our communities'
+            // state-root blobs) so we can serve them to members over CAS.
+            content_policy: production_content_policy(),
             filter_broadcast_config: FilterBroadcastConfig {
                 mutation_threshold: 10,
                 max_interval_ticks: 40,
