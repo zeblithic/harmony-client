@@ -41,7 +41,7 @@
   import { LibraryDirectoryService } from './lib/library-directory-service';
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
-  import { CommunityService } from './lib/community-service';
+  import { CommunityService, rosterHasJoinedAuthor } from './lib/community-service';
   import { FriendService } from './lib/friend-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
@@ -1242,6 +1242,25 @@
     if (selectedCommunityId && changedId === selectedCommunityId) {
       isCurrentCommunityDegraded = communityService.isDegraded(changedId);
     }
+  };
+
+  // ZEB-404: a channel message from an author not in our roster means we
+  // missed a live `community-members-changed` delta — the joiner announced
+  // themselves by speaking. Re-fetch the roster (which also re-subscribes the
+  // joiner's profile card, so their nickname resolves). Coalesce bursts so a
+  // backfill of many unknown-author messages triggers a single fetch.
+  let rosterRefetchTimer: ReturnType<typeof setTimeout> | null = null;
+  function scheduleRosterRefetch(id: string) {
+    if (rosterRefetchTimer !== null) return;
+    rosterRefetchTimer = setTimeout(() => {
+      rosterRefetchTimer = null;
+      if (selectedCommunityId === id) void refreshCommunityMembers(id);
+    }, 400);
+  }
+  channelMessageService.onMessage = (communityId, _channelId, message) => {
+    if (communityId !== selectedCommunityId) return;
+    if (rosterHasJoinedAuthor(communityMembers, message.author)) return;
+    scheduleRosterRefetch(communityId);
   };
 
   // Keep the display name on both services in sync with profile edits.

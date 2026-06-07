@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { CommunityService } from '../community-service';
+import { CommunityService, rosterHasJoinedAuthor } from '../community-service';
 import type { TauriAdapter } from '../zenoh-service';
 
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
@@ -373,5 +373,20 @@ describe('CommunityService', () => {
     (adapter2.invoke as any).mockResolvedValue([]);
     await service2.listChannels('aa'.repeat(16));
     expect(adapter2.invoke).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('rosterHasJoinedAuthor (ZEB-404)', () => {
+  it('true when a joined member matches (case-insensitive)', () => {
+    expect(rosterHasJoinedAuthor([{ address: 'AB12', status: 'joined' }], 'ab12')).toBe(true);
+  });
+  it('false when the author is absent from the roster', () => {
+    expect(rosterHasJoinedAuthor([{ address: 'ab12', status: 'joined' }], 'cd34')).toBe(false);
+  });
+  it('false when the only address match is not joined', () => {
+    expect(rosterHasJoinedAuthor([{ address: 'ab12', status: 'invited' }], 'ab12')).toBe(false);
+  });
+  it('false on an empty roster', () => {
+    expect(rosterHasJoinedAuthor([], 'ab12')).toBe(false);
   });
 });

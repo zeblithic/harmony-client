@@ -92,6 +92,23 @@ function dtoToMember(d: MemberInfoDto): CommunityMember {
   };
 }
 
+/**
+ * True iff `authorHex` is a currently-JOINED member of `members`.
+ *
+ * Used (ZEB-404) to detect a message from someone not yet in our roster — a
+ * signal that we missed a live `community-members-changed` delta and the
+ * roster should be re-fetched. Address comparison is case-insensitive because
+ * roster addresses and message authors are both lowercase hex by convention,
+ * but we normalize defensively.
+ */
+export function rosterHasJoinedAuthor(
+  members: Pick<CommunityMember, 'address' | 'status'>[],
+  authorHex: string,
+): boolean {
+  const a = authorHex.toLowerCase();
+  return members.some((x) => x.status === 'joined' && x.address.toLowerCase() === a);
+}
+
 export class CommunityService {
   /** Called when a community's member roster changes. The receiver
    *  should refresh listCommunityMembers for the given community.
