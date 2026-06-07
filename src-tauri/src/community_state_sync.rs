@@ -2349,6 +2349,11 @@ async fn internal_task(mut ctx: InternalCtx) {
                     continue;
                 };
                 let outcome = handle_incoming_publish(&ctx, bytes).await;
+                tracing::info!(
+                    community_id = ?ctx.community_id,
+                    outcome = ?outcome,
+                    "ZEB366diag: incoming state-root publish outcome"
+                );
                 if let Some(err) = outcome.error() {
                     tracing::warn!(
                         community_id = ?ctx.community_id,
@@ -2605,6 +2610,12 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     //    despite the encrypted flag. Registration completes before the state-
     //    root envelope announcing root_cid is published below, so no peer can
     //    request the CID before it is allowlisted.
+    tracing::info!(
+        community_id = ?ctx.community_id,
+        ?root_cid,
+        epoch = ?current_epoch,
+        "ZEB366diag: publish_root_now putting+allowlisting community root + about to announce it"
+    );
     ctx.content_store
         .put_serveable(root_cid, blob_ciphertext)
         .await?;
@@ -3133,14 +3144,27 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    failure — the publish carries a CID we couldn't resolve in
     //    time; CRDT eventual consistency lets the next state-root from
     //    any peer recover.
+    tracing::info!(
+        community_id = ?ctx.community_id,
+        root_cid = ?payload.root_cid,
+        publisher = ?payload.publisher_addr,
+        "ZEB366diag: handle_incoming_publish fetching root_cid from CAS (local-then-remote)"
+    );
     let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
-        Ok(Some(b)) => b,
+        Ok(Some(b)) => {
+            tracing::info!(root_cid = ?payload.root_cid, len = b.len(), "ZEB366diag: root_cid fetch OK");
+            b
+        }
         Ok(None) => {
+            tracing::warn!(root_cid = ?payload.root_cid, "ZEB366diag: root_cid fetch returned None (BlobNotFound) - remote serve gave no data");
             return IncomingOutcome::ErrPreMutation(CommunitySyncError::BlobNotFound {
                 cid: payload.root_cid,
             });
         }
-        Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(e)),
+        Err(e) => {
+            tracing::warn!(root_cid = ?payload.root_cid, error = %e, "ZEB366diag: root_cid fetch errored");
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(e));
+        }
     };
 
     // 7. Decrypt blob (deterministic-nonce).

@@ -37109,6 +37109,30 @@ fn quit_app(app_handle: tauri::AppHandle) {
 }
 
 pub fn run() {
+    // ── ZEB-366 DIAGNOSTIC (branch zeb-366-sync-diagnostics; never merge) ──────
+    // The GUI launch path does NOT call init_tracing(), so RUST_LOG is inert and
+    // every tracing span is dropped. Install a file-writing subscriber so the
+    // cross-WAN post-join sync trace lands in a durable artifact. Appends per
+    // event (immediate flush) so the log is readable live.
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(|| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/koya-sync-debug.log")
+                    .expect("ZEB-366 diag log open")
+            })
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("harmony_app=debug,zenoh=info,iroh=warn")
+                }),
+            )
+            .try_init();
+        tracing::info!("ZEB366diag: file subscriber installed; post-join sync diagnostic active");
+    }
+    // ──────────────────────────────────────────────────────────────────────────
     tauri::Builder::default()
         // ZEB-356: single-instance MUST be registered first. On a second launch
         // its callback shows + focuses the existing window instead of spawning a

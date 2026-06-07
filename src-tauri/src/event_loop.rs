@@ -6769,21 +6769,28 @@ where
                 res = qbl.recv_async() => {
                     let Ok(query) = res else { break; };
                     let qkey = query.key_expr().to_string();
+                    tracing::info!(%qkey, "ZEB366diag: content-serve QUERY received");
                     let Some(cid) = parse_content_serve_cid(&qkey) else {
+                        tracing::info!(%qkey, "ZEB366diag: verdict=D unparseable serve key (zenoh auto-finals empty)");
                         continue;
                     };
                     if !content_cid_servable(&cid, &serve_allowlist) {
+                        tracing::info!(%qkey, encrypted = cid.flags().encrypted, "ZEB366diag: verdict=A NOT servable - encrypted CID absent from serve-allowlist (never put_serveable'd this process) -> empty final");
                         continue; // private encrypted content stays unservable
                     }
                     let Some(bytes) = (lookup)(cid).await else {
+                        tracing::info!(%qkey, "ZEB366diag: verdict=B servable (allowlisted/public) but MISSING from local CAS cache -> empty final");
                         continue;
                     };
                     if !cid.verify_hash(&bytes) {
                         tracing::warn!(%qkey, "content-serve: local bytes failed hash==cid; not serving");
                         continue;
                     }
+                    let served_len = bytes.len();
                     if let Err(e) = query.reply(query.key_expr(), bytes).await {
                         tracing::warn!(%qkey, error = %e, "content-serve reply failed");
+                    } else {
+                        tracing::info!(%qkey, len = served_len, "ZEB366diag: verdict=C HIT - replied with bytes");
                     }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {

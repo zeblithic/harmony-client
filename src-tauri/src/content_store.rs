@@ -224,9 +224,13 @@ impl ContentStore for RuntimeContentStore {
 
     async fn put_serveable(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {
         // Admit first; only record as serveable after a successful put.
+        let blob_len = blob.len();
         self.put(cid, blob).await?;
         if let Some(allowlist) = &self.serve_allowlist {
             allowlist.allow(cid);
+            tracing::info!(?cid, blob_len, "ZEB366diag: put_serveable registered CID in serve-allowlist + CAS");
+        } else {
+            tracing::warn!(?cid, "ZEB366diag: put_serveable called but serve_allowlist is None (CID put to CAS but NOT allowlisted!)");
         }
         Ok(())
     }
