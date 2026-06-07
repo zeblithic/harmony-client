@@ -1703,9 +1703,13 @@ mod tests {
         members: HashMap<OwnerAddr, Vec<(Hlc, u8)>>, // (joined_at, power)
         // For "left" semantics, store the leave HLC per author. None = still joined.
         left_at: HashMap<OwnerAddr, Hlc>,
-        // ZEB-399: author's enrolled device verifying keys (ed25519).
-        // `verify_channel_event` checks the post sig against these.
-        enrolled: HashMap<OwnerAddr, Vec<[u8; 32]>>,
+        // ZEB-399: author's enrolled device verifying keys (ed25519), each
+        // paired with the HLC it was enrolled at so `snapshot_at` resolves
+        // them AS-OF the requested time — mirroring production, where enrolled
+        // keys come from membership materialized at `at` (a key enrolled after
+        // `at` must not authorize an earlier post). `verify_channel_event`
+        // checks the post sig against the resolved-at-`at` set.
+        enrolled: HashMap<OwnerAddr, Vec<(Hlc, [u8; 32])>>,
     }
 
     #[async_trait::async_trait]
@@ -1766,7 +1770,23 @@ mod tests {
             CommunityStateSnapshot {
                 channel,
                 author_power,
-                author_enrolled_keys: self.enrolled.get(author).cloned().unwrap_or_default(),
+                author_enrolled_keys: self
+                    .enrolled
+                    .get(author)
+                    .map(|history| {
+                        // Resolve enrolled keys as-of `at`: only keys enrolled
+                        // at-or-before the event HLC count (matches production's
+                        // materialize-at-`at`).
+                        history
+                            .iter()
+                            .filter(|(hlc, _)| {
+                                (hlc.wall_ms, hlc.logical, &hlc.device_id)
+                                    <= (at.wall_ms, at.logical, &at.device_id)
+                            })
+                            .map(|(_, key)| *key)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }
         }
     }
@@ -1807,7 +1827,13 @@ mod tests {
         let mut members = HashMap::new();
         members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 100)]);
         let mut enrolled = HashMap::new();
-        enrolled.insert(alice, vec![enrolled_key_from_pub64(&alice_pub64)]);
+        enrolled.insert(
+            alice,
+            vec![(
+                fixture_hlc(60_000, "a-dev"),
+                enrolled_key_from_pub64(&alice_pub64),
+            )],
+        );
         MockState {
             channels,
             members,
@@ -1870,7 +1896,7 @@ mod tests {
         let mut members = HashMap::new();
         members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 100)]);
         let mut enrolled = HashMap::new();
-        enrolled.insert(alice, vec![device_vk]);
+        enrolled.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), device_vk)]);
         let state = MockState {
             channels,
             members,
@@ -1934,7 +1960,13 @@ mod tests {
         let mut members = HashMap::new();
         members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 100)]);
         let mut enrolled = HashMap::new();
-        enrolled.insert(alice, vec![enrolled_key_from_pub64(&alice_pub64)]);
+        enrolled.insert(
+            alice,
+            vec![(
+                fixture_hlc(60_000, "a-dev"),
+                enrolled_key_from_pub64(&alice_pub64),
+            )],
+        );
         let state = MockState {
             channels,
             members,
@@ -2029,6 +2061,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_channel_event_rejects_key_enrolled_after_event_time() {
+        // ZEB-399 time-correctness: enrolled keys are resolved AS-OF the
+        // event's HLC (production materializes membership at `at`). A device
+        // key enrolled AFTER the post's timestamp must NOT authorize that post
+        // — otherwise a key added later could retroactively validate earlier
+        // history. The author is Joined-at-`at` (power gate passes), but the
+        // enrolled set resolved at `at` is empty, so verify surfaces
+        // UnknownAuthor.
+        let (_owner_signing, alice, _alice_pub64) = fixture_identity(0xa1);
+        let device_key = ed25519_dalek::SigningKey::from_bytes(&[0x2d; 32]);
+        let device_vk = device_key.verifying_key().to_bytes();
+
+        let mut channels = HashMap::new();
+        let creator_hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: "creator".into(),
+        };
+        channels.insert(
+            fixture_channel(0x01),
+            vec![(
+                creator_hlc.clone(),
+                ChannelInfo {
+                    name: "general".into(),
+                    write_power: 0,
+                    kind: crate::community_membership::ChannelKind::Text,
+                    created_at: creator_hlc,
+                    deleted_at: None,
+                },
+            )],
+        );
+        let mut members = HashMap::new();
+        members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 100)]);
+        // Key enrolled at 200_000 — AFTER the post at 100_000.
+        let mut enrolled = HashMap::new();
+        enrolled.insert(alice, vec![(fixture_hlc(200_000, "a-dev"), device_vk)]);
+        let state = MockState {
+            channels,
+            members,
+            left_at: HashMap::new(),
+            enrolled,
+        };
+
+        let payload = ChannelPostPayload {
+            id: MessageId([0x44; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author: alice,
+            at: Hlc {
+                wall_ms: 100_000,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+            content_kind: 0,
+            body: "signed by a key enrolled later",
+            reply_to: None,
+        };
+        let event = sign_channel_event(&payload, &device_key).expect("sign");
+
+        let mut tracker = ChannelLogReplayTracker::new();
+        let err = verify_channel_event(
+            &event,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+        )
+        .await
+        .expect_err("a key enrolled after the post time must not authorize it");
+        assert!(
+            matches!(err, ChannelEventError::UnknownAuthor(_)),
+            "expected UnknownAuthor for a not-yet-enrolled key, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn verify_channel_event_rejects_bad_signature() {
         let state = fixture_state_with_alice_joined();
         let mut tracker = ChannelLogReplayTracker::new();
@@ -2102,7 +2210,13 @@ mod tests {
         let mut members = HashMap::new();
         members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 0)]);
         let mut enrolled = HashMap::new();
-        enrolled.insert(alice, vec![enrolled_key_from_pub64(&alice_pub64)]);
+        enrolled.insert(
+            alice,
+            vec![(
+                fixture_hlc(60_000, "a-dev"),
+                enrolled_key_from_pub64(&alice_pub64),
+            )],
+        );
         let state = MockState {
             channels,
             members,
@@ -2168,7 +2282,13 @@ mod tests {
         let mut members = HashMap::new();
         members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 100)]);
         let mut enrolled = HashMap::new();
-        enrolled.insert(alice, vec![enrolled_key_from_pub64(&alice_pub64)]);
+        enrolled.insert(
+            alice,
+            vec![(
+                fixture_hlc(60_000, "a-dev"),
+                enrolled_key_from_pub64(&alice_pub64),
+            )],
+        );
         let state = MockState {
             channels,
             members,
