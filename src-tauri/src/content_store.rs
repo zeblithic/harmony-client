@@ -61,6 +61,16 @@ pub enum ContentStoreError {
 pub trait ContentStore: Send + Sync {
     async fn put(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError>;
     async fn get(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError>;
+
+    /// Like `put`, but also marks `cid` serveable to peers over CAS even though
+    /// it carries the `encrypted` flag (ZEB-395 community-root sharing). The
+    /// default impl is identical to `put`; only `RuntimeContentStore` registers
+    /// the CID in its shared `CommunityServeAllowlist`. Callers use this ONLY
+    /// for content that is safe to serve to any requester who can name the CID
+    /// (community state-root ciphertext) — never for private blobs.
+    async fn put_serveable(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {
+        self.put(cid, blob).await
+    }
 }
 
 #[derive(Default)]
@@ -151,6 +161,11 @@ pub const DEFAULT_FETCH_TIMEOUT_MS: u64 = 500;
 pub struct RuntimeContentStore {
     cas_op_tx: tokio::sync::mpsc::Sender<CasOp>,
     fetch_timeout: std::time::Duration,
+    /// ZEB-395: when set, `put_serveable` records the put CID here so the
+    /// content-serve queryable will serve it despite the `encrypted` flag.
+    /// `None` for the legacy/test constructions that don't serve community
+    /// roots. Shared (Arc clone) with `event_loop::run`'s serve queryable.
+    serve_allowlist: Option<CommunityServeAllowlist>,
 }
 
 impl RuntimeContentStore {
@@ -161,7 +176,16 @@ impl RuntimeContentStore {
         Self {
             cas_op_tx,
             fetch_timeout,
+            serve_allowlist: None,
         }
+    }
+
+    /// ZEB-395: attach the shared serve-allowlist so `put_serveable` registers
+    /// community-root CIDs. Chained builder so the existing
+    /// `RuntimeContentStore::new(...)` call sites stay untouched.
+    pub fn with_serve_allowlist(mut self, allowlist: CommunityServeAllowlist) -> Self {
+        self.serve_allowlist = Some(allowlist);
+        self
     }
 }
 
@@ -195,6 +219,15 @@ impl ContentStore for RuntimeContentStore {
         reply_rx
             .await
             .map_err(|_| ContentStoreError::Io("event loop unavailable (reply)".into()))?
+    }
+
+    async fn put_serveable(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {
+        // Admit first; only record as serveable after a successful put.
+        self.put(cid, blob).await?;
+        if let Some(allowlist) = &self.serve_allowlist {
+            allowlist.allow(cid);
+        }
+        Ok(())
     }
 }
 
@@ -418,6 +451,81 @@ mod tests {
         let c = cid(42);
         a.allow(c);
         assert!(b.contains(&c), "clone shares the underlying set");
+    }
+
+    #[tokio::test]
+    async fn put_serveable_registers_cid_in_allowlist() {
+        // RuntimeContentStore.with_serve_allowlist: put_serveable admits AND records
+        // the CID; plain put admits but does NOT record.
+        let (cas_op_tx, mut cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let allowlist = CommunityServeAllowlist::new();
+        let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500))
+            .with_serve_allowlist(allowlist.clone());
+
+        // Stub receiver: ack every PutLocal reply so put()/put_serveable() return Ok.
+        let stub = tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                if let CasOp::PutLocal {
+                    reply: Some(reply), ..
+                } = op
+                {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        });
+
+        let served = ContentId::from_bytes([0x11; 32]);
+        let private = ContentId::from_bytes([0x22; 32]);
+        store.put_serveable(served, vec![1, 2, 3]).await.unwrap();
+        store.put(private, vec![4, 5, 6]).await.unwrap();
+
+        assert!(
+            allowlist.contains(&served),
+            "put_serveable registers the CID"
+        );
+        assert!(
+            !allowlist.contains(&private),
+            "plain put does NOT register the CID"
+        );
+        drop(store);
+        stub.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_serveable_default_impl_routes_to_put() {
+        // The default trait impl (InMemoryStub) routes put_serveable to put with no
+        // allowlist concept and no panic.
+        let store = InMemoryStub::default();
+        store
+            .put_serveable(ContentId::from_bytes([9; 32]), vec![7, 8])
+            .await
+            .unwrap();
+        let got = store
+            .get(&ContentId::from_bytes([9; 32]))
+            .await
+            .unwrap()
+            .expect("blob present");
+        assert_eq!(got, vec![7, 8]);
+    }
+
+    #[tokio::test]
+    async fn put_serveable_without_allowlist_is_just_put() {
+        // RuntimeContentStore with no allowlist set: put_serveable behaves like put.
+        let (cas_op_tx, mut cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500));
+        let stub = tokio::spawn(async move {
+            if let Some(CasOp::PutLocal {
+                reply: Some(reply), ..
+            }) = cas_op_rx.recv().await
+            {
+                let _ = reply.send(Ok(()));
+            }
+        });
+        store
+            .put_serveable(ContentId::from_bytes([3; 32]), vec![1])
+            .await
+            .unwrap();
+        stub.await.unwrap();
     }
 
     /// Guard the `CasOp::GetLocal` enum shape and oneshot reply plumbing.
