@@ -1507,6 +1507,12 @@
         if (status.status === 'connected') {
           await fetchOwnAddress();
           await reloadBackendState();
+          // ZEB-404: a reconnect may have missed live community-members-changed
+          // deltas while the session was down; converge the active community's
+          // roster (and, transitively, its members' profile cards).
+          if (selectedCommunityId !== null) {
+            void refreshCommunityMembers(selectedCommunityId);
+          }
           // ZEB-341: the initial get_owner_state probe can return null when the
           // owner finishes loading AFTER start_node returns; selfOwnerId would
           // then stay null and tryBootPublishCard would be a permanent no-op.
