@@ -1348,11 +1348,14 @@ pub enum VotingVerifyError {
 ///   2. Resolver returns 64-byte composite identity (X25519 || Ed25519) for actor.
 ///   3. Defense-in-depth: re-derive canonical address_hash from the resolved
 ///      bytes and compare to `event.actor.0` — catches resolver bugs, cache
-///      lookup poisoning, or malicious peer substitution. Mirrors channel-log's
-///      Step 4b binding check (`community_channel_log.rs:678-698`).
+///      lookup poisoning, or malicious peer substitution. (Voting still binds
+///      identity via the resolver; the channel-log layer dropped resolver-based
+///      binding in ZEB-399 and now authenticates posts against each author's
+///      materialized enrolled device keys instead.)
 ///   4. The Ed25519 signature on the envelope's `signing_bytes()` is verified
 ///      with `verify_strict` (RFC 8032 strict subset) against the binding-checked
-///      verifying key. Matches `community_channel_log`'s posture.
+///      verifying key. (channel-log also verifies with `verify_strict`, but
+///      against membership-enrolled keys rather than a resolver-bound key.)
 ///
 /// Eligibility is NOT checked here — apply layer handles that with the
 /// same snapshot via `check_eligibility`.
@@ -1376,8 +1379,9 @@ pub async fn verify_voting_event(
     // resolver's returned bytes and compare to the claimed actor. Catches
     // resolver bugs, cache lookup poisoning, or malicious peer
     // substitution — even a valid Ed25519 signature is rejected if the
-    // identity doesn't bind to the claimed owner. Mirrors channel-log's
-    // Step 4b binding check.
+    // identity doesn't bind to the claimed owner. (Channel-log dropped this
+    // resolver binding in ZEB-399; it now verifies against membership-enrolled
+    // device keys.)
     let identity = harmony_identity::Identity::from_public_bytes(&identity_bytes)
         .map_err(|_| VotingVerifyError::ActorAddressMismatch)?;
     if identity.address_hash != event.actor.0 {

@@ -4,14 +4,14 @@
 //!
 //! Per spec §14.2.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use harmony_app::community_channel_log::{
-    derive_channel_key, encrypt_channel_packet, ChannelIdentityResolver, ChannelLogConfig,
-    CommunityStateAtHlc, CommunityStateSnapshot, SignedChannelEvent,
+    derive_channel_key, encrypt_channel_packet, ChannelLogConfig, CommunityStateAtHlc,
+    CommunityStateSnapshot, SignedChannelEvent,
 };
 use harmony_app::community_channel_log_engine::{
     ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig, SpawnOutcome,
@@ -49,6 +49,11 @@ struct BothJoinedState {
     a: OwnerAddr,
     b: OwnerAddr,
     channel_id: ChannelId,
+    // ZEB-399: each member's enrolled device verifying key (ed25519).
+    // verify_channel_event authenticates posts against these — the
+    // membership trust root — not a DM-layer identity resolver.
+    enrolled_a: [u8; 32],
+    enrolled_b: [u8; 32],
 }
 
 #[async_trait::async_trait]
@@ -79,22 +84,18 @@ impl CommunityStateAtHlc for BothJoinedState {
         } else {
             None
         };
+        let author_enrolled_keys = if author == &self.a {
+            vec![self.enrolled_a]
+        } else if author == &self.b {
+            vec![self.enrolled_b]
+        } else {
+            vec![]
+        };
         CommunityStateSnapshot {
             channel,
             author_power,
+            author_enrolled_keys,
         }
-    }
-}
-
-/// Resolver stub: maps OwnerAddr → 64-byte identity composite.
-struct SharedResolver {
-    map: HashMap<OwnerAddr, [u8; 64]>,
-}
-
-#[async_trait::async_trait]
-impl ChannelIdentityResolver for SharedResolver {
-    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
-        self.map.get(addr).copied()
     }
 }
 
@@ -202,8 +203,8 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     let session_b = Arc::new(zenoh::open(cfg).await.expect("session B"));
 
     // ── Set up identities A + B ──────────────────────────────────────
-    let (signing_a_raw, owner_a, pub_a) = fixture_identity(0xAA);
-    let (signing_b_raw, owner_b, pub_b) = fixture_identity(0xBB);
+    let (signing_a_raw, owner_a, _pub_a) = fixture_identity(0xAA);
+    let (signing_b_raw, owner_b, _pub_b) = fixture_identity(0xBB);
     let signing_a = Arc::new(signing_a_raw);
     let signing_b = Arc::new(signing_b_raw);
 
@@ -221,22 +222,22 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     let dir_b = TempDir::new().expect("tmp B");
 
     // ── Construct stubs (verify-chain shortcuts for the test) ───────
+    let enrolled_a = signing_a.verifying_key().to_bytes();
+    let enrolled_b = signing_b.verifying_key().to_bytes();
     let state_a: Arc<dyn CommunityStateAtHlc + Send + Sync> = Arc::new(BothJoinedState {
         a: owner_a,
         b: owner_b,
         channel_id,
+        enrolled_a,
+        enrolled_b,
     });
     let state_b: Arc<dyn CommunityStateAtHlc + Send + Sync> = Arc::new(BothJoinedState {
         a: owner_a,
         b: owner_b,
         channel_id,
+        enrolled_a,
+        enrolled_b,
     });
-
-    let mut resolver_map = HashMap::new();
-    resolver_map.insert(owner_a, pub_a);
-    resolver_map.insert(owner_b, pub_b);
-    let resolver: Arc<dyn ChannelIdentityResolver + Send + Sync> =
-        Arc::new(SharedResolver { map: resolver_map });
 
     let tracker_a: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
     let tracker_b: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
@@ -316,7 +317,6 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             channel_id,
             channel_key.clone(),
             Arc::clone(&state_a),
-            Arc::clone(&resolver),
             Arc::clone(&tracker_a),
         )
         .await
@@ -331,7 +331,6 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             channel_id,
             channel_key.clone(),
             Arc::clone(&state_b),
-            Arc::clone(&resolver),
             Arc::clone(&tracker_b),
         )
         .await
@@ -440,7 +439,6 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             channel_id,
             channel_key.clone(),
             Arc::clone(&state_b),
-            Arc::clone(&resolver),
             Arc::clone(&tracker_b),
         )
         .await
