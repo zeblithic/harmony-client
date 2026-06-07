@@ -26,6 +26,10 @@ use tauri_plugin_deep_link::DeepLinkExt;
 fn production_content_policy() -> ContentPolicy {
     ContentPolicy {
         encrypted_durable_persist: true,
+        // Pinned explicitly (rather than inherited from ..default()) so the
+        // privacy invariant in the doc comment above can't silently flip if
+        // ContentPolicy::default() changes upstream.
+        encrypted_durable_announce: false,
         ..ContentPolicy::default()
     }
 }
