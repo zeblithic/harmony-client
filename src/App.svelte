@@ -889,27 +889,31 @@
     isCurrentCommunityDegraded = id != null ? communityService.isDegraded(id) : false;
   }
 
+  // ZEB-404: a monotonic token guards against out-of-order completion of
+  // concurrent same-community refreshes (the message throttle, reconnect, and
+  // community-open paths can overlap). Only the most recently ISSUED refresh
+  // applies its result, so a slower older fetch can't clobber a newer roster
+  // and re-drop a just-joined member — the very staleness this fix targets.
+  let communityMembersRefreshSeq = 0;
   async function refreshCommunityMembers(id: string) {
+    const refreshSeq = ++communityMembersRefreshSeq;
     try {
-      // ZEB-404: force-bypass the per-community member cache. An explicit
-      // refresh must return ground truth — the cache is invalidated only by
-      // the `community-members-changed` event, the very signal a missed-delta
-      // refresh exists to compensate for.
+      // Force-bypass the per-community member cache: an explicit refresh must
+      // return ground truth (the cache is invalidated only by the
+      // `community-members-changed` event, the very signal a missed-delta
+      // refresh compensates for).
       const fresh = await communityService.listCommunityMembers(id, true);
-      // Stale-response guard: if the user switched communities while
-      // we were awaiting, drop the result rather than overwriting the
-      // newly-selected community's roster with the previous one's.
-      if (selectedCommunityId !== id) return;
+      // Drop if the user switched communities, or a newer refresh superseded
+      // this one, while we were awaiting.
+      if (selectedCommunityId !== id || refreshSeq !== communityMembersRefreshSeq) return;
       communityMembers = fresh;
     } catch (e) {
       // listCommunityMembers throws when the adapter isn't connected
-      // (mock-data mode) or when the backend isn't ready. Surface the
-      // failure to the console rather than crash the app — the panel
-      // simply renders with an empty member list.
-      if (selectedCommunityId !== id) return;
+      // (mock-data mode) or the backend isn't ready. Surface the failure to
+      // the console and keep the last known-good roster rather than wiping it
+      // on a transient failure — the throttle/reconnect paths will retry.
       const msg = e instanceof Error ? e.message : String(e);
       console.warn('[harmony-client] listCommunityMembers failed:', msg);
-      communityMembers = [];
     }
   }
 
