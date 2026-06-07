@@ -281,9 +281,11 @@ follow-up if a long-lived, high-churn session ever warrants it. Noted, not done.
    live re-test proves the full membership/channel propagation. (A future
    separate-store community-sync harness is noted as a §7 follow-up.)
 
-4. **Gates:** `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets
+6. **Gates:** `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets
    --features test-fixtures -- -D warnings`, `cargo nextest run --locked -p harmony-app`
-   (lib + the touched integration tests). Frontend untouched.
+   (lib + the touched integration tests). Frontend untouched. Note: the full
+   `--all-targets` clippy is load-bearing — `--lib` clippy does NOT compile `#[cfg(test)]`
+   modules, so a lint inside a unit-test helper only surfaces under `--all-targets`.
 
 ## 7. Follow-ups (out of scope for v1)
 

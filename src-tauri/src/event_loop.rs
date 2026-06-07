@@ -6717,6 +6717,17 @@ where
 /// bytes that passed `hash==cid` (StorageTier::verify_cid), so anything `lookup`
 /// returns already verifies. We still re-check `cid.verify_hash` before replying
 /// as defense-in-depth (cheap; never serve corrupt bytes).
+///
+/// Serve-gate predicate (ZEB-395): a CID is servable iff it is unencrypted OR it
+/// is an allowlisted community-root CID. Shared by the queryable loop and its
+/// unit tests so the two can never drift.
+fn content_cid_servable(
+    cid: &ContentId,
+    serve_allowlist: &crate::content_store::CommunityServeAllowlist,
+) -> bool {
+    !cid.flags().encrypted || serve_allowlist.contains(cid)
+}
+
 #[allow(clippy::type_complexity)]
 pub async fn spawn_content_serve_queryable<F>(
     session: Arc<zenoh::Session>,
@@ -6762,7 +6773,7 @@ where
                     let Some(cid) = parse_content_serve_cid(&qkey) else {
                         continue;
                     };
-                    if cid.flags().encrypted && !serve_allowlist.contains(&cid) {
+                    if !content_cid_servable(&cid, &serve_allowlist) {
                         continue; // private encrypted content stays unservable
                     }
                     let Some(bytes) = (lookup)(cid).await else {
@@ -6855,20 +6866,17 @@ mod content_serve_parse_tests {
 
 #[cfg(test)]
 mod content_serve_gate_tests {
+    // Exercise the PRODUCTION predicate `content_cid_servable` (the same fn the
+    // queryable loop calls), so the test can never drift from the real gate.
+    use super::content_cid_servable;
     use crate::content_store::CommunityServeAllowlist;
     use harmony_content::cid::{ContentFlags, ContentId};
-
-    /// The exact predicate used in the serve loop: serve iff unencrypted OR
-    /// allowlisted. Kept in lockstep with spawn_content_serve_queryable's gate.
-    fn servable(cid: &ContentId, allowlist: &CommunityServeAllowlist) -> bool {
-        !(cid.flags().encrypted && !allowlist.contains(cid))
-    }
 
     #[test]
     fn gate_serves_unencrypted_always() {
         let cid = ContentId::for_book(b"pub", ContentFlags::default()).unwrap();
         let allow = CommunityServeAllowlist::new();
-        assert!(servable(&cid, &allow));
+        assert!(content_cid_servable(&cid, &allow));
     }
 
     #[test]
@@ -6880,11 +6888,14 @@ mod content_serve_gate_tests {
         let cid = ContentId::for_book(b"sec", enc).unwrap();
         let allow = CommunityServeAllowlist::new();
         assert!(
-            !servable(&cid, &allow),
+            !content_cid_servable(&cid, &allow),
             "encrypted + not allowlisted => refuse"
         );
         allow.allow(cid);
-        assert!(servable(&cid, &allow), "encrypted + allowlisted => serve");
+        assert!(
+            content_cid_servable(&cid, &allow),
+            "encrypted + allowlisted => serve"
+        );
     }
 }
 

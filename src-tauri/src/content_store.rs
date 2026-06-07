@@ -528,6 +528,38 @@ mod tests {
         stub.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn put_serveable_failed_put_does_not_register() {
+        // Failure contract: if the underlying put fails, `?` returns early and
+        // the CID is NEVER added to the allowlist (serving an un-admitted CID
+        // would be a dangling entry that can never be satisfied locally).
+        let (cas_op_tx, mut cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let allowlist = CommunityServeAllowlist::new();
+        let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500))
+            .with_serve_allowlist(allowlist.clone());
+
+        // Stub: reply Err to the PutLocal so put_serveable's `?` propagates.
+        let stub = tokio::spawn(async move {
+            if let Some(CasOp::PutLocal {
+                reply: Some(reply), ..
+            }) = cas_op_rx.recv().await
+            {
+                let _ = reply.send(Err(ContentStoreError::Io("admit rejected".into())));
+            }
+        });
+
+        let cid = ContentId::from_bytes([0x55; 32]);
+        let err = store.put_serveable(cid, vec![1, 2]).await.unwrap_err();
+        match err {
+            ContentStoreError::Io(msg) => assert!(msg.contains("admit rejected")),
+        }
+        assert!(
+            !allowlist.contains(&cid),
+            "a failed put must NOT register the CID as serveable"
+        );
+        stub.await.unwrap();
+    }
+
     /// Guard the `CasOp::GetLocal` enum shape and oneshot reply plumbing.
     ///
     /// This test does NOT construct a `NodeRuntime` (no cheap harness exists;
