@@ -3290,7 +3290,14 @@ pub(crate) async fn start_node_inner(
                             identity_dir: identity_dir.clone(),
                             self_owner,
                             self_device_id: device_id.clone(),
-                            signing_key: std::sync::Arc::clone(&signing_key_arc),
+                            // ZEB-399: channel posts must be signed by the
+                            // ENROLLED device key #2 (community_signing_key_arc),
+                            // NOT the Reticulum device #1 key (signing_key_arc).
+                            // verify_channel_event authenticates posts against
+                            // the author's materialized enrolled_device_keys (the
+                            // same trust root as root-publish auth), which
+                            // contains device #2 from the EnrollmentCert.
+                            signing_key: std::sync::Arc::clone(&community_signing_key_arc),
                             engine_config:
                                 crate::community_channel_log_engine::ChannelLogEngineConfig::default(
                                 ),
@@ -3453,26 +3460,16 @@ pub(crate) async fn start_node_inner(
                                             );
                                                 let state_at_hlc =
                                                     community_engine.state_at_hlc_resolver();
-                                                let resolver = match community_engine
-                                                    .identity_resolver()
-                                                {
-                                                    Some(r) => r,
-                                                    None => {
-                                                        tracing::warn!(
-                                                            community_id = %payload.community_id,
-                                                            "channel-log registry hook: \
-                                                             community engine has no identity resolver"
-                                                        );
-                                                        return;
-                                                    }
-                                                };
+                                                // ZEB-399: channel-log verify
+                                                // authenticates posts against
+                                                // materialized membership — no
+                                                // identity resolver needed.
                                                 match registry
                                                     .spawn(
                                                         cid,
                                                         chid,
                                                         key,
                                                         state_at_hlc,
-                                                        resolver,
                                                         hlc_tracker,
                                                     )
                                                     .await
@@ -3894,18 +3891,8 @@ pub(crate) async fn start_node_inner(
                             };
                             let membership_key = community_engine.membership_key();
                             let state_at_hlc = community_engine.state_at_hlc_resolver();
-                            let resolver = match community_engine.identity_resolver() {
-                                Some(r) => r,
-                                None => {
-                                    tracing::warn!(
-                                        ?space_id,
-                                        "boot reconcile: community engine has no identity \
-                                         resolver — skipping per-channel reconcile (engine \
-                                         can still receive own publishes but cannot verify peers)"
-                                    );
-                                    continue;
-                                }
-                            };
+                            // ZEB-399: channel-log verify authenticates posts
+                            // against materialized membership — no resolver.
                             let hlc_tracker_for_reconcile = std::sync::Arc::clone(&tracker);
                             if let Err(e) =
                                 std::sync::Arc::clone(&channel_log_registry_for_reconcile)
@@ -3914,7 +3901,6 @@ pub(crate) async fn start_node_inner(
                                         &materialized,
                                         &membership_key,
                                         state_at_hlc,
-                                        resolver,
                                         hlc_tracker_for_reconcile,
                                     )
                                     .await
@@ -17138,12 +17124,10 @@ mod create_community_inner_tests {
                             &chid,
                         );
                         let state_at_hlc = community_engine.state_at_hlc_resolver();
-                        let resolver = match community_engine.identity_resolver() {
-                            Some(r) => r,
-                            None => return,
-                        };
+                        // ZEB-399: channel-log verify authenticates posts
+                        // against materialized membership — no resolver.
                         let _ = registry
-                            .spawn(cid, chid, key, state_at_hlc, resolver, hlc_tracker)
+                            .spawn(cid, chid, key, state_at_hlc, hlc_tracker)
                             .await;
                     }
                 },

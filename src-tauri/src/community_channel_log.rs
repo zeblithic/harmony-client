@@ -627,20 +627,18 @@ pub struct CommunityStateSnapshot {
     /// `Some(0)` for a Joined member with no explicit power-level
     /// entry (`power_levels` defaults to 0).
     pub author_power: Option<u8>,
-}
-
-/// Identity-resolution trait. Mirrors the existing
-/// `CommunitySyncEngineConfig::identity_resolver` shape so the Phase 3
-/// engine can pass through its existing IdentityResolver impl.
-#[async_trait::async_trait]
-pub trait ChannelIdentityResolver: Send + Sync {
-    /// Resolve OwnerAddr → 64-byte identity public bytes (X25519 || Ed25519).
-    /// Same shape as `community_state_sync::IdentityResolver` so Phase 3 can
-    /// pass through the existing `OwnerDeviceCacheResolver` directly.
-    /// `verify_channel_event` re-derives `address_hash` from these bytes
-    /// and rejects if it doesn't match `event.author.0` — defends against
-    /// resolver bugs that could attribute valid signatures to wrong owners.
-    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]>;
+    /// The author's materialized enrolled device verifying keys
+    /// (ed25519, 32-byte) as of the requested HLC — the SAME
+    /// `MemberState.enrolled_device_keys` set that root-publish auth
+    /// (`community_state_sync::verify_publisher_sig`) trusts. ZEB-399:
+    /// `verify_channel_event` checks the post signature against these.
+    /// A channel post is signed by the author's enrolled device key #2,
+    /// NOT the owner identity key, so authorship is proven by community
+    /// membership — not by a DM-layer owner→identity cache that isn't
+    /// populated on a community-invite first contact (the ZEB-399 bug).
+    /// Empty for a non-member, or for a member with no materialized
+    /// enrolled key (an anomaly).
+    pub author_enrolled_keys: Vec<[u8; 32]>,
 }
 
 /// Run the §7 chain steps 3-7 on a pre-decrypted SignedChannelEvent.
@@ -655,17 +653,15 @@ pub trait ChannelIdentityResolver: Send + Sync {
 ///
 /// The chain order matches the spec — cheapest checks first to drop
 /// garbage early without expensive identity/membership lookups.
-pub async fn verify_channel_event<S, R>(
+pub async fn verify_channel_event<S>(
     event: &SignedChannelEvent,
     expected_community_id: &SpaceId,
     expected_channel_id: &ChannelId,
     state: &S,
-    resolver: &R,
     replay_tracker: &mut ChannelLogReplayTracker,
 ) -> Result<(), ChannelEventError>
 where
     S: CommunityStateAtHlc + Sync + ?Sized,
-    R: ChannelIdentityResolver + ?Sized,
 {
     let SignedChannelEvent::Post {
         community_id,
@@ -694,53 +690,23 @@ where
     // events MUST NOT bump `last_seen` or they permanently block valid
     // future events on the same (channel, author, device) lane.
     //
-    // Order trade-off: a message that's both a replay AND has an
-    // unresolvable author now returns Replay (was UnknownAuthor pre-
-    // round-4). This is fine — replay-rejection is a stronger signal
-    // than unknown-author and the cheap O(log N) BTreeMap lookup must
-    // run before any async resolver I/O.
+    // Order trade-off: a message that's both a replay AND fails author
+    // authorization now returns Replay. This is fine — replay-rejection
+    // is a stronger signal, and the cheap O(log N) BTreeMap lookup must
+    // run before the async state materialization (`snapshot_at`).
     replay_tracker.would_accept(event)?;
 
-    // Step 4: identity resolution.
-    let identity_pub = resolver
-        .resolve(author)
-        .await
-        .ok_or(ChannelEventError::UnknownAuthor(*author))?;
+    // Step 4: materialize the community state at `at` ONCE. The snapshot
+    // carries the channel-config, the author's effective power, AND the
+    // author's enrolled device keys — all from a single materialization so
+    // verify-time decisions are coherent (see the `CommunityStateAtHlc`
+    // trait doc for the torn-read failure mode this prevents).
+    let snapshot = state.snapshot_at(channel_id, author, at).await;
 
-    // Step 4b: identity-pubkey-to-author binding check. Defends against
-    // a buggy or compromised resolver that pairs an OwnerAddr with the
-    // wrong key (cache lookup bug, malicious peer substitution, etc.).
-    // Mirrors community_membership::verify_signature's defense (see
-    // its doc comment for the same threat model).
-    let identity = harmony_identity::Identity::from_public_bytes(&identity_pub)
-        .map_err(|_| ChannelEventError::AuthorPubkeyMismatch)?;
-    if identity.address_hash != author.0 {
-        return Err(ChannelEventError::AuthorPubkeyMismatch);
-    }
-
-    // Step 5: signature verify (strict — RFC 8032 strict subset, rejects
-    // non-canonical S values + small-order R points). Same posture as
-    // community_membership::verify_signature and dm_envelope verifies.
-    let canon = signed_set_canonical_cbor(event)?;
-    identity
-        .verifying_key
-        .verify_strict(&canon, &ed25519_dalek::Signature::from_bytes(sig))
-        .map_err(|_| ChannelEventError::BadSignature)?;
-
-    // Step 7: membership-at-HLC gate. Both `write_power` and the
+    // Step 5: membership-at-HLC gate. Both `write_power` and the
     // tombstone (`deleted_at`) are evaluated AS OF event.at, not as
     // of "now" — channel-config events between post-time and verify-
     // time may have raised/lowered the threshold or deleted the channel.
-    //
-    // Single `snapshot_at` call (vs the previous two-call shape) so
-    // both `channel_info` and `author_power` reflect ONE materialized
-    // state at `at`. The previous shape allowed a torn read: the
-    // production adapter re-acquired the CommunityState lock on each
-    // call, and a CRDT update landing between the two `.await` points
-    // could let the verify chain admit a post based on a state that
-    // never coexisted at one HLC. See `CommunityStateAtHlc` trait
-    // doc-comment for full rationale.
-    let snapshot = state.snapshot_at(channel_id, author, at).await;
     let channel_info = snapshot.channel.ok_or_else(|| {
         ChannelEventError::NotAuthorized(format!(
             "channel {:?} did not exist at {:?}",
@@ -765,6 +731,32 @@ where
             "author power {} < channel write_power {}",
             author_power, channel_info.write_power
         )));
+    }
+
+    // Step 6: signature verify against the author's MATERIALIZED enrolled
+    // device keys (ZEB-399). A channel post is signed by the author's
+    // enrolled device key #2 — the SAME trust root root-publish auth uses
+    // (`community_state_sync::verify_publisher_sig`). Authorship is proven
+    // by community membership, NOT by a DM-layer owner→identity cache
+    // (which isn't populated on a community-invite first contact — the
+    // ZEB-399 bug). The author was just confirmed Joined-at-`at` by the
+    // power gate; an empty enrolled set for a Joined member is an anomaly
+    // (a member always carries ≥1 enrolled key from their EnrollmentCert-
+    // bearing Join) — surface it as UnknownAuthor for a clear diagnostic.
+    if snapshot.author_enrolled_keys.is_empty() {
+        return Err(ChannelEventError::UnknownAuthor(*author));
+    }
+    // verify_strict: rejects non-canonical S + small-order R, matching
+    // community_membership::verify_signature and verify_publisher_sig.
+    let canon = signed_set_canonical_cbor(event)?;
+    let parsed_sig = ed25519_dalek::Signature::from_bytes(sig);
+    let sig_ok = snapshot.author_enrolled_keys.iter().any(|key_bytes| {
+        ed25519_dalek::VerifyingKey::from_bytes(key_bytes)
+            .map(|vk| vk.verify_strict(&canon, &parsed_sig).is_ok())
+            .unwrap_or(false)
+    });
+    if !sig_ok {
+        return Err(ChannelEventError::BadSignature);
     }
 
     // Step 8: now that authorization succeeded, commit the tracker
@@ -1711,6 +1703,9 @@ mod tests {
         members: HashMap<OwnerAddr, Vec<(Hlc, u8)>>, // (joined_at, power)
         // For "left" semantics, store the leave HLC per author. None = still joined.
         left_at: HashMap<OwnerAddr, Hlc>,
+        // ZEB-399: author's enrolled device verifying keys (ed25519).
+        // `verify_channel_event` checks the post sig against these.
+        enrolled: HashMap<OwnerAddr, Vec<[u8; 32]>>,
     }
 
     #[async_trait::async_trait]
@@ -1771,26 +1766,24 @@ mod tests {
             CommunityStateSnapshot {
                 channel,
                 author_power,
+                author_enrolled_keys: self.enrolled.get(author).cloned().unwrap_or_default(),
             }
         }
     }
 
-    struct MockResolver {
-        entries: HashMap<OwnerAddr, [u8; 64]>,
+    /// ZEB-399: the author's enrolled device verifying key is the ed25519
+    /// half of the 64-byte identity composite (`fixture_signed_event` signs
+    /// with `fixture_identity(seed).0`, whose verifying key == pub64[32..]).
+    fn enrolled_key_from_pub64(pub64: &[u8; 64]) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&pub64[32..64]);
+        k
     }
 
-    #[async_trait::async_trait]
-    impl ChannelIdentityResolver for MockResolver {
-        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
-            self.entries.get(addr).copied()
-        }
-    }
-
-    fn fixture_state_with_alice_joined() -> (MockState, MockResolver) {
-        // Use fixture_identity so the resolver-returned 64-byte
-        // composite's address_hash matches the OwnerAddr used in the
-        // members map and event author. Required for the verify chain
-        // binding check (Step 4b in verify_channel_event).
+    fn fixture_state_with_alice_joined() -> MockState {
+        // Use fixture_identity so the author OwnerAddr in the members map
+        // matches the event author, and the enrolled key matches the
+        // signing key fixture_signed_event uses.
         let (_signing, alice, alice_pub64) = fixture_identity(0xa1);
         let mut channels = HashMap::new();
         let creator_hlc = Hlc {
@@ -1813,20 +1806,19 @@ mod tests {
         );
         let mut members = HashMap::new();
         members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 100)]);
-        let state = MockState {
+        let mut enrolled = HashMap::new();
+        enrolled.insert(alice, vec![enrolled_key_from_pub64(&alice_pub64)]);
+        MockState {
             channels,
             members,
             left_at: HashMap::new(),
-        };
-        let mut entries = HashMap::new();
-        entries.insert(alice, alice_pub64);
-        let resolver = MockResolver { entries };
-        (state, resolver)
+            enrolled,
+        }
     }
 
     #[tokio::test]
     async fn verify_channel_event_happy_path() {
-        let (state, resolver) = fixture_state_with_alice_joined();
+        let state = fixture_state_with_alice_joined();
         let mut tracker = ChannelLogReplayTracker::new();
         let event = fixture_signed_event(100_000, 0, "a-dev");
         verify_channel_event(
@@ -1834,7 +1826,6 @@ mod tests {
             &fixture_community(0xc0),
             &fixture_channel(0x01),
             &state,
-            &resolver,
             &mut tracker,
         )
         .await
@@ -1842,8 +1833,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_channel_event_accepts_post_signed_by_enrolled_device_key() {
+        // ZEB-399 regression anchor. A channel post is signed by the
+        // author's enrolled DEVICE key (device #2), which is DISTINCT from
+        // the owner identity key. The author field is the OwnerAddr, but
+        // the signing key is the device key — exactly the production shape
+        // the old owner-identity resolver could NOT validate (it bound the
+        // resolved 64-byte identity's address_hash to the author and
+        // verified against the owner identity key). Verify must accept
+        // because the device key is in the materialized enrolled_device_keys.
+        let (_owner_signing, alice, _alice_pub64) = fixture_identity(0xa1);
+        // A distinct device key (≠ alice's identity key) — stands in for
+        // the enrolled device key #2.
+        let device_key = ed25519_dalek::SigningKey::from_bytes(&[0x2d; 32]);
+        let device_vk = device_key.verifying_key().to_bytes();
+
+        let mut channels = HashMap::new();
+        let creator_hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: "creator".into(),
+        };
+        channels.insert(
+            fixture_channel(0x01),
+            vec![(
+                creator_hlc.clone(),
+                ChannelInfo {
+                    name: "general".into(),
+                    write_power: 0,
+                    kind: crate::community_membership::ChannelKind::Text,
+                    created_at: creator_hlc,
+                    deleted_at: None,
+                },
+            )],
+        );
+        let mut members = HashMap::new();
+        members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 100)]);
+        let mut enrolled = HashMap::new();
+        enrolled.insert(alice, vec![device_vk]);
+        let state = MockState {
+            channels,
+            members,
+            left_at: HashMap::new(),
+            enrolled,
+        };
+
+        // Post authored by alice (owner addr) but signed by the device key.
+        let payload = ChannelPostPayload {
+            id: MessageId([0x22; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author: alice,
+            at: Hlc {
+                wall_ms: 100_000,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+            content_kind: 0,
+            body: "hello from device key",
+            reply_to: None,
+        };
+        let event = sign_channel_event(&payload, &device_key).expect("sign");
+
+        let mut tracker = ChannelLogReplayTracker::new();
+        verify_channel_event(
+            &event,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+        )
+        .await
+        .expect("post signed by enrolled device key must verify");
+    }
+
+    #[tokio::test]
+    async fn verify_channel_event_rejects_post_signed_by_non_enrolled_key() {
+        // ZEB-399: a member's enrolled set is the authority. A post signed
+        // by a key NOT in enrolled_device_keys must reject as BadSignature.
+        let (_owner_signing, alice, alice_pub64) = fixture_identity(0xa1);
+        let mut channels = HashMap::new();
+        let creator_hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: "creator".into(),
+        };
+        channels.insert(
+            fixture_channel(0x01),
+            vec![(
+                creator_hlc.clone(),
+                ChannelInfo {
+                    name: "general".into(),
+                    write_power: 0,
+                    kind: crate::community_membership::ChannelKind::Text,
+                    created_at: creator_hlc,
+                    deleted_at: None,
+                },
+            )],
+        );
+        let mut members = HashMap::new();
+        members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 100)]);
+        let mut enrolled = HashMap::new();
+        enrolled.insert(alice, vec![enrolled_key_from_pub64(&alice_pub64)]);
+        let state = MockState {
+            channels,
+            members,
+            left_at: HashMap::new(),
+            enrolled,
+        };
+
+        // Sign with an imposter key NOT in alice's enrolled set.
+        let imposter = ed25519_dalek::SigningKey::from_bytes(&[0x99; 32]);
+        let payload = ChannelPostPayload {
+            id: MessageId([0x33; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author: alice,
+            at: Hlc {
+                wall_ms: 100_000,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+            content_kind: 0,
+            body: "imposter",
+            reply_to: None,
+        };
+        let event = sign_channel_event(&payload, &imposter).expect("sign");
+
+        let mut tracker = ChannelLogReplayTracker::new();
+        let err = verify_channel_event(
+            &event,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+        )
+        .await
+        .expect_err("post signed by a non-enrolled key must reject");
+        assert!(matches!(err, ChannelEventError::BadSignature));
+    }
+
+    #[tokio::test]
     async fn verify_channel_event_rejects_misroute_community() {
-        let (state, resolver) = fixture_state_with_alice_joined();
+        let state = fixture_state_with_alice_joined();
         let mut tracker = ChannelLogReplayTracker::new();
         let event = fixture_signed_event(100_000, 0, "a-dev");
         let err = verify_channel_event(
@@ -1851,7 +1983,6 @@ mod tests {
             &fixture_community(0xff),
             &fixture_channel(0x01),
             &state,
-            &resolver,
             &mut tracker,
         )
         .await
@@ -1861,7 +1992,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_channel_event_rejects_misroute_channel() {
-        let (state, resolver) = fixture_state_with_alice_joined();
+        let state = fixture_state_with_alice_joined();
         let mut tracker = ChannelLogReplayTracker::new();
         let event = fixture_signed_event(100_000, 0, "a-dev");
         let err = verify_channel_event(
@@ -1869,7 +2000,6 @@ mod tests {
             &fixture_community(0xc0),
             &fixture_channel(0xff),
             &state,
-            &resolver,
             &mut tracker,
         )
         .await
@@ -1879,11 +2009,11 @@ mod tests {
 
     #[tokio::test]
     async fn verify_channel_event_rejects_unknown_author() {
-        let (state, _) = fixture_state_with_alice_joined();
-        // Empty resolver — author won't resolve.
-        let resolver = MockResolver {
-            entries: HashMap::new(),
-        };
+        // ZEB-399: author is Joined (passes the power gate) but has no
+        // materialized enrolled device key — verify can't authenticate
+        // the post and surfaces UnknownAuthor.
+        let mut state = fixture_state_with_alice_joined();
+        state.enrolled.clear();
         let mut tracker = ChannelLogReplayTracker::new();
         let event = fixture_signed_event(100_000, 0, "a-dev");
         let err = verify_channel_event(
@@ -1891,17 +2021,16 @@ mod tests {
             &fixture_community(0xc0),
             &fixture_channel(0x01),
             &state,
-            &resolver,
             &mut tracker,
         )
         .await
-        .expect_err("unresolvable author must reject");
+        .expect_err("author with no enrolled key must reject");
         assert!(matches!(err, ChannelEventError::UnknownAuthor(_)));
     }
 
     #[tokio::test]
     async fn verify_channel_event_rejects_bad_signature() {
-        let (state, resolver) = fixture_state_with_alice_joined();
+        let state = fixture_state_with_alice_joined();
         let mut tracker = ChannelLogReplayTracker::new();
         let mut event = fixture_signed_event(100_000, 0, "a-dev");
         // Flip a byte in the signature. Only one variant currently —
@@ -1913,7 +2042,6 @@ mod tests {
             &fixture_community(0xc0),
             &fixture_channel(0x01),
             &state,
-            &resolver,
             &mut tracker,
         )
         .await
@@ -1923,7 +2051,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_channel_event_rejects_replay() {
-        let (state, resolver) = fixture_state_with_alice_joined();
+        let state = fixture_state_with_alice_joined();
         let mut tracker = ChannelLogReplayTracker::new();
         let event = fixture_signed_event(100_000, 0, "a-dev");
         verify_channel_event(
@@ -1931,7 +2059,6 @@ mod tests {
             &fixture_community(0xc0),
             &fixture_channel(0x01),
             &state,
-            &resolver,
             &mut tracker,
         )
         .await
@@ -1941,7 +2068,6 @@ mod tests {
             &fixture_community(0xc0),
             &fixture_channel(0x01),
             &state,
-            &resolver,
             &mut tracker,
         )
         .await
@@ -1975,14 +2101,14 @@ mod tests {
         );
         let mut members = HashMap::new();
         members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 0)]);
+        let mut enrolled = HashMap::new();
+        enrolled.insert(alice, vec![enrolled_key_from_pub64(&alice_pub64)]);
         let state = MockState {
             channels,
             members,
             left_at: HashMap::new(),
+            enrolled,
         };
-        let mut entries = HashMap::new();
-        entries.insert(alice, alice_pub64);
-        let resolver = MockResolver { entries };
         let mut tracker = ChannelLogReplayTracker::new();
         let event = fixture_signed_event(100_000, 0, "a-dev");
         let err = verify_channel_event(
@@ -1990,7 +2116,6 @@ mod tests {
             &fixture_community(0xc0),
             &fixture_channel(0x01),
             &state,
-            &resolver,
             &mut tracker,
         )
         .await
@@ -2042,14 +2167,14 @@ mod tests {
         );
         let mut members = HashMap::new();
         members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 100)]);
+        let mut enrolled = HashMap::new();
+        enrolled.insert(alice, vec![enrolled_key_from_pub64(&alice_pub64)]);
         let state = MockState {
             channels,
             members,
             left_at: HashMap::new(),
+            enrolled,
         };
-        let mut entries = HashMap::new();
-        entries.insert(alice, alice_pub64);
-        let resolver = MockResolver { entries };
         let mut tracker = ChannelLogReplayTracker::new();
         // Post at wall=100_000 — after delete (80_000).
         let event = fixture_signed_event(100_000, 0, "a-dev");
@@ -2058,7 +2183,6 @@ mod tests {
             &fixture_community(0xc0),
             &fixture_channel(0x01),
             &state,
-            &resolver,
             &mut tracker,
         )
         .await
@@ -2083,16 +2207,11 @@ mod tests {
 
     #[tokio::test]
     async fn verify_channel_event_chain_returns_earliest_failure() {
-        // Construct a request that fails:
+        // Construct a request that fails multiple checks at once:
         //   - Step 3  (misroute) — wrong community_id passed to verify
         //   - Step 3b (replay)   — pre-bumped tracker
-        //   - Step 4  (unknown author) — empty resolver
-        // The chain runs cheapest-first; expect Misroute (step 3) to win,
-        // not Replay or UnknownAuthor.
-        let (state, _) = fixture_state_with_alice_joined();
-        let resolver = MockResolver {
-            entries: HashMap::new(),
-        };
+        // The chain runs cheapest-first; expect Misroute (step 3) to win.
+        let state = fixture_state_with_alice_joined();
         let mut tracker = ChannelLogReplayTracker::new();
         let event = fixture_signed_event(100_000, 0, "a-dev");
         // Pre-bump the tracker so step 3b would fail too.
@@ -2102,7 +2221,6 @@ mod tests {
             &fixture_community(0xff), // wrong — triggers step 3
             &fixture_channel(0x01),
             &state,
-            &resolver,
             &mut tracker,
         )
         .await
@@ -2115,15 +2233,11 @@ mod tests {
 
     #[tokio::test]
     async fn verify_channel_event_chain_replay_check_runs_before_identity_resolve() {
-        // Round 4 fix: would_accept (cheap sync) must run BEFORE
-        // identity resolve (async I/O) to honor cheapest-first
-        // ordering. An event that's BOTH a replay AND has an
-        // unresolvable author should now return Replay, not
-        // UnknownAuthor.
-        let (state, _) = fixture_state_with_alice_joined();
-        let resolver = MockResolver {
-            entries: HashMap::new(), // empty — author won't resolve
-        };
+        // would_accept (cheap sync) must run BEFORE the async state
+        // materialization (snapshot_at) to honor cheapest-first ordering.
+        // A pre-bumped tracker makes step 3b fire first regardless of the
+        // downstream membership/signature checks.
+        let state = fixture_state_with_alice_joined();
         let mut tracker = ChannelLogReplayTracker::new();
         let event = fixture_signed_event(100_000, 0, "a-dev");
         // Pre-bump the tracker so step 3b would_accept fails.
@@ -2133,14 +2247,13 @@ mod tests {
             &fixture_community(0xc0),
             &fixture_channel(0x01),
             &state,
-            &resolver,
             &mut tracker,
         )
         .await
         .expect_err("must reject");
         assert!(
             matches!(err, ChannelEventError::Replay { .. }),
-            "Replay (cheap sync step 3b) must win over UnknownAuthor (async step 4); got {err:?}"
+            "Replay (cheap sync step 3b) must win over the async snapshot checks; got {err:?}"
         );
     }
 
