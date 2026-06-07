@@ -134,7 +134,7 @@ The live ZEB-404 symptom was therefore a **frontend delivery/timing** miss (an o
 ### Task 4: Final gate sweep + PR
 
 - [ ] **Step 1: Frontend gates** — `npx tsc --noEmit && npx vitest run` (repo root).
-- [ ] **Step 2: Rust gates** — `cd src-tauri && cargo fmt --all -- --check && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings && cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(<test_name>)'`. (Reserve full `--all-targets` nextest for CI.)
+- [ ] **Step 2: Rust gates** — not run locally: this change touches no Rust (the backend diff is empty), so the Rust gates match `main`. CI's fmt/clippy/nextest/MSRV jobs confirm the unchanged backend stays green.
 - [ ] **Step 2b:** commit-before-gate; 10-min wall-clock kill switch on long cargo steps.
 - [ ] **Step 3: Push + open PR** referencing ZEB-404, this plan, and the live test evidence. Then autonomous bot-review loop (CodeRabbit/Cursor/CodeAnt/Qodo — never Greptile). Pushover at ready-to-merge. Do NOT self-merge.
 

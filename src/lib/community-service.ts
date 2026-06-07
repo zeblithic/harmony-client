@@ -344,9 +344,24 @@ export class CommunityService {
     this.selectedChannelByCommunity.set(communityId, channelId);
   }
 
-  async listCommunityMembers(communityId: string): Promise<CommunityMember[]> {
-    const cached = this.memberCache.get(communityId);
-    if (cached) return cached;
+  /**
+   * Fetch a community's members. Returns the per-community in-memory cache
+   * when present and `forceRefresh` is false.
+   *
+   * ZEB-404: explicit live-refresh triggers (a peer joined / reconnect) pass
+   * `forceRefresh: true` so they bypass a roster the cache may be holding
+   * stale — the cache is otherwise invalidated only by the
+   * `community-members-changed` event, the very event those triggers exist to
+   * compensate for when it isn't delivered.
+   */
+  async listCommunityMembers(
+    communityId: string,
+    forceRefresh = false,
+  ): Promise<CommunityMember[]> {
+    if (!forceRefresh) {
+      const cached = this.memberCache.get(communityId);
+      if (cached) return cached;
+    }
     const dtos = await this.invoke<MemberInfoDto[]>('list_community_members', { communityId });
     const fresh = dtos.map(dtoToMember);
     this.memberCache.set(communityId, fresh);

@@ -178,6 +178,20 @@ describe('CommunityService', () => {
     expect(adapter.invoke).toHaveBeenCalledTimes(1);
   });
 
+  it('listCommunityMembers forceRefresh bypasses the cache (ZEB-404)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue([]);
+
+    await service.listCommunityMembers('aabbccdd'); // populates cache
+    expect(adapter.invoke).toHaveBeenCalledTimes(1);
+
+    await service.listCommunityMembers('aabbccdd'); // cache hit, no IPC
+    expect(adapter.invoke).toHaveBeenCalledTimes(1);
+
+    await service.listCommunityMembers('aabbccdd', true); // forced → re-fetch
+    expect(adapter.invoke).toHaveBeenCalledTimes(2);
+  });
+
   it('community-members-changed for a community invalidates its cache', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue([]);

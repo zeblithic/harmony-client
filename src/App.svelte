@@ -844,6 +844,11 @@
   let sharedInProfileByCommunity = $state<Map<string, boolean>>(new Map());
   let selectedCommunityId = $state<string | null>(null);
   let communityMembers = $state<CommunityMember[]>([]);
+  // ZEB-404: authors we've already triggered a roster refetch for in the
+  // current community session. Bounds the message-driven refresh so a backfill
+  // — or a departed member's old posts (who never become 'joined') — can't
+  // spin repeated fetches. Cleared on community switch (changeSelectedCommunity).
+  let rosterRefetchTriedAuthors = new Set<string>();
   let myAddress = $state('');
   // Local mirror of communityService.isDegraded(selectedCommunityId).
   // Direct method calls in the template aren't reactive — we need a
@@ -871,6 +876,8 @@
   function changeSelectedCommunity(id: string | null) {
     if (selectedCommunityId !== id) {
       communityMembers = [];
+      // ZEB-404: new community session → reset the per-author refetch dedupe.
+      rosterRefetchTriedAuthors.clear();
     }
     // ZEB-334 (Cursor PR #180): selecting a real community leaves the Notes
     // space, so the nav highlights the community and the feed shows it. Passing
@@ -883,7 +890,11 @@
 
   async function refreshCommunityMembers(id: string) {
     try {
-      const fresh = await communityService.listCommunityMembers(id);
+      // ZEB-404: force-bypass the per-community member cache. An explicit
+      // refresh must return ground truth — the cache is invalidated only by
+      // the `community-members-changed` event, the very signal a missed-delta
+      // refresh exists to compensate for.
+      const fresh = await communityService.listCommunityMembers(id, true);
       // Stale-response guard: if the user switched communities while
       // we were awaiting, drop the result rather than overwriting the
       // newly-selected community's roster with the previous one's.
@@ -1247,20 +1258,28 @@
   // ZEB-404: a channel message from an author not in our roster means we
   // missed a live `community-members-changed` delta — the joiner announced
   // themselves by speaking. Re-fetch the roster (which also re-subscribes the
-  // joiner's profile card, so their nickname resolves). Coalesce bursts so a
-  // backfill of many unknown-author messages triggers a single fetch.
+  // joiner's profile card, so their nickname resolves). Coalesce bursts; the
+  // fetch targets whichever community is selected when the timer FIRES, so a
+  // mid-window community switch can't drop the active community's refresh.
   let rosterRefetchTimer: ReturnType<typeof setTimeout> | null = null;
-  function scheduleRosterRefetch(id: string) {
+  function scheduleRosterRefetch() {
     if (rosterRefetchTimer !== null) return;
     rosterRefetchTimer = setTimeout(() => {
       rosterRefetchTimer = null;
-      if (selectedCommunityId === id) void refreshCommunityMembers(id);
+      const id = selectedCommunityId;
+      if (id !== null) void refreshCommunityMembers(id);
     }, 400);
   }
   channelMessageService.onMessage = (communityId, _channelId, message) => {
     if (communityId !== selectedCommunityId) return;
     if (rosterHasJoinedAuthor(communityMembers, message.author)) return;
-    scheduleRosterRefetch(communityId);
+    // Dedupe per author so a backfill (or a departed member's old posts, who
+    // never become 'joined') triggers at most one fetch each per community
+    // session — the set is cleared on community switch.
+    const author = message.author.toLowerCase();
+    if (rosterRefetchTriedAuthors.has(author)) return;
+    rosterRefetchTriedAuthors.add(author);
+    scheduleRosterRefetch();
   };
 
   // Keep the display name on both services in sync with profile edits.
