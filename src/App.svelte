@@ -91,11 +91,24 @@
   import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
   import FeedbackModal from './lib/components/FeedbackModal.svelte';
   import AboutModal from './lib/components/AboutModal.svelte';
+  import {
+    loadMediaPanelOpen,
+    saveMediaPanelOpen,
+    loadMediaPanelWidth,
+    saveMediaPanelWidth,
+  } from './lib/media-panel-prefs';
 
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
   let showSettings = $state(false);
   let appMode = $state<AppMode>('messages');
+
+  // ZEB-405 (WS-C): user-controlled reveal + width of the messages-mode media
+  // panel. Collapsed by default (opt-in). Bound into <Layout>, persisted here.
+  let mediaPanelOpen = $state(loadMediaPanelOpen());
+  let mediaPanelWidth = $state(loadMediaPanelWidth());
+  $effect(() => { saveMediaPanelOpen(mediaPanelOpen); });
+  $effect(() => { saveMediaPanelWidth(mediaPanelWidth); });
 
   let myProfile = $state(loadProfile());
 
@@ -2460,7 +2473,7 @@
 
 <BackupStalenessWarning onExportRequested={handleExportRequested} />
 
-<Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null}>
+<Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null} bind:mediaPanelOpen bind:mediaPanelWidth>
   {#snippet nav()}
     <div class="nav-with-dm-create">
       <NavPanel
