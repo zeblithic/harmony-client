@@ -81,6 +81,12 @@ fn payload_for(ep: &IrohEndpoint, announced_at_ms: u64) -> ReachabilityAnnounceP
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// ZEB-402: real-iroh dial completion is subject to live network timing and
+// flakes in CI even with warm_up_iroh_global_init + a 60s outer / 20s inner
+// timeout guard. Ignored from the blocking gate until it's made deterministic
+// (loopback transport seam) or moved to the non-blocking large-tests lane.
+// Still runnable locally with `--ignored`.
+#[ignore = "ZEB-402: real-iroh dial flakes in CI; make deterministic or move to non-blocking lane"]
 async fn mid_session_dial_connects_to_a_peer_learned_after_open() {
     // ZEB-347: prime the one-time process-global iroh bind init before the
     // asserted timeout (see `iroh_endpoint::warm_up_iroh_global_init`).
