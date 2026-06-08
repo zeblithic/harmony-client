@@ -39877,7 +39877,8 @@ mod channel_message_ipc_tests {
         let state = app.state::<StdMutex<NodeState>>();
         let got: Result<Vec<u8>, String> = fetch_avatar("nothex!!".to_string(), state).await;
         assert!(
-            got.as_ref().is_err_and(|e: &String| e.contains("invalid CID hex")),
+            got.as_ref()
+                .is_err_and(|e: &String| e.contains("invalid CID hex")),
             "expected invalid-hex rejection, got {got:?}"
         );
     }
