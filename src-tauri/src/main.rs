@@ -202,10 +202,12 @@ fn main() {
 }
 
 fn init_tracing() {
-    tracing_subscriber::fmt()
+    // try_init (not init) so a second subscriber install never panics; the GUI
+    // path (lib.rs run()) installs its own via app_tracing. ZEB-379.
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .init();
+        .try_init();
 }

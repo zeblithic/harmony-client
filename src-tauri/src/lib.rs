@@ -107,6 +107,7 @@ mod zeb398_content_policy_tests {
     }
 }
 
+mod app_tracing;
 pub mod backup_state;
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
@@ -37193,6 +37194,10 @@ fn quit_app(app_handle: tauri::AppHandle) {
 }
 
 pub fn run() {
+    // ZEB-379: install the tracing subscriber before anything else so RUST_LOG
+    // works in the desktop app and early-boot spans land in the log file.
+    app_tracing::init_app_tracing();
+
     tauri::Builder::default()
         // ZEB-356: single-instance MUST be registered first. On a second launch
         // its callback shows + focuses the existing window instead of spawning a
