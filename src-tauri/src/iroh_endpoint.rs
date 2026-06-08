@@ -38,7 +38,6 @@ use std::net::SocketAddr;
 
 use iroh::endpoint::{presets, Endpoint};
 use iroh::{EndpointId, RelayUrl, SecretKey};
-use zeroize::Zeroizing;
 
 /// ALPN registry for harmony-on-iroh sub-protocols. Constants are
 /// referenced by both the endpoint binder (server-side `accept`) and
@@ -84,8 +83,10 @@ pub enum IrohEndpointError {
         #[source]
         source: keyring::Error,
     },
-    #[error("keychain entry harmony.client/iroh.secret_key length is {len} bytes, expected 32")]
-    KeychainBadLength { len: usize },
+    /// ZEB-363: failure folding the iroh key into the single keychain vault
+    /// (covers the bad-length case the accessor validates internally).
+    #[error("secret vault: {context}")]
+    Vault { context: String },
 }
 
 impl IrohEndpoint {
@@ -221,42 +222,21 @@ impl IrohEndpoint {
 /// confirming the welcome modal fires) until a mock-keyring abstraction
 /// is introduced.
 pub fn load_or_create_secret_key() -> Result<(SecretKey, bool), IrohEndpointError> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| {
+    // ZEB-363: the iroh key is consolidated into the single `harmony`/`identity`
+    // keychain vault item rather than its own `harmony.client`/`iroh.secret_key`
+    // item. `vault_app_key_or_create` folds in (and deletes) any pre-existing
+    // legacy item — preserving the EndpointId — and otherwise generates a fresh
+    // key, all within the one item so macOS prompts for keychain access once.
+    let legacy = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| {
         IrohEndpointError::Keychain {
-            context: format!("entry creation {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
+            context: format!("legacy entry creation {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
             source: e,
         }
     })?;
-    match entry.get_secret() {
-        Ok(bytes) => {
-            // Wrap the keychain payload in Zeroizing so the heap copy is
-            // wiped on drop — see identity.rs for the canonical pattern.
-            let bytes = Zeroizing::new(bytes);
-            if bytes.len() != 32 {
-                return Err(IrohEndpointError::KeychainBadLength { len: bytes.len() });
-            }
-            let mut arr: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
-            arr.copy_from_slice(&bytes);
-            Ok((SecretKey::from_bytes(&arr), false))
-        }
-        Err(keyring::Error::NoEntry) => {
-            let key = SecretKey::generate();
-            // Snapshot the secret bytes in a Zeroizing buffer so any
-            // intermediate stack copy is wiped after the keychain write.
-            let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(key.to_bytes());
-            entry
-                .set_secret(key_bytes.as_ref())
-                .map_err(|e| IrohEndpointError::Keychain {
-                    context: format!("keychain write {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
-                    source: e,
-                })?;
-            Ok((key, true))
-        }
-        Err(e) => Err(IrohEndpointError::Keychain {
-            context: format!("keychain read {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
-            source: e,
-        }),
-    }
+    let (key_bytes, freshly_created) =
+        crate::identity::vault_app_key_or_create(crate::identity::VaultSlot::Iroh, &legacy)
+            .map_err(|context| IrohEndpointError::Vault { context })?;
+    Ok((SecretKey::from_bytes(&key_bytes), freshly_created))
 }
 
 /// ZEB-347: prime the one-time, process-global initialization that the

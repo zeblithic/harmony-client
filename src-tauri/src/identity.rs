@@ -420,7 +420,7 @@ const VAULT_VERSION: u8 = 1;
 /// comparisons (migration read-back verification) compare fields explicitly.
 #[derive(Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
-struct SecretVault {
+pub(crate) struct SecretVault {
     /// Structure version — see [`VAULT_VERSION`].
     version: u8,
     /// Identity master seed (recovery root); sub-keys derive from this.
@@ -971,7 +971,7 @@ fn read_legacy_key_or_create_persisting(
 /// `save_vault` are the primary surface; the seed-level `load` / `save` are
 /// convenience wrappers over them (read/write only the `seed` field) used by the
 /// existing seed-resolution machinery, which is otherwise unchanged.
-pub trait KeyStore {
+pub(crate) trait KeyStore {
     /// Load the full secret vault. Returns `Ok(None)` if no entry exists.
     fn load_vault(&self) -> Result<Option<SecretVault>, String>;
     /// Save the full secret vault (overwriting any existing item).
