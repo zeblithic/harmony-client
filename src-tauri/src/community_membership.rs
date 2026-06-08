@@ -1225,7 +1225,7 @@ pub fn enrolled_key_from_cert(
         .enrollment
         .as_ref()
         .ok_or(VerifyError::MissingEnrollmentCert)?;
-    cert.verify()
+    cert.verify(event.at.wall_ms)
         .map_err(|_| VerifyError::EnrollmentCertInvalid)?;
     // Reject non-Master issuers: the community path cannot fully verify Quorum
     // signatures, and cert.verify() only structurally-checks them (spec §10).
@@ -1467,7 +1467,7 @@ pub fn mint_test_owner(seed: u8) -> TestOwner {
         None,
     )
     .expect("sign_master");
-    cert.verify().expect("self-minted cert verifies");
+    cert.verify(0).expect("self-minted cert verifies");
     TestOwner {
         owner: OwnerAddr(owner_id),
         device_key: device_sk,
