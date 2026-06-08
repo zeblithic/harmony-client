@@ -611,18 +611,6 @@ impl NetworkHealthService {
     pub async fn cached_last_self_test(&self) -> Option<SelfTestReport> {
         self.last_self_test.read().await.clone()
     }
-
-    /// ZEB-329 Phase 1 helper: cache a report into `last_self_test`
-    /// from outside the module (used by the Phase-1 synthetic IPC stub
-    /// in lib.rs). Production `run_self_test` already writes to
-    /// `last_self_test` internally — this is only for the Phase-1
-    /// stub where the IPC bypasses `run_self_test` entirely.
-    ///
-    /// TODO(zeb-329-followup): remove this method once Task 7's IPC
-    /// synthetic path is replaced with the real `run_self_test` call.
-    pub async fn cache_synthetic_self_test(&self, report: SelfTestReport) {
-        *self.last_self_test.write().await = Some(report);
-    }
 }
 
 /// Spec §5.4: server-side redaction is the only path that emits
@@ -972,26 +960,22 @@ pub async fn ping_peer(
 /// Trait extension for self-test operations (spec §5.3). Production
 /// impl lives in lib.rs boot wiring; tests use fakes.
 pub trait IrohSelfTest: Send + Sync {
-    /// True if `Endpoint::is_bound()` (or equivalent). Phase 1
-    /// approximation: any `iroh_node_id_hex()` returning `Some`.
+    /// True if the iroh endpoint is bound (Phase 1: any endpoint present).
     fn endpoint_bound(&self) -> bool;
-    /// Round-trip ping to home relay. Returns the RTT or Err string.
-    /// Bounded reason strings per spec §6.2.
-    fn relay_round_trip(
-        &self,
-    ) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>>;
+    /// Round-trip reachability probe to the pkarr relay. Returns a
+    /// `StepOutcome` directly so the probe owns its duration / reason.
+    fn relay_round_trip(&self) -> futures::future::BoxFuture<'_, StepOutcome>;
 }
 
 /// Pkarr self-test surface. Production impl lives in lib.rs boot
 /// wiring; tests use fakes.
 pub trait PkarrSelfTest: Send + Sync {
-    fn publish_identity(
-        &self,
-    ) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>>;
-    /// Resolve own identity from pkarr, verify the returned payload
-    /// matches the most recent published one. Bounded reason strings
-    /// per spec §6.2.
-    fn resolve_self(&self) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>>;
+    /// Read-only state-check (never publishes): is the identity publication
+    /// active? Returns `Skipped` when discoverability is off (not a failure).
+    /// `resolve_self` carries the real DHT round-trip that proves publish.
+    fn publish_identity(&self) -> futures::future::BoxFuture<'_, StepOutcome>;
+    /// Resolve own identity from pkarr and verify the returned record.
+    fn resolve_self(&self) -> futures::future::BoxFuture<'_, StepOutcome>;
 }
 
 /// Trait for ping side. Production impl wraps `ping_peer` (Task 5);
@@ -1030,7 +1014,7 @@ impl NetworkHealthService {
         let mut steps = Vec::new();
         let mut peer_results = Vec::new();
 
-        // Step 1: endpoint
+        // Step 1: endpoint (binary precondition).
         let endpoint_ok = iroh_test.endpoint_bound();
         steps.push(SelfTestStep {
             name: "endpoint".into(),
@@ -1043,88 +1027,49 @@ impl NetworkHealthService {
             },
         });
 
-        // Step 2: relay (skipped if endpoint failed)
-        let relay_ok = if endpoint_ok {
-            match iroh_test.relay_round_trip().await {
-                Ok(d) => {
-                    steps.push(SelfTestStep {
-                        name: "relay".into(),
-                        outcome: StepOutcome::Pass {
-                            duration_ms: d.as_millis() as u32,
-                        },
-                    });
-                    true
-                }
-                Err(reason) => {
-                    steps.push(SelfTestStep {
-                        name: "relay".into(),
-                        outcome: StepOutcome::Fail { reason },
-                    });
-                    false
-                }
-            }
+        // Step 2: relay (gated on endpoint). The probe owns its outcome.
+        let relay_outcome = if endpoint_ok {
+            iroh_test.relay_round_trip().await
         } else {
-            steps.push(SelfTestStep {
-                name: "relay".into(),
-                outcome: StepOutcome::Skipped {
-                    reason: "skipped: endpoint not bound".into(),
-                },
-            });
-            false
+            StepOutcome::Skipped {
+                reason: "skipped: endpoint not bound".into(),
+            }
         };
+        let relay_ok = matches!(relay_outcome, StepOutcome::Pass { .. });
+        steps.push(SelfTestStep {
+            name: "relay".into(),
+            outcome: relay_outcome,
+        });
 
-        // Step 3: pkarr_publish (skipped if relay failed)
-        let publish_ok = if relay_ok {
-            match pkarr_test.publish_identity().await {
-                Ok(d) => {
-                    steps.push(SelfTestStep {
-                        name: "pkarr_publish".into(),
-                        outcome: StepOutcome::Pass {
-                            duration_ms: d.as_millis() as u32,
-                        },
-                    });
-                    true
-                }
-                Err(reason) => {
-                    steps.push(SelfTestStep {
-                        name: "pkarr_publish".into(),
-                        outcome: StepOutcome::Fail { reason },
-                    });
-                    false
-                }
-            }
+        // Step 3: pkarr_publish (gated on relay). The probe may itself
+        // return Skipped (e.g. discoverability off) — that gates resolve.
+        let publish_outcome = if relay_ok {
+            pkarr_test.publish_identity().await
         } else {
-            steps.push(SelfTestStep {
-                name: "pkarr_publish".into(),
-                outcome: StepOutcome::Skipped {
-                    reason: "skipped: relay unreachable".into(),
-                },
-            });
-            false
+            // Accurate for every non-Pass relay outcome (Fail OR Skipped);
+            // the root cause is already shown on the relay step itself.
+            StepOutcome::Skipped {
+                reason: "skipped: relay did not pass".into(),
+            }
         };
+        let publish_ok = matches!(publish_outcome, StepOutcome::Pass { .. });
+        steps.push(SelfTestStep {
+            name: "pkarr_publish".into(),
+            outcome: publish_outcome,
+        });
 
-        // Step 4: pkarr_resolve (skipped if publish failed)
-        if publish_ok {
-            match pkarr_test.resolve_self().await {
-                Ok(d) => steps.push(SelfTestStep {
-                    name: "pkarr_resolve".into(),
-                    outcome: StepOutcome::Pass {
-                        duration_ms: d.as_millis() as u32,
-                    },
-                }),
-                Err(reason) => steps.push(SelfTestStep {
-                    name: "pkarr_resolve".into(),
-                    outcome: StepOutcome::Fail { reason },
-                }),
-            }
+        // Step 4: pkarr_resolve (gated on publish) — the real round-trip.
+        let resolve_outcome = if publish_ok {
+            pkarr_test.resolve_self().await
         } else {
-            steps.push(SelfTestStep {
-                name: "pkarr_resolve".into(),
-                outcome: StepOutcome::Skipped {
-                    reason: "skipped: publish failed".into(),
-                },
-            });
-        }
+            StepOutcome::Skipped {
+                reason: "skipped: publish not completed".into(),
+            }
+        };
+        steps.push(SelfTestStep {
+            name: "pkarr_resolve".into(),
+            outcome: resolve_outcome,
+        });
 
         // Per-peer pings: only attempt if endpoint is bound. Otherwise
         // all peer pings are Skipped.
@@ -1227,6 +1172,159 @@ impl PingDispatcher for NullDispatcher {
         _timeout: std::time::Duration,
     ) -> futures::future::BoxFuture<'_, Result<(std::time::Duration, ConnectionMode), String>> {
         Box::pin(async { Err("dispatcher not wired".into()) })
+    }
+}
+
+// ── ZEB-385: production self-test probes ────────────────────────────
+//
+// Built at IPC-call time from the locked `NodeState`; holds cheap
+// `Arc`/copy handles. Both pkarr probes build a FRESH `PkarrResolver`
+// from the relay client each call so the self-test reflects current
+// reachability (no shared-cache hits / stale positives or negatives).
+//
+// `relay_round_trip` is declared on `IrohSelfTest` but probes the
+// **pkarr** relay (the precondition the pkarr publish/resolve steps
+// depend on): iroh 0.98 exposes no relay-RTT API, and iroh home-relay
+// assignment is surfaced separately on the snapshot panel.
+
+/// Fixed deterministic throwaway key for the relay-reachability probe.
+/// A fresh resolver resolves it each run (empty cache), so a reachable
+/// relay returns `Ok(None)` and the timed window is pure network RTT; the
+/// determinism keeps the probe stable and excludes keygen-entropy jitter.
+const RELAY_PROBE_SEED: [u8; 32] = [0x5a; 32];
+
+/// Self-test-owned latency budget for each pkarr probe (mirrors
+/// `PEER_PING_TIMEOUT`): a misbehaving relay must not hang "Run self-test".
+const SELF_TEST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub struct ProdSelfTest {
+    pub iroh_endpoint: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>,
+    pub pkarr_relay_client: Option<std::sync::Arc<harmony_pkarr::RelayClient>>,
+    pub identity_pub_64: Option<[u8; 64]>,
+    pub discoverable: bool,
+    pub identity_publishing: bool,
+}
+
+impl IrohSelfTest for ProdSelfTest {
+    fn endpoint_bound(&self) -> bool {
+        // A present endpoint is a bound endpoint (node_id() is infallible).
+        self.iroh_endpoint.is_some()
+    }
+
+    fn relay_round_trip(&self) -> futures::future::BoxFuture<'_, StepOutcome> {
+        Box::pin(async move {
+            let Some(relay) = self.pkarr_relay_client.as_ref() else {
+                return StepOutcome::Fail {
+                    reason: "pkarr relay client not initialized".into(),
+                };
+            };
+            // Fresh resolver -> empty cache -> a real round-trip every run,
+            // even with the fixed deterministic probe key (it is almost
+            // certainly absent, so a reachable relay returns Ok(None); a
+            // transport failure returns Err).
+            //
+            // The resolver wraps the LIVE RelayClient shared with the background
+            // publisher: if every relay is on cooldown from a recent publish
+            // failure, the GET short-circuits to Err without touching the
+            // network. The resulting Fail is still accurate (the relay is
+            // currently unavailable to this node), just with ~0ms duration.
+            let resolver = harmony_pkarr::PkarrResolver::new(std::sync::Arc::clone(relay));
+            let probe_vk = ed25519_dalek::SigningKey::from_bytes(&RELAY_PROBE_SEED).verifying_key();
+            // Time only the network round-trip (keygen excluded), bounded by a
+            // self-test-owned budget so a stalled relay can't hang the probe.
+            let start = std::time::Instant::now();
+            match tokio::time::timeout(SELF_TEST_PROBE_TIMEOUT, resolver.resolve(&probe_vk)).await {
+                Ok(Ok(_)) => StepOutcome::Pass {
+                    duration_ms: start.elapsed().as_millis() as u32,
+                },
+                Ok(Err(_)) => StepOutcome::Fail {
+                    reason: "pkarr relay unreachable".into(),
+                },
+                Err(_) => StepOutcome::Fail {
+                    reason: "pkarr relay timed out".into(),
+                },
+            }
+        })
+    }
+}
+
+impl PkarrSelfTest for ProdSelfTest {
+    fn publish_identity(&self) -> futures::future::BoxFuture<'_, StepOutcome> {
+        let discoverable = self.discoverable;
+        let publishing = self.identity_publishing;
+        Box::pin(async move {
+            if !discoverable {
+                StepOutcome::Skipped {
+                    reason: "enable 'Make me discoverable' to test discovery".into(),
+                }
+            } else if publishing {
+                StepOutcome::Pass { duration_ms: 0 }
+            } else {
+                StepOutcome::Fail {
+                    reason: "identity publication not active".into(),
+                }
+            }
+        })
+    }
+
+    fn resolve_self(&self) -> futures::future::BoxFuture<'_, StepOutcome> {
+        Box::pin(async move {
+            let Some(relay) = self.pkarr_relay_client.as_ref() else {
+                return StepOutcome::Fail {
+                    reason: "pkarr relay client not initialized".into(),
+                };
+            };
+            let Some(id_pub) = self.identity_pub_64 else {
+                return StepOutcome::Fail {
+                    reason: "identity not loaded".into(),
+                };
+            };
+            // Single clock sample for both key derivation and skew verification.
+            let now_ms = now_ms();
+            let verifying_keys: Vec<_> = harmony_pkarr::epoch_tolerance_window(now_ms)
+                .iter()
+                .map(|&epoch| {
+                    harmony_pkarr::derive_ephemeral_key(
+                        harmony_pkarr::PkarrCase::Identity,
+                        &id_pub,
+                        &epoch.to_be_bytes(),
+                    )
+                    .verifying_key()
+                })
+                .collect();
+            let resolver = harmony_pkarr::PkarrResolver::new(std::sync::Arc::clone(relay));
+            let start = std::time::Instant::now();
+            match tokio::time::timeout(
+                SELF_TEST_PROBE_TIMEOUT,
+                resolver.resolve_window(&verifying_keys),
+            )
+            .await
+            {
+                Ok(Ok(Some(rec))) => {
+                    if rec.verify_inner_sig().is_err()
+                        || rec.verify_identity_match(&id_pub).is_err()
+                        || rec.verify_skew(now_ms).is_err()
+                    {
+                        StepOutcome::Fail {
+                            reason: "resolved record failed verification".into(),
+                        }
+                    } else {
+                        StepOutcome::Pass {
+                            duration_ms: start.elapsed().as_millis() as u32,
+                        }
+                    }
+                }
+                Ok(Ok(None)) => StepOutcome::Fail {
+                    reason: "identity not resolvable from pkarr".into(),
+                },
+                Ok(Err(_)) => StepOutcome::Fail {
+                    reason: "pkarr resolve failed".into(),
+                },
+                Err(_) => StepOutcome::Fail {
+                    reason: "pkarr resolve timed out".into(),
+                },
+            }
+        })
     }
 }
 
@@ -2031,34 +2129,28 @@ mod tests {
 
     struct ScriptedIrohTest {
         bound: bool,
-        relay: Result<std::time::Duration, String>,
+        relay: StepOutcome,
     }
     impl IrohSelfTest for ScriptedIrohTest {
         fn endpoint_bound(&self) -> bool {
             self.bound
         }
-        fn relay_round_trip(
-            &self,
-        ) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>> {
+        fn relay_round_trip(&self) -> futures::future::BoxFuture<'_, StepOutcome> {
             let r = self.relay.clone();
             async move { r }.boxed()
         }
     }
 
     struct ScriptedPkarrTest {
-        publish: Result<std::time::Duration, String>,
-        resolve: Result<std::time::Duration, String>,
+        publish: StepOutcome,
+        resolve: StepOutcome,
     }
     impl PkarrSelfTest for ScriptedPkarrTest {
-        fn publish_identity(
-            &self,
-        ) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>> {
+        fn publish_identity(&self) -> futures::future::BoxFuture<'_, StepOutcome> {
             let r = self.publish.clone();
             async move { r }.boxed()
         }
-        fn resolve_self(
-            &self,
-        ) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>> {
+        fn resolve_self(&self) -> futures::future::BoxFuture<'_, StepOutcome> {
             let r = self.resolve.clone();
             async move { r }.boxed()
         }
@@ -2080,11 +2172,11 @@ mod tests {
         let svc = build_svc_for_self_test();
         let iroh_t = ScriptedIrohTest {
             bound: true,
-            relay: Ok(std::time::Duration::from_millis(24)),
+            relay: StepOutcome::Pass { duration_ms: 24 },
         };
         let pkarr_t = ScriptedPkarrTest {
-            publish: Ok(std::time::Duration::from_millis(380)),
-            resolve: Ok(std::time::Duration::from_millis(210)),
+            publish: StepOutcome::Pass { duration_ms: 380 },
+            resolve: StepOutcome::Pass { duration_ms: 210 },
         };
         let report = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
         assert_eq!(report.steps.len(), 4);
@@ -2115,11 +2207,13 @@ mod tests {
         let svc = build_svc_for_self_test();
         let iroh_t = ScriptedIrohTest {
             bound: true,
-            relay: Err("relay timeout after 5s".into()),
+            relay: StepOutcome::Fail {
+                reason: "relay timeout after 5s".into(),
+            },
         };
         let pkarr_t = ScriptedPkarrTest {
-            publish: Ok(std::time::Duration::from_millis(380)),
-            resolve: Ok(std::time::Duration::from_millis(210)),
+            publish: StepOutcome::Pass { duration_ms: 380 },
+            resolve: StepOutcome::Pass { duration_ms: 210 },
         };
         let report = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
         assert!(matches!(report.steps[0].outcome, StepOutcome::Pass { .. }));
@@ -2139,11 +2233,11 @@ mod tests {
         let svc = build_svc_for_self_test();
         let iroh_t = ScriptedIrohTest {
             bound: false,
-            relay: Ok(std::time::Duration::from_millis(0)),
+            relay: StepOutcome::Pass { duration_ms: 0 },
         };
         let pkarr_t = ScriptedPkarrTest {
-            publish: Ok(std::time::Duration::from_millis(0)),
-            resolve: Ok(std::time::Duration::from_millis(0)),
+            publish: StepOutcome::Pass { duration_ms: 0 },
+            resolve: StepOutcome::Pass { duration_ms: 0 },
         };
         let report = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
         assert!(
@@ -2164,11 +2258,13 @@ mod tests {
         let svc = build_svc_for_self_test();
         let iroh_t = ScriptedIrohTest {
             bound: true,
-            relay: Ok(std::time::Duration::from_millis(24)),
+            relay: StepOutcome::Pass { duration_ms: 24 },
         };
         let pkarr_t = ScriptedPkarrTest {
-            publish: Ok(std::time::Duration::from_millis(380)),
-            resolve: Err("pkarr resolved unexpected payload".into()),
+            publish: StepOutcome::Pass { duration_ms: 380 },
+            resolve: StepOutcome::Fail {
+                reason: "pkarr resolved unexpected payload".into(),
+            },
         };
         let report = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
         match &report.steps[3].outcome {
@@ -2182,11 +2278,11 @@ mod tests {
         let svc = build_svc_for_self_test();
         let iroh_t = ScriptedIrohTest {
             bound: true,
-            relay: Ok(std::time::Duration::from_millis(24)),
+            relay: StepOutcome::Pass { duration_ms: 24 },
         };
         let pkarr_t = ScriptedPkarrTest {
-            publish: Ok(std::time::Duration::from_millis(380)),
-            resolve: Ok(std::time::Duration::from_millis(210)),
+            publish: StepOutcome::Pass { duration_ms: 380 },
+            resolve: StepOutcome::Pass { duration_ms: 210 },
         };
         assert!(
             svc.cached_last_self_test().await.is_none(),
@@ -2195,6 +2291,246 @@ mod tests {
         let _ = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
         let cached = svc.cached_last_self_test().await;
         assert!(cached.is_some(), "cache populated after run");
+    }
+
+    #[tokio::test]
+    async fn self_test_publish_self_skip_cascades_resolve_to_skipped() {
+        // Probe returns Skipped on publish (e.g. discoverability off); the
+        // orchestrator must mark pkarr_resolve Skipped, NOT run it.
+        let svc = build_svc_for_self_test();
+        let iroh_t = ScriptedIrohTest {
+            bound: true,
+            relay: StepOutcome::Pass { duration_ms: 12 },
+        };
+        let pkarr_t = ScriptedPkarrTest {
+            publish: StepOutcome::Skipped {
+                reason: "enable 'Make me discoverable' to test discovery".into(),
+            },
+            resolve: StepOutcome::Pass { duration_ms: 99 },
+        };
+        let report = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
+        assert!(matches!(report.steps[1].outcome, StepOutcome::Pass { .. }));
+        assert!(
+            matches!(report.steps[2].outcome, StepOutcome::Skipped { .. }),
+            "publish self-skipped"
+        );
+        assert!(
+            matches!(report.steps[3].outcome, StepOutcome::Skipped { .. }),
+            "resolve skipped because publish did not pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_test_relay_self_skip_cascades_downstream_to_skipped() {
+        // The relay probe may itself return Skipped (not just Fail/Pass); the
+        // orchestrator must gate publish + resolve to Skipped, not run them.
+        let svc = build_svc_for_self_test();
+        let iroh_t = ScriptedIrohTest {
+            bound: true,
+            relay: StepOutcome::Skipped {
+                reason: "no relay configured".into(),
+            },
+        };
+        let pkarr_t = ScriptedPkarrTest {
+            publish: StepOutcome::Pass { duration_ms: 0 },
+            resolve: StepOutcome::Pass { duration_ms: 0 },
+        };
+        let report = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
+        assert!(matches!(report.steps[0].outcome, StepOutcome::Pass { .. }));
+        assert!(matches!(
+            report.steps[1].outcome,
+            StepOutcome::Skipped { .. }
+        ));
+        assert!(
+            matches!(report.steps[2].outcome, StepOutcome::Skipped { .. }),
+            "publish skipped"
+        );
+        assert!(
+            matches!(report.steps[3].outcome, StepOutcome::Skipped { .. }),
+            "resolve skipped"
+        );
+    }
+
+    // ── ZEB-385: ProdSelfTest probe tests (real RelayClient + mock relay) ──
+
+    #[tokio::test]
+    async fn prod_relay_round_trip_reachable_relay_passes() {
+        use harmony_pkarr::{testing::MockPkarrRelay, RelayClient, RelayPool};
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: Some(client),
+            identity_pub_64: None,
+            discoverable: false,
+            identity_publishing: false,
+        };
+        assert!(
+            matches!(probes.relay_round_trip().await, StepOutcome::Pass { .. }),
+            "reachable mock relay -> Pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn prod_relay_round_trip_dead_relay_fails() {
+        use harmony_pkarr::{RelayClient, RelayPool};
+        // Port 1 is unbindable / unreachable; the GET round-trip errors.
+        let pool = RelayPool::new(vec!["http://127.0.0.1:1".to_string()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: Some(client),
+            identity_pub_64: None,
+            discoverable: false,
+            identity_publishing: false,
+        };
+        assert!(
+            matches!(probes.relay_round_trip().await, StepOutcome::Fail { .. }),
+            "dead relay -> Fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn prod_publish_identity_state_check_three_ways() {
+        let mk = |discoverable, identity_publishing| ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: None,
+            identity_pub_64: None,
+            discoverable,
+            identity_publishing,
+        };
+        assert!(
+            matches!(
+                mk(false, false).publish_identity().await,
+                StepOutcome::Skipped { .. }
+            ),
+            "not discoverable -> Skipped"
+        );
+        assert!(
+            matches!(
+                mk(true, true).publish_identity().await,
+                StepOutcome::Pass { .. }
+            ),
+            "discoverable + registered -> Pass"
+        );
+        assert!(
+            matches!(
+                mk(true, false).publish_identity().await,
+                StepOutcome::Fail { .. }
+            ),
+            "discoverable but not registered -> Fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn prod_resolve_self_absent_identity_fails() {
+        use harmony_pkarr::{testing::MockPkarrRelay, RelayClient, RelayPool};
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let id_sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&id_sk.verifying_key().to_bytes());
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: Some(client),
+            identity_pub_64: Some(id_pub),
+            discoverable: true,
+            identity_publishing: true,
+        };
+        // Nothing published for this identity -> not resolvable -> Fail.
+        assert!(matches!(
+            probes.resolve_self().await,
+            StepOutcome::Fail { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn prod_resolve_self_finds_published_identity() {
+        use harmony_pkarr::{
+            current_epoch_id, derive_ephemeral_key, testing::MockPkarrRelay, EphemeralKeyBuilder,
+            PkarrCase, PkarrPublisher, PkarrRoutingRecord, RecordBuilder, RelayClient, RelayPool,
+        };
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let publisher = std::sync::Arc::new(PkarrPublisher::new(std::sync::Arc::clone(&client)));
+        let _ph = std::sync::Arc::clone(&publisher).spawn();
+
+        let id_sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&id_sk.verifying_key().to_bytes());
+
+        // Register the identity publication (mirrors PkarrIdentityPublisher::enable).
+        let id_pub_for_key = id_pub;
+        let key_builder: EphemeralKeyBuilder = std::sync::Arc::new(move |at_ms| {
+            let epoch_id = current_epoch_id(at_ms);
+            derive_ephemeral_key(
+                PkarrCase::Identity,
+                &id_pub_for_key,
+                &epoch_id.to_be_bytes(),
+            )
+        });
+        let id_sk2 = id_sk.clone();
+        let builder: RecordBuilder = std::sync::Arc::new(move |at_ms| {
+            PkarrRoutingRecord::sign_new(b"routing".to_vec(), id_pub, at_ms, &id_sk2).expect("sign")
+        });
+        publisher
+            .register("identity".to_string(), key_builder, builder)
+            .await;
+
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: Some(std::sync::Arc::clone(&client)),
+            identity_pub_64: Some(id_pub),
+            discoverable: true,
+            identity_publishing: true,
+        };
+        // resolve_self builds a FRESH resolver each call (no stale cache), so
+        // polling works: wait for the background publish to land on the relay.
+        let mut found = false;
+        for _ in 0..40 {
+            if matches!(probes.resolve_self().await, StepOutcome::Pass { .. }) {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(found, "published identity became resolvable -> Pass");
+    }
+
+    #[tokio::test]
+    async fn prod_endpoint_bound_false_when_no_endpoint() {
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: None,
+            identity_pub_64: None,
+            discoverable: false,
+            identity_publishing: false,
+        };
+        assert!(!probes.endpoint_bound());
+    }
+
+    #[tokio::test]
+    async fn prod_relay_and_resolve_fail_when_no_relay_client() {
+        // Defensive None-guards: with no relay client, both pkarr round-trips
+        // Fail (rather than panic) — covers the early-return branches.
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: None,
+            identity_pub_64: Some([0u8; 64]),
+            discoverable: true,
+            identity_publishing: true,
+        };
+        assert!(matches!(
+            probes.relay_round_trip().await,
+            StepOutcome::Fail { .. }
+        ));
+        assert!(matches!(
+            probes.resolve_self().await,
+            StepOutcome::Fail { .. }
+        ));
     }
 
     // ── ZEB-373 Task 3: DialTelemetry tests ─────────────────────────

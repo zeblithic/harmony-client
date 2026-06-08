@@ -37270,69 +37270,83 @@ async fn network_health_snapshot<R: tauri::Runtime>(
 }
 
 /// Spec §5.3 + §6.1. Returns Err only on truly exceptional cases
-/// (AppState lock poisoned). Step failures live inside the report.
+/// (NodeState lock poisoned). Step failures live inside the report.
 ///
-/// Phase 1: returns a synthetic all-Skipped report because production
-/// self-test traits (IrohSelfTest, PkarrSelfTest, PingDispatcher) are
-/// not yet wired into NetworkHealthService boot. When the service is
-/// Some, we ALSO write the synthetic into `last_self_test` so the
-/// export IPC shows it — matches the user's mental model that
-/// "running the test populates what export shows".
-///
-/// TODO(zeb-329-followup): replace the synthetic path with
-/// `svc.run_self_test(prod_iroh_test, prod_pkarr_test, prod_dispatcher).await`
-/// once the production trait wiring lands.
+/// ZEB-385: builds `ProdSelfTest` from the locked `NodeState` and runs
+/// the real four-step probe sequence (endpoint / pkarr-relay round-trip /
+/// publish state-check / resolve round-trip). Honors the "Make me
+/// discoverable" opt-in — publish/resolve `Skipped` (not failed) when off.
 #[tauri::command(rename_all = "snake_case")]
 async fn network_health_run_self_test(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<crate::network_health::SelfTestReport, String> {
-    let svc = {
-        state
+    // Snapshot every handle we need under the lock, then drop it before awaiting.
+    let (svc, iroh_endpoint, pkarr_relay_client, identity_pub_64, publisher, settings_path) = {
+        let g = state
             .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?
-            .network_health
-            .clone()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.network_health.clone(),
+            g.iroh_endpoint.clone(),
+            g.pkarr_relay_client.clone(),
+            g.dm_identity_pub_64,
+            g.pkarr_publisher.clone(),
+            g.pkarr_settings_path.clone(),
+        )
     };
-    let now = crate::network_health::__now_ms_for_ipc();
-    let synthetic = crate::network_health::SelfTestReport {
-        started_at_ms: now,
-        finished_at_ms: now,
-        steps: vec![
-            crate::network_health::SelfTestStep {
-                name: "endpoint".into(),
+
+    // Node not started: no service to probe — return an honest all-Skipped report.
+    let Some(svc) = svc else {
+        let now = crate::network_health::__now_ms_for_ipc();
+        let steps = ["endpoint", "relay", "pkarr_publish", "pkarr_resolve"]
+            .iter()
+            .map(|name| crate::network_health::SelfTestStep {
+                name: (*name).to_string(),
                 outcome: crate::network_health::StepOutcome::Skipped {
-                    reason: "production self-test traits not yet wired".into(),
+                    reason: "node not started".into(),
                 },
-            },
-            crate::network_health::SelfTestStep {
-                name: "relay".into(),
-                outcome: crate::network_health::StepOutcome::Skipped {
-                    reason: "production self-test traits not yet wired".into(),
-                },
-            },
-            crate::network_health::SelfTestStep {
-                name: "pkarr_publish".into(),
-                outcome: crate::network_health::StepOutcome::Skipped {
-                    reason: "production self-test traits not yet wired".into(),
-                },
-            },
-            crate::network_health::SelfTestStep {
-                name: "pkarr_resolve".into(),
-                outcome: crate::network_health::StepOutcome::Skipped {
-                    reason: "production self-test traits not yet wired".into(),
-                },
-            },
-        ],
-        peer_results: vec![],
+            })
+            .collect();
+        return Ok(crate::network_health::SelfTestReport {
+            started_at_ms: now,
+            finished_at_ms: now,
+            steps,
+            peer_results: vec![],
+        });
     };
-    // Cache the synthetic so the export IPC includes it — matches the
-    // user's mental model that running the test populates what they
-    // see in export. Safe because the synthetic is deterministic +
-    // structurally indistinguishable from a real all-Skipped result.
-    if let Some(svc) = svc.as_ref() {
-        svc.cache_synthetic_self_test(synthetic.clone()).await;
-    }
-    Ok(synthetic)
+
+    // Discoverability (persisted) + whether the identity publication is registered.
+    // Off-thread the synchronous settings file read so it can't block the async
+    // runtime worker during a user-triggered self-test.
+    let discoverable = match settings_path {
+        Some(p) => tokio::task::spawn_blocking(move || {
+            pkarr_settings::PkarrSettings::load_or_default(&p).identity_discoverable
+        })
+        .await
+        .unwrap_or(false),
+        None => false,
+    };
+    let identity_publishing = match publisher.as_ref() {
+        Some(p) => p
+            .active_handles()
+            .await
+            .iter()
+            .any(|h| h == crate::pkarr_identity_publisher::HANDLE),
+        None => false,
+    };
+
+    let probes = crate::network_health::ProdSelfTest {
+        iroh_endpoint,
+        pkarr_relay_client,
+        identity_pub_64,
+        discoverable,
+        identity_publishing,
+    };
+
+    // run_self_test caches the report internally for network_health_export_payload.
+    Ok(svc
+        .run_self_test(&probes, &probes, &crate::network_health::NullDispatcher)
+        .await)
 }
 
 /// Spec §5.4: export the current snapshot + last cached self-test
