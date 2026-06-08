@@ -54,20 +54,14 @@ async fn connectivity_get_my_identity_pub_hex(
 }
 ```
 
-The encoding logic is extracted into a pure helper so it is deterministically
-unit-testable without constructing a live `NodeState` (the same pattern ZEB-385 used
-for `log_dir_in`; the connectivity getters have no IPC-level unit tests today
-precisely because `NodeState` is expensive to build):
+The body is a one-liner — `Ok(g.dm_identity_pub_64.map(hex::encode))`. Mirrors
+`connectivity_get_my_reachability_record` (lock → read one field → `Ok(None)` when
+absent). Registered in the `invoke_handler!` registry.
 
-```rust
-/// Pure: map the optional 64-byte identity pub to its lowercase hex encoding.
-fn my_identity_pub_hex(pub64: Option<[u8; 64]>) -> Option<String> {
-    pub64.map(hex::encode)
-}
-```
-
-Mirrors `connectivity_get_my_reachability_record` (lock → read one field →
-`Ok(None)` when absent). Registered in the `invoke_handler!` registry.
+The connectivity test module already builds a `NodeState` cheaply via
+`mock_app_with_default_node_state()` and sets fields on it directly (see
+`force_republish_wakes_publisher`), so the IPC is unit-testable end-to-end without a
+pure-helper extraction — testing the real command is both simpler and more thorough.
 
 ### 2. TS wrapper — `FriendService.getMyIdentityPubHex`
 
@@ -109,9 +103,12 @@ write surface.
 
 ## Testing
 
-- **Rust:** unit-test `my_identity_pub_hex` — `None → None`; a known fixture
-  (`[0xAB; 64]`) → exact 128-char lowercase hex string (asserts encoding correctness
-  and length).
+- **Rust:** unit-test the IPC directly via `mock_app_with_default_node_state()` —
+  the `None` path (no `dm_identity_pub_64` → `Ok(None)`) and a `Some([0xAB; 64])`
+  fixture → exact 128-char lowercase hex string. Mirrors the existing
+  `get_my_reachability_returns_none_when_iroh_not_running` (None) and
+  `force_republish_wakes_publisher` (direct field-set) test patterns; no iroh bind,
+  so fast and flake-free.
 - **Frontend wrapper:** `friend-service.test.ts` — asserts the command name
   (`connectivity_get_my_identity_pub_hex`), empty `{}` args, and `string | null`
   passthrough (mirrors the existing `addByKey` test).
