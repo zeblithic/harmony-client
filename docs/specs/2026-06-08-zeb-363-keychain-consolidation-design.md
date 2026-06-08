@@ -39,8 +39,9 @@ model, with a safe migration from the existing multi-item layout.
 - **Out:** *across-launch* re-prompting — that is the code-signing / designated-
   requirement-stability axis (**ZEB-328**); an unsigned dev build re-prompts on
   every access regardless of item count. This change reduces fresh-setup
-  *distinct-item* prompts 3 → 1; a signed alpha creating its own single item gets
-  ~0. Also out: keychain access groups (need entitlement + signing), and deriving
+  *distinct-item* prompts to 1 (from 3 for a joiner, 4 for a full-owner install);
+  a signed alpha creating its own single item gets ~0. Also out: keychain access
+  groups (need entitlement + signing), and deriving
   sub-keys from the seed (deliberately not chosen — keys stay independent).
 
 ## Architecture
