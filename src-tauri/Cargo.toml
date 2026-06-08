@@ -149,6 +149,11 @@ iroh = "0.98"
 # `Stream<Item = std::io::Result<IfEvent>>` — we drive it via
 # `futures::StreamExt::next()` (no manual `poll_fn` wrapping needed).
 if-watch = { version = "3", features = ["tokio"] }
+# ZEB-391: one-shot host interface enumeration (name + assigned IP) used by
+# `direct_addr_filter` to drop stale/virtual addresses from the advertised iroh
+# direct-address set. Already in the lock transitively (via if-watch); a direct
+# entry just makes `if_addrs::get_if_addrs()` importable.
+if-addrs = "0.15"
 tauri-plugin-fs = "2.5.1"
 
 [dev-dependencies]
