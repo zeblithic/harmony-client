@@ -13923,6 +13923,27 @@ pub fn communities_for_nav(state: &crate::owner_state_crdt::OwnerState) -> Vec<C
         .collect()
 }
 
+/// ZEB-393 Bug B: enumerate the viewer's live (non-left) communities for
+/// boot rehydration of the nav sidebar. The frontend has no other way to
+/// learn "which communities am I in" — the nav tree is otherwise push-only
+/// (filled by runtime `nav-updated` events) and boots empty on every
+/// restart. Read-only over the in-memory owner-state CRDT (populated at
+/// `start_node` by `load_crdt`). App.svelte calls this after
+/// `navService.connectAdapter` and seeds via `addOrUpdateNavSpace`.
+#[tauri::command]
+async fn list_owner_communities(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<Vec<CommunityNavDto>, String> {
+    let crdt_state = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    let state = crdt_state.lock().await;
+    Ok(communities_for_nav(&state))
+}
+
 #[cfg(test)]
 mod zeb393_communities_for_nav_tests {
     use super::*;
@@ -37537,6 +37558,7 @@ pub fn run() {
             pairing_commands::cancel_pairing,
             pairing_commands::get_pairing_state,
             list_community_members,
+            list_owner_communities,
             generate_invite,
             create_community,
             redeem_invite,
