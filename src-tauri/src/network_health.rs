@@ -1186,6 +1186,17 @@ impl PingDispatcher for NullDispatcher {
 // **pkarr** relay (the precondition the pkarr publish/resolve steps
 // depend on): iroh 0.98 exposes no relay-RTT API, and iroh home-relay
 // assignment is surfaced separately on the snapshot panel.
+
+/// Fixed deterministic throwaway key for the relay-reachability probe.
+/// A fresh resolver resolves it each run (empty cache), so a reachable
+/// relay returns `Ok(None)` and the timed window is pure network RTT; the
+/// determinism keeps the probe stable and excludes keygen-entropy jitter.
+const RELAY_PROBE_SEED: [u8; 32] = [0x5a; 32];
+
+/// Self-test-owned latency budget for each pkarr probe (mirrors
+/// `PEER_PING_TIMEOUT`): a misbehaving relay must not hang "Run self-test".
+const SELF_TEST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct ProdSelfTest {
     pub iroh_endpoint: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>,
     pub pkarr_relay_client: Option<std::sync::Arc<harmony_pkarr::RelayClient>>,
@@ -1207,9 +1218,10 @@ impl IrohSelfTest for ProdSelfTest {
                     reason: "pkarr relay client not initialized".into(),
                 };
             };
-            // Fresh resolver -> empty cache -> a real round-trip every run. A
-            // random throwaway key is almost certainly absent, so a reachable
-            // relay returns Ok(None); a transport failure returns Err.
+            // Fresh resolver -> empty cache -> a real round-trip every run,
+            // even with the fixed deterministic probe key (it is almost
+            // certainly absent, so a reachable relay returns Ok(None); a
+            // transport failure returns Err).
             //
             // The resolver wraps the LIVE RelayClient shared with the background
             // publisher: if every relay is on cooldown from a recent publish
@@ -1217,16 +1229,19 @@ impl IrohSelfTest for ProdSelfTest {
             // network. The resulting Fail is still accurate (the relay is
             // currently unavailable to this node), just with ~0ms duration.
             let resolver = harmony_pkarr::PkarrResolver::new(std::sync::Arc::clone(relay));
-            // Time the full observable latency, including the blocking keygen.
+            let probe_vk = ed25519_dalek::SigningKey::from_bytes(&RELAY_PROBE_SEED).verifying_key();
+            // Time only the network round-trip (keygen excluded), bounded by a
+            // self-test-owned budget so a stalled relay can't hang the probe.
             let start = std::time::Instant::now();
-            let probe_vk =
-                ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
-            match resolver.resolve(&probe_vk).await {
-                Ok(_) => StepOutcome::Pass {
+            match tokio::time::timeout(SELF_TEST_PROBE_TIMEOUT, resolver.resolve(&probe_vk)).await {
+                Ok(Ok(_)) => StepOutcome::Pass {
                     duration_ms: start.elapsed().as_millis() as u32,
                 },
-                Err(_) => StepOutcome::Fail {
+                Ok(Err(_)) => StepOutcome::Fail {
                     reason: "pkarr relay unreachable".into(),
+                },
+                Err(_) => StepOutcome::Fail {
+                    reason: "pkarr relay timed out".into(),
                 },
             }
         })
@@ -1279,8 +1294,13 @@ impl PkarrSelfTest for ProdSelfTest {
                 .collect();
             let resolver = harmony_pkarr::PkarrResolver::new(std::sync::Arc::clone(relay));
             let start = std::time::Instant::now();
-            match resolver.resolve_window(&verifying_keys).await {
-                Ok(Some(rec)) => {
+            match tokio::time::timeout(
+                SELF_TEST_PROBE_TIMEOUT,
+                resolver.resolve_window(&verifying_keys),
+            )
+            .await
+            {
+                Ok(Ok(Some(rec))) => {
                     if rec.verify_inner_sig().is_err()
                         || rec.verify_identity_match(&id_pub).is_err()
                         || rec.verify_skew(now_ms).is_err()
@@ -1294,11 +1314,14 @@ impl PkarrSelfTest for ProdSelfTest {
                         }
                     }
                 }
-                Ok(None) => StepOutcome::Fail {
+                Ok(Ok(None)) => StepOutcome::Fail {
                     reason: "identity not resolvable from pkarr".into(),
                 },
-                Err(_) => StepOutcome::Fail {
+                Ok(Err(_)) => StepOutcome::Fail {
                     reason: "pkarr resolve failed".into(),
+                },
+                Err(_) => StepOutcome::Fail {
+                    reason: "pkarr resolve timed out".into(),
                 },
             }
         })

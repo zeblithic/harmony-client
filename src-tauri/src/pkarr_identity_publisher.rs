@@ -14,7 +14,11 @@ pub struct PkarrIdentityPublisher {
     routing_blob_builder: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
 }
 
-const HANDLE: &str = "identity";
+/// Publication handle for the case-B identity record. Exposed `pub(crate)`
+/// so the Network Health self-test (ZEB-385) can check "is the identity
+/// publication active?" against this single source of truth instead of a
+/// duplicated string literal.
+pub(crate) const HANDLE: &str = "identity";
 
 impl PkarrIdentityPublisher {
     pub fn new(

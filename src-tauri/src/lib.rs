@@ -37132,13 +37132,22 @@ async fn network_health_run_self_test(
     };
 
     // Discoverability (persisted) + whether the identity publication is registered.
+    // Off-thread the synchronous settings file read so it can't block the async
+    // runtime worker during a user-triggered self-test.
     let discoverable = match settings_path {
-        Some(p) => pkarr_settings::PkarrSettings::load_or_default(&p).identity_discoverable,
+        Some(p) => tokio::task::spawn_blocking(move || {
+            pkarr_settings::PkarrSettings::load_or_default(&p).identity_discoverable
+        })
+        .await
+        .unwrap_or(false),
         None => false,
     };
     let identity_publishing = match publisher.as_ref() {
-        // "identity" is the HANDLE const in pkarr_identity_publisher.rs.
-        Some(p) => p.active_handles().await.iter().any(|h| h == "identity"),
+        Some(p) => p
+            .active_handles()
+            .await
+            .iter()
+            .any(|h| h == crate::pkarr_identity_publisher::HANDLE),
         None => false,
     };
 
