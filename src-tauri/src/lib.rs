@@ -185,6 +185,9 @@ pub mod referral_catalog;
 // device's ReachabilityAnnounce on startup / network change / idle tick /
 // manual force-notify. Wired into the event loop by Task 8.
 pub mod network_health;
+// ZEB-391: filters stale/virtual addresses out of the advertised iroh direct
+// address set (feeds the reachability-announce publish path below).
+pub mod direct_addr_filter;
 pub mod reachability_publisher;
 pub mod reachability_record;
 pub mod reachability_resolver;
@@ -4308,7 +4311,16 @@ pub(crate) async fn start_node_inner(
                                     let node_id_bytes: [u8; 32] = *ep.node_id().as_bytes();
                                     let home_relay =
                                         ep.home_relay().map(|r| r.to_string()).unwrap_or_default();
-                                    let direct_addrs = ep.direct_addresses();
+                                    // ZEB-391: drop stale/wrong-subnet + virtual-switch
+                                    // (WSL/Docker) + down-interface addresses so peers don't
+                                    // dial the wrong/unreachable host. Async path: the iface
+                                    // enumeration is a blocking syscall, so offload it via
+                                    // spawn_blocking to keep this executor worker free.
+                                    let direct_addrs =
+                                        crate::direct_addr_filter::gather_routable_direct_addrs_async(
+                                            ep.direct_addresses(),
+                                        )
+                                        .await;
                                     let announced_at_ms = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
@@ -4581,7 +4593,15 @@ pub(crate) async fn start_node_inner(
                             let iroh_node_id: [u8; 32] = *ep.node_id().as_bytes();
                             let home_relay_url =
                                 ep.home_relay().map(|r| r.to_string()).unwrap_or_default();
-                            let direct_addresses = ep.direct_addresses();
+                            // ZEB-391: drop stale/wrong-subnet + virtual-switch (WSL/Docker)
+                            // + down-interface addresses so peers don't dial the wrong/
+                            // unreachable host. This `blob_builder` is a sync `Fn() -> Vec<u8>`
+                            // (pkarr routing-blob contract — already does sync CBOR + signing),
+                            // so it can't `.await`; the sync gather is correct here.
+                            let direct_addresses =
+                                crate::direct_addr_filter::gather_routable_direct_addrs(
+                                    ep.direct_addresses(),
+                                );
                             let announced_at_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()

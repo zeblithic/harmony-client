@@ -2816,6 +2816,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "if-addrs",
  "if-watch",
  "iroh",
  "keccak 0.2.0-rc.2",
