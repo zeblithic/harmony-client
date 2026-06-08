@@ -8817,6 +8817,7 @@ async fn export_content(
         .send(event_loop::FetchRequest {
             cid_hex: cid,
             reply: reply_tx,
+            max_bytes: None,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -11960,6 +11961,7 @@ async fn fetch_content(
         .send(event_loop::FetchRequest {
             cid_hex: cid,
             reply: reply_tx,
+            max_bytes: None,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -12066,6 +12068,7 @@ async fn fetch_profile_doc(
         .send(event_loop::FetchRequest {
             cid_hex: cid,
             reply: reply_tx,
+            max_bytes: None,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
