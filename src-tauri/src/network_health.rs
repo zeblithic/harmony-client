@@ -982,8 +982,9 @@ pub trait IrohSelfTest: Send + Sync {
 /// Pkarr self-test surface. Production impl lives in lib.rs boot
 /// wiring; tests use fakes.
 pub trait PkarrSelfTest: Send + Sync {
-    /// State-check: is the identity publication active? Returns `Skipped`
-    /// when the user has not enabled discoverability (not a failure).
+    /// Read-only state-check (never publishes): is the identity publication
+    /// active? Returns `Skipped` when discoverability is off (not a failure).
+    /// `resolve_self` carries the real DHT round-trip that proves publish.
     fn publish_identity(&self) -> futures::future::BoxFuture<'_, StepOutcome>;
     /// Resolve own identity from pkarr and verify the returned record.
     fn resolve_self(&self) -> futures::future::BoxFuture<'_, StepOutcome>;
@@ -1057,8 +1058,10 @@ impl NetworkHealthService {
         let publish_outcome = if relay_ok {
             pkarr_test.publish_identity().await
         } else {
+            // Accurate for every non-Pass relay outcome (Fail OR Skipped);
+            // the root cause is already shown on the relay step itself.
             StepOutcome::Skipped {
-                reason: "skipped: relay unreachable".into(),
+                reason: "skipped: relay did not pass".into(),
             }
         };
         let publish_ok = matches!(publish_outcome, StepOutcome::Pass { .. });
@@ -2173,6 +2176,37 @@ mod tests {
         assert!(
             matches!(report.steps[3].outcome, StepOutcome::Skipped { .. }),
             "resolve skipped because publish did not pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_test_relay_self_skip_cascades_downstream_to_skipped() {
+        // The relay probe may itself return Skipped (not just Fail/Pass); the
+        // orchestrator must gate publish + resolve to Skipped, not run them.
+        let svc = build_svc_for_self_test();
+        let iroh_t = ScriptedIrohTest {
+            bound: true,
+            relay: StepOutcome::Skipped {
+                reason: "no relay configured".into(),
+            },
+        };
+        let pkarr_t = ScriptedPkarrTest {
+            publish: StepOutcome::Pass { duration_ms: 0 },
+            resolve: StepOutcome::Pass { duration_ms: 0 },
+        };
+        let report = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
+        assert!(matches!(report.steps[0].outcome, StepOutcome::Pass { .. }));
+        assert!(matches!(
+            report.steps[1].outcome,
+            StepOutcome::Skipped { .. }
+        ));
+        assert!(
+            matches!(report.steps[2].outcome, StepOutcome::Skipped { .. }),
+            "publish skipped"
+        );
+        assert!(
+            matches!(report.steps[3].outcome, StepOutcome::Skipped { .. }),
+            "resolve skipped"
         );
     }
 
