@@ -104,6 +104,11 @@ clap = { version = "4", features = ["derive"] }
 secrecy = "0.10"
 subtle = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# ZEB-379: desktop GUI tracing subscriber (rolling log file for tester diagnostics).
+tracing-appender = "0.2"
+# ZEB-379: handle-free app-data dir resolution for the log path (already resolved
+# transitively at 6.0.0; this just makes it a direct dep).
+dirs = "6"
 
 # Pin pre-release PQ crypto deps to match the harmony workspace.
 # These RC crates have breaking changes between point releases; without
