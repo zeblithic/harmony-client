@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { CommunityService, rosterHasJoinedAuthor } from '../community-service';
+import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from '../community-service';
 import type { TauriAdapter } from '../zenoh-service';
 
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
@@ -13,6 +13,20 @@ function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
     }),
   } as any;
 }
+
+describe('toNavPayload (ZEB-393)', () => {
+  it('maps a community DTO to an added community nav payload', () => {
+    expect(
+      toNavPayload({ spaceId: 'aa', name: 'Open Town', isInviteOnly: false, pending: false }),
+    ).toEqual({ action: 'added', spaceId: 'aa', kind: 'community', name: 'Open Town', pending: undefined });
+  });
+
+  it('carries pending=true so an invite-only join renders greyed at boot', () => {
+    expect(
+      toNavPayload({ spaceId: 'bb', name: 'Secret Club', isInviteOnly: true, pending: true }).pending,
+    ).toBe(true);
+  });
+});
 
 describe('CommunityService', () => {
   let service: CommunityService;

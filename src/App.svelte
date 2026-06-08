@@ -41,7 +41,7 @@
   import { LibraryDirectoryService } from './lib/library-directory-service';
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
-  import { CommunityService, rosterHasJoinedAuthor } from './lib/community-service';
+  import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
   import { FriendService } from './lib/friend-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
@@ -1479,6 +1479,22 @@
         return URL.createObjectURL(blob);
       };
       await tryConnect('nav', navService.connectAdapter(adapter));
+
+      // ZEB-393 Bug B: rehydrate persisted communities into the sidebar. The
+      // nav tree is otherwise push-only/session-scoped and boots empty on every
+      // restart regardless of what's on disk. Pull (not a backend boot emit) so
+      // it can't race the nav listener registered just above; addOrUpdateNavSpace
+      // is cold-replay idempotent, so a later runtime nav-updated for the same
+      // community is a no-op update. Non-fatal: failure leaves the sidebar empty
+      // (today's behaviour), it doesn't block the rest of boot.
+      try {
+        for (const c of await communityService.listOwnerCommunities()) {
+          navService.addOrUpdateNavSpace(toNavPayload(c));
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('[harmony-client] community rehydration failed:', msg);
+      }
 
       // Fetch our node address so self-sent messages/vines echo back as
       // 'self'/'You'. Try immediately (node may already be connected after

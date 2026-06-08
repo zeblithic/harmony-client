@@ -8,6 +8,7 @@ import {
   type ModerationEvent,
 } from './types';
 import type { ChannelMessageDto } from './channel-message-service';
+import type { NavUpdatedPayload } from './nav-service';
 
 interface MembersChangedPayload { communityId: string; }
 interface DegradedPayload { communityId: string; degraded: boolean; }
@@ -42,6 +43,23 @@ export interface CommunityNavDto {
   name: string;
   isInviteOnly: boolean;
   pending: boolean;
+}
+
+/**
+ * ZEB-393 Bug B: CommunityNavDto → an 'added' community nav payload for
+ * `navService.addOrUpdateNavSpace`. `pending: undefined` when not pending so
+ * the nav tree leaves the greyed state off (addOrUpdateNavSpace reads
+ * `pending ?? undefined`); `pending: true` keeps an invite-only join whose
+ * countersign hasn't landed greyed at boot.
+ */
+export function toNavPayload(c: CommunityNavDto): NavUpdatedPayload {
+  return {
+    action: 'added',
+    spaceId: c.spaceId,
+    kind: 'community',
+    name: c.name,
+    pending: c.pending || undefined,
+  };
 }
 
 /** Mirrors `ChannelInfoDto` in src-tauri/src/lib.rs (ZEB-266 Phase 1).
