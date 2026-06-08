@@ -616,13 +616,19 @@ fn save_secret(
     // (locked / permission denied / etc) instead of the generic "HARMONY_PASSPHRASE
     // not set" message — otherwise mint reports the wrong remediation.
     let mut keychain_err: Option<String> = None;
+    // True when there is no keychain vault item (`Ok(false)`), so we fall through
+    // to the encrypted-file fallback. In that state the symmetric `load_secret`
+    // (via `vault_load_slot`) reads the legacy `harmony.owner`/<name> item
+    // directly, so a stale legacy entry could shadow the value we are about to
+    // write to the file. We clear it after a successful file write (below).
+    let mut no_vault_fell_through = false;
     if keychain.is_some() {
         // ZEB-363: write into the consolidated harmony/identity vault slot
         // (read-modify-write, preserving the other slots). Ok(false) => there is
         // no keychain vault item (keychain-less seed) — fall through to the file.
         match crate::identity::vault_save_slot(slot, bytes) {
             Ok(true) => return Ok(()),
-            Ok(false) => {}
+            Ok(false) => no_vault_fell_through = true,
             Err(e) => {
                 // Don't hard-fail: a flaky/locked keychain shouldn't block
                 // mint when the encrypted-file fallback is configured.
@@ -649,6 +655,23 @@ fn save_secret(
     store
         .save(bytes)
         .map_err(|e| format!("write {fallback_filename}: {e}"))?;
+    // The secret now lives durably in the encrypted file. If we took the
+    // no-keychain-vault path, best-effort delete the legacy `harmony.owner`/<name>
+    // keychain item so a later no-vault `vault_load_slot` reads the file rather
+    // than a stale legacy entry. Only after the file write succeeds (no data loss
+    // on a failed write). Best-effort: a delete failure is logged, not fatal.
+    if no_vault_fell_through {
+        if let Ok(legacy) = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name) {
+            if let Err(e) = legacy.delete_credential() {
+                if !matches!(e, keyring::Error::NoEntry) {
+                    tracing::warn!(
+                        "could not delete stale legacy owner keychain item \
+                         {KEYCHAIN_OWNER_SERVICE}/{keychain_name} after encrypted-file save: {e}"
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
