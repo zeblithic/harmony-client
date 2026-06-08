@@ -41,7 +41,7 @@
   import { LibraryDirectoryService } from './lib/library-directory-service';
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
-  import { CommunityService } from './lib/community-service';
+  import { CommunityService, rosterHasJoinedAuthor } from './lib/community-service';
   import { FriendService } from './lib/friend-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
@@ -857,6 +857,12 @@
   let sharedInProfileByCommunity = $state<Map<string, boolean>>(new Map());
   let selectedCommunityId = $state<string | null>(null);
   let communityMembers = $state<CommunityMember[]>([]);
+  // ZEB-404: timestamp throttle for the message-triggered roster refetch (see
+  // the channelMessageService.onMessage wiring). Time-based — a failed or
+  // too-early refresh self-heals on the next message rather than permanently
+  // suppressing an author. Reset on community switch so each community starts
+  // fresh.
+  let lastMessageRosterRefetchAt = 0;
   let myAddress = $state('');
   // Local mirror of communityService.isDegraded(selectedCommunityId).
   // Direct method calls in the template aren't reactive — we need a
@@ -884,6 +890,8 @@
   function changeSelectedCommunity(id: string | null) {
     if (selectedCommunityId !== id) {
       communityMembers = [];
+      // ZEB-404: new community session → reset the refetch throttle.
+      lastMessageRosterRefetchAt = 0;
     }
     // ZEB-334 (Cursor PR #180): selecting a real community leaves the Notes
     // space, so the nav highlights the community and the feed shows it. Passing
@@ -896,21 +904,24 @@
 
   async function refreshCommunityMembers(id: string) {
     try {
-      const fresh = await communityService.listCommunityMembers(id);
-      // Stale-response guard: if the user switched communities while
-      // we were awaiting, drop the result rather than overwriting the
-      // newly-selected community's roster with the previous one's.
+      // ZEB-404: force-bypass the per-community member cache — an explicit
+      // refresh must return ground truth (the cache is invalidated only by the
+      // `community-members-changed` event, the very signal a missed-delta
+      // refresh compensates for). Concurrent same-community refreshes are
+      // coalesced inside CommunityService (single-flight), so overlapping
+      // triggers (message throttle, reconnect, community-open) can't race the
+      // cache or the roster.
+      const fresh = await communityService.listCommunityMembers(id, true);
+      // Drop if the user switched communities while we were awaiting.
       if (selectedCommunityId !== id) return;
       communityMembers = fresh;
     } catch (e) {
       // listCommunityMembers throws when the adapter isn't connected
-      // (mock-data mode) or when the backend isn't ready. Surface the
-      // failure to the console rather than crash the app — the panel
-      // simply renders with an empty member list.
-      if (selectedCommunityId !== id) return;
+      // (mock-data mode) or the backend isn't ready. Surface the failure to
+      // the console and keep the last known-good roster rather than wiping it
+      // on a transient failure — the throttle/reconnect paths will retry.
       const msg = e instanceof Error ? e.message : String(e);
       console.warn('[harmony-client] listCommunityMembers failed:', msg);
-      communityMembers = [];
     }
   }
 
@@ -1257,6 +1268,27 @@
     }
   };
 
+  // ZEB-404: a channel message from an author not in our roster means we
+  // missed a live `community-members-changed` delta — the joiner announced
+  // themselves by speaking. Re-fetch the roster (which also re-subscribes the
+  // joiner's profile card, so their nickname resolves). Throttle so a backfill
+  // (or a departed member's old posts, who never become 'joined') can't spin
+  // refetches: at most one message-triggered refresh per
+  // ROSTER_REFETCH_MIN_INTERVAL_MS. The throttle is time-based, not per-author,
+  // so a failed or too-early refresh self-heals on the next message after the
+  // window — it never permanently suppresses an author. We refetch the message's
+  // own community (== selectedCommunityId here); refreshCommunityMembers' own
+  // stale-response guard drops the result if the selection changed in-flight.
+  const ROSTER_REFETCH_MIN_INTERVAL_MS = 3000;
+  channelMessageService.onMessage = (communityId, _channelId, message) => {
+    if (communityId !== selectedCommunityId) return;
+    if (rosterHasJoinedAuthor(communityMembers, message.author)) return;
+    const now = Date.now();
+    if (now - lastMessageRosterRefetchAt < ROSTER_REFETCH_MIN_INTERVAL_MS) return;
+    lastMessageRosterRefetchAt = now;
+    void refreshCommunityMembers(communityId);
+  };
+
   // Keep the display name on both services in sync with profile edits.
   $effect(() => {
     const name = myProfile.displayName || 'You';
@@ -1501,6 +1533,12 @@
         if (status.status === 'connected') {
           await fetchOwnAddress();
           await reloadBackendState();
+          // ZEB-404: a reconnect may have missed live community-members-changed
+          // deltas while the session was down; converge the active community's
+          // roster (and, transitively, its members' profile cards).
+          if (selectedCommunityId !== null) {
+            void refreshCommunityMembers(selectedCommunityId);
+          }
           // ZEB-341: the initial get_owner_state probe can return null when the
           // owner finishes loading AFTER start_node returns; selfOwnerId would
           // then stay null and tryBootPublishCard would be a permanent no-op.

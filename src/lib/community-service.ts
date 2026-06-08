@@ -92,6 +92,23 @@ function dtoToMember(d: MemberInfoDto): CommunityMember {
   };
 }
 
+/**
+ * True iff `authorHex` is a currently-JOINED member of `members`.
+ *
+ * Used (ZEB-404) to detect a message from someone not yet in our roster — a
+ * signal that we missed a live `community-members-changed` delta and the
+ * roster should be re-fetched. Address comparison is case-insensitive because
+ * roster addresses and message authors are both lowercase hex by convention,
+ * but we normalize defensively.
+ */
+export function rosterHasJoinedAuthor(
+  members: Pick<CommunityMember, 'address' | 'status'>[],
+  authorHex: string,
+): boolean {
+  const a = authorHex.toLowerCase();
+  return members.some((x) => x.status === 'joined' && x.address.toLowerCase() === a);
+}
+
 export class CommunityService {
   /** Called when a community's member roster changes. The receiver
    *  should refresh listCommunityMembers for the given community.
@@ -117,6 +134,9 @@ export class CommunityService {
 
   private adapter: TauriAdapter | null = null;
   private memberCache: Map<string, CommunityMember[]> = new Map();
+  // ZEB-404: in-flight member fetches per community, for single-flight
+  // coalescing (see listCommunityMembers).
+  private inFlightMemberFetches: Map<string, Promise<CommunityMember[]>> = new Map();
   private degraded: Map<string, boolean> = new Map();
   // Per-community kind. Populated by createCommunity (from the
   // user-supplied argument) and redeemInvite (from
@@ -327,13 +347,45 @@ export class CommunityService {
     this.selectedChannelByCommunity.set(communityId, channelId);
   }
 
-  async listCommunityMembers(communityId: string): Promise<CommunityMember[]> {
-    const cached = this.memberCache.get(communityId);
-    if (cached) return cached;
-    const dtos = await this.invoke<MemberInfoDto[]>('list_community_members', { communityId });
-    const fresh = dtos.map(dtoToMember);
-    this.memberCache.set(communityId, fresh);
-    return fresh;
+  /**
+   * Fetch a community's members. Returns the per-community in-memory cache
+   * when present and `forceRefresh` is false.
+   *
+   * ZEB-404: explicit live-refresh triggers (a peer joined / reconnect) pass
+   * `forceRefresh: true` so they bypass a roster the cache may be holding
+   * stale — the cache is otherwise invalidated only by the
+   * `community-members-changed` event, the very event those triggers exist to
+   * compensate for when it isn't delivered.
+   */
+  async listCommunityMembers(
+    communityId: string,
+    forceRefresh = false,
+  ): Promise<CommunityMember[]> {
+    // ZEB-404: single-flight. Multiple triggers (the message-throttle,
+    // reconnect, and community-open refreshes) can request a fetch for the same
+    // community concurrently. Share any in-flight fetch FIRST — before the
+    // cache — so even a non-forced read joins an imminent fresh result instead
+    // of serving a cache entry that fetch is about to replace. Coalescing also
+    // makes the cache write single and ordered, so two overlapping IPCs can't
+    // complete out of order and poison `memberCache`.
+    const inFlight = this.inFlightMemberFetches.get(communityId);
+    if (inFlight) return inFlight;
+    if (!forceRefresh) {
+      const cached = this.memberCache.get(communityId);
+      if (cached) return cached;
+    }
+    const fetchPromise = (async () => {
+      try {
+        const dtos = await this.invoke<MemberInfoDto[]>('list_community_members', { communityId });
+        const fresh = dtos.map(dtoToMember);
+        this.memberCache.set(communityId, fresh);
+        return fresh;
+      } finally {
+        this.inFlightMemberFetches.delete(communityId);
+      }
+    })();
+    this.inFlightMemberFetches.set(communityId, fetchPromise);
+    return fetchPromise;
   }
 
   async listRecentModerationEvents(

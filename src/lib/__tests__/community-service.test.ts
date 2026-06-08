@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { CommunityService } from '../community-service';
+import { CommunityService, rosterHasJoinedAuthor } from '../community-service';
 import type { TauriAdapter } from '../zenoh-service';
 
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
@@ -176,6 +176,42 @@ describe('CommunityService', () => {
     expect(r2).toEqual(r1);
     // Cached: only one IPC call
     expect(adapter.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('listCommunityMembers forceRefresh bypasses the cache (ZEB-404)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue([]);
+
+    await service.listCommunityMembers('aabbccdd'); // populates cache
+    expect(adapter.invoke).toHaveBeenCalledTimes(1);
+
+    await service.listCommunityMembers('aabbccdd'); // cache hit, no IPC
+    expect(adapter.invoke).toHaveBeenCalledTimes(1);
+
+    await service.listCommunityMembers('aabbccdd', true); // forced → re-fetch
+    expect(adapter.invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('listCommunityMembers coalesces concurrent fetches per community (single-flight, ZEB-404)', async () => {
+    await service.connectAdapter(adapter);
+    let resolveFetch: (v: unknown) => void = () => {};
+    (adapter.invoke as any).mockImplementation(
+      () => new Promise((r) => { resolveFetch = r as (v: unknown) => void; }),
+    );
+
+    // Two overlapping forced fetches for the same community share one IPC.
+    const p1 = service.listCommunityMembers('aabbccdd', true);
+    const p2 = service.listCommunityMembers('aabbccdd', true);
+    expect(adapter.invoke).toHaveBeenCalledTimes(1);
+
+    resolveFetch([]);
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r2).toBe(r1); // same shared result, no out-of-order cache write
+
+    // In-flight entry cleared on completion: a later forced fetch re-fetches.
+    (adapter.invoke as any).mockResolvedValue([]);
+    await service.listCommunityMembers('aabbccdd', true);
+    expect(adapter.invoke).toHaveBeenCalledTimes(2);
   });
 
   it('community-members-changed for a community invalidates its cache', async () => {
@@ -373,5 +409,20 @@ describe('CommunityService', () => {
     (adapter2.invoke as any).mockResolvedValue([]);
     await service2.listChannels('aa'.repeat(16));
     expect(adapter2.invoke).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('rosterHasJoinedAuthor (ZEB-404)', () => {
+  it('true when a joined member matches (case-insensitive)', () => {
+    expect(rosterHasJoinedAuthor([{ address: 'AB12', status: 'joined' }], 'ab12')).toBe(true);
+  });
+  it('false when the author is absent from the roster', () => {
+    expect(rosterHasJoinedAuthor([{ address: 'ab12', status: 'joined' }], 'cd34')).toBe(false);
+  });
+  it('false when the only address match is not joined', () => {
+    expect(rosterHasJoinedAuthor([{ address: 'ab12', status: 'invited' }], 'ab12')).toBe(false);
+  });
+  it('false on an empty roster', () => {
+    expect(rosterHasJoinedAuthor([], 'ab12')).toBe(false);
   });
 });
