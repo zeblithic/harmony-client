@@ -75,6 +75,9 @@
   // ── ZEB-388: my own identity pub hex (share for add-by-key) ───────────────
   let myKeyHex = $state<string | null>(null);
   let myKeyCopied = $state(false);
+  // Handle for the "Copied!" reset timer — cleared on re-click and on destroy
+  // so we never mutate $state after the component unmounts.
+  let myKeyCopiedTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Auto-accept toggle.
   let autoAccept = $state(false);
@@ -136,8 +139,14 @@
   async function loadMyKey(): Promise<void> {
     try {
       myKeyHex = await service.getMyIdentityPubHex();
-    } catch {
-      // Non-fatal: leave myKeyHex null → neutral "start your node" state.
+    } catch (e) {
+      // The Ok(None) "node not started" path does NOT throw, so a throw here is
+      // a real backend failure (e.g. a poisoned NodeState). Log it rather than
+      // swallow it silently; the UI still falls back to the neutral null state.
+      console.error(
+        'getMyIdentityPubHex failed:',
+        e instanceof Error ? e.message : String(e),
+      );
       myKeyHex = null;
     }
   }
@@ -162,6 +171,8 @@
     unsubscribeChanged = null;
     unsubscribePendingChanged?.();
     unsubscribePendingChanged = null;
+    if (myKeyCopiedTimer) clearTimeout(myKeyCopiedTimer);
+    myKeyCopiedTimer = null;
   });
 
   async function handleGenerate(): Promise<void> {
@@ -192,8 +203,12 @@
     try {
       await navigator.clipboard.writeText(myKeyHex);
       myKeyCopied = true;
-      setTimeout(() => {
+      // Clear any in-flight reset (rapid re-clicks) before scheduling a new one;
+      // onDestroy clears it too so we never write $state after unmount.
+      if (myKeyCopiedTimer) clearTimeout(myKeyCopiedTimer);
+      myKeyCopiedTimer = setTimeout(() => {
         myKeyCopied = false;
+        myKeyCopiedTimer = null;
       }, 1500);
     } catch {
       // Clipboard unavailable (headless / permission); the hex stays visible
