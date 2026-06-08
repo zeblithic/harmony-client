@@ -6,8 +6,9 @@
 use crate::identity::KeychainStore;
 use crate::identity_commands::run_blocking;
 use crate::owner_state::{
-    insert_token, load_owner_state, save_owner_state_atomic, take_token, DeviceView,
-    LoadedOwnerState, OwnerStateView, TrustDecisionView, TrustKind,
+    insert_token, load_owner_state, refresh_self_liveness, save_owner_state_atomic,
+    save_owner_state_cbor_only, take_token, DeviceView, LoadedOwnerState, OwnerStateView,
+    TrustDecisionView, TrustKind,
 };
 use crate::recovery_policy::{MAX_RECOVERY_COMMENT_BYTES, MIN_RECOVERY_PASSPHRASE_LEN};
 use harmony_owner::lifecycle::{mint_owner, MintResult, RecoveryArtifact};
@@ -136,8 +137,20 @@ pub async fn get_owner_state(_app: tauri::AppHandle) -> Result<Option<OwnerState
     let identity_dir = resolve_identity_dir()?;
     let display_name = "this device".to_string();
     run_blocking(move || {
-        let loaded = load_owner_state(&identity_dir, KeychainStore::new().ok())?;
-        Ok(loaded.map(|l| build_owner_state_view(&l, display_name)))
+        // ZEB-342: hold the write lock across load+refresh+save so the cbor
+        // write stays serialized with mint / pairing-install. Loading inside
+        // the lock closes the read-modify-write race with those writers.
+        let _guard = OWNER_STATE_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut loaded = match load_owner_state(&identity_dir, KeychainStore::new().ok())? {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now_unix()) {
+            save_owner_state_cbor_only(&identity_dir, &loaded.state)?;
+        }
+        Ok(Some(build_owner_state_view(&loaded, display_name)))
     })
     .await
 }

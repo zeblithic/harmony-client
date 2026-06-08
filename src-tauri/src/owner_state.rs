@@ -777,7 +777,9 @@ mod persistence_tests {
         save_owner_state_cbor_only(dir.path(), &state).unwrap();
 
         // Reload: cbor reflects the mutation AND the master seed survived.
-        let loaded = load_owner_state(dir.path(), None).unwrap().expect("must be Some");
+        let loaded = load_owner_state(dir.path(), None)
+            .unwrap()
+            .expect("must be Some");
         assert_eq!(
             loaded.state.liveness.len(),
             0,
@@ -846,6 +848,72 @@ mod persistence_tests {
         let mutated = refresh_self_liveness(&mut state, &device_signing_key, later);
         assert!(mutated, "stale liveness must be re-signed");
         assert!(state.liveness.get(&device_id).unwrap().timestamp > old_ts);
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_identity_self_heals_to_full_on_load_and_persists() {
+        // Mirrors get_owner_state's load -> refresh -> persist sequence for a
+        // legacy on-disk identity (enrolled, NO liveness, has master seed).
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "self-heal-test-pp");
+        let dir = tempdir().unwrap();
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_444).unwrap();
+        state.liveness.clear();
+        save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            Some(recovery_artifact.as_bytes()),
+            None,
+        )
+        .unwrap();
+
+        let now = 1_700_000_500;
+        let mut loaded = load_owner_state(dir.path(), None).unwrap().expect("Some");
+        let device_id = *loaded.state.enrollments.keys().next().unwrap();
+        assert_eq!(
+            harmony_owner::trust::evaluate_trust(
+                &loaded.state,
+                device_id,
+                now,
+                harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
+            ),
+            harmony_owner::trust::TrustDecision::Refused(
+                harmony_owner::trust::RefusalReason::StaleTrustState
+            ),
+            "precondition: legacy identity is Refused before refresh"
+        );
+
+        if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now) {
+            save_owner_state_cbor_only(dir.path(), &loaded.state).unwrap();
+        }
+
+        // Reload from disk: now Full + persisted + master seed intact.
+        let reloaded = load_owner_state(dir.path(), None).unwrap().expect("Some");
+        assert_eq!(
+            reloaded.state.liveness.len(),
+            1,
+            "liveness must be persisted"
+        );
+        assert_eq!(
+            harmony_owner::trust::evaluate_trust(
+                &reloaded.state,
+                device_id,
+                now,
+                harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
+            ),
+            harmony_owner::trust::TrustDecision::Full,
+        );
+        assert!(
+            reloaded.master_seed.is_some(),
+            "master seed must survive the refresh-persist"
+        );
     }
 
     #[test]
