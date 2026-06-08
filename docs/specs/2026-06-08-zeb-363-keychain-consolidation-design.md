@@ -9,16 +9,18 @@ when choosing "Always Allow." First-impression UX is poor.
 
 macOS keychain ACLs are **per-item** *and* **per-code-identity**. "Always Allow"
 whitelists one caller for one specific item; N distinct items ⇒ N prompts. Setup
-writes **3 distinct keychain items**, loaded sequentially at startup:
+writes up to **4 distinct keychain items**, loaded sequentially at startup:
 
 | Item (service / account) | Secret | Loader (`lib.rs`) |
 |---|---|---|
 | `harmony` / `identity` | identity seed (32 B) | `identity::load_or_generate` (`:2377`) |
 | `harmony.owner` / `device_signing_key` | device #2 signing key (32 B) | `owner_state::load_owner_state` (`:2450`) |
+| `harmony.owner` / `master_seed` | owner identity master seed (32 B) | `owner_state::load_owner_state` (`:2450`) |
 | `harmony.client` / `iroh.secret_key` | iroh transport key (32 B) | `iroh_endpoint::load_or_create_secret_key` (`:2742`) |
 
-(The reported "4th" prompt is a repeat access under the unsigned-dev-build
-re-prompt behaviour — see Scope.)
+(The owner `master_seed` item is absent in the cert-only joiner model, so a
+joiner sees 3 of these; a full-owner install sees all 4. A further unsigned-dev-
+build re-prompt can appear on top of these — see Scope.)
 
 The seed already has a clean `SeedStore` abstraction (trait + keychain impl +
 `HRMI` encrypted-file fallback). The iroh and device keys each open their own raw
@@ -26,9 +28,9 @@ The seed already has a clean `SeedStore` abstraction (trait + keychain impl +
 
 ## Goal
 
-Collapse the 3 items into **one keychain item** (one ACL ⇒ at most one prompt per
+Collapse the 4 items into **one keychain item** (one ACL ⇒ at most one prompt per
 fresh setup), preserving the encrypted-file fallback and the seed-only recovery
-model, with a safe migration from the existing 3-item layout.
+model, with a safe migration from the existing multi-item layout.
 
 ## Scope
 
@@ -52,9 +54,10 @@ subsystems.
 /// file in the headless fallback). Zeroized on drop.
 struct SecretVault {
     version: u8,                              // VAULT_VERSION = 1
-    seed: [u8; 32],                           // identity master seed (recovery root)
+    seed: [u8; 32],                           // node identity master seed (recovery root)
     iroh_secret_key: Option<[u8; 32]>,        // independent-random transport key
     device_signing_key: Option<[u8; 32]>,     // device #2 signing key
+    owner_master_seed: Option<[u8; 32]>,      // owner identity master seed (None for joiners)
 }
 ```
 
@@ -97,30 +100,34 @@ to `0x02` on the next save.
 
 ## Migration (failure-safe, idempotent)
 
-On startup load of the `harmony`/`identity` item:
+Migration is **inline and per-key**, driven by the accessors rather than a single
+startup pass. The seed item is read first (a legacy 32-byte seed decodes into a
+seed-only vault; a CBOR vault is used as-is). Each app-local key — iroh
+(`harmony.client`/`iroh.secret_key`), device signing
+(`harmony.owner`/`device_signing_key`), and owner master seed
+(`harmony.owner`/`master_seed`) — folds in on first access via its slot accessor:
 
-1. If the item is a CBOR vault already → done (steady state).
-2. If the item is a legacy 32-byte seed (or absent but the two old items exist):
-   a. Read the seed (from the legacy item or the encrypted file).
-   b. Best-effort read the old `harmony.client`/`iroh.secret_key` and
-      `harmony.owner`/`device_signing_key` items.
-   c. Assemble `SecretVault { seed, iroh, device }`.
-   d. **Write** the vault to `harmony`/`identity`, **read it back**, and verify
-      the folded keys match.
-   e. **Only on verified read-back**, delete the old iroh + device items.
-   f. If any of (d)/(e) fails → keep all old items, log a warning, and continue on
-      the legacy path (no data loss; retried next boot).
+1. Read the slot from the vault. Present → return it (steady state).
+2. Absent → best-effort read the corresponding **legacy single-key item**.
+3. If found, set the slot and **write** the vault to `harmony`/`identity`,
+   **read it back**, and verify the folded key matches.
+4. **Only on verified read-back**, delete that legacy item.
+5. If the write or read-back fails → keep the legacy item, log a warning, and
+   continue (no data loss; retried next access / next boot).
 
-Fresh installs never enter migration: the vault is created once with the seed, and
-iroh/device keys are added to it lazily on first use — all within the one item.
+Fresh installs never migrate: the vault is created once with the seed, and the
+three app-local keys are generated lazily into it on first use — all within the
+one item.
 
 ## Recovery stays seed-only
 
-The mnemonic and exported recovery files encode **only `vault.seed`** (iroh/device
-keys are app-local and regenerable). `read_seed_from_disk*` returns `vault.seed`;
-`write_seed_to_disk*` writes the seed into the `seed` field of a vault (preserving
-any existing iroh/device fields, or creating a seed-only vault). Restore-from-
-recovery yields a seed-only vault; iroh/device keys regenerate on next boot.
+The mnemonic and exported recovery files encode **only `vault.seed`** (the
+app-local keys — iroh, device, owner-master — are regenerable). `read_seed_from_disk*`
+returns `vault.seed`; `write_seed_to_disk*` writes the seed into the `seed` field
+of a vault (RMW-preserving any existing app-local fields, or creating a seed-only
+vault). On the keychain backend this preserves the app-local keys across a
+restore; where it must fall back to the encrypted file, they regenerate on next
+boot, consistent with the seed-only recovery model.
 
 ## Startup wiring
 
@@ -151,8 +158,13 @@ Mock-keychain (`keyring::mock`) + tempfile unit tests:
 - **Corrupt item:** non-32-byte, non-CBOR value → hard error, never overwritten.
 - All existing `identity.rs` seed tests continue to pass (seed semantics preserved).
 
-Gates: `cargo fmt`, `cargo clippy --all-targets --features test-fixtures
--D warnings`, `cargo nextest run -p harmony-app --lib --features test-fixtures`.
+Gates (from `src-tauri/`, per repo policy — `--locked` and `--all-targets` are
+load-bearing):
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`
+- `cargo nextest run --locked --workspace --all-targets --features test-fixtures`
+- `cargo check --locked --all-targets --features test-fixtures` (MSRV toolchain)
 
 ## Risks
 
