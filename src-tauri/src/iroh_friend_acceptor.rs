@@ -301,6 +301,10 @@ pub enum FriendHandshakeError {
     /// The handshake signature did not verify against the enrolled device key.
     #[error("handshake signature invalid")]
     SignatureInvalid,
+    /// `cert.verify()` failed specifically because the cert's `expires_at` is in
+    /// the past (ZEB-378). Distinct from `EnrollmentCertInvalid` for telemetry.
+    #[error("enrollment cert expired")]
+    EnrollmentCertExpired,
     /// Applying the resulting `FriendEntry` to the CRDT was rejected (e.g. a
     /// stale HLC or a key↔master-key invariant failure).
     #[error("friend-graph apply rejected: {0}")]
@@ -398,9 +402,14 @@ fn decode_strict<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, Friend
 pub fn verify_enrolled_device(
     cert: &EnrollmentCert,
     claimed_owner: OwnerAddr,
+    now_ms: u64,
 ) -> Result<[u8; 32], FriendHandshakeError> {
-    cert.verify()
-        .map_err(|_| FriendHandshakeError::EnrollmentCertInvalid)?;
+    cert.verify(now_ms).map_err(|e| match e {
+        harmony_owner::OwnerError::EnrollmentCertExpired { .. } => {
+            FriendHandshakeError::EnrollmentCertExpired
+        }
+        _ => FriendHandshakeError::EnrollmentCertInvalid,
+    })?;
     // Reject non-Master issuers: cert.verify() only structurally-checks Quorum
     // certs (it cannot verify the quorum signatures without an OwnerState walk-
     // back), so accepting one here would admit unverified signatures. Mirrors
@@ -537,7 +546,7 @@ pub const DEFAULT_FRIEND_IO_DEADLINE_MS: u64 = 30_000;
 /// Wall-clock now in epoch-milliseconds — the same one-syscall pattern used
 /// throughout `lib.rs` (`generate_invite`/HLC reservation) and `next_hlc`.
 /// Saturates to `0` if the clock is before the epoch.
-fn wall_now_ms() -> u64 {
+pub(crate) fn wall_now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
