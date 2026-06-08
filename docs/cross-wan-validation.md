@@ -62,6 +62,11 @@ self-test again and capture diagnostics.
 
 ## Step 3: Exchange
 
+> To exchange raw identity keys directly (instead of going through a community
+> invite), each tester opens **Friends → My key**, clicks **Copy**, and sends the
+> 128-char hex to the other out-of-band; the receiver pastes it into **Add friend
+> by key**. ("My key" shows "Start your node to view your key" until the node is up.)
+
 1. On **machine A**: send a DM to machine B's identity ("hello from A").
 2. On **machine B**: confirm receipt.
 3. Reverse: B → A.
