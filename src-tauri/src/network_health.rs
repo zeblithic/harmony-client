@@ -1209,11 +1209,18 @@ impl IrohSelfTest for ProdSelfTest {
             };
             // Fresh resolver -> empty cache -> a real round-trip every run. A
             // random throwaway key is almost certainly absent, so a reachable
-            // relay returns Ok(None); only a transport failure returns Err.
+            // relay returns Ok(None); a transport failure returns Err.
+            //
+            // The resolver wraps the LIVE RelayClient shared with the background
+            // publisher: if every relay is on cooldown from a recent publish
+            // failure, the GET short-circuits to Err without touching the
+            // network. The resulting Fail is still accurate (the relay is
+            // currently unavailable to this node), just with ~0ms duration.
             let resolver = harmony_pkarr::PkarrResolver::new(std::sync::Arc::clone(relay));
+            // Time the full observable latency, including the blocking keygen.
+            let start = std::time::Instant::now();
             let probe_vk =
                 ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
-            let start = std::time::Instant::now();
             match resolver.resolve(&probe_vk).await {
                 Ok(_) => StepOutcome::Pass {
                     duration_ms: start.elapsed().as_millis() as u32,
@@ -1257,10 +1264,8 @@ impl PkarrSelfTest for ProdSelfTest {
                     reason: "identity not loaded".into(),
                 };
             };
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            // Single clock sample for both key derivation and skew verification.
+            let now_ms = now_ms();
             let verifying_keys: Vec<_> = harmony_pkarr::epoch_tolerance_window(now_ms)
                 .iter()
                 .map(|&epoch| {
@@ -2482,6 +2487,27 @@ mod tests {
             identity_publishing: false,
         };
         assert!(!probes.endpoint_bound());
+    }
+
+    #[tokio::test]
+    async fn prod_relay_and_resolve_fail_when_no_relay_client() {
+        // Defensive None-guards: with no relay client, both pkarr round-trips
+        // Fail (rather than panic) — covers the early-return branches.
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: None,
+            identity_pub_64: Some([0u8; 64]),
+            discoverable: true,
+            identity_publishing: true,
+        };
+        assert!(matches!(
+            probes.relay_round_trip().await,
+            StepOutcome::Fail { .. }
+        ));
+        assert!(matches!(
+            probes.resolve_self().await,
+            StepOutcome::Fail { .. }
+        ));
     }
 
     // ── ZEB-373 Task 3: DialTelemetry tests ─────────────────────────
