@@ -460,6 +460,21 @@ pub fn save_owner_state_atomic(
     Ok(())
 }
 
+/// Persist only the `OwnerState` CRDT to `owner_state.cbor` (canonical CBOR,
+/// atomic 0600). Unlike [`save_owner_state_atomic`], this does NOT touch the
+/// `device_signing_key` / `master_seed` keychain entries — it is for callers
+/// (e.g. the ZEB-342 liveness refresh) that mutate only the CRDT and must not
+/// risk clearing the master seed via the `master_seed == None` joiner branch.
+/// Callers MUST hold `OWNER_STATE_WRITE_LOCK`.
+pub fn save_owner_state_cbor_only(identity_dir: &Path, state: &OwnerState) -> Result<(), String> {
+    let cbor_bytes =
+        cbor::to_canonical(state).map_err(|e| format!("CBOR encode of OwnerState failed: {e}"))?;
+    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    write_atomic_0600(&cbor_path, &cbor_bytes)
+        .map_err(|e| format!("failed to write {}: {e}", cbor_path.display()))?;
+    Ok(())
+}
+
 /// Load a 32-byte secret from keychain primary, encrypted-file fallback.
 /// Returns `Ok(None)` when neither source has the secret.
 ///
@@ -692,6 +707,46 @@ mod persistence_tests {
             device_signing_key.to_bytes()
         );
         assert_eq!(loaded.master_seed.as_deref(), Some(&master_seed));
+    }
+
+    #[test]
+    #[serial]
+    fn cbor_only_persists_state_without_touching_keychain() {
+        // ZEB-342: the liveness refresh persists ONLY the CRDT via the cbor-only
+        // writer; it must NOT clear the master-seed keychain entry the way
+        // save_owner_state_atomic(None) does.
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "cbor-only-test-pp");
+        let dir = tempdir().unwrap();
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_111).unwrap();
+        // Full save first: writes device_sk + master_seed keychain entries + cbor.
+        save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            Some(recovery_artifact.as_bytes()),
+            None,
+        )
+        .unwrap();
+
+        // Mutate the CRDT (simulate a liveness refresh) and persist cbor-only.
+        state.liveness.clear();
+        save_owner_state_cbor_only(dir.path(), &state).unwrap();
+
+        // Reload: cbor reflects the mutation AND the master seed survived.
+        let loaded = load_owner_state(dir.path(), None).unwrap().expect("must be Some");
+        assert_eq!(
+            loaded.state.liveness.len(),
+            0,
+            "cbor-only write must persist the CRDT mutation"
+        );
+        assert!(
+            loaded.master_seed.is_some(),
+            "cbor-only write must NOT clear the master seed"
+        );
     }
 
     #[test]
