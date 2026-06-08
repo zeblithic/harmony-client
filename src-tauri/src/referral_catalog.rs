@@ -249,11 +249,12 @@ pub fn sign_catalog_request(
 pub fn authenticate_catalog_request(
     req: &CatalogRequest,
     self_owner: OwnerAddr,
+    now_ms: u64,
 ) -> Result<(), ReferralAuthError> {
     if req.to_addr != self_owner {
         return Err(ReferralAuthError::WrongTarget);
     }
-    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr)
+    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_ms)
         .map_err(|_| ReferralAuthError::Auth)?;
     let vk =
         VerifyingKey::from_bytes(&device_key).map_err(|_| ReferralAuthError::SignatureInvalid)?;
@@ -301,12 +302,13 @@ pub fn verify_referral_catalog(
     cat: &ReferralCatalog,
     expected_author: OwnerAddr,
     expected_subject: OwnerAddr,
+    now_ms: u64,
 ) -> Result<(), ReferralAuthError> {
     if cat.author != expected_author {
         return Err(ReferralAuthError::AuthorMismatch);
     }
-    let device_key =
-        verify_enrolled_device(&cat.enrollment, cat.author).map_err(|_| ReferralAuthError::Auth)?;
+    let device_key = verify_enrolled_device(&cat.enrollment, cat.author, now_ms)
+        .map_err(|_| ReferralAuthError::Auth)?;
     let vk =
         VerifyingKey::from_bytes(&device_key).map_err(|_| ReferralAuthError::SignatureInvalid)?;
     let preimage =
@@ -550,18 +552,18 @@ mod tests {
         );
 
         // Happy path: correct author + subject verifies.
-        assert!(verify_referral_catalog(&cat, f.owner, subject).is_ok());
+        assert!(verify_referral_catalog(&cat, f.owner, subject, 0).is_ok());
 
         // Wrong subject → the signature no longer covers the expected preimage.
-        assert!(verify_referral_catalog(&cat, f.owner, OwnerAddr([0x99; 16])).is_err());
+        assert!(verify_referral_catalog(&cat, f.owner, OwnerAddr([0x99; 16]), 0).is_err());
 
         // Wrong expected author → AuthorMismatch (checked before crypto).
-        assert!(verify_referral_catalog(&cat, OwnerAddr([0x88; 16]), subject).is_err());
+        assert!(verify_referral_catalog(&cat, OwnerAddr([0x88; 16]), subject, 0).is_err());
 
         // Tampered entry display → signature over the entries no longer matches.
         let mut tampered = cat.clone();
         tampered.entries[0].display = Some("eve".to_string());
-        assert!(verify_referral_catalog(&tampered, f.owner, subject).is_err());
+        assert!(verify_referral_catalog(&tampered, f.owner, subject, 0).is_err());
     }
 
     #[test]
@@ -579,7 +581,7 @@ mod tests {
         );
         // Swap in G's cert: now cert.owner_id (G) != author (F).
         cat.enrollment = g.cert.clone();
-        assert!(verify_referral_catalog(&cat, f.owner, subject).is_err());
+        assert!(verify_referral_catalog(&cat, f.owner, subject, 0).is_err());
     }
 
     #[test]
@@ -591,7 +593,7 @@ mod tests {
         let f_owner = OwnerAddr([0x42; 16]);
         let mut req = sign_catalog_request(&r.device_key, r.owner, f_owner, r.cert.clone());
         req.enrollment = s.cert.clone();
-        assert!(authenticate_catalog_request(&req, f_owner).is_err());
+        assert!(authenticate_catalog_request(&req, f_owner, 0).is_err());
     }
 
     #[test]
@@ -601,15 +603,15 @@ mod tests {
         let req = sign_catalog_request(&r.device_key, r.owner, f_owner, r.cert.clone());
 
         // Happy path: addressed to f_owner, valid sig.
-        assert!(authenticate_catalog_request(&req, f_owner).is_ok());
+        assert!(authenticate_catalog_request(&req, f_owner, 0).is_ok());
 
         // Wrong target server → WrongTarget (checked before crypto).
-        assert!(authenticate_catalog_request(&req, OwnerAddr([0x43; 16])).is_err());
+        assert!(authenticate_catalog_request(&req, OwnerAddr([0x43; 16]), 0).is_err());
 
         // Flipped signature bit → SignatureInvalid.
         let mut bad = req.clone();
         bad.sig[0] ^= 1;
-        assert!(authenticate_catalog_request(&bad, f_owner).is_err());
+        assert!(authenticate_catalog_request(&bad, f_owner, 0).is_err());
     }
 
     /// Build a FULL valid `FriendEntry` with deterministic field values, varying
@@ -679,7 +681,7 @@ mod tests {
             build_referral_catalog(&fg, subject, f.owner, f.cert.clone(), &f.device_key, hlc(7));
 
         assert_eq!(cat.entries.len(), 1);
-        assert!(verify_referral_catalog(&cat, f.owner, subject).is_ok());
+        assert!(verify_referral_catalog(&cat, f.owner, subject, 0).is_ok());
     }
 
     #[test]
