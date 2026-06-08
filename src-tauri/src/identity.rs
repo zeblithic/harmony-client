@@ -20,6 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use harmony_identity::{PqPrivateIdentity, PrivateIdentity};
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 /// Plaintext payload protected by the `HRMI` envelope: the master 32-byte
@@ -90,9 +91,12 @@ impl NodeIdentity {
 
 // ── Serialization helpers (shared by both backends) ─────────────────────
 
-/// Serialize a 32-byte seed into the on-disk binary format. Identity at this
-/// layer is *just* the seed — the sub-keys are derived deterministically via
-/// `NodeIdentity::from_seed` on every load.
+/// Serialize a 32-byte seed into the legacy raw-32 on-disk format.
+///
+/// ZEB-363: production now persists a CBOR [`SecretVault`], not a bare seed, so
+/// this is retained only for tests that construct a legacy raw-32 item/file to
+/// exercise the legacy-detection + migration paths.
+#[cfg(test)]
 fn seed_to_blob(seed: &[u8; BLOB_LEN]) -> Zeroizing<Vec<u8>> {
     let mut buf = Zeroizing::new(Vec::with_capacity(BLOB_LEN));
     buf.extend_from_slice(seed);
@@ -395,14 +399,387 @@ pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LE
     Ok(blob_arr)
 }
 
+// ── SecretVault ─────────────────────────────────────────────────────────
+
+/// Version tag for the CBOR `SecretVault` payload. Distinct from the `HRMI`
+/// encrypted-file envelope version ([`ENC_FORMAT_VERSION`]): this versions the
+/// *plaintext* secret structure; that versions the *file* framing.
+const VAULT_VERSION: u8 = 1;
+
+/// All process-local secrets, stored as ONE keychain item (and, in the headless
+/// fallback, one `HRMI` encrypted file). Zeroized on drop.
+///
+/// ZEB-363: collapses the previously-separate `harmony.client`/`iroh.secret_key`
+/// and `harmony.owner`/`device_signing_key` keychain items into the seed's
+/// `harmony`/`identity` item, so macOS prompts for keychain access once during
+/// setup instead of three times. The `seed` is the recovery root (mnemonic /
+/// recovery exports encode only it); `iroh_secret_key` and `device_signing_key`
+/// are app-local, regenerable, and `None` until first use.
+///
+/// No `Debug` (would print key material). `PartialEq` is test-only — production
+/// comparisons (migration read-back verification) compare fields explicitly.
+#[derive(Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+struct SecretVault {
+    /// Structure version — see [`VAULT_VERSION`].
+    version: u8,
+    /// Identity master seed (recovery root); sub-keys derive from this.
+    seed: [u8; BLOB_LEN],
+    /// iroh transport secret key (independent-random; `None` until first node start).
+    iroh_secret_key: Option<[u8; 32]>,
+    /// Device #2 signing key (`None` until owner-state init).
+    device_signing_key: Option<[u8; 32]>,
+}
+
+impl SecretVault {
+    /// A fresh vault holding only the seed (no app-local keys yet).
+    fn from_seed(seed: [u8; BLOB_LEN]) -> Self {
+        Self {
+            version: VAULT_VERSION,
+            seed,
+            iroh_secret_key: None,
+            device_signing_key: None,
+        }
+    }
+
+    /// Serialize to CBOR. The returned buffer holds secret material and is wrapped
+    /// in `Zeroizing` so it is wiped on drop.
+    fn to_cbor(&self) -> Result<Zeroizing<Vec<u8>>, String> {
+        let mut buf = Zeroizing::new(Vec::new());
+        ciborium::into_writer(self, &mut *buf).map_err(|e| format!("vault CBOR encode: {e}"))?;
+        Ok(buf)
+    }
+
+    /// Parse from CBOR. Rejects an unknown `version` so a future on-disk format is
+    /// never silently misread as the current one.
+    fn from_cbor(bytes: &[u8]) -> Result<Self, String> {
+        let vault: SecretVault =
+            ciborium::from_reader(bytes).map_err(|e| format!("vault CBOR decode: {e}"))?;
+        if vault.version != VAULT_VERSION {
+            return Err(format!(
+                "unsupported secret-vault version {} (this build supports {VAULT_VERSION})",
+                vault.version
+            ));
+        }
+        Ok(vault)
+    }
+}
+
+#[cfg(test)]
+mod vault_tests {
+    use super::*;
+
+    #[test]
+    fn vault_cbor_round_trips() {
+        let v = SecretVault {
+            version: VAULT_VERSION,
+            seed: [7u8; BLOB_LEN],
+            iroh_secret_key: Some([9u8; 32]),
+            device_signing_key: None,
+        };
+        let cbor = v.to_cbor().expect("encode");
+        let back = SecretVault::from_cbor(&cbor).expect("decode");
+        assert!(v == back, "vault must round-trip through CBOR unchanged");
+    }
+
+    #[test]
+    fn seed_only_vault_exceeds_legacy_32_bytes() {
+        // Legacy-item detection relies on: a raw seed is exactly 32 bytes, while
+        // any CBOR vault is strictly longer. Guard that invariant.
+        let v = SecretVault::from_seed([0u8; BLOB_LEN]);
+        let cbor = v.to_cbor().expect("encode");
+        assert!(
+            cbor.len() > BLOB_LEN,
+            "seed-only vault CBOR is {} bytes; must exceed the {BLOB_LEN}-byte legacy seed",
+            cbor.len()
+        );
+    }
+
+    #[test]
+    fn from_cbor_rejects_unknown_version() {
+        let mut v = SecretVault::from_seed([1u8; BLOB_LEN]);
+        v.version = 99;
+        let cbor = v.to_cbor().expect("encode");
+        assert!(
+            SecretVault::from_cbor(&cbor).is_err(),
+            "an unknown vault version must be rejected, not silently accepted"
+        );
+    }
+
+    #[test]
+    fn from_seed_has_no_app_keys() {
+        let v = SecretVault::from_seed([3u8; BLOB_LEN]);
+        assert_eq!(v.version, VAULT_VERSION);
+        assert!(v.iroh_secret_key.is_none());
+        assert!(v.device_signing_key.is_none());
+    }
+
+    #[test]
+    fn keychain_legacy_32_item_reads_as_seed_only_vault() {
+        // Pre-ZEB-363 installs stored exactly 32 raw seed bytes. The vault loader
+        // must read that as a seed-only vault so the seed still loads.
+        let kc = KeychainStore::new_mock();
+        let seed = [0x11u8; BLOB_LEN];
+        kc.entry.set_secret(&seed).expect("write legacy raw-32 item");
+        let vault = kc.load_vault().expect("load").expect("present");
+        assert_eq!(vault.seed, seed, "legacy seed must survive");
+        assert!(vault.iroh_secret_key.is_none());
+        assert!(vault.device_signing_key.is_none());
+    }
+
+    #[test]
+    fn keychain_vault_round_trips_with_keys() {
+        let kc = KeychainStore::new_mock();
+        let vault = SecretVault {
+            version: VAULT_VERSION,
+            seed: [4u8; BLOB_LEN],
+            iroh_secret_key: Some([5u8; 32]),
+            device_signing_key: Some([6u8; 32]),
+        };
+        kc.save_vault(&vault).expect("save");
+        let back = kc.load_vault().expect("load").expect("present");
+        assert!(back == vault, "vault must round-trip through the keychain item");
+    }
+
+    #[test]
+    fn keychain_corrupt_item_is_hard_error() {
+        // 40 bytes: not the 32-byte legacy seed, not valid vault CBOR.
+        let kc = KeychainStore::new_mock();
+        kc.entry.set_secret(&[0xFFu8; 40]).expect("write garbage");
+        assert!(
+            kc.load_vault().is_err(),
+            "a non-seed, non-CBOR item must hard-error, never be silently overwritten"
+        );
+    }
+
+    #[test]
+    fn enc_file_v1_seed_reads_as_seed_only_vault() {
+        // A legacy v0x01 (fixed 32-byte seed) envelope decodes to a seed-only vault.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.enc");
+        let salt = [1u8; SALT_LEN];
+        let nonce = [2u8; NONCE_LEN];
+        let seed = [9u8; BLOB_LEN];
+        let v1 = encrypt_with_params(b"vault-v1-test", &salt, &nonce, &seed);
+        std::fs::write(&path, &v1).unwrap();
+        let store = EncryptedFileStore::new(path, secrecy::SecretString::from("vault-v1-test".to_string()));
+        let vault = store.load_vault().expect("load").expect("present");
+        assert_eq!(vault.seed, seed, "v1 seed must decode into a seed-only vault");
+        assert!(vault.iroh_secret_key.is_none());
+        assert!(vault.device_signing_key.is_none());
+    }
+
+    #[test]
+    fn enc_file_v2_round_trips_vault_with_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.enc");
+        let store =
+            EncryptedFileStore::new(path, secrecy::SecretString::from("vault-v2-test".to_string()));
+        let vault = SecretVault {
+            version: VAULT_VERSION,
+            seed: [1u8; BLOB_LEN],
+            iroh_secret_key: Some([2u8; 32]),
+            device_signing_key: Some([3u8; 32]),
+        };
+        store.save_vault(&vault).expect("save");
+        let back = store.load_vault().expect("load").expect("present");
+        assert!(back == vault, "v2 vault must round-trip through the encrypted file");
+    }
+}
+
+// ── Vault item / envelope codecs (ZEB-363) ─────────────────────────────
+
+/// HRMI envelope version carrying a CBOR [`SecretVault`] plaintext (vs. the
+/// `v0x01` fixed 32-byte seed plaintext).
+const ENC_FORMAT_VERSION_V2: u8 = 0x02;
+
+/// Interpret a keychain item's raw bytes as a [`SecretVault`].
+///
+/// A **legacy** item is exactly the 32 raw seed bytes (pre-ZEB-363); anything
+/// else is the CBOR vault. A legacy item becomes a seed-only vault — its
+/// iroh/device keys (if the install had them) still live in the old
+/// `harmony.client` / `harmony.owner` items and are folded in by the per-key
+/// accessors. A non-32-byte, non-CBOR value is a hard error (never overwritten).
+fn item_bytes_to_vault(bytes: &[u8]) -> Result<SecretVault, String> {
+    if bytes.len() == BLOB_LEN {
+        let seed = blob_to_seed(bytes)?;
+        return Ok(SecretVault::from_seed(*seed));
+    }
+    SecretVault::from_cbor(bytes)
+}
+
+/// Encode a CBOR `SecretVault` plaintext into the HRMI `v0x02` envelope.
+///
+/// Identical framing to [`encrypt_with_params`] (Argon2id m=64MiB/t=3/p=1 →
+/// XChaCha20-Poly1305, 13-byte header bound as AAD) except the version byte is
+/// `0x02` and the protected plaintext is variable-length. Salt/nonce supplied by
+/// the caller so the function is deterministic for tests.
+fn encrypt_vault_with_params(
+    passphrase: &[u8],
+    salt: &[u8; SALT_LEN],
+    nonce: &[u8; NONCE_LEN],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, Payload},
+        XChaCha20Poly1305, XNonce,
+    };
+
+    let mut out = Vec::with_capacity(HEADER_LEN + SALT_LEN + NONCE_LEN + plaintext.len() + TAG_LEN);
+    out.extend_from_slice(ENC_MAGIC);
+    out.push(ENC_FORMAT_VERSION_V2);
+    out.push(ENC_KDF_ID_ARGON2ID);
+    out.extend_from_slice(&KDF_M_KIB.to_be_bytes());
+    out.extend_from_slice(&KDF_T.to_be_bytes());
+    out.push(KDF_P);
+    debug_assert_eq!(out.len(), HEADER_LEN);
+    out.extend_from_slice(salt);
+    out.extend_from_slice(nonce);
+
+    let params = Params::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32, Some(KDF_OUT_LEN))
+        .expect("Argon2 params hardcoded valid");
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
+    argon
+        .hash_password_into(passphrase, salt, key.as_mut_slice())
+        .expect("Argon2 derivation cannot fail with hardcoded params");
+
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key.as_slice()).expect("32-byte key always valid");
+    let payload = Payload {
+        msg: plaintext,
+        aad: &out[..HEADER_LEN],
+    };
+    let ciphertext_with_tag = cipher
+        .encrypt(XNonce::from_slice(nonce), payload)
+        .expect("AEAD encrypt cannot fail with valid inputs");
+    out.extend_from_slice(&ciphertext_with_tag);
+    out
+}
+
+/// Decrypt an HRMI envelope (`v0x01` *or* `v0x02`) into a [`SecretVault`].
+///
+/// `v0x01` decrypts to a 32-byte seed (legacy) → seed-only vault; `v0x02`
+/// decrypts to the CBOR vault. Wrong-passphrase vs. corrupted-file remain
+/// indistinguishable (same as [`decrypt`]).
+fn decrypt_vault(passphrase: &[u8], bytes: &[u8]) -> Result<SecretVault, String> {
+    const MIN_LEN: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + TAG_LEN;
+    if bytes.len() < MIN_LEN {
+        return Err(format!(
+            "identity store is corrupt: {} bytes is below the {MIN_LEN}-byte minimum",
+            bytes.len()
+        ));
+    }
+    if &bytes[0..4] != ENC_MAGIC {
+        return Err(format!(
+            "identity store is in an unrecognized format (magic={:?}) — this build may be too old",
+            &bytes[0..4]
+        ));
+    }
+    match bytes[4] {
+        // v1: delegate to the original fixed-length decrypt.
+        ENC_FORMAT_VERSION => {
+            let seed = decrypt(passphrase, bytes)?;
+            Ok(SecretVault::from_seed(*seed))
+        }
+        ENC_FORMAT_VERSION_V2 => {
+            let plaintext = decrypt_v2_plaintext(passphrase, bytes)?;
+            SecretVault::from_cbor(&plaintext)
+        }
+        other => Err(format!(
+            "identity store is in an unrecognized format (version={other:#04x}) — this build may be too old"
+        )),
+    }
+}
+
+/// AEAD-decrypt a `v0x02` envelope to its (variable-length) CBOR plaintext.
+///
+/// Mirrors [`decrypt`] but without the fixed-length assumption: the ciphertext
+/// length is derived from the file length. Same KDF DoS guard (reject non-v1 KDF
+/// params before the Argon2 allocation) and indistinguishable error.
+fn decrypt_v2_plaintext(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, Payload},
+        XChaCha20Poly1305, XNonce,
+    };
+
+    const M_KIB_OFF: usize = 6;
+    const T_OFF: usize = M_KIB_OFF + 4;
+    const P_OFF: usize = T_OFF + 2;
+    const SALT_OFF: usize = HEADER_LEN;
+    const NONCE_OFF: usize = SALT_OFF + SALT_LEN;
+    const CIPHER_OFF: usize = NONCE_OFF + NONCE_LEN;
+
+    if bytes[5] != ENC_KDF_ID_ARGON2ID {
+        return Err(format!(
+            "identity store is in an unrecognized format (kdf_id={:#04x}) — this build may be too old",
+            bytes[5]
+        ));
+    }
+    let m_kib = u32::from_be_bytes(bytes[M_KIB_OFF..M_KIB_OFF + 4].try_into().unwrap());
+    let t = u16::from_be_bytes(bytes[T_OFF..T_OFF + 2].try_into().unwrap()) as u32;
+    let p = bytes[P_OFF] as u32;
+    let salt: &[u8; SALT_LEN] = bytes[SALT_OFF..NONCE_OFF].try_into().unwrap();
+    let nonce: &[u8; NONCE_LEN] = bytes[NONCE_OFF..CIPHER_OFF].try_into().unwrap();
+    let ciphertext_with_tag = &bytes[CIPHER_OFF..];
+
+    // Strict v1 KDF param check before allocating Argon2 memory (DoS guard).
+    if m_kib != KDF_M_KIB || t != KDF_T as u32 || p != KDF_P as u32 {
+        return Err(
+            "identity store could not be decrypted: wrong passphrase or corrupted file".to_string(),
+        );
+    }
+    let params = Params::new(m_kib, t, p, Some(KDF_OUT_LEN)).map_err(|_| {
+        "identity store could not be decrypted: wrong passphrase or corrupted file".to_string()
+    })?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
+    argon
+        .hash_password_into(passphrase, salt, key.as_mut_slice())
+        .map_err(|e| format!("Argon2 derivation failed: {e}"))?;
+
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key.as_slice()).expect("32-byte key always valid");
+    let payload = Payload {
+        msg: ciphertext_with_tag,
+        aad: &bytes[..HEADER_LEN],
+    };
+    let plaintext = Zeroizing::new(cipher.decrypt(XNonce::from_slice(nonce), payload).map_err(
+        |_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string(),
+    )?);
+    Ok(plaintext)
+}
+
 // ── KeyStore trait ──────────────────────────────────────────────────────
 
 /// Common interface for identity storage backends.
+///
+/// ZEB-363: a backend stores one [`SecretVault`] per item/file. `load_vault` /
+/// `save_vault` are the primary surface; the seed-level `load` / `save` are
+/// convenience wrappers over them (read/write only the `seed` field) used by the
+/// existing seed-resolution machinery, which is otherwise unchanged.
 pub trait KeyStore {
-    /// Load the master seed from this store. Returns `Ok(None)` if no entry exists.
-    fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String>;
-    /// Save the master seed to this store.
-    fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String>;
+    /// Load the full secret vault. Returns `Ok(None)` if no entry exists.
+    fn load_vault(&self) -> Result<Option<SecretVault>, String>;
+    /// Save the full secret vault (overwriting any existing item).
+    fn save_vault(&self, vault: &SecretVault) -> Result<(), String>;
+
+    /// Load just the master seed. `Ok(None)` if no entry exists.
+    fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String> {
+        Ok(self.load_vault()?.map(|v| Zeroizing::new(v.seed)))
+    }
+
+    /// Save the master seed as a fresh **seed-only** vault.
+    ///
+    /// Used by identity establishment (fresh-generate / restore): any prior
+    /// app-local keys belong to the *previous* identity and must not carry over —
+    /// they regenerate lazily for the new identity. Accessors that must preserve
+    /// app-local keys use [`KeyStore::save_vault`] (read-modify-write).
+    fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
+        self.save_vault(&SecretVault::from_seed(*seed))
+    }
 }
 
 // ── FileStore ───────────────────────────────────────────────────────────
@@ -429,22 +806,21 @@ impl FileStore {
 // KeychainStore or EncryptedFileStore.
 #[cfg(test)]
 impl KeyStore for FileStore {
-    fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String> {
+    fn load_vault(&self) -> Result<Option<SecretVault>, String> {
         let raw = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("Failed to read {}: {e}", self.path.display())),
         };
         let buf = Zeroizing::new(raw);
-        let seed = blob_to_seed(&buf)?;
         #[cfg(unix)]
         warn_permissions(&self.path);
-        Ok(Some(seed))
+        Ok(Some(item_bytes_to_vault(&buf)?))
     }
 
-    fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
-        let blob = seed_to_blob(seed);
-        write_atomic_0600(&self.path, &blob)
+    fn save_vault(&self, vault: &SecretVault) -> Result<(), String> {
+        let cbor = vault.to_cbor()?;
+        write_atomic_0600(&self.path, &cbor)
     }
 }
 
@@ -506,22 +882,21 @@ impl KeychainStore {
 }
 
 impl KeyStore for KeychainStore {
-    fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String> {
+    fn load_vault(&self) -> Result<Option<SecretVault>, String> {
         match self.entry.get_secret() {
             Ok(bytes) => {
                 let buf = Zeroizing::new(bytes);
-                let seed = blob_to_seed(&buf)?;
-                Ok(Some(seed))
+                Ok(Some(item_bytes_to_vault(&buf)?))
             }
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(format!("keychain load failed: {e}")),
         }
     }
 
-    fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
-        let blob = seed_to_blob(seed);
+    fn save_vault(&self, vault: &SecretVault) -> Result<(), String> {
+        let cbor = vault.to_cbor()?;
         self.entry
-            .set_secret(&blob)
+            .set_secret(&cbor)
             .map_err(|e| format!("keychain save failed: {e}"))
     }
 }
@@ -665,31 +1040,31 @@ impl EncryptedFileStore {
 }
 
 impl KeyStore for EncryptedFileStore {
-    fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String> {
+    fn load_vault(&self) -> Result<Option<SecretVault>, String> {
         let raw = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("Failed to read {}: {e}", self.path.display())),
         };
-        // `decrypt` returns Zeroizing<[u8; BLOB_LEN]> — the underlying [u8; 32]
-        // is wiped on drop. The seed array can be returned directly without
-        // a second deserialization step.
-        let seed = decrypt(self.passphrase.expose_secret().as_bytes(), &raw)?;
-        Ok(Some(seed))
+        // `decrypt_vault` dispatches on the HRMI version byte: v0x01 → seed-only
+        // vault (legacy), v0x02 → full CBOR vault. Both are Zeroizing-backed.
+        let vault = decrypt_vault(self.passphrase.expose_secret().as_bytes(), &raw)?;
+        Ok(Some(vault))
     }
 
-    fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
+    fn save_vault(&self, vault: &SecretVault) -> Result<(), String> {
         let mut salt = [0u8; SALT_LEN];
         let mut nonce = [0u8; NONCE_LEN];
         use rand::RngCore;
         rand::rngs::OsRng.fill_bytes(&mut salt);
         rand::rngs::OsRng.fill_bytes(&mut nonce);
 
-        let bytes = encrypt_with_params(
+        let plaintext = vault.to_cbor()?;
+        let bytes = encrypt_vault_with_params(
             self.passphrase.expose_secret().as_bytes(),
             &salt,
             &nonce,
-            seed,
+            &plaintext,
         );
         write_atomic_0600(&self.path, &bytes)
     }
@@ -1557,12 +1932,19 @@ mod tests {
         }
 
         #[test]
-        fn file_is_exactly_101_bytes() {
+        fn file_is_v2_vault_envelope() {
+            // ZEB-363: the encrypted file now carries a variable-length CBOR
+            // SecretVault (HRMI v0x02), not the fixed 101-byte v1 seed envelope.
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("identity.enc");
             let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
             store.save(&fresh_seed()).unwrap();
-            assert_eq!(std::fs::metadata(&path).unwrap().len(), 101);
+            let raw = std::fs::read(&path).unwrap();
+            assert_eq!(&raw[0..4], b"HRMI", "magic");
+            assert_eq!(raw[4], 0x02, "must be the v0x02 vault envelope");
+            // header(13) + salt(16) + nonce(24) + tag(16) = 69; a real vault
+            // plaintext pushes it strictly larger.
+            assert!(raw.len() > 69, "envelope must carry a vault plaintext, got {}", raw.len());
         }
 
         #[test]
@@ -1572,12 +1954,17 @@ mod tests {
             let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
             store.save(&fresh_seed()).unwrap();
 
-            // Truncate to 70 bytes.
+            // Truncate to 70 bytes: above the 69-byte envelope floor but with a
+            // mangled ciphertext, so the AEAD tag check fails (indistinguishable
+            // wrong-passphrase/corruption error).
             let bytes = std::fs::read(&path).unwrap();
             std::fs::write(&path, &bytes[..70]).unwrap();
 
             let err = store.load().unwrap_err();
-            assert!(err.contains("expected 101 bytes"), "got: {err}");
+            assert!(
+                err.contains("corrupt") || err.contains("wrong passphrase or corrupted"),
+                "got: {err}"
+            );
         }
     }
 
@@ -1873,11 +2260,15 @@ mod tests {
                 inner: KeychainStore,
             }
             impl KeyStore for CorruptingStore {
-                fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
-                    self.inner.save(seed)
+                fn load_vault(&self) -> Result<Option<SecretVault>, String> {
+                    self.inner.load_vault()
                 }
+                fn save_vault(&self, vault: &SecretVault) -> Result<(), String> {
+                    self.inner.save_vault(vault)
+                }
+                // Override the seed-level load to always return a different seed,
+                // forcing verify_round_trip's mismatch path.
                 fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String> {
-                    // Always return a different seed to force mismatch.
                     let mut buf: Zeroizing<[u8; BLOB_LEN]> = Zeroizing::new([0u8; BLOB_LEN]);
                     use rand::RngCore;
                     rand::rngs::OsRng.fill_bytes(buf.as_mut());
@@ -2120,10 +2511,15 @@ mod tests {
             "the freshly-written encrypted file must NOT be deleted"
         );
         let raw = std::fs::read(&enc_path).unwrap();
+        assert_eq!(&raw[0..4], b"HRMI", "the encrypted file must hold an HRMI envelope");
         assert_eq!(
-            raw.len(),
-            ENC_FILE_LEN,
-            "the encrypted file must hold the new envelope"
+            raw[4], 0x02,
+            "the encrypted file must hold the new v0x02 vault envelope"
+        );
+        assert!(
+            raw.len() > 69,
+            "envelope must carry a vault plaintext, got {}",
+            raw.len()
         );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
