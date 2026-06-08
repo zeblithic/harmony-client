@@ -611,18 +611,6 @@ impl NetworkHealthService {
     pub async fn cached_last_self_test(&self) -> Option<SelfTestReport> {
         self.last_self_test.read().await.clone()
     }
-
-    /// ZEB-329 Phase 1 helper: cache a report into `last_self_test`
-    /// from outside the module (used by the Phase-1 synthetic IPC stub
-    /// in lib.rs). Production `run_self_test` already writes to
-    /// `last_self_test` internally — this is only for the Phase-1
-    /// stub where the IPC bypasses `run_self_test` entirely.
-    ///
-    /// TODO(zeb-329-followup): remove this method once Task 7's IPC
-    /// synthetic path is replaced with the real `run_self_test` call.
-    pub async fn cache_synthetic_self_test(&self, report: SelfTestReport) {
-        *self.last_self_test.write().await = Some(report);
-    }
 }
 
 /// Spec §5.4: server-side redaction is the only path that emits
@@ -1184,6 +1172,131 @@ impl PingDispatcher for NullDispatcher {
         _timeout: std::time::Duration,
     ) -> futures::future::BoxFuture<'_, Result<(std::time::Duration, ConnectionMode), String>> {
         Box::pin(async { Err("dispatcher not wired".into()) })
+    }
+}
+
+// ── ZEB-385: production self-test probes ────────────────────────────
+//
+// Built at IPC-call time from the locked `NodeState`; holds cheap
+// `Arc`/copy handles. Both pkarr probes build a FRESH `PkarrResolver`
+// from the relay client each call so the self-test reflects current
+// reachability (no shared-cache hits / stale positives or negatives).
+//
+// `relay_round_trip` is declared on `IrohSelfTest` but probes the
+// **pkarr** relay (the precondition the pkarr publish/resolve steps
+// depend on): iroh 0.98 exposes no relay-RTT API, and iroh home-relay
+// assignment is surfaced separately on the snapshot panel.
+pub struct ProdSelfTest {
+    pub iroh_endpoint: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>,
+    pub pkarr_relay_client: Option<std::sync::Arc<harmony_pkarr::RelayClient>>,
+    pub identity_pub_64: Option<[u8; 64]>,
+    pub discoverable: bool,
+    pub identity_publishing: bool,
+}
+
+impl IrohSelfTest for ProdSelfTest {
+    fn endpoint_bound(&self) -> bool {
+        // A present endpoint is a bound endpoint (node_id() is infallible).
+        self.iroh_endpoint.is_some()
+    }
+
+    fn relay_round_trip(&self) -> futures::future::BoxFuture<'_, StepOutcome> {
+        Box::pin(async move {
+            let Some(relay) = self.pkarr_relay_client.as_ref() else {
+                return StepOutcome::Fail {
+                    reason: "pkarr relay client not initialized".into(),
+                };
+            };
+            // Fresh resolver -> empty cache -> a real round-trip every run. A
+            // random throwaway key is almost certainly absent, so a reachable
+            // relay returns Ok(None); only a transport failure returns Err.
+            let resolver = harmony_pkarr::PkarrResolver::new(std::sync::Arc::clone(relay));
+            let probe_vk =
+                ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+            let start = std::time::Instant::now();
+            match resolver.resolve(&probe_vk).await {
+                Ok(_) => StepOutcome::Pass {
+                    duration_ms: start.elapsed().as_millis() as u32,
+                },
+                Err(_) => StepOutcome::Fail {
+                    reason: "pkarr relay unreachable".into(),
+                },
+            }
+        })
+    }
+}
+
+impl PkarrSelfTest for ProdSelfTest {
+    fn publish_identity(&self) -> futures::future::BoxFuture<'_, StepOutcome> {
+        let discoverable = self.discoverable;
+        let publishing = self.identity_publishing;
+        Box::pin(async move {
+            if !discoverable {
+                StepOutcome::Skipped {
+                    reason: "enable 'Make me discoverable' to test discovery".into(),
+                }
+            } else if publishing {
+                StepOutcome::Pass { duration_ms: 0 }
+            } else {
+                StepOutcome::Fail {
+                    reason: "identity publication not active".into(),
+                }
+            }
+        })
+    }
+
+    fn resolve_self(&self) -> futures::future::BoxFuture<'_, StepOutcome> {
+        Box::pin(async move {
+            let Some(relay) = self.pkarr_relay_client.as_ref() else {
+                return StepOutcome::Fail {
+                    reason: "pkarr relay client not initialized".into(),
+                };
+            };
+            let Some(id_pub) = self.identity_pub_64 else {
+                return StepOutcome::Fail {
+                    reason: "identity not loaded".into(),
+                };
+            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let verifying_keys: Vec<_> = harmony_pkarr::epoch_tolerance_window(now_ms)
+                .iter()
+                .map(|&epoch| {
+                    harmony_pkarr::derive_ephemeral_key(
+                        harmony_pkarr::PkarrCase::Identity,
+                        &id_pub,
+                        &epoch.to_be_bytes(),
+                    )
+                    .verifying_key()
+                })
+                .collect();
+            let resolver = harmony_pkarr::PkarrResolver::new(std::sync::Arc::clone(relay));
+            let start = std::time::Instant::now();
+            match resolver.resolve_window(&verifying_keys).await {
+                Ok(Some(rec)) => {
+                    if rec.verify_inner_sig().is_err()
+                        || rec.verify_identity_match(&id_pub).is_err()
+                        || rec.verify_skew(now_ms).is_err()
+                    {
+                        StepOutcome::Fail {
+                            reason: "resolved record failed verification".into(),
+                        }
+                    } else {
+                        StepOutcome::Pass {
+                            duration_ms: start.elapsed().as_millis() as u32,
+                        }
+                    }
+                }
+                Ok(None) => StepOutcome::Fail {
+                    reason: "identity not resolvable from pkarr".into(),
+                },
+                Err(_) => StepOutcome::Fail {
+                    reason: "pkarr resolve failed".into(),
+                },
+            }
+        })
     }
 }
 
@@ -2208,6 +2321,167 @@ mod tests {
             matches!(report.steps[3].outcome, StepOutcome::Skipped { .. }),
             "resolve skipped"
         );
+    }
+
+    // ── ZEB-385: ProdSelfTest probe tests (real RelayClient + mock relay) ──
+
+    #[tokio::test]
+    async fn prod_relay_round_trip_reachable_relay_passes() {
+        use harmony_pkarr::{testing::MockPkarrRelay, RelayClient, RelayPool};
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: Some(client),
+            identity_pub_64: None,
+            discoverable: false,
+            identity_publishing: false,
+        };
+        assert!(
+            matches!(probes.relay_round_trip().await, StepOutcome::Pass { .. }),
+            "reachable mock relay -> Pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn prod_relay_round_trip_dead_relay_fails() {
+        use harmony_pkarr::{RelayClient, RelayPool};
+        // Port 1 is unbindable / unreachable; the GET round-trip errors.
+        let pool = RelayPool::new(vec!["http://127.0.0.1:1".to_string()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: Some(client),
+            identity_pub_64: None,
+            discoverable: false,
+            identity_publishing: false,
+        };
+        assert!(
+            matches!(probes.relay_round_trip().await, StepOutcome::Fail { .. }),
+            "dead relay -> Fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn prod_publish_identity_state_check_three_ways() {
+        let mk = |discoverable, identity_publishing| ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: None,
+            identity_pub_64: None,
+            discoverable,
+            identity_publishing,
+        };
+        assert!(
+            matches!(
+                mk(false, false).publish_identity().await,
+                StepOutcome::Skipped { .. }
+            ),
+            "not discoverable -> Skipped"
+        );
+        assert!(
+            matches!(
+                mk(true, true).publish_identity().await,
+                StepOutcome::Pass { .. }
+            ),
+            "discoverable + registered -> Pass"
+        );
+        assert!(
+            matches!(
+                mk(true, false).publish_identity().await,
+                StepOutcome::Fail { .. }
+            ),
+            "discoverable but not registered -> Fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn prod_resolve_self_absent_identity_fails() {
+        use harmony_pkarr::{testing::MockPkarrRelay, RelayClient, RelayPool};
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let id_sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&id_sk.verifying_key().to_bytes());
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: Some(client),
+            identity_pub_64: Some(id_pub),
+            discoverable: true,
+            identity_publishing: true,
+        };
+        // Nothing published for this identity -> not resolvable -> Fail.
+        assert!(matches!(
+            probes.resolve_self().await,
+            StepOutcome::Fail { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn prod_resolve_self_finds_published_identity() {
+        use harmony_pkarr::{
+            current_epoch_id, derive_ephemeral_key, testing::MockPkarrRelay, EphemeralKeyBuilder,
+            PkarrCase, PkarrPublisher, PkarrRoutingRecord, RecordBuilder, RelayClient, RelayPool,
+        };
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let publisher = std::sync::Arc::new(PkarrPublisher::new(std::sync::Arc::clone(&client)));
+        let _ph = std::sync::Arc::clone(&publisher).spawn();
+
+        let id_sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&id_sk.verifying_key().to_bytes());
+
+        // Register the identity publication (mirrors PkarrIdentityPublisher::enable).
+        let id_pub_for_key = id_pub;
+        let key_builder: EphemeralKeyBuilder = std::sync::Arc::new(move |at_ms| {
+            let epoch_id = current_epoch_id(at_ms);
+            derive_ephemeral_key(
+                PkarrCase::Identity,
+                &id_pub_for_key,
+                &epoch_id.to_be_bytes(),
+            )
+        });
+        let id_sk2 = id_sk.clone();
+        let builder: RecordBuilder = std::sync::Arc::new(move |at_ms| {
+            PkarrRoutingRecord::sign_new(b"routing".to_vec(), id_pub, at_ms, &id_sk2).expect("sign")
+        });
+        publisher
+            .register("identity".to_string(), key_builder, builder)
+            .await;
+
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: Some(std::sync::Arc::clone(&client)),
+            identity_pub_64: Some(id_pub),
+            discoverable: true,
+            identity_publishing: true,
+        };
+        // resolve_self builds a FRESH resolver each call (no stale cache), so
+        // polling works: wait for the background publish to land on the relay.
+        let mut found = false;
+        for _ in 0..40 {
+            if matches!(probes.resolve_self().await, StepOutcome::Pass { .. }) {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(found, "published identity became resolvable -> Pass");
+    }
+
+    #[tokio::test]
+    async fn prod_endpoint_bound_false_when_no_endpoint() {
+        let probes = ProdSelfTest {
+            iroh_endpoint: None,
+            pkarr_relay_client: None,
+            identity_pub_64: None,
+            discoverable: false,
+            identity_publishing: false,
+        };
+        assert!(!probes.endpoint_bound());
     }
 
     // ── ZEB-373 Task 3: DialTelemetry tests ─────────────────────────
