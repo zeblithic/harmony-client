@@ -48,4 +48,21 @@ describe('AvatarResolver — receive-side decode guard (ZEB-344)', () => {
 
     expect(resolver.resolve('bb')).toBeUndefined();
   });
+
+  it('does not cache a URL when destroy() runs during the decode await', async () => {
+    const resolver = new AvatarResolver();
+    const adapter = makeAdapter();
+    resolver.connectAdapter(adapter);
+    // Tear down WHILE the createImageBitmap await is in flight.
+    createImageBitmapMock.mockImplementation(async () => {
+      resolver.destroy();
+      return { width: 256, height: 256, close: vi.fn() };
+    });
+
+    await (resolver as unknown as { fetchCid(cid: string): Promise<void> }).fetchCid('cc');
+
+    // No blob URL created on the torn-down resolver, nothing cached.
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+    expect((resolver as unknown as { cache: Map<string, string> }).cache.size).toBe(0);
+  });
 });

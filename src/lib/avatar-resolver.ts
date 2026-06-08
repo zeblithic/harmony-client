@@ -56,6 +56,11 @@ export class AvatarResolver {
       } finally {
         bmp.close();
       }
+      // Re-check after the createImageBitmap async gap: destroy() may have run
+      // during decode, having already revoked + cleared the cache. Without this
+      // we'd create + cache a blob URL on a torn-down resolver that nothing will
+      // ever revoke (a leak) and fire onChange after teardown.
+      if (this.destroyed) return;
       const url = URL.createObjectURL(blob);
       this.cache.set(cid, url);
       this.onChange?.();
