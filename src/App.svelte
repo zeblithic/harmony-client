@@ -79,6 +79,7 @@
   import type { MintIpcResult, OwnerStateView } from './lib/owner-service';
   import type { StartNodeResponse } from './lib/types/onboarding';
   import { MemberCardService } from './lib/member-card-service';
+  import { selfCommunityPower } from './lib/community-self-power';
   import { getVoiceSession, type VoiceSession } from './lib/voice-session';
   import { getCallSession, type CallSession } from './lib/call-session';
   import { getGroupCallSession, type GroupCallSession } from './lib/group-call-session';
@@ -866,9 +867,11 @@
   // Derived from the live roster — recomputes when fetchOwnAddress
   // resolves later than the first roster load (race fixed in PR #91
   // review). Never assign to this directly.
-  let myCommunityPower = $derived(
-    communityMembers.find((m) => m.address === myAddress)?.power ?? 0,
-  );
+  //
+  // ZEB-396: the roster is owner_id-keyed; self-power must match selfOwnerId
+  // (owner_id), NOT myAddress (the node/transport address from get_node_addr).
+  // The $derived recomputes when selfOwnerId resolves after start_node.
+  let myCommunityPower = $derived(selfCommunityPower(communityMembers, selfOwnerId));
   // Count only currently-joined members so the overview matches the
   // "X joined" line in CommunitySettingsPanel — invited/banned/left
   // entries shouldn't be counted as members in either place.
@@ -2519,7 +2522,7 @@
         communityName={selectedCommunityNode.name}
         communityKind={communityService.getKind(selectedCommunityNode.id)}
         members={communityMembers}
-        ownAddress={myAddress}
+        ownAddress={selfOwnerId ?? ''}
         myPower={myCommunityPower}
         isDegraded={isCurrentCommunityDegraded}
         sharedInProfile={sharedInProfileByCommunity.get(selectedCommunityNode.id) ?? false}
