@@ -13911,9 +13911,7 @@ pub fn communities_for_nav(state: &crate::owner_state_crdt::OwnerState) -> Vec<C
     state
         .spaces
         .values()
-        .filter(|s| {
-            s.kind == crate::owner_state_types::SpaceKind::Community && s.left_at.is_none()
-        })
+        .filter(|s| s.kind == crate::owner_state_types::SpaceKind::Community && s.left_at.is_none())
         .map(|s| CommunityNavDto {
             space_id: hex::encode(s.id.0),
             name: s.name.clone(),
@@ -14001,7 +13999,7 @@ mod zeb393_communities_for_nav_tests {
             community_space(1, "Open Town", false, false, false),
             community_space(2, "Secret Club", true, true, false), // pending invite-only
             community_space(3, "Left Behind", false, false, true), // left → excluded
-            folder_space(4, "Root"),                               // non-community → excluded
+            folder_space(4, "Root"),                              // non-community → excluded
         ] {
             st.spaces.insert(s.id, s);
         }
@@ -14016,7 +14014,10 @@ mod zeb393_communities_for_nav_tests {
         assert!(!got[0].pending);
         assert_eq!(got[1].name, "Secret Club");
         assert!(got[1].is_invite_only);
-        assert!(got[1].pending, "invite-only pending join stays greyed at boot");
+        assert!(
+            got[1].pending,
+            "invite-only pending join stays greyed at boot"
+        );
     }
 
     #[test]
@@ -16923,6 +16924,7 @@ async fn create_community(
         channel_log_registry,
         dm_outbox,
         snapshot_generation,
+        sync_engine,
     ) = {
         let g = state_lock
             .lock()
@@ -16939,6 +16941,7 @@ async fn create_community(
             g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
+            g.sync_engine.clone(),
         )
     }; // std `state_lock` guard dropped here.
 
@@ -16971,6 +16974,19 @@ async fn create_community(
         &state_lock,
     )
     .await?;
+
+    // ZEB-393 Bug A: durable-on-commit. The in-memory Space + per-community
+    // dir are written, but owner_state_crdt.cbor otherwise persists only on
+    // the ~250ms debounce or graceful shutdown. Fence it to disk now so a
+    // non-graceful exit can't lose this membership. flush_now also republishes
+    // the state-root to the user's other devices (desirable for a mint).
+    // Non-fatal: the mint already committed in-memory; a flush hiccup falls
+    // back to the debounce path. `None` only pre-start_node, where mint can't run.
+    if let Some(engine) = sync_engine.as_ref() {
+        if let Err(e) = engine.flush_now().await {
+            tracing::warn!(error = %e, "create_community: owner-state flush_now failed");
+        }
+    }
 
     // ZEB-265: surface the new community to the nav listener. emit
     // failure is non-fatal — the create already committed, and the
@@ -18950,6 +18966,7 @@ async fn redeem_invite(
         channel_log_registry,
         dm_outbox,
         snapshot_generation,
+        sync_engine,
     ) = {
         let g = state_lock
             .lock()
@@ -18967,6 +18984,7 @@ async fn redeem_invite(
             g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
+            g.sync_engine.clone(),
         )
     }; // std lock dropped here.
 
@@ -19035,6 +19053,16 @@ async fn redeem_invite(
         false, // ZEB-325: redeem_invite IPC keeps Reticulum-required semantics.
     )
     .await?;
+
+    // ZEB-393 Bug A: durable-on-commit (see create_community). Fence the
+    // joined community's owner-state Space to disk before returning so a
+    // non-graceful exit can't lose this membership. Non-fatal; `None` only
+    // pre-start_node.
+    if let Some(engine) = sync_engine.as_ref() {
+        if let Err(e) = engine.flush_now().await {
+            tracing::warn!(error = %e, "redeem_invite: owner-state flush_now failed");
+        }
+    }
 
     // ZEB-265: surface the redeemed community to the nav listener.
     // emit failure is non-fatal — the join already committed, and
@@ -19191,6 +19219,7 @@ async fn join_open_community(
         channel_log_registry,
         dm_outbox,
         snapshot_generation,
+        sync_engine,
     ) = {
         let g = state_lock
             .lock()
@@ -19209,6 +19238,7 @@ async fn join_open_community(
             g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
+            g.sync_engine.clone(),
         )
     }; // std lock dropped here.
 
@@ -19266,6 +19296,17 @@ async fn join_open_community(
         fence_check,
     )
     .await?;
+
+    // ZEB-393 Bug A: durable-on-commit (see create_community). join_open_community
+    // is a separate IPC that mints an owner-state Space via the shared
+    // redeem_invite_inner path; fence it to disk before returning so a
+    // non-graceful exit can't lose this membership. Non-fatal; `None` only
+    // pre-start_node.
+    if let Some(engine) = sync_engine.as_ref() {
+        if let Err(e) = engine.flush_now().await {
+            tracing::warn!(error = %e, "join_open_community: owner-state flush_now failed");
+        }
+    }
 
     if let Err(e) = app.emit(
         "nav-updated",
