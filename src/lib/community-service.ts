@@ -8,6 +8,7 @@ import {
   type ModerationEvent,
 } from './types';
 import type { ChannelMessageDto } from './channel-message-service';
+import type { NavUpdatedPayload } from './nav-service';
 
 interface MembersChangedPayload { communityId: string; }
 interface DegradedPayload { communityId: string; degraded: boolean; }
@@ -29,6 +30,36 @@ export interface RedeemInviteResultDto {
    * counter-sign came back within 5s.
    */
   pending: boolean;
+}
+
+/**
+ * ZEB-393 Bug B: a persisted community shaped for boot rehydration of the
+ * nav sidebar. Mirrors `CommunityNavDto` in src-tauri/src/lib.rs
+ * (`#[serde(rename_all = "camelCase")]`). Returned from
+ * `list_owner_communities`; `pending` carries the ZEB-254 greyed state.
+ */
+export interface CommunityNavDto {
+  spaceId: string;
+  name: string;
+  isInviteOnly: boolean;
+  pending: boolean;
+}
+
+/**
+ * ZEB-393 Bug B: CommunityNavDto → an 'added' community nav payload for
+ * `navService.addOrUpdateNavSpace`. `pending: undefined` when not pending so
+ * the nav tree leaves the greyed state off (addOrUpdateNavSpace reads
+ * `pending ?? undefined`); `pending: true` keeps an invite-only join whose
+ * countersign hasn't landed greyed at boot.
+ */
+export function toNavPayload(c: CommunityNavDto): NavUpdatedPayload {
+  return {
+    action: 'added',
+    spaceId: c.spaceId,
+    kind: 'community',
+    name: c.name,
+    pending: c.pending || undefined,
+  };
 }
 
 /** Mirrors `ChannelInfoDto` in src-tauri/src/lib.rs (ZEB-266 Phase 1).
@@ -200,6 +231,22 @@ export class CommunityService {
     });
     this.knownKinds.set(id, kind);
     return id;
+  }
+
+  /**
+   * ZEB-393 Bug B: enumerate the viewer's persisted communities so the nav
+   * sidebar can be rehydrated at boot. The nav tree is otherwise push-only
+   * (filled by runtime `nav-updated` events) and boots empty on every
+   * restart. Also records each community's kind so `getKind()` resolves for
+   * rehydrated nodes instead of returning 'unknown'. App.svelte seeds the
+   * tree via `navService.addOrUpdateNavSpace(toNavPayload(row))`.
+   */
+  async listOwnerCommunities(): Promise<CommunityNavDto[]> {
+    const rows = await this.invoke<CommunityNavDto[]>('list_owner_communities', {});
+    for (const r of rows) {
+      this.knownKinds.set(r.spaceId, r.isInviteOnly ? 'invite-only' : 'open');
+    }
+    return rows;
   }
 
   async redeemInvite(url: string): Promise<RedeemInviteResultDto> {

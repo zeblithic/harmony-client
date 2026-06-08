@@ -866,6 +866,80 @@ mod debounce_tests {
         let _ = engine.shutdown().await;
     }
 
+    // ZEB-393 Fix A contract guard: flush_now must persist owner-state to
+    // disk synchronously (without a graceful shutdown). `create_community` /
+    // `redeem_invite` call flush_now after committing a new community so a
+    // non-graceful exit can't lose the membership. `flush_now_fires_immediately`
+    // only asserts the *publish* side; this locks the *persist* side. Expected
+    // green on first run (characterization of existing flush_now behaviour).
+    #[tokio::test]
+    async fn flush_now_persists_owner_state_to_disk_without_shutdown() {
+        use crate::owner_state_persist::load_crdt;
+        use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+        let (pub_tx, _pub_rx) = mpsc::channel(16);
+        let (_sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let crdt_path = paths.crdt.clone(); // capture before `paths` is moved into new()
+        let state = Arc::new(Mutex::new(OwnerState::default()));
+        let engine = SyncEngine::new(
+            make_kt(),
+            "test-device".into(),
+            Arc::clone(&state),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000, // long debounce — only flush_now can persist within the test
+        );
+
+        // Mutate owner-state in memory: insert a Community Space.
+        {
+            let h = Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            };
+            let space = Space {
+                id: SpaceId([42; 16]),
+                kind: SpaceKind::Community,
+                parent: None,
+                community_id: None,
+                name: "Durable".into(),
+                transport: None,
+                members: vec![],
+                custom_name: None,
+                notification_pref: None,
+                left_at: None,
+                created_at: h.clone(),
+                updated_at: h,
+                content_key: None,
+                prior_content_keys: vec![],
+                current_epoch: Some(0),
+                current_epoch_key: Some(EpochKey::new([1u8; 32])),
+                old_epoch_keys: BTreeMap::new(),
+                admin_addr: Some(OwnerAddr([2u8; 16])),
+                is_invite_only: Some(false),
+                shared_in_profile: false,
+                pending_join_at: None,
+            };
+            state.lock().await.spaces.insert(space.id, space);
+        }
+
+        // Fence to disk WITHOUT a graceful shutdown.
+        engine.flush_now().await.unwrap();
+
+        // Reload from disk as boot would — the Space must be present.
+        let reloaded = load_crdt(&crdt_path).unwrap();
+        assert!(
+            reloaded.spaces.contains_key(&SpaceId([42; 16])),
+            "flush_now must persist owner-state so a crash after mint can't lose it"
+        );
+
+        let _ = engine.shutdown().await;
+    }
+
     #[tokio::test]
     async fn flush_now_cancels_pending_wakeup() {
         let (pub_tx, mut pub_rx) = mpsc::channel(16);

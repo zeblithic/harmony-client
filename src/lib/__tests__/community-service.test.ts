@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { CommunityService, rosterHasJoinedAuthor } from '../community-service';
+import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from '../community-service';
 import type { TauriAdapter } from '../zenoh-service';
 
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
@@ -13,6 +13,20 @@ function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
     }),
   } as any;
 }
+
+describe('toNavPayload (ZEB-393)', () => {
+  it('maps a community DTO to an added community nav payload', () => {
+    expect(
+      toNavPayload({ spaceId: 'aa', name: 'Open Town', isInviteOnly: false, pending: false }),
+    ).toEqual({ action: 'added', spaceId: 'aa', kind: 'community', name: 'Open Town', pending: undefined });
+  });
+
+  it('carries pending=true so an invite-only join renders greyed at boot', () => {
+    expect(
+      toNavPayload({ spaceId: 'bb', name: 'Secret Club', isInviteOnly: true, pending: true }).pending,
+    ).toBe(true);
+  });
+});
 
 describe('CommunityService', () => {
   let service: CommunityService;
@@ -92,6 +106,24 @@ describe('CommunityService', () => {
     // ZEB-265: redeem now records kind so getKind() doesn't return 'unknown'
     // for redeemed communities.
     expect(service.getKind('eeff0011')).toBe('invite-only');
+  });
+
+  // ZEB-393 Bug B: boot rehydration of the nav sidebar.
+  it('listOwnerCommunities fetches the IPC and records each community kind', async () => {
+    await service.connectAdapter(adapter);
+    const rows = [
+      { spaceId: 'aa', name: 'Open Town', isInviteOnly: false, pending: false },
+      { spaceId: 'bb', name: 'Secret Club', isInviteOnly: true, pending: true },
+    ];
+    (adapter.invoke as any).mockResolvedValue(rows);
+
+    const got = await service.listOwnerCommunities();
+
+    expect(adapter.invoke).toHaveBeenCalledWith('list_owner_communities', {});
+    expect(got).toEqual(rows);
+    // getKind() must resolve for rehydrated communities, not return 'unknown'.
+    expect(service.getKind('aa')).toBe('open');
+    expect(service.getKind('bb')).toBe('invite-only');
   });
 
   // ZEB-254: pending flag on RedeemInviteResultDto

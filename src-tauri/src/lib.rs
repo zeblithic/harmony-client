@@ -13889,6 +13889,144 @@ pub fn member_info_for(
     rows
 }
 
+/// ZEB-393 Bug B: a persisted Community space shaped for the nav sidebar.
+/// `space_id` is the 32-char lowercase hex of the 16-byte SpaceId (same
+/// format the runtime `nav-updated` emit uses). Mirrors the frontend
+/// `CommunityNavDto` in `community-service.ts`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityNavDto {
+    pub space_id: String,
+    pub name: String,
+    pub is_invite_only: bool,
+    pub pending: bool,
+}
+
+/// ZEB-393 Bug B: owner-state Community spaces shaped for boot rehydration
+/// of the nav sidebar. Filters to live (non-left) Community spaces —
+/// mirrors the boot engine-spawn sweep's predicate (`start_node`) so the UI
+/// and the engine sweep agree on "which communities am I in." The frontend
+/// has no other way to learn this: `list_community_members` /
+/// `list_community_forks` both require a `communityId` you must already have.
+pub fn communities_for_nav(state: &crate::owner_state_crdt::OwnerState) -> Vec<CommunityNavDto> {
+    state
+        .spaces
+        .values()
+        .filter(|s| s.kind == crate::owner_state_types::SpaceKind::Community && s.left_at.is_none())
+        .map(|s| CommunityNavDto {
+            space_id: hex::encode(s.id.0),
+            name: s.name.clone(),
+            is_invite_only: s.is_invite_only.unwrap_or(false),
+            pending: s.pending_join_at.is_some(),
+        })
+        .collect()
+}
+
+/// ZEB-393 Bug B: enumerate the viewer's live (non-left) communities for
+/// boot rehydration of the nav sidebar. The frontend has no other way to
+/// learn "which communities am I in" — the nav tree is otherwise push-only
+/// (filled by runtime `nav-updated` events) and boots empty on every
+/// restart. Read-only over the in-memory owner-state CRDT (populated at
+/// `start_node` by `load_crdt`). App.svelte calls this after
+/// `navService.connectAdapter` and seeds via `addOrUpdateNavSpace`.
+#[tauri::command]
+async fn list_owner_communities(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<Vec<CommunityNavDto>, String> {
+    let crdt_state = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    let state = crdt_state.lock().await;
+    Ok(communities_for_nav(&state))
+}
+
+#[cfg(test)]
+mod zeb393_communities_for_nav_tests {
+    use super::*;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+    fn hlc() -> Hlc {
+        Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn community_space(id: u8, name: &str, invite_only: bool, pending: bool, left: bool) -> Space {
+        Space {
+            id: SpaceId([id; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: name.into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: if left { Some(hlc()) } else { None },
+            created_at: hlc(),
+            updated_at: hlc(),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([7u8; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([9u8; 16])),
+            is_invite_only: Some(invite_only),
+            shared_in_profile: false,
+            pending_join_at: if pending { Some(hlc()) } else { None },
+        }
+    }
+
+    fn folder_space(id: u8, name: &str) -> Space {
+        let mut s = community_space(id, name, false, false, false);
+        s.kind = SpaceKind::Folder;
+        s.current_epoch = None;
+        s.current_epoch_key = None;
+        s.admin_addr = None;
+        s.is_invite_only = None;
+        s
+    }
+
+    #[test]
+    fn returns_only_live_communities_with_correct_fields() {
+        let mut st = OwnerState::default();
+        for s in [
+            community_space(1, "Open Town", false, false, false),
+            community_space(2, "Secret Club", true, true, false), // pending invite-only
+            community_space(3, "Left Behind", false, false, true), // left → excluded
+            folder_space(4, "Root"),                              // non-community → excluded
+        ] {
+            st.spaces.insert(s.id, s);
+        }
+
+        let mut got = communities_for_nav(&st);
+        got.sort_by(|a, b| a.space_id.cmp(&b.space_id));
+
+        assert_eq!(got.len(), 2, "only the two live communities");
+        assert_eq!(got[0].space_id, hex::encode([1u8; 16]));
+        assert_eq!(got[0].name, "Open Town");
+        assert!(!got[0].is_invite_only);
+        assert!(!got[0].pending);
+        assert_eq!(got[1].name, "Secret Club");
+        assert!(got[1].is_invite_only);
+        assert!(
+            got[1].pending,
+            "invite-only pending join stays greyed at boot"
+        );
+    }
+
+    #[test]
+    fn empty_state_yields_empty() {
+        assert!(communities_for_nav(&OwnerState::default()).is_empty());
+    }
+}
+
 /// Read-only IPC over a community's materialized member list.
 /// Returns rows sorted by power desc then joined_at asc (see
 /// `member_info_for`). `community_id` is the 32-char lowercase
@@ -16787,6 +16925,7 @@ async fn create_community(
         channel_log_registry,
         dm_outbox,
         snapshot_generation,
+        sync_engine,
     ) = {
         let g = state_lock
             .lock()
@@ -16803,6 +16942,7 @@ async fn create_community(
             g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
+            g.sync_engine.clone(),
         )
     }; // std `state_lock` guard dropped here.
 
@@ -16835,6 +16975,23 @@ async fn create_community(
         &state_lock,
     )
     .await?;
+
+    // ZEB-393 Bug A: durable-on-commit. The in-memory Space + per-community
+    // dir are written, but owner_state_crdt.cbor otherwise persists only on
+    // the ~250ms debounce or graceful shutdown. Fence it to disk now so a
+    // non-graceful exit can't lose this membership. flush_now also republishes
+    // the state-root to the user's other devices (desirable for a mint).
+    // Non-fatal: the mint already committed in-memory and the per-community dir
+    // is written, so failing the create here would desync the UI from a
+    // community that already exists. On flush error we re-arm the debounce
+    // (notify_dirty) so the persist is retried, rather than left until graceful
+    // shutdown. `None` only pre-start_node, where mint can't run.
+    if let Some(engine) = sync_engine.as_ref() {
+        if let Err(e) = engine.flush_now().await {
+            tracing::warn!(error = %e, "create_community: owner-state flush_now failed");
+            engine.notify_dirty();
+        }
+    }
 
     // ZEB-265: surface the new community to the nav listener. emit
     // failure is non-fatal — the create already committed, and the
@@ -18814,6 +18971,7 @@ async fn redeem_invite(
         channel_log_registry,
         dm_outbox,
         snapshot_generation,
+        sync_engine,
     ) = {
         let g = state_lock
             .lock()
@@ -18831,6 +18989,7 @@ async fn redeem_invite(
             g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
+            g.sync_engine.clone(),
         )
     }; // std lock dropped here.
 
@@ -18899,6 +19058,17 @@ async fn redeem_invite(
         false, // ZEB-325: redeem_invite IPC keeps Reticulum-required semantics.
     )
     .await?;
+
+    // ZEB-393 Bug A: durable-on-commit (see create_community). Fence the
+    // joined community's owner-state Space to disk before returning so a
+    // non-graceful exit can't lose this membership. Non-fatal; `None` only
+    // pre-start_node.
+    if let Some(engine) = sync_engine.as_ref() {
+        if let Err(e) = engine.flush_now().await {
+            tracing::warn!(error = %e, "redeem_invite: owner-state flush_now failed");
+            engine.notify_dirty();
+        }
+    }
 
     // ZEB-265: surface the redeemed community to the nav listener.
     // emit failure is non-fatal — the join already committed, and
@@ -19055,6 +19225,7 @@ async fn join_open_community(
         channel_log_registry,
         dm_outbox,
         snapshot_generation,
+        sync_engine,
     ) = {
         let g = state_lock
             .lock()
@@ -19073,6 +19244,7 @@ async fn join_open_community(
             g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
+            g.sync_engine.clone(),
         )
     }; // std lock dropped here.
 
@@ -19130,6 +19302,18 @@ async fn join_open_community(
         fence_check,
     )
     .await?;
+
+    // ZEB-393 Bug A: durable-on-commit (see create_community). join_open_community
+    // is a separate IPC that mints an owner-state Space via the shared
+    // redeem_invite_inner path; fence it to disk before returning so a
+    // non-graceful exit can't lose this membership. Non-fatal; `None` only
+    // pre-start_node.
+    if let Some(engine) = sync_engine.as_ref() {
+        if let Err(e) = engine.flush_now().await {
+            tracing::warn!(error = %e, "join_open_community: owner-state flush_now failed");
+            engine.notify_dirty();
+        }
+    }
 
     if let Err(e) = app.emit(
         "nav-updated",
@@ -37426,6 +37610,7 @@ pub fn run() {
             pairing_commands::cancel_pairing,
             pairing_commands::get_pairing_state,
             list_community_members,
+            list_owner_communities,
             generate_invite,
             create_community,
             redeem_invite,
