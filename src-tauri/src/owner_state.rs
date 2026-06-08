@@ -475,6 +475,18 @@ pub fn save_owner_state_cbor_only(identity_dir: &Path, state: &OwnerState) -> Re
     Ok(())
 }
 
+/// Derive the local device's 16-byte id from its ed25519 signing key.
+///
+/// Single source of truth for the device-id mapping, shared by the Devices-panel
+/// view (`owner_commands::derive_this_device_id`) and [`refresh_self_liveness`].
+/// Keeping it in one place stops the two derivations drifting — drift would make
+/// the refresh sign liveness under a different id than the enrolled device and
+/// silently stop self-healing trust.
+pub fn device_id_from_signing_key(device_sk: &SigningKey) -> [u8; 16] {
+    harmony_owner::pubkey_bundle::PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes())
+        .identity_hash()
+}
+
 /// Ensure the local device (derived from `device_sk`) has a fresh `LivenessCert`
 /// in `state`. Returns `true` if it mutated `state` (caller must then persist via
 /// [`save_owner_state_cbor_only`]).
@@ -487,10 +499,8 @@ pub fn save_owner_state_cbor_only(identity_dir: &Path, state: &OwnerState) -> Re
 /// returns `false` — the panel falls back to today's behavior rather than failing.
 pub fn refresh_self_liveness(state: &mut OwnerState, device_sk: &SigningKey, now: u64) -> bool {
     use harmony_owner::certs::LivenessCert;
-    use harmony_owner::pubkey_bundle::PubKeyBundle;
 
-    let device_id =
-        PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes()).identity_hash();
+    let device_id = device_id_from_signing_key(device_sk);
     let threshold = harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS / 2;
     let stale = match state.liveness.get(&device_id) {
         Some(c) => c.timestamp < now.saturating_sub(threshold),
@@ -788,6 +798,26 @@ mod persistence_tests {
         assert!(
             loaded.master_seed.is_some(),
             "cbor-only write must NOT clear the master seed"
+        );
+    }
+
+    #[test]
+    fn cbor_only_returns_err_on_unwritable_path() {
+        // Guards the fail-open contract in get_owner_state: the writer surfaces a
+        // recoverable Err (not a panic) when persistence fails, so the caller can
+        // log-and-continue instead of blocking the Devices panel.
+        let MintResult { state, .. } = mint_owner(1_700_000_888).unwrap();
+        let dir = tempdir().unwrap();
+        // Use a regular FILE as the identity dir: joining owner_state.cbor onto a
+        // file path can never be created/written, so the writer must return Err
+        // (not panic) on all platforms — independent of write_atomic_0600's
+        // parent-dir-creation behavior.
+        let file_as_dir = dir.path().join("not-a-directory");
+        std::fs::write(&file_as_dir, b"x").unwrap();
+        let result = save_owner_state_cbor_only(&file_as_dir, &state);
+        assert!(
+            result.is_err(),
+            "cbor-only write under a non-directory path must return Err, not panic"
         );
     }
 

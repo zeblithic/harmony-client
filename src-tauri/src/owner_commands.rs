@@ -106,8 +106,9 @@ fn build_owner_state_view(loaded: &LoadedOwnerState, this_device_name: String) -
 }
 
 fn derive_this_device_id(sk: &ed25519_dalek::SigningKey) -> [u8; 16] {
-    use harmony_owner::pubkey_bundle::PubKeyBundle;
-    PubKeyBundle::classical_only(sk.verifying_key().to_bytes()).identity_hash()
+    // Delegates to the single source of truth so the Devices-panel view and the
+    // liveness refresh can never derive the local device id differently.
+    crate::owner_state::device_id_from_signing_key(sk)
 }
 
 /// Format the first 4 bytes of a 16-byte device_id as `xxxx·xxxx`
@@ -148,7 +149,16 @@ pub async fn get_owner_state(_app: tauri::AppHandle) -> Result<Option<OwnerState
             None => return Ok(None),
         };
         if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now_unix()) {
-            save_owner_state_cbor_only(&identity_dir, &loaded.state)?;
+            // Fail open: the in-memory state already carries the fresh liveness, so
+            // the panel renders correctly even if persistence fails. A persist error
+            // must NOT block the Devices panel (it didn't before this change); the
+            // next load retries the refresh + write.
+            if let Err(e) = save_owner_state_cbor_only(&identity_dir, &loaded.state) {
+                tracing::warn!(
+                    error = %e,
+                    "get_owner_state: failed to persist refreshed liveness; rendering from in-memory state"
+                );
+            }
         }
         Ok(Some(build_owner_state_view(&loaded, display_name)))
     })
