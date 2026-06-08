@@ -239,6 +239,21 @@ describe('FriendService', () => {
     });
   });
 
+  it('getMyIdentityPubHex invokes connectivity_get_my_identity_pub_hex and returns the hex', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('ab'.repeat(64));
+    const result = await service.getMyIdentityPubHex();
+    expect(adapter.invoke).toHaveBeenCalledWith('connectivity_get_my_identity_pub_hex', {});
+    expect(result).toBe('ab'.repeat(64));
+  });
+
+  it('getMyIdentityPubHex returns null when the node is not started', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(null);
+    const result = await service.getMyIdentityPubHex();
+    expect(result).toBeNull();
+  });
+
   it('setAutoAccept invokes set_friend_auto_accept with enabled', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue(undefined);

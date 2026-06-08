@@ -228,6 +228,15 @@ export class FriendService {
     return FriendService.parseAddFriendOutcome(raw);
   }
 
+  /**
+   * Returns the local node's 64-byte transport identity pub as 128 lowercase
+   * hex chars — the value a peer pastes into "Add friend by key". `null` when
+   * the node isn't started yet (owner identity not loaded). ZEB-388.
+   */
+  async getMyIdentityPubHex(): Promise<string | null> {
+    return this.invoke<string | null>('connectivity_get_my_identity_pub_hex', {});
+  }
+
   private static parseAddFriendOutcome(raw: RawAddFriendOutcome): AddFriendOutcome {
     if (raw === 'pending') return { kind: 'pending' };
     if (raw === 'unreachable') return { kind: 'unreachable' };
