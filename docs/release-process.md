@@ -403,6 +403,13 @@ Run on at least one platform per release. macOS aarch64 is zeblith's machine; Li
    - `RedeemInviteDialog` opens with the URL pre-populated
    - This validates `bundle.deepLinks` config + per-OS protocol registration
 
+7. **Diagnostics log file (ZEB-379).** After launch, confirm a rolling log file is being written under the app-data dir — this is the channel testers attach to bug reports:
+   - macOS: `~/Library/Application Support/net.zeblith.harmony/logs/harmony.<date>.log`
+   - Windows: `%APPDATA%\net.zeblith.harmony\logs\harmony.<date>.log`
+   - Linux: `~/.local/share/net.zeblith.harmony/logs/harmony.<date>.log`
+
+   The file should exist and grow as you use the app. Optionally launch once with `RUST_LOG=harmony_app=debug` and confirm the extra debug lines appear (in the file and, for a terminal-launched build, on stdout).
+
 ### First-run onboarding (ZEB-338) — required on every release
 
 Run on a machine with NO existing Harmony identity (or wipe first). This exercises the owner-identity hard gate that unblocks fresh installs.
@@ -419,7 +426,7 @@ Run on a machine with NO existing Harmony identity (or wipe first). This exercis
 7. **Skip path.** Wipe again, relaunch, this time click **Skip for now → I accept the risk**. The main UI loads with a persistent backup-reminder banner. Relaunch → the banner persists. Click **Back up now**, save → the banner disappears and stays gone on the next launch.
 8. **(If a Zeblithic invite URL is available) Deep-link + fresh install.** Wipe, then open the `harmony://invite/...` URL to launch the app. The Welcome modal still hard-gates first; after you mint + back up (or skip), the `RedeemInviteDialog` opens automatically with the invite pre-filled.
 
-Pass all 6 base steps **and** the first-run onboarding checklist: publish the release. Any failure: fix or document as a known issue before publishing.
+Pass all 7 base steps **and** the first-run onboarding checklist: publish the release. Any failure: fix or document as a known issue before publishing.
 
 ---
 
