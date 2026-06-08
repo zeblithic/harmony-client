@@ -79,6 +79,7 @@
   import type { MintIpcResult, OwnerStateView } from './lib/owner-service';
   import type { StartNodeResponse } from './lib/types/onboarding';
   import { MemberCardService } from './lib/member-card-service';
+  import { selfCommunityPower } from './lib/community-self-power';
   import { getVoiceSession, type VoiceSession } from './lib/voice-session';
   import { getCallSession, type CallSession } from './lib/call-session';
   import { getGroupCallSession, type GroupCallSession } from './lib/group-call-session';
@@ -872,9 +873,11 @@
   // Derived from the live roster — recomputes when fetchOwnAddress
   // resolves later than the first roster load (race fixed in PR #91
   // review). Never assign to this directly.
-  let myCommunityPower = $derived(
-    communityMembers.find((m) => m.address === myAddress)?.power ?? 0,
-  );
+  //
+  // ZEB-396: the roster is owner_id-keyed; self-power must match selfOwnerId
+  // (owner_id), NOT myAddress (the node/transport address from get_node_addr).
+  // The $derived recomputes when selfOwnerId resolves after start_node.
+  let myCommunityPower = $derived(selfCommunityPower(communityMembers, selfOwnerId));
   // Count only currently-joined members so the overview matches the
   // "X joined" line in CommunitySettingsPanel — invited/banned/left
   // entries shouldn't be counted as members in either place.
@@ -2511,6 +2514,10 @@
 
 <BackupStalenessWarning onExportRequested={handleExportRequested} />
 
+<div class="app-shell">
+{#if ownerIdentityState === 'present'}
+  <BackupReminderBanner />
+{/if}
 <Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null} bind:mediaPanelOpen bind:mediaPanelWidth>
   {#snippet nav()}
     <div class="nav-with-dm-create">
@@ -2557,7 +2564,7 @@
         communityName={selectedCommunityNode.name}
         communityKind={communityService.getKind(selectedCommunityNode.id)}
         members={communityMembers}
-        ownAddress={myAddress}
+        ownAddress={selfOwnerId ?? ''}
         myPower={myCommunityPower}
         isDegraded={isCurrentCommunityDegraded}
         sharedInProfile={sharedInProfileByCommunity.get(selectedCommunityNode.id) ?? false}
@@ -2909,6 +2916,7 @@
     <NetworkHealthView />
   {/snippet}
 </Layout>
+</div>
 
 {#if popoverProfile && profileBroadcastService}
   <ProfilePopover
@@ -3238,14 +3246,6 @@
   </div>
 {/if}
 
-<!-- ZEB-338: backup-reminder banner. Self-gates on backup-skipped state; only
-     shown once an owner identity is loaded so it never stacks behind the mint
-     gate or the startup-error overlay. -->
-{#if ownerIdentityState === 'present'}
-  <div class="backup-banner-overlay">
-    <BackupReminderBanner />
-  </div>
-{/if}
 
 <!-- ZEB-331: fixed-position help button overlay. Position top-right. -->
 <div class="help-overlay">
@@ -3389,12 +3389,13 @@
 
   /* ZEB-338: backup-reminder banner overlay. Below modal (1000) + help
      overlay; above app chrome. */
-  .backup-banner-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    z-index: 40;
+  /* ZEB-406: app-shell hosts the optional backup banner in normal flow above the
+     main layout, so the banner reserves height instead of overlaying + intercepting
+     the top toolbar. */
+  .app-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
   }
 
   /* ZEB-338 / PR #169: startup-error overlay (start_node failed). */
