@@ -7,10 +7,8 @@
 //! `cargo tauri dev`) and to a daily-rolling **file** under the app-data dir so
 //! external testers can attach logs to feedback (the desktop app has no console).
 
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 
-use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
@@ -21,17 +19,19 @@ use tracing_subscriber::{fmt, EnvFilter, Layer};
 /// `tauri.conf.json`.
 const APP_IDENTIFIER: &str = "net.zeblith.harmony";
 
-/// Keeps the non-blocking file-writer worker alive for the process lifetime.
-/// `tracing_appender::non_blocking` drops buffered lines when its `WorkerGuard`
-/// is dropped, so the guard must outlive the app.
-static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+/// Pure path join — `<base>/net.zeblith.harmony/logs`. Split out from `log_dir`
+/// so it can be unit-tested deterministically without depending on the host's
+/// data dir.
+fn log_dir_in(base: &Path) -> PathBuf {
+    base.join(APP_IDENTIFIER).join("logs")
+}
 
 /// Directory the rolling log files live in:
 /// `dirs::data_dir()/net.zeblith.harmony/logs`, byte-identical to Tauri v2's
 /// `app_data_dir()/logs` on macOS / Windows / Linux. `None` when the platform
 /// data dir can't be resolved.
 fn log_dir() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join(APP_IDENTIFIER).join("logs"))
+    Some(log_dir_in(&dirs::data_dir()?))
 }
 
 /// Install the global tracing subscriber for the desktop GUI. Idempotent: a
@@ -62,16 +62,15 @@ fn install_subscriber(log_dir: Option<PathBuf>) {
                 .max_log_files(7)
                 .build(&dir)
             {
+                // Synchronous writer: RollingFileAppender implements MakeWriter
+                // directly. We deliberately skip tracing_appender::non_blocking —
+                // its WorkerGuard would have to be parked for the process lifetime
+                // and is never dropped (Rust statics aren't), so the final buffered
+                // lines wouldn't flush at shutdown anyway. A desktop GUI logs at low
+                // enough volume that synchronous writes are fine, and the last line
+                // before a crash is already on disk — better for diagnostics.
                 Ok(appender) => {
-                    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-                    // Park the guard for the process lifetime so buffered lines flush.
-                    let _ = LOG_GUARD.set(guard);
-                    layers.push(
-                        fmt::layer()
-                            .with_ansi(false)
-                            .with_writer(non_blocking)
-                            .boxed(),
-                    );
+                    layers.push(fmt::layer().with_ansi(false).with_writer(appender).boxed());
                 }
                 Err(e) => eprintln!("harmony: cannot build rolling log appender: {e}"),
             }
@@ -89,17 +88,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn log_dir_is_under_identifier_and_logs() {
-        // dirs::data_dir() resolves on all supported platforms (incl. CI, which
-        // sets HOME). If the path logic regresses, this fails.
-        let dir = log_dir().expect("platform data dir resolvable");
-        assert!(
-            dir.ends_with("logs"),
-            "log dir must end with /logs: {dir:?}"
-        );
-        assert!(
-            dir.to_string_lossy().contains(APP_IDENTIFIER),
-            "log dir must be under the bundle identifier: {dir:?}"
+    fn log_dir_in_is_base_then_identifier_then_logs() {
+        // Deterministic: no dependency on the host data dir. Pins the structure
+        // `<base>/net.zeblith.harmony/logs` (and the literal identifier).
+        let base = Path::new("base");
+        assert_eq!(
+            log_dir_in(base),
+            base.join("net.zeblith.harmony").join("logs")
         );
     }
 
