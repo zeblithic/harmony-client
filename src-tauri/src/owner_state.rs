@@ -475,6 +475,46 @@ pub fn save_owner_state_cbor_only(identity_dir: &Path, state: &OwnerState) -> Re
     Ok(())
 }
 
+/// Ensure the local device (derived from `device_sk`) has a fresh `LivenessCert`
+/// in `state`. Returns `true` if it mutated `state` (caller must then persist via
+/// [`save_owner_state_cbor_only`]).
+///
+/// ZEB-342: without an active (liveness-bearing) local device, `evaluate_trust`
+/// refuses the sole device with `StaleTrustState` (the fresh-mint "● refused"
+/// badge). Publishes when the local device has no liveness or its liveness is
+/// older than `DEFAULT_FRESHNESS_WINDOW_SECS / 2` (~15 days), bounding writes to
+/// ~once per boot per fortnight. On a signing/add error it logs at warn and
+/// returns `false` — the panel falls back to today's behavior rather than failing.
+pub fn refresh_self_liveness(state: &mut OwnerState, device_sk: &SigningKey, now: u64) -> bool {
+    use harmony_owner::certs::LivenessCert;
+    use harmony_owner::pubkey_bundle::PubKeyBundle;
+
+    let device_id =
+        PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes()).identity_hash();
+    let threshold = harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS / 2;
+    let stale = match state.liveness.get(&device_id) {
+        Some(c) => c.timestamp < now.saturating_sub(threshold),
+        None => true,
+    };
+    if !stale {
+        return false;
+    }
+    let cert = match LivenessCert::sign(device_sk, state.owner_id, now) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "refresh_self_liveness: liveness sign failed");
+            return false;
+        }
+    };
+    match state.add_liveness(cert) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "refresh_self_liveness: add_liveness failed");
+            false
+        }
+    }
+}
+
 /// Load a 32-byte secret from keychain primary, encrypted-file fallback.
 /// Returns `Ok(None)` when neither source has the secret.
 ///
@@ -747,6 +787,65 @@ mod persistence_tests {
             loaded.master_seed.is_some(),
             "cbor-only write must NOT clear the master seed"
         );
+    }
+
+    #[test]
+    fn refresh_self_liveness_publishes_when_missing_then_full() {
+        let now = 1_700_000_222;
+        let MintResult {
+            mut state,
+            device_signing_key,
+            ..
+        } = mint_owner(now).unwrap();
+        state.liveness.clear(); // simulate a legacy identity with no liveness
+        let device_id = *state.enrollments.keys().next().unwrap();
+
+        let mutated = refresh_self_liveness(&mut state, &device_signing_key, now);
+        assert!(mutated, "missing liveness must trigger a publish");
+        assert_eq!(state.liveness.len(), 1);
+        assert_eq!(
+            harmony_owner::trust::evaluate_trust(
+                &state,
+                device_id,
+                now,
+                harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
+            ),
+            harmony_owner::trust::TrustDecision::Full,
+        );
+    }
+
+    #[test]
+    fn refresh_self_liveness_is_noop_when_fresh() {
+        let now = 1_700_000_333;
+        let MintResult {
+            mut state,
+            device_signing_key,
+            ..
+        } = mint_owner(now).unwrap();
+        // Ensure a fresh liveness exists (independent of mint_owner's own behavior).
+        refresh_self_liveness(&mut state, &device_signing_key, now);
+        let mutated = refresh_self_liveness(&mut state, &device_signing_key, now);
+        assert!(!mutated, "fresh liveness must NOT be re-published");
+    }
+
+    #[test]
+    fn refresh_self_liveness_resigns_when_stale() {
+        let mint_t = 1_700_000_000;
+        let MintResult {
+            mut state,
+            device_signing_key,
+            ..
+        } = mint_owner(mint_t).unwrap();
+        refresh_self_liveness(&mut state, &device_signing_key, mint_t);
+        let device_id = *state.enrollments.keys().next().unwrap();
+        let old_ts = state.liveness.get(&device_id).unwrap().timestamp;
+
+        // Advance past the refresh threshold (freshness / 2).
+        let later = mint_t + harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS / 2 + 1;
+        let mutated = refresh_self_liveness(&mut state, &device_signing_key, later);
+        assert!(mutated, "stale liveness must be re-signed");
+        assert!(state.liveness.get(&device_id).unwrap().timestamp > old_ts);
     }
 
     #[test]
