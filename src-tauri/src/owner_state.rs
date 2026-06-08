@@ -460,6 +460,71 @@ pub fn save_owner_state_atomic(
     Ok(())
 }
 
+/// Persist only the `OwnerState` CRDT to `owner_state.cbor` (canonical CBOR,
+/// atomic 0600). Unlike [`save_owner_state_atomic`], this does NOT touch the
+/// `device_signing_key` / `master_seed` keychain entries — it is for callers
+/// (e.g. the ZEB-342 liveness refresh) that mutate only the CRDT and must not
+/// risk clearing the master seed via the `master_seed == None` joiner branch.
+/// Callers MUST hold `OWNER_STATE_WRITE_LOCK`.
+pub fn save_owner_state_cbor_only(identity_dir: &Path, state: &OwnerState) -> Result<(), String> {
+    let cbor_bytes =
+        cbor::to_canonical(state).map_err(|e| format!("CBOR encode of OwnerState failed: {e}"))?;
+    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    write_atomic_0600(&cbor_path, &cbor_bytes)
+        .map_err(|e| format!("failed to write {}: {e}", cbor_path.display()))?;
+    Ok(())
+}
+
+/// Derive the local device's 16-byte id from its ed25519 signing key.
+///
+/// Single source of truth for the device-id mapping, shared by the Devices-panel
+/// view (`owner_commands::derive_this_device_id`) and [`refresh_self_liveness`].
+/// Keeping it in one place stops the two derivations drifting — drift would make
+/// the refresh sign liveness under a different id than the enrolled device and
+/// silently stop self-healing trust.
+pub fn device_id_from_signing_key(device_sk: &SigningKey) -> [u8; 16] {
+    harmony_owner::pubkey_bundle::PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes())
+        .identity_hash()
+}
+
+/// Ensure the local device (derived from `device_sk`) has a fresh `LivenessCert`
+/// in `state`. Returns `true` if it mutated `state` (caller must then persist via
+/// [`save_owner_state_cbor_only`]).
+///
+/// ZEB-342: without an active (liveness-bearing) local device, `evaluate_trust`
+/// refuses the sole device with `StaleTrustState` (the fresh-mint "● refused"
+/// badge). Publishes when the local device has no liveness or its liveness is
+/// older than `DEFAULT_FRESHNESS_WINDOW_SECS / 2` (~15 days), bounding writes to
+/// ~once per boot per fortnight. On a signing/add error it logs at warn and
+/// returns `false` — the panel falls back to today's behavior rather than failing.
+pub fn refresh_self_liveness(state: &mut OwnerState, device_sk: &SigningKey, now: u64) -> bool {
+    use harmony_owner::certs::LivenessCert;
+
+    let device_id = device_id_from_signing_key(device_sk);
+    let threshold = harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS / 2;
+    let stale = match state.liveness.get(&device_id) {
+        Some(c) => c.timestamp < now.saturating_sub(threshold),
+        None => true,
+    };
+    if !stale {
+        return false;
+    }
+    let cert = match LivenessCert::sign(device_sk, state.owner_id, now) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "refresh_self_liveness: liveness sign failed");
+            return false;
+        }
+    };
+    match state.add_liveness(cert) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "refresh_self_liveness: add_liveness failed");
+            false
+        }
+    }
+}
+
 /// Load a 32-byte secret from keychain primary, encrypted-file fallback.
 /// Returns `Ok(None)` when neither source has the secret.
 ///
@@ -692,6 +757,205 @@ mod persistence_tests {
             device_signing_key.to_bytes()
         );
         assert_eq!(loaded.master_seed.as_deref(), Some(&master_seed));
+    }
+
+    #[test]
+    #[serial]
+    fn cbor_only_persists_state_without_touching_keychain() {
+        // ZEB-342: the liveness refresh persists ONLY the CRDT via the cbor-only
+        // writer; it must NOT clear the master-seed keychain entry the way
+        // save_owner_state_atomic(None) does.
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "cbor-only-test-pp");
+        let dir = tempdir().unwrap();
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_111).unwrap();
+        // Full save first: writes device_sk + master_seed keychain entries + cbor.
+        save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            Some(recovery_artifact.as_bytes()),
+            None,
+        )
+        .unwrap();
+
+        // Mutate the CRDT (simulate a liveness refresh) and persist cbor-only.
+        state.liveness.clear();
+        save_owner_state_cbor_only(dir.path(), &state).unwrap();
+
+        // Reload: cbor reflects the mutation AND the master seed survived.
+        let loaded = load_owner_state(dir.path(), None)
+            .unwrap()
+            .expect("must be Some");
+        assert_eq!(
+            loaded.state.liveness.len(),
+            0,
+            "cbor-only write must persist the CRDT mutation"
+        );
+        assert!(
+            loaded.master_seed.is_some(),
+            "cbor-only write must NOT clear the master seed"
+        );
+    }
+
+    #[test]
+    fn cbor_only_returns_err_on_unwritable_path() {
+        // Guards the fail-open contract in get_owner_state: the writer surfaces a
+        // recoverable Err (not a panic) when persistence fails, so the caller can
+        // log-and-continue instead of blocking the Devices panel.
+        let MintResult { state, .. } = mint_owner(1_700_000_888).unwrap();
+        let dir = tempdir().unwrap();
+        // Use a regular FILE as the identity dir: joining owner_state.cbor onto a
+        // file path can never be created/written, so the writer must return Err
+        // (not panic) on all platforms — independent of write_atomic_0600's
+        // parent-dir-creation behavior.
+        let file_as_dir = dir.path().join("not-a-directory");
+        std::fs::write(&file_as_dir, b"x").unwrap();
+        let result = save_owner_state_cbor_only(&file_as_dir, &state);
+        assert!(
+            result.is_err(),
+            "cbor-only write under a non-directory path must return Err, not panic"
+        );
+    }
+
+    #[test]
+    fn refresh_self_liveness_publishes_when_missing_then_full() {
+        let now = 1_700_000_222;
+        let MintResult {
+            mut state,
+            device_signing_key,
+            ..
+        } = mint_owner(now).unwrap();
+        state.liveness.clear(); // simulate a legacy identity with no liveness
+        let device_id = *state.enrollments.keys().next().unwrap();
+
+        let mutated = refresh_self_liveness(&mut state, &device_signing_key, now);
+        assert!(mutated, "missing liveness must trigger a publish");
+        assert_eq!(state.liveness.len(), 1);
+        assert_eq!(
+            harmony_owner::trust::evaluate_trust(
+                &state,
+                device_id,
+                now,
+                harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
+            ),
+            harmony_owner::trust::TrustDecision::Full,
+        );
+    }
+
+    #[test]
+    fn refresh_self_liveness_is_noop_when_fresh() {
+        let now = 1_700_000_333;
+        let MintResult {
+            mut state,
+            device_signing_key,
+            ..
+        } = mint_owner(now).unwrap();
+        // Ensure a fresh liveness exists (independent of mint_owner's own behavior).
+        refresh_self_liveness(&mut state, &device_signing_key, now);
+        let mutated = refresh_self_liveness(&mut state, &device_signing_key, now);
+        assert!(!mutated, "fresh liveness must NOT be re-published");
+    }
+
+    #[test]
+    fn refresh_self_liveness_resigns_when_stale() {
+        let mint_t = 1_700_000_000;
+        let MintResult {
+            mut state,
+            device_signing_key,
+            ..
+        } = mint_owner(mint_t).unwrap();
+        refresh_self_liveness(&mut state, &device_signing_key, mint_t);
+        let device_id = *state.enrollments.keys().next().unwrap();
+        let old_ts = state.liveness.get(&device_id).unwrap().timestamp;
+
+        // Advance past the refresh threshold (freshness / 2).
+        let later = mint_t + harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS / 2 + 1;
+        let mutated = refresh_self_liveness(&mut state, &device_signing_key, later);
+        assert!(mutated, "stale liveness must be re-signed");
+        assert!(state.liveness.get(&device_id).unwrap().timestamp > old_ts);
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_identity_self_heals_to_full_on_load_and_persists() {
+        // Mirrors get_owner_state's load -> refresh -> persist sequence for a
+        // legacy on-disk identity (enrolled, NO liveness, has master seed).
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "self-heal-test-pp");
+        let dir = tempdir().unwrap();
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_444).unwrap();
+        state.liveness.clear();
+        save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            Some(recovery_artifact.as_bytes()),
+            None,
+        )
+        .unwrap();
+
+        let now = 1_700_000_500;
+        let mut loaded = load_owner_state(dir.path(), None).unwrap().expect("Some");
+        let device_id = *loaded.state.enrollments.keys().next().unwrap();
+        assert_eq!(
+            harmony_owner::trust::evaluate_trust(
+                &loaded.state,
+                device_id,
+                now,
+                harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
+            ),
+            harmony_owner::trust::TrustDecision::Refused(
+                harmony_owner::trust::RefusalReason::StaleTrustState
+            ),
+            "precondition: legacy identity is Refused before refresh"
+        );
+
+        if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now) {
+            save_owner_state_cbor_only(dir.path(), &loaded.state).unwrap();
+        }
+
+        // Reload from disk: now Full + persisted + master seed intact.
+        let reloaded = load_owner_state(dir.path(), None).unwrap().expect("Some");
+        assert_eq!(
+            reloaded.state.liveness.len(),
+            1,
+            "liveness must be persisted"
+        );
+        assert_eq!(
+            harmony_owner::trust::evaluate_trust(
+                &reloaded.state,
+                device_id,
+                now,
+                harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
+            ),
+            harmony_owner::trust::TrustDecision::Full,
+        );
+        assert!(
+            reloaded.master_seed.is_some(),
+            "master seed must survive the refresh-persist"
+        );
+    }
+
+    #[test]
+    fn bumped_mint_owner_stamps_initial_liveness() {
+        // ZEB-342: post-bump, mint_owner publishes device #1 liveness WITHOUT
+        // any client-side refresh. Tripwire against a harmony dep downgrade.
+        let result = mint_owner(1_700_000_777).unwrap();
+        assert_eq!(
+            result.state.liveness.len(),
+            1,
+            "bumped mint_owner must stamp device #1 liveness"
+        );
     }
 
     #[test]

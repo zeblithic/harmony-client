@@ -78,13 +78,20 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Harmony crates — harmony-runtime is the core sans-I/O runtime.
 # harmony-identity and harmony-content are direct deps because we use
 # their types (PrivateIdentity, PqPrivateIdentity, MemoryBookStore, etc.).
-harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
-harmony-identity = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
-harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
-harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
-harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
-harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
-harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "8f2d2f130ffc37939cee6be5677fed433c60692e", features = ["recovery"] }
+# Pinned to harmony main 1ccf42bf, which unifies two cross-repo bumps that
+# conflicted on merge: ZEB-342 (#275 c2a825b7, mint_owner publishes device #1
+# liveness — this PR) and ZEB-378 (#276, EnrollmentCert expiry — already on
+# client main via #211, which pinned only harmony-owner to the pre-squash tip
+# 8f2d2f13). 1ccf42bf is a descendant of c2a825b7 and its harmony-owner tree is
+# byte-identical to 8f2d2f13, so this carries both changes with no behaviour
+# delta versus what client main already builds against.
+harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
+harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
+harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
+harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
+harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
+harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af", features = ["recovery"] }
 # ZEB-323 Phase 2b: pkarr-based discovery policies. Pinned to harmony main
 # 2aaf403 (ZEB-380 PR1, harmony#274: hot-swappable RelayPool + per-relay health —
 # RelayConfig / RelayHealth / RelayState / RelayOutcome + RelayClient::{set_relays,
