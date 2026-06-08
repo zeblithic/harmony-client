@@ -105,7 +105,7 @@ The clock *source* is **security-load-bearing** and differs by path:
 | `verify_enrolled_device(cert, owner, now_ms)` — the chokepoint | live `wall_now_ms()` (from transport) | friend/referral auth is **live**: reject a cert expired *now* |
 | `authenticate_friend_request` / `process_friend_request` / `authenticate_catalog_request` / `verify_referral_catalog` | gain a `now_ms` param; their transport/IPC callers pass `wall_now_ms()` | keeps the pure auth fns deterministically testable, mirroring the existing `is_friend_token_active(&sig, now_ms)` idiom |
 | `enrolled_key_from_cert(event)` (`community_membership.rs:1228`) | **`event.at.wall_ms`** (event-time, *not* now) | **CRDT determinism** — see Component 3 |
-| `DmOutbox::new` assert (`dm_outbox.rs:461`) | `wall_now_ms()` | fail-fast: don't construct around an expired cert (inert today) |
+| `DmOutbox::new` assert (`dm_outbox.rs:461`) | **`0`** (structural-only) | this is a wiring-bug `assert!`, not an auth gate; `0` preserves its exact expiry-agnostic intent and avoids a **startup panic** if the node's own cert is expired (a separate policy concern, out of scope) |
 
 `verify_enrolled_device` returns the new
 `FriendHandshakeError::EnrollmentCertExpired` when `cert.verify(now_ms)` yields the
@@ -132,8 +132,17 @@ decision a pure function of the event, identical on every machine forever, and a
 the semantically correct question: *was the cert valid at the moment the event was
 signed?* This is deterministic and is the intended hardening.
 
-`add_enrollment` and `DmOutbox::new` are **local, live** operations (not replayed
-CRDT state), so they correctly use the live wall clock.
+`add_enrollment` is a **local, live** operation (not replayed CRDT state), so it
+correctly uses the live wall clock. `DmOutbox::new`'s call is a construction
+*wiring assert* (cert↔key↔owner binding), not an auth decision, so it passes `0`
+to keep the check structural-only — enforcing the node's **own** cert expiry at
+boot is a policy question (graceful re-enroll, not an `assert!` panic) deliberately
+left out of scope.
+
+The `verify()` contract still forces *every* caller to consciously pass a clock, so
+the defense-in-depth property holds: no caller can silently skip expiry. `DmOutbox`
+passing `0` is an explicit, documented opt-out for a wiring check — not an accidental
+omission.
 
 ## Data flow & error handling
 
@@ -142,8 +151,8 @@ CRDT state), so they correctly use the live wall clock.
 - Expired cert on the **referral catalog** → `ReferralAuthError::Auth` → rejected.
 - Expired cert on a **membership event** (as-of `event.at.wall_ms`) →
   `VerifyError::EnrollmentCertInvalid` → event rejected by `verify_event`.
-- Expired cert at **`add_enrollment` / `DmOutbox::new`** → `OwnerError::…Expired` /
-  construction assert fails.
+- Expired cert at **`add_enrollment`** (live clock) → `OwnerError::…Expired`.
+- **`DmOutbox::new`** passes `0` → structural-only, unaffected by expiry (by design).
 
 All are no-ops for `expires_at: None`, which is every production cert today.
 
@@ -195,3 +204,7 @@ All are no-ops for `expires_at: None`, which is every production cert today.
 - **Choosing production expiry durations / actually minting non-`None` `expires_at`**
   — a policy decision tracked separately; this ticket makes enforcement correct so
   that policy can be turned on safely.
+- **Graceful handling of the node's *own* enrollment cert expiring at boot** — the
+  `DmOutbox::new` wiring assert stays structural-only (`now_ms = 0`); a graceful
+  "your cert expired, re-enroll" boot path is a separate policy concern, not an
+  `assert!` panic.
