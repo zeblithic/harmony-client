@@ -26406,7 +26406,7 @@ async fn voting_list_active_polls(
 /// directly (no signed event — the policy is local UX preference, not
 /// consensus-relevant). Lazy-creates the VotingLog for the community
 /// if it doesn't exist yet, mirroring the IPC fast-path used elsewhere.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn voting_set_notify_on_delegate_signal(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
     community_id: String,
@@ -29475,7 +29475,7 @@ async fn voting_get_tier2_proposal(
 /// - "invalid poll_id hex" — hex decode failure
 /// - "voting_get_tier3_poll: poll {id} not found" — no PollState matches
 /// - "voting_get_tier3_poll: poll {id} is tier {t:?}, not Tier3" — tier mismatch
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn voting_get_tier3_poll(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
     poll_id: String,
@@ -29859,7 +29859,7 @@ fn build_tier3_export(
 ///
 /// Errors:
 /// - "invalid community_id hex" — hex decode failure
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn voting_list_tier3_polls(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
     community_id: String,
@@ -34239,7 +34239,7 @@ mod friend_redeem_expiry_tests {
 /// Toggle case-B "Make me discoverable" setting. Persists the toggle to
 /// `connectivity-settings.json` and registers / unregisters the pkarr
 /// identity publication accordingly.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn connectivity_set_identity_discoverable(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -34293,7 +34293,7 @@ async fn connectivity_set_identity_discoverable(
 /// Read the current case-B "Make me discoverable" toggle state from the
 /// persisted settings file. Returns `false` when the file is missing or
 /// the pkarr settings path is not initialized.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn connectivity_get_identity_discoverable(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
@@ -34445,7 +34445,7 @@ fn pkarr_relay_write_lock() -> &'static tokio::sync::Mutex<()> {
 
 /// ZEB-380: replace the user-configurable pkarr relay list. Validates, persists
 /// to `connectivity-settings.json`, then hot-swaps the live pool (no restart).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn set_pkarr_relays<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -34459,7 +34459,7 @@ async fn set_pkarr_relays<R: tauri::Runtime>(
 /// ZEB-380: reset the pkarr relay pool to the recommended default set
 /// (`default_relays()`), persisted + hot-swapped live. Server-authoritative so
 /// the frontend never hardcodes the default list ("Restore recommended").
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn reset_pkarr_relays<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -34478,7 +34478,7 @@ async fn reset_pkarr_relays<R: tauri::Runtime>(
 /// persisted list is empty/invalid) and re-validates, so adding to a fresh
 /// install preserves the live defaults rather than replacing them with just
 /// the new URL.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn add_pkarr_relay<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -34507,7 +34507,7 @@ async fn add_pkarr_relay<R: tauri::Runtime>(
 /// install can remove an unwanted default. Removing the last relay fails
 /// (validate_relay_urls rejects an empty list), preserving the >=1 invariant
 /// server-side.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn remove_pkarr_relay<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -34536,7 +34536,7 @@ async fn remove_pkarr_relay<R: tauri::Runtime>(
 /// ZEB-380: current relay list + per-relay health. Prefers the live client's
 /// health; falls back to the persisted list (Healthy placeholders) pre-wiring
 /// so the Settings UI can render + edit before/without a running node.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn get_pkarr_relays<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -34636,7 +34636,7 @@ async fn connectivity_discover_identity(
 
 /// Query the current pkarr publication state for the diagnostics panel.
 /// Returns counts of active publications by case (A/B/C).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn connectivity_pkarr_publication_status(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<PkarrPublicationStatus, String> {
@@ -34870,7 +34870,7 @@ fn friend_token_publish_guard(
 ///
 /// Errors: `OWNER_NOT_LOADED_MSG` when the node isn't booted; the mint /
 /// encode error string otherwise.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn generate_friend_token(
     state: tauri::State<'_, Mutex<NodeState>>,
     expires_at: Option<u64>,
@@ -34957,7 +34957,7 @@ async fn generate_friend_token(
 /// dm_self_owner / dm_outbox), then reads the device-#2 signing key
 /// (`community_signing_key`) + `enrollment_cert` from the outbox — exactly the
 /// inputs `connectivity_link_friend_iroh_inner` requires.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn redeem_friend_token(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -35081,7 +35081,7 @@ async fn redeem_friend_token(
 
 /// List the local owner's friends (non-`Revoked` entries) for the
 /// `FriendsPanel`. Read-only snapshot of the friend-graph sub-CRDT.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn list_friends(state: tauri::State<'_, Mutex<NodeState>>) -> Result<Vec<FriendDto>, String> {
     let crdt_state = {
         let g = state
@@ -35099,7 +35099,7 @@ async fn list_friends(state: tauri::State<'_, Mutex<NodeState>>) -> Result<Vec<F
 /// Unfriend a peer: write a `Revoked` tombstone (LWW, so it can't be silently
 /// resurrected by a stale `Active`) and emit `friend-list-changed`.
 /// `peer_addr` is the friend's 16-byte master `owner_id` in hex.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn unfriend(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -35171,7 +35171,7 @@ async fn unfriend(
 /// HLC, LWW-apply the updated entry via `apply_friend_update` (so other devices
 /// converge), arm the debounced publish-root + persist on the owner-state
 /// SyncEngine, and emit `friend-list-changed` so the UI refreshes.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn set_friend_referrable(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -35248,7 +35248,7 @@ async fn set_friend_referrable(
 /// iroh is down — un-dial-able, treated as "not reachable").
 ///
 /// `peer_addr` is the friend's 16-byte master `owner_id` in hex.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn connectivity_resolve_friend(
     state: tauri::State<'_, Mutex<NodeState>>,
     owner_id_hex: String,
@@ -35336,7 +35336,7 @@ async fn connectivity_resolve_friend(
 /// Reuses `connectivity_resolve_friend`'s Case-D resolve verbatim and mirrors
 /// `add_friend_by_key`'s dial+frame discipline (but on the PEX ALPN). `owner_id_hex`
 /// is the friend's 16-byte master `owner_id` in hex.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn browse_friend_referrals(
     state: tauri::State<'_, Mutex<NodeState>>,
     owner_id_hex: String,
@@ -35654,7 +35654,7 @@ fn decode_owner_id_16(owner_id_hex: &str) -> Result<crate::owner_state_types::Ow
 /// List the process-local pending inbound friend requests (Path A) for the
 /// frontend inbox. Returns an empty list when the Path-A store isn't wired
 /// (pre-`start_node` or owner not loaded) rather than erroring.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn list_pending_friend_requests(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<PendingFriendRequestDto>, String> {
@@ -35675,7 +35675,7 @@ async fn list_pending_friend_requests(
 /// NEXT dial is accepted inline by the acceptor's `prior_accept` consent gate.
 /// This does NOT dial out — the link completes on the requester's re-dial. Emits
 /// `friend-list-changed` so the UI refreshes its inbox/friend views.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn accept_friend_request(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -35700,7 +35700,7 @@ async fn accept_friend_request(
 
 /// Decline a pending inbound friend request: drop the recorded inbound request
 /// AND any approval. Emits `friend-list-changed` so the UI drops the row.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn decline_friend_request(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -35731,7 +35731,7 @@ async fn decline_friend_request(
 /// trait object in the iroh link-manager's dispatcher OnceCell, with no
 /// interior-mutability handle exposed), so a running acceptor keeps its prior
 /// value until restart. The persisted value is what the next `start_node` reads.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn set_friend_auto_accept(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -35768,7 +35768,7 @@ async fn set_friend_auto_accept(
 /// Read the current "auto-accept known requesters" toggle from the persisted
 /// settings file. Returns the spec default (ON) when the file is missing or the
 /// pkarr settings path is not initialized.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Result<bool, String> {
     let path = {
         state
@@ -37163,7 +37163,7 @@ pub struct PeerReachabilityDto {
 /// Returns `Ok(None)` when iroh isn't running (boot failed, or
 /// pre-`start_node`). The `announced_at_ms` field is always 0 — see
 /// the DTO doc for rationale.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn connectivity_get_my_reachability_record(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Option<ReachabilityRecordDto>, String> {
@@ -37196,7 +37196,7 @@ async fn connectivity_get_my_reachability_record(
 /// identity (mirrors `connectivity_get_my_reachability_record`'s pre-start
 /// `Ok(None)`). Read-only: the identity *pub* is public key material, not the
 /// owner secret. (ZEB-388)
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn connectivity_get_my_identity_pub_hex(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Option<String>, String> {
@@ -37209,7 +37209,7 @@ async fn connectivity_get_my_identity_pub_hex(
 /// Snapshot of all peer-reachability entries known to this device's
 /// LWW resolver. Returns `Ok(vec![])` when the resolver hasn't been
 /// installed (pre-`start_node`) or when no peers have published yet.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn connectivity_list_peer_reachability(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<PeerReachabilityDto>, String> {
@@ -37254,7 +37254,7 @@ async fn connectivity_list_peer_reachability(
 /// immediately, and the actual publish work runs asynchronously on
 /// the publisher's task. The IPC's success only attests that the
 /// notify was delivered.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn connectivity_force_republish(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
@@ -37334,7 +37334,7 @@ impl crate::network_health::PkarrSnapshot for StubEmptyPkarrSnapshot {
 /// snapshot. Returns `NetworkHealthSnapshot::empty()` when the service
 /// hasn't been wired yet (boot ordering / pre-start_node) — the panel
 /// renders gracefully on the empty shape.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn network_health_snapshot<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -37380,7 +37380,7 @@ async fn network_health_snapshot<R: tauri::Runtime>(
 /// the real four-step probe sequence (endpoint / pkarr-relay round-trip /
 /// publish state-check / resolve round-trip). Honors the "Make me
 /// discoverable" opt-in — publish/resolve `Skipped` (not failed) when off.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn network_health_run_self_test(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<crate::network_health::SelfTestReport, String> {
@@ -37464,7 +37464,7 @@ async fn network_health_run_self_test(
 /// Memory rule `feedback_two_ipc_toctou`: the cached last self-test
 /// is memo-style (read after the most recent `run_self_test`), NOT a
 /// commit token bound to a previous IPC's preview. No TOCTOU window.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command]
 async fn network_health_export_payload(
     state: tauri::State<'_, Mutex<NodeState>>,
     include_full_ids: bool,
