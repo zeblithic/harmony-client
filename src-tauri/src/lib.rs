@@ -8922,18 +8922,23 @@ async fn ingest_content(
 /// (PublicDurable / unencrypted) so the resulting CID is publicly servable.
 /// Skips the sidecar insert (send_ingest_with_name) so avatars never appear in
 /// the file listing.
+/// ZEB-344: shared avatar byte ceiling. Enforced on ingest
+/// (`ingest_avatar_bytes_inner`) AND on receive (`fetch_avatar` via
+/// `FetchRequest.max_bytes`), so the two cannot drift. 512KB carries ~2× headroom
+/// over a realistic 256×256 PNG (≤256KB).
+pub(crate) const AVATAR_MAX_BYTES: usize = 512 * 1024;
+
 pub(crate) async fn ingest_avatar_bytes_inner(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
     use harmony_content::chunker::ChunkerConfig;
-    const MAX_AVATAR_BYTES: usize = 512 * 1024;
     if bytes.is_empty() {
         return Err("empty avatar bytes".to_string());
     }
-    if bytes.len() > MAX_AVATAR_BYTES {
+    if bytes.len() > AVATAR_MAX_BYTES {
         return Err(format!(
-            "avatar too large: {} > {MAX_AVATAR_BYTES}",
+            "avatar too large: {} > {AVATAR_MAX_BYTES}",
             bytes.len()
         ));
     }
@@ -11962,6 +11967,42 @@ async fn fetch_content(
             cid_hex: cid,
             reply: reply_tx,
             max_bytes: None,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())?
+}
+
+/// ZEB-344: avatar-semantic CAS fetch. Identical to `fetch_content` but caps the
+/// download at `AVATAR_MAX_BYTES` via `FetchRequest.max_bytes`, so an oversized
+/// `avatar_cid` on a peer's signed profile card can't force an unbounded fetch.
+/// The decoded-dimension guard lives on the receive side in `AvatarResolver`.
+#[tauri::command]
+async fn fetch_avatar(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<u8>, String> {
+    if cid.is_empty() || !cid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid CID hex: {cid}"));
+    }
+
+    let fetch_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid,
+            reply: reply_tx,
+            max_bytes: Some(AVATAR_MAX_BYTES),
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -37580,6 +37621,7 @@ pub fn run() {
             archive_content,
             set_replication_tier,
             fetch_content,
+            fetch_avatar,
             fetch_profile_doc,
             export_content,
             ingest_content,
@@ -39824,6 +39866,30 @@ mod channel_message_ipc_tests {
             err.contains("channel_log_registry missing"),
             "Some(HlcDto) should fall through to registry lookup; got: {err}"
         );
+    }
+
+    // ZEB-344: fetch_avatar rejects a malformed (non-hex) CID before touching
+    // the event loop. The state has no fetch_tx, so the guard path is never
+    // reached — only the hex-validation early-return matters here.
+    #[tokio::test]
+    async fn fetch_avatar_rejects_malformed_hex() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let got: Result<Vec<u8>, String> = fetch_avatar("nothex!!".to_string(), state).await;
+        assert!(
+            got.as_ref().is_err_and(|e: &String| e.contains("invalid CID hex")),
+            "expected invalid-hex rejection, got {got:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zeb_344_avatar_fetch_tests {
+    use super::*;
+
+    #[test]
+    fn avatar_max_bytes_is_512k() {
+        assert_eq!(AVATAR_MAX_BYTES, 512 * 1024);
     }
 }
 
