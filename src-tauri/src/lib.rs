@@ -4312,11 +4312,15 @@ pub(crate) async fn start_node_inner(
                                     let home_relay =
                                         ep.home_relay().map(|r| r.to_string()).unwrap_or_default();
                                     // ZEB-391: drop stale/wrong-subnet + virtual-switch
-                                    // (WSL/Docker) addresses so peers don't dial the wrong host.
+                                    // (WSL/Docker) + down-interface addresses so peers don't
+                                    // dial the wrong/unreachable host. Async path: the iface
+                                    // enumeration is a blocking syscall, so offload it via
+                                    // spawn_blocking to keep this executor worker free.
                                     let direct_addrs =
-                                        crate::direct_addr_filter::gather_routable_direct_addrs(
+                                        crate::direct_addr_filter::gather_routable_direct_addrs_async(
                                             ep.direct_addresses(),
-                                        );
+                                        )
+                                        .await;
                                     let announced_at_ms = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
@@ -4590,7 +4594,10 @@ pub(crate) async fn start_node_inner(
                             let home_relay_url =
                                 ep.home_relay().map(|r| r.to_string()).unwrap_or_default();
                             // ZEB-391: drop stale/wrong-subnet + virtual-switch (WSL/Docker)
-                            // addresses so peers don't dial the wrong host.
+                            // + down-interface addresses so peers don't dial the wrong/
+                            // unreachable host. This `blob_builder` is a sync `Fn() -> Vec<u8>`
+                            // (pkarr routing-blob contract — already does sync CBOR + signing),
+                            // so it can't `.await`; the sync gather is correct here.
                             let direct_addresses =
                                 crate::direct_addr_filter::gather_routable_direct_addrs(
                                     ep.direct_addresses(),

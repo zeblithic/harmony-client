@@ -41,12 +41,13 @@ A new focused module `src-tauri/src/direct_addr_filter.rs` with a **pure** core
 (testable) and a thin impure gather:
 
 ```rust
-/// One live local interface address: the assigned IP + the interface name.
-pub struct LocalIface { pub ip: IpAddr, pub name: String }
+/// One local interface address: the assigned IP, the interface name, and whether
+/// the interface is operationally up (`if_addrs::IfOperStatus::Up`).
+pub struct LocalIface { pub ip: IpAddr, pub name: String, pub oper_up: bool }
 
-/// PURE: keep only iroh direct addrs that are assigned to a currently-live,
-/// non-virtual, routable local interface. Order-preserving; deduplication is
-/// not required (the publisher's set is already small).
+/// PURE: keep only iroh direct addrs that are assigned to a currently-live
+/// (operationally up), non-virtual, routable local interface. Order-preserving;
+/// deduplication is not required (the publisher's set is already small).
 pub fn routable_direct_addresses(
     iroh_addrs: &[SocketAddr],
     local_ifaces: &[LocalIface],
@@ -56,6 +57,13 @@ pub fn routable_direct_addresses(
 /// apply the pure filter. FAIL-OPEN: on enumeration error, log a warning and
 /// return `iroh_addrs` unfiltered (no connectivity regression vs today).
 pub fn gather_routable_direct_addrs(iroh_addrs: Vec<SocketAddr>) -> Vec<SocketAddr>;
+
+/// Async wrapper for callers on a Tokio worker: offloads the blocking
+/// `get_if_addrs()` syscall to `spawn_blocking` so a burst of reachability
+/// republishes can't stall an executor worker. Returns an empty set (relay
+/// fallback) on task panic / shutdown. The sync `gather_*` above is retained for
+/// the sync `Fn() -> Vec<u8>` pkarr routing-blob builder, which cannot `.await`.
+pub async fn gather_routable_direct_addrs_async(iroh_addrs: Vec<SocketAddr>) -> Vec<SocketAddr>;
 ```
 
 `if-addrs` is already in `Cargo.lock` (transitive via `if-watch`); ZEB-391 adds it
@@ -71,8 +79,11 @@ For each `sa` in `iroh_addrs`, **keep** it iff ALL hold:
    link-local — IPv4 `169.254.0.0/16` (`Ipv4Addr::is_link_local`), IPv6 `fe80::/10`
    (`(seg0 & 0xffc0) == 0xfe80`). (IPv6 unique-local `fc00::/7` and IPv4 private
    ranges are **kept** — they're valid on a LAN.)
-2. **Live + non-virtual interface.** Some `LocalIface` has `iface.ip == sa.ip()` and
-   `!is_virtual_iface(&iface.name)`.
+2. **Live + non-virtual interface.** Some `LocalIface` has `iface.ip == sa.ip()`,
+   `iface.oper_up` (the interface is operationally up — `IfOperStatus::Up`), and
+   `!is_virtual_iface(&iface.name)`. The `oper_up` gate rejects a stale address still
+   listed on a physical interface that has gone down (cable pulled / Wi-Fi dropped)
+   so peers don't dial an unreachable endpoint.
 
 `is_virtual_iface(name)` matches on the **lowercased** name containing any of a
 conservative pattern set:
@@ -94,20 +105,24 @@ an interface scan. Rule 2 (the allowlist) is what catches the stale/wrong-subnet
 
 ## Integration
 
-Both publish closures in `lib.rs` (`~4311`, `~4584`) replace
+Both publish closures in `lib.rs` filter `ep.direct_addresses()` before building the
+payload, but they run in **different execution contexts**:
 
-```rust
-let direct_addrs = ep.direct_addresses();
-```
+- **Reachability republish (`~4317`) is async** (`PublishFn` → `Box::pin(async move {…})`),
+  fired on `if-watch` network-change events. It uses the async wrapper so the blocking
+  interface enumeration is offloaded to `spawn_blocking`:
 
-with
+  ```rust
+  let direct_addrs =
+      crate::direct_addr_filter::gather_routable_direct_addrs_async(ep.direct_addresses()).await;
+  ```
 
-```rust
-let direct_addrs = crate::direct_addr_filter::gather_routable_direct_addrs(ep.direct_addresses());
-```
+- **pkarr routing `blob_builder` (`~4595`) is a sync `Arc<dyn Fn() -> Vec<u8>>`** (the
+  routing-blob contract; already does sync CBOR + signing). It cannot `.await`, so it
+  calls the sync `gather_routable_direct_addrs(...)` directly — the marginal
+  `getifaddrs` cost is consistent with the closure's existing sync work.
 
-(and the second site's `let direct_addresses = ...` likewise). No other change to
-payload construction; `home_relay_url` and the rest are untouched.
+No other change to payload construction; `home_relay_url` and the rest are untouched.
 
 **`network_health.rs` is intentionally NOT filtered** (`:572`, `:1357`). Those feed
 the connectivity **diagnostic** surface, where seeing iroh's raw address set —
@@ -136,6 +151,8 @@ fixtures (no real interface I/O):
   `br-abc` → out.
 - **Physical kept:** addr on `en0`/`eth0`/`Wi-Fi` → kept; IPv6 ULA on a physical
   iface → kept.
+- **Down physical dropped:** addr on a non-virtual iface with `oper_up == false`
+  (cable pulled / Wi-Fi dropped) → filtered out; an up sibling → kept.
 - **Shape drops:** loopback (`127.0.0.1`), link-local (`169.254.x`, `fe80::x`),
   unspecified (`0.0.0.0`) → out regardless of interface.
 - **All-filtered → empty** (asserts the relay-fallback precondition: an empty vec,
