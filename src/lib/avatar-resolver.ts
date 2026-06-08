@@ -1,4 +1,5 @@
 import type { TauriAdapter } from './zenoh-service';
+import { assertDecodedDimsOk } from './avatar-normalize';
 
 /** How long to wait before retrying a failed CID fetch (30s). */
 const RETRY_COOLDOWN_MS = 30_000;
@@ -6,7 +7,7 @@ const RETRY_COOLDOWN_MS = 30_000;
 /**
  * Resolves avatar CIDs to displayable blob URLs via content transport.
  *
- * Fetches raw bytes from the Zenoh mesh using the `fetch_content` Tauri
+ * Fetches raw bytes from the Zenoh mesh using the `fetch_avatar` Tauri
  * command and creates object URLs for rendering in <img> tags. Results
  * are cached so each CID is fetched at most once.
  */
@@ -42,10 +43,19 @@ export class AvatarResolver {
     if (!this.adapter) return;
     this.pending.add(cid);
     try {
-      const bytes = (await this.adapter.invoke('fetch_content', { cid })) as number[];
+      const bytes = (await this.adapter.invoke('fetch_avatar', { cid })) as number[];
       if (this.destroyed) return;
       const mime = detectImageMime(bytes);
       const blob = new Blob([new Uint8Array(bytes)], { type: mime });
+      // ZEB-344: decoded-dimension guard on the RECEIVE path (parity with
+      // normalizeAvatar's ingest guard) — reject a decode bomb before its blob
+      // URL ever reaches an <img>. A throw here lands in the catch → identicon.
+      const bmp = await createImageBitmap(blob);
+      try {
+        assertDecodedDimsOk(bmp.width, bmp.height);
+      } finally {
+        bmp.close();
+      }
       const url = URL.createObjectURL(blob);
       this.cache.set(cid, url);
       this.onChange?.();
