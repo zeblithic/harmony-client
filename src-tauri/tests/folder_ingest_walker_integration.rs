@@ -791,7 +791,7 @@ async fn missing_root_path_errors_without_inserting_sidecar() {
     );
 }
 
-// ── Test 10: depth-2+ nested-bundle round-trip on a 36 GiB sparse file ─────
+// ── Test 10: depth-2+ nested-bundle round-trip (small-chunker fixture) ──────
 //
 // ZEB-161 Task 5: end-to-end pin for the streaming + tree-build path. The
 // `streaming_ingest_tests` block inside `src/lib.rs` exercises
@@ -801,26 +801,22 @@ async fn missing_root_path_errors_without_inserting_sidecar() {
 // depth-2+ tree that streaming_ingest must build when the chunk count
 // exceeds `MAX_BUNDLE_ENTRIES` (= 32_767 at MAX_PAYLOAD_SIZE / CID_SIZE).
 //
-// The fixture is a 36 GiB + 1 byte sparse tempfile. Sized to GUARANTEE
-// depth-2 on sparse-zero input: with `ChunkerConfig::DEFAULT` (min=256 KiB,
-// avg=512 KiB, max ≈ 1 MiB), the FastCDC gear hash on a pure-zero stream
-// never satisfies the mask check (the deterministic hash settles to a
-// non-zero residue mod 2^19 and mod 2^20), so every cut is forced at
-// max_chunk. 36 GiB / 1 MiB ≈ 36_864 leaves > MAX_BUNDLE_ENTRIES (32_767),
-// forcing the tree-build loop to add a second level. 9 GiB (the original
-// planned size, symbolic of the old FLAT_BUNDLE_MAX) only produced ~9_216
-// max_chunks — depth-1 — and would not exercise this code path.
+// ZEB-397: depth-2 is driven by leaf COUNT (> MAX_BUNDLE_ENTRIES), not by
+// byte volume. The chunk count on a sparse-zero stream is
+// `ceil(size / max_chunk)`: zeros never satisfy the FastCDC gear-hash mask
+// (the rolling hash over a constant byte converges to a fixed non-zero
+// residue, so no content boundary ever fires), forcing every cut at
+// `max_chunk`. So rather than reach >32_767 leaves the brute-force way
+// (36 GiB ÷ 1 MiB `ChunkerConfig::DEFAULT` chunks ≈ 36_864 leaves — ~17 min
+// of FastCDC hashing that made this the per-PR CI long pole, ZEB-397), we
+// shrink `max_chunk` to 4 KiB and reach the same >32_767 leaves with a
+// ~140 MiB sparse fixture that hashes in well under a second. The tree-build
+// path exercised is byte-for-byte identical — only the chunk size differs.
 //
-// Real-world non-zero data hits the gear-hash mask more often and produces
-// many more chunks per byte, so a 36 GiB sparse-zero fixture is a much
-// LARGER input than typical depth-2 production cases. That's intentional:
-// it's the only way to reach depth-2 with `ChunkerConfig::DEFAULT` on a
-// sparse fixture that doesn't consume real disk.
-//
-// Gated behind HARMONY_LARGE_TESTS=1 — disk + wall-clock cost is too high
-// for the default `cargo nextest run` flow. CI's `rust-test` job sets the
-// env var so this still runs there. Local devs opt in when they want to
-// validate streaming behaviour without the full E2E suite.
+// The fixture is a sparse tempfile (`set_len` creates a hole; ≈0 real disk
+// on ext4/APFS/NTFS/ZFS, read back as a continuous run of zero bytes). No
+// HARMONY_LARGE_TESTS gate and no dedicated CI job any more — at ~140 MiB
+// this runs in the normal `cargo nextest run` flow on every PR.
 //
 // Captured-channel pattern: we route `streaming_ingest`'s ingest sends into
 // an mpsc the test owns, recording every (CID, bytes) pair on the way past.
@@ -841,33 +837,32 @@ async fn nested_bundle_tree_round_trip() {
     use harmony_content::chunker::ChunkerConfig;
     use harmony_content::cid::{CidType, ContentId};
 
-    // Require exact "1" rather than just-set — keeps `HARMONY_LARGE_TESTS=0`
-    // (common pattern for opting OUT of expensive opt-in tests) from
-    // accidentally running the 36 GiB path.
-    if std::env::var("HARMONY_LARGE_TESTS").ok().as_deref() != Some("1") {
-        eprintln!(
-            "Skipping nested_bundle_tree_round_trip: set HARMONY_LARGE_TESTS=1 to enable \
-             (needs sparse-file support on the tempdir filesystem; ≈0 real disk \
-             consumed, but the file appears as 36 GiB to userspace)"
-        );
-        return;
-    }
+    // ZEB-397: a deliberately tiny chunker so a ~140 MiB sparse fixture
+    // produces > MAX_BUNDLE_ENTRIES (32_767) leaves and forces depth-2.
+    // Valid per ChunkerConfig::validate (min < avg < max ≤ MAX_PAYLOAD_SIZE;
+    // avg a power of two). On zero input every cut is forced at max_chunk
+    // (4 KiB), so leaf count ≈ EXPECTED_SIZE / 4 KiB.
+    const TINY_CHUNKER: ChunkerConfig = ChunkerConfig {
+        min_chunk: 1024,
+        avg_chunk: 2048,
+        max_chunk: 4096,
+    };
 
-    // 36 GiB + 1 byte — see the section header comment for the sizing
-    // rationale. The +1 byte also pins the total_size sentinel to a value
-    // that's not a clean GiB boundary, catching off-by-one bugs in the
-    // chunker's tail-byte accounting.
-    const EXPECTED_SIZE: u64 = 36 * 1024 * 1024 * 1024 + 1;
+    // 36_000 forced max_chunk cuts + 1 tail byte → 36_001 leaves: comfortably
+    // above MAX_BUNDLE_ENTRIES (32_767, proving depth-2) and below the 50_000
+    // regression ceiling. The +1 also keeps total_size off a clean boundary —
+    // an off-by-one canary for the chunker's tail-byte accounting.
+    const EXPECTED_SIZE: u64 = 36_000 * 4096 + 1;
 
-    // Sparse tempfile. `set_len` on most modern filesystems (NTFS, ext4,
-    // APFS, ZFS) creates a hole rather than allocating zeros; the file
-    // *appears* 36 GiB but actually consumes ~0 bytes until written to. The
-    // chunker reads it as a continuous run of zero bytes via tokio::fs::File.
-    let tmp_dir = tempfile::tempdir().expect("tempdir for sparse 36 GiB fixture");
-    let path = tmp_dir.path().join("sparse_36gib_plus_one.bin");
+    // Sparse tempfile. `set_len` on modern filesystems (ext4, APFS, NTFS, ZFS)
+    // creates a hole rather than allocating zeros; the file *appears* as
+    // EXPECTED_SIZE but consumes ~0 real bytes until written. The chunker
+    // reads it as a continuous run of zero bytes via tokio::fs::File.
+    let tmp_dir = tempfile::tempdir().expect("tempdir for sparse fixture");
+    let path = tmp_dir.path().join("sparse_zero_fixture.bin");
     {
         let file = std::fs::File::create(&path).expect("create sparse fixture");
-        file.set_len(EXPECTED_SIZE).expect("set_len 36 GiB + 1");
+        file.set_len(EXPECTED_SIZE).expect("set_len sparse fixture");
         // Drop closes the handle before the async reader opens it.
     }
 
@@ -876,16 +871,13 @@ async fn nested_bundle_tree_round_trip() {
     // `chunked_ingest_pin_cascade_fetch_burn_roundtrip`): drive
     // `streaming_ingest` through a channel we own.
     //
-    // Memory note: the obvious "record every (cid_hex, bytes) pair" pattern
-    // works for small fixtures but OOMs CI on 36 GiB inputs — every leaf's
-    // ~1 MiB payload is cloned into the captured Vec, retaining
-    // ~O(file_size) bytes for the lifetime of the test. The refactored
-    // drain below counts leaves and discards their bytes (only the CID type
-    // matters), and stores bundle payloads in a CID-keyed map so the root
-    // bundle's bytes can be parsed for the inline-metadata assertion. Total
-    // retained RAM is bounded by leaf-COUNT × 0 + bundle-count × bundle-size
-    // (~MAX_BUNDLE_ENTRIES × 32 B per bundle), well under a single MiB
-    // total at this scale.
+    // Memory note: recording every (cid_hex, bytes) pair would retain
+    // ~O(file_size) bytes (every 4 KiB leaf cloned into the captured Vec).
+    // The drain below counts leaves and discards their bytes (only the CID
+    // type matters), and stores bundle payloads in a CID-keyed map so the
+    // root bundle's bytes can be parsed for the inline-metadata assertion.
+    // Total retained RAM is bounded by leaf-COUNT × 0 + bundle-count ×
+    // bundle-size (~MAX_BUNDLE_ENTRIES × 32 B per bundle), well under a MiB.
     struct DrainOutput {
         leaf_count: usize,
         /// CID hex → bundle payload bytes. Only Bundle CIDs are stored;
@@ -931,16 +923,16 @@ async fn nested_bundle_tree_round_trip() {
         .await
         .expect("open sparse fixture for async read");
     let (root, _total_bytes) =
-        harmony_app::streaming_ingest(reader, &capture_tx, ChunkerConfig::DEFAULT, None)
+        harmony_app::streaming_ingest(reader, &capture_tx, TINY_CHUNKER, None)
             .await
-            .expect("streaming_ingest must succeed on the 36 GiB sparse fixture");
+            .expect("streaming_ingest must succeed on the sparse fixture");
     drop(capture_tx);
     let captured = drain.await.expect("capture drain joins cleanly");
     let elapsed = start.elapsed();
 
-    // Smoke-test bound: streaming ingest of a sparse-zero 36 GiB tempfile is
-    // I/O-bound (zeros are cheap to hash). Slow disks can legitimately
-    // exceed 60 s — warn rather than fail to keep CI green on shared hosts.
+    // Smoke-test bound: ingest of a ~140 MiB sparse-zero fixture is fast
+    // (zeros hash cheaply; the cost is ~36 k chunk sends through the channel).
+    // Slow shared CI hosts can still exceed 60 s — warn rather than fail.
     if elapsed.as_secs() > 60 {
         eprintln!("WARNING: nested_bundle_tree_round_trip ingest took {elapsed:?} (>60s)");
     }
@@ -950,24 +942,23 @@ async fn nested_bundle_tree_round_trip() {
         CidType::Bundle(depth) => {
             assert!(
                 depth >= 2,
-                "expected Bundle(>=2) for 36 GiB input (chunk count must exceed MAX_BUNDLE_ENTRIES), got Bundle({depth})"
+                "expected Bundle(>=2) (leaf count must exceed MAX_BUNDLE_ENTRIES), got Bundle({depth})"
             );
         }
         other => panic!("expected Bundle CID for multi-chunk input, got {other:?}"),
     }
 
     // ── Leaf-count assertion: > 32_767, < 50_000 ──────────────────────
-    // Expected for 36 GiB sparse-zero at default config: chunker forces
-    // ~36_864 max_chunk cuts (36 GiB / ~1 MiB). The lower bound > 32_767
-    // is the only value that strictly proves depth-2 was forced by chunk
-    // count exceeding MAX_BUNDLE_ENTRIES. Upper bound < 50_000 catches
-    // a regression where the chunker starts producing many more cuts than
-    // expected (e.g. min_chunk-sized cuts would yield 36 GiB / 256 KiB =
-    // 147_456 leaves — still depth-2 but ~4× the expected count).
+    // At TINY_CHUNKER on sparse zeros the chunker forces max_chunk (4 KiB)
+    // cuts: EXPECTED_SIZE / 4 KiB ≈ 36_001 leaves. The lower bound > 32_767
+    // is the only value that strictly proves depth-2 was forced by leaf
+    // count exceeding MAX_BUNDLE_ENTRIES. Upper bound < 50_000 catches a
+    // regression where cuts shrink toward min_chunk (e.g. 1 KiB cuts would
+    // yield ~140_000 leaves — still depth-2 but ~4× the expected count).
     let leaf_count = captured.leaf_count;
     assert!(
         leaf_count > 32_767 && leaf_count < 50_000,
-        "expected leaf count in (32_767, 50_000) for 36 GiB sparse input, got {leaf_count}"
+        "expected leaf count in (32_767, 50_000) for the sparse fixture, got {leaf_count}"
     );
 
     // ── Inline-metadata round-trip on the root bundle ───────────────────
