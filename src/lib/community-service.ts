@@ -361,19 +361,19 @@ export class CommunityService {
     communityId: string,
     forceRefresh = false,
   ): Promise<CommunityMember[]> {
+    // ZEB-404: single-flight. Multiple triggers (the message-throttle,
+    // reconnect, and community-open refreshes) can request a fetch for the same
+    // community concurrently. Share any in-flight fetch FIRST — before the
+    // cache — so even a non-forced read joins an imminent fresh result instead
+    // of serving a cache entry that fetch is about to replace. Coalescing also
+    // makes the cache write single and ordered, so two overlapping IPCs can't
+    // complete out of order and poison `memberCache`.
+    const inFlight = this.inFlightMemberFetches.get(communityId);
+    if (inFlight) return inFlight;
     if (!forceRefresh) {
       const cached = this.memberCache.get(communityId);
       if (cached) return cached;
     }
-    // ZEB-404: single-flight. Multiple triggers (the message-throttle,
-    // reconnect, and community-open refreshes) can request a fetch for the same
-    // community concurrently. Without coalescing, two overlapping IPCs could
-    // complete out of order and write the staler response into `memberCache`
-    // last — poisoning it for the next read. Sharing one in-flight promise
-    // makes the cache write single and ordered, and every caller observes the
-    // same fresh result, so there is no superseded-response race to guard.
-    const inFlight = this.inFlightMemberFetches.get(communityId);
-    if (inFlight) return inFlight;
     const fetchPromise = (async () => {
       try {
         const dtos = await this.invoke<MemberInfoDto[]>('list_community_members', { communityId });
