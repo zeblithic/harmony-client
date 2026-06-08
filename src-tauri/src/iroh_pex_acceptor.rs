@@ -184,12 +184,12 @@ impl IrohFriendPexAcceptor {
         // `serve_catalog_for_request` below re-runs this same check internally;
         // that redundant second verify is intentional defense-in-depth and keeps
         // the pure fn self-contained.
-        crate::referral_catalog::authenticate_catalog_request(
-            &req,
-            self.self_owner,
-            crate::iroh_friend_acceptor::wall_now_secs(),
-        )
-        .map_err(|e| format!("{e:?}"))?;
+        // ZEB-378: one expiry-clock sample for BOTH this pre-HLC auth and the
+        // serve-side re-auth below, so the two checks can't straddle an expiry
+        // boundary (nondeterministic accept/reject near a cert's expiry second).
+        let now_secs = crate::iroh_friend_acceptor::wall_now_secs();
+        crate::referral_catalog::authenticate_catalog_request(&req, self.self_owner, now_secs)
+            .map_err(|e| format!("{e:?}"))?;
 
         // Stamp the catalog clock BEFORE taking the crdt lock so the two locks
         // (hlc_tracker, crdt_state) are never nested.
@@ -207,7 +207,7 @@ impl IrohFriendPexAcceptor {
                 self.self_enrollment.clone(),
                 &self.device2_signing_key,
                 at,
-                crate::iroh_friend_acceptor::wall_now_secs(),
+                now_secs,
             )
             .map_err(|e| format!("serve decision: {e}"))?
         }; // guard dropped here — owner-state lock released before the write.

@@ -34057,8 +34057,15 @@ pub async fn connectivity_link_friend_iroh_inner(
     // 7. Verify the accept: it must be from the inviter (cert binds
     //    payload.inviter_addr) and signed over the accept preimage.
     let accept_device_key =
-        verify_enrolled_device(&accepted.enrollment, payload.inviter_addr, now_ms / 1000) // ms→s: EnrollmentCert expiry is Unix seconds (ZEB-378)
-            .map_err(|e| format!("verify accept enrollment: {e}"))?;
+        // ZEB-378: sample a FRESH clock here — this verify runs after pkarr
+        // resolution + the iroh handshake (seconds of I/O), so the `now_ms`
+        // captured early for token/pkarr checks would be stale at verification time.
+        verify_enrolled_device(
+            &accepted.enrollment,
+            payload.inviter_addr,
+            crate::iroh_friend_acceptor::wall_now_secs(),
+        )
+        .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
     accept_vk
@@ -36059,8 +36066,14 @@ pub async fn connectivity_add_friend_by_key_inner(
     //    never writes a friend.
     let target_addr_master = accepted.from_addr;
     let accept_device_key =
-        verify_enrolled_device(&accepted.enrollment, target_addr_master, now_ms / 1000) // ms→s: EnrollmentCert expiry is Unix seconds (ZEB-378)
-            .map_err(|e| format!("verify accept enrollment: {e}"))?;
+        // ZEB-378: fresh clock — this verify runs after pkarr resolution + the iroh
+        // handshake, so the early-captured `now_ms` would be stale at verify time.
+        verify_enrolled_device(
+            &accepted.enrollment,
+            target_addr_master,
+            crate::iroh_friend_acceptor::wall_now_secs(),
+        )
+        .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
     accept_vk

@@ -84,7 +84,7 @@ harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "044
 harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
 harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
-harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "4c7fc72f51b76676bce62a770e08e31588bc84b5", features = ["recovery"] }
+harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "8f2d2f130ffc37939cee6be5677fed433c60692e", features = ["recovery"] }
 # ZEB-323 Phase 2b: pkarr-based discovery policies. Pinned to harmony main
 # 2aaf403 (ZEB-380 PR1, harmony#274: hot-swappable RelayPool + per-relay health —
 # RelayConfig / RelayHealth / RelayState / RelayOutcome + RelayClient::{set_relays,

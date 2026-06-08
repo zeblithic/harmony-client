@@ -1045,7 +1045,13 @@ where
         // here — the consent flags below only gate whether to PROMPT, never
         // whether to authenticate. A request that fails auth is rejected before
         // any consent branch (no friend written, no record kept, no accept sent).
-        authenticate_friend_request(&req, wall_now_secs()).map_err(FriendAcceptError::Handshake)?;
+        //
+        // ZEB-378: sample the expiry clock ONCE per inbound handshake and thread it
+        // through both the pre-consent auth and the post-token-gate accept. Using one
+        // instant means a cert can't pass auth here yet fail the later accept (which
+        // would burn the one-shot token), and both checks agree on a single time.
+        let now_secs = wall_now_secs();
+        authenticate_friend_request(&req, now_secs).map_err(FriendAcceptError::Handshake)?;
 
         // Compute `known` under the CRDT lock: is the requester already an
         // Active|Pending friend? Snapshot the boolean and DROP the guard before
@@ -1094,7 +1100,7 @@ where
                         &self.self_enrollment,
                         &self.device2_signing_key,
                         &self.keytree,
-                        wall_now_secs(),
+                        now_secs,
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1123,7 +1129,7 @@ where
                         &self.self_enrollment,
                         &self.device2_signing_key,
                         &self.keytree,
-                        wall_now_secs(),
+                        now_secs,
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
