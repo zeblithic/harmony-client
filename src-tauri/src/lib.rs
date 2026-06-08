@@ -37102,6 +37102,23 @@ async fn connectivity_get_my_reachability_record(
     }))
 }
 
+/// Returns the local node's 64-byte transport identity pub
+/// (`X25519_pub(32) ‖ Ed25519_pub(32)`) as 128 lowercase hex chars — exactly
+/// the value `add_friend_by_key` / `connectivity_discover_identity` consume, so
+/// a peer can add you by key. `Ok(None)` before `start_node` captures an
+/// identity (mirrors `connectivity_get_my_reachability_record`'s pre-start
+/// `Ok(None)`). Read-only: the identity *pub* is public key material, not the
+/// owner secret. (ZEB-388)
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_get_my_identity_pub_hex(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Option<String>, String> {
+    let g = state
+        .lock()
+        .map_err(|e| format!("NodeState poisoned: {e}"))?;
+    Ok(g.dm_identity_pub_64.map(hex::encode))
+}
+
 /// Snapshot of all peer-reachability entries known to this device's
 /// LWW resolver. Returns `Ok(vec![])` when the resolver hasn't been
 /// installed (pre-`start_node`) or when no peers have published yet.
@@ -37719,6 +37736,7 @@ pub fn run() {
             mint::mint_export_csv,
             // ZEB-321 Phase 1 Task 9: connectivity debug IPCs.
             connectivity_get_my_reachability_record,
+            connectivity_get_my_identity_pub_hex,
             connectivity_list_peer_reachability,
             connectivity_force_republish,
             // ZEB-323 Phase 2b: pkarr policy IPCs.
@@ -43087,6 +43105,41 @@ mod zeb_321_connectivity_ipc_tests {
             got.is_none(),
             "expected None when iroh_endpoint is unset, got {got:?}"
         );
+    }
+
+    /// `connectivity_get_my_identity_pub_hex` returns `Ok(None)` before
+    /// `start_node` captures an identity (no `dm_identity_pub_64`). Mirrors
+    /// `get_my_reachability_returns_none_when_iroh_not_running`.
+    #[tokio::test]
+    async fn get_my_identity_pub_hex_returns_none_when_unset() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let got = connectivity_get_my_identity_pub_hex(state)
+            .await
+            .expect("IPC must succeed");
+        assert!(
+            got.is_none(),
+            "expected None when dm_identity_pub_64 is unset, got {got:?}"
+        );
+    }
+
+    /// `connectivity_get_my_identity_pub_hex` returns the 128-char lowercase
+    /// hex of `dm_identity_pub_64` — exactly what `add_friend_by_key` consumes.
+    /// Sets the field directly, the same way `force_republish_wakes_publisher`
+    /// installs `iroh_publisher_force`.
+    #[tokio::test]
+    async fn get_my_identity_pub_hex_encodes_the_64_byte_pub() {
+        let app = mock_app_with_default_node_state();
+        {
+            let state_handle = app.state::<StdMutex<NodeState>>();
+            let mut g = state_handle.lock().expect("NodeState lock");
+            g.dm_identity_pub_64 = Some([0xAB; 64]);
+        }
+        let state = app.state::<StdMutex<NodeState>>();
+        let got = connectivity_get_my_identity_pub_hex(state)
+            .await
+            .expect("IPC must succeed");
+        assert_eq!(got, Some("ab".repeat(64)));
     }
 
     /// `connectivity_list_peer_reachability` returns `Ok(vec![])`
