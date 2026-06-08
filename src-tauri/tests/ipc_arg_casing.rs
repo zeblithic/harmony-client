@@ -25,6 +25,11 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).expect("read_dir") {
         let path = entry.expect("dir entry").path();
         if path.is_dir() {
+            // Skip Cargo's build directory — it holds generated/vendored `.rs`
+            // we don't own; scanning it is slow and false-positive-prone.
+            if path.file_name().map(|n| n == "target").unwrap_or(false) {
+                continue;
+            }
             collect_rs_files(&path, out);
         } else if path.extension().map(|e| e == "rs").unwrap_or(false) {
             out.push(path);
@@ -34,10 +39,15 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 #[test]
 fn no_tauri_command_uses_snake_case_rename() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // Scan the entire crate, not just `src/` — commands live in `src/lib.rs`
+    // today, but covering `tests/`, `build.rs`, and any future module dir means
+    // a command defined outside `src/` can't silently slip past this guard.
+    // `target/` is skipped in `collect_rs_files`. This file is self-safe: it
+    // assembles the needle via `forbidden()` so it never matches its own text.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    collect_rs_files(&src, &mut files);
-    assert!(!files.is_empty(), "no .rs files under {}", src.display());
+    collect_rs_files(root, &mut files);
+    assert!(!files.is_empty(), "no .rs files under {}", root.display());
 
     let needle = forbidden();
     let mut offenders = Vec::new();
@@ -47,7 +57,7 @@ fn no_tauri_command_uses_snake_case_rename() {
             .matches(&needle)
             .count();
         if count > 0 {
-            let rel = file.strip_prefix(&src).unwrap_or(file);
+            let rel = file.strip_prefix(root).unwrap_or(file);
             offenders.push(format!("  {} ({count})", rel.display()));
         }
     }
