@@ -93,7 +93,8 @@ length (`file − header − salt − nonce − tag`), so no explicit length fie
 needed (XChaCha20-Poly1305 is a stream cipher). Decode dispatches on the header
 version byte:
 
-- `0x01` → decrypt → 32-byte seed → wrap into a `SecretVault { seed, None, None }`.
+- `0x01` → decrypt → 32-byte seed → wrap into a seed-only
+  `SecretVault { version: 1, seed, iroh_secret_key: None, device_signing_key: None, owner_master_seed: None }`.
 - `0x02` → decrypt → CBOR `SecretVault`.
 
 Saves always write `0x02`. A `0x01` file is thus read transparently and upgraded
