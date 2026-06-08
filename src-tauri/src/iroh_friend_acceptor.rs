@@ -581,8 +581,11 @@ impl Default for FriendAcceptorConfig {
 /// preimage against that key. `process_friend_request` re-runs the same two
 /// checks (cheap; keeps it self-contained), so this is belt-and-suspenders on
 /// the accept paths and the sole gate on the Pending path.
-pub fn authenticate_friend_request(req: &FriendLinkRequest) -> Result<(), FriendHandshakeError> {
-    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr)?;
+pub fn authenticate_friend_request(
+    req: &FriendLinkRequest,
+    now_ms: u64,
+) -> Result<(), FriendHandshakeError> {
+    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_ms)?;
     let vk = VerifyingKey::from_bytes(&device_key)
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
     let preimage =
@@ -617,9 +620,10 @@ pub fn process_friend_request(
     self_enrollment: &EnrollmentCert,
     self_device2: &ed25519_dalek::SigningKey,
     keytree: &crate::owner_state_crypto::KeyTree,
+    now_ms: u64,
 ) -> Result<FriendLinkAccepted, FriendHandshakeError> {
     // 1. Authenticate the requester's cert → enrolled device-#2 key.
-    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr)?;
+    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_ms)?;
 
     // 2. Verify the request signature over the canonical preimage (now binds the
     // requester's ephemeral X25519 key + optional token).
@@ -1034,7 +1038,7 @@ where
         // here — the consent flags below only gate whether to PROMPT, never
         // whether to authenticate. A request that fails auth is rejected before
         // any consent branch (no friend written, no record kept, no accept sent).
-        authenticate_friend_request(&req).map_err(FriendAcceptError::Handshake)?;
+        authenticate_friend_request(&req, wall_now_ms()).map_err(FriendAcceptError::Handshake)?;
 
         // Compute `known` under the CRDT lock: is the requester already an
         // Active|Pending friend? Snapshot the boolean and DROP the guard before
@@ -1083,6 +1087,7 @@ where
                         &self.self_enrollment,
                         &self.device2_signing_key,
                         &self.keytree,
+                        wall_now_ms(),
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1111,6 +1116,7 @@ where
                         &self.self_enrollment,
                         &self.device2_signing_key,
                         &self.keytree,
+                        wall_now_ms(),
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1502,7 +1508,7 @@ mod tests {
     #[test]
     fn verify_enrolled_device_accepts_valid_cert() {
         let owner = mint_test_owner(0x31);
-        let device_key = verify_enrolled_device(&owner.cert, owner.owner).expect("valid");
+        let device_key = verify_enrolled_device(&owner.cert, owner.owner, 0).expect("valid");
         assert_eq!(
             device_key,
             owner.cert.device_pubkeys.classical.ed25519_verify
@@ -1514,7 +1520,7 @@ mod tests {
         let owner = mint_test_owner(0x32);
         let other = mint_test_owner(0x33);
         // Cert is owner's, but we claim it belongs to `other` → owner mismatch.
-        match verify_enrolled_device(&owner.cert, other.owner) {
+        match verify_enrolled_device(&owner.cert, other.owner, 0) {
             Err(FriendHandshakeError::EnrollmentOwnerMismatch) => {}
             other => panic!("expected EnrollmentOwnerMismatch, got {other:?}"),
         }
@@ -1527,7 +1533,7 @@ mod tests {
         // Structurally tamper: flip issued_at so the master signature no longer
         // covers the payload → cert.verify() fails.
         cert.issued_at ^= 0xFFFF;
-        match verify_enrolled_device(&cert, owner.owner) {
+        match verify_enrolled_device(&cert, owner.owner, 0) {
             Err(FriendHandshakeError::EnrollmentCertInvalid) => {}
             other => panic!("expected EnrollmentCertInvalid, got {other:?}"),
         }
@@ -1544,7 +1550,7 @@ mod tests {
             signers: vec![[1u8; 16], [2u8; 16]],
             signatures: vec![vec![0u8; 64], vec![0u8; 64]],
         };
-        match verify_enrolled_device(&cert, owner.owner) {
+        match verify_enrolled_device(&cert, owner.owner, 0) {
             Err(FriendHandshakeError::EnrollmentCertInvalid) => {}
             other => panic!("expected EnrollmentCertInvalid, got {other:?}"),
         }
@@ -1558,7 +1564,7 @@ mod tests {
 
         // The enrolled device key resolved from the cert must verify the sig
         // over the request preimage.
-        let resolved = verify_enrolled_device(&req.enrollment, req.from_addr).expect("valid cert");
+        let resolved = verify_enrolled_device(&req.enrollment, req.from_addr, 0).expect("valid cert");
         assert_eq!(resolved, device_key);
         let vk = VerifyingKey::from_bytes(&resolved).expect("vk");
         let preimage =
@@ -1628,6 +1634,7 @@ mod tests {
             &me.cert,
             &me.device_key,
             &kt,
+            0,
         )
         .expect("valid request processed");
 
@@ -1651,7 +1658,7 @@ mod tests {
         // over the accept preimage (same token_sig, accept domain tag).
         assert_eq!(accepted.from_addr, me.owner);
         assert_eq!(accepted.display.as_deref(), Some("me"));
-        let self_device_key = verify_enrolled_device(&accepted.enrollment, accepted.from_addr)
+        let self_device_key = verify_enrolled_device(&accepted.enrollment, accepted.from_addr, 0)
             .expect("self cert verifies");
         let vk = VerifyingKey::from_bytes(&self_device_key).expect("vk");
         // The accept binds the accepter's own (randomly-generated) ephemeral key,
@@ -1696,6 +1703,7 @@ mod tests {
             &me.cert,
             &me.device_key,
             &kt,
+            0,
         )
         .expect("processed");
 
@@ -1735,6 +1743,7 @@ mod tests {
             &me.cert,
             &me.device_key,
             &kt,
+            0,
         )
         .expect_err("bad sig rejected");
         assert!(matches!(err, FriendHandshakeError::SignatureInvalid));
@@ -1777,6 +1786,7 @@ mod tests {
             &me.cert,
             &me.device_key,
             &kt,
+            0,
         )
         .expect_err("owner-mismatched cert rejected");
         assert!(matches!(err, FriendHandshakeError::EnrollmentOwnerMismatch));
@@ -2122,13 +2132,13 @@ mod tests {
     #[test]
     fn authenticate_friend_request_accepts_valid_and_rejects_tampered() {
         let req = signed_request_no_token(0x80);
-        authenticate_friend_request(&req).expect("a valid no-token request authenticates");
+        authenticate_friend_request(&req, 0).expect("a valid no-token request authenticates");
 
         let mut bad = req.clone();
         bad.sig[0] ^= 0xFF;
         assert!(
             matches!(
-                authenticate_friend_request(&bad),
+                authenticate_friend_request(&bad, 0),
                 Err(FriendHandshakeError::SignatureInvalid)
             ),
             "a tampered signature must fail authentication"
@@ -2153,6 +2163,7 @@ mod tests {
             &me.cert,
             &me.device_key,
             &kt,
+            0,
         )
         .expect("no-token request processed");
         let entry = state
