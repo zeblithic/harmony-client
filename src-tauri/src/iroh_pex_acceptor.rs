@@ -34,11 +34,11 @@ pub fn serve_catalog_for_request(
     self_enrollment: EnrollmentCert,
     device2: &ed25519_dalek::SigningKey,
     at: Hlc,
-    now_ms: u64,
+    now_secs: u64,
 ) -> Result<ReferralCatalog, ReferralAuthError> {
     // 1. Authenticate the request against OUR owner address (rejects a request
     //    addressed to someone else, a bad cert, or a bad signature).
-    authenticate_catalog_request(req, self_owner, now_ms)?;
+    authenticate_catalog_request(req, self_owner, now_secs)?;
     // 2. Friend-gate: only an ACTIVE friend gets a non-empty catalog. Anyone
     //    else (authenticated but unknown, or Pending/Revoked) gets EMPTY.
     let is_friend = fg
@@ -184,8 +184,12 @@ impl IrohFriendPexAcceptor {
         // `serve_catalog_for_request` below re-runs this same check internally;
         // that redundant second verify is intentional defense-in-depth and keeps
         // the pure fn self-contained.
-        crate::referral_catalog::authenticate_catalog_request(&req, self.self_owner, wall_now_ms())
-            .map_err(|e| format!("{e:?}"))?;
+        crate::referral_catalog::authenticate_catalog_request(
+            &req,
+            self.self_owner,
+            crate::iroh_friend_acceptor::wall_now_secs(),
+        )
+        .map_err(|e| format!("{e:?}"))?;
 
         // Stamp the catalog clock BEFORE taking the crdt lock so the two locks
         // (hlc_tracker, crdt_state) are never nested.
@@ -203,7 +207,7 @@ impl IrohFriendPexAcceptor {
                 self.self_enrollment.clone(),
                 &self.device2_signing_key,
                 at,
-                wall_now_ms(),
+                crate::iroh_friend_acceptor::wall_now_secs(),
             )
             .map_err(|e| format!("serve decision: {e}"))?
         }; // guard dropped here — owner-state lock released before the write.

@@ -249,12 +249,12 @@ pub fn sign_catalog_request(
 pub fn authenticate_catalog_request(
     req: &CatalogRequest,
     self_owner: OwnerAddr,
-    now_ms: u64,
+    now_secs: u64,
 ) -> Result<(), ReferralAuthError> {
     if req.to_addr != self_owner {
         return Err(ReferralAuthError::WrongTarget);
     }
-    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_ms)
+    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)
         .map_err(|_| ReferralAuthError::Auth)?;
     let vk =
         VerifyingKey::from_bytes(&device_key).map_err(|_| ReferralAuthError::SignatureInvalid)?;
@@ -302,12 +302,12 @@ pub fn verify_referral_catalog(
     cat: &ReferralCatalog,
     expected_author: OwnerAddr,
     expected_subject: OwnerAddr,
-    now_ms: u64,
+    now_secs: u64,
 ) -> Result<(), ReferralAuthError> {
     if cat.author != expected_author {
         return Err(ReferralAuthError::AuthorMismatch);
     }
-    let device_key = verify_enrolled_device(&cat.enrollment, cat.author, now_ms)
+    let device_key = verify_enrolled_device(&cat.enrollment, cat.author, now_secs)
         .map_err(|_| ReferralAuthError::Auth)?;
     let vk =
         VerifyingKey::from_bytes(&device_key).map_err(|_| ReferralAuthError::SignatureInvalid)?;

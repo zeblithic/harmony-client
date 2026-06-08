@@ -1543,7 +1543,7 @@ pub async fn run<R: Runtime>(
                                             let verified_owner =
                                                 match crate::profile_card_broadcast::verify_card(
                                                     &card,
-                                                    crate::iroh_friend_acceptor::wall_now_ms(),
+                                                    crate::iroh_friend_acceptor::wall_now_secs(),
                                                 ) {
                                                     Ok(o) => o,
                                                     Err(e) => {

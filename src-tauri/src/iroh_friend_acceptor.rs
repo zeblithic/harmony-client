@@ -402,9 +402,9 @@ fn decode_strict<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, Friend
 pub fn verify_enrolled_device(
     cert: &EnrollmentCert,
     claimed_owner: OwnerAddr,
-    now_ms: u64,
+    now_secs: u64,
 ) -> Result<[u8; 32], FriendHandshakeError> {
-    cert.verify(now_ms).map_err(|e| match e {
+    cert.verify(now_secs).map_err(|e| match e {
         harmony_owner::OwnerError::EnrollmentCertExpired { .. } => {
             FriendHandshakeError::EnrollmentCertExpired
         }
@@ -554,6 +554,13 @@ pub(crate) fn wall_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Wall-clock now in epoch-SECONDS. `EnrollmentCert` timestamps (`issued_at` /
+/// `expires_at`) are Unix seconds, so cert-expiry checks must pass seconds — NOT
+/// the millisecond [`wall_now_ms`]. (ZEB-378)
+pub(crate) fn wall_now_secs() -> u64 {
+    wall_now_ms() / 1000
+}
+
 /// Tunable timeouts for the friend handshake handler. Tests construct this
 /// directly with sub-second values; production uses [`Self::default`] (or an
 /// env override at the call site).
@@ -583,9 +590,9 @@ impl Default for FriendAcceptorConfig {
 /// the accept paths and the sole gate on the Pending path.
 pub fn authenticate_friend_request(
     req: &FriendLinkRequest,
-    now_ms: u64,
+    now_secs: u64,
 ) -> Result<(), FriendHandshakeError> {
-    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_ms)?;
+    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)?;
     let vk = VerifyingKey::from_bytes(&device_key)
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
     let preimage =
@@ -620,10 +627,10 @@ pub fn process_friend_request(
     self_enrollment: &EnrollmentCert,
     self_device2: &ed25519_dalek::SigningKey,
     keytree: &crate::owner_state_crypto::KeyTree,
-    now_ms: u64,
+    now_secs: u64,
 ) -> Result<FriendLinkAccepted, FriendHandshakeError> {
     // 1. Authenticate the requester's cert → enrolled device-#2 key.
-    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_ms)?;
+    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)?;
 
     // 2. Verify the request signature over the canonical preimage (now binds the
     // requester's ephemeral X25519 key + optional token).
@@ -1038,7 +1045,7 @@ where
         // here — the consent flags below only gate whether to PROMPT, never
         // whether to authenticate. A request that fails auth is rejected before
         // any consent branch (no friend written, no record kept, no accept sent).
-        authenticate_friend_request(&req, wall_now_ms()).map_err(FriendAcceptError::Handshake)?;
+        authenticate_friend_request(&req, wall_now_secs()).map_err(FriendAcceptError::Handshake)?;
 
         // Compute `known` under the CRDT lock: is the requester already an
         // Active|Pending friend? Snapshot the boolean and DROP the guard before
@@ -1087,7 +1094,7 @@ where
                         &self.self_enrollment,
                         &self.device2_signing_key,
                         &self.keytree,
-                        wall_now_ms(),
+                        wall_now_secs(),
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1116,7 +1123,7 @@ where
                         &self.self_enrollment,
                         &self.device2_signing_key,
                         &self.keytree,
-                        wall_now_ms(),
+                        wall_now_secs(),
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };

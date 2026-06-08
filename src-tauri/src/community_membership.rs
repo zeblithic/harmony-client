@@ -1225,7 +1225,9 @@ pub fn enrolled_key_from_cert(
         .enrollment
         .as_ref()
         .ok_or(VerifyError::MissingEnrollmentCert)?;
-    cert.verify(event.at.wall_ms)
+    // Divide by 1000: EnrollmentCert expiry is Unix seconds; event.at.wall_ms is
+    // milliseconds. Still deterministic — a pure function of event.at.wall_ms. (ZEB-378)
+    cert.verify(event.at.wall_ms / 1000)
         .map_err(|_| VerifyError::EnrollmentCertInvalid)?;
     // Reject non-Master issuers: the community path cannot fully verify Quorum
     // signatures, and cert.verify() only structurally-checks them (spec §10).
@@ -10668,16 +10670,16 @@ mod zeb_339_signer_verify_tests {
             }
         };
 
-        // Expired: event wall_ms = 3_000 > expires_at = 2_999 → EnrollmentCertInvalid.
-        let expired_event = make_event(3_000, cert.clone());
+        // Expired: event wall_ms = 3_000_000 ms → 3_000 s > expires_at = 2_999 s → EnrollmentCertInvalid.
+        let expired_event = make_event(3_000_000, cert.clone());
         assert_eq!(
             enrolled_key_from_cert(&expired_event),
             Err(VerifyError::EnrollmentCertInvalid),
             "cert expired AS-OF the event timestamp must be rejected"
         );
 
-        // Valid: event wall_ms = 2_999 == expires_at = 2_999 (not expired; > not >=).
-        let ok_event = make_event(2_999, cert.clone());
+        // Valid: event wall_ms = 2_999_000 ms → 2_999 s == expires_at = 2_999 s (not expired; > not >=).
+        let ok_event = make_event(2_999_000, cert.clone());
         assert!(
             enrolled_key_from_cert(&ok_event).is_ok(),
             "cert still valid at event timestamp must be accepted"

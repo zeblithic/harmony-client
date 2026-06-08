@@ -153,7 +153,10 @@ pub enum CardVerifyError {
 /// the WHOLE struct — same construction as `sign_card`. Do NOT re-encode the
 /// embedded EnrollmentCert via `harmony_owner::cbor::to_canonical`; that yields
 /// different bytes (sorted keys) and the signature would not verify.
-pub fn verify_card(card: &ProfileCardBroadcast, now_ms: u64) -> Result<[u8; 16], CardVerifyError> {
+pub fn verify_card(
+    card: &ProfileCardBroadcast,
+    now_secs: u64,
+) -> Result<[u8; 16], CardVerifyError> {
     if card.display_name.len() > MAX_DISPLAY_NAME_BYTES {
         return Err(CardVerifyError::DisplayNameTooLong);
     }
@@ -161,7 +164,7 @@ pub fn verify_card(card: &ProfileCardBroadcast, now_ms: u64) -> Result<[u8; 16],
         return Err(CardVerifyError::StatusTextTooLong);
     }
     card.enrollment
-        .verify(now_ms)
+        .verify(now_secs)
         .map_err(|_| CardVerifyError::EnrollmentCertInvalid)?;
     // Reject non-Master issuers: the profile card path cannot fully verify
     // Quorum signatures, and cert.verify() only structurally-checks them
