@@ -33815,9 +33815,12 @@ pub async fn connectivity_link_friend_iroh_inner(
 
     // 1a. Verify the inviter's EnrollmentCert binds the claimed owner_id, and
     //     recover the inviter's enrolled device-#2 key.
-    let inviter_device_key =
-        verify_enrolled_device(&payload.inviter_enrollment, payload.inviter_addr, crate::iroh_friend_acceptor::wall_now_ms())
-            .map_err(|e| format!("verify inviter enrollment: {e}"))?;
+    let inviter_device_key = verify_enrolled_device(
+        &payload.inviter_enrollment,
+        payload.inviter_addr,
+        crate::iroh_friend_acceptor::wall_now_ms(),
+    )
+    .map_err(|e| format!("verify inviter enrollment: {e}"))?;
 
     // 1b. Verify the friend token's device-#2 signature against that key (the
     //     token is `InviteToken`-shaped, minted by `mint_friend_token`).
@@ -34053,8 +34056,9 @@ pub async fn connectivity_link_friend_iroh_inner(
 
     // 7. Verify the accept: it must be from the inviter (cert binds
     //    payload.inviter_addr) and signed over the accept preimage.
-    let accept_device_key = verify_enrolled_device(&accepted.enrollment, payload.inviter_addr, now_ms)
-        .map_err(|e| format!("verify accept enrollment: {e}"))?;
+    let accept_device_key =
+        verify_enrolled_device(&accepted.enrollment, payload.inviter_addr, now_ms)
+            .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
     accept_vk
@@ -35550,8 +35554,13 @@ async fn browse_friend_referrals(
 
     // 8. VERIFY the catalog: author MUST be the friend we asked, subject MUST be
     //    us. A verify failure rejects the whole call — no partial trust.
-    crate::referral_catalog::verify_referral_catalog(&cat, friend_owner, self_owner, crate::iroh_friend_acceptor::wall_now_ms())
-        .map_err(|e| format!("catalog verify failed: {e:?}"))?;
+    crate::referral_catalog::verify_referral_catalog(
+        &cat,
+        friend_owner,
+        self_owner,
+        crate::iroh_friend_acceptor::wall_now_ms(),
+    )
+    .map_err(|e| format!("catalog verify failed: {e:?}"))?;
 
     // 9. Project the verified entries against our own friend graph.
     Ok(crate::referral_catalog::project_referrals(
@@ -36049,8 +36058,9 @@ pub async fn connectivity_add_friend_by_key_inner(
     //    the token-LESS accept preimage. A garbage/forged reply errors here —
     //    never writes a friend.
     let target_addr_master = accepted.from_addr;
-    let accept_device_key = verify_enrolled_device(&accepted.enrollment, target_addr_master, now_ms)
-        .map_err(|e| format!("verify accept enrollment: {e}"))?;
+    let accept_device_key =
+        verify_enrolled_device(&accepted.enrollment, target_addr_master, now_ms)
+            .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
     accept_vk

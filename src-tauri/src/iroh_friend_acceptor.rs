@@ -1557,6 +1557,63 @@ mod tests {
     }
 
     #[test]
+    fn verify_enrolled_device_rejects_expired_cert() {
+        use harmony_owner::certs::EnrollmentCert;
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+
+        // Build a cert with expires_at = Some(2_000), issued_at = 1_000.
+        let seed = 0x39u8;
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let master_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: master_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let owner_id = master_bundle.identity_hash();
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0xFF; 32]);
+        let device_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: device_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device_id = device_bundle.identity_hash();
+        let cert = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000,
+            Some(2_000),
+        )
+        .expect("sign_master");
+        let owner = crate::owner_state_types::OwnerAddr(owner_id);
+
+        // Expired: now_ms = 2_001 > expires_at = 2_000 → EnrollmentCertExpired.
+        assert!(
+            matches!(
+                verify_enrolled_device(&cert, owner, 2_001),
+                Err(FriendHandshakeError::EnrollmentCertExpired)
+            ),
+            "a cert past its expires_at must be rejected with EnrollmentCertExpired"
+        );
+        // At-boundary (now_ms = 2_000, expires_at = 2_000): verify uses >
+        // so 2_000 is NOT expired — must succeed.
+        assert!(
+            verify_enrolled_device(&cert, owner, 2_000).is_ok(),
+            "a cert at exactly expires_at is NOT expired (> not >=)"
+        );
+        // Before expiry (now_ms = 1_500): must succeed.
+        assert!(
+            verify_enrolled_device(&cert, owner, 1_500).is_ok(),
+            "a cert before expires_at must be accepted"
+        );
+    }
+
+    #[test]
     fn request_signature_verifies_against_enrolled_key_and_tamper_fails() {
         use ed25519_dalek::{Signature, VerifyingKey};
         let token_sig = [7u8; 64];
@@ -1564,7 +1621,8 @@ mod tests {
 
         // The enrolled device key resolved from the cert must verify the sig
         // over the request preimage.
-        let resolved = verify_enrolled_device(&req.enrollment, req.from_addr, 0).expect("valid cert");
+        let resolved =
+            verify_enrolled_device(&req.enrollment, req.from_addr, 0).expect("valid cert");
         assert_eq!(resolved, device_key);
         let vk = VerifyingKey::from_bytes(&resolved).expect("vk");
         let preimage =

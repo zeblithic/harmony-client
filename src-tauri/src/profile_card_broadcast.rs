@@ -161,7 +161,7 @@ pub fn verify_card(card: &ProfileCardBroadcast) -> Result<[u8; 16], CardVerifyEr
         return Err(CardVerifyError::StatusTextTooLong);
     }
     card.enrollment
-        .verify()
+        .verify(0)
         .map_err(|_| CardVerifyError::EnrollmentCertInvalid)?;
     // Reject non-Master issuers: the profile card path cannot fully verify
     // Quorum signatures, and cert.verify() only structurally-checks them
@@ -921,7 +921,7 @@ mod tests {
             signature: vec![],
         };
         quorum_cert
-            .verify()
+            .verify(0)
             .expect("quorum cert passes structural verify");
         // Build a card with the Quorum cert (sign with device key; owner_id matches cert)
         let card = sign_card(

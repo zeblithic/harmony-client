@@ -10609,6 +10609,89 @@ mod zeb_339_signer_verify_tests {
         );
     }
 
+    /// ZEB-378: enrolled_key_from_cert uses event.at.wall_ms for the expiry check,
+    /// NOT the current wall clock — so the decision is CRDT-deterministic: the same
+    /// event always yields the same outcome regardless of when it is replayed.
+    #[test]
+    fn enrolled_key_from_cert_rejects_cert_expired_at_event_time() {
+        use harmony_owner::certs::EnrollmentCert;
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+
+        // Build an owner with a cert that expires at 2_999, issued at 1_000.
+        let seed = 0x28u8;
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let master_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: master_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let owner_id = master_bundle.identity_hash();
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0xFF; 32]);
+        let device_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: device_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device_id = device_bundle.identity_hash();
+        let cert = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle.clone(),
+            device_id,
+            device_bundle.clone(),
+            1_000,
+            Some(2_999), // expires at 2_999
+        )
+        .expect("sign_master");
+        let owner = OwnerAddr(owner_id);
+
+        // Helper to build a signed event for this owner at a given wall_ms.
+        let make_event = |wall_ms: u64, cert: EnrollmentCert| {
+            use ed25519_dalek::Signer;
+            let payload = EventPayload {
+                id: [0xEEu8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: owner,
+                at: Hlc {
+                    wall_ms,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            };
+            let ev = sign_event(&payload, &device_sk).expect("sign_event");
+            SignedMembershipEvent {
+                enrollment: Some(cert),
+                ..ev
+            }
+        };
+
+        // Expired: event wall_ms = 3_000 > expires_at = 2_999 → EnrollmentCertInvalid.
+        let expired_event = make_event(3_000, cert.clone());
+        assert_eq!(
+            enrolled_key_from_cert(&expired_event),
+            Err(VerifyError::EnrollmentCertInvalid),
+            "cert expired AS-OF the event timestamp must be rejected"
+        );
+
+        // Valid: event wall_ms = 2_999 == expires_at = 2_999 (not expired; > not >=).
+        let ok_event = make_event(2_999, cert.clone());
+        assert!(
+            enrolled_key_from_cert(&ok_event).is_ok(),
+            "cert still valid at event timestamp must be accepted"
+        );
+
+        // Determinism: same event, same result — the check is purely a function
+        // of event.at.wall_ms, not the current wall clock.
+        assert!(
+            enrolled_key_from_cert(&ok_event).is_ok(),
+            "repeated call must yield the same result (CRDT-deterministic)"
+        );
+    }
+
     /// ZEB-339 (spec §10): a `Quorum`-issued cert is rejected by the community
     /// path even when it passes `cert.verify()`'s STRUCTURAL checks, because
     /// quorum signatures cannot be verified here (no OwnerState walk-back).
@@ -10645,7 +10728,7 @@ mod zeb_339_signer_verify_tests {
             signature: vec![],
         };
         quorum_cert
-            .verify()
+            .verify(0)
             .expect("hand-built Quorum cert passes structural verify()");
 
         let ev = sign_event(

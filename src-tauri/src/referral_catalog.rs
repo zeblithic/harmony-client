@@ -567,6 +567,61 @@ mod tests {
     }
 
     #[test]
+    fn verify_referral_catalog_rejects_expired_cert() {
+        use harmony_owner::certs::EnrollmentCert;
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+
+        // Build an owner with a cert that expires at 2_000, issued at 1_000.
+        let seed = 0x15u8;
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let master_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: master_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let owner_id = master_bundle.identity_hash();
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0xFF; 32]);
+        let device_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: device_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device_id = device_bundle.identity_hash();
+        let cert = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000,
+            Some(2_000),
+        )
+        .expect("sign_master");
+        let author = OwnerAddr(owner_id);
+        let subject = OwnerAddr([0x22; 16]);
+
+        // Sign a catalog using this cert (valid structure, expires_at = 2_000).
+        let cat = sign_referral_catalog(&device_sk, author, subject, vec![], hlc(1_000), cert);
+
+        // Expired: now_ms = 2_001 > expires_at = 2_000 → Err(Auth).
+        assert!(
+            matches!(
+                verify_referral_catalog(&cat, author, subject, 2_001),
+                Err(ReferralAuthError::Auth)
+            ),
+            "a catalog with an expired cert must be rejected"
+        );
+        // Before expiry (now_ms = 1_500): must succeed.
+        assert!(
+            verify_referral_catalog(&cat, author, subject, 1_500).is_ok(),
+            "a catalog with a non-expired cert must be accepted"
+        );
+    }
+
+    #[test]
     fn catalog_with_mismatched_cert_owner_is_rejected() {
         let f = mint_test_owner(0x11);
         let g = mint_test_owner(0x12);
