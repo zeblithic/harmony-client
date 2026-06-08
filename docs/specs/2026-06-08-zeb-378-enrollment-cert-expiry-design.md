@@ -21,6 +21,10 @@ point-to-point auth path inherits this gap:
   gate as a backstop), so a stale cert has no secondary mitigation.
 - **Community membership** — `enrolled_key_from_cert` (`community_membership.rs:1221`)
   calls `cert.verify()` directly for identity-introducing CRDT events.
+- **Profile cards** — `verify_card` (`profile_card_broadcast.rs:156`) authenticates a
+  received `ProfileCardBroadcast`'s enrollment cert on the event-loop receive path.
+  (Surfaced during implementation; folded in per the approved full-reach principle —
+  every `verify()` auth path enforces expiry.)
 - **Owner state** — `OwnerState::add_enrollment` (`state.rs:208`) and the
   **`DmOutbox::new`** construction assert (`dm_outbox.rs:461`) also call `verify()`.
 
@@ -105,6 +109,7 @@ The clock *source* is **security-load-bearing** and differs by path:
 | `verify_enrolled_device(cert, owner, now_ms)` — the chokepoint | live `wall_now_ms()` (from transport) | friend/referral auth is **live**: reject a cert expired *now* |
 | `authenticate_friend_request` / `process_friend_request` / `authenticate_catalog_request` / `verify_referral_catalog` | gain a `now_ms` param; their transport/IPC callers pass `wall_now_ms()` | keeps the pure auth fns deterministically testable, mirroring the existing `is_friend_token_active(&sig, now_ms)` idiom |
 | `enrolled_key_from_cert(event)` (`community_membership.rs:1228`) | **`event.at.wall_ms`** (event-time, *not* now) | **CRDT determinism** — see Component 3 |
+| `verify_card(card, now_ms)` (`profile_card_broadcast.rs`, single receive caller `event_loop.rs`) | live `wall_now_ms()` | profile-card receive is a **live** peer-auth path (not a replayed CRDT log), so it mirrors the friend/referral treatment; a live clock also can't be gamed by a backdated `card.shared_at`. Expired → coarse `CardVerifyError::EnrollmentCertInvalid` (consistent with how that path already buckets cert errors) |
 | `DmOutbox::new` assert (`dm_outbox.rs:461`) | **`0`** (structural-only) | this is a wiring-bug `assert!`, not an auth gate; `0` preserves its exact expiry-agnostic intent and avoids a **startup panic** if the node's own cert is expired (a separate policy concern, out of scope) |
 
 `verify_enrolled_device` returns the new
@@ -151,6 +156,8 @@ omission.
 - Expired cert on the **referral catalog** → `ReferralAuthError::Auth` → rejected.
 - Expired cert on a **membership event** (as-of `event.at.wall_ms`) →
   `VerifyError::EnrollmentCertInvalid` → event rejected by `verify_event`.
+- Expired cert on a received **profile card** (live clock) →
+  `CardVerifyError::EnrollmentCertInvalid` → card dropped at the receive gate.
 - Expired cert at **`add_enrollment`** (live clock) → `OwnerError::…Expired`.
 - **`DmOutbox::new`** passes `0` → structural-only, unaffected by expiry (by design).
 

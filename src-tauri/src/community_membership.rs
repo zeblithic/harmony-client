@@ -10650,7 +10650,6 @@ mod zeb_339_signer_verify_tests {
 
         // Helper to build a signed event for this owner at a given wall_ms.
         let make_event = |wall_ms: u64, cert: EnrollmentCert| {
-            use ed25519_dalek::Signer;
             let payload = EventPayload {
                 id: [0xEEu8; 16],
                 community_id: SpaceId([7u8; 16]),

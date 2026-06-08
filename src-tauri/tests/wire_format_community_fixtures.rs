@@ -631,7 +631,7 @@ fn signed_event_join_with_cert_wire_bytes_pinned() {
         .enrollment
         .as_ref()
         .unwrap()
-        .verify()
+        .verify(0)
         .expect("decoded cert must pass cert.verify()");
 
     // Pin the canonical bytes. ed25519 is RFC 8032 deterministic, and
