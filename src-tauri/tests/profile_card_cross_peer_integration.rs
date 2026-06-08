@@ -28,7 +28,7 @@ async fn pool_ingest(
     subscribed_owner: [u8; 16],
     card: &harmony_app::profile_card_broadcast::ProfileCardBroadcast,
 ) {
-    match verify_card(card) {
+    match verify_card(card, 0) {
         Ok(verified_owner) if verified_owner == subscribed_owner => {
             cache.insert_verified(sub, card).await;
         }
@@ -53,7 +53,7 @@ async fn owner_b_resolves_owner_a_card_and_rejects_spoof() {
         hlc(1, "a"),
     )
     .unwrap();
-    assert_eq!(verify_card(&a_card).unwrap(), a.owner.0);
+    assert_eq!(verify_card(&a_card, 0).unwrap(), a.owner.0);
 
     // B subscribes to A's owner_id; A's card caches through the pool gate.
     let cache = ProfileCardCache::default();
@@ -80,7 +80,7 @@ async fn owner_b_resolves_owner_a_card_and_rejects_spoof() {
     .unwrap();
     spoof.owner_id = a.owner.0; // forge attribution to A.
     assert!(
-        verify_card(&spoof).is_err(),
+        verify_card(&spoof, 0).is_err(),
         "spoof claiming A's owner_id with B's cert must fail verify_card"
     );
 

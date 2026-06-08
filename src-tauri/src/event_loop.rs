@@ -190,6 +190,9 @@ pub struct PublishRequest {
 pub struct FetchRequest {
     pub cid_hex: String,
     pub reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    /// ZEB-344: optional assembled-byte ceiling enforced by `fetch_recursive`.
+    /// `None` = unbounded (all callers except `fetch_avatar`).
+    pub max_bytes: Option<usize>,
 }
 
 /// A content-ingest request: store local file bytes in the runtime's storage tier.
@@ -1540,6 +1543,7 @@ pub async fn run<R: Runtime>(
                                             let verified_owner =
                                                 match crate::profile_card_broadcast::verify_card(
                                                     &card,
+                                                    crate::iroh_friend_acceptor::wall_now_secs(),
                                                 ) {
                                                     Ok(o) => o,
                                                     Err(e) => {
@@ -2529,6 +2533,7 @@ pub async fn run<R: Runtime>(
             Some(req) = fetch_rx.recv() => {
                 let session = session.clone();
                 let cid_hex = req.cid_hex;
+                let max_bytes = req.max_bytes;
                 // ZEB-155: clone the completion sender so the spawned
                 // task can notify the main loop after a successful fetch.
                 let completion_tx = fetch_completion_tx.clone();
@@ -2581,7 +2586,7 @@ pub async fn run<R: Runtime>(
                     let fetch_one_with_admit =
                         wrap_fetch_one_with_admission(fetch_one, cas_op_tx_for_fetch);
 
-                    let result = fetch_recursive(fetch_one_with_admit, root).await;
+                    let result = fetch_recursive(fetch_one_with_admit, root, max_bytes).await;
                     // ZEB-155: reply to the fetch caller FIRST so a full
                     // completion channel never delays the fetch reply.
                     // Then best-effort-notify via try_send. If the
@@ -5248,6 +5253,7 @@ pub(crate) fn compute_keep_set<S: BookStore>(
 pub(crate) async fn fetch_recursive<F, Fut>(
     fetch_one: F,
     root: ContentId,
+    max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, String>
 where
     F: Fn(ContentId) -> Fut,
@@ -5273,6 +5279,17 @@ where
             }
         } else {
             out.extend_from_slice(&bytes);
+            // ZEB-344: bound the assembled size so an oversized avatar_cid
+            // can't force an unbounded download. ≤ cap + one chunk (a single
+            // chunk is bounded by ChunkerConfig::DEFAULT). None = unbounded.
+            if let Some(cap) = max_bytes {
+                if out.len() > cap {
+                    return Err(format!(
+                        "content exceeds max_bytes cap: {} > {cap}",
+                        out.len()
+                    ));
+                }
+            }
         }
     }
     Ok(out)
@@ -5487,7 +5504,7 @@ mod fetch_recursive_tests {
             std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
         };
 
-        let got = fetch_recursive(fetcher, leaf).await.unwrap();
+        let got = fetch_recursive(fetcher, leaf, None).await.unwrap();
         assert_eq!(got, b"hello");
     }
 
@@ -5515,7 +5532,7 @@ mod fetch_recursive_tests {
             std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
         };
 
-        let got = fetch_recursive(fetcher, root).await.unwrap();
+        let got = fetch_recursive(fetcher, root, None).await.unwrap();
         let mut expected = a_bytes;
         expected.extend_from_slice(&b_bytes);
         expected.extend_from_slice(&c_bytes);
@@ -5540,8 +5557,45 @@ mod fetch_recursive_tests {
             std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
         };
 
-        let err = fetch_recursive(fetcher, root).await.unwrap_err();
+        let err = fetch_recursive(fetcher, root, None).await.unwrap_err();
         assert!(err.contains("missing cid"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn max_bytes_cap_rejects_oversized_assembly() {
+        // a(3)+b(4)+c(5) = 12 bytes assembled, fetched in order a,b,c.
+        let a_bytes = b"aaa".to_vec();
+        let b_bytes = b"bbbb".to_vec();
+        let c_bytes = b"ccccc".to_vec();
+        let a = ContentId::for_book(&a_bytes, ContentFlags::default()).unwrap();
+        let b = ContentId::for_book(&b_bytes, ContentFlags::default()).unwrap();
+        let c = ContentId::for_book(&c_bytes, ContentFlags::default()).unwrap();
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b).add(c);
+        let (payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        store.insert(a, a_bytes);
+        store.insert(b, b_bytes);
+        store.insert(c, c_bytes);
+        store.insert(root, payload);
+        let fetcher = move |cid: ContentId| {
+            let bytes = store.get(&cid).cloned();
+            std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
+        };
+
+        // cap=5 → rejected once a(3)+b(4)=7 > 5.
+        let err = fetch_recursive(fetcher.clone(), root, Some(5))
+            .await
+            .unwrap_err();
+        assert!(err.contains("exceeds"), "got: {err}");
+        // cap=12 (exactly the total) → accepted.
+        let got = fetch_recursive(fetcher.clone(), root, Some(12))
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 12);
+        // None → unbounded, accepted.
+        let got = fetch_recursive(fetcher, root, None).await.unwrap();
+        assert_eq!(got.len(), 12);
     }
 }
 
@@ -5644,7 +5698,7 @@ mod fetch_one_wrapper_tests {
 
         // Drive through fetch_recursive — every per-CID call goes through
         // the wrapper, so every successful fetch must produce a PutLocal.
-        let got = fetch_recursive(wrapped, root).await.unwrap();
+        let got = fetch_recursive(wrapped, root, None).await.unwrap();
         let admits = responder.await.unwrap();
 
         // fetch_recursive's output is the concatenated leaves (existing

@@ -429,6 +429,7 @@ impl<R: Runtime> MailSync<R> {
                 .send(FetchRequest {
                     cid_hex: cid_hex.clone(),
                     reply: reply_tx,
+                    max_bytes: None,
                 })
                 .await
                 .map_err(|_| "fetch channel closed".to_string())?;

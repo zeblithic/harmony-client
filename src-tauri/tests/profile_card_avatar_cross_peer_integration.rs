@@ -46,7 +46,7 @@ async fn inner() {
     .expect("sign");
 
     // ---- Peer B receives + verifies the card, extracts the avatar CID ----
-    let verified_owner = verify_card(&card).expect("card verifies");
+    let verified_owner = verify_card(&card, 0).expect("card verifies");
     assert_eq!(verified_owner, owner.owner.0);
     let avatar_cid_bytes = card.avatar_cid.expect("card carries avatar_cid");
     let cid_to_fetch = ContentId::from_bytes(avatar_cid_bytes);

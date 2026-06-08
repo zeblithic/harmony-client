@@ -153,7 +153,10 @@ pub enum CardVerifyError {
 /// the WHOLE struct — same construction as `sign_card`. Do NOT re-encode the
 /// embedded EnrollmentCert via `harmony_owner::cbor::to_canonical`; that yields
 /// different bytes (sorted keys) and the signature would not verify.
-pub fn verify_card(card: &ProfileCardBroadcast) -> Result<[u8; 16], CardVerifyError> {
+pub fn verify_card(
+    card: &ProfileCardBroadcast,
+    now_secs: u64,
+) -> Result<[u8; 16], CardVerifyError> {
     if card.display_name.len() > MAX_DISPLAY_NAME_BYTES {
         return Err(CardVerifyError::DisplayNameTooLong);
     }
@@ -161,7 +164,7 @@ pub fn verify_card(card: &ProfileCardBroadcast) -> Result<[u8; 16], CardVerifyEr
         return Err(CardVerifyError::StatusTextTooLong);
     }
     card.enrollment
-        .verify()
+        .verify(now_secs)
         .map_err(|_| CardVerifyError::EnrollmentCertInvalid)?;
     // Reject non-Master issuers: the profile card path cannot fully verify
     // Quorum signatures, and cert.verify() only structurally-checks them
@@ -428,7 +431,7 @@ mod tests {
         let g = out.lock().await;
         assert_eq!(g.len(), 1);
         let decoded: ProfileCardBroadcast = ciborium::de::from_reader(&g[0].1[..]).unwrap();
-        assert_eq!(verify_card(&decoded).unwrap(), owner.owner.0);
+        assert_eq!(verify_card(&decoded, 0).unwrap(), owner.owner.0);
     }
 
     #[tokio::test]
@@ -698,7 +701,7 @@ mod tests {
         )
         .expect("sign");
         assert_eq!(card.avatar_cid, avatar);
-        assert_eq!(verify_card(&card).expect("verify"), owner.owner.0);
+        assert_eq!(verify_card(&card, 0).expect("verify"), owner.owner.0);
     }
 
     #[test]
@@ -777,7 +780,7 @@ mod tests {
         let decoded: ProfileCardBroadcast =
             ciborium::de::from_reader(&bytes[..]).expect("decode struct");
         assert_eq!(decoded.profile_page_root, page_root);
-        assert_eq!(verify_card(&decoded).expect("verify"), owner.owner.0);
+        assert_eq!(verify_card(&decoded, 0).expect("verify"), owner.owner.0);
     }
 
     #[test]
@@ -810,7 +813,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(verify_card(&card).unwrap(), owner.owner.0);
+        assert_eq!(verify_card(&card, 0).unwrap(), owner.owner.0);
     }
 
     #[test]
@@ -834,7 +837,7 @@ mod tests {
         .unwrap();
         card.owner_id = x.owner.0; // owner_id now != cert.owner_id
         assert!(matches!(
-            verify_card(&card),
+            verify_card(&card, 0),
             Err(CardVerifyError::EnrollmentOwnerMismatch)
         ));
     }
@@ -859,7 +862,7 @@ mod tests {
         .unwrap();
         card.signature[0] ^= 0x01;
         assert!(matches!(
-            verify_card(&card),
+            verify_card(&card, 0),
             Err(CardVerifyError::SignatureInvalid)
         ));
     }
@@ -884,7 +887,7 @@ mod tests {
         .unwrap();
         card.display_name = "z".repeat(MAX_DISPLAY_NAME_BYTES + 1);
         assert!(matches!(
-            verify_card(&card),
+            verify_card(&card, 0),
             Err(CardVerifyError::DisplayNameTooLong)
         ));
     }
@@ -921,7 +924,7 @@ mod tests {
             signature: vec![],
         };
         quorum_cert
-            .verify()
+            .verify(0)
             .expect("quorum cert passes structural verify");
         // Build a card with the Quorum cert (sign with device key; owner_id matches cert)
         let card = sign_card(
@@ -940,8 +943,67 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            verify_card(&card),
+            verify_card(&card, 0),
             Err(CardVerifyError::EnrollmentCertInvalid)
         ));
+    }
+
+    #[test]
+    fn verify_card_rejects_expired_cert() {
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+
+        // Build a card with an enrollment cert that expires at 2_000.
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[0x55u8; 32]);
+        let master_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: master_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let owner_id = master_bundle.identity_hash();
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[0x55u8 ^ 0xFFu8; 32]);
+        let device_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: device_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device_id = device_bundle.identity_hash();
+        // issued_at = 1_000, expires_at = Some(2_000)
+        let cert = harmony_owner::certs::EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000,
+            Some(2_000),
+        )
+        .expect("sign_master");
+
+        let card = sign_card(
+            &device_sk,
+            owner_id,
+            "Exp".into(),
+            "".into(),
+            None,
+            None,
+            cert,
+            Hlc {
+                wall_ms: 1_500,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .expect("sign");
+
+        // now > expiry → rejected
+        assert!(matches!(
+            verify_card(&card, 2_001),
+            Err(CardVerifyError::EnrollmentCertInvalid)
+        ));
+        // before expiry → ok
+        assert!(verify_card(&card, 1_500).is_ok());
     }
 }

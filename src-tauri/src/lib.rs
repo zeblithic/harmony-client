@@ -8817,6 +8817,7 @@ async fn export_content(
         .send(event_loop::FetchRequest {
             cid_hex: cid,
             reply: reply_tx,
+            max_bytes: None,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -8921,18 +8922,23 @@ async fn ingest_content(
 /// (PublicDurable / unencrypted) so the resulting CID is publicly servable.
 /// Skips the sidecar insert (send_ingest_with_name) so avatars never appear in
 /// the file listing.
+/// ZEB-344: shared avatar byte ceiling. Enforced on ingest
+/// (`ingest_avatar_bytes_inner`) AND on receive (`fetch_avatar` via
+/// `FetchRequest.max_bytes`), so the two cannot drift. 512KB carries ~2× headroom
+/// over a realistic 256×256 PNG (≤256KB).
+pub(crate) const AVATAR_MAX_BYTES: usize = 512 * 1024;
+
 pub(crate) async fn ingest_avatar_bytes_inner(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
     use harmony_content::chunker::ChunkerConfig;
-    const MAX_AVATAR_BYTES: usize = 512 * 1024;
     if bytes.is_empty() {
         return Err("empty avatar bytes".to_string());
     }
-    if bytes.len() > MAX_AVATAR_BYTES {
+    if bytes.len() > AVATAR_MAX_BYTES {
         return Err(format!(
-            "avatar too large: {} > {MAX_AVATAR_BYTES}",
+            "avatar too large: {} > {AVATAR_MAX_BYTES}",
             bytes.len()
         ));
     }
@@ -11960,6 +11966,43 @@ async fn fetch_content(
         .send(event_loop::FetchRequest {
             cid_hex: cid,
             reply: reply_tx,
+            max_bytes: None,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())?
+}
+
+/// ZEB-344: avatar-semantic CAS fetch. Identical to `fetch_content` but caps the
+/// download at `AVATAR_MAX_BYTES` via `FetchRequest.max_bytes`, so an oversized
+/// `avatar_cid` on a peer's signed profile card can't force an unbounded fetch.
+/// The decoded-dimension guard lives on the receive side in `AvatarResolver`.
+#[tauri::command]
+async fn fetch_avatar(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<u8>, String> {
+    if cid.is_empty() || !cid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid CID hex: {cid}"));
+    }
+
+    let fetch_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid,
+            reply: reply_tx,
+            max_bytes: Some(AVATAR_MAX_BYTES),
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -12066,6 +12109,7 @@ async fn fetch_profile_doc(
         .send(event_loop::FetchRequest {
             cid_hex: cid,
             reply: reply_tx,
+            max_bytes: None,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -33771,9 +33815,12 @@ pub async fn connectivity_link_friend_iroh_inner(
 
     // 1a. Verify the inviter's EnrollmentCert binds the claimed owner_id, and
     //     recover the inviter's enrolled device-#2 key.
-    let inviter_device_key =
-        verify_enrolled_device(&payload.inviter_enrollment, payload.inviter_addr)
-            .map_err(|e| format!("verify inviter enrollment: {e}"))?;
+    let inviter_device_key = verify_enrolled_device(
+        &payload.inviter_enrollment,
+        payload.inviter_addr,
+        crate::iroh_friend_acceptor::wall_now_secs(),
+    )
+    .map_err(|e| format!("verify inviter enrollment: {e}"))?;
 
     // 1b. Verify the friend token's device-#2 signature against that key (the
     //     token is `InviteToken`-shaped, minted by `mint_friend_token`).
@@ -34009,7 +34056,15 @@ pub async fn connectivity_link_friend_iroh_inner(
 
     // 7. Verify the accept: it must be from the inviter (cert binds
     //    payload.inviter_addr) and signed over the accept preimage.
-    let accept_device_key = verify_enrolled_device(&accepted.enrollment, payload.inviter_addr)
+    let accept_device_key =
+        // ZEB-378: sample a FRESH clock here — this verify runs after pkarr
+        // resolution + the iroh handshake (seconds of I/O), so the `now_ms`
+        // captured early for token/pkarr checks would be stale at verification time.
+        verify_enrolled_device(
+            &accepted.enrollment,
+            payload.inviter_addr,
+            crate::iroh_friend_acceptor::wall_now_secs(),
+        )
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
@@ -35506,8 +35561,13 @@ async fn browse_friend_referrals(
 
     // 8. VERIFY the catalog: author MUST be the friend we asked, subject MUST be
     //    us. A verify failure rejects the whole call — no partial trust.
-    crate::referral_catalog::verify_referral_catalog(&cat, friend_owner, self_owner)
-        .map_err(|e| format!("catalog verify failed: {e:?}"))?;
+    crate::referral_catalog::verify_referral_catalog(
+        &cat,
+        friend_owner,
+        self_owner,
+        crate::iroh_friend_acceptor::wall_now_secs(),
+    )
+    .map_err(|e| format!("catalog verify failed: {e:?}"))?;
 
     // 9. Project the verified entries against our own friend graph.
     Ok(crate::referral_catalog::project_referrals(
@@ -36005,7 +36065,14 @@ pub async fn connectivity_add_friend_by_key_inner(
     //    the token-LESS accept preimage. A garbage/forged reply errors here —
     //    never writes a friend.
     let target_addr_master = accepted.from_addr;
-    let accept_device_key = verify_enrolled_device(&accepted.enrollment, target_addr_master)
+    let accept_device_key =
+        // ZEB-378: fresh clock — this verify runs after pkarr resolution + the iroh
+        // handshake, so the early-captured `now_ms` would be stale at verify time.
+        verify_enrolled_device(
+            &accepted.enrollment,
+            target_addr_master,
+            crate::iroh_friend_acceptor::wall_now_secs(),
+        )
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
@@ -37102,6 +37169,23 @@ async fn connectivity_get_my_reachability_record(
     }))
 }
 
+/// Returns the local node's 64-byte transport identity pub
+/// (`X25519_pub(32) ‖ Ed25519_pub(32)`) as 128 lowercase hex chars — exactly
+/// the value `add_friend_by_key` / `connectivity_discover_identity` consume, so
+/// a peer can add you by key. `Ok(None)` before `start_node` captures an
+/// identity (mirrors `connectivity_get_my_reachability_record`'s pre-start
+/// `Ok(None)`). Read-only: the identity *pub* is public key material, not the
+/// owner secret. (ZEB-388)
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_get_my_identity_pub_hex(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Option<String>, String> {
+    let g = state
+        .lock()
+        .map_err(|e| format!("NodeState poisoned: {e}"))?;
+    Ok(g.dm_identity_pub_64.map(hex::encode))
+}
+
 /// Snapshot of all peer-reachability entries known to this device's
 /// LWW resolver. Returns `Ok(vec![])` when the resolver hasn't been
 /// installed (pre-`start_node`) or when no peers have published yet.
@@ -37560,6 +37644,7 @@ pub fn run() {
             archive_content,
             set_replication_tier,
             fetch_content,
+            fetch_avatar,
             fetch_profile_doc,
             export_content,
             ingest_content,
@@ -37719,6 +37804,7 @@ pub fn run() {
             mint::mint_export_csv,
             // ZEB-321 Phase 1 Task 9: connectivity debug IPCs.
             connectivity_get_my_reachability_record,
+            connectivity_get_my_identity_pub_hex,
             connectivity_list_peer_reachability,
             connectivity_force_republish,
             // ZEB-323 Phase 2b: pkarr policy IPCs.
@@ -39803,6 +39889,31 @@ mod channel_message_ipc_tests {
             err.contains("channel_log_registry missing"),
             "Some(HlcDto) should fall through to registry lookup; got: {err}"
         );
+    }
+
+    // ZEB-344: fetch_avatar rejects a malformed (non-hex) CID before touching
+    // the event loop. The state has no fetch_tx, so the guard path is never
+    // reached — only the hex-validation early-return matters here.
+    #[tokio::test]
+    async fn fetch_avatar_rejects_malformed_hex() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let got: Result<Vec<u8>, String> = fetch_avatar("nothex!!".to_string(), state).await;
+        assert!(
+            got.as_ref()
+                .is_err_and(|e: &String| e.contains("invalid CID hex")),
+            "expected invalid-hex rejection, got {got:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zeb_344_avatar_fetch_tests {
+    use super::*;
+
+    #[test]
+    fn avatar_max_bytes_is_512k() {
+        assert_eq!(AVATAR_MAX_BYTES, 512 * 1024);
     }
 }
 
@@ -43087,6 +43198,41 @@ mod zeb_321_connectivity_ipc_tests {
             got.is_none(),
             "expected None when iroh_endpoint is unset, got {got:?}"
         );
+    }
+
+    /// `connectivity_get_my_identity_pub_hex` returns `Ok(None)` before
+    /// `start_node` captures an identity (no `dm_identity_pub_64`). Mirrors
+    /// `get_my_reachability_returns_none_when_iroh_not_running`.
+    #[tokio::test]
+    async fn get_my_identity_pub_hex_returns_none_when_unset() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let got = connectivity_get_my_identity_pub_hex(state)
+            .await
+            .expect("IPC must succeed");
+        assert!(
+            got.is_none(),
+            "expected None when dm_identity_pub_64 is unset, got {got:?}"
+        );
+    }
+
+    /// `connectivity_get_my_identity_pub_hex` returns the 128-char lowercase
+    /// hex of `dm_identity_pub_64` — exactly what `add_friend_by_key` consumes.
+    /// Sets the field directly, the same way `force_republish_wakes_publisher`
+    /// installs `iroh_publisher_force`.
+    #[tokio::test]
+    async fn get_my_identity_pub_hex_encodes_the_64_byte_pub() {
+        let app = mock_app_with_default_node_state();
+        {
+            let state_handle = app.state::<StdMutex<NodeState>>();
+            let mut g = state_handle.lock().expect("NodeState lock");
+            g.dm_identity_pub_64 = Some([0xAB; 64]);
+        }
+        let state = app.state::<StdMutex<NodeState>>();
+        let got = connectivity_get_my_identity_pub_hex(state)
+            .await
+            .expect("IPC must succeed");
+        assert_eq!(got, Some("ab".repeat(64)));
     }
 
     /// `connectivity_list_peer_reachability` returns `Ok(vec![])`

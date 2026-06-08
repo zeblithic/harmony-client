@@ -34,10 +34,11 @@ pub fn serve_catalog_for_request(
     self_enrollment: EnrollmentCert,
     device2: &ed25519_dalek::SigningKey,
     at: Hlc,
+    now_secs: u64,
 ) -> Result<ReferralCatalog, ReferralAuthError> {
     // 1. Authenticate the request against OUR owner address (rejects a request
     //    addressed to someone else, a bad cert, or a bad signature).
-    authenticate_catalog_request(req, self_owner)?;
+    authenticate_catalog_request(req, self_owner, now_secs)?;
     // 2. Friend-gate: only an ACTIVE friend gets a non-empty catalog. Anyone
     //    else (authenticated but unknown, or Pending/Revoked) gets EMPTY.
     let is_friend = fg
@@ -183,7 +184,11 @@ impl IrohFriendPexAcceptor {
         // `serve_catalog_for_request` below re-runs this same check internally;
         // that redundant second verify is intentional defense-in-depth and keeps
         // the pure fn self-contained.
-        crate::referral_catalog::authenticate_catalog_request(&req, self.self_owner)
+        // ZEB-378: one expiry-clock sample for BOTH this pre-HLC auth and the
+        // serve-side re-auth below, so the two checks can't straddle an expiry
+        // boundary (nondeterministic accept/reject near a cert's expiry second).
+        let now_secs = crate::iroh_friend_acceptor::wall_now_secs();
+        crate::referral_catalog::authenticate_catalog_request(&req, self.self_owner, now_secs)
             .map_err(|e| format!("{e:?}"))?;
 
         // Stamp the catalog clock BEFORE taking the crdt lock so the two locks
@@ -202,6 +207,7 @@ impl IrohFriendPexAcceptor {
                 self.self_enrollment.clone(),
                 &self.device2_signing_key,
                 at,
+                now_secs,
             )
             .map_err(|e| format!("serve decision: {e}"))?
         }; // guard dropped here — owner-state lock released before the write.
@@ -303,7 +309,7 @@ mod tests {
 
         let req = sign_catalog_request(&r.device_key, r.owner, f.owner, r.cert.clone());
         let cat =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7))
+            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0)
                 .expect("active friend is served a catalog");
 
         assert_eq!(
@@ -313,7 +319,7 @@ mod tests {
         );
         assert_eq!(cat.entries[0].peer_owner, OwnerAddr([7; 16]));
         // The catalog is validly signed by F and subject-bound to R.
-        assert!(verify_referral_catalog(&cat, f.owner, r.owner).is_ok());
+        assert!(verify_referral_catalog(&cat, f.owner, r.owner, 0).is_ok());
     }
 
     #[test]
@@ -335,7 +341,7 @@ mod tests {
             stranger.cert.clone(),
         );
         let cat =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7))
+            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0)
                 .expect("a non-friend still gets a (benign, empty) signed catalog");
 
         // SECURITY: a non-friend leaks NOTHING about F's referrable friends.
@@ -345,7 +351,7 @@ mod tests {
         );
         // The empty catalog is still validly signed + subject-bound to the
         // stranger (benign: indistinguishable from "F has no referrables").
-        assert!(verify_referral_catalog(&cat, f.owner, stranger.owner).is_ok());
+        assert!(verify_referral_catalog(&cat, f.owner, stranger.owner, 0).is_ok());
     }
 
     #[test]
@@ -362,7 +368,7 @@ mod tests {
             r.cert.clone(),
         );
         let res =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7));
+            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0);
         assert_eq!(
             res.unwrap_err(),
             ReferralAuthError::WrongTarget,
@@ -394,7 +400,7 @@ mod tests {
             requester.cert.clone(),
         );
         let cat =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7))
+            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0)
                 .expect("a Pending requester still gets a (benign, empty) signed catalog");
 
         // SECURITY: a non-Active friend leaks NOTHING about F's referrables.
@@ -403,7 +409,7 @@ mod tests {
             "a Pending requester must not learn any referrable friends"
         );
         // Still a validly signed catalog, subject-bound to the requester.
-        assert!(verify_referral_catalog(&cat, f.owner, requester.owner).is_ok());
+        assert!(verify_referral_catalog(&cat, f.owner, requester.owner, 0).is_ok());
     }
 
     #[test]
@@ -430,7 +436,7 @@ mod tests {
             requester.cert.clone(),
         );
         let cat =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7))
+            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0)
                 .expect("a Revoked requester still gets a (benign, empty) signed catalog");
 
         // SECURITY: a Revoked friend leaks NOTHING about F's referrables.
@@ -439,7 +445,7 @@ mod tests {
             "a Revoked requester must not learn any referrable friends"
         );
         // Still a validly signed catalog, subject-bound to the requester.
-        assert!(verify_referral_catalog(&cat, f.owner, requester.owner).is_ok());
+        assert!(verify_referral_catalog(&cat, f.owner, requester.owner, 0).is_ok());
     }
 
     #[test]
@@ -463,7 +469,7 @@ mod tests {
 
         let req = sign_catalog_request(&r.device_key, r.owner, f.owner, r.cert.clone());
         let cat =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7))
+            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0)
                 .expect("active friend is served a catalog");
 
         // Only the Active+referrable peer is served; the Revoked one is excluded.
@@ -478,6 +484,6 @@ mod tests {
             "a Revoked peer must never be served even if flagged referrable"
         );
         // The catalog is validly signed by F and subject-bound to R.
-        assert!(verify_referral_catalog(&cat, f.owner, r.owner).is_ok());
+        assert!(verify_referral_catalog(&cat, f.owner, r.owner, 0).is_ok());
     }
 }

@@ -72,6 +72,13 @@
   let addingByKey = $state(false);
   let addByKeyStatus = $state<string | null>(null);
 
+  // ── ZEB-388: my own identity pub hex (share for add-by-key) ───────────────
+  let myKeyHex = $state<string | null>(null);
+  let myKeyCopied = $state(false);
+  // Handle for the "Copied!" reset timer — cleared on re-click and on destroy
+  // so we never mutate $state after the component unmounts.
+  let myKeyCopiedTimer: ReturnType<typeof setTimeout> | null = null;
+
   // Auto-accept toggle.
   let autoAccept = $state(false);
   let autoAcceptLoading = $state(true);
@@ -129,6 +136,21 @@
     }
   }
 
+  async function loadMyKey(): Promise<void> {
+    try {
+      myKeyHex = await service.getMyIdentityPubHex();
+    } catch (e) {
+      // The Ok(None) "node not started" path does NOT throw, so a throw here is
+      // a real backend failure (e.g. a poisoned NodeState). Log it rather than
+      // swallow it silently; the UI still falls back to the neutral null state.
+      console.error(
+        'getMyIdentityPubHex failed:',
+        e instanceof Error ? e.message : String(e),
+      );
+      myKeyHex = null;
+    }
+  }
+
   onMount(() => {
     // Re-fetch friends whenever the backend signals a change.
     unsubscribeChanged = service.onFriendsChanged(() => {
@@ -141,6 +163,7 @@
     void refresh();
     void refreshPending();
     void loadAutoAccept();
+    void loadMyKey();
   });
 
   onDestroy(() => {
@@ -148,6 +171,8 @@
     unsubscribeChanged = null;
     unsubscribePendingChanged?.();
     unsubscribePendingChanged = null;
+    if (myKeyCopiedTimer) clearTimeout(myKeyCopiedTimer);
+    myKeyCopiedTimer = null;
   });
 
   async function handleGenerate(): Promise<void> {
@@ -170,6 +195,24 @@
     } catch {
       // Clipboard may be unavailable (headless / permission); the URL stays
       // visible in the readonly input for manual copy.
+    }
+  }
+
+  async function handleCopyMyKey(): Promise<void> {
+    if (!myKeyHex) return;
+    try {
+      await navigator.clipboard.writeText(myKeyHex);
+      myKeyCopied = true;
+      // Clear any in-flight reset (rapid re-clicks) before scheduling a new one;
+      // onDestroy clears it too so we never write $state after unmount.
+      if (myKeyCopiedTimer) clearTimeout(myKeyCopiedTimer);
+      myKeyCopiedTimer = setTimeout(() => {
+        myKeyCopied = false;
+        myKeyCopiedTimer = null;
+      }, 1500);
+    } catch {
+      // Clipboard unavailable (headless / permission); the hex stays visible
+      // in the readonly input for manual copy. Mirrors handleCopy.
     }
   }
 
@@ -522,6 +565,34 @@
           </li>
         {/each}
       </ul>
+    {/if}
+  </div>
+
+  <!-- ── ZEB-388: My key (share so a peer can add you by key) ───────────── -->
+  <div class="action-block" data-testid="my-key-section">
+    <label class="add-label" for="my-key-input">My key</label>
+    {#if myKeyHex}
+      <div class="add-row">
+        <input
+          id="my-key-input"
+          type="text"
+          class="url-input"
+          readonly
+          value={myKeyHex}
+          data-testid="my-key-input"
+        />
+        <button
+          type="button"
+          class="secondary-btn"
+          onclick={handleCopyMyKey}
+          data-testid="my-key-copy-btn"
+        >
+          {myKeyCopied ? 'Copied!' : 'Copy'}
+        </button>
+      </div>
+      <p class="muted">Share this so a friend can add you with "Add friend by key".</p>
+    {:else}
+      <p class="muted" data-testid="my-key-empty">Start your node to view your key.</p>
     {/if}
   </div>
 
