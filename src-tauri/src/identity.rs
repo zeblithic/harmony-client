@@ -442,6 +442,22 @@ impl SecretVault {
         }
     }
 
+    /// The app-local key for `slot`, if present.
+    fn slot_key(&self, slot: VaultSlot) -> Option<[u8; 32]> {
+        match slot {
+            VaultSlot::Iroh => self.iroh_secret_key,
+            VaultSlot::Device => self.device_signing_key,
+        }
+    }
+
+    /// Set (or clear) the app-local key for `slot`.
+    fn set_slot_key(&mut self, slot: VaultSlot, key: Option<[u8; 32]>) {
+        match slot {
+            VaultSlot::Iroh => self.iroh_secret_key = key,
+            VaultSlot::Device => self.device_signing_key = key,
+        }
+    }
+
     /// Serialize to CBOR. The returned buffer holds secret material and is wrapped
     /// in `Zeroizing` so it is wiped on drop.
     fn to_cbor(&self) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -584,6 +600,94 @@ mod vault_tests {
         store.save_vault(&vault).expect("save");
         let back = store.load_vault().expect("load").expect("present");
         assert!(back == vault, "v2 vault must round-trip through the encrypted file");
+    }
+
+    fn mock_entry() -> keyring::Entry {
+        keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()))
+    }
+
+    #[test]
+    fn accessor_returns_existing_vault_key_without_touching_legacy() {
+        let store = KeychainStore::new_mock();
+        let mut vault = SecretVault::from_seed([1u8; BLOB_LEN]);
+        vault.iroh_secret_key = Some([7u8; 32]);
+        store.save_vault(&vault).unwrap();
+        let legacy = mock_entry();
+
+        let (key, fresh) =
+            vault_app_key_or_create_with_store(&store, VaultSlot::Iroh, &legacy).unwrap();
+        assert_eq!(*key, [7u8; 32]);
+        assert!(!fresh, "an existing vault key is not freshly created");
+        assert!(
+            matches!(legacy.get_secret(), Err(keyring::Error::NoEntry)),
+            "legacy item must not be created when the vault already has the key"
+        );
+    }
+
+    #[test]
+    fn accessor_migrates_legacy_item_then_deletes_it() {
+        let store = KeychainStore::new_mock();
+        store
+            .save_vault(&SecretVault::from_seed([1u8; BLOB_LEN]))
+            .unwrap();
+        let legacy = mock_entry();
+        legacy.set_secret(&[9u8; 32]).unwrap();
+
+        let (key, fresh) =
+            vault_app_key_or_create_with_store(&store, VaultSlot::Device, &legacy).unwrap();
+        assert_eq!(*key, [9u8; 32], "migrated key value preserved");
+        assert!(!fresh, "a migrated key is the same identity, not freshly created");
+
+        let v = store.load_vault().unwrap().unwrap();
+        assert_eq!(v.device_signing_key, Some([9u8; 32]), "folded into vault");
+        assert_eq!(v.seed, [1u8; BLOB_LEN], "seed preserved through the fold");
+        assert!(
+            matches!(legacy.get_secret(), Err(keyring::Error::NoEntry)),
+            "legacy item deleted after verified read-back"
+        );
+    }
+
+    #[test]
+    fn accessor_generates_when_neither_present_and_is_idempotent() {
+        let store = KeychainStore::new_mock();
+        store
+            .save_vault(&SecretVault::from_seed([1u8; BLOB_LEN]))
+            .unwrap();
+        let legacy = mock_entry();
+
+        let (key, fresh) =
+            vault_app_key_or_create_with_store(&store, VaultSlot::Iroh, &legacy).unwrap();
+        assert!(fresh, "no vault key + no legacy item => freshly created");
+        let v = store.load_vault().unwrap().unwrap();
+        assert_eq!(v.iroh_secret_key, Some(*key), "generated key folded into vault");
+
+        // Second call returns the same key and is no longer "fresh".
+        let (key2, fresh2) =
+            vault_app_key_or_create_with_store(&store, VaultSlot::Iroh, &legacy).unwrap();
+        assert_eq!(*key2, *key);
+        assert!(!fresh2);
+    }
+
+    #[test]
+    fn accessor_without_vault_item_falls_back_to_legacy() {
+        // Empty mock store: load_vault() -> None (headless / no-keychain seed).
+        let store = KeychainStore::new_mock();
+        let legacy = mock_entry();
+
+        let (key, fresh) =
+            vault_app_key_or_create_with_store(&store, VaultSlot::Iroh, &legacy).unwrap();
+        assert!(fresh, "fresh generate persisted to the legacy item");
+        assert_eq!(legacy.get_secret().unwrap(), (*key).to_vec(), "stored in legacy");
+        assert!(
+            store.load_vault().unwrap().is_none(),
+            "no vault item is created in the fallback path"
+        );
+
+        // Second call reads the existing legacy key (not fresh).
+        let (key2, fresh2) =
+            vault_app_key_or_create_with_store(&store, VaultSlot::Iroh, &legacy).unwrap();
+        assert!(!fresh2);
+        assert_eq!(*key2, *key);
     }
 }
 
@@ -750,6 +854,113 @@ fn decrypt_v2_plaintext(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<Vec
         |_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string(),
     )?);
     Ok(plaintext)
+}
+
+// ── App-local key accessors (ZEB-363 consolidation) ─────────────────────
+
+/// Which app-local key slot in the [`SecretVault`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultSlot {
+    /// iroh transport secret key (`harmony.client`/`iroh.secret_key` legacy item).
+    Iroh,
+    /// Device #2 signing key (`harmony.owner`/`device_signing_key` legacy item).
+    Device,
+}
+
+/// Load-or-create a 32-byte app-local key, **consolidated into the single
+/// keychain vault item** (`harmony`/`identity`).
+///
+/// Returns `(key, freshly_created)`. `freshly_created` is `true` ONLY when a
+/// brand-new key was generated — never when an existing key was loaded from the
+/// vault or migrated from a legacy item (those are the *same* identity, so e.g.
+/// the iroh `EndpointId` is preserved).
+///
+/// - vault has the key → return it (`false`);
+/// - vault lacks it but the `legacy` single-key item exists → fold it into the
+///   vault, **verify the read-back, then delete the legacy item** (`false`);
+/// - neither → generate and fold into the vault (`true`).
+///
+/// When there is no keychain vault item at all (headless / no-keychain install,
+/// where the seed lives in the encrypted file), falls back to the pre-ZEB-363
+/// per-item behaviour: read-or-create the key in `legacy` itself.
+pub fn vault_app_key_or_create(
+    slot: VaultSlot,
+    legacy: &keyring::Entry,
+) -> Result<(Zeroizing<[u8; 32]>, bool), String> {
+    let store = KeychainStore::new()?;
+    vault_app_key_or_create_with_store(&store, slot, legacy)
+}
+
+fn vault_app_key_or_create_with_store(
+    store: &KeychainStore,
+    slot: VaultSlot,
+    legacy: &keyring::Entry,
+) -> Result<(Zeroizing<[u8; 32]>, bool), String> {
+    let Some(mut vault) = store.load_vault()? else {
+        // No keychain vault item — keep app-local keys in their own legacy item.
+        return read_legacy_key_or_create_persisting(legacy);
+    };
+
+    if let Some(k) = vault.slot_key(slot) {
+        return Ok((Zeroizing::new(k), false));
+    }
+
+    let (key, fresh) = read_legacy_key_or_generate(legacy)?;
+    vault.set_slot_key(slot, Some(*key));
+    store.save_vault(&vault)?;
+
+    // Verify the key is durably in the vault BEFORE removing the legacy item, so
+    // a failed write never loses the key.
+    let back = store
+        .load_vault()?
+        .ok_or_else(|| "secret vault disappeared immediately after write".to_string())?;
+    if back.slot_key(slot) != Some(*key) {
+        return Err("secret-vault read-back mismatch after fold; legacy item retained".to_string());
+    }
+
+    // The key now lives in the vault. Best-effort remove the legacy item so only
+    // the one consolidated item remains. (NoEntry on the generate path is fine.)
+    if let Err(e) = legacy.delete_credential() {
+        if !matches!(e, keyring::Error::NoEntry) {
+            tracing::warn!("could not delete migrated legacy keychain item: {e}");
+        }
+    }
+
+    Ok((key, fresh))
+}
+
+/// Read a 32-byte key from a legacy single-key item, or generate a fresh one
+/// (NOT persisted here — the caller folds it into the vault).
+fn read_legacy_key_or_generate(
+    legacy: &keyring::Entry,
+) -> Result<(Zeroizing<[u8; 32]>, bool), String> {
+    match legacy.get_secret() {
+        Ok(bytes) => {
+            let bytes = Zeroizing::new(bytes);
+            Ok((blob_to_seed(&bytes)?, false))
+        }
+        Err(keyring::Error::NoEntry) => {
+            let mut key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(key.as_mut());
+            Ok((key, true))
+        }
+        Err(e) => Err(format!("legacy keychain item read failed: {e}")),
+    }
+}
+
+/// Fallback when there is no keychain vault item: read-or-create the key in the
+/// `legacy` single-key item itself (pre-ZEB-363 behaviour).
+fn read_legacy_key_or_create_persisting(
+    legacy: &keyring::Entry,
+) -> Result<(Zeroizing<[u8; 32]>, bool), String> {
+    let (key, fresh) = read_legacy_key_or_generate(legacy)?;
+    if fresh {
+        legacy
+            .set_secret(key.as_ref())
+            .map_err(|e| format!("legacy keychain item write failed: {e}"))?;
+    }
+    Ok((key, fresh))
 }
 
 // ── KeyStore trait ──────────────────────────────────────────────────────
