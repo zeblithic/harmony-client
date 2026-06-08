@@ -72,6 +72,10 @@
   let addingByKey = $state(false);
   let addByKeyStatus = $state<string | null>(null);
 
+  // ── ZEB-388: my own identity pub hex (share for add-by-key) ───────────────
+  let myKeyHex = $state<string | null>(null);
+  let myKeyCopied = $state(false);
+
   // Auto-accept toggle.
   let autoAccept = $state(false);
   let autoAcceptLoading = $state(true);
@@ -129,6 +133,15 @@
     }
   }
 
+  async function loadMyKey(): Promise<void> {
+    try {
+      myKeyHex = await service.getMyIdentityPubHex();
+    } catch {
+      // Non-fatal: leave myKeyHex null → neutral "start your node" state.
+      myKeyHex = null;
+    }
+  }
+
   onMount(() => {
     // Re-fetch friends whenever the backend signals a change.
     unsubscribeChanged = service.onFriendsChanged(() => {
@@ -141,6 +154,7 @@
     void refresh();
     void refreshPending();
     void loadAutoAccept();
+    void loadMyKey();
   });
 
   onDestroy(() => {
@@ -170,6 +184,20 @@
     } catch {
       // Clipboard may be unavailable (headless / permission); the URL stays
       // visible in the readonly input for manual copy.
+    }
+  }
+
+  async function handleCopyMyKey(): Promise<void> {
+    if (!myKeyHex) return;
+    try {
+      await navigator.clipboard.writeText(myKeyHex);
+      myKeyCopied = true;
+      setTimeout(() => {
+        myKeyCopied = false;
+      }, 1500);
+    } catch {
+      // Clipboard unavailable (headless / permission); the hex stays visible
+      // in the readonly input for manual copy. Mirrors handleCopy.
     }
   }
 
@@ -522,6 +550,34 @@
           </li>
         {/each}
       </ul>
+    {/if}
+  </div>
+
+  <!-- ── ZEB-388: My key (share so a peer can add you by key) ───────────── -->
+  <div class="action-block" data-testid="my-key-section">
+    <label class="add-label" for="my-key-input">My key</label>
+    {#if myKeyHex}
+      <div class="add-row">
+        <input
+          id="my-key-input"
+          type="text"
+          class="url-input"
+          readonly
+          value={myKeyHex}
+          data-testid="my-key-input"
+        />
+        <button
+          type="button"
+          class="secondary-btn"
+          onclick={handleCopyMyKey}
+          data-testid="my-key-copy-btn"
+        >
+          {myKeyCopied ? 'Copied!' : 'Copy'}
+        </button>
+      </div>
+      <p class="muted">Share this so a friend can add you with "Add friend by key".</p>
+    {:else}
+      <p class="muted" data-testid="my-key-empty">Start your node to view your key.</p>
     {/if}
   </div>
 
