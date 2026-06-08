@@ -710,6 +710,66 @@ mod vault_tests {
     }
 
     #[test]
+    fn corrupt_vault_degrades_app_key_to_legacy_item() {
+        // A corrupt/unreadable harmony/identity vault must NOT take iroh transport
+        // down: the accessor degrades to the legacy per-item key and leaves the
+        // corrupt vault intact (never overwritten). (Cursor High.)
+        let store = KeychainStore::new_mock();
+        let corrupt = [0xFFu8; 40];
+        store
+            .entry
+            .set_secret(&corrupt)
+            .expect("write corrupt vault");
+        let legacy = mock_entry();
+        legacy.set_secret(&[7u8; 32]).expect("seed legacy iroh key");
+
+        let (key, fresh) = vault_app_key_or_create_with_store(&store, VaultSlot::Iroh, &legacy)
+            .expect("must degrade to the legacy key, not hard-fail");
+        assert_eq!(
+            *key, [7u8; 32],
+            "legacy app-local key returned on corrupt vault"
+        );
+        assert!(!fresh, "an existing legacy key is not freshly created");
+
+        let raw = store
+            .entry
+            .get_secret()
+            .expect("corrupt vault still present");
+        assert_eq!(
+            raw, corrupt,
+            "the corrupt vault must not be overwritten by the degrade path"
+        );
+        assert_eq!(
+            legacy.get_secret().expect("legacy retained"),
+            vec![7u8; 32],
+            "the legacy item is retained when the vault is unreadable"
+        );
+    }
+
+    #[test]
+    fn corrupt_vault_degrades_load_slot_to_legacy_item() {
+        // The owner slot read also degrades to the legacy item on a corrupt vault
+        // rather than skipping the secret. (Cursor High.)
+        let store = KeychainStore::new_mock();
+        store
+            .entry
+            .set_secret(&[0xFFu8; 40])
+            .expect("write corrupt vault");
+        let legacy = mock_entry();
+        legacy
+            .set_secret(&[5u8; 32])
+            .expect("seed legacy device key");
+
+        let got = vault_load_slot_with_store(&store, VaultSlot::Device, &legacy)
+            .expect("must degrade to the legacy slot, not hard-fail");
+        assert_eq!(
+            got.map(|z| *z),
+            Some([5u8; 32]),
+            "legacy slot value read on corrupt vault"
+        );
+    }
+
+    #[test]
     fn accessor_migrates_legacy_item_then_deletes_it() {
         let store = KeychainStore::new_mock();
         store
@@ -1107,9 +1167,23 @@ fn vault_app_key_or_create_with_store(
     slot: VaultSlot,
     legacy: &keyring::Entry,
 ) -> Result<(Zeroizing<[u8; 32]>, bool), String> {
-    let Some(mut vault) = store.load_vault()? else {
+    let mut vault = match store.load_vault() {
+        Ok(Some(v)) => v,
         // No keychain vault item — keep app-local keys in their own legacy item.
-        return read_legacy_key_or_create_persisting(legacy);
+        Ok(None) => return read_legacy_key_or_create_persisting(legacy),
+        // Vault item present but UNREADABLE (corrupt / unknown-version). Don't take
+        // iroh transport down with the seed: degrade to the pre-ZEB-363 per-item
+        // legacy key (read-or-create), leaving the corrupt vault intact — never
+        // overwritten, mirroring the seed path which falls back to identity.enc on
+        // the same error. (Cursor High; consolidation must not widen the blast
+        // radius of a corrupt item.)
+        Err(e) => {
+            tracing::warn!(
+                "keychain vault unreadable ({e}); using the legacy per-item app-local \
+                 key and leaving the vault intact"
+            );
+            return read_legacy_key_or_create_persisting(legacy);
+        }
     };
 
     if let Some(k) = vault.slot_key(slot) {
@@ -1206,8 +1280,19 @@ fn vault_load_slot_with_store(
     slot: VaultSlot,
     legacy: &keyring::Entry,
 ) -> Result<Option<Zeroizing<[u8; 32]>>, String> {
-    let Some(mut vault) = store.load_vault()? else {
-        return read_legacy_slot(legacy);
+    let mut vault = match store.load_vault() {
+        Ok(Some(v)) => v,
+        Ok(None) => return read_legacy_slot(legacy),
+        // Unreadable vault: read the slot from the legacy item rather than
+        // skipping the owner secret entirely, leaving the corrupt vault intact.
+        // (Cursor High; consistent with the iroh accessor + the seed→enc path.)
+        Err(e) => {
+            tracing::warn!(
+                "keychain vault unreadable ({e}); reading the app-local slot from the \
+                 legacy item and leaving the vault intact"
+            );
+            return read_legacy_slot(legacy);
+        }
     };
     if let Some(k) = vault.slot_key(slot) {
         return Ok(Some(Zeroizing::new(*k)));
@@ -1262,11 +1347,22 @@ fn vault_clear_slot_with_store(
     slot: VaultSlot,
     legacy: &keyring::Entry,
 ) -> Result<(), String> {
-    if let Some(mut vault) = store.load_vault()? {
-        if vault.slot_key(slot).is_some() {
-            vault.set_slot_key(slot, None);
-            store.save_vault(&vault)?;
+    match store.load_vault() {
+        Ok(Some(mut vault)) => {
+            if vault.slot_key(slot).is_some() {
+                vault.set_slot_key(slot, None);
+                store.save_vault(&vault)?;
+            }
         }
+        Ok(None) => {}
+        // Unreadable vault: we can't selectively clear one slot without risking an
+        // overwrite of the whole (corrupt) item, so leave it intact and still clear
+        // the legacy item below. An unreadable vault can't resurrect the secret on
+        // load anyway (the read fails the same way). (Cursor High.)
+        Err(e) => tracing::warn!(
+            "keychain vault unreadable ({e}); leaving it intact and clearing only the \
+             legacy item"
+        ),
     }
     if let Err(e) = legacy.delete_credential() {
         if !matches!(e, keyring::Error::NoEntry) {
