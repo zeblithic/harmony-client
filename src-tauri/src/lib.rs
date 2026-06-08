@@ -13888,6 +13888,122 @@ pub fn member_info_for(
     rows
 }
 
+/// ZEB-393 Bug B: a persisted Community space shaped for the nav sidebar.
+/// `space_id` is the 32-char lowercase hex of the 16-byte SpaceId (same
+/// format the runtime `nav-updated` emit uses). Mirrors the frontend
+/// `CommunityNavDto` in `community-service.ts`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityNavDto {
+    pub space_id: String,
+    pub name: String,
+    pub is_invite_only: bool,
+    pub pending: bool,
+}
+
+/// ZEB-393 Bug B: owner-state Community spaces shaped for boot rehydration
+/// of the nav sidebar. Filters to live (non-left) Community spaces —
+/// mirrors the boot engine-spawn sweep's predicate (`start_node`) so the UI
+/// and the engine sweep agree on "which communities am I in." The frontend
+/// has no other way to learn this: `list_community_members` /
+/// `list_community_forks` both require a `communityId` you must already have.
+pub fn communities_for_nav(state: &crate::owner_state_crdt::OwnerState) -> Vec<CommunityNavDto> {
+    state
+        .spaces
+        .values()
+        .filter(|s| {
+            s.kind == crate::owner_state_types::SpaceKind::Community && s.left_at.is_none()
+        })
+        .map(|s| CommunityNavDto {
+            space_id: hex::encode(s.id.0),
+            name: s.name.clone(),
+            is_invite_only: s.is_invite_only.unwrap_or(false),
+            pending: s.pending_join_at.is_some(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod zeb393_communities_for_nav_tests {
+    use super::*;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+    fn hlc() -> Hlc {
+        Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn community_space(id: u8, name: &str, invite_only: bool, pending: bool, left: bool) -> Space {
+        Space {
+            id: SpaceId([id; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: name.into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: if left { Some(hlc()) } else { None },
+            created_at: hlc(),
+            updated_at: hlc(),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([7u8; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([9u8; 16])),
+            is_invite_only: Some(invite_only),
+            shared_in_profile: false,
+            pending_join_at: if pending { Some(hlc()) } else { None },
+        }
+    }
+
+    fn folder_space(id: u8, name: &str) -> Space {
+        let mut s = community_space(id, name, false, false, false);
+        s.kind = SpaceKind::Folder;
+        s.current_epoch = None;
+        s.current_epoch_key = None;
+        s.admin_addr = None;
+        s.is_invite_only = None;
+        s
+    }
+
+    #[test]
+    fn returns_only_live_communities_with_correct_fields() {
+        let mut st = OwnerState::default();
+        for s in [
+            community_space(1, "Open Town", false, false, false),
+            community_space(2, "Secret Club", true, true, false), // pending invite-only
+            community_space(3, "Left Behind", false, false, true), // left → excluded
+            folder_space(4, "Root"),                               // non-community → excluded
+        ] {
+            st.spaces.insert(s.id, s);
+        }
+
+        let mut got = communities_for_nav(&st);
+        got.sort_by(|a, b| a.space_id.cmp(&b.space_id));
+
+        assert_eq!(got.len(), 2, "only the two live communities");
+        assert_eq!(got[0].space_id, hex::encode([1u8; 16]));
+        assert_eq!(got[0].name, "Open Town");
+        assert!(!got[0].is_invite_only);
+        assert!(!got[0].pending);
+        assert_eq!(got[1].name, "Secret Club");
+        assert!(got[1].is_invite_only);
+        assert!(got[1].pending, "invite-only pending join stays greyed at boot");
+    }
+
+    #[test]
+    fn empty_state_yields_empty() {
+        assert!(communities_for_nav(&OwnerState::default()).is_empty());
+    }
+}
+
 /// Read-only IPC over a community's materialized member list.
 /// Returns rows sorted by power desc then joined_at asc (see
 /// `member_info_for`). `community_id` is the 32-char lowercase
