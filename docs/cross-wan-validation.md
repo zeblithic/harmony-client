@@ -20,10 +20,22 @@ On EACH machine independently:
 
 1. Launch Harmony.
 2. Open the **Network** panel (sidebar → Network).
-3. Wait until the "Reachable" status appears (typically <30 seconds).
-4. Click **Run self-test**. Expect every step (endpoint, relay,
-   pkarr_publish, pkarr_resolve) to show ✓.
-5. Screenshot the panel for your records.
+3. Enable **Settings → Make me discoverable** (publishes your identity to
+   pkarr so the pkarr self-test steps can verify discovery). Leave it on for
+   the whole test.
+4. Wait until the "Reachable" status appears (typically <30 seconds).
+5. Click **Run self-test**. With discoverability on and a healthy network,
+   all four steps show ✓:
+   - **endpoint** — your iroh endpoint is bound.
+   - **relay** — round-trip to the pkarr relay (shows the real RTT in ms; a
+     slow but non-zero RTT is fine, not a failure).
+   - **pkarr_publish** — your identity publication is active.
+   - **pkarr_resolve** — your identity resolved back from pkarr (real RTT).
+
+   A neutral **⊘** on `pkarr_publish`/`pkarr_resolve` means discoverability is
+   off (turn it on in step 3) — it is **not** a failure. A red **✗** is a real
+   problem; the reason next to it says what.
+6. Screenshot the panel for your records.
 
 **If a machine fails Step 1**: the cross-WAN test can't proceed.
 Click **Submit diagnostics**, save the export, and attach it to a
