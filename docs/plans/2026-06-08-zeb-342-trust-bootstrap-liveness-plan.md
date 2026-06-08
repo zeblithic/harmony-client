@@ -416,7 +416,12 @@ pub async fn get_owner_state(_app: tauri::AppHandle) -> Result<Option<OwnerState
             None => return Ok(None),
         };
         if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now_unix()) {
-            save_owner_state_cbor_only(&identity_dir, &loaded.state)?;
+            // Fail open: the in-memory state already carries the fresh liveness, so the
+            // panel renders even if persistence fails; the next load retries the write.
+            if let Err(e) = save_owner_state_cbor_only(&identity_dir, &loaded.state) {
+                tracing::warn!(error = %e,
+                    "get_owner_state: failed to persist refreshed liveness; rendering from in-memory state");
+            }
         }
         Ok(Some(build_owner_state_view(&loaded, display_name)))
     })
@@ -433,7 +438,8 @@ cd src-tauri && cargo nextest run --locked -p harmony-app --features test-fixtur
 Expected: PASS. Then fmt + clippy:
 ```bash
 cargo fmt --all -- --check
-cargo clippy --locked -p harmony-app --features test-fixtures --no-deps -- -D warnings
+cargo clippy --locked --all-targets -p harmony-app --features test-fixtures --no-deps -- -D warnings
+cargo check --locked --all-targets --features test-fixtures
 ```
 Expected: clean.
 

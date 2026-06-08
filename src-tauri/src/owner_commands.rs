@@ -138,28 +138,33 @@ pub async fn get_owner_state(_app: tauri::AppHandle) -> Result<Option<OwnerState
     let identity_dir = resolve_identity_dir()?;
     let display_name = "this device".to_string();
     run_blocking(move || {
-        // ZEB-342: hold the write lock across load+refresh+save so the cbor
-        // write stays serialized with mint / pairing-install. Loading inside
-        // the lock closes the read-modify-write race with those writers.
-        let _guard = OWNER_STATE_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let mut loaded = match load_owner_state(&identity_dir, KeychainStore::new().ok())? {
-            Some(l) => l,
-            None => return Ok(None),
-        };
-        if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now_unix()) {
-            // Fail open: the in-memory state already carries the fresh liveness, so
-            // the panel renders correctly even if persistence fails. A persist error
-            // must NOT block the Devices panel (it didn't before this change); the
-            // next load retries the refresh + write.
-            if let Err(e) = save_owner_state_cbor_only(&identity_dir, &loaded.state) {
-                tracing::warn!(
-                    error = %e,
-                    "get_owner_state: failed to persist refreshed liveness; rendering from in-memory state"
-                );
+        // ZEB-342: hold the write lock only across load+refresh+save, so the cbor
+        // write stays serialized with mint / pairing-install (loading inside the
+        // lock closes the read-modify-write race). The lock is released at the end
+        // of this block — build_owner_state_view below only reads the already-local
+        // `loaded` snapshot (trust eval + formatting), which needs no serialization.
+        let loaded = {
+            let _guard = OWNER_STATE_WRITE_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut loaded = match load_owner_state(&identity_dir, KeychainStore::new().ok())? {
+                Some(l) => l,
+                None => return Ok(None),
+            };
+            if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now_unix()) {
+                // Fail open: the in-memory state already carries the fresh liveness, so
+                // the panel renders correctly even if persistence fails. A persist error
+                // must NOT block the Devices panel (it didn't before this change); the
+                // next load retries the refresh + write.
+                if let Err(e) = save_owner_state_cbor_only(&identity_dir, &loaded.state) {
+                    tracing::warn!(
+                        error = %e,
+                        "get_owner_state: failed to persist refreshed liveness; rendering from in-memory state"
+                    );
+                }
             }
-        }
+            loaded
+        };
         Ok(Some(build_owner_state_view(&loaded, display_name)))
     })
     .await

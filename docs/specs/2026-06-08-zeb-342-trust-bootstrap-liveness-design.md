@@ -131,7 +131,12 @@ run_blocking(move || {
         None => return Ok(None),
     };
     if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now_unix()) {
-        save_owner_state_cbor_only(&identity_dir, &loaded.state)?;
+        // Fail open (Decision 4): a persist failure must not block the panel — the
+        // in-memory state already carries the fresh liveness; next load retries.
+        if let Err(e) = save_owner_state_cbor_only(&identity_dir, &loaded.state) {
+            tracing::warn!(error = %e,
+                "get_owner_state: failed to persist refreshed liveness; rendering from in-memory state");
+        }
     }
     Ok(Some(build_owner_state_view(&loaded, display_name)))
 })
