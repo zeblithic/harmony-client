@@ -132,82 +132,16 @@ jobs:
       # test in favor of nextest is loss-free coverage-wise. If the
       # project gains Rust doctests later, add a `cargo test --doc` step
       # to this job before relying on nextest as the sole test gate.
-      # The depth-2+ nested-bundle round-trip lives in the separate
-      # `rust-test-large` job below — it needs HARMONY_LARGE_TESTS=1
-      # plus a longer timeout (the 36 GiB sparse-file FastCDC hash takes
-      # 17+ min wall-clock and blew through this 30-min job's budget on
-      # PR #166). Keeping it in its own parallel job means slow-test
-      # regressions don't slow the fast feedback loop on every PR.
+      # ZEB-397: the depth-2+ nested-bundle round-trip
+      # (`nested_bundle_tree_round_trip`) used to need a dedicated
+      # `rust-test-large` job (HARMONY_LARGE_TESTS=1, 60-min timeout) because
+      # it forced depth-2 by hashing a 36 GiB sparse file (~17 min) — the
+      # per-PR CI long pole. It now forces the identical depth-2 path
+      # (leaf count > MAX_BUNDLE_ENTRIES) with a tiny chunker config + a
+      # ~140 MiB sparse fixture that runs in well under a second, so it is
+      # un-gated and runs right here under --all-targets on every PR.
       - name: cargo nextest run --workspace --all-targets
         run: cargo nextest run --locked --workspace --all-targets --features test-fixtures --no-fail-fast
-
-  # ZEB-161 Task 5 large-test job: opts into the depth-2+ nested-bundle
-  # round-trip in `tests/folder_ingest_walker_integration.rs`, which
-  # creates a 36 GiB + 1 byte sparse tempfile and streams it through
-  # `streaming_ingest` to validate the multi-level tree-build path. The
-  # test is gated locally because the sparse-zero chunker path on default
-  # config only produces depth-2 at ≥ 32 GiB input (~MAX_BUNDLE_ENTRIES of
-  # max_chunk cuts). The sparse-file body consumes ~0 disk bytes on ext4
-  # (set_len creates a hole), but hashing zeros through FastCDC is
-  # wall-clock-bounded — 17+ min on the GitHub Actions Linux runner.
-  #
-  # Split from the main rust-test job (PR #166) because the slow test
-  # blew through the 30-min job timeout; isolating it here keeps the
-  # fast rust-test job's feedback loop tight while preserving per-PR
-  # coverage of the depth-2 chunker path.
-  #
-  # If this job consistently times out at 60 min too, options are: (1)
-  # cut the test's input size down to the minimum required to trigger
-  # depth-2 (currently 32 GiB / MAX_BUNDLE_ENTRIES of max_chunk cuts),
-  # (2) move to nightly-only via `schedule:` cron, (3) keep bumping
-  # timeout-minutes if the GH runner gets slower. The current 60-min
-  # budget is 3x the observed 17-min runtime — generous headroom.
-  rust-test-large:
-    name: Rust — large tests (HARMONY_LARGE_TESTS=1)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    defaults:
-      run:
-        working-directory: src-tauri
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-
-      - name: Install Tauri Linux deps
-        uses: ./.github/actions/install-linux-tauri-deps
-
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
-        with:
-          toolchain: stable
-
-      - uses: taiki-e/install-action@ec28e287910af896fd98e04056d31fa68607e7ad  # v2.77.4
-        with:
-          tool: cargo-nextest
-
-      # Separate cache key from rust-test so the filter-narrowed compile
-      # state (smaller universe of test binaries) doesn't trample the
-      # full-workspace cache the rust-test job warms up.
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
-        with:
-          workspaces: src-tauri
-          key: test-large
-
-      # `--test folder_ingest_walker_integration` scopes compilation to
-      # the one integration-test binary that houses the slow test.
-      # Without it, `cargo nextest run -E ...` still compiles the
-      # entire workspace's 55+ test binaries (the `-E` filter selects
-      # which tests RUN, not which COMPILE), and the runner's ~14 GiB
-      # of free disk fills up linking unrelated test binaries — exactly
-      # what failed PR #166 round 3 ("No space left on device" while
-      # linking `pkarr_iroh_redeem_full_integration`).
-      #
-      # `-E 'test(nested_bundle_tree_round_trip)'` is nextest's filter
-      # expression — within the one bin compiled above, select only the
-      # gated test. The HARMONY_LARGE_TESTS env var is the actual
-      # runtime gate (the test skips itself if absent).
-      - name: cargo nextest run --test folder_ingest_walker_integration
-        env:
-          HARMONY_LARGE_TESTS: "1"
-        run: cargo nextest run --locked --features test-fixtures --no-fail-fast --test folder_ingest_walker_integration -E 'test(nested_bundle_tree_round_trip)'
 
   # Validates `rust-version` declared in src-tauri/Cargo.toml. The `rust-check`
   # job above runs on stable for newer clippy lints + fastest iteration; this
