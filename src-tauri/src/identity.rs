@@ -450,12 +450,15 @@ impl SecretVault {
         }
     }
 
-    /// The app-local key for `slot`, if present.
-    fn slot_key(&self, slot: VaultSlot) -> Option<[u8; 32]> {
+    /// The app-local key for `slot`, if present. Returns a borrow so callers copy
+    /// straight into a `Zeroizing` buffer without materializing an intermediate
+    /// non-zeroized `[u8; 32]` on the stack (keeps the "zeroized throughout"
+    /// discipline).
+    fn slot_key(&self, slot: VaultSlot) -> Option<&[u8; 32]> {
         match slot {
-            VaultSlot::Iroh => self.iroh_secret_key,
-            VaultSlot::Device => self.device_signing_key,
-            VaultSlot::OwnerMasterSeed => self.owner_master_seed,
+            VaultSlot::Iroh => self.iroh_secret_key.as_ref(),
+            VaultSlot::Device => self.device_signing_key.as_ref(),
+            VaultSlot::OwnerMasterSeed => self.owner_master_seed.as_ref(),
         }
     }
 
@@ -582,6 +585,59 @@ mod vault_tests {
         assert!(
             kc.load_vault().is_err(),
             "a non-seed, non-CBOR item must hard-error, never be silently overwritten"
+        );
+    }
+
+    #[test]
+    fn seed_save_on_corrupt_keychain_item_hard_fails() {
+        // The seed-level `save` default must NOT silently overwrite a corrupt
+        // (non-seed, non-CBOR) keychain item — doing so would discard app-local
+        // keys and break the "hard error, never overwritten" contract.
+        let kc = KeychainStore::new_mock();
+        let corrupt = [0xFFu8; 40];
+        kc.entry.set_secret(&corrupt).expect("write garbage");
+        let err = kc
+            .save(&[3u8; BLOB_LEN])
+            .expect_err("save must hard-fail on a corrupt vault item, not overwrite it");
+        assert!(
+            err.contains("vault") || err.contains("decode") || err.contains("version"),
+            "expected a vault read/decode error, got: {err}"
+        );
+        let raw = kc.entry.get_secret().expect("item still present");
+        assert_eq!(
+            raw, corrupt,
+            "a corrupt item must not be overwritten by a failed seed save"
+        );
+    }
+
+    #[test]
+    fn reconcile_after_enc_restore_preserves_app_local_keys() {
+        // An encrypted-file force-restore reconciles a stale keychain vault to
+        // the restored seed WITHOUT dropping app-local keys (pre-ZEB-363 those
+        // lived in separate items untouched by a seed write).
+        let kc = KeychainStore::new_mock();
+        let mut vault = SecretVault::from_seed([1u8; BLOB_LEN]);
+        vault.set_slot_key(VaultSlot::Iroh, Some([9u8; 32]));
+        vault.set_slot_key(VaultSlot::Device, Some([8u8; 32]));
+        kc.save_vault(&vault).expect("seed initial vault");
+
+        let restored_seed = [2u8; BLOB_LEN];
+        reconcile_keychain_after_enc_restore(&kc, &restored_seed);
+
+        let back = kc.load_vault().expect("load").expect("present");
+        assert_eq!(
+            back.seed, restored_seed,
+            "seed must be reconciled to the restored value"
+        );
+        assert_eq!(
+            back.slot_key(VaultSlot::Iroh),
+            Some(&[9u8; 32]),
+            "iroh key must be preserved across reconcile"
+        );
+        assert_eq!(
+            back.slot_key(VaultSlot::Device),
+            Some(&[8u8; 32]),
+            "device key must be preserved across reconcile"
         );
     }
 
@@ -863,23 +919,25 @@ fn item_bytes_to_vault(bytes: &[u8]) -> Result<SecretVault, String> {
     SecretVault::from_cbor(bytes)
 }
 
-/// Encode a CBOR `SecretVault` plaintext into the HRMI `v0x02` envelope.
+/// Encrypt a CBOR `SecretVault` plaintext into the HRMI `v0x02` envelope.
 ///
-/// Identical framing to [`encrypt_with_params`] (Argon2id m=64MiB/t=3/p=1 →
-/// XChaCha20-Poly1305, 13-byte header bound as AAD) except the version byte is
-/// `0x02` and the protected plaintext is variable-length. Salt/nonce supplied by
-/// the caller so the function is deterministic for tests.
-fn encrypt_vault_with_params(
-    passphrase: &[u8],
-    salt: &[u8; SALT_LEN],
-    nonce: &[u8; NONCE_LEN],
-    plaintext: &[u8],
-) -> Vec<u8> {
+/// Production-only: generates a fresh random salt and nonce per call (no
+/// caller-supplied nonce, so there is no deterministic-nonce surface to misuse
+/// in production). Framing matches [`encrypt_with_params`] (Argon2id
+/// m=64MiB/t=3/p=1 → XChaCha20-Poly1305, 13-byte header bound as AAD) except the
+/// version byte is `0x02` and the protected plaintext is variable-length.
+fn encrypt_vault(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8> {
     use argon2::{Algorithm, Argon2, Params, Version};
     use chacha20poly1305::{
         aead::{Aead, KeyInit, Payload},
         XChaCha20Poly1305, XNonce,
     };
+    use rand::RngCore;
+
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
 
     let mut out = Vec::with_capacity(HEADER_LEN + SALT_LEN + NONCE_LEN + plaintext.len() + TAG_LEN);
     out.extend_from_slice(ENC_MAGIC);
@@ -889,15 +947,15 @@ fn encrypt_vault_with_params(
     out.extend_from_slice(&KDF_T.to_be_bytes());
     out.push(KDF_P);
     debug_assert_eq!(out.len(), HEADER_LEN);
-    out.extend_from_slice(salt);
-    out.extend_from_slice(nonce);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce);
 
     let params = Params::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32, Some(KDF_OUT_LEN))
         .expect("Argon2 params hardcoded valid");
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
     argon
-        .hash_password_into(passphrase, salt, key.as_mut_slice())
+        .hash_password_into(passphrase, &salt, key.as_mut_slice())
         .expect("Argon2 derivation cannot fail with hardcoded params");
 
     let cipher =
@@ -907,7 +965,7 @@ fn encrypt_vault_with_params(
         aad: &out[..HEADER_LEN],
     };
     let ciphertext_with_tag = cipher
-        .encrypt(XNonce::from_slice(nonce), payload)
+        .encrypt(XNonce::from_slice(&nonce), payload)
         .expect("AEAD encrypt cannot fail with valid inputs");
     out.extend_from_slice(&ciphertext_with_tag);
     out
@@ -1055,7 +1113,7 @@ fn vault_app_key_or_create_with_store(
     };
 
     if let Some(k) = vault.slot_key(slot) {
-        return Ok((Zeroizing::new(k), false));
+        return Ok((Zeroizing::new(*k), false));
     }
 
     let (key, fresh) = read_legacy_key_or_generate(legacy)?;
@@ -1067,7 +1125,7 @@ fn vault_app_key_or_create_with_store(
     let back = store
         .load_vault()?
         .ok_or_else(|| "secret vault disappeared immediately after write".to_string())?;
-    if back.slot_key(slot) != Some(*key) {
+    if back.slot_key(slot) != Some(&*key) {
         return Err("secret-vault read-back mismatch after fold; legacy item retained".to_string());
     }
 
@@ -1152,7 +1210,7 @@ fn vault_load_slot_with_store(
         return read_legacy_slot(legacy);
     };
     if let Some(k) = vault.slot_key(slot) {
-        return Ok(Some(Zeroizing::new(k)));
+        return Ok(Some(Zeroizing::new(*k)));
     }
     let Some(key) = read_legacy_slot(legacy)? else {
         return Ok(None);
@@ -1162,7 +1220,7 @@ fn vault_load_slot_with_store(
     let back = store
         .load_vault()?
         .ok_or_else(|| "secret vault disappeared immediately after write".to_string())?;
-    if back.slot_key(slot) != Some(*key) {
+    if back.slot_key(slot) != Some(&*key) {
         return Err("secret-vault read-back mismatch after fold; legacy item retained".to_string());
     }
     if let Err(e) = legacy.delete_credential() {
@@ -1246,14 +1304,22 @@ pub(crate) trait KeyStore {
     /// preserves the EndpointId and owner backup eligibility). On a fresh install
     /// (no existing vault) this creates a seed-only vault.
     fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
-        // RMW-preserve app-local keys when the existing vault is readable; if it
-        // isn't — a fresh install (None), or, during restore, an enc-file under a
-        // different passphrase (Err) — write a seed-only vault. (Passphrase
-        // rotation re-encrypts the whole vault via `rotate_passphrase`, so it
-        // never relies on this read-with-the-new-passphrase path.)
-        let mut vault = match self.load_vault() {
-            Ok(Some(v)) => v,
-            Ok(None) | Err(_) => SecretVault::from_seed(*seed),
+        // RMW-preserve app-local keys when an existing vault is readable. A
+        // genuine read error (corrupt / unknown-version item) is a HARD FAIL:
+        // silently overwriting it would discard app-local keys and break the
+        // corruption-handling contract (`item_bytes_to_vault` documents
+        // non-legacy/non-CBOR as "hard error, never overwritten"). Only
+        // `Ok(None)` (no entry) creates a fresh seed-only vault.
+        //
+        // The encrypted-file backend overrides this: for it a read error means a
+        // file it cannot DECRYPT (wrong passphrase during a deliberate restore /
+        // regen, or AEAD-corrupt), which it intentionally overwrites — see
+        // `impl KeyStore for EncryptedFileStore`. Passphrase rotation never
+        // relies on this path (it re-encrypts the whole vault via
+        // `rotate_passphrase`).
+        let mut vault = match self.load_vault()? {
+            Some(v) => v,
+            None => SecretVault::from_seed(*seed),
         };
         vault.version = VAULT_VERSION;
         vault.seed = *seed;
@@ -1532,20 +1598,28 @@ impl KeyStore for EncryptedFileStore {
     }
 
     fn save_vault(&self, vault: &SecretVault) -> Result<(), String> {
-        let mut salt = [0u8; SALT_LEN];
-        let mut nonce = [0u8; NONCE_LEN];
-        use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut salt);
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
-
         let plaintext = vault.to_cbor()?;
-        let bytes = encrypt_vault_with_params(
-            self.passphrase.expose_secret().as_bytes(),
-            &salt,
-            &nonce,
-            &plaintext,
-        );
+        let bytes = encrypt_vault(self.passphrase.expose_secret().as_bytes(), &plaintext);
         write_atomic_0600(&self.path, &bytes)
+    }
+
+    /// Overrides the default seed-level `save` for the encrypted-file backend:
+    /// an existing file we cannot DECRYPT (wrong passphrase during a deliberate
+    /// force-restore / regen, or an AEAD-corrupt file) is replaced with a fresh
+    /// seed-only vault. A deliberate restore write means "replace this identity,"
+    /// and AEAD makes wrong-passphrase indistinguishable from corruption, so the
+    /// distinction the keychain backend draws (hard-fail on corrupt) can't be
+    /// made here. This preserves the pre-ZEB-363 blind-overwrite restore
+    /// semantics for the headless / encrypted-file path. A *readable* file is
+    /// RMW-preserved exactly like the default.
+    fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
+        let mut vault = match self.load_vault() {
+            Ok(Some(v)) => v,
+            Ok(None) | Err(_) => SecretVault::from_seed(*seed),
+        };
+        vault.version = VAULT_VERSION;
+        vault.seed = *seed;
+        self.save_vault(&vault)
     }
 }
 
@@ -1625,6 +1699,61 @@ fn load_or_generate_with_stores_post_probe(
         },
     )?;
     Ok(seed_buf)
+}
+
+/// After an encrypted-file force-restore, reconcile a stale keychain vault so it
+/// can't shadow the restore on next boot (the resolution chain prefers the
+/// keychain), without gratuitously discarding app-local keys.
+///
+/// The consolidated vault also holds the iroh / device / owner-master keys,
+/// which pre-ZEB-363 lived in separate keychain items untouched by a seed write.
+/// Blindly deleting the whole vault here would regress that (new iroh
+/// `EndpointId`; owner-state vs `owner_state.cbor` inconsistency). So we rewrite
+/// only the seed (RMW-preserve app-local) when the keychain is readable, and
+/// fall back to deleting the stale entry only when it isn't — at which point the
+/// app-local keys regenerate on next boot, per the seed-only recovery model.
+fn reconcile_keychain_after_enc_restore(kc: &KeychainStore, seed: &[u8; BLOB_LEN]) {
+    match kc.load_vault() {
+        Ok(Some(mut vault)) => {
+            vault.version = VAULT_VERSION;
+            vault.seed = *seed;
+            match kc.save_vault(&vault) {
+                Ok(()) => tracing::info!(
+                    "reconciled keychain vault seed after encrypted-file force-restore (app-local keys preserved)"
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "could not reconcile keychain seed after encrypted-file force-restore; deleting stale entry so it cannot shadow the restore (app-local keys will regenerate)"
+                    );
+                    delete_stale_keychain_after_restore(kc);
+                }
+            }
+        }
+        Ok(None) => { /* no stale keychain entry to reconcile */ }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not read keychain while reconciling after encrypted-file force-restore; deleting stale entry defensively so it cannot shadow the restore"
+            );
+            delete_stale_keychain_after_restore(kc);
+        }
+    }
+}
+
+/// Best-effort delete of a stale keychain entry (last resort when it can't be
+/// reconciled). NoEntry is silent; other errors warn but do not fail the restore.
+fn delete_stale_keychain_after_restore(kc: &KeychainStore) {
+    match kc.delete() {
+        Ok(()) => {
+            tracing::info!("removed stale keychain entry after encrypted-file force-restore")
+        }
+        Err(keyring::Error::NoEntry) => { /* nothing to clean */ }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not remove stale keychain entry after encrypted-file force-restore — manual cleanup may be needed"
+        ),
+    }
 }
 
 /// Save `seed` to the preferred destination (keychain > encrypted), with
@@ -1894,18 +2023,11 @@ pub fn write_seed_to_disk_with_keychain(
                 }
             }
             SaveDestination::EncryptedFile => {
-                // Wrote to encrypted file → clean up any stale keychain entry.
+                // Wrote the restored seed to the encrypted file → reconcile any
+                // stale keychain vault so it can't shadow the restore on next
+                // boot, WITHOUT gratuitously dropping app-local keys.
                 if let Some(kc) = &keychain {
-                    match kc.delete() {
-                        Ok(()) => tracing::info!(
-                            "removed stale keychain entry after encrypted-file force-restore"
-                        ),
-                        Err(keyring::Error::NoEntry) => { /* nothing to clean */ }
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "could not remove stale keychain entry after encrypted-file force-restore — manual cleanup may be needed"
-                        ),
-                    }
+                    reconcile_keychain_after_enc_restore(kc, seed);
                 }
             }
         }
