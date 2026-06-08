@@ -423,12 +423,19 @@ const VAULT_VERSION: u8 = 1;
 pub(crate) struct SecretVault {
     /// Structure version — see [`VAULT_VERSION`].
     version: u8,
-    /// Identity master seed (recovery root); sub-keys derive from this.
+    /// Node/Reticulum identity master seed (recovery root); sub-keys derive from
+    /// this. Distinct from `owner_master_seed`.
     seed: [u8; BLOB_LEN],
     /// iroh transport secret key (independent-random; `None` until first node start).
+    #[serde(default)]
     iroh_secret_key: Option<[u8; 32]>,
     /// Device #2 signing key (`None` until owner-state init).
+    #[serde(default)]
     device_signing_key: Option<[u8; 32]>,
+    /// Owner identity master seed (drives backup eligibility; `None` in the
+    /// cert-only joiner model). Distinct from `seed` (the node seed).
+    #[serde(default)]
+    owner_master_seed: Option<[u8; 32]>,
 }
 
 impl SecretVault {
@@ -439,6 +446,7 @@ impl SecretVault {
             seed,
             iroh_secret_key: None,
             device_signing_key: None,
+            owner_master_seed: None,
         }
     }
 
@@ -447,6 +455,7 @@ impl SecretVault {
         match slot {
             VaultSlot::Iroh => self.iroh_secret_key,
             VaultSlot::Device => self.device_signing_key,
+            VaultSlot::OwnerMasterSeed => self.owner_master_seed,
         }
     }
 
@@ -455,6 +464,7 @@ impl SecretVault {
         match slot {
             VaultSlot::Iroh => self.iroh_secret_key = key,
             VaultSlot::Device => self.device_signing_key = key,
+            VaultSlot::OwnerMasterSeed => self.owner_master_seed = key,
         }
     }
 
@@ -492,6 +502,7 @@ mod vault_tests {
             seed: [7u8; BLOB_LEN],
             iroh_secret_key: Some([9u8; 32]),
             device_signing_key: None,
+            owner_master_seed: Some([8u8; 32]),
         };
         let cbor = v.to_cbor().expect("encode");
         let back = SecretVault::from_cbor(&cbor).expect("decode");
@@ -536,7 +547,9 @@ mod vault_tests {
         // must read that as a seed-only vault so the seed still loads.
         let kc = KeychainStore::new_mock();
         let seed = [0x11u8; BLOB_LEN];
-        kc.entry.set_secret(&seed).expect("write legacy raw-32 item");
+        kc.entry
+            .set_secret(&seed)
+            .expect("write legacy raw-32 item");
         let vault = kc.load_vault().expect("load").expect("present");
         assert_eq!(vault.seed, seed, "legacy seed must survive");
         assert!(vault.iroh_secret_key.is_none());
@@ -551,10 +564,14 @@ mod vault_tests {
             seed: [4u8; BLOB_LEN],
             iroh_secret_key: Some([5u8; 32]),
             device_signing_key: Some([6u8; 32]),
+            owner_master_seed: Some([8u8; 32]),
         };
         kc.save_vault(&vault).expect("save");
         let back = kc.load_vault().expect("load").expect("present");
-        assert!(back == vault, "vault must round-trip through the keychain item");
+        assert!(
+            back == vault,
+            "vault must round-trip through the keychain item"
+        );
     }
 
     #[test]
@@ -578,9 +595,15 @@ mod vault_tests {
         let seed = [9u8; BLOB_LEN];
         let v1 = encrypt_with_params(b"vault-v1-test", &salt, &nonce, &seed);
         std::fs::write(&path, &v1).unwrap();
-        let store = EncryptedFileStore::new(path, secrecy::SecretString::from("vault-v1-test".to_string()));
+        let store = EncryptedFileStore::new(
+            path,
+            secrecy::SecretString::from("vault-v1-test".to_string()),
+        );
         let vault = store.load_vault().expect("load").expect("present");
-        assert_eq!(vault.seed, seed, "v1 seed must decode into a seed-only vault");
+        assert_eq!(
+            vault.seed, seed,
+            "v1 seed must decode into a seed-only vault"
+        );
         assert!(vault.iroh_secret_key.is_none());
         assert!(vault.device_signing_key.is_none());
     }
@@ -589,17 +612,23 @@ mod vault_tests {
     fn enc_file_v2_round_trips_vault_with_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.enc");
-        let store =
-            EncryptedFileStore::new(path, secrecy::SecretString::from("vault-v2-test".to_string()));
+        let store = EncryptedFileStore::new(
+            path,
+            secrecy::SecretString::from("vault-v2-test".to_string()),
+        );
         let vault = SecretVault {
             version: VAULT_VERSION,
             seed: [1u8; BLOB_LEN],
             iroh_secret_key: Some([2u8; 32]),
             device_signing_key: Some([3u8; 32]),
+            owner_master_seed: Some([4u8; 32]),
         };
         store.save_vault(&vault).expect("save");
         let back = store.load_vault().expect("load").expect("present");
-        assert!(back == vault, "v2 vault must round-trip through the encrypted file");
+        assert!(
+            back == vault,
+            "v2 vault must round-trip through the encrypted file"
+        );
     }
 
     fn mock_entry() -> keyring::Entry {
@@ -636,7 +665,10 @@ mod vault_tests {
         let (key, fresh) =
             vault_app_key_or_create_with_store(&store, VaultSlot::Device, &legacy).unwrap();
         assert_eq!(*key, [9u8; 32], "migrated key value preserved");
-        assert!(!fresh, "a migrated key is the same identity, not freshly created");
+        assert!(
+            !fresh,
+            "a migrated key is the same identity, not freshly created"
+        );
 
         let v = store.load_vault().unwrap().unwrap();
         assert_eq!(v.device_signing_key, Some([9u8; 32]), "folded into vault");
@@ -659,7 +691,11 @@ mod vault_tests {
             vault_app_key_or_create_with_store(&store, VaultSlot::Iroh, &legacy).unwrap();
         assert!(fresh, "no vault key + no legacy item => freshly created");
         let v = store.load_vault().unwrap().unwrap();
-        assert_eq!(v.iroh_secret_key, Some(*key), "generated key folded into vault");
+        assert_eq!(
+            v.iroh_secret_key,
+            Some(*key),
+            "generated key folded into vault"
+        );
 
         // Second call returns the same key and is no longer "fresh".
         let (key2, fresh2) =
@@ -677,7 +713,11 @@ mod vault_tests {
         let (key, fresh) =
             vault_app_key_or_create_with_store(&store, VaultSlot::Iroh, &legacy).unwrap();
         assert!(fresh, "fresh generate persisted to the legacy item");
-        assert_eq!(legacy.get_secret().unwrap(), (*key).to_vec(), "stored in legacy");
+        assert_eq!(
+            legacy.get_secret().unwrap(),
+            (*key).to_vec(),
+            "stored in legacy"
+        );
         assert!(
             store.load_vault().unwrap().is_none(),
             "no vault item is created in the fallback path"
@@ -688,6 +728,117 @@ mod vault_tests {
             vault_app_key_or_create_with_store(&store, VaultSlot::Iroh, &legacy).unwrap();
         assert!(!fresh2);
         assert_eq!(*key2, *key);
+    }
+
+    #[test]
+    fn load_slot_returns_vault_value_and_migrates_legacy() {
+        // (a) value already in the vault.
+        let store = KeychainStore::new_mock();
+        let mut v = SecretVault::from_seed([1u8; BLOB_LEN]);
+        v.owner_master_seed = Some([2u8; 32]);
+        store.save_vault(&v).unwrap();
+        let legacy = mock_entry();
+        let got = vault_load_slot_with_store(&store, VaultSlot::OwnerMasterSeed, &legacy).unwrap();
+        assert_eq!(*got.unwrap(), [2u8; 32]);
+
+        // (b) value only in the legacy item -> migrated + legacy deleted.
+        let store2 = KeychainStore::new_mock();
+        store2
+            .save_vault(&SecretVault::from_seed([1u8; BLOB_LEN]))
+            .unwrap();
+        let legacy2 = mock_entry();
+        legacy2.set_secret(&[3u8; 32]).unwrap();
+        let got2 = vault_load_slot_with_store(&store2, VaultSlot::Device, &legacy2).unwrap();
+        assert_eq!(*got2.unwrap(), [3u8; 32]);
+        assert_eq!(
+            store2.load_vault().unwrap().unwrap().device_signing_key,
+            Some([3u8; 32])
+        );
+        assert!(matches!(legacy2.get_secret(), Err(keyring::Error::NoEntry)));
+    }
+
+    #[test]
+    fn load_slot_is_none_when_absent_everywhere_and_never_generates() {
+        let store = KeychainStore::new_mock();
+        store
+            .save_vault(&SecretVault::from_seed([1u8; BLOB_LEN]))
+            .unwrap();
+        let legacy = mock_entry();
+        let got = vault_load_slot_with_store(&store, VaultSlot::Device, &legacy).unwrap();
+        assert!(got.is_none(), "pure read must not generate a key");
+    }
+
+    #[test]
+    fn save_slot_writes_to_vault_or_reports_no_item() {
+        let store = KeychainStore::new_mock();
+        store
+            .save_vault(&SecretVault::from_seed([1u8; BLOB_LEN]))
+            .unwrap();
+        assert!(
+            vault_save_slot_with_store(&store, VaultSlot::OwnerMasterSeed, &[7u8; 32]).unwrap()
+        );
+        assert_eq!(
+            store.load_vault().unwrap().unwrap().owner_master_seed,
+            Some([7u8; 32])
+        );
+
+        // No vault item -> Ok(false) so the caller falls back to its own store.
+        let empty = KeychainStore::new_mock();
+        assert!(
+            !vault_save_slot_with_store(&empty, VaultSlot::OwnerMasterSeed, &[7u8; 32]).unwrap()
+        );
+    }
+
+    #[test]
+    fn clear_slot_clears_vault_and_legacy_idempotently() {
+        let store = KeychainStore::new_mock();
+        let mut v = SecretVault::from_seed([1u8; BLOB_LEN]);
+        v.owner_master_seed = Some([9u8; 32]);
+        store.save_vault(&v).unwrap();
+        let legacy = mock_entry();
+        legacy.set_secret(&[9u8; 32]).unwrap();
+
+        vault_clear_slot_with_store(&store, VaultSlot::OwnerMasterSeed, &legacy).unwrap();
+        assert_eq!(
+            store.load_vault().unwrap().unwrap().owner_master_seed,
+            None,
+            "vault slot cleared"
+        );
+        assert!(matches!(legacy.get_secret(), Err(keyring::Error::NoEntry)));
+        // Idempotent second call.
+        vault_clear_slot_with_store(&store, VaultSlot::OwnerMasterSeed, &legacy).unwrap();
+    }
+
+    #[test]
+    fn seed_save_preserves_existing_app_local_keys() {
+        // A node-seed write (restore / re-generate) must keep the device's
+        // iroh / device / owner-master keys — same as the pre-consolidation
+        // behaviour where they lived in separate, untouched items.
+        let store = KeychainStore::new_mock();
+        let mut v = SecretVault::from_seed([1u8; BLOB_LEN]);
+        v.iroh_secret_key = Some([2u8; 32]);
+        v.device_signing_key = Some([3u8; 32]);
+        v.owner_master_seed = Some([4u8; 32]);
+        store.save_vault(&v).unwrap();
+
+        store.save(&[9u8; BLOB_LEN]).unwrap();
+
+        let back = store.load_vault().unwrap().unwrap();
+        assert_eq!(back.seed, [9u8; BLOB_LEN], "seed updated");
+        assert_eq!(back.iroh_secret_key, Some([2u8; 32]), "iroh preserved");
+        assert_eq!(back.device_signing_key, Some([3u8; 32]), "device preserved");
+        assert_eq!(back.owner_master_seed, Some([4u8; 32]), "owner preserved");
+    }
+
+    #[test]
+    fn seed_save_on_empty_creates_seed_only_vault() {
+        let store = KeychainStore::new_mock();
+        store.save(&[5u8; BLOB_LEN]).unwrap();
+        let back = store.load_vault().unwrap().unwrap();
+        assert_eq!(back.seed, [5u8; BLOB_LEN]);
+        assert!(back.iroh_secret_key.is_none());
+        assert!(back.device_signing_key.is_none());
+        assert!(back.owner_master_seed.is_none());
     }
 }
 
@@ -865,6 +1016,8 @@ pub enum VaultSlot {
     Iroh,
     /// Device #2 signing key (`harmony.owner`/`device_signing_key` legacy item).
     Device,
+    /// Owner identity master seed (`harmony.owner`/`master_seed` legacy item).
+    OwnerMasterSeed,
 }
 
 /// Load-or-create a 32-byte app-local key, **consolidated into the single
@@ -963,6 +1116,108 @@ fn read_legacy_key_or_create_persisting(
     Ok((key, fresh))
 }
 
+/// Read a 32-byte key from a legacy single-key item (no generation). `Ok(None)`
+/// if absent.
+fn read_legacy_slot(legacy: &keyring::Entry) -> Result<Option<Zeroizing<[u8; 32]>>, String> {
+    match legacy.get_secret() {
+        Ok(bytes) => {
+            let bytes = Zeroizing::new(bytes);
+            Ok(Some(blob_to_seed(&bytes)?))
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("legacy keychain item read failed: {e}")),
+    }
+}
+
+/// Read an app-local key **slot** from the keychain vault, folding in (and
+/// deleting, after a verified read-back) a `legacy` single-key item if the vault
+/// lacks it. Returns `Ok(None)` when the key is in neither place.
+///
+/// Unlike [`vault_app_key_or_create`], this NEVER generates a key — it is a pure
+/// read for callers (owner-state) that manage their own creation. With no
+/// keychain vault item, reads the `legacy` item directly.
+pub fn vault_load_slot(
+    slot: VaultSlot,
+    legacy: &keyring::Entry,
+) -> Result<Option<Zeroizing<[u8; 32]>>, String> {
+    vault_load_slot_with_store(&KeychainStore::new()?, slot, legacy)
+}
+
+fn vault_load_slot_with_store(
+    store: &KeychainStore,
+    slot: VaultSlot,
+    legacy: &keyring::Entry,
+) -> Result<Option<Zeroizing<[u8; 32]>>, String> {
+    let Some(mut vault) = store.load_vault()? else {
+        return read_legacy_slot(legacy);
+    };
+    if let Some(k) = vault.slot_key(slot) {
+        return Ok(Some(Zeroizing::new(k)));
+    }
+    let Some(key) = read_legacy_slot(legacy)? else {
+        return Ok(None);
+    };
+    vault.set_slot_key(slot, Some(*key));
+    store.save_vault(&vault)?;
+    let back = store
+        .load_vault()?
+        .ok_or_else(|| "secret vault disappeared immediately after write".to_string())?;
+    if back.slot_key(slot) != Some(*key) {
+        return Err("secret-vault read-back mismatch after fold; legacy item retained".to_string());
+    }
+    if let Err(e) = legacy.delete_credential() {
+        if !matches!(e, keyring::Error::NoEntry) {
+            tracing::warn!("could not delete migrated legacy keychain item: {e}");
+        }
+    }
+    Ok(Some(key))
+}
+
+/// Write an app-local key into the keychain vault (read-modify-write, preserving
+/// other slots). Returns `Ok(false)` when there is no keychain vault item to
+/// write into, so the caller can use its own fallback store.
+pub fn vault_save_slot(slot: VaultSlot, key: &[u8; 32]) -> Result<bool, String> {
+    vault_save_slot_with_store(&KeychainStore::new()?, slot, key)
+}
+
+fn vault_save_slot_with_store(
+    store: &KeychainStore,
+    slot: VaultSlot,
+    key: &[u8; 32],
+) -> Result<bool, String> {
+    let Some(mut vault) = store.load_vault()? else {
+        return Ok(false);
+    };
+    vault.set_slot_key(slot, Some(*key));
+    store.save_vault(&vault)?;
+    Ok(true)
+}
+
+/// Clear an app-local key slot in the keychain vault (if a vault item exists) and
+/// best-effort delete any `legacy` single-key item. Idempotent.
+pub fn vault_clear_slot(slot: VaultSlot, legacy: &keyring::Entry) -> Result<(), String> {
+    vault_clear_slot_with_store(&KeychainStore::new()?, slot, legacy)
+}
+
+fn vault_clear_slot_with_store(
+    store: &KeychainStore,
+    slot: VaultSlot,
+    legacy: &keyring::Entry,
+) -> Result<(), String> {
+    if let Some(mut vault) = store.load_vault()? {
+        if vault.slot_key(slot).is_some() {
+            vault.set_slot_key(slot, None);
+            store.save_vault(&vault)?;
+        }
+    }
+    if let Err(e) = legacy.delete_credential() {
+        if !matches!(e, keyring::Error::NoEntry) {
+            return Err(format!("legacy keychain item delete failed: {e}"));
+        }
+    }
+    Ok(())
+}
+
 // ── KeyStore trait ──────────────────────────────────────────────────────
 
 /// Common interface for identity storage backends.
@@ -982,14 +1237,27 @@ pub(crate) trait KeyStore {
         Ok(self.load_vault()?.map(|v| Zeroizing::new(v.seed)))
     }
 
-    /// Save the master seed as a fresh **seed-only** vault.
+    /// Save the master seed, **preserving any existing app-local keys**.
     ///
-    /// Used by identity establishment (fresh-generate / restore): any prior
-    /// app-local keys belong to the *previous* identity and must not carry over —
-    /// they regenerate lazily for the new identity. Accessors that must preserve
-    /// app-local keys use [`KeyStore::save_vault`] (read-modify-write).
+    /// Read-modify-write: only the `seed` field is replaced. A node-seed write
+    /// (fresh-generate / restore) must NOT wipe the device's iroh / device /
+    /// owner-master keys — matching the pre-consolidation behaviour where those
+    /// lived in separate keychain items untouched by a seed write (so a restore
+    /// preserves the EndpointId and owner backup eligibility). On a fresh install
+    /// (no existing vault) this creates a seed-only vault.
     fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
-        self.save_vault(&SecretVault::from_seed(*seed))
+        // RMW-preserve app-local keys when the existing vault is readable; if it
+        // isn't — a fresh install (None), or, during restore, an enc-file under a
+        // different passphrase (Err) — write a seed-only vault. (Passphrase
+        // rotation re-encrypts the whole vault via `rotate_passphrase`, so it
+        // never relies on this read-with-the-new-passphrase path.)
+        let mut vault = match self.load_vault() {
+            Ok(Some(v)) => v,
+            Ok(None) | Err(_) => SecretVault::from_seed(*seed),
+        };
+        vault.version = VAULT_VERSION;
+        vault.seed = *seed;
+        self.save_vault(&vault)
     }
 }
 
@@ -1658,15 +1926,21 @@ pub(crate) fn rotate_passphrase(
     old: &EncryptedFileStore,
     new_passphrase: SecretString,
 ) -> Result<(), String> {
-    let seed = old.load()?.ok_or_else(|| {
+    // ZEB-363: rotate the WHOLE vault (preserving app-local keys), not just the
+    // seed. The new store has a different passphrase, so a seed-level RMW save
+    // would try to read the old-passphrase file with the new passphrase and fail
+    // — load the full vault with the old passphrase and re-encrypt it under the
+    // new one.
+    let vault = old.load_vault()?.ok_or_else(|| {
         format!(
             "no encrypted identity to rotate at {}",
             old.path().display()
         )
     })?;
+    let seed = Zeroizing::new(vault.seed);
 
     let new_store = EncryptedFileStore::new(old.path().to_path_buf(), new_passphrase);
-    new_store.save(&seed)?;
+    new_store.save_vault(&vault)?;
     // After save() returns Ok, the file at `old.path()` has been atomically
     // replaced and is now decryptable ONLY by the new passphrase. A
     // verify-after-write failure here is a transient I/O / corruption signal,
@@ -2155,7 +2429,11 @@ mod tests {
             assert_eq!(raw[4], 0x02, "must be the v0x02 vault envelope");
             // header(13) + salt(16) + nonce(24) + tag(16) = 69; a real vault
             // plaintext pushes it strictly larger.
-            assert!(raw.len() > 69, "envelope must carry a vault plaintext, got {}", raw.len());
+            assert!(
+                raw.len() > 69,
+                "envelope must carry a vault plaintext, got {}",
+                raw.len()
+            );
         }
 
         #[test]
@@ -2722,7 +3000,11 @@ mod tests {
             "the freshly-written encrypted file must NOT be deleted"
         );
         let raw = std::fs::read(&enc_path).unwrap();
-        assert_eq!(&raw[0..4], b"HRMI", "the encrypted file must hold an HRMI envelope");
+        assert_eq!(
+            &raw[0..4],
+            b"HRMI",
+            "the encrypted file must hold an HRMI envelope"
+        );
         assert_eq!(
             raw[4], 0x02,
             "the encrypted file must hold the new v0x02 vault envelope"

@@ -339,7 +339,7 @@ mod path_token_cache_tests {
 // The `.cbor` file's presence is the minted-marker — its absence means the
 // natural un-minted state.
 
-use crate::identity::{write_atomic_0600, EncryptedFileStore, KeyStore, KeychainStore};
+use crate::identity::{write_atomic_0600, EncryptedFileStore, KeyStore, KeychainStore, VaultSlot};
 use ed25519_dalek::SigningKey;
 use harmony_owner::cbor;
 use harmony_owner::state::OwnerState;
@@ -386,13 +386,16 @@ pub fn load_owner_state(
 
     // Inconsistent-state checks: state present implies signing key MUST be
     // findable; master seed MAY be absent (degraded but functional).
-    let signing_key_bytes =
-        load_secret(&keychain, KEYCHAIN_DEVICE_SK, identity_dir, "device_sk.enc")?.ok_or_else(
-            || {
-                "owner_state.cbor present but device_signing_key missing — inconsistent state"
-                    .to_string()
-            },
-        )?;
+    let signing_key_bytes = load_secret(
+        &keychain,
+        VaultSlot::Device,
+        KEYCHAIN_DEVICE_SK,
+        identity_dir,
+        "device_sk.enc",
+    )?
+    .ok_or_else(|| {
+        "owner_state.cbor present but device_signing_key missing — inconsistent state".to_string()
+    })?;
 
     // SigningKey::from_bytes copies; the Zeroizing wrapper around
     // signing_key_bytes ensures the source heap buffer wipes on drop.
@@ -400,6 +403,7 @@ pub fn load_owner_state(
 
     let master_seed = load_secret(
         &keychain,
+        VaultSlot::OwnerMasterSeed,
         KEYCHAIN_MASTER_SEED,
         identity_dir,
         "master_seed.enc",
@@ -428,6 +432,7 @@ pub fn save_owner_state_atomic(
 ) -> Result<(), String> {
     save_secret(
         &keychain,
+        VaultSlot::Device,
         KEYCHAIN_DEVICE_SK,
         identity_dir,
         "device_sk.enc",
@@ -436,6 +441,7 @@ pub fn save_owner_state_atomic(
     if let Some(seed) = master_seed {
         save_secret(
             &keychain,
+            VaultSlot::OwnerMasterSeed,
             KEYCHAIN_MASTER_SEED,
             identity_dir,
             "master_seed.enc",
@@ -447,6 +453,7 @@ pub fn save_owner_state_atomic(
         // pick it up and `canBackUp` would lie about backup eligibility.
         clear_secret(
             &keychain,
+            VaultSlot::OwnerMasterSeed,
             KEYCHAIN_MASTER_SEED,
             identity_dir,
             "master_seed.enc",
@@ -542,6 +549,7 @@ pub fn refresh_self_liveness(state: &mut OwnerState, device_sk: &SigningKey, now
 /// raw `keyring::Entry::new(...)`. Future cleanup will properly delegate.
 fn load_secret(
     keychain: &Option<KeychainStore>,
+    slot: VaultSlot,
     keychain_name: &str,
     identity_dir: &Path,
     fallback_filename: &str,
@@ -551,28 +559,19 @@ fn load_secret(
     // un-minted state when no encrypted-file fallback is configured.
     let mut keychain_err: Option<String> = None;
     if keychain.is_some() {
-        let entry = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
+        // ZEB-363: this owner secret is consolidated into the single
+        // `harmony`/`identity` keychain vault slot. `vault_load_slot` reads the
+        // slot, folding in (and deleting after a verified read-back) the legacy
+        // `harmony.owner`/<name> item if the vault doesn't have it yet.
+        let legacy = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
             .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
-        match entry.get_secret() {
-            Ok(raw_bytes) => {
-                // Wrap the heap Vec immediately so it zeroes on drop, matching
-                // the discipline applied to keychain reads in `crate::identity`.
-                let bytes = Zeroizing::new(raw_bytes);
-                if bytes.len() != 32 {
-                    return Err(format!(
-                        "keychain entry {KEYCHAIN_OWNER_SERVICE}/{keychain_name} length is {} bytes, expected 32",
-                        bytes.len()
-                    ));
-                }
-                let mut arr = Zeroizing::new([0u8; 32]);
-                arr.copy_from_slice(&bytes);
-                return Ok(Some(arr));
-            }
-            Err(keyring::Error::NoEntry) => {}
+        match crate::identity::vault_load_slot(slot, &legacy) {
+            Ok(Some(key)) => return Ok(Some(key)),
+            Ok(None) => {}
             Err(e) => {
-                // Don't hard-fail: a flaky/locked keychain shouldn't break
-                // load when the encrypted-file fallback is configured.
-                let msg = format!("keychain read {KEYCHAIN_OWNER_SERVICE}/{keychain_name}: {e}");
+                // Don't hard-fail: a flaky/locked keychain shouldn't break load
+                // when the encrypted-file fallback is configured.
+                let msg = format!("vault slot read {KEYCHAIN_OWNER_SERVICE}/{keychain_name}: {e}");
                 tracing::warn!("{msg}; falling through to encrypted-file fallback");
                 keychain_err = Some(msg);
             }
@@ -606,6 +605,7 @@ fn load_secret(
 // raw `keyring::Entry::new(...)`. Future cleanup will properly delegate.
 fn save_secret(
     keychain: &Option<KeychainStore>,
+    slot: VaultSlot,
     keychain_name: &str,
     identity_dir: &Path,
     fallback_filename: &str,
@@ -617,14 +617,16 @@ fn save_secret(
     // not set" message — otherwise mint reports the wrong remediation.
     let mut keychain_err: Option<String> = None;
     if keychain.is_some() {
-        let entry = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
-            .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
-        match entry.set_secret(bytes) {
-            Ok(()) => return Ok(()),
+        // ZEB-363: write into the consolidated harmony/identity vault slot
+        // (read-modify-write, preserving the other slots). Ok(false) => there is
+        // no keychain vault item (keychain-less seed) — fall through to the file.
+        match crate::identity::vault_save_slot(slot, bytes) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
             Err(e) => {
                 // Don't hard-fail: a flaky/locked keychain shouldn't block
                 // mint when the encrypted-file fallback is configured.
-                let msg = format!("keychain write {KEYCHAIN_OWNER_SERVICE}/{keychain_name}: {e}");
+                let msg = format!("vault slot write {KEYCHAIN_OWNER_SERVICE}/{keychain_name}: {e}");
                 tracing::warn!("{msg}; falling through to encrypted-file fallback");
                 keychain_err = Some(msg);
             }
@@ -670,21 +672,22 @@ fn save_secret(
 /// keychain error so callers know the keychain side wasn't fully cleared.
 fn clear_secret(
     keychain: &Option<KeychainStore>,
+    slot: VaultSlot,
     keychain_name: &str,
     identity_dir: &Path,
     fallback_filename: &str,
 ) -> Result<(), String> {
     let mut keychain_err: Option<String> = None;
     if keychain.is_some() {
-        let entry = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
+        // ZEB-363: clear the consolidated vault slot AND best-effort delete the
+        // legacy `harmony.owner` item, so a stale legacy entry can't resurrect
+        // the master seed on a later no-keychain load.
+        let legacy = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
             .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {}
-            Err(e) => {
-                keychain_err = Some(format!(
-                    "keychain delete {KEYCHAIN_OWNER_SERVICE}/{keychain_name}: {e}"
-                ));
-            }
+        if let Err(e) = crate::identity::vault_clear_slot(slot, &legacy) {
+            keychain_err = Some(format!(
+                "vault slot clear {KEYCHAIN_OWNER_SERVICE}/{keychain_name}: {e}"
+            ));
         }
     }
     let path = identity_dir.join(fallback_filename);
