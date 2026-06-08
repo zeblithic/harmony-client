@@ -243,7 +243,7 @@ community updates in place. So the boot seed is safe against ordering.
 
 ### Data flow (boot)
 
-```
+```text
 start_node  ──► owner_state_persist::load_crdt ──► crdt_state (in mem)
                                                        │
 App.svelte boot: navService.connectAdapter (listener live)
@@ -292,8 +292,9 @@ which is impractical to unit-test without a full Tauri `mock_app` + NodeState):*
   launch, per the keychain-passphrase gotcha.)
 
 **Full suite:** `npx tsc --noEmit` + `npx vitest run` green; `cargo nextest run
---locked --all-targets --features test-fixtures` + `cargo clippy -D warnings` +
-`cargo fmt --check` green.
+--locked --all-targets --features test-fixtures` + `cargo clippy --locked
+--all-targets --features test-fixtures --no-deps -- -D warnings` + `cargo fmt
+--all -- --check` green.
 
 ---
 

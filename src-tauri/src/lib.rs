@@ -16980,11 +16980,15 @@ async fn create_community(
     // the ~250ms debounce or graceful shutdown. Fence it to disk now so a
     // non-graceful exit can't lose this membership. flush_now also republishes
     // the state-root to the user's other devices (desirable for a mint).
-    // Non-fatal: the mint already committed in-memory; a flush hiccup falls
-    // back to the debounce path. `None` only pre-start_node, where mint can't run.
+    // Non-fatal: the mint already committed in-memory and the per-community dir
+    // is written, so failing the create here would desync the UI from a
+    // community that already exists. On flush error we re-arm the debounce
+    // (notify_dirty) so the persist is retried, rather than left until graceful
+    // shutdown. `None` only pre-start_node, where mint can't run.
     if let Some(engine) = sync_engine.as_ref() {
         if let Err(e) = engine.flush_now().await {
             tracing::warn!(error = %e, "create_community: owner-state flush_now failed");
+            engine.notify_dirty();
         }
     }
 
@@ -19061,6 +19065,7 @@ async fn redeem_invite(
     if let Some(engine) = sync_engine.as_ref() {
         if let Err(e) = engine.flush_now().await {
             tracing::warn!(error = %e, "redeem_invite: owner-state flush_now failed");
+            engine.notify_dirty();
         }
     }
 
@@ -19305,6 +19310,7 @@ async fn join_open_community(
     if let Some(engine) = sync_engine.as_ref() {
         if let Err(e) = engine.flush_now().await {
             tracing::warn!(error = %e, "join_open_community: owner-state flush_now failed");
+            engine.notify_dirty();
         }
     }
 
