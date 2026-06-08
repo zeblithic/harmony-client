@@ -1162,11 +1162,34 @@ pub fn vault_app_key_or_create(
     vault_app_key_or_create_with_store(&store, slot, legacy)
 }
 
+/// Serializes read-modify-write sequences against the single consolidated
+/// keychain vault item.
+///
+/// Every vault-mutating helper does `load_vault` → modify → `save_vault`. Without
+/// a guard, two concurrent writers updating different slots (e.g. iroh and owner
+/// folding at first startup) could each save a stale snapshot, so the last commit
+/// wins and the other slot is silently dropped. Startup is sequential today, but
+/// this enforces the invariant by construction rather than relying on call
+/// ordering. (CodeAnt / Greptile.)
+///
+/// **Process-local only.** Cross-process races (two app instances sharing one
+/// keychain) remain — `keyring` exposes no compare-and-swap / add-if-absent
+/// primitive, the same accepted limitation documented for the
+/// `write_seed_to_disk` TOCTOU. The five helpers below never call one another, so
+/// this non-reentrant lock cannot deadlock.
+fn vault_rmw_guard() -> std::sync::MutexGuard<'static, ()> {
+    static VAULT_RMW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    VAULT_RMW_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn vault_app_key_or_create_with_store(
     store: &KeychainStore,
     slot: VaultSlot,
     legacy: &keyring::Entry,
 ) -> Result<(Zeroizing<[u8; 32]>, bool), String> {
+    let _vault_guard = vault_rmw_guard();
     let mut vault = match store.load_vault() {
         Ok(Some(v)) => v,
         // No keychain vault item — keep app-local keys in their own legacy item.
@@ -1280,6 +1303,7 @@ fn vault_load_slot_with_store(
     slot: VaultSlot,
     legacy: &keyring::Entry,
 ) -> Result<Option<Zeroizing<[u8; 32]>>, String> {
+    let _vault_guard = vault_rmw_guard();
     let mut vault = match store.load_vault() {
         Ok(Some(v)) => v,
         Ok(None) => return read_legacy_slot(legacy),
@@ -1328,11 +1352,19 @@ fn vault_save_slot_with_store(
     slot: VaultSlot,
     key: &[u8; 32],
 ) -> Result<bool, String> {
+    let _vault_guard = vault_rmw_guard();
     let Some(mut vault) = store.load_vault()? else {
         return Ok(false);
     };
     vault.set_slot_key(slot, Some(*key));
     store.save_vault(&vault)?;
+    // Unlike the fold paths in `vault_app_key_or_create_with_store` /
+    // `vault_load_slot_with_store`, this site intentionally omits a read-back
+    // assertion: it performs no subsequent destructive action (no legacy item is
+    // deleted on the strength of the write), so there is nothing to confirm
+    // before. The read-back in the other two guards a legacy delete, not the
+    // write itself. Do NOT copy this without re-adding the read-back if a new
+    // call site deletes another copy after this returns.
     Ok(true)
 }
 
@@ -1347,6 +1379,7 @@ fn vault_clear_slot_with_store(
     slot: VaultSlot,
     legacy: &keyring::Entry,
 ) -> Result<(), String> {
+    let _vault_guard = vault_rmw_guard();
     match store.load_vault() {
         Ok(Some(mut vault)) => {
             if vault.slot_key(slot).is_some() {
@@ -1809,6 +1842,7 @@ fn load_or_generate_with_stores_post_probe(
 /// fall back to deleting the stale entry only when it isn't — at which point the
 /// app-local keys regenerate on next boot, per the seed-only recovery model.
 fn reconcile_keychain_after_enc_restore(kc: &KeychainStore, seed: &[u8; BLOB_LEN]) {
+    let _vault_guard = vault_rmw_guard();
     match kc.load_vault() {
         Ok(Some(mut vault)) => {
             vault.version = VAULT_VERSION;
