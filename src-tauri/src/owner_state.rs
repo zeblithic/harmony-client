@@ -917,6 +917,18 @@ mod persistence_tests {
     }
 
     #[test]
+    fn bumped_mint_owner_stamps_initial_liveness() {
+        // ZEB-342: post-bump, mint_owner publishes device #1 liveness WITHOUT
+        // any client-side refresh. Tripwire against a harmony dep downgrade.
+        let result = mint_owner(1_700_000_777).unwrap();
+        assert_eq!(
+            result.state.liveness.len(),
+            1,
+            "bumped mint_owner must stamp device #1 liveness"
+        );
+    }
+
+    #[test]
     #[serial]
     fn load_returns_none_when_no_cbor_present() {
         // No HARMONY_PASSPHRASE needed: this test exits before any secret load.
