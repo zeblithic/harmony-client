@@ -246,7 +246,11 @@
     display: grid;
     grid-template-columns: var(--nav-width) 1fr 1fr;
     grid-template-areas: "nav text media";
-    height: 100vh;
+    /* ZEB-406: fill the .app-shell column (banner reserves its own height above)
+       instead of pinning to 100vh, which used to force the layout under a
+       fixed-overlay banner. */
+    flex: 1 1 auto;
+    min-height: 0;
     overflow: hidden;
     position: relative;
   }

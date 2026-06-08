@@ -2476,6 +2476,10 @@
 
 <BackupStalenessWarning onExportRequested={handleExportRequested} />
 
+<div class="app-shell">
+{#if ownerIdentityState === 'present'}
+  <BackupReminderBanner />
+{/if}
 <Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null} bind:mediaPanelOpen bind:mediaPanelWidth>
   {#snippet nav()}
     <div class="nav-with-dm-create">
@@ -2874,6 +2878,7 @@
     <NetworkHealthView />
   {/snippet}
 </Layout>
+</div>
 
 {#if popoverProfile && profileBroadcastService}
   <ProfilePopover
@@ -3203,14 +3208,6 @@
   </div>
 {/if}
 
-<!-- ZEB-338: backup-reminder banner. Self-gates on backup-skipped state; only
-     shown once an owner identity is loaded so it never stacks behind the mint
-     gate or the startup-error overlay. -->
-{#if ownerIdentityState === 'present'}
-  <div class="backup-banner-overlay">
-    <BackupReminderBanner />
-  </div>
-{/if}
 
 <!-- ZEB-331: fixed-position help button overlay. Position top-right. -->
 <div class="help-overlay">
@@ -3354,12 +3351,13 @@
 
   /* ZEB-338: backup-reminder banner overlay. Below modal (1000) + help
      overlay; above app chrome. */
-  .backup-banner-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    z-index: 40;
+  /* ZEB-406: app-shell hosts the optional backup banner in normal flow above the
+     main layout, so the banner reserves height instead of overlaying + intercepting
+     the top toolbar. */
+  .app-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
   }
 
   /* ZEB-338 / PR #169: startup-error overlay (start_node failed). */
