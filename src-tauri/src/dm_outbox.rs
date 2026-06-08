@@ -458,8 +458,8 @@ impl DmOutbox {
         // mismatched synthetic material call `new_synthetic`, which bypasses
         // these checks by design.
         assert!(
-            enrollment_cert.verify().is_ok(),
-            "DmOutbox: enrollment_cert must verify"
+            enrollment_cert.verify(0).is_ok(),
+            "DmOutbox: enrollment_cert must verify (structural; expiry-agnostic by design — ZEB-378)"
         );
         assert_eq!(
             enrollment_cert.owner_id, self_owner.0,
@@ -2543,7 +2543,7 @@ mod tests {
         // 1. EnrollmentCert verifies.
         outbox
             .enrollment_cert
-            .verify()
+            .verify(0)
             .expect("enrollment_cert must verify");
 
         // 2. cert.device_pubkeys.classical.ed25519_verify matches community_signing_key.

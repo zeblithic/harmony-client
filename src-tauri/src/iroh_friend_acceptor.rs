@@ -301,6 +301,10 @@ pub enum FriendHandshakeError {
     /// The handshake signature did not verify against the enrolled device key.
     #[error("handshake signature invalid")]
     SignatureInvalid,
+    /// `cert.verify()` failed specifically because the cert's `expires_at` is in
+    /// the past (ZEB-378). Distinct from `EnrollmentCertInvalid` for telemetry.
+    #[error("enrollment cert expired")]
+    EnrollmentCertExpired,
     /// Applying the resulting `FriendEntry` to the CRDT was rejected (e.g. a
     /// stale HLC or a key↔master-key invariant failure).
     #[error("friend-graph apply rejected: {0}")]
@@ -398,9 +402,14 @@ fn decode_strict<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, Friend
 pub fn verify_enrolled_device(
     cert: &EnrollmentCert,
     claimed_owner: OwnerAddr,
+    now_secs: u64,
 ) -> Result<[u8; 32], FriendHandshakeError> {
-    cert.verify()
-        .map_err(|_| FriendHandshakeError::EnrollmentCertInvalid)?;
+    cert.verify(now_secs).map_err(|e| match e {
+        harmony_owner::OwnerError::EnrollmentCertExpired { .. } => {
+            FriendHandshakeError::EnrollmentCertExpired
+        }
+        _ => FriendHandshakeError::EnrollmentCertInvalid,
+    })?;
     // Reject non-Master issuers: cert.verify() only structurally-checks Quorum
     // certs (it cannot verify the quorum signatures without an OwnerState walk-
     // back), so accepting one here would admit unverified signatures. Mirrors
@@ -537,12 +546,19 @@ pub const DEFAULT_FRIEND_IO_DEADLINE_MS: u64 = 30_000;
 /// Wall-clock now in epoch-milliseconds — the same one-syscall pattern used
 /// throughout `lib.rs` (`generate_invite`/HLC reservation) and `next_hlc`.
 /// Saturates to `0` if the clock is before the epoch.
-fn wall_now_ms() -> u64 {
+pub(crate) fn wall_now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Wall-clock now in epoch-SECONDS. `EnrollmentCert` timestamps (`issued_at` /
+/// `expires_at`) are Unix seconds, so cert-expiry checks must pass seconds — NOT
+/// the millisecond [`wall_now_ms`]. (ZEB-378)
+pub(crate) fn wall_now_secs() -> u64 {
+    wall_now_ms() / 1000
 }
 
 /// Tunable timeouts for the friend handshake handler. Tests construct this
@@ -572,8 +588,11 @@ impl Default for FriendAcceptorConfig {
 /// preimage against that key. `process_friend_request` re-runs the same two
 /// checks (cheap; keeps it self-contained), so this is belt-and-suspenders on
 /// the accept paths and the sole gate on the Pending path.
-pub fn authenticate_friend_request(req: &FriendLinkRequest) -> Result<(), FriendHandshakeError> {
-    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr)?;
+pub fn authenticate_friend_request(
+    req: &FriendLinkRequest,
+    now_secs: u64,
+) -> Result<(), FriendHandshakeError> {
+    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)?;
     let vk = VerifyingKey::from_bytes(&device_key)
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
     let preimage =
@@ -608,9 +627,10 @@ pub fn process_friend_request(
     self_enrollment: &EnrollmentCert,
     self_device2: &ed25519_dalek::SigningKey,
     keytree: &crate::owner_state_crypto::KeyTree,
+    now_secs: u64,
 ) -> Result<FriendLinkAccepted, FriendHandshakeError> {
     // 1. Authenticate the requester's cert → enrolled device-#2 key.
-    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr)?;
+    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)?;
 
     // 2. Verify the request signature over the canonical preimage (now binds the
     // requester's ephemeral X25519 key + optional token).
@@ -1025,7 +1045,13 @@ where
         // here — the consent flags below only gate whether to PROMPT, never
         // whether to authenticate. A request that fails auth is rejected before
         // any consent branch (no friend written, no record kept, no accept sent).
-        authenticate_friend_request(&req).map_err(FriendAcceptError::Handshake)?;
+        //
+        // ZEB-378: sample the expiry clock ONCE per inbound handshake and thread it
+        // through both the pre-consent auth and the post-token-gate accept. Using one
+        // instant means a cert can't pass auth here yet fail the later accept (which
+        // would burn the one-shot token), and both checks agree on a single time.
+        let now_secs = wall_now_secs();
+        authenticate_friend_request(&req, now_secs).map_err(FriendAcceptError::Handshake)?;
 
         // Compute `known` under the CRDT lock: is the requester already an
         // Active|Pending friend? Snapshot the boolean and DROP the guard before
@@ -1074,6 +1100,7 @@ where
                         &self.self_enrollment,
                         &self.device2_signing_key,
                         &self.keytree,
+                        now_secs,
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1102,6 +1129,7 @@ where
                         &self.self_enrollment,
                         &self.device2_signing_key,
                         &self.keytree,
+                        now_secs,
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1493,7 +1521,7 @@ mod tests {
     #[test]
     fn verify_enrolled_device_accepts_valid_cert() {
         let owner = mint_test_owner(0x31);
-        let device_key = verify_enrolled_device(&owner.cert, owner.owner).expect("valid");
+        let device_key = verify_enrolled_device(&owner.cert, owner.owner, 0).expect("valid");
         assert_eq!(
             device_key,
             owner.cert.device_pubkeys.classical.ed25519_verify
@@ -1505,7 +1533,7 @@ mod tests {
         let owner = mint_test_owner(0x32);
         let other = mint_test_owner(0x33);
         // Cert is owner's, but we claim it belongs to `other` → owner mismatch.
-        match verify_enrolled_device(&owner.cert, other.owner) {
+        match verify_enrolled_device(&owner.cert, other.owner, 0) {
             Err(FriendHandshakeError::EnrollmentOwnerMismatch) => {}
             other => panic!("expected EnrollmentOwnerMismatch, got {other:?}"),
         }
@@ -1518,7 +1546,7 @@ mod tests {
         // Structurally tamper: flip issued_at so the master signature no longer
         // covers the payload → cert.verify() fails.
         cert.issued_at ^= 0xFFFF;
-        match verify_enrolled_device(&cert, owner.owner) {
+        match verify_enrolled_device(&cert, owner.owner, 0) {
             Err(FriendHandshakeError::EnrollmentCertInvalid) => {}
             other => panic!("expected EnrollmentCertInvalid, got {other:?}"),
         }
@@ -1535,10 +1563,67 @@ mod tests {
             signers: vec![[1u8; 16], [2u8; 16]],
             signatures: vec![vec![0u8; 64], vec![0u8; 64]],
         };
-        match verify_enrolled_device(&cert, owner.owner) {
+        match verify_enrolled_device(&cert, owner.owner, 0) {
             Err(FriendHandshakeError::EnrollmentCertInvalid) => {}
             other => panic!("expected EnrollmentCertInvalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn verify_enrolled_device_rejects_expired_cert() {
+        use harmony_owner::certs::EnrollmentCert;
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+
+        // Build a cert with expires_at = Some(2_000), issued_at = 1_000.
+        let seed = 0x39u8;
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let master_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: master_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let owner_id = master_bundle.identity_hash();
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0xFF; 32]);
+        let device_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: device_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device_id = device_bundle.identity_hash();
+        let cert = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000,
+            Some(2_000),
+        )
+        .expect("sign_master");
+        let owner = crate::owner_state_types::OwnerAddr(owner_id);
+
+        // Expired: now_ms = 2_001 > expires_at = 2_000 → EnrollmentCertExpired.
+        assert!(
+            matches!(
+                verify_enrolled_device(&cert, owner, 2_001),
+                Err(FriendHandshakeError::EnrollmentCertExpired)
+            ),
+            "a cert past its expires_at must be rejected with EnrollmentCertExpired"
+        );
+        // At-boundary (now_ms = 2_000, expires_at = 2_000): verify uses >
+        // so 2_000 is NOT expired — must succeed.
+        assert!(
+            verify_enrolled_device(&cert, owner, 2_000).is_ok(),
+            "a cert at exactly expires_at is NOT expired (> not >=)"
+        );
+        // Before expiry (now_ms = 1_500): must succeed.
+        assert!(
+            verify_enrolled_device(&cert, owner, 1_500).is_ok(),
+            "a cert before expires_at must be accepted"
+        );
     }
 
     #[test]
@@ -1549,7 +1634,8 @@ mod tests {
 
         // The enrolled device key resolved from the cert must verify the sig
         // over the request preimage.
-        let resolved = verify_enrolled_device(&req.enrollment, req.from_addr).expect("valid cert");
+        let resolved =
+            verify_enrolled_device(&req.enrollment, req.from_addr, 0).expect("valid cert");
         assert_eq!(resolved, device_key);
         let vk = VerifyingKey::from_bytes(&resolved).expect("vk");
         let preimage =
@@ -1619,6 +1705,7 @@ mod tests {
             &me.cert,
             &me.device_key,
             &kt,
+            0,
         )
         .expect("valid request processed");
 
@@ -1642,7 +1729,7 @@ mod tests {
         // over the accept preimage (same token_sig, accept domain tag).
         assert_eq!(accepted.from_addr, me.owner);
         assert_eq!(accepted.display.as_deref(), Some("me"));
-        let self_device_key = verify_enrolled_device(&accepted.enrollment, accepted.from_addr)
+        let self_device_key = verify_enrolled_device(&accepted.enrollment, accepted.from_addr, 0)
             .expect("self cert verifies");
         let vk = VerifyingKey::from_bytes(&self_device_key).expect("vk");
         // The accept binds the accepter's own (randomly-generated) ephemeral key,
@@ -1687,6 +1774,7 @@ mod tests {
             &me.cert,
             &me.device_key,
             &kt,
+            0,
         )
         .expect("processed");
 
@@ -1726,6 +1814,7 @@ mod tests {
             &me.cert,
             &me.device_key,
             &kt,
+            0,
         )
         .expect_err("bad sig rejected");
         assert!(matches!(err, FriendHandshakeError::SignatureInvalid));
@@ -1768,6 +1857,7 @@ mod tests {
             &me.cert,
             &me.device_key,
             &kt,
+            0,
         )
         .expect_err("owner-mismatched cert rejected");
         assert!(matches!(err, FriendHandshakeError::EnrollmentOwnerMismatch));
@@ -2113,13 +2203,13 @@ mod tests {
     #[test]
     fn authenticate_friend_request_accepts_valid_and_rejects_tampered() {
         let req = signed_request_no_token(0x80);
-        authenticate_friend_request(&req).expect("a valid no-token request authenticates");
+        authenticate_friend_request(&req, 0).expect("a valid no-token request authenticates");
 
         let mut bad = req.clone();
         bad.sig[0] ^= 0xFF;
         assert!(
             matches!(
-                authenticate_friend_request(&bad),
+                authenticate_friend_request(&bad, 0),
                 Err(FriendHandshakeError::SignatureInvalid)
             ),
             "a tampered signature must fail authentication"
@@ -2144,6 +2234,7 @@ mod tests {
             &me.cert,
             &me.device_key,
             &kt,
+            0,
         )
         .expect("no-token request processed");
         let entry = state
