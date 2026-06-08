@@ -94,6 +94,24 @@ describe('CommunityService', () => {
     expect(service.getKind('eeff0011')).toBe('invite-only');
   });
 
+  // ZEB-393 Bug B: boot rehydration of the nav sidebar.
+  it('listOwnerCommunities fetches the IPC and records each community kind', async () => {
+    await service.connectAdapter(adapter);
+    const rows = [
+      { spaceId: 'aa', name: 'Open Town', isInviteOnly: false, pending: false },
+      { spaceId: 'bb', name: 'Secret Club', isInviteOnly: true, pending: true },
+    ];
+    (adapter.invoke as any).mockResolvedValue(rows);
+
+    const got = await service.listOwnerCommunities();
+
+    expect(adapter.invoke).toHaveBeenCalledWith('list_owner_communities', {});
+    expect(got).toEqual(rows);
+    // getKind() must resolve for rehydrated communities, not return 'unknown'.
+    expect(service.getKind('aa')).toBe('open');
+    expect(service.getKind('bb')).toBe('invite-only');
+  });
+
   // ZEB-254: pending flag on RedeemInviteResultDto
   it('redeemInvite returns pending: true when admin was offline (fast-path timeout)', async () => {
     await service.connectAdapter(adapter);
