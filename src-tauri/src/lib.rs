@@ -3265,10 +3265,10 @@ pub(crate) async fn start_node_inner(
                     let notes_replay_path =
                         identity_dir.join(crate::notes_persist::NOTES_REPLAY_FILENAME);
                     let notes_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::notes_persist::load(&notes_path).unwrap_or_default(),
+                        crate::notes_persist::load_doc_or_recover(&notes_path),
                     ));
                     let notes_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::notes_persist::load_replay(&notes_replay_path).unwrap_or_default(),
+                        crate::notes_persist::load_replay_or_recover(&notes_replay_path),
                     ));
                     let (notes_out_tx, notes_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                     let (notes_in_tx, notes_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);

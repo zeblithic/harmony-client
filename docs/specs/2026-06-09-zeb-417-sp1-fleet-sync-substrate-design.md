@@ -53,6 +53,7 @@ Generic over a snapshot type `S`, instantiated once per named dataset. Everythin
 - the **CRITICAL ordering invariants** (from mint_sync's CRITICAL 1/3 + MAJOR 5): apply-before-tracker-advance, tracker-advance-before-persist, persist only post-mutation. Centralizing these is a correctness win — they stop being re-derived per subsystem.
 
 **Parameters (per dataset):**
+
 | Param | Owner-state | Notes |
 |---|---|---|
 | snapshot type `S` | `OwnerState` | `NotesDoc` |

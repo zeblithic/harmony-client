@@ -49,11 +49,13 @@ These were the spec's four "Open items deferred to the implementation plan." Res
 ## Conventions for every task
 
 - **Gates run from `src-tauri/`** unless noted. Per the relink-cost memory, per-task gates are `--lib`-scoped:
+
   ```bash
   cargo fmt --all -- --check
   cargo clippy --locked -p harmony-app --lib --features test-fixtures --no-deps -- -D warnings
   cargo nextest run --locked -p harmony-app --lib --features test-fixtures -E 'test(fleet_sync)+test(owner_state)+test(notes_)'
   ```
+
   Frontend gates run from repo root: `npx tsc --noEmit && npx vitest run`.
 - **Commit before running the long clippy/nextest gate** (memory: implementer time-budget discipline).
 - Reuse existing crypto/types verbatim — never rewrite `KeyTree`, `encrypt_entry`, `encrypt_root_publish`, `Hlc`, `ContentId`, `space_lookup_key`.
@@ -1289,11 +1291,13 @@ git commit -m "docs(zeb-417): document SP1<->SP2 seam; test list_online_devices"
 - [ ] **Step 1: Rust full sweep (`--all-targets`)**
 
 From `src-tauri/`:
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 cargo nextest run --locked --workspace --all-targets --features test-fixtures
 ```
+
 Expected: clean. Fix any integration-target breakage (e.g. a test file constructing the old `owner_state_sync` internals). Per memory: `--all-targets` is load-bearing — lib-only green can hide integration breakage.
 
 - [ ] **Step 2: MSRV check**

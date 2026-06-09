@@ -33,12 +33,12 @@ describe('NotesView — ZEB-417 IPC-backed self-notes', () => {
   });
 
   it('appends a note on Enter and renders it', async () => {
-    // First call (getEntries in $effect) returns empty; second (getEntries after
-    // append) returns the new entry.
+    // First call (notes_list in the $effect load) returns empty; the append
+    // upsert returns the new entry. The view mirrors notesService.entries via
+    // onChange (no post-append re-fetch), so no third notes_list is issued.
     vi.mocked(invoke)
       .mockResolvedValueOnce([]) // notes_list on $effect load
-      .mockResolvedValueOnce({ id: 'n1', text: 'new thought', timestamp: 5 }) // notes_upsert
-      .mockResolvedValueOnce([{ id: 'n1', text: 'new thought', timestamp: 5 }]); // notes_list after append
+      .mockResolvedValueOnce({ id: 'n1', text: 'new thought', timestamp: 5 }); // notes_upsert
     const svc = new NotesService();
     render(NotesView, { notesService: svc, ownerId: 'owner-1', displayName: 'Jake' });
     const box = screen.getByTestId('notes-compose');

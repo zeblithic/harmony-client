@@ -9,7 +9,7 @@ export async function migrateLocalNotes(
   if (!ownerId) return;
   const doneKey = `harmony-notes-migrated:${ownerId}`;
   if (localStorage.getItem(doneKey) === '1') return;
-  let legacy: Array<{ text?: unknown }> = [];
+  let legacy: Array<{ id?: unknown; text?: unknown }> = [];
   try {
     const raw = localStorage.getItem(`harmony-notes:${ownerId}`);
     const parsed = raw ? JSON.parse(raw) : [];
@@ -19,7 +19,10 @@ export async function migrateLocalNotes(
   }
   for (const e of legacy) {
     if (e && typeof e.text === 'string' && e.text.trim()) {
-      await invokeFn('notes_upsert', { id: undefined, text: e.text });
+      // Pass the legacy entry's stable id so a crash mid-import re-imports the
+      // SAME ids (LWW no-op) instead of minting fresh ULIDs and duplicating.
+      const id = typeof e.id === 'string' && e.id ? e.id : undefined;
+      await invokeFn('notes_upsert', { id, text: e.text });
     }
   }
   localStorage.setItem(doneKey, '1');

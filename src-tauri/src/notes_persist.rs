@@ -1,5 +1,6 @@
 //! On-disk persistence for NotesDoc and its replay tracker (ZEB-417 SP1).
-//! Atomic-rename + fsync via `tempfile`, mirroring `owner_state_persist`.
+//! Atomic-rename + file fsync + parent-dir fsync via
+//! `owner_state_persist::save_atomically`, mirroring `owner_state_persist`.
 //!
 //! Both files use a 1-byte schema-version prefix (plaintext CBOR) — identical
 //! format to `owner_state_persist`'s `ReplayFileV1`. `NotesDoc` is not
@@ -11,7 +12,7 @@ use crate::owner_state_types::Hlc;
 use ciborium::{from_reader, into_writer};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::path::Path;
 
 /// File name for the persisted NotesDoc. Lives at `<app_data_dir>/notes/notes.cbor`.
@@ -31,22 +32,17 @@ struct NotesReplayFileV1(BTreeMap<String, Hlc>);
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/// Atomic write with parent-directory fsync (crash-durable rename). Routes
+/// through `owner_state_persist::save_atomically`, which fsyncs both the
+/// tempfile and (on Unix) the parent directory entry — the hand-rolled
+/// version here did not fsync the directory, so the rename wasn't durable.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), SyncError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| SyncError::Persist(format!("create_dir_all {}: {e}", path.display())))?;
     }
-    let dir = path.parent().expect("atomic_write: path has no parent");
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)
-        .map_err(|e| SyncError::Persist(format!("tempfile create {}: {e}", path.display())))?;
-    tmp.write_all(bytes)
-        .map_err(|e| SyncError::Persist(format!("tempfile write {}: {e}", path.display())))?;
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| SyncError::Persist(format!("sync_all {}: {e}", path.display())))?;
-    tmp.persist(path)
-        .map_err(|e| SyncError::Persist(format!("persist {}: {e}", path.display())))?;
-    Ok(())
+    crate::owner_state_persist::save_atomically(path, bytes)
+        .map_err(|e| SyncError::Persist(e.to_string()))
 }
 
 // ── NotesDoc ─────────────────────────────────────────────────────────────────
@@ -81,8 +77,51 @@ pub fn load(path: &Path) -> Result<NotesDoc, SyncError> {
     }
 }
 
-/// Save `NotesDoc` to `path` atomically (tempfile + fsync + rename).
-/// Creates parent directories if needed.
+/// Load the notes doc, or — on a corruption/IO error (NOT NotFound) — log
+/// loudly, quarantine the bad file (renamed aside, never overwritten), and
+/// start fresh. Prevents the silent-data-loss path where a load error becomes
+/// an empty doc that the next persist writes over the user's real notes.
+pub fn load_doc_or_recover(path: &Path) -> NotesDoc {
+    match load(path) {
+        Ok(doc) => doc,
+        Err(e) => {
+            quarantine(path, &e);
+            NotesDoc::default()
+        }
+    }
+}
+
+/// Same recovery contract as [`load_doc_or_recover`], but for the replay
+/// tracker: on a corruption/IO error (NOT NotFound) the bad file is
+/// quarantined and an empty tracker returned, never silently overwritten.
+pub fn load_replay_or_recover(path: &Path) -> BTreeMap<String, Hlc> {
+    match load_replay(path) {
+        Ok(t) => t,
+        Err(e) => {
+            quarantine(path, &e);
+            BTreeMap::new()
+        }
+    }
+}
+
+fn quarantine(path: &Path, err: &SyncError) {
+    // Append a timestamped `.corrupt-<ms>` suffix so we never clobber a prior
+    // quarantine or the live file; preserves the bytes for manual recovery.
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut corrupt = path.as_os_str().to_os_string();
+    corrupt.push(format!(".corrupt-{ms}"));
+    tracing::error!(path = %path.display(), error = %err,
+        "notes persistence load failed; quarantining corrupt file and starting fresh (bytes preserved)");
+    if let Err(re) = std::fs::rename(path, &corrupt) {
+        tracing::warn!(path = %path.display(), error = %re, "failed to quarantine corrupt notes file");
+    }
+}
+
+/// Save `NotesDoc` to `path` atomically (tempfile + fsync + parent-dir fsync
+/// + rename). Creates parent directories if needed.
 pub fn save(path: &Path, doc: &NotesDoc) -> Result<(), SyncError> {
     let mut bytes = vec![NOTES_SCHEMA_V1];
     into_writer(&NotesFileV1(doc.clone()), &mut bytes)
@@ -190,6 +229,72 @@ mod tests {
         );
         save_replay(&path, &t).unwrap();
         assert_eq!(load_replay(&path).unwrap(), t);
+    }
+
+    #[test]
+    fn load_doc_or_recover_quarantines_corrupt_and_starts_fresh() {
+        // A corrupt notes file must NOT silently become an empty doc that
+        // overwrites the user's notes on the next persist: the recovery path
+        // renames the bad bytes aside and returns a fresh default.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.cbor");
+        // Unknown schema version byte → load() returns Err(CborDecode).
+        std::fs::write(&path, [0xFF_u8, 0x01, 0x02]).unwrap();
+        let doc = load_doc_or_recover(&path);
+        assert_eq!(doc, NotesDoc::default(), "recovers to a fresh empty doc");
+        assert!(
+            !path.exists(),
+            "the corrupt file is moved aside, not left in place"
+        );
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("notes.cbor.corrupt-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine file");
+        assert_eq!(
+            std::fs::read(quarantined[0].path()).unwrap(),
+            vec![0xFF_u8, 0x01, 0x02],
+            "quarantined bytes are preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn load_doc_or_recover_missing_is_default_no_quarantine() {
+        // NotFound is NOT a corruption: load() returns Ok(default), so no
+        // quarantine file should be created.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.cbor");
+        assert_eq!(load_doc_or_recover(&path), NotesDoc::default());
+        let any: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(any.is_empty(), "no quarantine on a missing file");
+    }
+
+    #[test]
+    fn load_replay_or_recover_quarantines_corrupt_and_starts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes_replay.cbor");
+        std::fs::write(&path, [0xFF_u8]).unwrap(); // unknown schema version
+        let tracker = load_replay_or_recover(&path);
+        assert!(tracker.is_empty(), "recovers to an empty tracker");
+        assert!(!path.exists(), "corrupt replay file moved aside");
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("notes_replay.cbor.corrupt-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine file");
     }
 
     #[test]

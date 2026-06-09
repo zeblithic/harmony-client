@@ -62,9 +62,15 @@ pub(crate) async fn notes_upsert_core(
     let id = id.unwrap_or_else(new_ulid);
     let mut d = doc.lock().await;
     d.upsert(id.clone(), trimmed, at);
-    Ok(to_view(
-        d.get(&id).expect("note present immediately after upsert"),
-    ))
+    // `upsert` is a no-op for a stale HLC and `get` filters tombstoned notes,
+    // so a concurrent delete/newer-edit on another device can make this `get`
+    // return `None`. Surface that as a recoverable error rather than panicking
+    // (reachable once edits target an existing id, incl. the idempotent
+    // migration in notes-migrate.ts).
+    d.get(&id).map(to_view).ok_or_else(|| {
+        "note upsert was superseded (stale write or the note was deleted on another device)"
+            .to_string()
+    })
 }
 
 /// Tombstone a note (LWW on a freshly minted HLC). Deleting a missing or
@@ -173,6 +179,58 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_superseded_by_newer_delete_returns_err_no_panic() {
+        // Regression for the `.expect("note present immediately after upsert")`
+        // panic: an upsert with a STALE HLC against a note that a concurrent
+        // device already deleted with a strictly-newer HLC is a no-op in the
+        // CRDT, so `get` returns None. The core must surface that as Err, never
+        // panic (which would crash the backend).
+        let doc = Arc::new(Mutex::new(NotesDoc::default()));
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+
+        // 1. Create the note (low HLC via the real mint path).
+        let v = notes_upsert_core(&doc, &tracker, "dev-A", None, "original".into())
+            .await
+            .unwrap();
+        let id = v.id.clone();
+
+        // 2. A concurrent device deletes it with a strictly-newer (far-future)
+        //    HLC — directly on the doc to simulate an inbound merge from a
+        //    sibling, independent of dev-B's local tracker.
+        doc.lock().await.delete(
+            &id,
+            Hlc {
+                wall_ms: u64::MAX,
+                logical: u32::MAX,
+                device_id: "dev-B".into(),
+            },
+        );
+        assert!(
+            doc.lock().await.get(&id).is_none(),
+            "note is tombstoned after the far-future delete"
+        );
+
+        // 3. dev-B re-upserts the SAME id with its own fresh tracker, which
+        //    mints a wall_ms ≈ now — strictly OLDER than the u64::MAX delete,
+        //    so the CRDT upsert is a no-op and `get` returns None.
+        let stale_tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let result = notes_upsert_core(
+            &doc,
+            &stale_tracker,
+            "dev-B",
+            Some(id.clone()),
+            "edit".into(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "stale upsert against a tombstone must return Err, not panic"
+        );
+        // The note stays deleted (the stale edit did not resurrect it).
+        assert!(doc.lock().await.get(&id).is_none());
     }
 
     #[tokio::test]

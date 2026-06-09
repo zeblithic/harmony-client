@@ -66,7 +66,7 @@ The opt-in relay's entire security rests on **sealed delivery** — a blob encry
 
 Two layers, one narrow interface. The Butler is the network-facing accept/hold/deliver layer; Fleet Sync is the local replication layer.
 
-```
+```text
             ┌────────────────────── BUTLER (network-facing delivery) ──────────────────────┐
   peer ───▶ │  accept sealed delivery (admission-gated)   │   hold outbound, retry to peer │
             │  advertise butler-set → pkarr/Mainline DHT   │   first-party ▸ then opt-in relay│

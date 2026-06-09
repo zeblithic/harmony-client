@@ -27,21 +27,36 @@
 
   // Load on mount and reload whenever the active identity changes. Reading
   // ownerId here makes the effect re-run on identity switch, so notes never
-  // bleed across identities.
+  // bleed across identities. `load` hydrates the SERVICE state (and fires
+  // onChange) so `append`/`notes-changed` updates all flow through a single
+  // source of truth (notesService.entries) — no direct getEntries reads that
+  // could diverge from it.
+  //
+  // The `active` flag guards against a stale-ownerId race: if ownerId changes
+  // mid-load, the in-flight `load`'s onChange must not clobber `entries` with
+  // the prior owner's notes. Cleanup flips `active` false so only the latest
+  // effect run mirrors into `entries`.
   $effect(() => {
-    void notesService.getEntries(ownerId).then((result) => { entries = result; });
+    let active = true;
+    const owner = ownerId;
+    notesService.onChange = () => {
+      if (active) entries = [...notesService.entries];
+    };
+    void notesService.load(owner);
+    return () => {
+      active = false;
+    };
   });
 
   // ZEB-417: subscribe to backend sync events so inbound changes are reflected
-  // immediately without a manual reload. Cleaned up on component destroy.
+  // immediately without a manual reload. Guard the reload against the current
+  // ownerId so a late event for a switched-away identity can't repopulate.
+  // Cleaned up on component destroy.
   let unlistenNotesChanged: (() => void) | null = null;
   onMount(async () => {
     unlistenNotesChanged = await listen('notes-changed', () => {
       void notesService.load(ownerId);
     });
-    notesService.onChange = () => {
-      entries = [...notesService.entries];
-    };
   });
   onDestroy(() => {
     unlistenNotesChanged?.();
@@ -57,7 +72,10 @@
     // (Cursor PR #180.)
     const entry = await notesService.append(ownerId, text);
     if (!entry) return;
-    entries = await notesService.getEntries(ownerId);
+    // `append` already updated notesService.entries and fired onChange (which
+    // mirrors into `entries`), and inbound sync arrives via notes-changed — so
+    // a re-fetch here is redundant and risky: a failed getEntries returning []
+    // would hide the note we just saved. Trust the service state.
     composeText = '';
   }
 

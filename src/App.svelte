@@ -135,12 +135,29 @@
   // backend. Runs once the first time selfOwnerId becomes non-null; the
   // per-owner localStorage flag makes it idempotent across restarts.
   let _notesMigratedForOwner = $state<string | null>(null);
+  // In-flight guard: prevents the effect from launching a second concurrent
+  // import for the same owner. Reset on failure so a later re-trigger retries.
+  let _notesMigrationInFlight: string | null = null;
   $effect(() => {
-    if (!selfOwnerId || _notesMigratedForOwner === selfOwnerId) return;
-    _notesMigratedForOwner = selfOwnerId;
-    void import('@tauri-apps/api/core').then(({ invoke }) =>
-      migrateLocalNotes(selfOwnerId!, invoke as (cmd: string, args: Record<string, unknown>) => Promise<unknown>),
-    );
+    const owner = selfOwnerId;
+    if (!owner || _notesMigratedForOwner === owner || _notesMigrationInFlight === owner) return;
+    _notesMigrationInFlight = owner;
+    void import('@tauri-apps/api/core')
+      .then(({ invoke }) =>
+        migrateLocalNotes(owner, invoke as (cmd: string, args: Record<string, unknown>) => Promise<unknown>),
+      )
+      .then(() => {
+        // Only mark migrated on success; idempotency (notes-migrate.ts) makes
+        // any retry safe, so leaving the guard unset on failure lets a later
+        // re-trigger retry instead of permanently skipping this session.
+        _notesMigratedForOwner = owner;
+      })
+      .catch((e) => {
+        console.error('notes migration failed; will retry on a later trigger:', e);
+      })
+      .finally(() => {
+        if (_notesMigrationInFlight === owner) _notesMigrationInFlight = null;
+      });
   });
 
   // ── ZEB-351 Voice V3: app-lifetime voice session ───────────────────
