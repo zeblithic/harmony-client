@@ -143,6 +143,7 @@ pub mod folder_ingest;
 pub mod folders;
 mod follows;
 pub mod friend_graph;
+pub mod friend_nicknames;
 pub mod friend_rendezvous;
 pub mod friend_requests;
 pub mod friend_token;
@@ -34695,6 +34696,9 @@ pub struct FriendDto {
     pub owner_id_hex: String,
     /// Human display name recorded at link time (may be absent).
     pub display: Option<String>,
+    /// ZEB-419: local-only nickname (joined from `friend_nicknames`, never from
+    /// the published CRDT). `None` when the user hasn't set one.
+    pub nickname: Option<String>,
     /// Lifecycle (`"pending"` / `"active"`; `"revoked"` rows are filtered out
     /// by `list_friends_inner`, so this is never `"revoked"` in practice).
     pub status: crate::friend_graph::FriendStatus,
@@ -34728,11 +34732,30 @@ pub fn list_friends_inner(state: &crate::owner_state_crdt::OwnerState) -> Vec<Fr
         .map(|(addr, entry)| FriendDto {
             owner_id_hex: hex::encode(addr.0),
             display: entry.display.clone(),
+            nickname: None,
             status: entry.status,
             established_via: entry.established_via,
             referrable: entry.referrable,
         })
         .collect()
+}
+
+/// ZEB-419: overlay local nicknames onto a projected friend list. Pure so it's
+/// unit-testable without a NodeState harness; the `list_friends` IPC calls it
+/// after `list_friends_inner`. Nicknames are an ACTIVE-friend-only feature, so a
+/// stored nickname is overlaid only onto `Active` rows — a non-active row (e.g. a
+/// friend that reverted to `Pending`) never surfaces a nickname even if one is
+/// stored. A friend with no nickname entry is unchanged.
+pub fn apply_nicknames(
+    mut friends: Vec<FriendDto>,
+    nicknames: &crate::friend_nicknames::FriendNicknames,
+) -> Vec<FriendDto> {
+    for f in &mut friends {
+        if f.status == crate::friend_graph::FriendStatus::Active {
+            f.nickname = nicknames.get(&f.owner_id_hex).map(str::to_owned);
+        }
+    }
+    friends
 }
 
 /// Write a `Revoked` tombstone for `peer_addr` into local owner-state, using a
@@ -35083,16 +35106,28 @@ async fn redeem_friend_token(
 /// `FriendsPanel`. Read-only snapshot of the friend-graph sub-CRDT.
 #[tauri::command]
 async fn list_friends(state: tauri::State<'_, Mutex<NodeState>>) -> Result<Vec<FriendDto>, String> {
-    let crdt_state = {
+    let (crdt_state, pkarr_settings_path) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+        (
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.pkarr_settings_path.clone(),
+        )
     };
     let dtos = {
         let s = crdt_state.lock().await;
         list_friends_inner(&s)
     };
+    // ZEB-419: join purely-local nicknames from their own file (outside the
+    // published CRDT). A missing/unset path → no nicknames.
+    let nicknames = match &pkarr_settings_path {
+        Some(p) => crate::friend_nicknames::FriendNicknames::load_or_default(
+            &p.with_file_name("friend_nicknames.json"),
+        ),
+        None => crate::friend_nicknames::FriendNicknames::default(),
+    };
+    let dtos = apply_nicknames(dtos, &nicknames);
     Ok(dtos)
 }
 
@@ -35784,6 +35819,93 @@ async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Re
     Ok(pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known)
 }
 
+/// ZEB-419: serializes the nickname-file read-modify-write so two concurrent
+/// `set_friend_nickname` calls can't lose an update (load A, load B, save A, save
+/// B → A's change is lost). Reads in `list_friends` don't need it —
+/// `save_atomically` renames atomically, so a reader always sees a complete
+/// old-or-new file.
+static NICKNAME_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+/// Max nickname length, in chars. Generous for a personal label; bounds local
+/// storage and rejects pathological input.
+const MAX_NICKNAME_LEN: usize = 64;
+
+/// ZEB-419: set or clear the local-only nickname for a friend (by owner_id hex).
+/// `nickname = None`/blank clears it. Persists to `friend_nicknames.json` beside
+/// the connectivity settings, then emits `friend-list-changed` so the panel
+/// re-fetches with the new label. Local-only: never published or synced.
+#[tauri::command]
+async fn set_friend_nickname(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+    nickname: Option<String>,
+) -> Result<(), String> {
+    // Validate the owner_id (reject malformed before any write). decode_owner_id_16
+    // is the 16-byte master owner_id decoder used by the other friend IPCs.
+    let addr = decode_owner_id_16(&owner_id_hex)?;
+
+    // Normalize: trim, treat blank as "clear". Cap the length of a real nickname
+    // before any state work (bounds storage + rejects abuse).
+    let trimmed = nickname.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(nick) = trimmed {
+        if nick.chars().count() > MAX_NICKNAME_LEN {
+            return Err(format!(
+                "nickname too long (max {MAX_NICKNAME_LEN} characters)"
+            ));
+        }
+    }
+    let is_setting = trimmed.is_some();
+
+    let (crdt_state, path) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (g.crdt_state.clone(), g.pkarr_settings_path.clone())
+    };
+    let (Some(crdt_state), Some(path)) = (crdt_state, path) else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+
+    // Scope: nicknames are an ACTIVE-friend-only feature (the UI only offers the
+    // editor on active rows). Enforce it server-side too so a direct IPC call
+    // can't persist a nickname for a pending/unknown owner. Clearing is always
+    // allowed so a stale nickname can be removed regardless of status.
+    if is_setting {
+        let s = crdt_state.lock().await;
+        let is_active = matches!(
+            s.friend_graph.friends.get(&addr),
+            Some(e) if e.status == crate::friend_graph::FriendStatus::Active
+        );
+        if !is_active {
+            return Err("nickname can only be set for an active friend".into());
+        }
+    }
+
+    let nick_path = path.with_file_name("friend_nicknames.json");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Serialize the read-modify-write so concurrent calls can't lose an update.
+    {
+        let _guard = NICKNAME_WRITE_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let mut store = crate::friend_nicknames::FriendNicknames::load_or_default(&nick_path);
+        store.set(&owner_id_hex, nickname.as_deref(), now_ms);
+        store
+            .save(&nick_path)
+            .map_err(|e| format!("save friend_nicknames: {e}"))?;
+    }
+
+    let _ = app.emit("friend-list-changed", ());
+    Ok(())
+}
+
 /// Outcome of a Path-A `add_friend_by_key` initiate.
 ///
 /// `rename_all` camelCases the variant tags (`linked`/`pending`/`unreachable`);
@@ -36399,6 +36521,82 @@ mod friend_ipc_tests {
         assert_eq!(dtos[0].owner_id_hex, hex::encode(active_addr.0));
         assert_eq!(dtos[0].status, FriendStatus::Active);
         assert_eq!(dtos[0].established_via, FriendOrigin::Token);
+    }
+
+    #[test]
+    fn apply_nicknames_overlays_active_friends_only() {
+        let friends = vec![
+            FriendDto {
+                owner_id_hex: "aa".into(),
+                display: None,
+                nickname: None,
+                status: FriendStatus::Active,
+                established_via: FriendOrigin::MutualKey,
+                referrable: false,
+            },
+            FriendDto {
+                owner_id_hex: "bb".into(),
+                display: Some("Hint".into()),
+                nickname: None,
+                status: FriendStatus::Active,
+                established_via: FriendOrigin::Token,
+                referrable: false,
+            },
+            FriendDto {
+                owner_id_hex: "cc".into(),
+                display: None,
+                nickname: None,
+                status: FriendStatus::Pending,
+                established_via: FriendOrigin::MutualKey,
+                referrable: false,
+            },
+        ];
+        let mut nicks = crate::friend_nicknames::FriendNicknames::default();
+        nicks.set("AA", Some("Koya"), 1); // casing differs from owner_id_hex
+        nicks.set("cc", Some("ShouldNotShow"), 1); // stored against a PENDING friend
+        let out = apply_nicknames(friends, &nicks);
+        assert_eq!(out[0].nickname.as_deref(), Some("Koya")); // active → overlaid
+        assert_eq!(out[1].nickname, None); // active, no stored nickname
+        assert_eq!(out[1].display.as_deref(), Some("Hint")); // display hint untouched
+        assert_eq!(
+            out[2].nickname, None,
+            "a pending friend never surfaces a nickname (active-only scope)"
+        );
+    }
+
+    #[test]
+    fn nickname_never_appears_in_published_owner_state() {
+        // Build an OwnerState with one friend, then serialize it via the SAME
+        // canonical encoder the sync/backup path publishes with. Nicknames live
+        // in a separate file, so the published bytes must not contain the
+        // nickname. This LOCKS the structural invariant: if a future refactor
+        // moves `nickname` into `FriendEntry`/`OwnerState`, the published bytes
+        // would contain it and this test fails.
+        let mut state = OwnerState::default();
+        let (addr, mut entry) = friend_entry(0xAA, FriendStatus::Active, 7);
+        // A unique value in a PUBLISHED field (`display`) so we can prove the
+        // friend entry is genuinely in the serialized bytes (non-vacuous test).
+        entry.display = Some("DISPLAY-SENTINEL-7f3a".to_string());
+        assert!(matches!(
+            state.apply_friend_update(addr, entry),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+        let bytes =
+            crate::owner_state_crypto::canonical_cbor_encode(&state).expect("encode owner state");
+        // Sanity: the friend entry really is serialized into the published bytes.
+        assert!(
+            bytes
+                .windows("DISPLAY-SENTINEL-7f3a".len())
+                .any(|w| w == b"DISPLAY-SENTINEL-7f3a"),
+            "sanity: the friend entry must be present in the serialized owner-state",
+        );
+        // Invariant: no serializable `nickname` field rides published owner-state.
+        // If a future refactor moves `nickname` into `FriendEntry`/`OwnerState`,
+        // the CBOR map key `nickname` would appear here and this assertion fails.
+        assert!(
+            !bytes.windows("nickname".len()).any(|w| w == b"nickname"),
+            "published owner-state must not contain a serializable `nickname` field",
+        );
     }
 
     #[tokio::test]
@@ -37901,6 +38099,7 @@ pub fn run() {
             decline_friend_request,
             set_friend_auto_accept,
             get_friend_auto_accept,
+            set_friend_nickname,
             // ZEB-329: Network Health IPCs.
             network_health_snapshot,
             network_health_run_self_test,

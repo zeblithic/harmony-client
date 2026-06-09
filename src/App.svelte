@@ -1052,6 +1052,13 @@
   // FriendsPanel.
   const friendService = new FriendService();
   $effect(() => () => friendService.destroy());
+  // ZEB-419: a SECOND MemberCardService dedicated to the Friends panel. It must
+  // NOT share the roster instance: subscribeVisible(ids) reconciles to EXACTLY
+  // the passed set, so friends + roster would unsubscribe each other. The panel
+  // drives its subscriptions and owns its onUpdate; App only wires the adapter +
+  // avatar resolver (below).
+  const friendCardService = new MemberCardService();
+  $effect(() => () => void friendCardService.unsubscribeAll());
   const channelMessageService = new ChannelMessageService();
   $effect(() => () => channelMessageService.destroy());
 
@@ -1062,6 +1069,8 @@
   // nav nodes. Task 11's setAvatarResolver does NOT touch resolver.onChange, so
   // setting the combined onChange immediately below is safe regardless of order.
   memberCardService.setAvatarResolver(avatarResolver);
+  // ZEB-419: same shared resolver for the friends-panel card service.
+  friendCardService.setAvatarResolver(avatarResolver);
 
   // When avatar CIDs finish resolving, push blob URLs into BOTH stored
   // nav profiles/nodes AND peer member cards so every avatar surface
@@ -1069,6 +1078,9 @@
   avatarResolver.onChange = () => {
     navService.refreshAvatars();
     memberCardService.onAvatarsRefreshed();
+    // ZEB-419: the friends panel's card service shares this resolver — refresh it
+    // too so resolved friend avatars repaint immediately, not only on its poll.
+    friendCardService.onAvatarsRefreshed();
   };
   navService.onChange = () => {
     navNodes = [...navService.nodes];
@@ -1332,6 +1344,8 @@
       // seedSelf/resolve work at boot before Tauri-init); wire the adapter
       // now so cross-peer subscriptions can start.
       memberCardService.setAdapter(adapter);
+      // ZEB-419: wire the same adapter into the friends-panel card service.
+      friendCardService.setAdapter(adapter);
 
       // ZEB-298 PR 2 Task 10 — wire the voting adapter so the
       // delegate-on-behalf Tauri event can fire toast notifications.
@@ -1616,14 +1630,18 @@
         avatarCid?: string;
         profilePageRoot?: string;
       }>('member-card-received', (event) => {
-        memberCardService.applyCard(event.payload.ownerIdHex, {
+        const card = {
           displayName: event.payload.displayName,
           statusText: event.payload.statusText,
           avatarCid: event.payload.avatarCid,
           // ZEB-345: forward the profile-page root CID so an open panel for
           // this owner re-resolves once a fresh card lands.
           profilePageRoot: event.payload.profilePageRoot,
-        });
+        };
+        memberCardService.applyCard(event.payload.ownerIdHex, card);
+        // ZEB-419: also feed the friends-panel card service so friend/request
+        // rows update instantly on a pushed card, not only via its 3s poll.
+        friendCardService.applyCard(event.payload.ownerIdHex, card);
       });
       fileManagerService.addUnlisten(unlistenMemberCard);
 
@@ -2750,7 +2768,11 @@
       onTrustChange={handleTrustChange}
     />
     <NetworkDiscoverabilitySettings />
-    <FriendsPanel service={friendService} />
+    <FriendsPanel
+      service={friendService}
+      cardService={friendCardService}
+      onOpenCard={openMemberCard}
+    />
   {/snippet}
   {#snippet vineFeed()}
     <VineFeed

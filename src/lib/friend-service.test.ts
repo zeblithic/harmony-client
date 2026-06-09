@@ -278,6 +278,21 @@ describe('FriendService', () => {
     });
   });
 
+  it('setNickname invokes set_friend_nickname with ownerIdHex + nickname (null clears)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.setNickname('aabb', 'Koya');
+    expect(adapter.invoke).toHaveBeenCalledWith('set_friend_nickname', {
+      ownerIdHex: 'aabb',
+      nickname: 'Koya',
+    });
+    await service.setNickname('ccdd', null);
+    expect(adapter.invoke).toHaveBeenLastCalledWith('set_friend_nickname', {
+      ownerIdHex: 'ccdd',
+      nickname: null,
+    });
+  });
+
   it('browseReferrals invokes browse_friend_referrals with the ownerIdHex arg and returns the array', async () => {
     await service.connectAdapter(adapter);
     const referrals = [

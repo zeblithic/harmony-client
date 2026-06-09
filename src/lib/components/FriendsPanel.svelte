@@ -31,12 +31,31 @@
     setIdentityDiscoverable,
     onIdentityDiscoverableChanged,
   } from '../connectivity-adapter';
+  import Avatar from './Avatar.svelte';
+  import type { MemberCardService } from '../member-card-service';
+  import type { OpenCardPayload } from './MemberRow.svelte';
 
-  let { service }: { service: FriendService } = $props();
+  let {
+    service,
+    cardService,
+    onOpenCard,
+  }: {
+    service: FriendService;
+    /** ZEB-419: dedicated MemberCardService for live friend/request names +
+     *  avatars (App injects it). Optional so unit tests can omit it; when
+     *  absent, names fall back to the frozen hint / short-hex. */
+    cardService?: MemberCardService;
+    /** ZEB-419: open the owner-card drill-down popover (App's openMemberCard). */
+    onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
+  } = $props();
 
   let friends = $state<FriendDto[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  // ZEB-419: bumped by the dedicated card service's onUpdate (poll/event) so the
+  // name/avatar helpers re-read resolve() and the rows repaint.
+  let cardVersion = $state(0);
 
   // Generate-link state.
   let generatedUrl = $state<string | null>(null);
@@ -52,6 +71,12 @@
 
   // Per-row in-flight referrable-toggle guard (by owner_id hex). ZEB-375 Phase 2a.
   let referrableSaving = $state<Set<string>>(new Set());
+
+  // ZEB-419: inline nickname editor. `editingNickname` is the owner_id of the
+  // row whose editor is open (or null); `nicknameSaving` guards in-flight saves.
+  let editingNickname = $state<string | null>(null);
+  let nicknameDraft = $state('');
+  let nicknameSaving = $state<Set<string>>(new Set());
 
   // ZEB-375 Phase 2a Task 7: per-row "browse referrals" state, keyed by the
   // friend's owner_id hex. `loading` is the in-flight guard; `results` holds the
@@ -123,7 +148,12 @@
 
   async function refresh(): Promise<void> {
     try {
-      friends = await service.listFriends();
+      const next = await service.listFriends();
+      // Don't assign list state after teardown — it would also re-trigger the
+      // card-subscription $effect on the App-owned friendCardService while the
+      // panel is closed (ZEB-415 liveness discipline).
+      if (destroyed) return;
+      friends = next;
       error = null;
       // ZEB-375 Phase 2a: browse is Active-only, so drop any per-row referral
       // state for friends that are no longer Active (now Pending, or absent).
@@ -148,7 +178,9 @@
 
   async function refreshPending(): Promise<void> {
     try {
-      pendingRequests = await service.listPendingRequests();
+      const next = await service.listPendingRequests();
+      if (destroyed) return; // see refresh(): no post-teardown state writes
+      pendingRequests = next;
       pendingError = null;
     } catch (e) {
       pendingError = e instanceof Error ? e.message : String(e);
@@ -225,6 +257,13 @@
   }
 
   onMount(() => {
+    // ZEB-419: repaint names/avatars when the dedicated card service resolves a
+    // card (poll or member-card-received event). Guard post-teardown writes.
+    if (cardService) {
+      cardService.onUpdate = () => {
+        if (!destroyed) cardVersion += 1;
+      };
+    }
     // Re-fetch friends whenever the backend signals a change.
     unsubscribeChanged = service.onFriendsChanged(() => {
       void refresh();
@@ -259,6 +298,11 @@
     // write `identityDiscoverable` after we've unmounted (CodeRabbit).
     discoverableGen += 1;
     stopAddRetry();
+    // ZEB-419: stop card updates + drop all friend/request card subscriptions.
+    if (cardService) {
+      cardService.onUpdate = undefined;
+      void cardService.unsubscribeAll();
+    }
     if (myKeyCopiedTimer) clearTimeout(myKeyCopiedTimer);
     myKeyCopiedTimer = null;
   });
@@ -333,6 +377,41 @@
       const next = new Set(unfriending);
       next.delete(ownerIdHex);
       unfriending = next;
+    }
+  }
+
+  // ── ZEB-419: local nickname editing (active friends) ──────────────────────
+  function startEditNickname(f: FriendDto): void {
+    editingNickname = f.ownerIdHex;
+    nicknameDraft = f.nickname ?? '';
+  }
+  function cancelEditNickname(): void {
+    editingNickname = null;
+    nicknameDraft = '';
+  }
+  // Save (or clear, when blank) the nickname. The backend emits
+  // `friend-list-changed` → `refresh()` repaints with the new value, so there's
+  // no optimistic local mutation. `destroyed` guards the post-await writes
+  // (same liveness discipline as the add-by-key paths).
+  async function saveNickname(ownerIdHex: string): Promise<void> {
+    if (nicknameSaving.has(ownerIdHex)) return;
+    nicknameSaving = new Set(nicknameSaving).add(ownerIdHex);
+    try {
+      await service.setNickname(ownerIdHex, nicknameDraft.trim() || null);
+      if (destroyed) return;
+      // Only close the editor if we're still editing THIS row — the user may have
+      // opened another friend's editor while this save was in flight.
+      if (editingNickname === ownerIdHex) {
+        editingNickname = null;
+        nicknameDraft = '';
+      }
+    } catch (e) {
+      if (destroyed) return;
+      error = `Couldn't save nickname: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      const next = new Set(nicknameSaving);
+      next.delete(ownerIdHex);
+      nicknameSaving = next;
     }
   }
 
@@ -539,6 +618,59 @@
   function shortId(hex: string): string {
     return hex.length > 12 ? `${hex.slice(0, 12)}…` : hex;
   }
+
+  // ── ZEB-419: live owner-card resolution (name + avatar) ───────────────────
+  // Reading `cardVersion` inside these helpers makes the template re-render when
+  // a poll/event fills a card. Empty strings fall through (`||` not `??`) so a
+  // blank card name never masks a usable hint.
+  function cardName(ownerIdHex: string): string | undefined {
+    cardVersion;
+    return cardService?.resolve(ownerIdHex)?.displayName || undefined;
+  }
+  function cardAvatarUrl(ownerIdHex: string): string | undefined {
+    cardVersion;
+    return cardService?.resolve(ownerIdHex)?.avatarUrl;
+  }
+  // Label ladder: personal nickname ► live card name ► frozen link hint ►
+  // short owner_id. The short-hex line under the name stays the verifiable id.
+  function friendLabel(f: FriendDto): string {
+    return f.nickname || cardName(f.ownerIdHex) || f.display || shortId(f.ownerIdHex);
+  }
+  // Pending requests have no nickname rung (you nickname a peer after accepting).
+  function requestLabel(r: PendingFriendRequestDto): string {
+    return cardName(r.ownerIdHex) || r.display || shortId(r.ownerIdHex);
+  }
+
+  // ZEB-419: open the owner-card drill-down (App's ProfilePopover owner-card
+  // mode). The popover shows the peer's REAL signed card name + full owner_id —
+  // never the local nickname — so a misleading nickname can't mask identity.
+  function openIdentity(ownerIdHex: string, ev: MouseEvent): void {
+    const resolved = cardService?.resolve(ownerIdHex);
+    onOpenCard?.(
+      {
+        ownerIdHex,
+        displayName: resolved?.displayName ?? '',
+        statusText: resolved?.statusText ?? '',
+        avatarUrl: resolved?.avatarUrl,
+      },
+      ev,
+    );
+  }
+
+  // Reconcile the dedicated card service's subscriptions to the current friend +
+  // pending owner_id set whenever those lists change. subscribeVisible is
+  // idempotent and reconciles (unsubscribes owners that left the lists).
+  $effect(() => {
+    // Belt-and-suspenders: never (re)subscribe after teardown. The refresh
+    // guards above stop list state changing post-unmount, and Svelte disposes
+    // this effect on destroy — this check makes a stray re-run a no-op too.
+    if (destroyed || !cardService) return;
+    const ids = [
+      ...friends.map((f) => f.ownerIdHex),
+      ...pendingRequests.map((r) => r.ownerIdHex),
+    ];
+    void cardService.subscribeVisible(ids);
+  });
 </script>
 
 <div class="friends-section" data-testid="friends-panel">
@@ -559,9 +691,21 @@
     <ul class="friend-list" data-testid="friend-list">
       {#each friends as f (f.ownerIdHex)}
         <li class="friend-row">
+          <Avatar
+            address={f.ownerIdHex}
+            displayName={friendLabel(f)}
+            avatarUrl={cardAvatarUrl(f.ownerIdHex)}
+            size={28}
+          />
           <div class="friend-id">
-            <span class="friend-name">{f.display ?? shortId(f.ownerIdHex)}</span>
-            <span class="friend-addr" title={f.ownerIdHex}>{shortId(f.ownerIdHex)}</span>
+            <span class="friend-name" data-testid="friend-name-{f.ownerIdHex}">{friendLabel(f)}</span>
+            <button
+              type="button"
+              class="friend-addr identity-btn"
+              title="Verify identity — show full key"
+              data-testid="friend-identity-{f.ownerIdHex}"
+              onclick={(e) => openIdentity(f.ownerIdHex, e)}
+            >{shortId(f.ownerIdHex)}</button>
           </div>
           <!-- ZEB-375 Phase 2a: the referrable opt-in + browse action only work
                for Active friends — the backend returns a typed error for
@@ -569,6 +713,46 @@
                gate both controls on status to avoid surfacing functional-looking
                controls that throw. -->
           {#if f.status === 'active'}
+            <!-- ZEB-419: local nickname editor (this device only). -->
+            {#if editingNickname === f.ownerIdHex}
+              <input
+                type="text"
+                class="nickname-input"
+                placeholder="Nickname (only you see this)"
+                bind:value={nicknameDraft}
+                data-testid="nickname-input-{f.ownerIdHex}"
+                onkeydown={(e) => {
+                  if (e.key === 'Enter') saveNickname(f.ownerIdHex);
+                  else if (e.key === 'Escape') cancelEditNickname();
+                }}
+              />
+              <button
+                type="button"
+                class="secondary-btn small-btn"
+                disabled={nicknameSaving.has(f.ownerIdHex)}
+                onclick={() => saveNickname(f.ownerIdHex)}
+                data-testid="nickname-save-{f.ownerIdHex}"
+              >
+                {nicknameSaving.has(f.ownerIdHex) ? '…' : 'Save'}
+              </button>
+              <button
+                type="button"
+                class="secondary-btn small-btn"
+                onclick={cancelEditNickname}
+                data-testid="nickname-cancel-{f.ownerIdHex}"
+              >
+                Cancel
+              </button>
+            {:else}
+              <button
+                type="button"
+                class="secondary-btn small-btn"
+                onclick={() => startEditNickname(f)}
+                data-testid="set-nickname-btn-{f.ownerIdHex}"
+              >
+                {f.nickname ? 'Edit nickname' : 'Set nickname'}
+              </button>
+            {/if}
             <label class="referrable-toggle" data-testid="referrable-toggle-label">
               <input
                 type="checkbox"
@@ -710,9 +894,21 @@
       <ul class="friend-list" data-testid="pending-list">
         {#each pendingRequests as req (req.ownerIdHex)}
           <li class="friend-row">
+            <Avatar
+              address={req.ownerIdHex}
+              displayName={requestLabel(req)}
+              avatarUrl={cardAvatarUrl(req.ownerIdHex)}
+              size={28}
+            />
             <div class="friend-id">
-              <span class="friend-name">{req.display ?? shortId(req.ownerIdHex)}</span>
-              <span class="friend-addr" title={req.ownerIdHex}>{shortId(req.ownerIdHex)}</span>
+              <span class="friend-name" data-testid="friend-name-{req.ownerIdHex}">{requestLabel(req)}</span>
+              <button
+                type="button"
+                class="friend-addr identity-btn"
+                title="Verify identity — show full key"
+                data-testid="friend-identity-{req.ownerIdHex}"
+                onclick={(e) => openIdentity(req.ownerIdHex, e)}
+              >{shortId(req.ownerIdHex)}</button>
             </div>
             <div class="request-actions">
               <button
@@ -857,6 +1053,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
     gap: 12px;
     padding: 6px 0;
     border-bottom: 1px solid var(--border, #2a2a2a);
@@ -902,6 +1099,17 @@
     flex-shrink: 0;
     font-size: 12px;
     padding: 4px 10px;
+  }
+
+  .nickname-input {
+    flex: 0 1 150px;
+    min-width: 90px;
+    font-size: 12px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border, #555);
+    background: var(--bg-secondary, #1e1e1e);
+    color: var(--text-primary);
   }
 
   .referrals-row {
@@ -953,6 +1161,25 @@
     font-size: 11px;
     color: var(--text-secondary);
     font-family: var(--font-mono, monospace);
+  }
+
+  /* ZEB-419: the short-hex line doubles as the identity drill-down trigger.
+     Reset button chrome but keep the .friend-addr font/colour. */
+  .identity-btn {
+    background: transparent;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+  }
+  .identity-btn:hover {
+    text-decoration: underline;
+    color: var(--text-primary);
+  }
+  .identity-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+    border-radius: 2px;
   }
 
   .unfriend-btn {
