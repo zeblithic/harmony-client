@@ -188,4 +188,67 @@ mod tests {
             .unwrap();
         assert!(b.timestamp >= a.timestamp); // wall_ms monotone (logical bumps within same ms)
     }
+
+    /// End-to-end engine-wiring proof: a real `FleetSyncEngine<NotesDoc>`
+    /// configured exactly as `start_node` configures it (NotesPersist sink,
+    /// `merge_from` merger, `publish_seen: true`, lookup tag `b"notes-v1"`)
+    /// must emit an outbound wire frame on the publisher channel when a local
+    /// note write is followed by `notify_dirty` + `flush_now`. This exercises
+    /// the engine + merger + persist + channel wiring the Zenoh adapter sits
+    /// on top of (the Zenoh hop itself can't be unit-tested without a session).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notes_engine_publishes_on_local_write() {
+        use crate::content_store::{ContentStore, InMemoryStub};
+        use crate::fleet_sync::{FleetSyncConfig, FleetSyncEngine, Merger, DEFAULT_DEBOUNCE_MS};
+        use crate::notes_persist::NotesPersist;
+        use crate::owner_state_crypto::KeyTree;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kt = Arc::new(KeyTree::derive(&[0x33u8; 32]).expect("derive kt"));
+        let doc = Arc::new(Mutex::new(NotesDoc::default()));
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (_in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let merger: Merger<NotesDoc> = Arc::new(|local, remote| local.merge_from(remote));
+
+        let engine = FleetSyncEngine::<NotesDoc>::new(FleetSyncConfig {
+            kt,
+            device_id: "dev-A".to_string(),
+            state: Arc::clone(&doc),
+            merger,
+            replay_tracker: Arc::clone(&tracker),
+            content_store: cas,
+            publisher_tx: out_tx,
+            subscriber_rx: in_rx,
+            persist: Arc::new(NotesPersist {
+                doc_path: dir.path().join("notes.cbor"),
+                replay_path: dir.path().join("notes_replay.cbor"),
+            }),
+            lookup_key_tag: b"notes-v1",
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            publish_seen: true,
+            on_applied: None,
+            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+        });
+
+        // A local note write through the production IPC core, then force the
+        // engine to publish.
+        notes_upsert_core(&doc, &tracker, "dev-A", None, "hello".into())
+            .await
+            .unwrap();
+        engine.notify_dirty();
+        engine.flush_now().await.unwrap();
+
+        // The local write must have driven a (non-empty) publish frame onto
+        // the outbound channel.
+        let frame = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("publish frame produced within 5s")
+            .expect("publisher channel yielded Some(frame)");
+        assert!(!frame.is_empty(), "published wire frame must be non-empty");
+
+        let _ = engine.shutdown().await;
+    }
 }

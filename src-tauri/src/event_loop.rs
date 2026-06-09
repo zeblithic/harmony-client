@@ -51,6 +51,20 @@ pub struct MintSyncHandles {
     pub inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
+/// ZEB-417 SP1: Notes fleet-sync Zenoh adapter handles. Mirrors
+/// `MintSyncHandles` — constructed in `start_node` alongside the
+/// `FleetSyncEngine<NotesDoc>`, consumed inside `event_loop::run` once the
+/// Zenoh session is open.
+pub struct NotesSyncHandles {
+    /// Hex-encoded OWNER identity address — forms the notes topic key
+    /// `harmony/owner/{addr_hex}/ds/notes-v1`.
+    pub addr_hex: String,
+    /// Encrypted bytes from the notes engine's publish path → Zenoh put.
+    pub outbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Encrypted bytes from Zenoh → the notes engine's subscribe path.
+    pub inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
 /// One per-community adapter request handed from `start_node` (lib.rs)
 /// into the event loop's Zenoh-session scope.
 ///
@@ -540,6 +554,10 @@ pub async fn run<R: Runtime>(
     // Mint Phase 2 sync: channel pair bridging MintSyncEngine to Zenoh.
     // `None` when no owner identity is loaded.
     mut mint_sync_handles: Option<MintSyncHandles>,
+    // ZEB-417 SP1: channel pair bridging the Notes FleetSyncEngine to Zenoh
+    // on `harmony/owner/{addr_hex}/ds/notes-v1`. `None` when no owner identity
+    // is loaded (and in test callers that bypass `start_node`).
+    mut notes_sync_handles: Option<NotesSyncHandles>,
     // ZEB-321 Phase 1 Task 8: bundle of iroh-transport resources built in
     // `start_node`. When `Some`, the event loop spawns the link-manager
     // accept loop + publisher driver as background tasks; when `None`
@@ -995,6 +1013,132 @@ pub async fn run<R: Runtime>(
                     "mint-root key_expr invalid; MintSyncEngine Zenoh adapter skipped"
                 );
                 emit_mint_degraded("key_expr_invalid");
+            }
+        }
+    }
+
+    // ── ZEB-417 SP1: Notes fleet-sync Zenoh adapter for ds/notes-v1 topic ─
+    // Mirrors the mint-root wiring above (including the superior
+    // backoff-resubscribe inbound loop): outbound bytes from the Notes
+    // FleetSyncEngine's publish path → Zenoh put; inbound bytes from Zenoh →
+    // the engine's subscriber path. `None` when no owner identity is loaded.
+    if let Some(handles) = notes_sync_handles.take() {
+        let topic = format!("harmony/owner/{}/ds/notes-v1", handles.addr_hex);
+        let emit_notes_degraded = |reason: &str| {
+            let _ = app.emit(
+                "notes-sync-degraded",
+                serde_json::json!({
+                    "reason": reason,
+                    "topic": &topic,
+                }),
+            );
+        };
+        match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
+            Ok(key_expr) => {
+                // Outbound: drain Notes engine publisher → Zenoh put.
+                let session_pub = session.clone();
+                let key_pub = key_expr.clone();
+                let mut outbound_rx = handles.outbound_rx;
+                let closing_pub = Arc::clone(&closing);
+                tokio::spawn(async move {
+                    while let Some(bytes) = outbound_rx.recv().await {
+                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
+                            if !closing_pub.load(Ordering::SeqCst) {
+                                tracing::warn!(error = %e, "notes-root publish failed");
+                            }
+                        }
+                    }
+                });
+
+                // Inbound: Zenoh subscriber → Notes engine subscriber_rx.
+                // On transient recv_async errors, re-declare the subscriber
+                // with exponential backoff. The only terminal condition is
+                // `closing` becoming true (node shutdown) or `inbound_tx.send`
+                // failing (engine dropped its receiver).
+                match session.declare_subscriber(&key_expr).await {
+                    Ok(sub) => {
+                        let inbound_tx = handles.inbound_tx;
+                        let closing_sub = Arc::clone(&closing);
+                        let app_late = app.clone();
+                        let topic_late = topic.clone();
+                        let session_sub = session.clone();
+                        let key_expr_sub = key_expr.clone();
+                        tokio::spawn(async move {
+                            let mut current_sub = sub;
+                            let mut backoff_ms: u64 = 100;
+                            'outer: loop {
+                                loop {
+                                    match current_sub.recv_async().await {
+                                        Ok(sample) => {
+                                            backoff_ms = 100; // reset on success
+                                            let bytes: Vec<u8> =
+                                                sample.payload().to_bytes().to_vec();
+                                            if inbound_tx.send(bytes).await.is_err() {
+                                                // Engine dropped its receiver — clean shutdown.
+                                                break 'outer;
+                                            }
+                                        }
+                                        Err(_) => {
+                                            if closing_sub.load(Ordering::SeqCst) {
+                                                break 'outer;
+                                            }
+                                            tracing::warn!(
+                                                backoff_ms,
+                                                "notes-root subscriber closed unexpectedly; \
+                                                 will re-declare after backoff"
+                                            );
+                                            let _ = app_late.emit(
+                                                "notes-sync-degraded",
+                                                serde_json::json!({
+                                                    "reason": "subscriber_closed",
+                                                    "topic": &topic_late,
+                                                }),
+                                            );
+                                            break; // break inner, retry outer
+                                        }
+                                    }
+                                }
+                                if closing_sub.load(Ordering::SeqCst) {
+                                    break 'outer;
+                                }
+                                // Exponential backoff before re-declaring.
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                backoff_ms = (backoff_ms * 2).min(30_000);
+                                match session_sub.declare_subscriber(&key_expr_sub).await {
+                                    Ok(new_sub) => {
+                                        tracing::info!(
+                                            "notes-root subscriber re-declared successfully"
+                                        );
+                                        current_sub = new_sub;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            backoff_ms,
+                                            "notes-root subscriber re-declare failed; retrying"
+                                        );
+                                        // Don't reset backoff — keep backing off.
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "failed to declare notes-root subscriber"
+                        );
+                        emit_notes_degraded("declare_subscriber_failed");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %topic,
+                    "notes-root key_expr invalid; Notes FleetSyncEngine Zenoh adapter skipped"
+                );
+                emit_notes_degraded("key_expr_invalid");
             }
         }
     }
