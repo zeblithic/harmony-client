@@ -884,7 +884,7 @@ mod engine_tests {
         in_tx: mpsc::Sender<Vec<u8>>,
     }
 
-    fn build_engine(device_id: &str, cas: Arc<dyn ContentStore>) -> Built {
+    fn build_engine(device_id: &str, cas: Arc<dyn ContentStore>, publish_seen: bool) -> Built {
         let (out_tx, out_rx) = mpsc::channel(64);
         let (in_tx, in_rx) = mpsc::channel(64);
         let state = Arc::new(Mutex::new(ToyDoc::default()));
@@ -901,7 +901,7 @@ mod engine_tests {
             persist: Arc::new(NoopPersist),
             lookup_key_tag: TOY_TAG,
             debounce_ms: 50,
-            publish_seen: false,
+            publish_seen,
             on_applied: None,
             sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
         });
@@ -936,8 +936,8 @@ mod engine_tests {
     async fn two_engines_converge() {
         // Shared CAS so both engines name the same blobs.
         let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
-        let mut a = build_engine("dev-A", Arc::clone(&cas));
-        let mut b = build_engine("dev-B", Arc::clone(&cas));
+        let mut a = build_engine("dev-A", Arc::clone(&cas), false);
+        let mut b = build_engine("dev-B", Arc::clone(&cas), false);
 
         // Forwarder: pump A.out -> B.in and B.out -> A.in. Move the out
         // receivers out of each Built (replacing with a dead receiver) so
@@ -993,6 +993,145 @@ mod engine_tests {
         forwarder.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn synced_device_count_reflects_fan_out() {
+        // Three engines sharing ONE CAS so they all name the same blobs.
+        // All three run with `publish_seen = true`: B and C must EMIT a
+        // `seen` digest that contains dev-A's HLC (their acknowledgement of
+        // A's state), and A must RECORD those acks into `sibling_acks` —
+        // both halves require the flag.
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let mut a = build_engine("dev-A", Arc::clone(&cas), true);
+        let mut b = build_engine("dev-B", Arc::clone(&cas), true);
+        let mut c = build_engine("dev-C", Arc::clone(&cas), true);
+
+        // Fan-out forwarder: every engine's outbound frame is delivered to
+        // BOTH of the other two engines' inboxes. Move each out-receiver
+        // out of its Built (replacing with a dead receiver) so the
+        // remaining fields (engine/state) stay usable.
+        let a_in = a.in_tx.clone();
+        let b_in = b.in_tx.clone();
+        let c_in = c.in_tx.clone();
+        let mut a_out = std::mem::replace(&mut a.out_rx, mpsc::channel(1).1);
+        let mut b_out = std::mem::replace(&mut b.out_rx, mpsc::channel(1).1);
+        let mut c_out = std::mem::replace(&mut c.out_rx, mpsc::channel(1).1);
+        let forwarder = {
+            let a_in = a_in.clone();
+            let b_in = b_in.clone();
+            let c_in = c_in.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        Some(frame) = a_out.recv() => {
+                            // A.out -> B.in & C.in
+                            let _ = b_in.send(frame.clone()).await;
+                            let _ = c_in.send(frame).await;
+                        }
+                        Some(frame) = b_out.recv() => {
+                            // B.out -> A.in & C.in
+                            let _ = a_in.send(frame.clone()).await;
+                            let _ = c_in.send(frame).await;
+                        }
+                        Some(frame) = c_out.recv() => {
+                            // C.out -> A.in & B.in
+                            let _ = a_in.send(frame.clone()).await;
+                            let _ = b_in.send(frame).await;
+                        }
+                        else => break,
+                    }
+                }
+            })
+        };
+
+        // A does a local write, then forces a publish.
+        {
+            let mut doc = a.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "from-A".into(),
+                },
+            );
+        }
+        a.engine.flush_now().await.expect("flush A");
+
+        // B and C must both converge to A's entry.
+        let b_state = Arc::clone(&b.state);
+        let c_state = Arc::clone(&c.state);
+        let both_converged = wait_until(
+            || {
+                let b_state = Arc::clone(&b_state);
+                let c_state = Arc::clone(&c_state);
+                async move {
+                    let b_has = b_state
+                        .lock()
+                        .await
+                        .entries
+                        .get("k1")
+                        .is_some_and(|e| e.val == "from-A");
+                    let c_has = c_state
+                        .lock()
+                        .await
+                        .entries
+                        .get("k1")
+                        .is_some_and(|e| e.val == "from-A");
+                    b_has && c_has
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            both_converged,
+            "B and C did not both converge to A's entry within 5s"
+        );
+
+        // An INBOUND merge does NOT schedule a republish, so B and C have
+        // not yet emitted a `seen` digest carrying dev-A's HLC. Force each
+        // to publish so their acknowledgement flows back to A.
+        b.engine.flush_now().await.expect("flush B");
+        c.engine.flush_now().await.expect("flush C");
+
+        // A must now observe that BOTH siblings have acked its latest
+        // state — `synced_device_count` == 2.
+        let synced_two = wait_until(
+            || {
+                let engine = &a.engine;
+                async move { engine.synced_device_count().await == 2 }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            synced_two,
+            "A's synced_device_count never reached 2 (acks from B and C) within 5s; \
+             observed {}",
+            a.engine.synced_device_count().await
+        );
+        assert_eq!(
+            a.engine.synced_device_count().await,
+            2,
+            "synced_device_count should count exactly the two acking siblings"
+        );
+
+        // A freshly-built, isolated engine (no peers, never published) must
+        // report 0 acked devices — "1 device — not yet backed up" maps to
+        // zero synced siblings.
+        let lone = build_engine("dev-lone", Arc::clone(&cas), true);
+        assert_eq!(
+            lone.engine.synced_device_count().await,
+            0,
+            "an isolated engine with no peers must report 0 synced devices"
+        );
+
+        let _ = a.engine.shutdown().await;
+        let _ = b.engine.shutdown().await;
+        let _ = c.engine.shutdown().await;
+        let _ = lone.engine.shutdown().await;
+        forwarder.abort();
+    }
+
     /// CAS wrapper whose `get` misses (returns Ok(None)) until `armed` is
     /// set, after which `get` delegates to the inner store. `put` always
     /// delegates so the blob is present in the inner store from the
@@ -1036,8 +1175,8 @@ mod engine_tests {
             armed: std::sync::atomic::AtomicBool::new(false),
             get_attempts: Arc::clone(&get_attempts),
         });
-        let mut a = build_engine("dev-A", Arc::clone(&inner));
-        let b = build_engine("dev-B", Arc::clone(&gate) as Arc<dyn ContentStore>);
+        let mut a = build_engine("dev-A", Arc::clone(&inner), false);
+        let b = build_engine("dev-B", Arc::clone(&gate) as Arc<dyn ContentStore>, false);
 
         // Forward A.out -> B.in only (one-directional is enough here).
         let b_in = b.in_tx.clone();
@@ -1155,13 +1294,13 @@ mod engine_tests {
         // errors, so the inbound apply fails AFTER the read-only replay
         // check but BEFORE the merge — the tracker must stay un-advanced.
         let inner: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
-        let mut a = build_engine("dev-A", Arc::clone(&inner));
+        let mut a = build_engine("dev-A", Arc::clone(&inner), false);
         let get_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let err_cas: Arc<dyn ContentStore> = Arc::new(ErrGetCas {
             inner: Arc::clone(&inner),
             get_attempts: Arc::clone(&get_attempts),
         });
-        let b = build_engine("dev-B", err_cas);
+        let b = build_engine("dev-B", err_cas, false);
 
         // Capture exactly one valid wire frame from A.
         {
