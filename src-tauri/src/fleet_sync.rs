@@ -585,13 +585,39 @@ where
 /// donor `owner_state_sync::next_hlc` wall-ms / logical-saturation logic
 /// exactly.
 pub async fn mint_next_hlc(tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>, device_id: &str) -> Hlc {
+    let wall_ms = now_wall_ms();
+    let mut tracker = tracker.lock().await;
+    let now = compute_next_hlc(&tracker, device_id, wall_ms);
+    tracker.insert(device_id.to_string(), now.clone());
+    now
+}
+
+/// Compute the HLC that `mint_next_hlc` *would* produce from the current
+/// tracker, **without** advancing it. Lets a caller decide whether a write
+/// will actually apply before committing the HLC — minting on a no-op write
+/// would advance `tracker[device]` above the last published HLC with no
+/// corresponding publish, skewing the durability indicator and wasting a tick.
+///
+/// There is an inherent (sub-millisecond) race with a subsequent
+/// `mint_next_hlc`: the real mint reads the clock again and the tracker may
+/// have advanced, so the minted HLC is always `>=` this peek. That direction
+/// is the safe one — if this peek is strictly-newer-than some value, the real
+/// mint is too.
+pub fn peek_next_hlc(tracker_snapshot: &BTreeMap<String, Hlc>, device_id: &str) -> Hlc {
+    compute_next_hlc(tracker_snapshot, device_id, now_wall_ms())
+}
+
+fn now_wall_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let wall_ms = SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
 
-    let mut tracker = tracker.lock().await;
+/// Pure HLC computation shared by `mint_next_hlc` (which commits the result to
+/// the tracker) and `peek_next_hlc` (which does not). No side effects.
+fn compute_next_hlc(tracker: &BTreeMap<String, Hlc>, device_id: &str, wall_ms: u64) -> Hlc {
     // Read once — both the logical-counter computation and the
     // effective-wall pin need the same `prev`. Re-fetching from the map
     // is cheap but invites future divergence; folding into one lookup
@@ -607,8 +633,8 @@ pub async fn mint_next_hlc(tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>, device_i
     // device on the same wall_ms tick would be rejected by the receiver
     // until the wall clock advances, which is preferable to silent
     // replay.
-    let prev = tracker.get(device_id).cloned();
-    let (logical, prev_wall) = match prev.as_ref() {
+    let prev = tracker.get(device_id);
+    let (logical, prev_wall) = match prev {
         Some(p) if p.wall_ms == wall_ms => (p.logical.saturating_add(1), p.wall_ms),
         Some(p) if p.wall_ms > wall_ms => (p.logical.saturating_add(1), p.wall_ms),
         Some(p) => (0, p.wall_ms),
@@ -616,13 +642,11 @@ pub async fn mint_next_hlc(tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>, device_i
     };
     let effective_wall = std::cmp::max(wall_ms, prev_wall);
 
-    let now = Hlc {
+    Hlc {
         wall_ms: effective_wall,
         logical,
         device_id: device_id.to_string(),
-    };
-    tracker.insert(device_id.to_string(), now.clone());
-    now
+    }
 }
 
 /// Outcome of processing one inbound state-root publish.

@@ -58,15 +58,35 @@ pub(crate) async fn notes_upsert_core(
     if trimmed.is_empty() {
         return Err("note text is empty".into());
     }
-    let at = crate::fleet_sync::mint_next_hlc(tracker, device_id).await;
     let id = id.unwrap_or_else(new_ulid);
     let mut d = doc.lock().await;
+    // Mint the HLC (which advances the shared tracker) only when the write will
+    // actually apply. For an EXISTING note, peek the HLC `mint_next_hlc` would
+    // produce and bail early if it wouldn't beat the note's current
+    // `updated_at` (a concurrent newer edit/delete already won). Minting on
+    // such a no-op would push `tracker[device]` above our last published HLC
+    // with no corresponding publish — skewing the durability indicator and
+    // wasting a tick. A brand-new note (no entry yet) always applies, so it
+    // skips the peek and mints unconditionally. Lock order is doc→tracker
+    // (matches `notes_delete_core`); deadlock-free since no path locks the
+    // tracker while holding the doc in the opposite order.
+    if let Some(existing) = d.notes.get(&id) {
+        let candidate = {
+            let t = tracker.lock().await;
+            crate::fleet_sync::peek_next_hlc(&t, device_id)
+        };
+        if !candidate.is_strictly_newer_than(&existing.updated_at) {
+            return Err(
+                "note upsert was superseded (a newer edit or delete already won)".to_string(),
+            );
+        }
+    }
+    let at = crate::fleet_sync::mint_next_hlc(tracker, device_id).await;
     d.upsert(id.clone(), trimmed, at);
-    // `upsert` is a no-op for a stale HLC and `get` filters tombstoned notes,
-    // so a concurrent delete/newer-edit on another device can make this `get`
-    // return `None`. Surface that as a recoverable error rather than panicking
-    // (reachable once edits target an existing id, incl. the idempotent
-    // migration in notes-migrate.ts).
+    // Defensive: even after the peek, a concurrent tombstone with a newer HLC
+    // could land between the peek and this upsert, making it a no-op (`get`
+    // filters tombstoned notes → `None`). Surface that as a recoverable error
+    // rather than panicking.
     d.get(&id).map(to_view).ok_or_else(|| {
         "note upsert was superseded (stale write or the note was deleted on another device)"
             .to_string()
@@ -272,6 +292,14 @@ mod tests {
         );
         // The note stays deleted (the stale edit did not resurrect it).
         assert!(doc.lock().await.get(&id).is_none());
+        // And — the fix for the "HLC minted before failed upsert" skew — the
+        // superseded write must NOT have advanced the tracker: minting on a
+        // no-op would push tracker[dev-B] above any published HLC with no
+        // corresponding publish, undercounting the durability indicator.
+        assert!(
+            stale_tracker.lock().await.get("dev-B").is_none(),
+            "a superseded upsert must not mint an HLC (tracker stays unadvanced)"
+        );
     }
 
     #[tokio::test]
