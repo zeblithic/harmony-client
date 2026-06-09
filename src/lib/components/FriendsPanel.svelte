@@ -630,6 +630,22 @@
     return cardName(r.ownerIdHex) || r.display || shortId(r.ownerIdHex);
   }
 
+  // ZEB-419: open the owner-card drill-down (App's ProfilePopover owner-card
+  // mode). The popover shows the peer's REAL signed card name + full owner_id —
+  // never the local nickname — so a misleading nickname can't mask identity.
+  function openIdentity(ownerIdHex: string, ev: MouseEvent): void {
+    const resolved = cardService?.resolve(ownerIdHex);
+    onOpenCard?.(
+      {
+        ownerIdHex,
+        displayName: resolved?.displayName ?? '',
+        statusText: resolved?.statusText ?? '',
+        avatarUrl: resolved?.avatarUrl,
+      },
+      ev,
+    );
+  }
+
   // Reconcile the dedicated card service's subscriptions to the current friend +
   // pending owner_id set whenever those lists change. subscribeVisible is
   // idempotent and reconciles (unsubscribes owners that left the lists).
@@ -669,7 +685,13 @@
           />
           <div class="friend-id">
             <span class="friend-name" data-testid="friend-name-{f.ownerIdHex}">{friendLabel(f)}</span>
-            <span class="friend-addr" title={f.ownerIdHex}>{shortId(f.ownerIdHex)}</span>
+            <button
+              type="button"
+              class="friend-addr identity-btn"
+              title="Verify identity — show full key"
+              data-testid="friend-identity-{f.ownerIdHex}"
+              onclick={(e) => openIdentity(f.ownerIdHex, e)}
+            >{shortId(f.ownerIdHex)}</button>
           </div>
           <!-- ZEB-375 Phase 2a: the referrable opt-in + browse action only work
                for Active friends — the backend returns a typed error for
@@ -866,7 +888,13 @@
             />
             <div class="friend-id">
               <span class="friend-name" data-testid="friend-name-{req.ownerIdHex}">{requestLabel(req)}</span>
-              <span class="friend-addr" title={req.ownerIdHex}>{shortId(req.ownerIdHex)}</span>
+              <button
+                type="button"
+                class="friend-addr identity-btn"
+                title="Verify identity — show full key"
+                data-testid="friend-identity-{req.ownerIdHex}"
+                onclick={(e) => openIdentity(req.ownerIdHex, e)}
+              >{shortId(req.ownerIdHex)}</button>
             </div>
             <div class="request-actions">
               <button
@@ -1119,6 +1147,25 @@
     font-size: 11px;
     color: var(--text-secondary);
     font-family: var(--font-mono, monospace);
+  }
+
+  /* ZEB-419: the short-hex line doubles as the identity drill-down trigger.
+     Reset button chrome but keep the .friend-addr font/colour. */
+  .identity-btn {
+    background: transparent;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+  }
+  .identity-btn:hover {
+    text-decoration: underline;
+    color: var(--text-primary);
+  }
+  .identity-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+    border-radius: 2px;
   }
 
   .unfriend-btn {

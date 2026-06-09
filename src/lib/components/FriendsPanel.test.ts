@@ -433,4 +433,24 @@ describe('FriendsPanel — owner names + nicknames (ZEB-419)', () => {
     await fireEvent.click(getByTestId(`nickname-save-${id}`));
     expect(setNickname).toHaveBeenCalledWith(id, null);
   });
+
+  it('identity drill-down opens the owner card with full hex + real card name (not the nickname)', async () => {
+    const id = 'a'.repeat(32);
+    const friends = [
+      { ownerIdHex: id, display: null, nickname: 'Nick', status: 'active', establishedVia: 'mutual_key', referrable: false },
+    ];
+    const service = mockService({ listFriends: vi.fn().mockResolvedValue(friends) });
+    const cardService = mockCardService({ [id]: { displayName: 'RealCardName', statusText: 'hi' } });
+    const onOpenCard = vi.fn();
+    const { findByTestId, getByTestId } = render(FriendsPanel, {
+      props: { service, cardService, onOpenCard },
+    });
+    await findByTestId('friend-list');
+
+    await fireEvent.click(getByTestId(`friend-identity-${id}`));
+    expect(onOpenCard).toHaveBeenCalledTimes(1);
+    const payload = onOpenCard.mock.calls[0][0];
+    expect(payload.ownerIdHex).toBe(id); // FULL hex, not short
+    expect(payload.displayName).toBe('RealCardName'); // the signed card name, NOT 'Nick'
+  });
 });
