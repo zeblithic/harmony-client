@@ -27,6 +27,20 @@ function mockService(overrides: Partial<FriendService> = {}): FriendService {
   } as unknown as FriendService;
 }
 
+// ZEB-419: a stand-in for the dedicated MemberCardService the panel runs. Only
+// the surface the panel touches (resolve / subscribeVisible / unsubscribeAll /
+// onUpdate) is implemented.
+function mockCardService(
+  cards: Record<string, { displayName: string; avatarUrl?: string; statusText?: string }> = {},
+) {
+  return {
+    onUpdate: undefined as (() => void) | undefined,
+    resolve: vi.fn((id: string) => cards[id.toLowerCase()]),
+    subscribeVisible: vi.fn().mockResolvedValue(undefined),
+    unsubscribeAll: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 const writeText = vi.fn().mockResolvedValue(undefined);
 
 beforeEach(() => {
@@ -333,5 +347,54 @@ describe('FriendsPanel — add-by-key auto-retry (ZEB-415 #2)', () => {
 
     // The post-refresh `startAddRetry` must not run after teardown.
     expect(addByKey).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('FriendsPanel — owner names + nicknames (ZEB-419)', () => {
+  const ID = (b: string) => b.repeat(32); // 16-byte owner_id = 32 hex chars
+
+  it('label ladder: nickname > card name > display hint > short-hex', async () => {
+    const friends = [
+      { ownerIdHex: ID('a'), display: null, nickname: 'Nick', status: 'active', establishedVia: 'mutual_key', referrable: false },
+      { ownerIdHex: ID('b'), display: 'Hint', nickname: null, status: 'active', establishedVia: 'token', referrable: false },
+      { ownerIdHex: ID('c'), display: 'Hint', nickname: null, status: 'active', establishedVia: 'token', referrable: false },
+      { ownerIdHex: ID('d'), display: null, nickname: null, status: 'active', establishedVia: 'mutual_key', referrable: false },
+    ];
+    const service = mockService({ listFriends: vi.fn().mockResolvedValue(friends) });
+    const cardService = mockCardService({ [ID('c')]: { displayName: 'CardName' } });
+    const { findByTestId, getByTestId } = render(FriendsPanel, {
+      props: { service, cardService },
+    });
+    await findByTestId('friend-list');
+
+    expect(getByTestId(`friend-name-${ID('a')}`).textContent).toBe('Nick'); // nickname wins
+    expect(getByTestId(`friend-name-${ID('b')}`).textContent).toBe('Hint'); // display hint (no card)
+    expect(getByTestId(`friend-name-${ID('c')}`).textContent).toBe('CardName'); // card beats hint
+    expect(getByTestId(`friend-name-${ID('d')}`).textContent).toContain('dddddddddddd'); // short-hex
+  });
+
+  it('subscribes to friend + pending owner_ids and unsubscribes on unmount', async () => {
+    const friends = [
+      { ownerIdHex: ID('a'), display: null, nickname: null, status: 'active', establishedVia: 'mutual_key', referrable: false },
+    ];
+    const pending = [{ ownerIdHex: ID('b'), display: null, receivedAtMs: 0 }];
+    const service = mockService({
+      listFriends: vi.fn().mockResolvedValue(friends),
+      listPendingRequests: vi.fn().mockResolvedValue(pending),
+    });
+    const cardService = mockCardService();
+    const { findByTestId, unmount } = render(FriendsPanel, {
+      props: { service, cardService },
+    });
+    await findByTestId('friend-list');
+
+    await vi.waitFor(() =>
+      expect(cardService.subscribeVisible).toHaveBeenCalledWith(
+        expect.arrayContaining([ID('a'), ID('b')]),
+      ),
+    );
+
+    unmount();
+    expect(cardService.unsubscribeAll).toHaveBeenCalled();
   });
 });

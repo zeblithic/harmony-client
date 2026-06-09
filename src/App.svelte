@@ -1052,6 +1052,13 @@
   // FriendsPanel.
   const friendService = new FriendService();
   $effect(() => () => friendService.destroy());
+  // ZEB-419: a SECOND MemberCardService dedicated to the Friends panel. It must
+  // NOT share the roster instance: subscribeVisible(ids) reconciles to EXACTLY
+  // the passed set, so friends + roster would unsubscribe each other. The panel
+  // drives its subscriptions and owns its onUpdate; App only wires the adapter +
+  // avatar resolver (below).
+  const friendCardService = new MemberCardService();
+  $effect(() => () => void friendCardService.unsubscribeAll());
   const channelMessageService = new ChannelMessageService();
   $effect(() => () => channelMessageService.destroy());
 
@@ -1062,6 +1069,8 @@
   // nav nodes. Task 11's setAvatarResolver does NOT touch resolver.onChange, so
   // setting the combined onChange immediately below is safe regardless of order.
   memberCardService.setAvatarResolver(avatarResolver);
+  // ZEB-419: same shared resolver for the friends-panel card service.
+  friendCardService.setAvatarResolver(avatarResolver);
 
   // When avatar CIDs finish resolving, push blob URLs into BOTH stored
   // nav profiles/nodes AND peer member cards so every avatar surface
@@ -1332,6 +1341,8 @@
       // seedSelf/resolve work at boot before Tauri-init); wire the adapter
       // now so cross-peer subscriptions can start.
       memberCardService.setAdapter(adapter);
+      // ZEB-419: wire the same adapter into the friends-panel card service.
+      friendCardService.setAdapter(adapter);
 
       // ZEB-298 PR 2 Task 10 — wire the voting adapter so the
       // delegate-on-behalf Tauri event can fire toast notifications.
@@ -2750,7 +2761,11 @@
       onTrustChange={handleTrustChange}
     />
     <NetworkDiscoverabilitySettings />
-    <FriendsPanel service={friendService} />
+    <FriendsPanel
+      service={friendService}
+      cardService={friendCardService}
+      onOpenCard={openMemberCard}
+    />
   {/snippet}
   {#snippet vineFeed()}
     <VineFeed

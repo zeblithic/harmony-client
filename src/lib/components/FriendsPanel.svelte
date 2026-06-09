@@ -31,12 +31,31 @@
     setIdentityDiscoverable,
     onIdentityDiscoverableChanged,
   } from '../connectivity-adapter';
+  import Avatar from './Avatar.svelte';
+  import type { MemberCardService } from '../member-card-service';
+  import type { OpenCardPayload } from './MemberRow.svelte';
 
-  let { service }: { service: FriendService } = $props();
+  let {
+    service,
+    cardService,
+    onOpenCard,
+  }: {
+    service: FriendService;
+    /** ZEB-419: dedicated MemberCardService for live friend/request names +
+     *  avatars (App injects it). Optional so unit tests can omit it; when
+     *  absent, names fall back to the frozen hint / short-hex. */
+    cardService?: MemberCardService;
+    /** ZEB-419: open the owner-card drill-down popover (App's openMemberCard). */
+    onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
+  } = $props();
 
   let friends = $state<FriendDto[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  // ZEB-419: bumped by the dedicated card service's onUpdate (poll/event) so the
+  // name/avatar helpers re-read resolve() and the rows repaint.
+  let cardVersion = $state(0);
 
   // Generate-link state.
   let generatedUrl = $state<string | null>(null);
@@ -225,6 +244,13 @@
   }
 
   onMount(() => {
+    // ZEB-419: repaint names/avatars when the dedicated card service resolves a
+    // card (poll or member-card-received event). Guard post-teardown writes.
+    if (cardService) {
+      cardService.onUpdate = () => {
+        if (!destroyed) cardVersion += 1;
+      };
+    }
     // Re-fetch friends whenever the backend signals a change.
     unsubscribeChanged = service.onFriendsChanged(() => {
       void refresh();
@@ -259,6 +285,11 @@
     // write `identityDiscoverable` after we've unmounted (CodeRabbit).
     discoverableGen += 1;
     stopAddRetry();
+    // ZEB-419: stop card updates + drop all friend/request card subscriptions.
+    if (cardService) {
+      cardService.onUpdate = undefined;
+      void cardService.unsubscribeAll();
+    }
     if (myKeyCopiedTimer) clearTimeout(myKeyCopiedTimer);
     myKeyCopiedTimer = null;
   });
@@ -539,6 +570,40 @@
   function shortId(hex: string): string {
     return hex.length > 12 ? `${hex.slice(0, 12)}…` : hex;
   }
+
+  // ── ZEB-419: live owner-card resolution (name + avatar) ───────────────────
+  // Reading `cardVersion` inside these helpers makes the template re-render when
+  // a poll/event fills a card. Empty strings fall through (`||` not `??`) so a
+  // blank card name never masks a usable hint.
+  function cardName(ownerIdHex: string): string | undefined {
+    cardVersion;
+    return cardService?.resolve(ownerIdHex)?.displayName || undefined;
+  }
+  function cardAvatarUrl(ownerIdHex: string): string | undefined {
+    cardVersion;
+    return cardService?.resolve(ownerIdHex)?.avatarUrl;
+  }
+  // Label ladder: personal nickname ► live card name ► frozen link hint ►
+  // short owner_id. The short-hex line under the name stays the verifiable id.
+  function friendLabel(f: FriendDto): string {
+    return f.nickname || cardName(f.ownerIdHex) || f.display || shortId(f.ownerIdHex);
+  }
+  // Pending requests have no nickname rung (you nickname a peer after accepting).
+  function requestLabel(r: PendingFriendRequestDto): string {
+    return cardName(r.ownerIdHex) || r.display || shortId(r.ownerIdHex);
+  }
+
+  // Reconcile the dedicated card service's subscriptions to the current friend +
+  // pending owner_id set whenever those lists change. subscribeVisible is
+  // idempotent and reconciles (unsubscribes owners that left the lists).
+  $effect(() => {
+    if (!cardService) return;
+    const ids = [
+      ...friends.map((f) => f.ownerIdHex),
+      ...pendingRequests.map((r) => r.ownerIdHex),
+    ];
+    void cardService.subscribeVisible(ids);
+  });
 </script>
 
 <div class="friends-section" data-testid="friends-panel">
@@ -559,8 +624,14 @@
     <ul class="friend-list" data-testid="friend-list">
       {#each friends as f (f.ownerIdHex)}
         <li class="friend-row">
+          <Avatar
+            address={f.ownerIdHex}
+            displayName={friendLabel(f)}
+            avatarUrl={cardAvatarUrl(f.ownerIdHex)}
+            size={28}
+          />
           <div class="friend-id">
-            <span class="friend-name">{f.display ?? shortId(f.ownerIdHex)}</span>
+            <span class="friend-name" data-testid="friend-name-{f.ownerIdHex}">{friendLabel(f)}</span>
             <span class="friend-addr" title={f.ownerIdHex}>{shortId(f.ownerIdHex)}</span>
           </div>
           <!-- ZEB-375 Phase 2a: the referrable opt-in + browse action only work
@@ -710,8 +781,14 @@
       <ul class="friend-list" data-testid="pending-list">
         {#each pendingRequests as req (req.ownerIdHex)}
           <li class="friend-row">
+            <Avatar
+              address={req.ownerIdHex}
+              displayName={requestLabel(req)}
+              avatarUrl={cardAvatarUrl(req.ownerIdHex)}
+              size={28}
+            />
             <div class="friend-id">
-              <span class="friend-name">{req.display ?? shortId(req.ownerIdHex)}</span>
+              <span class="friend-name" data-testid="friend-name-{req.ownerIdHex}">{requestLabel(req)}</span>
               <span class="friend-addr" title={req.ownerIdHex}>{shortId(req.ownerIdHex)}</span>
             </div>
             <div class="request-actions">
