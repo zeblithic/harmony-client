@@ -70,3 +70,34 @@ fn no_tauri_command_uses_snake_case_rename() {
         offenders.join("\n"),
     );
 }
+
+/// ZEB-419: `set_friend_nickname` must use a plain `#[tauri::command]` so its
+/// `owner_id_hex` / `nickname` Rust params map from the frontend's camelCase
+/// `ownerIdHex` / `nickname` keys (mirroring `accept_friend_request` /
+/// `add_friend_by_key`). A `rename_all = "snake_case"` override here would make
+/// the IPC reject the panel's `setNickname(ownerIdHex, …)` call with
+/// `missing required key ownerIdHex`. The general scan above already forbids the
+/// override crate-wide; this pins the specific friend command + its arg shape so
+/// a refactor of *this* IPC can't silently regress the casing contract.
+#[test]
+fn set_friend_nickname_takes_camelcase_args_via_plain_command() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lib_rs = root.join("src").join("lib.rs");
+    let src = fs::read_to_string(&lib_rs).expect("read src/lib.rs");
+
+    // The exact signature line we ship. Its presence proves: (a) the fn exists,
+    // (b) it declares snake_case Rust params `owner_id_hex` + `nickname` (Tauri
+    // maps the JS camelCase `ownerIdHex`/`nickname` onto these), and — paired
+    // with the crate-wide `no_tauri_command_uses_snake_case_rename` scan — that
+    // it carries NO `rename_all` override, so the JS keys stay camelCase.
+    assert!(
+        src.contains("async fn set_friend_nickname("),
+        "set_friend_nickname IPC not found in src/lib.rs",
+    );
+    assert!(
+        src.contains("owner_id_hex: String,") && src.contains("nickname: Option<String>,"),
+        "set_friend_nickname must declare snake_case Rust params `owner_id_hex` + \
+         `nickname` so the frontend's camelCase `ownerIdHex`/`nickname` keys map \
+         through Tauri (ZEB-414 / ZEB-419)",
+    );
+}

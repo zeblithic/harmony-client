@@ -35814,6 +35814,48 @@ async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Re
     Ok(pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known)
 }
 
+/// ZEB-419: set or clear the local-only nickname for a friend (by owner_id hex).
+/// `nickname = None`/blank clears it. Persists to `friend_nicknames.json` beside
+/// the connectivity settings, then emits `friend-list-changed` so the panel
+/// re-fetches with the new label. Local-only: never published or synced.
+#[tauri::command]
+async fn set_friend_nickname(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+    nickname: Option<String>,
+) -> Result<(), String> {
+    // Validate the owner_id (reject malformed before any write). decode_owner_id_16
+    // is the 16-byte master owner_id decoder used by the other friend IPCs.
+    let _ = decode_owner_id_16(&owner_id_hex)?;
+
+    let path = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .pkarr_settings_path
+            .clone()
+    };
+    let Some(path) = path else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+    let nick_path = path.with_file_name("friend_nicknames.json");
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let mut store = crate::friend_nicknames::FriendNicknames::load_or_default(&nick_path);
+    store.set(&owner_id_hex, nickname.as_deref(), now_ms);
+    store
+        .save(&nick_path)
+        .map_err(|e| format!("save friend_nicknames: {e}"))?;
+
+    let _ = app.emit("friend-list-changed", ());
+    Ok(())
+}
+
 /// Outcome of a Path-A `add_friend_by_key` initiate.
 ///
 /// `rename_all` camelCases the variant tags (`linked`/`pending`/`unreachable`);
@@ -37982,6 +38024,7 @@ pub fn run() {
             decline_friend_request,
             set_friend_auto_accept,
             get_friend_auto_accept,
+            set_friend_nickname,
             // ZEB-329: Network Health IPCs.
             network_health_snapshot,
             network_health_run_self_test,
