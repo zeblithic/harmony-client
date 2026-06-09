@@ -14,6 +14,18 @@
 //! peer's next publish is retried rather than silently lost. This is the
 //! opposite of the donor `owner_state_sync` advance-before-apply scheme,
 //! which is intentionally NOT replicated here.
+//!
+//! ## SP1↔SP2 seam (the Butler, ZEB-418)
+//!
+//! SP2 (the Butler) deposits into a fleet dataset through exactly two
+//! operations and never reaches into replication:
+//!   * `write(dataset, op)` — a consumer mutates the dataset's `S` under its
+//!     lock, then calls `FleetSyncEngine::notify_dirty` to schedule the
+//!     debounced publish/fan-out. (The Notes IPC commands are the reference
+//!     `write` site.)
+//!   * `FleetSyncEngine::list_online_devices` — the butler-set source. SP1
+//!     derives it best-effort from the replay tracker (devices seen
+//!     publishing recently); SP2 refines "online" with liveness/presence.
 
 use crate::content_store::{ContentStore, ContentStoreError};
 use crate::owner_state_crypto::{
@@ -1358,5 +1370,97 @@ mod engine_tests {
 
         let _ = a.engine.shutdown().await;
         let _ = b.engine.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_online_devices_returns_seen_peers_excluding_self() {
+        // Build A and B sharing one CAS. A publishes, B merges A's state.
+        // After convergence:
+        //   - B.list_online_devices() == ["dev-A"]  (B saw A publish)
+        //   - A.list_online_devices() does NOT contain "dev-A" (A's tracker
+        //     only has its own entry from publishing, which is excluded by
+        //     the self-filter).
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let mut a = build_engine("dev-A", Arc::clone(&cas), false);
+        let mut b = build_engine("dev-B", Arc::clone(&cas), false);
+
+        // Bidirectional forwarder (same pattern as two_engines_converge).
+        let a_in = a.in_tx.clone();
+        let b_in = b.in_tx.clone();
+        let mut a_out = std::mem::replace(&mut a.out_rx, mpsc::channel(1).1);
+        let mut b_out = std::mem::replace(&mut b.out_rx, mpsc::channel(1).1);
+        let forwarder = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(frame) = a_out.recv() => {
+                        let _ = b_in.send(frame).await;
+                    }
+                    Some(frame) = b_out.recv() => {
+                        let _ = a_in.send(frame).await;
+                    }
+                    else => break,
+                }
+            }
+        });
+
+        // A writes an entry and publishes.
+        {
+            let mut doc = a.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "from-A".into(),
+                },
+            );
+        }
+        a.engine.flush_now().await.expect("flush A");
+
+        // Wait until B has merged A's entry (B's tracker now has "dev-A").
+        let b_state = Arc::clone(&b.state);
+        let converged = wait_until(
+            || {
+                let b_state = Arc::clone(&b_state);
+                async move {
+                    b_state
+                        .lock()
+                        .await
+                        .entries
+                        .get("k1")
+                        .is_some_and(|e| e.val == "from-A")
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(converged, "B did not converge to A's entry within 5s");
+
+        // B must report "dev-A" as an online peer (it merged A's publish).
+        let mut b_online = b.engine.list_online_devices().await;
+        b_online.sort();
+        assert_eq!(
+            b_online,
+            vec!["dev-A".to_string()],
+            "B.list_online_devices() must equal [\"dev-A\"] after merging A's publish"
+        );
+
+        // B's own id must NOT appear in the list (self-exclusion).
+        assert!(
+            !b_online.contains(&"dev-B".to_string()),
+            "B.list_online_devices() must not contain B's own device id"
+        );
+
+        // A's tracker only records its own entry (from the publish path,
+        // which inserts the publisher's own device_id). The self-filter
+        // must exclude it, yielding an empty list.
+        let a_online = a.engine.list_online_devices().await;
+        assert!(
+            !a_online.contains(&"dev-A".to_string()),
+            "A.list_online_devices() must not contain A's own device id"
+        );
+
+        let _ = a.engine.shutdown().await;
+        let _ = b.engine.shutdown().await;
+        forwarder.abort();
     }
 }
