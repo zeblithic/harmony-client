@@ -26,6 +26,11 @@
     PendingFriendRequestDto,
     ReferralView,
   } from '../friend-service';
+  import {
+    getIdentityDiscoverable,
+    setIdentityDiscoverable,
+    onIdentityDiscoverableChanged,
+  } from '../connectivity-adapter';
 
   let { service }: { service: FriendService } = $props();
 
@@ -72,12 +77,39 @@
   let addingByKey = $state(false);
   let addByKeyStatus = $state<string | null>(null);
 
+  // ── ZEB-415 #2: in-panel auto-retry of a pending outbound add ─────────────
+  // The mutual-key handshake is synchronous with no server-push: after we send a
+  // request the link only completes when WE dial again (once the peer accepts).
+  // Rather than make the user guess when to re-press Connect, we re-attempt on a
+  // bounded interval and surface "now connected" the instant it links.
+  const ADD_RETRY_INTERVAL_MS = 10_000;
+  const ADD_RETRY_MAX_ATTEMPTS = 30; // ~5-minute ceiling
+  let addRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  // Bumped to invalidate an in-flight retry chain (supersede / cancel / destroy).
+  let addRetryGeneration = 0;
+  // Set once in onDestroy. Any async path that resumes after teardown (the
+  // initial add awaiting `addByKey`, a retry tick awaiting `refresh`) checks
+  // this before touching state or scheduling new timers.
+  let destroyed = false;
+
   // ── ZEB-388: my own identity pub hex (share for add-by-key) ───────────────
   let myKeyHex = $state<string | null>(null);
   let myKeyCopied = $state(false);
   // Handle for the "Copied!" reset timer — cleared on re-click and on destroy
   // so we never mutate $state after the component unmounts.
   let myKeyCopiedTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ── ZEB-415 #1: discovery-off footgun guard ───────────────────────────────
+  // Tri-state: null = unknown (still loading — show nothing), false = OFF (warn:
+  // peers can't add us by key), true = ON. A read failure stays null so a
+  // transient error never nags the user with a false warning.
+  let identityDiscoverable = $state<boolean | null>(null);
+  let enablingDiscovery = $state(false);
+  let unsubscribeDiscoverable: (() => void) | null = null;
+  // Bumped by any authoritative update (change event / inline Enable). The
+  // mount-time read captures this before awaiting and bails if it changed, so a
+  // slow initial read can't clobber a fresher value when it finally resolves.
+  let discoverableGen = 0;
 
   // Auto-accept toggle.
   let autoAccept = $state(false);
@@ -151,6 +183,47 @@
     }
   }
 
+  // ZEB-415 #1: read the case-B "Allow discovery by identity address" toggle so
+  // the "My key" section can warn when sharing the key is futile (peers resolve
+  // the identity-keyed pkarr record, which is only published when discovery is on).
+  async function loadDiscoverable(): Promise<void> {
+    const gen = discoverableGen;
+    try {
+      const value = await getIdentityDiscoverable();
+      // A change event or inline Enable that landed while we were awaiting is
+      // strictly fresher than this mount-time snapshot — don't overwrite it.
+      if (gen !== discoverableGen) return;
+      identityDiscoverable = value;
+    } catch (e) {
+      // A read failure must NOT nag the user with a (possibly false) warning;
+      // leave the tri-state at null. Log so a real backend fault stays visible.
+      console.error(
+        'getIdentityDiscoverable failed:',
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  }
+
+  async function handleEnableDiscovery(): Promise<void> {
+    if (enablingDiscovery) return;
+    enablingDiscovery = true;
+    try {
+      await setIdentityDiscoverable(true);
+      if (destroyed) return; // unmounted mid-toggle — don't touch state
+      // Optimistic clear — the `connectivity-identity-discoverable-changed`
+      // event will also flip this, but updating now hides the warning at once.
+      identityDiscoverable = true;
+      discoverableGen += 1;
+    } catch (e) {
+      console.error(
+        'setIdentityDiscoverable failed:',
+        e instanceof Error ? e.message : String(e),
+      );
+    } finally {
+      enablingDiscovery = false;
+    }
+  }
+
   onMount(() => {
     // Re-fetch friends whenever the backend signals a change.
     unsubscribeChanged = service.onFriendsChanged(() => {
@@ -164,6 +237,13 @@
     void refreshPending();
     void loadAutoAccept();
     void loadMyKey();
+    void loadDiscoverable();
+    // Keep the warning in lockstep with the discovery toggle wherever it's
+    // flipped (e.g. the Network settings panel), not just our inline Enable.
+    unsubscribeDiscoverable = onIdentityDiscoverableChanged((enabled) => {
+      identityDiscoverable = enabled;
+      discoverableGen += 1;
+    });
   });
 
   onDestroy(() => {
@@ -171,6 +251,14 @@
     unsubscribeChanged = null;
     unsubscribePendingChanged?.();
     unsubscribePendingChanged = null;
+    unsubscribeDiscoverable?.();
+    unsubscribeDiscoverable = null;
+    // Block any async path that resumes after teardown (initial add / retry).
+    destroyed = true;
+    // Cancel any in-flight `loadDiscoverable` read so its late resolve can't
+    // write `identityDiscoverable` after we've unmounted (CodeRabbit).
+    discoverableGen += 1;
+    stopAddRetry();
     if (myKeyCopiedTimer) clearTimeout(myKeyCopiedTimer);
     myKeyCopiedTimer = null;
   });
@@ -324,23 +412,107 @@
     }
   }
 
+  // Cancel any in-flight pending-add retry chain (on supersede / destroy).
+  function stopAddRetry(): void {
+    addRetryGeneration += 1;
+    if (addRetryTimer) {
+      clearTimeout(addRetryTimer);
+      addRetryTimer = null;
+    }
+  }
+
+  // Begin retrying `add_friend_by_key` for a key that returned `pending`. Each
+  // tick re-dials; a `linked` result reports success and stops, anything else
+  // (still pending, a transient `unreachable`, a transient dial error) keeps
+  // waiting until the bounded window elapses. The `generation` guard makes a
+  // superseded or post-unmount tick a no-op so we never mutate $state after
+  // teardown or run two chains at once.
+  function startAddRetry(key: string): void {
+    stopAddRetry();
+    const generation = addRetryGeneration;
+    let attempt = 0;
+    // Why the latest attempt didn't link, so the terminal (max-attempts) message
+    // reflects reality — "they haven't accepted" vs "couldn't reach them" vs a
+    // hard error — instead of always blaming a missing accept (Cursor).
+    let lastReason = 'they have not accepted yet';
+    const waitingCopy =
+      "Request sent — they'll need to accept. We'll connect automatically once they do.";
+    const tick = async (): Promise<void> => {
+      if (generation !== addRetryGeneration) return;
+      try {
+        const outcome = await service.addByKey(key);
+        if (generation !== addRetryGeneration) return; // superseded while awaiting
+        if (outcome.kind === 'linked') {
+          addByKeyStatus = `Now connected with ${outcome.display ?? shortId(outcome.ownerIdHex)}`;
+          addRetryTimer = null;
+          // Re-check teardown before the (async) refresh — the panel may have
+          // unmounted while we awaited the dial (Cursor).
+          if (!destroyed) await refresh();
+          return;
+        }
+        if (outcome.kind === 'unreachable') {
+          lastReason = 'we could not reach them on the last try';
+        } else {
+          // 'pending' → the expected wait; re-assert the calm copy in case a
+          // prior transient error had replaced it.
+          lastReason = 'they have not accepted yet';
+          addByKeyStatus = waitingCopy;
+        }
+      } catch (e) {
+        if (generation !== addRetryGeneration) return;
+        const msg = e instanceof Error ? e.message : String(e);
+        // Keep retrying (the throw is usually a transient dial blip while the
+        // peer is still offline), but surface the failure now rather than hide
+        // it behind the rosy "we'll connect automatically" copy.
+        console.debug(
+          `add-by-key auto-retry attempt ${attempt + 1} failed (still retrying):`,
+          msg,
+        );
+        lastReason = `the last attempt failed: ${msg}`;
+        addByKeyStatus = `Still trying to connect — ${lastReason}.`;
+      }
+      attempt += 1;
+      if (attempt >= ADD_RETRY_MAX_ATTEMPTS) {
+        // Terminal message names the actual last outcome, not a blanket "still
+        // waiting to accept" (Cursor) — and doesn't clobber a surfaced error.
+        addByKeyStatus = `Stopped trying to connect — ${lastReason}. Press Connect again to retry.`;
+        addRetryTimer = null;
+        return;
+      }
+      addRetryTimer = setTimeout(() => void tick(), ADD_RETRY_INTERVAL_MS);
+    };
+    addRetryTimer = setTimeout(() => void tick(), ADD_RETRY_INTERVAL_MS);
+  }
+
   async function handleAddByKey(): Promise<void> {
     const key = addByKeyInput.trim();
     if (addingByKey || key.length === 0) return;
+    // A fresh add supersedes any prior pending-add retry chain.
+    stopAddRetry();
     addingByKey = true;
     addByKeyStatus = null;
     try {
       const outcome = await service.addByKey(key);
+      // The panel may have been torn down while the add was in flight — don't
+      // mutate state or start a retry chain after unmount (CodeAnt).
+      if (destroyed) return;
       if (outcome.kind === 'linked') {
         addByKeyStatus = `Connected with ${outcome.display ?? shortId(outcome.ownerIdHex)}`;
         addByKeyInput = '';
-        await refresh();
+        if (!destroyed) await refresh();
       } else if (outcome.kind === 'pending') {
-        addByKeyStatus = 'Request sent — they\'ll need to accept';
+        addByKeyStatus =
+          "Request sent — they'll need to accept. We'll connect automatically once they do.";
         addByKeyInput = '';
         await refreshPending();
+        // refreshPending awaited above — re-check teardown before scheduling a
+        // retry chain, or an unmount during that refresh leaves timers running
+        // on a dead component (Cursor).
+        if (destroyed) return;
+        startAddRetry(key);
       } else {
-        addByKeyStatus = 'Couldn\'t reach them — ask for a friend token instead';
+        addByKeyStatus =
+          "Couldn't reach them — they may need to enable discovery, or try again in a moment.";
       }
     } catch (e) {
       addByKeyStatus = `Failed: ${e instanceof Error ? e.message : String(e)}`;
@@ -591,6 +763,21 @@
         </button>
       </div>
       <p class="muted">Share this so a friend can add you with "Add friend by key".</p>
+      {#if identityDiscoverable === false}
+        <p class="warn-text" data-testid="my-key-discovery-warning">
+          Friends can't add you with this key until you turn on "Allow discovery
+          by identity address".
+          <button
+            type="button"
+            class="link-btn"
+            onclick={handleEnableDiscovery}
+            disabled={enablingDiscovery}
+            data-testid="my-key-enable-discovery-btn"
+          >
+            {enablingDiscovery ? 'Enabling…' : 'Enable'}
+          </button>
+        </p>
+      {/if}
     {:else}
       <p class="muted" data-testid="my-key-empty">Start your node to view your key.</p>
     {/if}
@@ -854,6 +1041,29 @@
     font-size: 12px;
     color: #d83c3e;
     margin: 4px 0 8px;
+  }
+
+  /* ZEB-415 #1: discovery-off advisory — amber, distinct from .error-text. */
+  .warn-text {
+    font-size: 12px;
+    color: var(--warning, #e0a23c);
+    margin: 4px 0 8px;
+  }
+
+  /* Inline text-button (the "Enable" action inside the discovery warning). */
+  .link-btn {
+    font: inherit;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--accent, #5865f2);
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  .link-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 
   /* Phase 1b additions */

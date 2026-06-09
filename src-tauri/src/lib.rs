@@ -35818,6 +35818,20 @@ fn classify_pending_outcome() -> AddFriendOutcome {
     AddFriendOutcome::Pending
 }
 
+/// Classify a `resolve_window` error as a *transient* relay-warm-up / cooldown
+/// condition (vs a genuine resolve fault). During the pkarr relay warm-up window
+/// (~1–2 min after `start_node`) and after the machine idles/sleeps, every relay
+/// can be on cooldown, so the resolver returns
+/// `"no relays available (all on cooldown or unreachable)"`. That is NOT a hard
+/// failure — a retry moments later succeeds — so `add_friend_by_key` maps it to
+/// the graceful `Unreachable` outcome (the UI says "couldn't reach them — try
+/// again in a moment") rather than leaking the raw string as a `Failed: …`
+/// error (ZEB-415 #3). Genuine faults (DHT timeout, malformed record) return
+/// `false` and still surface as `Err` so the user sees a real diagnostic.
+fn resolve_error_is_transient_unreachable(err: &str) -> bool {
+    err.contains("no relays available")
+}
+
 /// ZEB-371 Task 13: the OUTBOUND side of the Path-A (mutual-key, no-token)
 /// friend handshake — resolve a target by their 64-byte Case-B transport
 /// identity pub, dial `harmony/friend/v1`, send a token-less `FriendLinkRequest`,
@@ -35899,12 +35913,22 @@ pub async fn connectivity_add_friend_by_key_inner(
         })
         .collect();
 
-    let Some(rec) = resolver
-        .resolve_window(&verifying_keys)
-        .await
-        .map_err(|e| format!("pkarr resolve: {e}"))?
-    else {
-        return Ok(AddFriendOutcome::Unreachable);
+    let rec = match resolver.resolve_window(&verifying_keys).await {
+        Ok(Some(rec)) => rec,
+        // No Case-B record published → the target isn't discoverable.
+        Ok(None) => return Ok(AddFriendOutcome::Unreachable),
+        // Relay warm-up / cooldown is transient — map to `Unreachable` (retry
+        // later) instead of leaking the raw error to the UI (ZEB-415 #3). Keep
+        // the raw error in the logs so operators can still diagnose repeated
+        // warm-up/cooldown failures (the UI deliberately hides it).
+        Err(e) if resolve_error_is_transient_unreachable(&e.to_string()) => {
+            tracing::debug!(
+                error = %e,
+                "add_friend_by_key: transient pkarr resolve failure → Unreachable"
+            );
+            return Ok(AddFriendOutcome::Unreachable);
+        }
+        Err(e) => return Err(format!("pkarr resolve: {e}")),
     };
     if rec.verify_inner_sig().is_err()
         || rec.verify_identity_match(&identity_pub).is_err()
@@ -36716,6 +36740,32 @@ mod friend_ipc_tests {
         // The Path-A `Pending` reply MUST classify as `AddFriendOutcome::Pending`
         // (no FriendEntry written — the caller retries after the target accepts).
         assert_eq!(super::classify_pending_outcome(), AddFriendOutcome::Pending);
+    }
+
+    #[test]
+    fn transient_relay_warmup_error_classifies_as_unreachable() {
+        // ZEB-415 #3: during pkarr relay warm-up (~1–2 min after start) and after
+        // idle/sleep, every relay is on cooldown and `resolve_window` returns this
+        // raw error. It is NOT a hard fault — a retry moments later succeeds — so
+        // `add_friend_by_key` must surface it as the graceful `Unreachable`
+        // outcome, not leak the raw string to the UI.
+        assert!(super::resolve_error_is_transient_unreachable(
+            "no relays available (all on cooldown or unreachable)"
+        ));
+        // The distinctive substring is enough — wording around it may gain detail.
+        assert!(super::resolve_error_is_transient_unreachable(
+            "pkarr: no relays available right now"
+        ));
+        // Genuine resolve faults are NOT transient — they must still surface as
+        // `Err` so the user sees a real diagnostic rather than a misleading
+        // "couldn't reach them".
+        assert!(!super::resolve_error_is_transient_unreachable(
+            "dht query timed out"
+        ));
+        assert!(!super::resolve_error_is_transient_unreachable(
+            "decode routing_blob: malformed cbor"
+        ));
+        assert!(!super::resolve_error_is_transient_unreachable(""));
     }
 
     #[test]
