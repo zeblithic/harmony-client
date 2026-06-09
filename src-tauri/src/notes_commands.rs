@@ -83,16 +83,22 @@ pub(crate) async fn notes_delete_core(
     device_id: &str,
     id: String,
 ) -> Result<bool, String> {
-    // Only a LIVE note can be deleted to effect; absent or already-tombstoned
-    // ids are a no-op — return false so the wrapper skips notify_dirty (no
-    // spurious publish of unchanged state).
-    {
-        if doc.lock().await.get(&id).is_none() {
-            return Ok(false);
-        }
+    // Hold the doc lock across the whole check-mint-delete so the liveness
+    // check and the delete observe the same state. Releasing it between (an
+    // early `is_none()` check and a re-lock for the delete) is a TOCTOU: a
+    // concurrent tombstone — from another IPC or a remote merge — in the gap
+    // would make this a CRDT no-op that still returns `Ok(true)` and triggers
+    // a spurious `notify_dirty()` publish of unchanged state. Only a LIVE note
+    // is deleted to effect; absent or already-tombstoned ids are a no-op (no
+    // HLC minted) so the wrapper skips `notify_dirty`. Holding `d` across the
+    // `mint_next_hlc` tracker-lock is deadlock-free: no path locks the tracker
+    // while holding the doc in the opposite order.
+    let mut d = doc.lock().await;
+    if d.get(&id).is_none() {
+        return Ok(false);
     }
     let at = crate::fleet_sync::mint_next_hlc(tracker, device_id).await;
-    doc.lock().await.delete(&id, at);
+    d.delete(&id, at);
     Ok(true)
 }
 
