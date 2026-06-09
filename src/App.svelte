@@ -54,6 +54,7 @@
   import { FileManagerService } from './lib/file-manager-service';
   import { MessageService } from './lib/message-service';
   import { NotesService } from './lib/notes-service';
+  import { migrateLocalNotes } from './lib/notes-migrate';
   import { MailService } from './lib/mail-service';
   import { VineService } from './lib/vine-service';
   import { resolveOriginalCreator } from './lib/vine-utils';
@@ -130,6 +131,17 @@
   // selfOwnerId is the OwnerAddr hex (32 chars) obtained from get_owner_state.
   // Set at startup (after start_node) and kept stable for the session.
   let selfOwnerId = $state<string | null>(null);
+  // ZEB-417: one-time migration of legacy localStorage notes to the Rust
+  // backend. Runs once the first time selfOwnerId becomes non-null; the
+  // per-owner localStorage flag makes it idempotent across restarts.
+  let _notesMigratedForOwner = $state<string | null>(null);
+  $effect(() => {
+    if (!selfOwnerId || _notesMigratedForOwner === selfOwnerId) return;
+    _notesMigratedForOwner = selfOwnerId;
+    void import('@tauri-apps/api/core').then(({ invoke }) =>
+      migrateLocalNotes(selfOwnerId!, invoke as (cmd: string, args: Record<string, unknown>) => Promise<unknown>),
+    );
+  });
 
   // ── ZEB-351 Voice V3: app-lifetime voice session ───────────────────
   // Built once after owner identity loads (the get_self_voice_identity IPC
