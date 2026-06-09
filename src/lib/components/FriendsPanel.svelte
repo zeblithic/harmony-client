@@ -148,7 +148,12 @@
 
   async function refresh(): Promise<void> {
     try {
-      friends = await service.listFriends();
+      const next = await service.listFriends();
+      // Don't assign list state after teardown — it would also re-trigger the
+      // card-subscription $effect on the App-owned friendCardService while the
+      // panel is closed (ZEB-415 liveness discipline).
+      if (destroyed) return;
+      friends = next;
       error = null;
       // ZEB-375 Phase 2a: browse is Active-only, so drop any per-row referral
       // state for friends that are no longer Active (now Pending, or absent).
@@ -173,7 +178,9 @@
 
   async function refreshPending(): Promise<void> {
     try {
-      pendingRequests = await service.listPendingRequests();
+      const next = await service.listPendingRequests();
+      if (destroyed) return; // see refresh(): no post-teardown state writes
+      pendingRequests = next;
       pendingError = null;
     } catch (e) {
       pendingError = e instanceof Error ? e.message : String(e);
@@ -654,7 +661,10 @@
   // pending owner_id set whenever those lists change. subscribeVisible is
   // idempotent and reconciles (unsubscribes owners that left the lists).
   $effect(() => {
-    if (!cardService) return;
+    // Belt-and-suspenders: never (re)subscribe after teardown. The refresh
+    // guards above stop list state changing post-unmount, and Svelte disposes
+    // this effect on destroy — this check makes a stray re-run a no-op too.
+    if (destroyed || !cardService) return;
     const ids = [
       ...friends.map((f) => f.ownerIdHex),
       ...pendingRequests.map((r) => r.ownerIdHex),
