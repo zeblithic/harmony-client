@@ -422,8 +422,11 @@ where
                 // retries on its next signal instead of losing work.
                 let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
                 let pub_result = publish_root_now(&ctx).await;
-                if pub_result.is_err() && was_dirty {
-                    ctx.has_pending_dirty.store(true, Ordering::Release);
+                if let Err(ref e) = pub_result {
+                    tracing::warn!(error = %e, "flush_now publish_root_now failed");
+                    if was_dirty {
+                        ctx.has_pending_dirty.store(true, Ordering::Release);
+                    }
                 }
                 let persist_result = persist_now(&ctx).await;
                 let result = pub_result.and(persist_result);
@@ -533,15 +536,18 @@ where
     let seen = if ctx.publish_seen {
         // Snapshot the tracker into the `seen` digest, capped at
         // MAX_DEVICES_PER_OWNER so a pathological roster can't unbound
-        // the envelope. Deterministic BTreeMap iteration keeps the cap
-        // stable.
-        ctx.replay_tracker
-            .lock()
-            .await
+        // the envelope. When over the cap, keep the most-recently-active
+        // devices (newest wall_ms) rather than truncating in BTreeMap
+        // key (device_id) order, which would arbitrarily drop the
+        // lexicographically-last devices.
+        let tracker = ctx.replay_tracker.lock().await;
+        let mut entries: Vec<(String, Hlc)> = tracker
             .iter()
-            .take(MAX_DEVICES_PER_OWNER)
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .collect();
+        entries.sort_by(|a, b| b.1.wall_ms.cmp(&a.1.wall_ms));
+        entries.truncate(MAX_DEVICES_PER_OWNER);
+        entries.into_iter().collect()
     } else {
         BTreeMap::new()
     };
@@ -990,10 +996,15 @@ mod engine_tests {
     /// CAS wrapper whose `get` misses (returns Ok(None)) until `armed` is
     /// set, after which `get` delegates to the inner store. `put` always
     /// delegates so the blob is present in the inner store from the
-    /// start.
+    /// start. `get_attempts` counts every `get` call (incremented FIRST,
+    /// before the armed branch) so a test can observe that B's engine
+    /// actually reached the CAS-fetch step — a POSITIVE signal that turns
+    /// the "nothing happened" assertion into a deterministic guard with no
+    /// wall-clock dependency.
     struct GateGetCas {
         inner: Arc<dyn ContentStore>,
         armed: std::sync::atomic::AtomicBool,
+        get_attempts: Arc<std::sync::atomic::AtomicUsize>,
     }
     #[async_trait]
     impl ContentStore for GateGetCas {
@@ -1001,9 +1012,14 @@ mod engine_tests {
             self.inner.put(cid, blob).await
         }
         async fn get(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+            self.get_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
                 self.inner.get(cid).await
             } else {
+                // Miss (Ok(None)) — NOT a hang — so the engine completes
+                // the failing fetch path and the counter reflects a real
+                // attempt.
                 Ok(None)
             }
         }
@@ -1014,9 +1030,11 @@ mod engine_tests {
         // Shared inner store so A's puts are nominally fetchable; B's view
         // is gated so its first `get` misses, later gets succeed.
         let inner: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let get_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let gate = Arc::new(GateGetCas {
             inner: Arc::clone(&inner),
             armed: std::sync::atomic::AtomicBool::new(false),
+            get_attempts: Arc::clone(&get_attempts),
         });
         let mut a = build_engine("dev-A", Arc::clone(&inner));
         let b = build_engine("dev-B", Arc::clone(&gate) as Arc<dyn ContentStore>);
@@ -1045,20 +1063,28 @@ mod engine_tests {
 
         // B must NOT converge, and its tracker must NOT record dev-A
         // (apply-before-advance: a fetch miss leaves the tracker
-        // un-advanced). Give the inbound frame time to be processed and
-        // dropped, then assert.
+        // un-advanced). Gate the negative assertion on a POSITIVE signal —
+        // that B's engine actually reached the (missing) CAS fetch —
+        // rather than a fixed wall-clock window (which is false-green on a
+        // loaded machine). Once a get has been attempted, the
+        // apply-before-advance ordering guarantees the tracker is only
+        // advanced AFTER a successful fetch; so observing get_attempts >= 1
+        // and then asserting "no dev-A entry" is a deterministic guard.
         let b_state = Arc::clone(&b.state);
-        let b_tracker = Arc::clone(&b.tracker);
-        let dropped = wait_until(
+        let reached_fetch = wait_until(
             || {
-                let b_tracker = Arc::clone(&b_tracker);
-                async move { b_tracker.lock().await.contains_key("dev-A") }
+                let get_attempts = Arc::clone(&get_attempts);
+                async move { get_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1 }
             },
-            Duration::from_millis(600),
+            Duration::from_secs(5),
         )
         .await;
         assert!(
-            !dropped,
+            reached_fetch,
+            "B's engine never reached the CAS fetch step within 5s"
+        );
+        assert!(
+            !b.tracker.lock().await.contains_key("dev-A"),
             "B's tracker advanced for dev-A despite a blob-fetch miss"
         );
         assert!(
@@ -1102,9 +1128,13 @@ mod engine_tests {
     }
 
     /// CAS wrapper whose `get` ALWAYS errors. `put` delegates so A can
-    /// still publish a real (fetchable-by-others) blob.
+    /// still publish a real (fetchable-by-others) blob. `get_attempts`
+    /// counts every `get` call (incremented FIRST, before returning Err)
+    /// so a test can observe that B's engine actually reached the
+    /// (failing) CAS-fetch step.
     struct ErrGetCas {
         inner: Arc<dyn ContentStore>,
+        get_attempts: Arc<std::sync::atomic::AtomicUsize>,
     }
     #[async_trait]
     impl ContentStore for ErrGetCas {
@@ -1112,6 +1142,8 @@ mod engine_tests {
             self.inner.put(cid, blob).await
         }
         async fn get(&self, _cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+            self.get_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(ContentStoreError::Io("forced get failure".into()))
         }
     }
@@ -1124,8 +1156,10 @@ mod engine_tests {
         // check but BEFORE the merge — the tracker must stay un-advanced.
         let inner: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
         let mut a = build_engine("dev-A", Arc::clone(&inner));
+        let get_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let err_cas: Arc<dyn ContentStore> = Arc::new(ErrGetCas {
             inner: Arc::clone(&inner),
+            get_attempts: Arc::clone(&get_attempts),
         });
         let b = build_engine("dev-B", err_cas);
 
@@ -1149,21 +1183,33 @@ mod engine_tests {
         // Feed it to B.
         b.in_tx.send(frame).await.expect("inject frame");
 
-        // After processing, B's tracker must have NO key for dev-A
-        // (proving advance happens only after a successful apply). Poll
-        // for the negative window: if the tracker ever gains dev-A within
-        // the window the test fails.
-        let b_tracker = Arc::clone(&b.tracker);
-        let advanced = wait_until(
+        // Gate the negative assertion on a POSITIVE signal: wait until B's
+        // engine has actually reached the (failing) CAS fetch. A fixed
+        // wall-clock window would be false-green on a loaded machine (the
+        // engine task may simply not have run yet). In apply-before-advance
+        // ordering the tracker insert happens strictly AFTER the CAS get;
+        // so once a get has been attempted, if the (buggy) advance-before-
+        // apply ordering were present the tracker would ALREADY contain
+        // dev-A. Asserting "no dev-A entry" right after observing
+        // get_attempts >= 1 is therefore a deterministic guard with no
+        // wall-clock dependency.
+        let reached_fetch = wait_until(
             || {
-                let b_tracker = Arc::clone(&b_tracker);
-                async move { b_tracker.lock().await.contains_key("dev-A") }
+                let get_attempts = Arc::clone(&get_attempts);
+                async move { get_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1 }
             },
-            Duration::from_millis(600),
+            Duration::from_secs(5),
         )
         .await;
         assert!(
-            !advanced,
+            reached_fetch,
+            "B's engine never reached the CAS fetch step within 5s"
+        );
+
+        // After the failing fetch, B's tracker must have NO key for dev-A
+        // (proving advance happens only after a successful apply).
+        assert!(
+            !b.tracker.lock().await.contains_key("dev-A"),
             "tracker advanced for dev-A despite the apply failing (get error)"
         );
         assert!(
