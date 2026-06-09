@@ -100,30 +100,51 @@ pub(crate) async fn notes_upsert_core(
 /// Tombstone a note (LWW on a freshly minted HLC). Returns `Ok(true)` when a
 /// live note was tombstoned; `Ok(false)` when the id is absent or already
 /// tombstoned (a no-op — no HLC is minted, so the wrapper skips `notify_dirty`
-/// and we avoid publishing unchanged state).
+/// and we avoid publishing unchanged state). Returns `Err` when our delete
+/// would lose LWW to a concurrent newer edit (mirrors `notes_upsert_core`).
 pub(crate) async fn notes_delete_core(
     doc: &Arc<Mutex<NotesDoc>>,
     tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>,
     device_id: &str,
     id: String,
 ) -> Result<bool, String> {
-    // Hold the doc lock across the whole check-mint-delete so the liveness
+    // Hold the doc lock across the whole check-peek-delete so the liveness
     // check and the delete observe the same state. Releasing it between (an
     // early `is_none()` check and a re-lock for the delete) is a TOCTOU: a
     // concurrent tombstone — from another IPC or a remote merge — in the gap
     // would make this a CRDT no-op that still returns `Ok(true)` and triggers
-    // a spurious `notify_dirty()` publish of unchanged state. Only a LIVE note
-    // is deleted to effect; absent or already-tombstoned ids are a no-op (no
-    // HLC minted) so the wrapper skips `notify_dirty`. Holding `d` across the
-    // `mint_next_hlc` tracker-lock is deadlock-free: no path locks the tracker
-    // while holding the doc in the opposite order.
+    // a spurious `notify_dirty()` publish of unchanged state. Absent or
+    // already-tombstoned ids are a no-op (no HLC minted) so the wrapper skips
+    // `notify_dirty`. Holding `d` across the tracker-lock is deadlock-free: no
+    // path locks the tracker while holding the doc in the opposite order.
     let mut d = doc.lock().await;
-    if d.get(&id).is_none() {
+    let Some(current_updated_at) = d.get(&id).map(|n| n.updated_at.clone()) else {
         return Ok(false);
-    }
-    let at = crate::fleet_sync::mint_next_hlc(tracker, device_id).await;
+    };
+    // Peek-and-commit the delete HLC atomically under a SINGLE tracker-lock
+    // hold, mirroring `notes_upsert_core`. `mint_next_hlc` only advances THIS
+    // device's tracker entry, so a note last written by another device with a
+    // newer/future `updated_at` can outrank a freshly minted HLC — and
+    // `NotesDoc::delete` is LWW, so the tombstone would silently lose while we
+    // still minted (advancing the tracker → durability-indicator skew) and
+    // returned `Ok(true)` (a spurious publish of unchanged state). Bail with a
+    // recoverable error when the candidate wouldn't beat the live note's
+    // `updated_at`; otherwise commit it under the same lock and apply.
+    let at = {
+        let mut t = tracker.lock().await;
+        let candidate = crate::fleet_sync::peek_next_hlc(&t, device_id);
+        if !candidate.is_strictly_newer_than(&current_updated_at) {
+            return Err("note delete was superseded (a newer edit already won)".to_string());
+        }
+        t.insert(device_id.to_string(), candidate.clone());
+        candidate
+    };
     d.delete(&id, at);
-    Ok(true)
+    // The committed candidate is strictly newer than the live note's
+    // `updated_at` (checked under the same doc lock, no mutation since), so the
+    // tombstone wins and `get` now returns `None`. Report from observed state
+    // rather than asserting `Ok(true)`.
+    Ok(d.get(&id).is_none())
 }
 
 const NOTES_NOT_LOADED_MSG: &str = "notes dataset not loaded";
@@ -233,6 +254,63 @@ mod tests {
         // The tracker entry for the device is unchanged — no HLC was minted.
         let after = tracker.lock().await.get("dev-A").cloned();
         assert_eq!(after, before, "no HLC minted for a no-op delete");
+    }
+
+    #[tokio::test]
+    async fn delete_superseded_by_remote_future_edit_errs_and_mints_nothing() {
+        // Delete-side mirror of `upsert_superseded_by_newer_delete...`: a note
+        // last edited by another device with a strictly-newer (far-future) HLC
+        // must NOT be deletable by our locally minted (≈now) HLC. `NotesDoc::
+        // delete` is LWW, so our tombstone would silently lose — the bug was
+        // that the core still minted (advancing the shared tracker → durability
+        // skew) and returned `Ok(true)` (a spurious notify_dirty publish of
+        // unchanged state). The fix peeks before minting and bails.
+        let doc = Arc::new(Mutex::new(NotesDoc::default()));
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+
+        // 1. Create the note locally (low HLC via the real mint path).
+        let v = notes_upsert_core(&doc, &tracker, "dev-A", None, "keep".into())
+            .await
+            .unwrap();
+        let id = v.id.clone();
+
+        // 2. A remote device edits it with a far-future HLC — directly on the
+        //    doc to simulate an inbound merge from a sibling with a clock that
+        //    is ahead of ours. The note stays LIVE.
+        doc.lock().await.upsert(
+            id.clone(),
+            "remote edit".into(),
+            Hlc {
+                wall_ms: u64::MAX,
+                logical: u32::MAX,
+                device_id: "dev-B".into(),
+            },
+        );
+        assert!(
+            doc.lock().await.get(&id).is_some(),
+            "note is still live after the remote future edit"
+        );
+
+        // 3. dev-B deletes via a FRESH tracker, minting wall_ms ≈ now — strictly
+        //    OLDER than the u64::MAX edit — so the LWW delete would lose.
+        let fresh_tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let result = notes_delete_core(&doc, &fresh_tracker, "dev-B", id.clone()).await;
+        assert!(
+            result.is_err(),
+            "a delete that would lose LWW must return Err, never Ok(true)"
+        );
+
+        // The note stays LIVE — the losing delete did not tombstone it.
+        assert!(
+            doc.lock().await.get(&id).is_some(),
+            "note remains live; the superseded delete was a no-op"
+        );
+        // And no HLC was minted on the no-op delete (tracker stays unadvanced),
+        // so the durability indicator is not skewed and nothing is published.
+        assert!(
+            fresh_tracker.lock().await.get("dev-B").is_none(),
+            "a superseded delete must not mint an HLC (tracker stays unadvanced)"
+        );
     }
 
     #[tokio::test]
