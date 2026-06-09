@@ -305,4 +305,33 @@ describe('FriendsPanel — add-by-key auto-retry (ZEB-415 #2)', () => {
     expect(status).toContain('reach'); // "could not reach them on the last try"
     expect(status).not.toContain('have not accepted');
   });
+
+  it('does not start a retry chain if unmounted during refreshPending', async () => {
+    vi.useFakeTimers();
+    let resolvePending: (v: unknown[]) => void = () => {};
+    const addByKey = vi.fn().mockResolvedValue({ kind: 'pending' });
+    const listPendingRequests = vi
+      .fn()
+      .mockResolvedValueOnce([]) // initial mount refresh
+      .mockReturnValue(
+        new Promise((r) => {
+          resolvePending = r as (v: unknown[]) => void;
+        }),
+      ); // the post-add refresh hangs until we resolve it
+    const service = mockService({ addByKey, listPendingRequests });
+    const { getByTestId, unmount } = render(FriendsPanel, { props: { service } });
+    await vi.advanceTimersByTimeAsync(0);
+
+    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
+    await fireEvent.click(getByTestId('add-by-key-btn'));
+    await vi.advanceTimersByTimeAsync(0); // addByKey resolves pending; now awaiting refreshPending
+
+    // Tear down while refreshPending is in flight, THEN let it resolve.
+    unmount();
+    resolvePending([]);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    // The post-refresh `startAddRetry` must not run after teardown.
+    expect(addByKey).toHaveBeenCalledTimes(1);
+  });
 });

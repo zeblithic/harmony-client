@@ -209,6 +209,7 @@
     enablingDiscovery = true;
     try {
       await setIdentityDiscoverable(true);
+      if (destroyed) return; // unmounted mid-toggle — don't touch state
       // Optimistic clear — the `connectivity-identity-discoverable-changed`
       // event will also flip this, but updating now hides the warning at once.
       identityDiscoverable = true;
@@ -498,12 +499,16 @@
       if (outcome.kind === 'linked') {
         addByKeyStatus = `Connected with ${outcome.display ?? shortId(outcome.ownerIdHex)}`;
         addByKeyInput = '';
-        await refresh();
+        if (!destroyed) await refresh();
       } else if (outcome.kind === 'pending') {
         addByKeyStatus =
           "Request sent — they'll need to accept. We'll connect automatically once they do.";
         addByKeyInput = '';
         await refreshPending();
+        // refreshPending awaited above — re-check teardown before scheduling a
+        // retry chain, or an unmount during that refresh leaves timers running
+        // on a dead component (Cursor).
+        if (destroyed) return;
         startAddRetry(key);
       } else {
         addByKeyStatus =
