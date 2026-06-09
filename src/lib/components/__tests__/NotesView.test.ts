@@ -1,57 +1,79 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/svelte';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
+
+// Hoist mocks ahead of static imports.
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
+
+import { invoke } from '@tauri-apps/api/core';
 import NotesView from '../NotesView.svelte';
 import { NotesService } from '../../notes-service';
 
-// ZEB-334: NotesView renders the local self-notes stream + a compose box,
-// backed only by NotesService (no network plumbing). It must render existing
-// notes with the configured display name, surface the private-space framing,
-// and append on Enter.
-describe('NotesView — ZEB-334 self-notes', () => {
-  beforeEach(() => localStorage.clear());
+// ZEB-417: NotesView renders the IPC-backed self-notes stream + a compose box.
+// It must render existing notes with the configured display name, surface the
+// private-space framing, and append on Enter via the async IPC service.
+describe('NotesView — ZEB-417 IPC-backed self-notes', () => {
+  beforeEach(() => vi.mocked(invoke).mockReset());
 
-  it('renders existing notes for the owner, labelled with the display name', () => {
+  it('renders existing notes for the owner, labelled with the display name', async () => {
+    vi.mocked(invoke).mockResolvedValue([{ id: 'n1', text: 'remember the milk', timestamp: 1 }]);
     const svc = new NotesService();
-    svc.append('owner-1', 'remember the milk');
     render(NotesView, { notesService: svc, ownerId: 'owner-1', displayName: 'Jake' });
-    expect(screen.getByText('remember the milk')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('remember the milk')).toBeInTheDocument());
     expect(screen.getByText('Jake')).toBeInTheDocument();
   });
 
   it('makes clear the space is private', () => {
+    vi.mocked(invoke).mockResolvedValue([]);
     const svc = new NotesService();
     render(NotesView, { notesService: svc, ownerId: 'owner-1', displayName: 'Jake' });
     expect(screen.getByTestId('notes-view')).toHaveTextContent(/private/i);
   });
 
-  it('appends a note on Enter, renders it, and persists it via the service', async () => {
+  it('appends a note on Enter and renders it', async () => {
+    // First call (notes_list in the $effect load) returns empty; the append
+    // upsert returns the new entry. The view mirrors notesService.entries via
+    // onChange (no post-append re-fetch), so no third notes_list is issued.
+    vi.mocked(invoke)
+      .mockResolvedValueOnce([]) // notes_list on $effect load
+      .mockResolvedValueOnce({ id: 'n1', text: 'new thought', timestamp: 5 }); // notes_upsert
     const svc = new NotesService();
     render(NotesView, { notesService: svc, ownerId: 'owner-1', displayName: 'Jake' });
     const box = screen.getByTestId('notes-compose');
     await fireEvent.input(box, { target: { value: 'new thought' } });
     await fireEvent.keyDown(box, { key: 'Enter' });
-    expect(screen.getByText('new thought')).toBeInTheDocument();
-    expect(svc.getEntries('owner-1').map((e) => e.text)).toContain('new thought');
+    await waitFor(() => expect(screen.getByText('new thought')).toBeInTheDocument());
   });
 
   it('does not append blank/whitespace-only notes', async () => {
+    vi.mocked(invoke).mockResolvedValue([]);
     const svc = new NotesService();
     render(NotesView, { notesService: svc, ownerId: 'owner-1', displayName: 'Jake' });
     const box = screen.getByTestId('notes-compose');
     await fireEvent.input(box, { target: { value: '   ' } });
     await fireEvent.keyDown(box, { key: 'Enter' });
-    expect(svc.getEntries('owner-1')).toHaveLength(0);
+    // notes_upsert should NOT be called (blank text guard fires first)
+    await waitFor(() => {
+      const upsertCalls = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === 'notes_upsert');
+      expect(upsertCalls).toHaveLength(0);
+    });
   });
 
-  it('keeps the compose text when the note cannot be saved (owner id not ready)', async () => {
-    // Cursor (PR #180): with an empty ownerId, append is a no-op — the text
-    // must NOT be cleared, or the user silently loses what they typed.
+  it('keeps the compose text when the note cannot be saved (append returns null)', async () => {
+    // With an empty ownerId, append still gets called but text.trim() is non-empty,
+    // so notes_upsert is invoked. Simulate a backend failure → append returns null
+    // → compose text must not be cleared.
+    vi.mocked(invoke)
+      .mockResolvedValueOnce([]) // notes_list on $effect load
+      .mockRejectedValueOnce('backend error'); // notes_upsert failure
     const svc = new NotesService();
     render(NotesView, { notesService: svc, ownerId: '', displayName: 'Jake' });
     const box = screen.getByTestId('notes-compose') as HTMLTextAreaElement;
     await fireEvent.input(box, { target: { value: 'unsaved thought' } });
     await fireEvent.keyDown(box, { key: 'Enter' });
-    expect(box.value).toBe('unsaved thought');
-    expect(svc.getEntries('')).toEqual([]);
+    // After the async append fails, compose text must remain (not cleared).
+    await waitFor(() => expect(box.value).toBe('unsaved thought'));
   });
 });

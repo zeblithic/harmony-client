@@ -139,6 +139,7 @@ pub mod dm_envelope;
 pub mod dm_outbox;
 pub mod dm_signing;
 pub mod event_loop;
+pub mod fleet_sync;
 pub mod folder_ingest;
 pub mod folders;
 mod follows;
@@ -162,6 +163,9 @@ pub mod mint;
 pub mod mint_sync;
 pub mod mint_sync_persist;
 pub mod mint_sync_types;
+pub mod notes_commands;
+pub mod notes_crdt;
+pub mod notes_persist;
 pub mod owner_commands;
 pub mod owner_loaded;
 pub mod owner_state;
@@ -843,6 +847,21 @@ pub struct NodeState {
     /// before the event-loop thread is joined.
     pub mint_sync: Option<std::sync::Arc<crate::mint_sync::MintSyncEngine>>,
 
+    /// ZEB-417 SP1: owner-private Notes dataset. `Some` while the node is
+    /// running and an owner identity is loaded; `None` before the
+    /// FleetSyncEngine is wired at startup (next task) or after stop_node.
+    /// The Notes IPC commands reject with "notes dataset not loaded" while
+    /// any of these are `None`.
+    pub notes_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::notes_crdt::NotesDoc>>>,
+    pub notes_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+    >,
+    pub notes_sync:
+        Option<std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::notes_crdt::NotesDoc>>>,
+    pub notes_device_id: Option<String>,
+
     /// ZEB-321 Phase 1 Task 8: iroh endpoint Arc. `Some` while node is
     /// running AND the keychain-resident secret key + bind both succeeded;
     /// `None` otherwise (tests, headless platforms, bind failure). Task 9's
@@ -1157,6 +1176,12 @@ impl Default for NodeState {
             mint_db: None,
             // Mint sync engine: initialized in identity bootstrap.
             mint_sync: None,
+            // ZEB-417 SP1: notes dataset handles stay None until the
+            // FleetSyncEngine is wired at startup (next task).
+            notes_doc: None,
+            notes_tracker: None,
+            notes_sync: None,
+            notes_device_id: None,
             // ZEB-321 Phase 1 Task 8: iroh handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
             iroh_endpoint: None,
@@ -1383,6 +1408,11 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // Mint Phase 2 sync: taken outside the lock so shutdown() can be
     // awaited on an ephemeral runtime after the MutexGuard is dropped.
     let mint_sync_for_shutdown: Option<std::sync::Arc<crate::mint_sync::MintSyncEngine>>;
+    // ZEB-417 SP1: Notes fleet-sync engine, taken outside the lock for the
+    // same ephemeral-runtime shutdown pattern as mint.
+    let notes_sync_for_shutdown: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::notes_crdt::NotesDoc>>,
+    >;
     let (
         shutdown_tx,
         thread,
@@ -1551,6 +1581,14 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // Mint Phase 2 sync: take before releasing the lock so a concurrent
         // IPC doesn't race to call notify_dirty on a shutting-down engine.
         mint_sync_for_shutdown = guard.mint_sync.take();
+        // ZEB-417 SP1: take the Notes engine for shutdown and clear the
+        // remaining notes handles so a concurrent notes_* IPC fast-rejects
+        // (with "notes dataset not loaded") instead of racing the
+        // shutting-down engine. A restart re-loads them from disk.
+        notes_sync_for_shutdown = guard.notes_sync.take();
+        guard.notes_doc = None;
+        guard.notes_tracker = None;
+        guard.notes_device_id = None;
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -1861,6 +1899,35 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                             error = %e,
                             "could not build ephemeral tokio runtime for MintSyncEngine \
                              shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-417 SP1: shut down the Notes fleet-sync engine alongside mint so
+    // its final debounced publish + persist pass runs before the event-loop
+    // thread is joined. Same ephemeral-runtime pattern as mint/owner.
+    if let Some(notes_engine) = notes_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(notes_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "Notes FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for Notes \
+                             FleetSyncEngine shutdown — final flush skipped"
                         );
                     }
                 }
@@ -2460,6 +2527,25 @@ pub(crate) async fn start_node_inner(
         let mut mint_sync_engine_opt: Option<std::sync::Arc<crate::mint_sync::MintSyncEngine>> =
             None;
         let mut mint_sync_handles_opt: Option<crate::event_loop::MintSyncHandles> = None;
+        // ZEB-417 SP1: Notes fleet-sync engine + its NodeState handles. Built
+        // alongside the mint engine when an owner identity loads; lifted to
+        // outer scope so the NodeState assignment (notes_doc/tracker/sync/
+        // device_id) and the event_loop::run call site can reach them.
+        let mut notes_doc_opt: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::notes_crdt::NotesDoc>>,
+        > = None;
+        let mut notes_tracker_opt: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<
+                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                >,
+            >,
+        > = None;
+        let mut notes_sync_engine_opt: Option<
+            std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::notes_crdt::NotesDoc>>,
+        > = None;
+        let mut notes_device_id_opt: Option<String> = None;
+        let mut notes_sync_handles_opt: Option<crate::event_loop::NotesSyncHandles> = None;
         // ZEB-225 Sub-B Phase 2: lift the per-identity handles SyncEngine
         // depends on (device_id, self_owner, crdt_state, tracker,
         // content_store) out of the `if let Some(seed)` block so the
@@ -3166,6 +3252,64 @@ pub(crate) async fn start_node_inner(
                             inbound_tx: mint_in_tx,
                         });
                     }
+
+                    // ── ZEB-417 SP1: Notes fleet-sync engine ────────────────
+                    //
+                    // Owner-private Notes dataset. Construct the generic
+                    // `FleetSyncEngine<NotesDoc>` now that kt, device_id, and
+                    // content_store are available. Channel-based like mint:
+                    // notes_out_tx / notes_in_rx are bridged to Zenoh by
+                    // event_loop on the `harmony/owner/{addr_hex}/ds/notes-v1`
+                    // topic. Reuses the SAME kt / device_id / content_store /
+                    // owner_addr_hex the mint + owner engines share.
+                    let notes_path = identity_dir.join(crate::notes_persist::NOTES_FILENAME);
+                    let notes_replay_path =
+                        identity_dir.join(crate::notes_persist::NOTES_REPLAY_FILENAME);
+                    let notes_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::notes_persist::load_doc_or_recover(&notes_path),
+                    ));
+                    let notes_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::notes_persist::load_replay_or_recover(&notes_replay_path),
+                    ));
+                    let (notes_out_tx, notes_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let (notes_in_tx, notes_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let notes_merger: crate::fleet_sync::Merger<crate::notes_crdt::NotesDoc> =
+                        std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                    let notes_app = app.clone();
+                    let notes_sync = std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                        crate::fleet_sync::FleetSyncConfig {
+                            kt: std::sync::Arc::clone(&kt),
+                            device_id: device_id.clone(),
+                            state: std::sync::Arc::clone(&notes_doc),
+                            merger: notes_merger,
+                            replay_tracker: std::sync::Arc::clone(&notes_tracker),
+                            content_store: std::sync::Arc::clone(&content_store),
+                            publisher_tx: notes_out_tx,
+                            subscriber_rx: notes_in_rx,
+                            persist: std::sync::Arc::new(crate::notes_persist::NotesPersist {
+                                doc_path: notes_path,
+                                replay_path: notes_replay_path,
+                            }),
+                            lookup_key_tag: b"notes-v1",
+                            debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                            publish_seen: true,
+                            on_applied: Some(std::sync::Arc::new(move || {
+                                let _ = notes_app.emit("notes-changed", ());
+                            })),
+                            sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                std::collections::BTreeMap::new(),
+                            )),
+                        },
+                    ));
+                    notes_doc_opt = Some(std::sync::Arc::clone(&notes_doc));
+                    notes_tracker_opt = Some(std::sync::Arc::clone(&notes_tracker));
+                    notes_sync_engine_opt = Some(std::sync::Arc::clone(&notes_sync));
+                    notes_device_id_opt = Some(device_id.clone());
+                    notes_sync_handles_opt = Some(crate::event_loop::NotesSyncHandles {
+                        addr_hex: owner_addr_hex.clone(),
+                        outbound_rx: notes_out_rx,
+                        inbound_tx: notes_in_tx,
+                    });
 
                     // ── ZEB-217 Sub-C Phase 2 + Phase 3 Task 8: per-community state CRDT sync ─
                     //
@@ -5170,6 +5314,9 @@ pub(crate) async fn start_node_inner(
                 let profile_card_request_rx_for_loop = Some(profile_card_request_rx);
                 // Mint Phase 2 sync: thread handles into event_loop::run.
                 let mint_sync_handles_for_loop = mint_sync_handles_opt;
+                // ZEB-417 SP1: thread the Notes adapter handles into
+                // event_loop::run (mirrors mint).
+                let notes_sync_handles_for_loop = notes_sync_handles_opt;
                 // ZEB-321 Phase 1 Task 8: shadow the outer-scope binding into
                 // a move-capturable local so the thread closure can take
                 // ownership without disturbing the iroh_endpoint_arc /
@@ -5288,6 +5435,7 @@ pub(crate) async fn start_node_inner(
                                 profile_card_cache_for_loop,
                                 profile_card_request_rx_for_loop,
                                 mint_sync_handles_for_loop,
+                                notes_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                                 dial_telemetry_into_loop,
                                 serve_allowlist_for_loop,
@@ -5447,6 +5595,13 @@ pub(crate) async fn start_node_inner(
                         // Mint Phase 2 sync: store the engine Arc so IPC handlers
                         // can call notify_dirty() after mutations.
                         guard.mint_sync = mint_sync_engine_opt.clone();
+                        // ZEB-417 SP1: store the Notes dataset handles so the
+                        // notes_* IPC commands can read/mutate the doc + tracker
+                        // and call notify_dirty() on the engine after a write.
+                        guard.notes_doc = notes_doc_opt.clone();
+                        guard.notes_tracker = notes_tracker_opt.clone();
+                        guard.notes_sync = notes_sync_engine_opt.clone();
+                        guard.notes_device_id = notes_device_id_opt.clone();
                         // ZEB-321 Phase 1 Task 8: stash iroh resources so
                         // Task 9 IPC handlers can reach them via NodeState.
                         // All three are `Option`-shaped because iroh boot
@@ -5646,6 +5801,11 @@ pub(crate) async fn start_node_inner(
             // shutdown can run before this start_node attempt errors out.
             dfrost_log_registry_arc.clone(),
             mint_sync_engine_opt,
+            // ZEB-417 SP1 (Cursor MEDIUM fix): carry the Notes FleetSyncEngine
+            // out too so the failure-cleanup path can shut it down. The
+            // success path above already stashed a `.clone()` into NodeState,
+            // so moving the original out here is safe (mirrors mint).
+            notes_sync_engine_opt,
             node_addr_for_response,
             freshly_created,
             has_owner_identity,
@@ -5663,6 +5823,7 @@ pub(crate) async fn start_node_inner(
         profile_card_publisher_for_cleanup,
         dfrost_log_registry_for_cleanup,
         mint_engine_for_cleanup,
+        notes_engine_for_cleanup,
         node_addr_for_response,
         freshly_created,
         has_owner_identity,
@@ -5746,6 +5907,19 @@ pub(crate) async fn start_node_inner(
                 tracing::error!(
                     error = %e,
                     "MintSyncEngine cleanup after start_node failure"
+                );
+            }
+        }
+        // ZEB-417 SP1 (Cursor MEDIUM fix): same rationale for the Notes
+        // FleetSyncEngine. Its construction may have succeeded before a later
+        // step (thread spawn, lock failure, supersede) aborted the install to
+        // NodeState. Without this, its internal tokio task leaks — running with
+        // no Zenoh adapter and no NodeState handles until the process exits.
+        if let Some(notes_engine) = notes_engine_for_cleanup {
+            if let Err(e) = notes_engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "Notes FleetSyncEngine cleanup after start_node failure"
                 );
             }
         }
@@ -38110,6 +38284,10 @@ pub fn run() {
             reset_pkarr_relays,
             add_pkarr_relay,
             remove_pkarr_relay,
+            // ZEB-417 SP1: owner-private Notes IPCs.
+            notes_commands::notes_list,
+            notes_commands::notes_upsert,
+            notes_commands::notes_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -41560,6 +41738,11 @@ mod start_node_race_tests {
             pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             mint_db: None,
             mint_sync: None,
+            // ZEB-417 SP1: notes dataset handles unused in race tests.
+            notes_doc: None,
+            notes_tracker: None,
+            notes_sync: None,
+            notes_device_id: None,
             // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.
             iroh_endpoint: None,
             reachability_resolver: None,

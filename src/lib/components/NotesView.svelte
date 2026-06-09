@@ -1,13 +1,15 @@
 <script lang="ts">
   /**
-   * ZEB-334 — Self-notes view.
+   * ZEB-334 / ZEB-417 — Self-notes view.
    *
    * The always-present, private scratchpad shown as the default when no
    * community is joined (replacing the misleading "#general floating in the
-   * void"). Reads/writes through NotesService only — no network plumbing —
-   * so it works offline and across identity switches. Author label reuses the
-   * configured display name (consistent with ZEB-337).
+   * void"). Reads/writes through NotesService only — IPC-backed since ZEB-417,
+   * synced across the owner's devices. Author label reuses the configured
+   * display name (consistent with ZEB-337).
    */
+  import { onMount, onDestroy } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import type { NotesService, NoteEntry } from '../notes-service';
 
   let {
@@ -25,22 +27,55 @@
 
   // Load on mount and reload whenever the active identity changes. Reading
   // ownerId here makes the effect re-run on identity switch, so notes never
-  // bleed across identities.
+  // bleed across identities. `load` hydrates the SERVICE state (and fires
+  // onChange) so `append`/`notes-changed` updates all flow through a single
+  // source of truth (notesService.entries) — no direct getEntries reads that
+  // could diverge from it.
+  //
+  // The `active` flag guards against a stale-ownerId race: if ownerId changes
+  // mid-load, the in-flight `load`'s onChange must not clobber `entries` with
+  // the prior owner's notes. Cleanup flips `active` false so only the latest
+  // effect run mirrors into `entries`.
   $effect(() => {
-    entries = notesService.getEntries(ownerId);
+    let active = true;
+    const owner = ownerId;
+    notesService.onChange = () => {
+      if (active) entries = [...notesService.entries];
+    };
+    void notesService.load(owner);
+    return () => {
+      active = false;
+    };
+  });
+
+  // ZEB-417: subscribe to backend sync events so inbound changes are reflected
+  // immediately without a manual reload. Guard the reload against the current
+  // ownerId so a late event for a switched-away identity can't repopulate.
+  // Cleaned up on component destroy.
+  let unlistenNotesChanged: (() => void) | null = null;
+  onMount(async () => {
+    unlistenNotesChanged = await listen('notes-changed', () => {
+      void notesService.load(ownerId);
+    });
+  });
+  onDestroy(() => {
+    unlistenNotesChanged?.();
   });
 
   const authorLabel = $derived(displayName?.trim() ? displayName : 'You');
 
-  function submit() {
+  async function submit() {
     const text = composeText.trim();
     if (!text) return;
     // Keep the text if it couldn't be saved (e.g. the owner id hasn't loaded
     // yet, so append is a no-op) — clearing it would silently lose the note.
     // (Cursor PR #180.)
-    const entry = notesService.append(ownerId, text);
+    const entry = await notesService.append(ownerId, text);
     if (!entry) return;
-    entries = notesService.getEntries(ownerId);
+    // `append` already updated notesService.entries and fired onChange (which
+    // mirrors into `entries`), and inbound sync arrives via notes-changed — so
+    // a re-fetch here is redundant and risky: a failed getEntries returning []
+    // would hide the note we just saved. Trust the service state.
     composeText = '';
   }
 
@@ -48,7 +83,7 @@
     // Enter sends; Shift+Enter inserts a newline (matches channel/DM compose).
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      submit();
+      void submit();
     }
   }
 

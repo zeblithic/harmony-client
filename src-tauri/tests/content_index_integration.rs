@@ -190,6 +190,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
+                    None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
@@ -486,6 +487,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
+                    None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
@@ -884,6 +886,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
+                    None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
@@ -1140,6 +1143,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
+                    None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
@@ -1458,6 +1462,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
+                    None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)

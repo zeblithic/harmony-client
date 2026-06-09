@@ -5,39 +5,59 @@
 //! See `docs/specs/2026-05-01-zeb-215-sub-a-phase3a-sync-design.md`
 //! §"Architecture". Channel-based; the Zenoh adapter lives in
 //! `event_loop.rs` (Task 19).
+//!
+//! ZEB-417 SP1: the engine internals (debounce timer, publish path,
+//! replay-protected merge path) are now the generic
+//! `crate::fleet_sync::FleetSyncEngine<OwnerState>`. This module is a thin
+//! owner-state-specific wrapper: it preserves the exact public
+//! `SyncEngine::new(...)` signature, supplies the OwnerState merge function
+//! (`merge_remote_into_local`), the durability sink (`OwnerStatePersist`),
+//! and the fixed root-blob lookup tag (`OWNER_STATE_ROOT_BLOB_TAG`). The
+//! on-wire envelope and on-disk format are byte-identical to the pre-417
+//! implementation (see `owner_publish_envelope_is_byte_identical_to_legacy`
+//! and the construction note on `OwnerStatePersist`).
+//!
+//! The generic engine uses MINT ordering (apply-before-advance) on the
+//! inbound path, replacing the donor's advance-before-apply /
+//! `IncomingOutcome::ErrPreMutation`/`ErrPostMutation` retry detail.
+//! Owner-state convergence is unchanged; that internal retry ordering is
+//! now owned + tested by `fleet_sync` (see its
+//! `apply_before_advance_failure_does_not_advance_tracker` and
+//! `blob_miss_is_dropped_and_recovered_on_next_publish`).
 
 use crate::content_store::ContentStore;
+use crate::fleet_sync::{FleetPersist, FleetSyncConfig, FleetSyncEngine, MergeOutcome, Merger};
 use crate::owner_state_crdt::OwnerState;
 use crate::owner_state_crypto::KeyTree;
 use crate::owner_state_types::Hlc;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Notify};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, Mutex};
+
+/// Re-export the generic engine's error type. ZEB-417 replaced the local
+/// `SyncError` enum (which carried `Persist(PersistError)`) with this; the
+/// new `Persist` variant carries a `String` (the durability sink is now an
+/// injected trait, so its concrete error type is flattened at the
+/// boundary). No external code matched on the old `Persist(PersistError)`
+/// variant, so this is a non-breaking swap for all callers.
+pub use crate::fleet_sync::SyncError;
 
 /// Default debounce window between a `notify_dirty` and the
 /// resulting state-root publish. See spec §"Architecture" — small
 /// enough to feel near-instant to a human, large enough to collapse
 /// keystroke-rate mutations.
-pub const DEFAULT_DEBOUNCE_MS: u64 = 250;
+///
+/// Re-exported from `fleet_sync` (both are 250; pinned equal by
+/// `default_debounce_ms_matches_fleet_sync`).
+pub use crate::fleet_sync::DEFAULT_DEBOUNCE_MS;
 
-#[derive(thiserror::Error, Debug)]
-pub enum SyncError {
-    #[error("content store: {0}")]
-    ContentStore(#[from] crate::content_store::ContentStoreError),
-    #[error("crypto: {0}")]
-    Crypto(String),
-    #[error("CBOR encode: {0}")]
-    CborEncode(String),
-    #[error("CBOR decode: {0}")]
-    CborDecode(String),
-    #[error("persist: {0}")]
-    Persist(#[from] crate::owner_state_persist::PersistError),
-    #[error("transport channel closed")]
-    TransportClosed,
-}
+/// Lookup-key tag for the single-blob OwnerState in 3a's simplified CAS
+/// layout. See spec §"Root blob shape — Phase 3a simplification". Phase
+/// 3b/c restructures into per-entry blobs. Load-bearing for wire identity:
+/// the receiver decrypts the root blob with the same `space_lookup_key`
+/// tag the publisher used.
+pub(crate) const OWNER_STATE_ROOT_BLOB_TAG: &[u8] = b"owner-state-root-blob-v1";
 
 /// Filesystem paths for both new files; assembled at boot from
 /// `resolve_identity_dir()` and the spec's filename constants.
@@ -47,24 +67,36 @@ pub struct PersistPaths {
     pub replay: PathBuf,
 }
 
-/// Owner-state sync engine. Owns a tokio task that runs the
-/// debounce timer + publisher + subscriber + persistence flushes.
-/// Construction spawns the task; `shutdown().await` stops it
-/// cleanly with one final flush.
+/// Owner-state durability sink for the generic engine. Writes the CRDT +
+/// replay-tracker to disk via the SAME `save_crdt` / `save_replay` calls
+/// the pre-417 `persist_both` used, so the on-disk format is byte-identical
+/// by construction (no new disk pin needed — see the comment on
+/// `owner_publish_envelope_is_byte_identical_to_legacy`).
+struct OwnerStatePersist {
+    paths: PersistPaths,
+}
+
+impl FleetPersist<OwnerState> for OwnerStatePersist {
+    fn persist(
+        &self,
+        state: &OwnerState,
+        tracker: &BTreeMap<String, Hlc>,
+    ) -> Result<(), SyncError> {
+        crate::owner_state_persist::save_crdt(&self.paths.crdt, state)
+            .map_err(|e| SyncError::Persist(e.to_string()))?;
+        crate::owner_state_persist::save_replay(&self.paths.replay, tracker)
+            .map_err(|e| SyncError::Persist(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Owner-state sync engine. A thin wrapper over the generic
+/// `FleetSyncEngine<OwnerState>` (ZEB-417 SP1). Owns a tokio task that runs
+/// the debounce timer + publisher + subscriber + persistence flushes.
+/// Construction spawns the task; `shutdown().await` stops it cleanly with
+/// one final flush.
 pub struct SyncEngine {
-    notify_dirty: Arc<Notify>,
-    /// Set to `true` by `notify_dirty()`; cleared by the task after
-    /// each publish. Prevents the shutdown path from emitting a
-    /// spurious publish when the `Notify` permit was left over from
-    /// before the most-recent actual publish.
-    has_pending_dirty: Arc<AtomicBool>,
-    flush_now_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
-    /// Carries `Result<(), SyncError>` so the final publish + persist
-    /// errors propagate to the caller rather than being silently
-    /// swallowed by `()`. Phase 3a's only persistent state lives here;
-    /// dropping these errors masks data-durability regressions.
-    shutdown_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
-    task: Mutex<Option<JoinHandle<()>>>,
+    inner: FleetSyncEngine<OwnerState>,
 }
 
 impl SyncEngine {
@@ -73,6 +105,9 @@ impl SyncEngine {
     /// `kt` derives the AEAD keys; `device_id` is the local device's
     /// HLC source; `state` and `tracker` are shared with the rest
     /// of the app via the same `Arc<Mutex<_>>`s.
+    ///
+    /// PUBLIC SIGNATURE — preserved byte-for-byte across the ZEB-417
+    /// migration so the lib.rs boot call site compiles unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         kt: Arc<KeyTree>,
@@ -85,41 +120,52 @@ impl SyncEngine {
         paths: PersistPaths,
         debounce_ms: u64,
     ) -> Self {
-        let notify_dirty = Arc::new(Notify::new());
-        let has_pending_dirty = Arc::new(AtomicBool::new(false));
-        let (flush_now_tx, flush_now_rx) = mpsc::channel(8);
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        // The OwnerState merge function. `merge_remote_into_local` folds
+        // every sub-CRDT from a decoded remote snapshot into local in the
+        // load-bearing order documented on that function. Owner-state's
+        // merge does not compute a fine-grained changed-bit (the merge is
+        // idempotent and the only inbound side effect is a debounced
+        // persist), so we report `changed: true` unconditionally — the
+        // engine uses this only to decide whether to fire `on_applied`,
+        // which owner-state leaves `None`.
+        let merger: Merger<OwnerState> = Arc::new(|local: &mut OwnerState, remote: OwnerState| {
+            merge_remote_into_local(local, remote);
+            MergeOutcome { changed: true }
+        });
 
-        let task = tokio::spawn(internal_task(InternalCtx {
+        let inner = FleetSyncEngine::new(FleetSyncConfig {
             kt,
             device_id,
             state,
-            tracker,
+            merger,
+            replay_tracker: tracker,
             content_store,
             publisher_tx,
             subscriber_rx,
-            paths,
-            debounce: std::time::Duration::from_millis(debounce_ms),
-            notify_dirty: Arc::clone(&notify_dirty),
-            has_pending_dirty: Arc::clone(&has_pending_dirty),
-            flush_now_rx,
-            shutdown_rx,
-        }));
+            persist: Arc::new(OwnerStatePersist { paths }),
+            lookup_key_tag: OWNER_STATE_ROOT_BLOB_TAG,
+            debounce_ms,
+            // CRITICAL: keeps the owner-state wire byte-identical. With
+            // `publish_seen = false` the envelope emits an empty `seen`
+            // map, which `FleetRootPublish`'s `skip_serializing_if`
+            // omits — encoding byte-for-byte the same as the legacy
+            // `RootPublishPayload { root_cid, at }`. Owner-state never used
+            // the `seen` digest / `synced_device_count` path.
+            publish_seen: false,
+            // Owner-state emits no inbound UI event (unchanged behavior).
+            on_applied: None,
+            // Unused while `publish_seen == false`, but the config field is
+            // mandatory; a fresh empty map keeps the engine self-contained.
+            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+        });
 
-        SyncEngine {
-            notify_dirty,
-            has_pending_dirty,
-            flush_now_tx,
-            shutdown_tx,
-            task: Mutex::new(Some(task)),
-        }
+        SyncEngine { inner }
     }
 
     /// Hint that local CRDT state has mutated and a debounced
     /// publish should fire after `debounce_ms`. Non-blocking.
     pub fn notify_dirty(&self) {
-        self.has_pending_dirty.store(true, Ordering::Relaxed);
-        self.notify_dirty.notify_one();
+        self.inner.notify_dirty();
     }
 
     /// Force an immediate publish, bypassing the debounce window.
@@ -128,19 +174,14 @@ impl SyncEngine {
     ///
     /// Unconditionally publishes even when the engine has no pending
     /// dirty state — this differs from the implicit shutdown flush,
-    /// which is gated on `has_pending_dirty`. The "force publish"
-    /// semantics are intentional for callers that need a fence-style
-    /// sync point (tests, explicit "sync now" UI). On an idle engine
-    /// the publish carries an advanced HLC but identical content, so
-    /// peers see one extra encrypt/decrypt round-trip — acceptable for
-    /// the cases that opt in to this method.
+    /// which is gated on pending-dirty. The "force publish" semantics are
+    /// intentional for callers that need a fence-style sync point (tests,
+    /// explicit "sync now" UI, `create_community` / `redeem_invite`
+    /// durability fences). On an idle engine the publish carries an
+    /// advanced HLC but identical content, so peers see one extra
+    /// encrypt/decrypt round-trip — acceptable for the cases that opt in.
     pub async fn flush_now(&self) -> Result<(), SyncError> {
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        self.flush_now_tx
-            .send(resp_tx)
-            .await
-            .map_err(|_| SyncError::TransportClosed)?;
-        resp_rx.await.map_err(|_| SyncError::TransportClosed)?
+        self.inner.flush_now().await
     }
 
     /// Stop the internal task, flushing any pending writes first.
@@ -154,375 +195,8 @@ impl SyncEngine {
     ///
     /// If the engine task was already gone (channel closed before our
     /// send landed), returns `Ok(())` — there was nothing to flush.
-    ///
-    /// Note: we DO NOT `handle.await` the JoinHandle. The internal
-    /// task is spawned via `tokio::spawn` on whatever runtime called
-    /// `SyncEngine::new` (Tauri's main runtime in production); but
-    /// `stop_inner` invokes `shutdown()` from a fresh current-thread
-    /// runtime via `std::thread::scope`. Awaiting a JoinHandle from
-    /// a different runtime than the one it was spawned on is not part
-    /// of tokio's documented contract and risks deadlocking under
-    /// future tokio releases. The `resp_rx.await` already gives the
-    /// flush-complete guarantee — the task sends on `resp_tx` as the
-    /// LAST step before `return`, so dropping the JoinHandle just
-    /// lets the task's final stack-pop happen on its own runtime.
     pub async fn shutdown(&self) -> Result<(), SyncError> {
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let result = if self.shutdown_tx.send(resp_tx).await.is_ok() {
-            // Mirror `flush_now`'s error propagation. Three outcomes:
-            //   Ok(Ok(()))    flush succeeded
-            //   Ok(Err(e))    flush failed (publish or persist)
-            //   Err(_)        oneshot cancelled — task panicked or
-            //                 dropped resp_tx mid-flush. We surface
-            //                 this as TransportClosed rather than
-            //                 silently swallowing as Ok(()), since
-            //                 that would mask exactly the failure
-            //                 mode this API is meant to surface.
-            resp_rx.await.map_err(|_| SyncError::TransportClosed)?
-        } else {
-            // shutdown_tx.send failed — the receiver is gone, so
-            // the task already exited (e.g. a previous shutdown).
-            // No flush to wait on; treat as already-done.
-            Ok(())
-        };
-        // Drop the JoinHandle without awaiting it (see doc above for why).
-        let _ = self.task.lock().await.take();
-        result
-    }
-}
-
-struct InternalCtx {
-    kt: Arc<KeyTree>,
-    device_id: String,
-    state: Arc<Mutex<OwnerState>>,
-    tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
-    content_store: Arc<dyn ContentStore>,
-    publisher_tx: mpsc::Sender<Vec<u8>>,
-    subscriber_rx: mpsc::Receiver<Vec<u8>>,
-    /// Persistence paths — used by Tasks 13+ for CRDT + replay-tracker flush.
-    paths: PersistPaths,
-    debounce: std::time::Duration,
-    notify_dirty: Arc<Notify>,
-    has_pending_dirty: Arc<AtomicBool>,
-    flush_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
-    shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
-}
-
-async fn internal_task(mut ctx: InternalCtx) {
-    use std::time::Instant;
-
-    let mut next_wakeup: Option<Instant> = None;
-    // Latched after we observe `None` on `subscriber_rx`. Without this,
-    // select! polls a closed channel every iteration and the arm-pattern
-    // `Some(bytes) = recv()` silently filters out None — inbound sync
-    // is permanently dead with no surfaced signal. The latch lets us
-    // log once and gate the arm off so the engine's other branches
-    // (notify_dirty, flush_now, shutdown) keep working as a degraded
-    // publish-only mode.
-    let mut inbound_closed = false;
-
-    // Pin the `Notified` future OUTSIDE the loop so its state persists
-    // across iterations. `tokio::select!` polls every branch in each
-    // iteration; when both `notified()` and another branch are Ready
-    // simultaneously, select picks one and drops the &mut reference to
-    // the others. If `notified()` was constructed inside the loop, that
-    // drop discards the consumed permit and the wakeup is silently
-    // lost. Pinning outside means the underlying `Notified` survives
-    // the dropped &mut, retains its `Done(consumed)` state, and the
-    // next iteration's poll returns `Ready` immediately — the permit's
-    // effect is preserved regardless of which branch select picked.
-    //
-    // After we successfully observe the notification, we replace the
-    // pinned future with a fresh `Notified` to start waiting again.
-    let notify = Arc::clone(&ctx.notify_dirty);
-    let notified = notify.notified();
-    tokio::pin!(notified);
-
-    loop {
-        // Compute the sleep duration for the wakeup branch.
-        let sleep_dur = next_wakeup
-            .map(|t| t.saturating_duration_since(Instant::now()))
-            .unwrap_or(std::time::Duration::from_secs(3600));
-
-        tokio::select! {
-            _ = notified.as_mut() => {
-                // Extend (or arm) the debounce window on every dirty
-                // signal. This is a sliding debounce: multiple rapid
-                // calls reset the timer, collapsing to one publish
-                // `debounce` after the last call in the burst.
-                if ctx.has_pending_dirty.load(Ordering::Relaxed) {
-                    next_wakeup = Some(Instant::now() + ctx.debounce);
-                }
-                // Replace the pinned future with a fresh one so we wait
-                // for the next notification. Without this, subsequent
-                // polls of the Done future return Ready in a tight loop.
-                notified.set(notify.notified());
-            }
-            _ = tokio::time::sleep(sleep_dur), if next_wakeup.is_some() => {
-                next_wakeup = None;
-                // Use `swap` rather than `store(false)` so we can
-                // restore the dirty bit if the publish itself fails.
-                // Otherwise a transient publish error (Zenoh blip,
-                // ContentStore failure) silently consumes the dirty
-                // signal and the next `shutdown()`/wakeup misses the
-                // pending-state guard.
-                let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
-                let pub_result = publish_root_now(&ctx).await;
-                if let Err(e) = &pub_result {
-                    tracing::warn!(error = %e, "publish_root_now failed");
-                    if was_dirty {
-                        // Re-arm so the next debounce wakeup / shutdown
-                        // retries this publish instead of skipping it.
-                        ctx.has_pending_dirty.store(true, Ordering::Release);
-                    }
-                }
-                if let Err(e) = persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await {
-                    tracing::warn!(error = %e, "persist_both failed");
-                }
-            }
-            Some(resp_tx) = ctx.flush_now_rx.recv() => {
-                // `flush_now` ALWAYS publishes, even on an idle engine
-                // (no `has_pending_dirty` guard, unlike the shutdown
-                // arm). This is intentional — see the public-facing
-                // doc on `SyncEngine::flush_now`. The cost is one
-                // extra Zenoh put + AES-GCM round-trip if the engine
-                // happens to be idle, which is acceptable for tests
-                // and explicit "force publish" callers.
-                next_wakeup = None;
-                // Same swap-and-restore pattern as the wakeup arm: if
-                // the publish fails, preserve the dirty latch so the
-                // engine retries on its next signal instead of losing
-                // pending work.
-                let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
-                let pub_result = publish_root_now(&ctx).await;
-                if pub_result.is_err() && was_dirty {
-                    ctx.has_pending_dirty.store(true, Ordering::Release);
-                }
-                let persist_result = persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await;
-                let result = pub_result.and(persist_result);
-                let _ = resp_tx.send(result);
-            }
-            maybe_bytes = ctx.subscriber_rx.recv(), if !inbound_closed => {
-                let Some(bytes) = maybe_bytes else {
-                    // The Zenoh adapter or whoever owned `inbound_tx`
-                    // dropped it. Log loudly so this surfaces in the
-                    // Tauri-side logs, then latch the arm off. Engine
-                    // remains alive in publish-only mode; user can
-                    // still mutate local state and persist.
-                    tracing::error!(
-                        "owner-state inbound subscriber channel closed; \
-                         sync inbound disabled (engine continuing in publish-only mode)"
-                    );
-                    inbound_closed = true;
-                    continue;
-                };
-                let outcome = handle_incoming_publish(&mut ctx, bytes).await;
-                if let Some(err) = outcome.error() {
-                    tracing::warn!(error = %err, "incoming publish dropped");
-                }
-                if outcome.needs_persist() {
-                    if let Err(e) =
-                        persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await
-                    {
-                        tracing::warn!(error = %e, "persist_both failed");
-                    }
-                }
-            }
-            Some(resp_tx) = ctx.shutdown_rx.recv() => {
-                // Flush only if there is genuinely unpublished dirty state.
-                let pub_result = if ctx.has_pending_dirty.load(Ordering::Relaxed) {
-                    publish_root_now(&ctx).await
-                } else {
-                    Ok(())
-                };
-                let persist_result =
-                    persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await;
-                // Surface either failure to the caller. Persist failure
-                // is the more critical of the two — losing the final
-                // disk flush silently corrupts the next-boot replay
-                // tracker / CRDT state.
-                let _ = resp_tx.send(pub_result.and(persist_result));
-                return;
-            }
-        }
-    }
-}
-
-use crate::owner_state_crypto::{
-    canonical_cbor_decode, canonical_cbor_encode, decrypt_entry, decrypt_root_publish,
-    encrypt_entry, encrypt_root_publish, space_lookup_key,
-};
-use crate::owner_state_types::RootPublishPayload;
-
-/// Lookup-key tag for the single-blob OwnerState in 3a's
-/// simplified CAS layout. See spec §"Root blob shape — Phase 3a
-/// simplification". Phase 3b/c restructures into per-entry blobs.
-const OWNER_STATE_ROOT_BLOB_TAG: &[u8] = b"owner-state-root-blob-v1";
-
-async fn persist_both(
-    state: &Arc<Mutex<OwnerState>>,
-    tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>,
-    paths: &PersistPaths,
-) -> Result<(), SyncError> {
-    // Snapshot under the async locks, then hop to a blocking thread for
-    // the actual file I/O. `save_crdt` / `save_replay` call `write_all`
-    // + `sync_all` (fsync) + `persist` (atomic rename) + (on Unix) a
-    // directory fsync — all blocking syscalls. Running them directly
-    // on the tokio runtime stalls the worker for the full fsync cost
-    // and starves debounce timers / inbound publishes.
-    let state_snap = state.lock().await.clone();
-    let tracker_snap = tracker.lock().await.clone();
-    let paths = paths.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), SyncError> {
-        crate::owner_state_persist::save_crdt(&paths.crdt, &state_snap)?;
-        crate::owner_state_persist::save_replay(&paths.replay, &tracker_snap)?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| {
-        SyncError::Persist(crate::owner_state_persist::PersistError::Io(
-            std::io::Error::other(format!("spawn_blocking join: {e}")),
-        ))
-    })??;
-    Ok(())
-}
-
-async fn publish_root_now(ctx: &InternalCtx) -> Result<(), SyncError> {
-    // Snapshot CRDT state under brief lock.
-    let snapshot = {
-        let state = ctx.state.lock().await;
-        state.clone()
-    };
-
-    // 1. Canonical-CBOR encode the OwnerState as the cleartext "root blob."
-    let blob_cleartext =
-        canonical_cbor_encode(&snapshot).map_err(|e| SyncError::CborEncode(e.to_string()))?;
-
-    // 2. Encrypt with deterministic per-entry AEAD using the fixed
-    //    owner-state-root lookup key, so cipher_cid is reproducible
-    //    across two devices encrypting the same state.
-    let lookup = space_lookup_key(&ctx.kt, OWNER_STATE_ROOT_BLOB_TAG);
-    let blob_ciphertext = encrypt_entry(&ctx.kt, &lookup, &blob_cleartext)
-        .map_err(|e| SyncError::Crypto(e.to_string()))?;
-
-    // 3. Phase 3b: cipher_cid = harmony-content's structured ContentId
-    //    derived from the ciphertext. ContentFlags has no `durable`
-    //    field — durability comes from `ephemeral: false` (the default
-    //    via `..Default::default()`) combined with `encrypted: true`,
-    //    which `ContentClass::content_class()` maps to `EncryptedDurable`
-    //    (eviction priority 0; never auto-burns). The 28-byte hash is
-    //    SHA-256 truncated to its 224 most-significant bits.
-    let root_cid = harmony_content::cid::ContentId::for_book(
-        &blob_ciphertext,
-        harmony_content::cid::ContentFlags {
-            encrypted: true,
-            ..Default::default()
-        },
-    )
-    .map_err(|e| SyncError::Crypto(format!("ContentId::for_book: {e}")))?;
-
-    // 4. Put into ContentStore (Phase 3b: routes through CasOp::PutLocal).
-    ctx.content_store.put(root_cid, blob_ciphertext).await?;
-
-    // 5. Build state-root payload.
-    let now = next_hlc(ctx).await;
-    let payload = RootPublishPayload { root_cid, at: now };
-    let payload_bytes =
-        canonical_cbor_encode(&payload).map_err(|e| SyncError::CborEncode(e.to_string()))?;
-
-    // 6. Encrypt with random-nonce root AEAD (Phase 1).
-    let wire = encrypt_root_publish(&ctx.kt, &payload_bytes)
-        .map_err(|e| SyncError::Crypto(e.to_string()))?;
-
-    // 7. Send onto outbound channel — Zenoh adapter forwards.
-    ctx.publisher_tx
-        .send(wire)
-        .await
-        .map_err(|_| SyncError::TransportClosed)?;
-
-    Ok(())
-}
-
-/// Build a strictly-newer HLC than the last one we published. The
-/// internal task is single-threaded so we don't need atomic ops;
-/// caller holds an `&mut self` to the task's local state in a real
-/// design, but for now we re-derive from system time + a per-task
-/// monotonic counter cached in `ctx.tracker` keyed by our own
-/// device_id.
-async fn next_hlc(ctx: &InternalCtx) -> Hlc {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let wall_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
-    let mut tracker = ctx.tracker.lock().await;
-    // Read once — both the logical-counter computation and the
-    // effective-wall pin need the same `prev`. Re-fetching from the
-    // map is cheap but invites future divergence; folding into one
-    // lookup keeps the read consistent.
-    //
-    // `saturating_add` on the logical counter: under sustained
-    // backward NTP correction or repeated clock-monotonicity faults
-    // we'd repeatedly bump `logical` without advancing `wall_ms`. An
-    // unchecked u32 add would eventually wrap and produce an HLC
-    // smaller than the previous one, breaking the strict-newer
-    // monotonicity that replay protection depends on. Saturation
-    // pins the value at u32::MAX instead — pathological but
-    // bounded; further publishes from the same device on the same
-    // wall_ms tick would be rejected by the receiver until the
-    // wall clock advances, which is preferable to silent replay.
-    let prev = tracker.get(&ctx.device_id).cloned();
-    let (logical, prev_wall) = match prev.as_ref() {
-        Some(p) if p.wall_ms == wall_ms => (p.logical.saturating_add(1), p.wall_ms),
-        Some(p) if p.wall_ms > wall_ms => (p.logical.saturating_add(1), p.wall_ms),
-        Some(p) => (0, p.wall_ms),
-        None => (0, 0),
-    };
-    let effective_wall = std::cmp::max(wall_ms, prev_wall);
-
-    let now = Hlc {
-        wall_ms: effective_wall,
-        logical,
-        device_id: ctx.device_id.clone(),
-    };
-    tracker.insert(ctx.device_id.clone(), now.clone());
-    now
-}
-
-/// Outcome of processing one inbound state-root publish. The variants
-/// distinguish where the failure happened so the caller persists only
-/// when local state actually changed — fsync per malformed wire packet
-/// is wasteful, and persisting only on `Mutated | ErrPostMutation`
-/// matches the single state-mutation point (the replay-tracker
-/// `tracker.insert(...)` after the strictly-newer check).
-#[derive(Debug)]
-enum IncomingOutcome {
-    /// Replay-rejected as a duplicate. No state change. Don't persist.
-    Duplicate,
-    /// Tracker advanced AND remote merge applied. Persist.
-    Mutated,
-    /// Failure occurred BEFORE the tracker advanced (decrypt-root,
-    /// payload decode, or replay-check itself). No state change.
-    /// Don't persist — disk is already consistent with memory.
-    ErrPreMutation(SyncError),
-    /// Failure occurred AFTER the tracker advanced but before the
-    /// merge completed (blob fetch, blob decrypt, blob decode).
-    /// Tracker is in-memory dirty; persist defensively so a restart
-    /// doesn't replay the same publish.
-    ErrPostMutation(SyncError),
-}
-
-impl IncomingOutcome {
-    fn needs_persist(&self) -> bool {
-        matches!(self, Self::Mutated | Self::ErrPostMutation(_))
-    }
-
-    fn error(&self) -> Option<&SyncError> {
-        match self {
-            Self::ErrPreMutation(e) | Self::ErrPostMutation(e) => Some(e),
-            Self::Duplicate | Self::Mutated => None,
-        }
+        self.inner.shutdown().await
     }
 }
 
@@ -531,10 +205,11 @@ impl IncomingOutcome {
 /// "outbox_tombstones → spaces → outbox → inbox → markers →
 /// tombstones → owner_device_cache" comment).
 ///
-/// Extracted from `handle_incoming_publish` so the merge invariants
-/// (in particular, that tombstone application clears any matching
-/// live Space even if the snapshot carries both) are unit-testable
-/// without spinning up the SyncEngine wire harness.
+/// This is the owner-state merge function supplied to the generic
+/// `FleetSyncEngine` as its `Merger<OwnerState>`. Kept as a free function
+/// so the merge invariants (in particular, that tombstone application
+/// clears any matching live Space even if the snapshot carries both) are
+/// unit-testable without spinning up the SyncEngine wire harness.
 fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // Destructure `remote` up front so each field can be moved through
     // its own loop without partial-move conflicts later.
@@ -674,89 +349,6 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     }
 }
 
-/// Process an incoming publish. See `IncomingOutcome` for the
-/// return-value semantics.
-#[allow(clippy::needless_pass_by_ref_mut)]
-async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> IncomingOutcome {
-    // 1. Decrypt the Zenoh wire payload.
-    let payload_bytes = match decrypt_root_publish(&ctx.kt, &wire) {
-        Ok(b) => b,
-        Err(e) => return IncomingOutcome::ErrPreMutation(SyncError::Crypto(e.to_string())),
-    };
-    let payload: RootPublishPayload = match canonical_cbor_decode(&payload_bytes) {
-        Ok(p) => p,
-        Err(e) => return IncomingOutcome::ErrPreMutation(SyncError::CborDecode(e.to_string())),
-    };
-
-    // 2. Replay protection. Tracker mutation is the single
-    //    "post-mutation" boundary: every error past this point must
-    //    persist; every error before it must NOT.
-    {
-        let mut tracker = ctx.tracker.lock().await;
-        let accept = match tracker.get(&payload.at.device_id) {
-            None => true,
-            Some(existing) => payload.at.is_strictly_newer_than(existing),
-        };
-        if !accept {
-            return IncomingOutcome::Duplicate;
-        }
-        tracker.insert(payload.at.device_id.clone(), payload.at.clone());
-    }
-
-    // 3. Fetch the encrypted root blob from CAS.
-    let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
-        Ok(Some(b)) => b,
-        Ok(None) => {
-            // Phase 3b: a missing blob means either a fetch timeout (network
-            // didn't deliver within DEFAULT_FETCH_TIMEOUT_MS) or a peer's
-            // corrupted-admit drop (StorageTier silently rejected hash-verify
-            // failures). Both collapse onto the same recovery path: drop the
-            // publish, rely on next state-root from any peer (CRDT eventual
-            // consistency). Classify as ContentStore error, NOT crypto —
-            // misleading in logs otherwise.
-            return IncomingOutcome::ErrPostMutation(SyncError::ContentStore(
-                crate::content_store::ContentStoreError::Io(format!(
-                    "missing root blob for cid {:?} (fetch timeout or admit-rejected)",
-                    payload.root_cid
-                )),
-            ));
-        }
-        Err(e) => return IncomingOutcome::ErrPostMutation(SyncError::ContentStore(e)),
-    };
-
-    // 4. Decrypt with the same lookup key the publisher used.
-    let lookup = space_lookup_key(&ctx.kt, OWNER_STATE_ROOT_BLOB_TAG);
-    let blob_cleartext = match decrypt_entry(&ctx.kt, &lookup, &blob_ciphertext) {
-        Ok(b) => b,
-        Err(e) => return IncomingOutcome::ErrPostMutation(SyncError::Crypto(e.to_string())),
-    };
-
-    // 5. Decode into a remote OwnerState snapshot.
-    let remote: OwnerState = match canonical_cbor_decode(&blob_cleartext) {
-        Ok(s) => s,
-        Err(e) => return IncomingOutcome::ErrPostMutation(SyncError::CborDecode(e.to_string())),
-    };
-
-    // 6. Merge each entry through Phase 2's CRDT methods. Order
-    //    matters slightly — Spaces must merge first because outbox/
-    //    inbox/markers reference SpaceIds that the canonicalization
-    //    rewrite needs to see resolved. owner_device_cache is
-    //    independent of the others (keyed by OwnerAddr, not SpaceId)
-    //    so its merge order doesn't matter — placed last for grouping.
-    //    See `merge_remote_into_local` for the per-loop semantics
-    //    (in particular the tombstone arm: route through
-    //    `tombstone_space` so a malformed/racing remote carrying both
-    //    spaces[id] and tombstones[id] cannot leave a live entry
-    //    behind).
-    {
-        let mut local = ctx.state.lock().await;
-        merge_remote_into_local(&mut local, remote);
-    }
-
-    // Tracker advanced and merge ran.
-    IncomingOutcome::Mutated
-}
-
 #[cfg(test)]
 mod debounce_tests {
     use super::*;
@@ -774,6 +366,16 @@ mod debounce_tests {
             replay: dir.path().join("replay.cbor"),
         };
         (dir, paths)
+    }
+
+    /// Re-export equality pin: owner-state's `DEFAULT_DEBOUNCE_MS` must
+    /// equal `fleet_sync`'s (the two are the same constant via re-export;
+    /// this guards against an accidental divergent redefinition in a
+    /// future refactor).
+    #[test]
+    fn default_debounce_ms_matches_fleet_sync() {
+        assert_eq!(DEFAULT_DEBOUNCE_MS, crate::fleet_sync::DEFAULT_DEBOUNCE_MS);
+        assert_eq!(DEFAULT_DEBOUNCE_MS, 250);
     }
 
     /// One notify_dirty fires exactly one publish after the debounce.
@@ -1053,6 +655,132 @@ mod skeleton_tests {
 }
 
 #[cfg(test)]
+mod wire_identity_tests {
+    //! Wire-identity pin: the OWNER publish path must emit a byte-identical
+    //! envelope to the pre-ZEB-417 implementation. `publish_seen = false`
+    //! makes `FleetRootPublish` carry an empty `seen` map, which its
+    //! `skip_serializing_if` omits — so the canonical-CBOR encoding equals
+    //! the legacy `RootPublishPayload { root_cid, at }` byte-for-byte.
+    //!
+    //! The on-disk format is preserved by construction: `OwnerStatePersist`
+    //! calls the same `save_crdt` / `save_replay` (same V2 schema header +
+    //! ciborium body) the pre-417 `persist_both` used, so no new disk pin is
+    //! needed here. The existing `owner_state_persist` round-trip tests and
+    //! `replay_tracker_survives_engine_restart` cover the disk format.
+
+    use super::*;
+    use crate::content_store::InMemoryStub;
+    use crate::fleet_sync::FleetRootPublish;
+    use crate::owner_state_crypto::{
+        canonical_cbor_decode, canonical_cbor_encode, decrypt_root_publish,
+    };
+    use crate::owner_state_types::RootPublishPayload;
+    use std::time::Duration;
+
+    fn make_kt() -> Arc<KeyTree> {
+        Arc::new(KeyTree::derive(&[0x5au8; 32]).expect("kt"))
+    }
+
+    #[tokio::test]
+    async fn owner_publish_envelope_is_byte_identical_to_legacy() {
+        let (pub_tx, mut pub_rx) = mpsc::channel(16);
+        let (_sub_tx, sub_rx) = mpsc::channel(16);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PersistPaths {
+            crdt: dir.path().join("crdt.cbor"),
+            replay: dir.path().join("replay.cbor"),
+        };
+        let kt = make_kt();
+        // A fixed (non-default) OwnerState so the published root_cid is a
+        // real content-addressed value, not the empty-state CID.
+        let mut state = OwnerState::default();
+        {
+            use crate::owner_state_types::{
+                OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
+            };
+            let h = Hlc {
+                wall_ms: 7,
+                logical: 0,
+                device_id: "owner-dev".into(),
+            };
+            state.spaces.insert(
+                SpaceId([9; 16]),
+                Space {
+                    id: SpaceId([9; 16]),
+                    kind: SpaceKind::Dm,
+                    parent: None,
+                    community_id: None,
+                    name: "DM".into(),
+                    transport: Some(TransportBinding::Reticulum {
+                        participants: vec![],
+                    }),
+                    members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+                    custom_name: None,
+                    notification_pref: None,
+                    left_at: None,
+                    created_at: h.clone(),
+                    updated_at: h,
+                    content_key: None,
+                    prior_content_keys: vec![],
+                    current_epoch: None,
+                    current_epoch_key: None,
+                    old_epoch_keys: BTreeMap::new(),
+                    admin_addr: None,
+                    is_invite_only: None,
+                    shared_in_profile: false,
+                    pending_join_at: None,
+                },
+            );
+        }
+
+        let engine = SyncEngine::new(
+            Arc::clone(&kt),
+            "owner-dev".into(),
+            Arc::new(Mutex::new(state)),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000,
+        );
+
+        engine.flush_now().await.unwrap();
+
+        // Receive the wire frame and decrypt the root publish.
+        let wire = tokio::time::timeout(Duration::from_millis(500), pub_rx.recv())
+            .await
+            .expect("publish within timeout")
+            .expect("channel open");
+        let payload_bytes = decrypt_root_publish(&kt, &wire).expect("decrypt root publish");
+        let fp: FleetRootPublish = canonical_cbor_decode(&payload_bytes).expect("decode envelope");
+
+        // 1. The owner path must NOT emit a `seen` digest.
+        assert!(
+            fp.seen.is_empty(),
+            "owner publish must carry an empty `seen` map (publish_seen=false)"
+        );
+
+        // 2. The canonical encoding of the emitted FleetRootPublish must
+        //    equal the canonical encoding of the legacy RootPublishPayload
+        //    carrying the same root_cid + at — i.e. the owner envelope is
+        //    byte-identical to the pre-417 wire type.
+        let legacy_bytes = canonical_cbor_encode(&RootPublishPayload {
+            root_cid: fp.root_cid,
+            at: fp.at.clone(),
+        })
+        .expect("encode legacy");
+        let fleet_bytes = canonical_cbor_encode(&fp).expect("encode fleet");
+        assert_eq!(
+            fleet_bytes, legacy_bytes,
+            "owner-state publish envelope must be byte-identical to legacy RootPublishPayload"
+        );
+
+        let _ = engine.shutdown().await;
+    }
+}
+
+#[cfg(test)]
 mod subscriber_tests {
     use super::*;
     use crate::content_store::InMemoryStub;
@@ -1063,9 +791,6 @@ mod subscriber_tests {
     use std::time::Duration;
 
     /// Per ZEB-259: bounded polling helper for convergence-wait tests.
-    /// Mirrors the helper in `mod integration_tests` below — kept private
-    /// per module to follow the codebase's "every test file has its own"
-    /// convention (see spec §5).
     async fn wait_until<F, Fut>(mut cond: F, timeout: Duration) -> bool
     where
         F: FnMut() -> Fut,
@@ -1097,7 +822,9 @@ mod subscriber_tests {
     }
 
     /// Build a wire payload for testing — re-uses the publisher's
-    /// encryption path but with a controlled HLC.
+    /// encryption path but with a controlled HLC. The `at.device_id` is
+    /// the simulated PEER (never the engine's own device), so the
+    /// generic engine's echo-suppression doesn't drop it.
     async fn make_wire(
         kt: &Arc<KeyTree>,
         store: &Arc<dyn ContentStore>,
@@ -1118,6 +845,9 @@ mod subscriber_tests {
         )
         .unwrap();
         store.put(root_cid, blob_ciphertext).await.unwrap();
+        // Use the legacy RootPublishPayload here on purpose: it proves the
+        // generic engine decodes the pre-417 wire shape (empty-seen
+        // FleetRootPublish == RootPublishPayload bytes).
         let payload = RootPublishPayload {
             root_cid,
             at: Hlc {
@@ -1483,6 +1213,15 @@ mod subscriber_tests {
         // Build a wire payload but DON'T put the blob in the store —
         // simulate cross-process / cross-device case where the
         // publisher and subscriber don't share their stubs.
+        //
+        // NOTE (ZEB-417): under the generic engine's MINT ordering
+        // (apply-before-advance), a missing blob now leaves the tracker
+        // UN-advanced — the opposite of the donor's advance-before-apply
+        // scheme, where the tracker was advanced before the fetch. We
+        // therefore assert local state stays empty (the merge was
+        // skipped); the tracker-still-records assertion from the donor is
+        // intentionally dropped here. That ordering is owned + tested by
+        // `fleet_sync`'s `blob_miss_is_dropped_and_recovered_on_next_publish`.
         let (pub_tx, _pub_rx) = mpsc::channel(16);
         let (sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
@@ -1510,23 +1249,14 @@ mod subscriber_tests {
         // stub never receives it.
         let wire = make_wire(&kt, &store_publisher, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
-        // Poll on the positive signal (tracker recorded the publish).
-        // Engine flow: tracker.insert → blob fetch → (Ok(None) on
-        // missing blob) → ErrPostMutation, NO merge. The
-        // affirmative `spaces.is_empty()` check below is now
-        // load-bearing: it catches a buggy world where merge
-        // happened anyway. Microsecond-scale operations on the empty
-        // stub make in-progress racing implausible by the time we
-        // re-acquire the local_state lock.
-        let recorded = wait_until(
-            || async {
-                let t = tracker.lock().await;
-                t.contains_key("peer-bob")
-            },
-            Duration::from_secs(2),
-        )
-        .await;
-        assert!(recorded, "tracker did not record peer-bob within 2s");
+
+        // Settle window: the subscriber dequeues the wire, passes the
+        // read-only replay check, then misses the CAS fetch (Ok(None)) and
+        // drops the publish WITHOUT merging or advancing the tracker. A
+        // bare sleep is the right tool for this negative assertion (the
+        // "spaces stays empty" predicate is true on entry, so wait_until
+        // would exit before the engine processes the wire).
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Subscriber must NOT have merged — local stays empty.
         let local = local_state.lock().await;
@@ -1536,12 +1266,14 @@ mod subscriber_tests {
         );
         drop(local);
 
-        // BUT replay tracker should still have advanced — we accepted
-        // the publish, just couldn't fetch the data. That's OK because
-        // the next publish from the same peer will carry a newer HLC
-        // and a new (hopefully present) root_cid.
+        // Under MINT ordering the tracker is NOT advanced when the blob is
+        // unfetchable, so the next publish from the same peer (newer HLC,
+        // hopefully-present root_cid) is retried rather than rejected.
         let t = tracker.lock().await;
-        assert!(t.contains_key("peer-bob"), "tracker must still record");
+        assert!(
+            !t.contains_key("peer-bob"),
+            "MINT ordering: tracker must NOT advance on a blob-fetch miss"
+        );
         drop(t);
 
         let _ = engine.shutdown().await;
@@ -2096,7 +1828,7 @@ mod integration_tests {
     }
 
     /// OwnerDeviceCache must replicate over Flow A sync. Without the
-    /// owner_device_cache loop in `handle_incoming_publish`, an entry
+    /// owner_device_cache loop in `merge_remote_into_local`, an entry
     /// learned on device A would never appear on device B even after
     /// successful state-root sync — Phase 3b's link-origin resolver on
     /// B would fail to bind incoming DM messages from the same OwnerAddr
@@ -2208,7 +1940,7 @@ mod integration_tests {
         remote.spaces.insert(space_id, live);
         remote.tombstones.insert(space_id);
 
-        merge_remote_into_local(&mut local, remote);
+        super::merge_remote_into_local(&mut local, remote);
 
         assert!(
             local.tombstones.contains(&space_id),
@@ -2261,7 +1993,7 @@ mod integration_tests {
         let mut remote = OwnerState::default();
         remote.outbox_tombstones.insert(id, tomb_hlc.clone());
 
-        merge_remote_into_local(&mut local, remote);
+        super::merge_remote_into_local(&mut local, remote);
 
         assert!(
             !local.outbox.contains_key(&id),
@@ -2328,7 +2060,7 @@ mod integration_tests {
         remote.friend_graph.friends.insert(wrong_addr, bad_entry);
 
         let mut local = OwnerState::default();
-        merge_remote_into_local(&mut local, remote);
+        super::merge_remote_into_local(&mut local, remote);
 
         assert!(
             !local.friend_graph.friends.contains_key(&wrong_addr),
@@ -2392,7 +2124,7 @@ mod integration_tests {
 
         // --- A merges B's state: tombstone must sweep A's local entry. ---
         let b_snapshot_for_a = b.clone();
-        merge_remote_into_local(&mut a, b_snapshot_for_a);
+        super::merge_remote_into_local(&mut a, b_snapshot_for_a);
 
         assert!(
             !a.outbox.contains_key(&id),
@@ -2414,7 +2146,7 @@ mod integration_tests {
         // --- Idempotency: merge B←A again → no change. ---
         let a_snapshot_for_b = a.clone();
         let b_tombstones_before = b.outbox_tombstones.clone();
-        merge_remote_into_local(&mut b, a_snapshot_for_b);
+        super::merge_remote_into_local(&mut b, a_snapshot_for_b);
         assert!(
             b.outbox.is_empty(),
             "B's outbox must remain empty after idempotent merge"
@@ -2595,6 +2327,7 @@ mod cas_op_protocol_tests {
         // Drives a SyncEngine subscriber through a synthetic state-root
         // delivery for a CID the stub doesn't have, asserts the engine
         // continues running and local state stays empty.
+        use super::*;
         use crate::owner_state_crdt::OwnerState;
         use crate::owner_state_crypto::{
             canonical_cbor_encode, encrypt_entry, encrypt_root_publish, space_lookup_key, KeyTree,
