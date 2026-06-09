@@ -22,7 +22,17 @@ export async function migrateLocalNotes(
       // Pass the legacy entry's stable id so a crash mid-import re-imports the
       // SAME ids (LWW no-op) instead of minting fresh ULIDs and duplicating.
       const id = typeof e.id === 'string' && e.id ? e.id : undefined;
-      await invokeFn('notes_upsert', { id, text: e.text });
+      try {
+        await invokeFn('notes_upsert', { id, text: e.text });
+      } catch (err) {
+        // A "superseded" rejection means this id was already deleted or edited
+        // (with a newer HLC) on another device — skip it, don't let one note
+        // wedge the whole migration (which would leave the migrated flag unset
+        // and re-fail on every startup). Re-throw anything else (e.g. the
+        // backend not being ready yet) so we retry the import next launch.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes('superseded')) throw err;
+      }
     }
   }
   localStorage.setItem(doneKey, '1');

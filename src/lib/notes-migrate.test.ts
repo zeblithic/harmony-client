@@ -76,4 +76,33 @@ describe('migrateLocalNotes (ZEB-417 one-time import)', () => {
     expect(inv).not.toHaveBeenCalled();
     expect(localStorage.getItem('harmony-notes-migrated:o')).toBe('1');
   });
+
+  it('skips a "superseded" note without wedging the rest of the migration', async () => {
+    // A note that was already deleted/edited on another device makes notes_upsert
+    // reject with "superseded". That must not abort the loop or leave the flag
+    // unset (which would re-fail every startup); the other notes still import.
+    localStorage.setItem('harmony-notes:owner-sup', JSON.stringify([
+      { id: 'a', text: 'one', timestamp: 1 },
+      { id: 'b', text: 'gone', timestamp: 2 },
+      { id: 'c', text: 'three', timestamp: 3 },
+    ]));
+    const inv = vi.fn().mockImplementation((_cmd, args: { id?: string }) =>
+      args.id === 'b'
+        ? Promise.reject(new Error('note upsert was superseded (a newer edit or delete already won)'))
+        : Promise.resolve({}),
+    );
+    await migrateLocalNotes('owner-sup', inv);
+    expect(inv).toHaveBeenCalledTimes(3); // all three attempted, none aborted
+    expect(inv).toHaveBeenCalledWith('notes_upsert', { id: 'c', text: 'three' });
+    expect(localStorage.getItem('harmony-notes-migrated:owner-sup')).toBe('1');
+  });
+
+  it('re-throws a non-superseded error and leaves the flag unset (retry next launch)', async () => {
+    localStorage.setItem('harmony-notes:owner-err', JSON.stringify([
+      { id: 'a', text: 'one', timestamp: 1 },
+    ]));
+    const inv = vi.fn().mockRejectedValue('notes dataset not loaded');
+    await expect(migrateLocalNotes('owner-err', inv)).rejects.toBe('notes dataset not loaded');
+    expect(localStorage.getItem('harmony-notes-migrated:owner-err')).toBeNull();
+  });
 });

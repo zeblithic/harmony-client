@@ -61,27 +61,31 @@ pub(crate) async fn notes_upsert_core(
     let id = id.unwrap_or_else(new_ulid);
     let mut d = doc.lock().await;
     // Mint the HLC (which advances the shared tracker) only when the write will
-    // actually apply. For an EXISTING note, peek the HLC `mint_next_hlc` would
-    // produce and bail early if it wouldn't beat the note's current
-    // `updated_at` (a concurrent newer edit/delete already won). Minting on
-    // such a no-op would push `tracker[device]` above our last published HLC
-    // with no corresponding publish — skewing the durability indicator and
-    // wasting a tick. A brand-new note (no entry yet) always applies, so it
-    // skips the peek and mints unconditionally. Lock order is doc→tracker
-    // (matches `notes_delete_core`); deadlock-free since no path locks the
-    // tracker while holding the doc in the opposite order.
-    if let Some(existing) = d.notes.get(&id) {
-        let candidate = {
-            let t = tracker.lock().await;
-            crate::fleet_sync::peek_next_hlc(&t, device_id)
-        };
+    // actually apply. For an EXISTING note, compute the candidate HLC and
+    // commit it atomically under a SINGLE tracker-lock hold: peek, bail if it
+    // wouldn't beat the note's current `updated_at` (a concurrent newer
+    // edit/delete already won), else commit it. Doing the peek and the commit
+    // under one lock — rather than peek, release, then `mint_next_hlc` which
+    // re-reads the clock — closes a race where the wall clock stepping backward
+    // between the two reads could let the peek pass while the minted value is
+    // stale, advancing the tracker on a no-op (the exact skew this guards
+    // against). A brand-new note (no entry yet) always applies, so it mints
+    // normally. Lock order is doc→tracker (matches `notes_delete_core`);
+    // deadlock-free since no path locks the tracker while holding the doc in
+    // the opposite order.
+    let at = if let Some(existing) = d.notes.get(&id) {
+        let mut t = tracker.lock().await;
+        let candidate = crate::fleet_sync::peek_next_hlc(&t, device_id);
         if !candidate.is_strictly_newer_than(&existing.updated_at) {
             return Err(
                 "note upsert was superseded (a newer edit or delete already won)".to_string(),
             );
         }
-    }
-    let at = crate::fleet_sync::mint_next_hlc(tracker, device_id).await;
+        t.insert(device_id.to_string(), candidate.clone());
+        candidate
+    } else {
+        crate::fleet_sync::mint_next_hlc(tracker, device_id).await
+    };
     d.upsert(id.clone(), trimmed, at);
     // Defensive: even after the peek, a concurrent tombstone with a newer HLC
     // could land between the peek and this upsert, making it a no-op (`get`
