@@ -28,28 +28,45 @@ pub struct NicknameEntry {
 }
 
 impl FriendNicknames {
-    /// Load from `path`, or return an empty map when the file is missing or
-    /// unparseable (never panics; a corrupt file must not brick the panel).
+    /// Load from `path`. A MISSING file is the normal first-run case → empty map,
+    /// silently. A corrupt/unparseable file or an UNEXPECTED read error (e.g.
+    /// permissions) also yields an empty map so a bad file can't brick the panel,
+    /// but is logged at WARN so a real problem stays visible rather than silent.
     pub fn load_or_default(path: &Path) -> Self {
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Self::default(),
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e, path = %path.display(),
+                        "friend_nicknames: corrupt file; using empty set"
+                    );
+                    Self::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e, path = %path.display(),
+                    "friend_nicknames: read failed; using empty set (nicknames may be temporarily unavailable)"
+                );
+                Self::default()
+            }
         }
     }
 
-    /// Atomically persist to `path` (write temp in the same dir, then rename).
+    /// Atomically persist to `path`, creating the parent dir first. Reuses the
+    /// shared `owner_state_persist::save_atomically` helper (NamedTempFile +
+    /// fsync + atomic persist) rather than a hand-rolled temp+rename.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        // Ensure the settings directory exists before writing — on a fresh
-        // profile the owner data dir may not be created yet, and without this the
-        // temp write fails with ENOENT (mirrors other settings persistence).
+        // save_atomically requires the parent dir to exist; on a fresh profile
+        // the owner data dir may not be created yet.
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| format!("encode: {e}"))?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes).map_err(|e| format!("write tmp: {e}"))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
-        Ok(())
+        crate::owner_state_persist::save_atomically(path, &bytes)
+            .map_err(|e| format!("save friend_nicknames: {e}"))
     }
 
     /// Upsert (`Some` non-blank) or clear (`None`/blank) a nickname. `owner_id_hex`

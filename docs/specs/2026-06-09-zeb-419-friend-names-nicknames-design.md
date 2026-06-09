@@ -68,13 +68,15 @@ pub struct FriendNicknames {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NicknameEntry {
     pub nickname: String,
-    /// HLC at last write (substrate-ready LWW key).
-    pub updated_hlc: crate::owner_state_types::Hlc,
+    /// Wall-clock ms at last write — local LWW key. (The substrate owns real
+    /// HLCs; a single-writer local store doesn't need the HLC tracker — see the
+    /// plan's deviation note.)
+    pub updated_ms: u64,
 }
 ```
 
-- `load_or_default(path) -> FriendNicknames` and `save(path, &self)` mirror `pkarr_settings.rs` (atomic write via temp + rename; missing file → default empty).
-- `set(&mut self, owner_id_hex, nickname: Option<String>, hlc)`: `Some(non-empty)` upserts with the new HLC; `None` or empty/whitespace removes the entry. Owner_id is lowercased on the way in.
+- `load_or_default(path) -> FriendNicknames` (missing file → empty; corrupt/unreadable → log a warning + empty) and `save(path)` reuse the shared `owner_state_persist::save_atomically` helper (NamedTempFile + fsync + atomic persist) after `create_dir_all(parent)`.
+- `set(&mut self, owner_id_hex, nickname: Option<&str>, now_ms)`: `Some(non-blank)` upserts; `None`/blank removes the entry. Owner_id is lowercased on the way in. (No return value.)
 - `get(&self, owner_id_hex) -> Option<&str>`.
 - File location: a dedicated `friend_nicknames.json` alongside the existing per-owner settings (same dir resolution `pkarr_settings` uses).
 
@@ -83,29 +85,30 @@ pub struct NicknameEntry {
 ```rust
 #[tauri::command]
 async fn set_friend_nickname(
-    owner_id_hex: String,
-    nickname: Option<String>,        // None / empty / whitespace => clear
+    app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+    nickname: Option<String>,        // None / blank => clear
 ) -> Result<(), String>
 ```
 
-- Validates `owner_id_hex` via `parse_owner_addr_hex` (reject malformed before any write).
-- Reserves a fresh HLC (same `reserve_next_hlc_for_device` path used elsewhere), loads-or-defaults, `set(...)`, saves.
+- Validates `owner_id_hex` via `decode_owner_id_16` (reject malformed before any write).
+- **Active-only:** setting a (non-blank) nickname for an owner that isn't an Active friend is rejected; clearing is always allowed. Then loads-or-defaults, `set(... now_ms)`, saves atomically.
 - Emits `friend-list-changed` so the panel re-fetches and re-renders the new label. (Reuses the existing refresh path — no new event type.)
 - Plain `#[tauri::command]` (camelCase JS → snake_case Rust per the project convention; **no** `rename_all` — see ZEB-414).
 
 ### 4.3 Projection join
 
-`FriendDto` gains `nickname: Option<String>`. `list_friends_inner` takes the nickname map and joins at projection, staying pure + unit-testable:
+`FriendDto` gains `nickname: Option<String>`. To avoid churning every existing `list_friends_inner` call site/test, the join lives in a dedicated pure helper `apply_nicknames` (called by the `list_friends` IPC right after `list_friends_inner`), staying pure + unit-testable. It overlays a stored nickname **only onto `Active` rows** (active-only scope, enforced read-side):
 
 ```rust
-pub fn list_friends_inner(
-    state: &crate::owner_state_crdt::OwnerState,
+pub fn apply_nicknames(
+    mut friends: Vec<FriendDto>,
     nicknames: &crate::friend_nicknames::FriendNicknames,
-) -> Vec<FriendDto> { /* ... nickname: nicknames.get(&owner_id_hex).map(str::to_owned) ... */ }
+) -> Vec<FriendDto> { /* for Active f: f.nickname = nicknames.get(&f.owner_id_hex)... */ }
 ```
 
-The `list_friends` IPC wrapper loads-or-defaults the nickname store and passes it in.
+The `list_friends` IPC wrapper loads-or-defaults the nickname store and applies it.
 
 ### 4.4 Privacy invariant (structural)
 
