@@ -139,6 +139,7 @@ pub mod dm_envelope;
 pub mod dm_outbox;
 pub mod dm_signing;
 pub mod event_loop;
+pub mod fleet_sync;
 pub mod folder_ingest;
 pub mod folders;
 mod follows;
