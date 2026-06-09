@@ -72,6 +72,12 @@
   // Per-row in-flight referrable-toggle guard (by owner_id hex). ZEB-375 Phase 2a.
   let referrableSaving = $state<Set<string>>(new Set());
 
+  // ZEB-419: inline nickname editor. `editingNickname` is the owner_id of the
+  // row whose editor is open (or null); `nicknameSaving` guards in-flight saves.
+  let editingNickname = $state<string | null>(null);
+  let nicknameDraft = $state('');
+  let nicknameSaving = $state<Set<string>>(new Set());
+
   // ZEB-375 Phase 2a Task 7: per-row "browse referrals" state, keyed by the
   // friend's owner_id hex. `loading` is the in-flight guard; `results` holds the
   // last verified ReferralView[] (an empty array renders an "empty" line);
@@ -367,6 +373,37 @@
     }
   }
 
+  // ── ZEB-419: local nickname editing (active friends) ──────────────────────
+  function startEditNickname(f: FriendDto): void {
+    editingNickname = f.ownerIdHex;
+    nicknameDraft = f.nickname ?? '';
+  }
+  function cancelEditNickname(): void {
+    editingNickname = null;
+    nicknameDraft = '';
+  }
+  // Save (or clear, when blank) the nickname. The backend emits
+  // `friend-list-changed` → `refresh()` repaints with the new value, so there's
+  // no optimistic local mutation. `destroyed` guards the post-await writes
+  // (same liveness discipline as the add-by-key paths).
+  async function saveNickname(ownerIdHex: string): Promise<void> {
+    if (nicknameSaving.has(ownerIdHex)) return;
+    nicknameSaving = new Set(nicknameSaving).add(ownerIdHex);
+    try {
+      await service.setNickname(ownerIdHex, nicknameDraft.trim() || null);
+      if (destroyed) return;
+      editingNickname = null;
+      nicknameDraft = '';
+    } catch (e) {
+      if (destroyed) return;
+      error = `Couldn't save nickname: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      const next = new Set(nicknameSaving);
+      next.delete(ownerIdHex);
+      nicknameSaving = next;
+    }
+  }
+
   // ZEB-375 Phase 2a: flip a friend's referral-catalog opt-in. `next` is the
   // desired new value (the inverse of the current `referrable`). The backend
   // re-syncs and emits `friend-list-changed`, but we also `refresh()` so the
@@ -640,6 +677,46 @@
                gate both controls on status to avoid surfacing functional-looking
                controls that throw. -->
           {#if f.status === 'active'}
+            <!-- ZEB-419: local nickname editor (this device only). -->
+            {#if editingNickname === f.ownerIdHex}
+              <input
+                type="text"
+                class="nickname-input"
+                placeholder="Nickname (only you see this)"
+                bind:value={nicknameDraft}
+                data-testid="nickname-input-{f.ownerIdHex}"
+                onkeydown={(e) => {
+                  if (e.key === 'Enter') saveNickname(f.ownerIdHex);
+                  else if (e.key === 'Escape') cancelEditNickname();
+                }}
+              />
+              <button
+                type="button"
+                class="secondary-btn small-btn"
+                disabled={nicknameSaving.has(f.ownerIdHex)}
+                onclick={() => saveNickname(f.ownerIdHex)}
+                data-testid="nickname-save-{f.ownerIdHex}"
+              >
+                {nicknameSaving.has(f.ownerIdHex) ? '…' : 'Save'}
+              </button>
+              <button
+                type="button"
+                class="secondary-btn small-btn"
+                onclick={cancelEditNickname}
+                data-testid="nickname-cancel-{f.ownerIdHex}"
+              >
+                Cancel
+              </button>
+            {:else}
+              <button
+                type="button"
+                class="secondary-btn small-btn"
+                onclick={() => startEditNickname(f)}
+                data-testid="set-nickname-btn-{f.ownerIdHex}"
+              >
+                {f.nickname ? 'Edit nickname' : 'Set nickname'}
+              </button>
+            {/if}
             <label class="referrable-toggle" data-testid="referrable-toggle-label">
               <input
                 type="checkbox"
@@ -934,6 +1011,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
     gap: 12px;
     padding: 6px 0;
     border-bottom: 1px solid var(--border, #2a2a2a);
@@ -979,6 +1057,17 @@
     flex-shrink: 0;
     font-size: 12px;
     padding: 4px 10px;
+  }
+
+  .nickname-input {
+    flex: 0 1 150px;
+    min-width: 90px;
+    font-size: 12px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border, #555);
+    background: var(--bg-secondary, #1e1e1e);
+    color: var(--text-primary);
   }
 
   .referrals-row {

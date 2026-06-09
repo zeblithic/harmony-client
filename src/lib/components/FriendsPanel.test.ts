@@ -397,4 +397,40 @@ describe('FriendsPanel — owner names + nicknames (ZEB-419)', () => {
     unmount();
     expect(cardService.unsubscribeAll).toHaveBeenCalled();
   });
+
+  it('sets a nickname via the inline editor', async () => {
+    const id = 'a'.repeat(32);
+    const friends = [
+      { ownerIdHex: id, display: null, nickname: null, status: 'active', establishedVia: 'mutual_key', referrable: false },
+    ];
+    const setNickname = vi.fn().mockResolvedValue(undefined);
+    const service = mockService({ listFriends: vi.fn().mockResolvedValue(friends), setNickname });
+    const { findByTestId, getByTestId } = render(FriendsPanel, {
+      props: { service, cardService: mockCardService() },
+    });
+    await findByTestId('friend-list');
+
+    await fireEvent.click(getByTestId(`set-nickname-btn-${id}`));
+    await fireEvent.input(getByTestId(`nickname-input-${id}`), { target: { value: 'Koya' } });
+    await fireEvent.click(getByTestId(`nickname-save-${id}`));
+    expect(setNickname).toHaveBeenCalledWith(id, 'Koya');
+  });
+
+  it('clears a nickname when saved blank (trim → null)', async () => {
+    const id = 'b'.repeat(32);
+    const friends = [
+      { ownerIdHex: id, display: 'Hint', nickname: 'Old', status: 'active', establishedVia: 'token', referrable: false },
+    ];
+    const setNickname = vi.fn().mockResolvedValue(undefined);
+    const service = mockService({ listFriends: vi.fn().mockResolvedValue(friends), setNickname });
+    const { findByTestId, getByTestId } = render(FriendsPanel, {
+      props: { service, cardService: mockCardService() },
+    });
+    await findByTestId('friend-list');
+
+    await fireEvent.click(getByTestId(`set-nickname-btn-${id}`));
+    await fireEvent.input(getByTestId(`nickname-input-${id}`), { target: { value: '   ' } });
+    await fireEvent.click(getByTestId(`nickname-save-${id}`));
+    expect(setNickname).toHaveBeenCalledWith(id, null);
+  });
 });
