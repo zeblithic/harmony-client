@@ -1,13 +1,15 @@
 <script lang="ts">
   /**
-   * ZEB-334 — Self-notes view.
+   * ZEB-334 / ZEB-417 — Self-notes view.
    *
    * The always-present, private scratchpad shown as the default when no
    * community is joined (replacing the misleading "#general floating in the
-   * void"). Reads/writes through NotesService only — no network plumbing —
-   * so it works offline and across identity switches. Author label reuses the
-   * configured display name (consistent with ZEB-337).
+   * void"). Reads/writes through NotesService only — IPC-backed since ZEB-417,
+   * synced across the owner's devices. Author label reuses the configured
+   * display name (consistent with ZEB-337).
    */
+  import { onMount, onDestroy } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import type { NotesService, NoteEntry } from '../notes-service';
 
   let {
@@ -27,20 +29,35 @@
   // ownerId here makes the effect re-run on identity switch, so notes never
   // bleed across identities.
   $effect(() => {
-    entries = notesService.getEntries(ownerId);
+    void notesService.getEntries(ownerId).then((result) => { entries = result; });
+  });
+
+  // ZEB-417: subscribe to backend sync events so inbound changes are reflected
+  // immediately without a manual reload. Cleaned up on component destroy.
+  let unlistenNotesChanged: (() => void) | null = null;
+  onMount(async () => {
+    unlistenNotesChanged = await listen('notes-changed', () => {
+      void notesService.load(ownerId);
+    });
+    notesService.onChange = () => {
+      entries = [...notesService.entries];
+    };
+  });
+  onDestroy(() => {
+    unlistenNotesChanged?.();
   });
 
   const authorLabel = $derived(displayName?.trim() ? displayName : 'You');
 
-  function submit() {
+  async function submit() {
     const text = composeText.trim();
     if (!text) return;
     // Keep the text if it couldn't be saved (e.g. the owner id hasn't loaded
     // yet, so append is a no-op) — clearing it would silently lose the note.
     // (Cursor PR #180.)
-    const entry = notesService.append(ownerId, text);
+    const entry = await notesService.append(ownerId, text);
     if (!entry) return;
-    entries = notesService.getEntries(ownerId);
+    entries = await notesService.getEntries(ownerId);
     composeText = '';
   }
 
@@ -48,7 +65,7 @@
     // Enter sends; Shift+Enter inserts a newline (matches channel/DM compose).
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      submit();
+      void submit();
     }
   }
 
