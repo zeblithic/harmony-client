@@ -119,6 +119,38 @@ describe('FriendsPanel — discovery-off footgun (ZEB-415 #1)', () => {
     fireChange(true);
     await vi.waitFor(() => expect(queryByTestId('my-key-discovery-warning')).toBeNull());
   });
+
+  it('does not let a slow initial read clobber a fresher discovery event', async () => {
+    // Defer the mount-time read so a change event can land before it resolves.
+    let resolveRead: (v: boolean) => void = () => {};
+    vi.mocked(connectivity.getIdentityDiscoverable).mockReturnValue(
+      new Promise<boolean>((res) => {
+        resolveRead = res;
+      }),
+    );
+    let fireChange: (enabled: boolean) => void = () => {};
+    vi.mocked(connectivity.onIdentityDiscoverableChanged).mockImplementation((cb) => {
+      fireChange = cb;
+      return () => {};
+    });
+    const service = mockService({
+      getMyIdentityPubHex: vi.fn().mockResolvedValue(FULL_KEY),
+    });
+    const { findByTestId, queryByTestId } = render(FriendsPanel, { props: { service } });
+
+    await findByTestId('my-key-input'); // mounted; subscription registered
+
+    // A fresher event reports discovery ON, THEN the slow mount-time read
+    // finally resolves with the now-stale OFF snapshot. The stale value must
+    // NOT win and resurrect the warning.
+    fireChange(true);
+    resolveRead(false);
+    // Settle on a macrotask boundary so the stale-read continuation AND the
+    // Svelte DOM flush both complete — we assert the final stable state, not a
+    // mid-flush snapshot.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(queryByTestId('my-key-discovery-warning')).toBeNull();
+  });
 });
 
 describe('FriendsPanel — add-by-key auto-retry (ZEB-415 #2)', () => {

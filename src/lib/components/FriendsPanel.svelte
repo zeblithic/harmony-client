@@ -102,6 +102,10 @@
   let identityDiscoverable = $state<boolean | null>(null);
   let enablingDiscovery = $state(false);
   let unsubscribeDiscoverable: (() => void) | null = null;
+  // Bumped by any authoritative update (change event / inline Enable). The
+  // mount-time read captures this before awaiting and bails if it changed, so a
+  // slow initial read can't clobber a fresher value when it finally resolves.
+  let discoverableGen = 0;
 
   // Auto-accept toggle.
   let autoAccept = $state(false);
@@ -179,8 +183,13 @@
   // the "My key" section can warn when sharing the key is futile (peers resolve
   // the identity-keyed pkarr record, which is only published when discovery is on).
   async function loadDiscoverable(): Promise<void> {
+    const gen = discoverableGen;
     try {
-      identityDiscoverable = await getIdentityDiscoverable();
+      const value = await getIdentityDiscoverable();
+      // A change event or inline Enable that landed while we were awaiting is
+      // strictly fresher than this mount-time snapshot — don't overwrite it.
+      if (gen !== discoverableGen) return;
+      identityDiscoverable = value;
     } catch (e) {
       // A read failure must NOT nag the user with a (possibly false) warning;
       // leave the tri-state at null. Log so a real backend fault stays visible.
@@ -199,6 +208,7 @@
       // Optimistic clear — the `connectivity-identity-discoverable-changed`
       // event will also flip this, but updating now hides the warning at once.
       identityDiscoverable = true;
+      discoverableGen += 1;
     } catch (e) {
       console.error(
         'setIdentityDiscoverable failed:',
@@ -227,6 +237,7 @@
     // flipped (e.g. the Network settings panel), not just our inline Enable.
     unsubscribeDiscoverable = onIdentityDiscoverableChanged((enabled) => {
       identityDiscoverable = enabled;
+      discoverableGen += 1;
     });
   });
 
@@ -422,9 +433,15 @@
           return;
         }
         // 'pending' or a transient 'unreachable' → keep waiting in-window.
-      } catch {
+      } catch (e) {
         if (generation !== addRetryGeneration) return;
-        // Transient dial/IO error mid-window — keep waiting rather than abort.
+        // Transient dial/IO error mid-window — keep waiting rather than abort,
+        // but leave a breadcrumb so a persistently-failing retry is diagnosable
+        // (otherwise the only signal is the generic max-attempts message).
+        console.debug(
+          `add-by-key auto-retry attempt ${attempt + 1} failed (still waiting):`,
+          e instanceof Error ? e.message : String(e),
+        );
       }
       attempt += 1;
       if (attempt >= ADD_RETRY_MAX_ATTEMPTS) {

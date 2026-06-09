@@ -35918,8 +35918,14 @@ pub async fn connectivity_add_friend_by_key_inner(
         // No Case-B record published → the target isn't discoverable.
         Ok(None) => return Ok(AddFriendOutcome::Unreachable),
         // Relay warm-up / cooldown is transient — map to `Unreachable` (retry
-        // later) instead of leaking the raw error to the UI (ZEB-415 #3).
+        // later) instead of leaking the raw error to the UI (ZEB-415 #3). Keep
+        // the raw error in the logs so operators can still diagnose repeated
+        // warm-up/cooldown failures (the UI deliberately hides it).
         Err(e) if resolve_error_is_transient_unreachable(&e.to_string()) => {
+            tracing::debug!(
+                error = %e,
+                "add_friend_by_key: transient pkarr resolve failure → Unreachable"
+            );
             return Ok(AddFriendOutcome::Unreachable);
         }
         Err(e) => return Err(format!("pkarr resolve: {e}")),
