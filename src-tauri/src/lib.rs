@@ -163,6 +163,7 @@ pub mod mint_sync;
 pub mod mint_sync_persist;
 pub mod mint_sync_types;
 pub mod notes_crdt;
+pub mod notes_persist;
 pub mod owner_commands;
 pub mod owner_loaded;
 pub mod owner_state;
