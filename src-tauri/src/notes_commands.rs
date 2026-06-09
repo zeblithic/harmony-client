@@ -73,17 +73,27 @@ pub(crate) async fn notes_upsert_core(
     })
 }
 
-/// Tombstone a note (LWW on a freshly minted HLC). Deleting a missing or
-/// already-deleted id is a no-op.
+/// Tombstone a note (LWW on a freshly minted HLC). Returns `Ok(true)` when a
+/// live note was tombstoned; `Ok(false)` when the id is absent or already
+/// tombstoned (a no-op — no HLC is minted, so the wrapper skips `notify_dirty`
+/// and we avoid publishing unchanged state).
 pub(crate) async fn notes_delete_core(
     doc: &Arc<Mutex<NotesDoc>>,
     tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>,
     device_id: &str,
     id: String,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    // Only a LIVE note can be deleted to effect; absent or already-tombstoned
+    // ids are a no-op — return false so the wrapper skips notify_dirty (no
+    // spurious publish of unchanged state).
+    {
+        if doc.lock().await.get(&id).is_none() {
+            return Ok(false);
+        }
+    }
     let at = crate::fleet_sync::mint_next_hlc(tracker, device_id).await;
     doc.lock().await.delete(&id, at);
-    Ok(())
+    Ok(true)
 }
 
 const NOTES_NOT_LOADED_MSG: &str = "notes dataset not loaded";
@@ -145,8 +155,10 @@ pub async fn notes_delete(
             g.notes_sync.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
         )
     };
-    notes_delete_core(&doc, &tracker, &device_id, id).await?;
-    sync.notify_dirty();
+    let changed = notes_delete_core(&doc, &tracker, &device_id, id).await?;
+    if changed {
+        sync.notify_dirty();
+    }
     Ok(())
 }
 
@@ -164,10 +176,33 @@ mod tests {
         assert_eq!(v.text, "hi");
         let listed = notes_list_core(&doc).await;
         assert_eq!(listed.len(), 1);
-        notes_delete_core(&doc, &tracker, "dev-A", v.id.clone())
+        let deleted = notes_delete_core(&doc, &tracker, "dev-A", v.id.clone())
             .await
             .unwrap();
+        assert!(deleted, "deleting a live note returns Ok(true)");
         assert!(notes_list_core(&doc).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_absent_id_is_noop_no_hlc_minted() {
+        // Deleting an id that was never created must be a no-op: return
+        // Ok(false) AND mint no HLC, so the Tauri wrapper skips notify_dirty
+        // and we never publish unchanged state (Greptile P2).
+        let doc = Arc::new(Mutex::new(NotesDoc::default()));
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+
+        // Tracker has no entry for the device before the delete.
+        let before = tracker.lock().await.get("dev-A").cloned();
+        assert!(before.is_none(), "no HLC minted yet");
+
+        let changed = notes_delete_core(&doc, &tracker, "dev-A", "does-not-exist".into())
+            .await
+            .unwrap();
+        assert!(!changed, "deleting an unknown id returns Ok(false)");
+
+        // The tracker entry for the device is unchanged — no HLC was minted.
+        let after = tracker.lock().await.get("dev-A").cloned();
+        assert_eq!(after, before, "no HLC minted for a no-op delete");
     }
 
     #[tokio::test]

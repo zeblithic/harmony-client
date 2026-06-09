@@ -68,6 +68,17 @@ pub fn load(path: &Path) -> Result<NotesDoc, SyncError> {
             let mut cursor = Cursor::new(payload);
             let file: NotesFileV1 = from_reader(&mut cursor)
                 .map_err(|e| SyncError::CborDecode(format!("load {}: {e}", path.display())))?;
+            // Reject trailing bytes after the CBOR value (mirrors
+            // owner_state_crypto::canonical_cbor_decode): a corrupt file that is
+            // valid-prefix + garbage must NOT decode as "valid".
+            let pos = cursor.position() as usize;
+            if pos != payload.len() {
+                return Err(SyncError::CborDecode(format!(
+                    "trailing bytes after notes value: consumed {} of {}",
+                    pos,
+                    payload.len()
+                )));
+            }
             Ok(file.0)
         }
         v => Err(SyncError::CborDecode(format!(
@@ -125,7 +136,7 @@ fn quarantine(path: &Path, err: &SyncError) {
 pub fn save(path: &Path, doc: &NotesDoc) -> Result<(), SyncError> {
     let mut bytes = vec![NOTES_SCHEMA_V1];
     into_writer(&NotesFileV1(doc.clone()), &mut bytes)
-        .map_err(|e| SyncError::CborDecode(format!("encode {}: {e}", path.display())))?;
+        .map_err(|e| SyncError::CborEncode(format!("encode {}: {e}", path.display())))?;
     atomic_write(path, &bytes)
 }
 
@@ -153,6 +164,16 @@ pub fn load_replay(path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
             let file: NotesReplayFileV1 = from_reader(&mut cursor).map_err(|e| {
                 SyncError::CborDecode(format!("load_replay {}: {e}", path.display()))
             })?;
+            // Reject trailing bytes after the CBOR value (mirrors
+            // owner_state_crypto::canonical_cbor_decode).
+            let pos = cursor.position() as usize;
+            if pos != payload.len() {
+                return Err(SyncError::CborDecode(format!(
+                    "trailing bytes after notes value: consumed {} of {}",
+                    pos,
+                    payload.len()
+                )));
+            }
             Ok(file.0)
         }
         v => Err(SyncError::CborDecode(format!(
@@ -166,7 +187,7 @@ pub fn load_replay(path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
 pub fn save_replay(path: &Path, tracker: &BTreeMap<String, Hlc>) -> Result<(), SyncError> {
     let mut bytes = vec![NOTES_REPLAY_SCHEMA_V1];
     into_writer(&NotesReplayFileV1(tracker.clone()), &mut bytes)
-        .map_err(|e| SyncError::CborDecode(format!("encode replay {}: {e}", path.display())))?;
+        .map_err(|e| SyncError::CborEncode(format!("encode replay {}: {e}", path.display())))?;
     atomic_write(path, &bytes)
 }
 
@@ -211,6 +232,41 @@ mod tests {
         );
         save(&path, &doc).unwrap();
         assert_eq!(load(&path).unwrap(), doc);
+    }
+
+    #[test]
+    fn load_rejects_trailing_bytes_after_valid_value() {
+        // A valid saved file with a stray byte appended must NOT decode as
+        // "valid" — it should surface an Err so load_doc_or_recover quarantines
+        // it (mirrors owner_state_crypto::canonical_cbor_decode strictness).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.cbor");
+        let mut doc = crate::notes_crdt::NotesDoc::default();
+        doc.upsert(
+            "n1".into(),
+            "hi".into(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "A".into(),
+            },
+        );
+        save(&path, &doc).unwrap();
+        // Sanity: the clean file loads.
+        assert_eq!(load(&path).unwrap(), doc);
+        // Append a stray byte after the valid CBOR value.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0xFF);
+        std::fs::write(&path, &bytes).unwrap();
+        let err = load(&path).unwrap_err();
+        assert!(
+            matches!(err, SyncError::CborDecode(_)),
+            "trailing bytes must surface CborDecode, got {err:?}"
+        );
+        // And recovery quarantines it rather than silently starting fresh-on-write.
+        let recovered = load_doc_or_recover(&path);
+        assert_eq!(recovered, NotesDoc::default());
+        assert!(!path.exists(), "corrupt file was quarantined");
     }
 
     #[test]

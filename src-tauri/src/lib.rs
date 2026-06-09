@@ -5800,6 +5800,11 @@ pub(crate) async fn start_node_inner(
             // shutdown can run before this start_node attempt errors out.
             dfrost_log_registry_arc.clone(),
             mint_sync_engine_opt,
+            // ZEB-417 SP1 (Cursor MEDIUM fix): carry the Notes FleetSyncEngine
+            // out too so the failure-cleanup path can shut it down. The
+            // success path above already stashed a `.clone()` into NodeState,
+            // so moving the original out here is safe (mirrors mint).
+            notes_sync_engine_opt,
             node_addr_for_response,
             freshly_created,
             has_owner_identity,
@@ -5817,6 +5822,7 @@ pub(crate) async fn start_node_inner(
         profile_card_publisher_for_cleanup,
         dfrost_log_registry_for_cleanup,
         mint_engine_for_cleanup,
+        notes_engine_for_cleanup,
         node_addr_for_response,
         freshly_created,
         has_owner_identity,
@@ -5900,6 +5906,19 @@ pub(crate) async fn start_node_inner(
                 tracing::error!(
                     error = %e,
                     "MintSyncEngine cleanup after start_node failure"
+                );
+            }
+        }
+        // ZEB-417 SP1 (Cursor MEDIUM fix): same rationale for the Notes
+        // FleetSyncEngine. Its construction may have succeeded before a later
+        // step (thread spawn, lock failure, supersede) aborted the install to
+        // NodeState. Without this, its internal tokio task leaks — running with
+        // no Zenoh adapter and no NodeState handles until the process exits.
+        if let Some(notes_engine) = notes_engine_for_cleanup {
+            if let Err(e) = notes_engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "Notes FleetSyncEngine cleanup after start_node failure"
                 );
             }
         }
