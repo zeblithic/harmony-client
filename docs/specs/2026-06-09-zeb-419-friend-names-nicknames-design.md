@@ -34,7 +34,7 @@ What already exists and is reused wholesale:
 
 Evaluated per row in a `$derived`, both lists:
 
-```
+```text
 nickname  ►  live member-card displayName  ►  frozen FriendDto.display  ►  shortId(ownerId)
 ```
 
@@ -42,7 +42,7 @@ Pending requests use the same ladder minus the nickname rung (out of scope this 
 
 Row layout (both lists):
 
-```
+```text
 [avatar28]  <name label>                 [row actions]
             <muted short-hex>   ⓘ
 ```

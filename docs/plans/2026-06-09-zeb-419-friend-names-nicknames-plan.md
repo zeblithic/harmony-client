@@ -109,16 +109,17 @@ impl FriendNicknames {
     }
 
     /// Upsert (`Some` non-blank) or clear (`None`/blank) a nickname. `owner_id_hex`
-    /// is lowercased. Returns true when the map changed.
-    pub fn set(&mut self, owner_id_hex: &str, nickname: Option<&str>, now_ms: u64) -> bool {
+    /// is lowercased on the way in. No return value — every set advances
+    /// `updated_ms`, so a "did the map change?" bool would be misleading + unused.
+    pub fn set(&mut self, owner_id_hex: &str, nickname: Option<&str>, now_ms: u64) {
         let key = owner_id_hex.to_lowercase();
         match nickname.map(str::trim).filter(|s| !s.is_empty()) {
             Some(nick) => {
-                let entry = NicknameEntry { nickname: nick.to_string(), updated_ms: now_ms };
-                self.entries.insert(key, entry).as_ref() != Some(&self.entries[&owner_id_hex.to_lowercase()])
-                    || true
+                self.entries.insert(key, NicknameEntry { nickname: nick.to_string(), updated_ms: now_ms });
             }
-            None => self.entries.remove(&key).is_some(),
+            None => {
+                self.entries.remove(&key);
+            }
         }
     }
 
@@ -183,14 +184,7 @@ mod tests {
 }
 ```
 
-> Simplify the `set` return value: replace the convoluted upsert expression with a clear version:
-> ```rust
-> Some(nick) => {
->     let prev = self.entries.insert(key, NicknameEntry { nickname: nick.to_string(), updated_ms: now_ms });
->     !matches!(prev, Some(p) if p.nickname == nick)
-> }
-> ```
-> (The bool is informational; callers don't currently branch on it.)
+> Note: the shipped `set` returns `()` (the snippet above is the final form). `save()` also `create_dir_all`s the parent dir before writing.
 
 Add `mod friend_nicknames;` to `src-tauri/src/lib.rs` beside the other module declarations. Confirm `tempfile` is a dev-dependency (it is used widely in this crate; if `cargo` complains, it's already in `[dev-dependencies]`).
 

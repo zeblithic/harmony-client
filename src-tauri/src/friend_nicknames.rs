@@ -39,6 +39,12 @@ impl FriendNicknames {
 
     /// Atomically persist to `path` (write temp in the same dir, then rename).
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        // Ensure the settings directory exists before writing — on a fresh
+        // profile the owner data dir may not be created yet, and without this the
+        // temp write fails with ENOENT (mirrors other settings persistence).
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+        }
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| format!("encode: {e}"))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &bytes).map_err(|e| format!("write tmp: {e}"))?;
@@ -47,21 +53,24 @@ impl FriendNicknames {
     }
 
     /// Upsert (`Some` non-blank) or clear (`None`/blank) a nickname. `owner_id_hex`
-    /// is lowercased. Returns true when the map changed.
-    pub fn set(&mut self, owner_id_hex: &str, nickname: Option<&str>, now_ms: u64) -> bool {
+    /// is lowercased on the way in. No return value: every set advances
+    /// `updated_ms`, so a "did the map change?" bool would be misleading (and was
+    /// unused by callers).
+    pub fn set(&mut self, owner_id_hex: &str, nickname: Option<&str>, now_ms: u64) {
         let key = owner_id_hex.to_lowercase();
         match nickname.map(str::trim).filter(|s| !s.is_empty()) {
             Some(nick) => {
-                let prev = self.entries.insert(
+                self.entries.insert(
                     key,
                     NicknameEntry {
                         nickname: nick.to_string(),
                         updated_ms: now_ms,
                     },
                 );
-                !matches!(prev, Some(p) if p.nickname == nick)
             }
-            None => self.entries.remove(&key).is_some(),
+            None => {
+                self.entries.remove(&key);
+            }
         }
     }
 
@@ -124,5 +133,20 @@ mod tests {
         let loaded = FriendNicknames::load_or_default(&path);
         assert_eq!(loaded.get("aa"), Some("Koya"));
         assert_eq!(loaded.entries["aa"].updated_ms, 7);
+    }
+
+    #[test]
+    fn save_creates_missing_parent_dir() {
+        // A fresh profile may not have the settings dir yet; save() must create
+        // it rather than fail with ENOENT.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/sub/friend_nicknames.json");
+        let mut n = FriendNicknames::default();
+        n.set("aa", Some("Koya"), 1);
+        n.save(&path).expect("save creates the parent dir");
+        assert_eq!(
+            FriendNicknames::load_or_default(&path).get("aa"),
+            Some("Koya")
+        );
     }
 }

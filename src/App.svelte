@@ -1078,6 +1078,9 @@
   avatarResolver.onChange = () => {
     navService.refreshAvatars();
     memberCardService.onAvatarsRefreshed();
+    // ZEB-419: the friends panel's card service shares this resolver — refresh it
+    // too so resolved friend avatars repaint immediately, not only on its poll.
+    friendCardService.onAvatarsRefreshed();
   };
   navService.onChange = () => {
     navNodes = [...navService.nodes];
@@ -1627,14 +1630,18 @@
         avatarCid?: string;
         profilePageRoot?: string;
       }>('member-card-received', (event) => {
-        memberCardService.applyCard(event.payload.ownerIdHex, {
+        const card = {
           displayName: event.payload.displayName,
           statusText: event.payload.statusText,
           avatarCid: event.payload.avatarCid,
           // ZEB-345: forward the profile-page root CID so an open panel for
           // this owner re-resolves once a fresh card lands.
           profilePageRoot: event.payload.profilePageRoot,
-        });
+        };
+        memberCardService.applyCard(event.payload.ownerIdHex, card);
+        // ZEB-419: also feed the friends-panel card service so friend/request
+        // rows update instantly on a pushed card, not only via its 3s poll.
+        friendCardService.applyCard(event.payload.ownerIdHex, card);
       });
       fileManagerService.addUnlisten(unlistenMemberCard);
 

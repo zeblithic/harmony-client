@@ -34742,13 +34742,18 @@ pub fn list_friends_inner(state: &crate::owner_state_crdt::OwnerState) -> Vec<Fr
 
 /// ZEB-419: overlay local nicknames onto a projected friend list. Pure so it's
 /// unit-testable without a NodeState harness; the `list_friends` IPC calls it
-/// after `list_friends_inner`. A friend with no nickname entry is unchanged.
+/// after `list_friends_inner`. Nicknames are an ACTIVE-friend-only feature, so a
+/// stored nickname is overlaid only onto `Active` rows — a non-active row (e.g. a
+/// friend that reverted to `Pending`) never surfaces a nickname even if one is
+/// stored. A friend with no nickname entry is unchanged.
 pub fn apply_nicknames(
     mut friends: Vec<FriendDto>,
     nicknames: &crate::friend_nicknames::FriendNicknames,
 ) -> Vec<FriendDto> {
     for f in &mut friends {
-        f.nickname = nicknames.get(&f.owner_id_hex).map(str::to_owned);
+        if f.status == crate::friend_graph::FriendStatus::Active {
+            f.nickname = nicknames.get(&f.owner_id_hex).map(str::to_owned);
+        }
     }
     friends
 }
@@ -35827,18 +35832,38 @@ async fn set_friend_nickname(
 ) -> Result<(), String> {
     // Validate the owner_id (reject malformed before any write). decode_owner_id_16
     // is the 16-byte master owner_id decoder used by the other friend IPCs.
-    let _ = decode_owner_id_16(&owner_id_hex)?;
+    let addr = decode_owner_id_16(&owner_id_hex)?;
 
-    let path = {
-        state
+    let (crdt_state, path) = {
+        let g = state
             .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?
-            .pkarr_settings_path
-            .clone()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (g.crdt_state.clone(), g.pkarr_settings_path.clone())
     };
-    let Some(path) = path else {
+    let (Some(crdt_state), Some(path)) = (crdt_state, path) else {
         return Err(OWNER_NOT_LOADED_MSG.into());
     };
+
+    // Scope: nicknames are an ACTIVE-friend-only feature (the UI only offers the
+    // editor on active rows). Enforce it server-side too so a direct IPC call
+    // can't persist a nickname for a pending/unknown owner. Clearing (`None`/blank)
+    // is always allowed so a stale nickname can be removed regardless of status.
+    let is_setting = nickname
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if is_setting {
+        let s = crdt_state.lock().await;
+        let is_active = matches!(
+            s.friend_graph.friends.get(&addr),
+            Some(e) if e.status == crate::friend_graph::FriendStatus::Active
+        );
+        if !is_active {
+            return Err("nickname can only be set for an active friend".into());
+        }
+    }
+
     let nick_path = path.with_file_name("friend_nicknames.json");
 
     let now_ms = std::time::SystemTime::now()
@@ -36474,7 +36499,7 @@ mod friend_ipc_tests {
     }
 
     #[test]
-    fn apply_nicknames_overlays_only_matching_owners() {
+    fn apply_nicknames_overlays_active_friends_only() {
         let friends = vec![
             FriendDto {
                 owner_id_hex: "aa".into(),
@@ -36492,13 +36517,26 @@ mod friend_ipc_tests {
                 established_via: FriendOrigin::Token,
                 referrable: false,
             },
+            FriendDto {
+                owner_id_hex: "cc".into(),
+                display: None,
+                nickname: None,
+                status: FriendStatus::Pending,
+                established_via: FriendOrigin::MutualKey,
+                referrable: false,
+            },
         ];
         let mut nicks = crate::friend_nicknames::FriendNicknames::default();
-        nicks.set("AA", Some("Koya"), 1); // note casing differs from owner_id_hex
+        nicks.set("AA", Some("Koya"), 1); // casing differs from owner_id_hex
+        nicks.set("cc", Some("ShouldNotShow"), 1); // stored against a PENDING friend
         let out = apply_nicknames(friends, &nicks);
-        assert_eq!(out[0].nickname.as_deref(), Some("Koya"));
-        assert_eq!(out[1].nickname, None); // bb has no nickname; display hint untouched
-        assert_eq!(out[1].display.as_deref(), Some("Hint"));
+        assert_eq!(out[0].nickname.as_deref(), Some("Koya")); // active → overlaid
+        assert_eq!(out[1].nickname, None); // active, no stored nickname
+        assert_eq!(out[1].display.as_deref(), Some("Hint")); // display hint untouched
+        assert_eq!(
+            out[2].nickname, None,
+            "a pending friend never surfaces a nickname (active-only scope)"
+        );
     }
 
     #[test]
@@ -36510,17 +36548,29 @@ mod friend_ipc_tests {
         // moves `nickname` into `FriendEntry`/`OwnerState`, the published bytes
         // would contain it and this test fails.
         let mut state = OwnerState::default();
-        let (addr, entry) = friend_entry(0xAA, FriendStatus::Active, 7);
+        let (addr, mut entry) = friend_entry(0xAA, FriendStatus::Active, 7);
+        // A unique value in a PUBLISHED field (`display`) so we can prove the
+        // friend entry is genuinely in the serialized bytes (non-vacuous test).
+        entry.display = Some("DISPLAY-SENTINEL-7f3a".to_string());
         assert!(matches!(
             state.apply_friend_update(addr, entry),
             crate::owner_state_crdt::ApplyOutcome::Inserted
         ));
         let bytes =
             crate::owner_state_crypto::canonical_cbor_encode(&state).expect("encode owner state");
-        let needle = b"Koya-secret-nickname";
+        // Sanity: the friend entry really is serialized into the published bytes.
         assert!(
-            !bytes.windows(needle.len()).any(|w| w == needle),
-            "published owner-state must not contain any nickname bytes",
+            bytes
+                .windows("DISPLAY-SENTINEL-7f3a".len())
+                .any(|w| w == b"DISPLAY-SENTINEL-7f3a"),
+            "sanity: the friend entry must be present in the serialized owner-state",
+        );
+        // Invariant: no serializable `nickname` field rides published owner-state.
+        // If a future refactor moves `nickname` into `FriendEntry`/`OwnerState`,
+        // the CBOR map key `nickname` would appear here and this assertion fails.
+        assert!(
+            !bytes.windows("nickname".len()).any(|w| w == b"nickname"),
+            "published owner-state must not contain a serializable `nickname` field",
         );
     }
 

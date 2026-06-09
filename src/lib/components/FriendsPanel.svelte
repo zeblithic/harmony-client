@@ -392,8 +392,12 @@
     try {
       await service.setNickname(ownerIdHex, nicknameDraft.trim() || null);
       if (destroyed) return;
-      editingNickname = null;
-      nicknameDraft = '';
+      // Only close the editor if we're still editing THIS row — the user may have
+      // opened another friend's editor while this save was in flight.
+      if (editingNickname === ownerIdHex) {
+        editingNickname = null;
+        nicknameDraft = '';
+      }
     } catch (e) {
       if (destroyed) return;
       error = `Couldn't save nickname: ${e instanceof Error ? e.message : String(e)}`;
