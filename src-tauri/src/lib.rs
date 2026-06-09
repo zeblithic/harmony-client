@@ -35819,6 +35819,18 @@ async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Re
     Ok(pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known)
 }
 
+/// ZEB-419: serializes the nickname-file read-modify-write so two concurrent
+/// `set_friend_nickname` calls can't lose an update (load A, load B, save A, save
+/// B → A's change is lost). Reads in `list_friends` don't need it —
+/// `save_atomically` renames atomically, so a reader always sees a complete
+/// old-or-new file.
+static NICKNAME_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+/// Max nickname length, in chars. Generous for a personal label; bounds local
+/// storage and rejects pathological input.
+const MAX_NICKNAME_LEN: usize = 64;
+
 /// ZEB-419: set or clear the local-only nickname for a friend (by owner_id hex).
 /// `nickname = None`/blank clears it. Persists to `friend_nicknames.json` beside
 /// the connectivity settings, then emits `friend-list-changed` so the panel
@@ -35834,6 +35846,18 @@ async fn set_friend_nickname(
     // is the 16-byte master owner_id decoder used by the other friend IPCs.
     let addr = decode_owner_id_16(&owner_id_hex)?;
 
+    // Normalize: trim, treat blank as "clear". Cap the length of a real nickname
+    // before any state work (bounds storage + rejects abuse).
+    let trimmed = nickname.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(nick) = trimmed {
+        if nick.chars().count() > MAX_NICKNAME_LEN {
+            return Err(format!(
+                "nickname too long (max {MAX_NICKNAME_LEN} characters)"
+            ));
+        }
+    }
+    let is_setting = trimmed.is_some();
+
     let (crdt_state, path) = {
         let g = state
             .lock()
@@ -35846,13 +35870,8 @@ async fn set_friend_nickname(
 
     // Scope: nicknames are an ACTIVE-friend-only feature (the UI only offers the
     // editor on active rows). Enforce it server-side too so a direct IPC call
-    // can't persist a nickname for a pending/unknown owner. Clearing (`None`/blank)
-    // is always allowed so a stale nickname can be removed regardless of status.
-    let is_setting = nickname
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_some();
+    // can't persist a nickname for a pending/unknown owner. Clearing is always
+    // allowed so a stale nickname can be removed regardless of status.
     if is_setting {
         let s = crdt_state.lock().await;
         let is_active = matches!(
@@ -35865,17 +35884,23 @@ async fn set_friend_nickname(
     }
 
     let nick_path = path.with_file_name("friend_nicknames.json");
-
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let mut store = crate::friend_nicknames::FriendNicknames::load_or_default(&nick_path);
-    store.set(&owner_id_hex, nickname.as_deref(), now_ms);
-    store
-        .save(&nick_path)
-        .map_err(|e| format!("save friend_nicknames: {e}"))?;
+    // Serialize the read-modify-write so concurrent calls can't lose an update.
+    {
+        let _guard = NICKNAME_WRITE_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let mut store = crate::friend_nicknames::FriendNicknames::load_or_default(&nick_path);
+        store.set(&owner_id_hex, nickname.as_deref(), now_ms);
+        store
+            .save(&nick_path)
+            .map_err(|e| format!("save friend_nicknames: {e}"))?;
+    }
 
     let _ = app.emit("friend-list-changed", ());
     Ok(())
