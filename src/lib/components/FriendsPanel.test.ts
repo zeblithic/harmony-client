@@ -241,4 +241,68 @@ describe('FriendsPanel — add-by-key auto-retry (ZEB-415 #2)', () => {
     expect(status).toContain('iroh connect failed');
     expect(status).not.toContain('Request sent');
   });
+
+  it('does not start a retry chain if unmounted during the initial add', async () => {
+    vi.useFakeTimers();
+    let resolveAdd: (v: { kind: string }) => void = () => {};
+    const addByKey = vi.fn().mockReturnValue(
+      new Promise((r) => {
+        resolveAdd = r as (v: { kind: string }) => void;
+      }),
+    );
+    const service = mockService({ addByKey });
+    const { getByTestId, unmount } = render(FriendsPanel, { props: { service } });
+    await vi.advanceTimersByTimeAsync(0);
+
+    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
+    await fireEvent.click(getByTestId('add-by-key-btn'));
+    // addByKey is in-flight; tear the panel down, THEN let it resolve pending.
+    unmount();
+    resolveAdd({ kind: 'pending' });
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    // No retry chain was created after teardown (only the initial in-flight call).
+    expect(addByKey).toHaveBeenCalledTimes(1);
+  });
+
+  it('terminal message reflects the last error, not a generic wait', async () => {
+    vi.useFakeTimers();
+    const addByKey = vi
+      .fn()
+      .mockResolvedValueOnce({ kind: 'pending' })
+      .mockRejectedValue(new Error('pkarr resolve: boom'));
+    const service = mockService({ addByKey });
+    const { getByTestId } = render(FriendsPanel, { props: { service } });
+    await vi.advanceTimersByTimeAsync(0);
+
+    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
+    await fireEvent.click(getByTestId('add-by-key-btn'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Exhaust the whole retry window so the terminal message is shown.
+    await vi.advanceTimersByTimeAsync(10_000 * 31);
+    const status = getByTestId('add-by-key-status').textContent ?? '';
+    expect(status).toContain('pkarr resolve: boom'); // the real failure, not hidden
+    expect(status).not.toContain('have not accepted');
+  });
+
+  it('terminal message reflects repeated unreachable, not "waiting to accept"', async () => {
+    vi.useFakeTimers();
+    const addByKey = vi
+      .fn()
+      .mockResolvedValueOnce({ kind: 'pending' })
+      .mockResolvedValue({ kind: 'unreachable' });
+    const service = mockService({ addByKey });
+    const { getByTestId } = render(FriendsPanel, { props: { service } });
+    await vi.advanceTimersByTimeAsync(0);
+
+    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
+    await fireEvent.click(getByTestId('add-by-key-btn'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    await vi.advanceTimersByTimeAsync(10_000 * 31);
+    const status = (getByTestId('add-by-key-status').textContent ?? '').toLowerCase();
+    expect(status).toContain('reach'); // "could not reach them on the last try"
+    expect(status).not.toContain('have not accepted');
+  });
 });

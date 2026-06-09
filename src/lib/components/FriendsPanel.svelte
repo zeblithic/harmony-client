@@ -87,6 +87,10 @@
   let addRetryTimer: ReturnType<typeof setTimeout> | null = null;
   // Bumped to invalidate an in-flight retry chain (supersede / cancel / destroy).
   let addRetryGeneration = 0;
+  // Set once in onDestroy. Any async path that resumes after teardown (the
+  // initial add awaiting `addByKey`, a retry tick awaiting `refresh`) checks
+  // this before touching state or scheduling new timers.
+  let destroyed = false;
 
   // ── ZEB-388: my own identity pub hex (share for add-by-key) ───────────────
   let myKeyHex = $state<string | null>(null);
@@ -248,6 +252,8 @@
     unsubscribePendingChanged = null;
     unsubscribeDiscoverable?.();
     unsubscribeDiscoverable = null;
+    // Block any async path that resumes after teardown (initial add / retry).
+    destroyed = true;
     // Cancel any in-flight `loadDiscoverable` read so its late resolve can't
     // write `identityDiscoverable` after we've unmounted (CodeRabbit).
     discoverableGen += 1;
@@ -424,6 +430,12 @@
     stopAddRetry();
     const generation = addRetryGeneration;
     let attempt = 0;
+    // Why the latest attempt didn't link, so the terminal (max-attempts) message
+    // reflects reality — "they haven't accepted" vs "couldn't reach them" vs a
+    // hard error — instead of always blaming a missing accept (Cursor).
+    let lastReason = 'they have not accepted yet';
+    const waitingCopy =
+      "Request sent — they'll need to accept. We'll connect automatically once they do.";
     const tick = async (): Promise<void> => {
       if (generation !== addRetryGeneration) return;
       try {
@@ -432,27 +444,37 @@
         if (outcome.kind === 'linked') {
           addByKeyStatus = `Now connected with ${outcome.display ?? shortId(outcome.ownerIdHex)}`;
           addRetryTimer = null;
-          await refresh();
+          // Re-check teardown before the (async) refresh — the panel may have
+          // unmounted while we awaited the dial (Cursor).
+          if (!destroyed) await refresh();
           return;
         }
-        // 'pending' or a transient 'unreachable' → keep waiting in-window.
+        if (outcome.kind === 'unreachable') {
+          lastReason = 'we could not reach them on the last try';
+        } else {
+          // 'pending' → the expected wait; re-assert the calm copy in case a
+          // prior transient error had replaced it.
+          lastReason = 'they have not accepted yet';
+          addByKeyStatus = waitingCopy;
+        }
       } catch (e) {
         if (generation !== addRetryGeneration) return;
         const msg = e instanceof Error ? e.message : String(e);
         // Keep retrying (the throw is usually a transient dial blip while the
-        // peer is still offline), but DON'T keep showing the rosy "we'll connect
-        // automatically" copy — surface the failure now so a persistent fault is
-        // visible immediately rather than only after the window elapses.
+        // peer is still offline), but surface the failure now rather than hide
+        // it behind the rosy "we'll connect automatically" copy.
         console.debug(
           `add-by-key auto-retry attempt ${attempt + 1} failed (still retrying):`,
           msg,
         );
-        addByKeyStatus = `Still trying to connect — last attempt failed: ${msg}`;
+        lastReason = `the last attempt failed: ${msg}`;
+        addByKeyStatus = `Still trying to connect — ${lastReason}.`;
       }
       attempt += 1;
       if (attempt >= ADD_RETRY_MAX_ATTEMPTS) {
-        addByKeyStatus =
-          'Still waiting for them to accept — press Connect again later to retry.';
+        // Terminal message names the actual last outcome, not a blanket "still
+        // waiting to accept" (Cursor) — and doesn't clobber a surfaced error.
+        addByKeyStatus = `Stopped trying to connect — ${lastReason}. Press Connect again to retry.`;
         addRetryTimer = null;
         return;
       }
@@ -470,6 +492,9 @@
     addByKeyStatus = null;
     try {
       const outcome = await service.addByKey(key);
+      // The panel may have been torn down while the add was in flight — don't
+      // mutate state or start a retry chain after unmount (CodeAnt).
+      if (destroyed) return;
       if (outcome.kind === 'linked') {
         addByKeyStatus = `Connected with ${outcome.display ?? shortId(outcome.ownerIdHex)}`;
         addByKeyInput = '';
