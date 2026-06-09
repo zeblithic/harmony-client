@@ -162,6 +162,7 @@ pub mod mint;
 pub mod mint_sync;
 pub mod mint_sync_persist;
 pub mod mint_sync_types;
+pub mod notes_commands;
 pub mod notes_crdt;
 pub mod notes_persist;
 pub mod owner_commands;
@@ -845,6 +846,21 @@ pub struct NodeState {
     /// before the event-loop thread is joined.
     pub mint_sync: Option<std::sync::Arc<crate::mint_sync::MintSyncEngine>>,
 
+    /// ZEB-417 SP1: owner-private Notes dataset. `Some` while the node is
+    /// running and an owner identity is loaded; `None` before the
+    /// FleetSyncEngine is wired at startup (next task) or after stop_node.
+    /// The Notes IPC commands reject with "notes dataset not loaded" while
+    /// any of these are `None`.
+    pub notes_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::notes_crdt::NotesDoc>>>,
+    pub notes_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+    >,
+    pub notes_sync:
+        Option<std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::notes_crdt::NotesDoc>>>,
+    pub notes_device_id: Option<String>,
+
     /// ZEB-321 Phase 1 Task 8: iroh endpoint Arc. `Some` while node is
     /// running AND the keychain-resident secret key + bind both succeeded;
     /// `None` otherwise (tests, headless platforms, bind failure). Task 9's
@@ -1159,6 +1175,12 @@ impl Default for NodeState {
             mint_db: None,
             // Mint sync engine: initialized in identity bootstrap.
             mint_sync: None,
+            // ZEB-417 SP1: notes dataset handles stay None until the
+            // FleetSyncEngine is wired at startup (next task).
+            notes_doc: None,
+            notes_tracker: None,
+            notes_sync: None,
+            notes_device_id: None,
             // ZEB-321 Phase 1 Task 8: iroh handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
             iroh_endpoint: None,
@@ -37914,6 +37936,10 @@ pub fn run() {
             reset_pkarr_relays,
             add_pkarr_relay,
             remove_pkarr_relay,
+            // ZEB-417 SP1: owner-private Notes IPCs.
+            notes_commands::notes_list,
+            notes_commands::notes_upsert,
+            notes_commands::notes_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -41364,6 +41390,11 @@ mod start_node_race_tests {
             pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             mint_db: None,
             mint_sync: None,
+            // ZEB-417 SP1: notes dataset handles unused in race tests.
+            notes_doc: None,
+            notes_tracker: None,
+            notes_sync: None,
+            notes_device_id: None,
             // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.
             iroh_endpoint: None,
             reachability_resolver: None,
