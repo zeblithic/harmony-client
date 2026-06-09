@@ -248,6 +248,9 @@
     unsubscribePendingChanged = null;
     unsubscribeDiscoverable?.();
     unsubscribeDiscoverable = null;
+    // Cancel any in-flight `loadDiscoverable` read so its late resolve can't
+    // write `identityDiscoverable` after we've unmounted (CodeRabbit).
+    discoverableGen += 1;
     stopAddRetry();
     if (myKeyCopiedTimer) clearTimeout(myKeyCopiedTimer);
     myKeyCopiedTimer = null;
@@ -435,13 +438,16 @@
         // 'pending' or a transient 'unreachable' → keep waiting in-window.
       } catch (e) {
         if (generation !== addRetryGeneration) return;
-        // Transient dial/IO error mid-window — keep waiting rather than abort,
-        // but leave a breadcrumb so a persistently-failing retry is diagnosable
-        // (otherwise the only signal is the generic max-attempts message).
+        const msg = e instanceof Error ? e.message : String(e);
+        // Keep retrying (the throw is usually a transient dial blip while the
+        // peer is still offline), but DON'T keep showing the rosy "we'll connect
+        // automatically" copy — surface the failure now so a persistent fault is
+        // visible immediately rather than only after the window elapses.
         console.debug(
-          `add-by-key auto-retry attempt ${attempt + 1} failed (still waiting):`,
-          e instanceof Error ? e.message : String(e),
+          `add-by-key auto-retry attempt ${attempt + 1} failed (still retrying):`,
+          msg,
         );
+        addByKeyStatus = `Still trying to connect — last attempt failed: ${msg}`;
       }
       attempt += 1;
       if (attempt >= ADD_RETRY_MAX_ATTEMPTS) {

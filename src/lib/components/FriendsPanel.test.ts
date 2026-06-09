@@ -218,4 +218,27 @@ describe('FriendsPanel — add-by-key auto-retry (ZEB-415 #2)', () => {
     // An unreachable peer is NOT auto-retried (only a 'pending' outcome is).
     expect(addByKey).toHaveBeenCalledTimes(1);
   });
+
+  it('surfaces a retry error instead of masking it as normal waiting', async () => {
+    vi.useFakeTimers();
+    const addByKey = vi
+      .fn()
+      .mockResolvedValueOnce({ kind: 'pending' }) // initial add
+      .mockRejectedValueOnce(new Error('iroh connect failed')); // retry throws
+    const service = mockService({ addByKey });
+    const { getByTestId } = render(FriendsPanel, { props: { service } });
+    await vi.advanceTimersByTimeAsync(0);
+
+    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
+    await fireEvent.click(getByTestId('add-by-key-btn'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getByTestId('add-by-key-status').textContent).toContain('Request sent');
+
+    await vi.advanceTimersByTimeAsync(10_000); // retry → throws a hard error
+    const status = getByTestId('add-by-key-status').textContent;
+    // The failure is surfaced immediately, not hidden behind the rosy
+    // "we'll connect automatically" copy until the window elapses.
+    expect(status).toContain('iroh connect failed');
+    expect(status).not.toContain('Request sent');
+  });
 });
