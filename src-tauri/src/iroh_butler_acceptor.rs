@@ -224,8 +224,9 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
     }
 
     /// "Pending" = every live entry in the dm-inbox doc. The ingest sweep's
-    /// GC removes entries the moment `ingested_by` covers the enrolled
-    /// device set (or the TTL expires), so doc occupancy IS the
+    /// GC removes entries once `ingested_by` covers the enrolled device
+    /// set (one sweep after the final ig ack lands, so the covering state
+    /// replicates first) or the TTL expires, so doc occupancy IS the
     /// deposited-but-not-yet-fully-ingested set — counting live entries
     /// keeps the quota a real bound on butler storage rather than a
     /// flood-resettable counter.

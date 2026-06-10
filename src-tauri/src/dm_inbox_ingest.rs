@@ -3,7 +3,9 @@
 //! NORMAL DM receive path (CAS availability, receive-path verification,
 //! `apply_inbox`, the same `dm-received` UI event), then acks its ingestion
 //! into the entry's grow-only `ingested_by` set, then GCs entries whose
-//! `ingested_by` covers the enrolled device set or whose TTL expired.
+//! `ingested_by` already covered the enrolled device set when the sweep
+//! began (one-sweep deferral so the covering state replicates first — see
+//! `covered_at_start` in [`ingest_pending`]) or whose TTL expired.
 //!
 //! See `docs/specs/2026-06-09-zeb-418-sp2-butler-design.md` §5 (normative
 //! for ingestion + GC semantics).
@@ -128,6 +130,27 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
     let self_id = ctx.self_device_id();
     let mut changed = false;
 
+    // Coverage snapshot at sweep START (publish-before-GC, ZEB-418 P1
+    // Task 9): coverage-GC below removes only entries that were ALREADY
+    // covered when the sweep began. An entry whose final ig ack lands
+    // DURING this sweep is retained for one sweep so the covering
+    // `ig ⊇ enrolled` state is published (the caller's notify_dirty) and
+    // replicates to siblings BEFORE any replica destroys it. Without this,
+    // the last-ingesting device would add itself to `ig` and remove the
+    // entry in the same pass — the covering state would never escape, and
+    // every OTHER replica (whose own ig view is missing the last ack)
+    // would pin the entry until the 30-day TTL. Caught by
+    // `tests/butler_deposit_integration.rs`. Coverage is disabled when the
+    // enrolled snapshot is empty: `ig ⊇ ∅` is vacuously true, and an empty
+    // provider snapshot (state not yet loaded) must not wipe the inbox.
+    let enrolled = ctx.enrolled_device_ids().await;
+    let covered_at_start: BTreeSet<String> = doc
+        .entries
+        .iter()
+        .filter(|(_, e)| !enrolled.is_empty() && enrolled.iter().all(|d| e.ingested_by.contains(d)))
+        .map(|(k, _)| k.clone())
+        .collect();
+
     for (key, entry) in doc.entries.iter_mut() {
         if entry.ingested_by.contains(&self_id) {
             continue;
@@ -197,9 +220,10 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
     }
 
     // GC pass — an entry is removable when EITHER:
-    //   (a) coverage: every currently-enrolled device id appears in
-    //       `ingested_by` (compared in the shared 64-hex device-id string
-    //       form — see `DmInboxIngestCtx::enrolled_device_ids`), or
+    //   (a) coverage: every currently-enrolled device id appeared in
+    //       `ingested_by` at sweep START (compared in the shared 64-hex
+    //       device-id string form — see the `covered_at_start` snapshot
+    //       above and `DmInboxIngestCtx::enrolled_device_ids`), or
     //   (b) TTL: `deposited_at.wall_ms + INBOX_TTL_MS < now` (strict).
     //
     // Churn-tolerant model (resurrection-by-merge): a sibling that GC'd
@@ -208,25 +232,21 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
     // both GC criteria are deterministic functions of (ingested_by, now),
     // and `ingested_by` is grow-only with union merge — so every replica
     // evaluating the resurrected entry reaches the same removable verdict
-    // and the next sweep removes it again. Once every replica has GC'd, no
-    // copy remains to resurrect, so the fleet converges WITHOUT tombstones.
-    // Re-ingestion after a lost ig-update is likewise safe: `apply_inbox`
-    // is idempotent on (space_id, message_cid), and the dm-received emit
-    // is gated on its Inserted outcome.
+    // and the next sweep removes it again (a resurrected entry arrives
+    // already covered, so it IS covered at that sweep's start). Once every
+    // replica has GC'd, no copy remains to resurrect, so the fleet
+    // converges WITHOUT tombstones. Re-ingestion after a lost ig-update is
+    // likewise safe: `apply_inbox` is idempotent on (space_id,
+    // message_cid), and the dm-received emit is gated on its Inserted
+    // outcome.
     //
     // An expired entry that was just ingested above is still removed —
     // delivery beat the deadline; the deposit record's job is done.
-    let enrolled = ctx.enrolled_device_ids().await;
     let now_ms = ctx.now_ms();
     let before = doc.entries.len();
-    doc.entries.retain(|_, e| {
+    doc.entries.retain(|key, e| {
         let ttl_expired = e.deposited_at.wall_ms.saturating_add(INBOX_TTL_MS) < now_ms;
-        // Coverage GC is disabled when the enrolled snapshot is empty:
-        // `ig ⊇ ∅` is vacuously true, and an empty provider snapshot
-        // (state not yet loaded) must not wipe the inbox. TTL still
-        // applies.
-        let covered = !enrolled.is_empty() && enrolled.iter().all(|d| e.ingested_by.contains(d));
-        !(ttl_expired || covered)
+        !(ttl_expired || covered_at_start.contains(key))
     });
     changed |= doc.entries.len() != before;
 
