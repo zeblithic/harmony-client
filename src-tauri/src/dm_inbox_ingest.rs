@@ -284,6 +284,151 @@ pub async fn run_dm_inbox_ingest_sweeper(
     // recv() == None: every nudge sender dropped (engine shutdown).
 }
 
+/// Production [`DmInboxIngestCtx`] over real `start_node` handles (ZEB-418
+/// P1 Task 7). Each method implements its trait doc's production contract
+/// verbatim:
+///
+/// * CAS = the shared `RuntimeContentStore` (`ContentStore::put`,
+///   idempotent on content address);
+/// * verification = the `pub(crate)` receive-path helpers extracted from
+///   `handle_cidnotify_lifted` (`dm_outbox::verify_cidnotify_admission` +
+///   `dm_outbox::decrypt_and_bind_dm_blob`) under the owner-state lock —
+///   the SAME trust path a direct arrival takes;
+/// * the UI emit = the shared `dm_outbox::DM_RECEIVED_EVENT` const +
+///   `dm_received_event_payload` builder;
+/// * `enrolled` = a start_node-time snapshot of the `harmony_owner`
+///   `OwnerState.enrollments` values mapped through
+///   `hex::encode(cert.device_pubkeys.classical.ed25519_verify)` (the SP1
+///   64-hex device-id form). Enrollment changes require a node restart, so
+///   the snapshot tracks the enrolled set for the engine's lifetime.
+pub struct ProdDmInboxIngestCtx<R: tauri::Runtime> {
+    /// This device's SP1 device id (64-hex of the device ed25519 verify key).
+    pub device_id: String,
+    /// The runtime owner-state CRDT (`NodeState`'s `crdt_state` Arc).
+    pub crdt_state: Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
+    /// The shared CAS handle (`RuntimeContentStore` in production).
+    pub content_store: Arc<dyn crate::content_store::ContentStore>,
+    /// AppHandle for the `dm-received` emit.
+    pub app: tauri::AppHandle<R>,
+    /// Enrolled device ids (64-hex), snapshotted at start_node.
+    pub enrolled: BTreeSet<String>,
+}
+
+#[async_trait]
+impl<R: tauri::Runtime> DmInboxIngestCtx for ProdDmInboxIngestCtx<R> {
+    fn self_device_id(&self) -> String {
+        self.device_id.clone()
+    }
+
+    async fn cas_put(&self, storage_blob: &[u8]) -> Result<(), String> {
+        // The CID is recomputed under the DM send path's exact for_book
+        // flags so the stored blob is fetchable at the packet's
+        // message_cid (the acceptor already verified the binding; verify()
+        // re-checks it before anything references the CID).
+        let cid = harmony_content::cid::ContentId::for_book(
+            storage_blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("for_book: {e:?}"))?;
+        self.content_store
+            .put(cid, storage_blob.to_vec())
+            .await
+            .map_err(|e| format!("cas put: {e}"))
+    }
+
+    async fn verify(&self, entry: &DmInboxEntry) -> Result<VerifiedDmDeposit, String> {
+        // 1. Decode the deposited packet — must be a CidNotify.
+        let packet = crate::dm_envelope::decode_packet(&entry.cidnotify_packet)
+            .map_err(|e| format!("decode_packet: {e}"))?;
+        let crate::dm_envelope::DmPacket::CidNotify {
+            signed,
+            signature,
+            signed_bytes,
+        } = packet
+        else {
+            return Err("deposited packet is not a CidNotify".into());
+        };
+        // 2. Sender consistency: the packet must claim the deposit entry's
+        //    sender (mirrors the acceptor's step-6 check; re-checked here
+        //    because a sibling's doc merge is also a trust boundary).
+        if signed.sender_owner_addr.0 != entry.sender_owner {
+            return Err("packet sender_owner does not match deposit entry".into());
+        }
+        // 3. The NORMAL receive-path admission pipeline, under the
+        //    owner-state lock (signature, owner resolution, Space lookup,
+        //    SpaceKind gate, membership).
+        let (space, resolved_owner) = {
+            let state = self.crdt_state.lock().await;
+            let (space, resolved_owner, _identity_pub) =
+                crate::dm_outbox::verify_cidnotify_admission(
+                    &state,
+                    &signed,
+                    &signature,
+                    &signed_bytes,
+                )
+                .map_err(|e| format!("verify_cidnotify_admission: {e:?}"))?;
+            (space, resolved_owner)
+        };
+        // 4. Blob ↔ packet binding: the deposited storage blob must hash to
+        //    the packet's message_cid under the DM send path's flags.
+        let computed_cid = harmony_content::cid::ContentId::for_book(
+            &entry.storage_blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("for_book: {e:?}"))?;
+        if computed_cid != signed.message_cid {
+            return Err("storage blob CID does not match packet message_cid".into());
+        }
+        // 5. Decrypt + sender binding — the normal path's Phase C.
+        let payload =
+            crate::dm_outbox::decrypt_and_bind_dm_blob(&space, &entry.storage_blob, resolved_owner)
+                .map_err(|e| format!("decrypt_and_bind_dm_blob: {e:?}"))?;
+        Ok(VerifiedDmDeposit {
+            space_id: signed.space_id,
+            message_cid: signed.message_cid,
+            body: payload.body,
+            mime_type: payload.mime_type,
+            sent_at: payload.sent_at,
+        })
+    }
+
+    async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
+        let mut state = self.crdt_state.lock().await;
+        match state.apply_inbox(entry) {
+            crate::owner_state_crdt::ApplyOutcome::Inserted => Ok(true),
+            crate::owner_state_crdt::ApplyOutcome::Merged { .. } => Ok(false),
+            crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+                Err(format!("apply_inbox rejected: {reason:?}"))
+            }
+        }
+    }
+
+    fn emit_dm_received(&self, msg: &ReceivedMessage) {
+        use tauri::Emitter;
+        let _ = self.app.emit(
+            crate::dm_outbox::DM_RECEIVED_EVENT,
+            crate::dm_outbox::dm_received_event_payload(msg),
+        );
+    }
+
+    async fn enrolled_device_ids(&self) -> BTreeSet<String> {
+        self.enrolled.clone()
+    }
+
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+}
+
 /// One locked sweep; `notify_dirty` only when the doc actually changed so
 /// idle sweeps don't schedule no-op publishes.
 async fn sweep_once(
@@ -648,6 +793,76 @@ mod tests {
         nudge(); // buffer full — dropped, must not block/panic
         assert_eq!(rx.recv().await, Some(()));
         assert!(rx.try_recv().is_err(), "extras coalesced into one nudge");
+    }
+
+    /// End-to-end engine-wiring proof (ZEB-418 P1 Task 7): a real
+    /// `FleetSyncEngine<DmInboxDoc>` configured exactly as `start_node`
+    /// configures it (DmInboxPersist sink, `merge_from` merger,
+    /// `publish_seen: true` — GC depends on sibling ig-acks propagating,
+    /// spec §5 — lookup tag `b"dm-inbox-v1"`, `on_applied` = the ingestion
+    /// nudge) must emit an outbound wire frame on the publisher channel when
+    /// a local deposit write is followed by `notify_dirty` + `flush_now`.
+    /// Mirrors `notes_commands::notes_engine_publishes_on_local_write`
+    /// site-for-site.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dm_inbox_engine_publishes_on_local_write() {
+        use crate::content_store::{ContentStore, InMemoryStub};
+        use crate::dm_inbox_persist::DmInboxPersist;
+        use crate::fleet_sync::{FleetSyncConfig, FleetSyncEngine, Merger, DEFAULT_DEBOUNCE_MS};
+        use crate::owner_state_crypto::KeyTree;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kt = Arc::new(KeyTree::derive(&[0x44u8; 32]).expect("derive kt"));
+        let doc = Arc::new(Mutex::new(DmInboxDoc::default()));
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let merger: Merger<DmInboxDoc> = Arc::new(|local, remote| local.merge_from(remote));
+        // The ingestion-nudge channel exactly as start_node wires it (the
+        // receiver half would feed `run_dm_inbox_ingest_sweeper`; this test
+        // proves the ENGINE wiring, so the rx is simply held).
+        let (nudge_tx, _nudge_rx) = mpsc::channel::<()>(1);
+
+        let engine = FleetSyncEngine::<DmInboxDoc>::new(FleetSyncConfig {
+            kt,
+            device_id: "dev-A".to_string(),
+            state: Arc::clone(&doc),
+            merger,
+            replay_tracker: Arc::clone(&tracker),
+            content_store: cas,
+            publisher_tx: out_tx,
+            subscriber_rx: in_rx,
+            persist: Arc::new(DmInboxPersist {
+                doc_path: dir.path().join("dm_inbox.cbor"),
+                replay_path: dir.path().join("dm_inbox_replay.cbor"),
+            }),
+            lookup_key_tag: b"dm-inbox-v1",
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            publish_seen: true,
+            on_applied: Some(ingest_nudge_on_applied(nudge_tx)),
+            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+        });
+
+        // A local deposit write (what the production butler persist path
+        // does under the doc lock), then force the engine to publish.
+        {
+            let (key, entry) = make_entry([9; 16], [8; 32], 700, &[]);
+            doc.lock().await.entries.insert(key, entry);
+        }
+        engine.notify_dirty();
+        engine.flush_now().await.unwrap();
+
+        // The local write must have driven a (non-empty) publish frame onto
+        // the outbound channel.
+        let frame = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("publish frame produced within 5s")
+            .expect("publisher channel yielded Some(frame)");
+        assert!(!frame.is_empty(), "published wire frame must be non-empty");
+
+        let _ = engine.shutdown().await;
     }
 
     #[tokio::test]

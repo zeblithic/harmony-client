@@ -156,6 +156,145 @@ pub trait ButlerDepositCtx: Send + Sync {
     async fn persist_entry(&self, key: String, entry: DmInboxEntry) -> Result<bool, String>;
 }
 
+/// Production [`ButlerDepositCtx`] over real `start_node` handles (ZEB-418
+/// P1 Task 7). Each method implements its trait doc's production contract
+/// verbatim:
+///
+/// * admission reads `OwnerState.friend_graph` under the CRDT lock;
+/// * decrypt = `open_from_owner_with_info` with this device's X25519
+///   private (the birational twin of the cert-bound device ed25519 key —
+///   the SAME key the butler-set advertisement publishes as `vk`, so a
+///   sender sealing to `birational(vk)` lands here);
+/// * `lookup_identity_pub` sources from `owner_device_cache` via
+///   `dm_outbox::lookup_pubkey_for_device` — the SAME trust source the
+///   normal receive path uses (a deposit from a never-seen sender device
+///   rejects at inner-verify, exactly as the normal path would drop it);
+/// * `mint_hlc` mints from the dm-inbox engine's HLC tracker, mirroring
+///   how the notes IPC cores mint from the notes tracker;
+/// * `persist_entry` = insert-once under the doc lock, then
+///   `notify_dirty` + `flush_now().await` (durable publish + persist)
+///   BEFORE returning — persist-before-ack, D7 — then a best-effort nudge
+///   of the local ingest sweeper (the butler is itself a recipient device:
+///   without the nudge its own UI delivery would wait for a sibling's
+///   ig-ack merge, which never comes when the rest of the fleet stays
+///   offline).
+pub struct ProdButlerDepositCtx {
+    /// This owner's address bytes (`OwnerAddr.0`).
+    pub self_owner: [u8; 16],
+    /// This device's SP1 device id (64-hex of the device ed25519 verify key).
+    pub device_id: String,
+    /// The runtime owner-state CRDT (`NodeState`'s `crdt_state` Arc) —
+    /// friend graph + owner device cache live here.
+    pub crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    /// X25519 private scalar derived once at start_node via
+    /// `dm_signing::ed25519_priv_to_x25519(device_signing_key)`.
+    pub device_x25519_priv: zeroize::Zeroizing<[u8; 32]>,
+    /// The dm-inbox dataset handles (same Arcs the engine owns).
+    pub dm_inbox_doc: Arc<tokio::sync::Mutex<DmInboxDoc>>,
+    pub dm_inbox_tracker:
+        Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>>,
+    pub dm_inbox_engine: Arc<crate::fleet_sync::FleetSyncEngine<DmInboxDoc>>,
+    /// Weak nudge sender into the dm-inbox ingest sweeper. Weak so the
+    /// acceptor (whose lifetime is tied to the iroh link manager, not the
+    /// engine) can never keep the sweeper alive past engine shutdown —
+    /// the engine's `on_applied` closure holds the only strong sender.
+    pub ingest_nudge: tokio::sync::mpsc::WeakSender<()>,
+}
+
+#[async_trait]
+impl ButlerDepositCtx for ProdButlerDepositCtx {
+    fn self_owner(&self) -> [u8; 16] {
+        self.self_owner
+    }
+
+    async fn lookup_friend(&self, sender_owner: &[u8; 16]) -> Option<([u8; 32], FriendStatus)> {
+        let state = self.crdt_state.lock().await;
+        state
+            .friend_graph
+            .friends
+            .get(&crate::owner_state_types::OwnerAddr(*sender_owner))
+            .map(|e| (e.master_ed25519, e.status))
+    }
+
+    fn now_secs(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// "Pending" = every live entry in the dm-inbox doc. The ingest sweep's
+    /// GC removes entries the moment `ingested_by` covers the enrolled
+    /// device set (or the TTL expires), so doc occupancy IS the
+    /// deposited-but-not-yet-fully-ingested set — counting live entries
+    /// keeps the quota a real bound on butler storage rather than a
+    /// flood-resettable counter.
+    async fn caps_snapshot(&self, sender_owner: &[u8; 16]) -> (usize, usize) {
+        let doc = self.dm_inbox_doc.lock().await;
+        let total = doc.entries.len();
+        let from_sender = doc
+            .entries
+            .values()
+            .filter(|e| e.sender_owner == *sender_owner)
+            .count();
+        (from_sender, total)
+    }
+
+    fn decrypt(&self, sealed_blob: &[u8]) -> Result<Vec<u8>, String> {
+        crate::dm_signing::open_from_owner_with_info(
+            &self.device_x25519_priv,
+            sealed_blob,
+            crate::butler_deposit::BUTLER_DEPOSIT_SEAL_INFO,
+        )
+        .map_err(|e| format!("{e:?}"))
+    }
+
+    async fn lookup_identity_pub(&self, device_hash: DeviceIdentityHash) -> Option<[u8; 64]> {
+        let state = self.crdt_state.lock().await;
+        crate::dm_outbox::lookup_pubkey_for_device(&state.owner_device_cache, device_hash)
+    }
+
+    fn device_id(&self) -> String {
+        self.device_id.clone()
+    }
+
+    async fn mint_hlc(&self) -> Hlc {
+        crate::fleet_sync::mint_next_hlc(&self.dm_inbox_tracker, &self.device_id).await
+    }
+
+    async fn persist_entry(&self, key: String, entry: DmInboxEntry) -> Result<bool, String> {
+        let inserted = {
+            let mut doc = self.dm_inbox_doc.lock().await;
+            match doc.entries.entry(key) {
+                std::collections::btree_map::Entry::Occupied(_) => false,
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(entry);
+                    true
+                }
+            }
+        };
+        // notify_dirty BEFORE flush_now: if the flush's publish leg fails,
+        // the engine's swap-and-restore keeps the dirty latch armed so a
+        // later debounce retries the publish (fleet_sync.rs flush arm).
+        self.dm_inbox_engine.notify_dirty();
+        // Durable persist + publish BEFORE the ack exists (D7). Flushed
+        // even for a duplicate key: if the FIRST deposit's flush failed
+        // after the in-memory insert, the retry hits the occupied entry —
+        // skipping the flush here would ack an entry that was never made
+        // durable.
+        self.dm_inbox_engine
+            .flush_now()
+            .await
+            .map_err(|e| format!("flush_now: {e}"))?;
+        // Wake the local ingest sweeper (level trigger; full buffer = a
+        // sweep is already scheduled; None = engine already shut down).
+        if let Some(tx) = self.ingest_nudge.upgrade() {
+            let _ = tx.try_send(());
+        }
+        Ok(inserted)
+    }
+}
+
 /// Strict canonical-CBOR decode of the embedded [`EnrollmentCert`] (trailing
 /// bytes rejected — mirrors `iroh_friend_acceptor::decode_strict`).
 fn decode_enrollment_cert_strict(bytes: &[u8]) -> Result<EnrollmentCert, DepositReject> {
