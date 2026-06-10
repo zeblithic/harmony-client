@@ -101,7 +101,8 @@ interface Space {
   members: OwnerAddr[];           // for DM/group-DM only — INCLUDES sender; communities use separate CRDT
   custom_name: string | null;     // owner's local rename, applies only on this owner's devices
   notification_pref: 'all' | 'mentions' | 'muted' | null;
-  left_at: HLC | null;            // dm/group-dm only: HLC of when *I* left this Space.
+  left_at: HLC | null;            // dm/group-dm/community: HLC of when *I* left this Space
+                                  // (communities since the 2026-06-10 ZEB-427 amendment below).
                                   // Owner-local field — never propagates to other members.
                                   // Receive layer drops incoming DMs when non-null.
                                   // Re-invitation clears back to null (NOT a tombstone).
@@ -460,7 +461,8 @@ The rewrite happens as part of the same merge transaction; partial application w
 Two distinct concepts that the spec previously conflated:
 
 - **Tombstone** = explicit deletion. Result of `remove_space(space_id)`. Permanent; CRDT's "tombstone wins over re-add" rule applies. Re-creating a Space with the same dedupe key after tombstone is **blocked** until the user manually clears the tombstone (or for community-kind spaces, joins the community fresh — which produces a new `id` if the original community itself is gone).
-- **Leave** (DM/group-DM only) = sets `Space.left_at: HLC` to mark "I'm not actively in this conversation right now." NOT a tombstone. Re-invitation clears `left_at` back to `null`. The Space's `id` is preserved, so chat history (OutboxEntry/InboxEntry) is intact and visible if/when you rejoin.
+- **Leave** = sets `Space.left_at: HLC` to mark "I'm not actively in this conversation right now." NOT a tombstone. Re-invitation clears `left_at` back to `null`. The Space's `id` is preserved, so chat history (OutboxEntry/InboxEntry) is intact and visible if/when you rejoin.
+  - *Amended 2026-06-10 (ZEB-427):* originally scoped to DM/group-DM only; **communities now use the same mechanism.** `leave_community` first commits the self-Leave (+ EpochRotation) to the community membership CRDT — which remains the membership source of truth — then sets `left_at` on the owner-state Space row and fences it to disk. The row is retained for a future `remove_space` (ZEB-435). Nav rehydration, the boot engine sweep (the startup pass that spawns a per-community engine for each owner-state community Space), and the profile-broadcast shared-set all exclude left rows, so a left community no longer resurrects at reboot. A later invite redemption recommits the Space row (adopting the existing row's immutable `created_at` pin) with `left_at: null`, relisting it — leave stays reversible for communities exactly as for group-DMs.
 
 **This means leaving a group-DM is reversible** if you're re-invited (with the same `id`). Tombstoning via explicit `remove_space` is not. UI should make the distinction obvious — the standard "leave" action sets `left_at`; only an explicit "delete this conversation forever" gesture writes a tombstone.
 
