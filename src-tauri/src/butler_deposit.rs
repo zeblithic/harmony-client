@@ -85,6 +85,12 @@ pub const INBOX_GLOBAL_CAP: usize = 1024;
 /// path worth pinning fleet storage for.
 pub const INBOX_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
+/// ZEB-422 (P2): number of full backoff windows a (entry, recipient) pair may
+/// sit sent-but-never-acked before each FURTHER Ok-send window also attempts
+/// the butler-deposit rung. Windows accumulate via the Ok-arm's AttemptState
+/// bump in `drain_phase_c`; an ack clears the pair entirely.
+pub const DEPOSIT_NOACK_WINDOWS: u32 = 2;
+
 /// The sender → butler deposit request body (canonical CBOR, sent inside a
 /// length-prefixed frame). Spec §4: the butler verifies the enrollment cert
 /// chain, the `sig`, and admission (friend graph) BEFORE any decryption of
