@@ -2395,22 +2395,34 @@ mod tests {
         );
     }
 
+    /// True when `err` came from one of the ZEB-428 gates (as opposed to a
+    /// platform backend failure — e.g. no Secret Service on headless Linux).
+    /// The allow-override tests pin GATE behavior only: a backend error on a
+    /// keychain-less system is legitimate and must not fail the suite (Qodo
+    /// PR #227 R1).
+    fn is_zeb428_gate_error(err: &str) -> bool {
+        err.contains("ZEB-428") || err.contains("HARMONY_DISABLE_KEYCHAIN")
+    }
+
     #[test]
     #[serial]
     fn keychain_new_escape_hatch_overrides_test_gate() {
         std::env::set_var("HARMONY_ALLOW_REAL_KEYCHAIN", "1");
         std::env::remove_var("HARMONY_DISABLE_KEYCHAIN");
-        // With the explicit override the constructor must proceed to the
-        // real keyring entry. Entry CREATION succeeds without touching the
-        // credential itself (no read/write happens until load/save), so
-        // this is safe to run on a dev machine.
+        // With the explicit override the constructor must get PAST the gates
+        // to the real keyring entry. On a keychain-less system (headless
+        // Linux/CI) entry creation may then fail for backend reasons — that
+        // is acceptable; what must NOT appear is a gate refusal. Entry
+        // creation never touches the credential itself (no read/write
+        // happens until load/save), so this is safe on a dev machine.
         let result = KeychainStore::new();
         std::env::remove_var("HARMONY_ALLOW_REAL_KEYCHAIN");
-        assert!(
-            result.is_ok(),
-            "HARMONY_ALLOW_REAL_KEYCHAIN=1 must re-enable the real keychain: {:?}",
-            result.err()
-        );
+        if let Err(e) = result {
+            assert!(
+                !is_zeb428_gate_error(&e),
+                "HARMONY_ALLOW_REAL_KEYCHAIN=1 must bypass the ZEB-428 gates, got gate error: {e}"
+            );
+        }
     }
 
     #[test]
@@ -2434,10 +2446,15 @@ mod tests {
         std::env::set_var("HARMONY_ALLOW_REAL_KEYCHAIN", "1");
         for benign in ["0", ""] {
             std::env::set_var("HARMONY_DISABLE_KEYCHAIN", benign);
-            assert!(
-                KeychainStore::new().is_ok(),
-                "HARMONY_DISABLE_KEYCHAIN={benign:?} must not disable the keychain"
-            );
+            // Same backend-agnostic posture as the escape-hatch test: a
+            // benign disable value must not trigger either gate; a backend
+            // error on a keychain-less system is acceptable.
+            if let Err(e) = KeychainStore::new() {
+                assert!(
+                    !is_zeb428_gate_error(&e),
+                    "HARMONY_DISABLE_KEYCHAIN={benign:?} must not trigger a gate, got: {e}"
+                );
+            }
         }
         std::env::remove_var("HARMONY_DISABLE_KEYCHAIN");
         std::env::remove_var("HARMONY_ALLOW_REAL_KEYCHAIN");
