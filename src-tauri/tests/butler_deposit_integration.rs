@@ -37,7 +37,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
-use harmony_app::butler_deposit::{build_deposit_frame, DepositPayload, BUTLER_DEPOSIT_SEAL_INFO};
+use harmony_app::butler_deposit::{
+    build_deposit_frame, DepositPayload, BUTLER_DEPOSIT_SEAL_INFO, INBOX_GLOBAL_CAP,
+    INBOX_PER_SENDER_CAP,
+};
 use harmony_app::community_membership::{mint_test_owner, TestOwner};
 use harmony_app::content_store::{ContentStore, InMemoryStub};
 use harmony_app::dm_envelope::{
@@ -54,7 +57,9 @@ use harmony_app::fleet_sync::{
     mint_next_hlc, FleetPersist, FleetSyncConfig, FleetSyncEngine, Merger, SyncError,
 };
 use harmony_app::friend_graph::FriendStatus;
-use harmony_app::iroh_butler_acceptor::{handle_deposit_core, ButlerDepositCtx};
+use harmony_app::iroh_butler_acceptor::{
+    handle_deposit_core, ButlerDepositCtx, DepositPersistVerdict,
+};
 use harmony_app::owner_state_crypto::KeyTree;
 use harmony_app::owner_state_types::{
     DeviceIdentityHash, Hlc, InboxEntry, OwnerAddr, ReceivedMessage, SpaceId,
@@ -265,7 +270,10 @@ struct TestButlerCtx {
     self_owner: [u8; 16],
     device_id: String,
     friends: BTreeMap<[u8; 16], ([u8; 32], FriendStatus)>,
-    identity_pubs: BTreeMap<DeviceIdentityHash, [u8; 64]>,
+    /// Sender DEVICE → (owner id, identity pub) — the
+    /// `resolve_sender_device` source (mirrors the production
+    /// `owner_device_cache` resolution).
+    device_owners: BTreeMap<DeviceIdentityHash, ([u8; 16], [u8; 64])>,
     butler_sk: SigningKey,
     doc: Arc<Mutex<DmInboxDoc>>,
     tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
@@ -287,17 +295,6 @@ impl ButlerDepositCtx for TestButlerCtx {
         1_700_000_100
     }
 
-    async fn caps_snapshot(&self, sender_owner: &[u8; 16]) -> (usize, usize) {
-        let doc = self.doc.lock().await;
-        let total = doc.entries.len();
-        let from_sender = doc
-            .entries
-            .values()
-            .filter(|e| e.sender_owner == *sender_owner)
-            .count();
-        (from_sender, total)
-    }
-
     fn decrypt(&self, sealed_blob: &[u8]) -> Result<Vec<u8>, String> {
         open_from_owner_with_info(
             &ed25519_priv_to_x25519(&self.butler_sk),
@@ -307,8 +304,11 @@ impl ButlerDepositCtx for TestButlerCtx {
         .map_err(|e| format!("{e:?}"))
     }
 
-    async fn lookup_identity_pub(&self, device_hash: DeviceIdentityHash) -> Option<[u8; 64]> {
-        self.identity_pubs.get(&device_hash).copied()
+    async fn resolve_sender_device(
+        &self,
+        device_hash: DeviceIdentityHash,
+    ) -> Option<([u8; 16], [u8; 64])> {
+        self.device_owners.get(&device_hash).copied()
     }
 
     fn device_id(&self) -> String {
@@ -319,18 +319,32 @@ impl ButlerDepositCtx for TestButlerCtx {
         mint_next_hlc(&self.tracker, &self.device_id).await
     }
 
-    /// ProdButlerDepositCtx::persist_entry verbatim: insert-once under the
-    /// doc lock, `notify_dirty`, then `flush_now().await` (durable publish
-    /// + persist) BEFORE returning — persist-before-ack, D7.
-    async fn persist_entry(&self, key: String, entry: DmInboxEntry) -> Result<bool, String> {
-        let inserted = {
+    /// ProdButlerDepositCtx::persist_entry verbatim: atomic
+    /// persist-with-caps under the doc lock (occupied key → Duplicate, caps
+    /// bypassed; vacant → per-sender + global quota check, CapExceeded
+    /// inserts and flushes nothing), then `notify_dirty` + `flush_now()
+    /// .await` (durable publish + persist) BEFORE returning —
+    /// persist-before-ack, D7.
+    async fn persist_entry(
+        &self,
+        key: String,
+        entry: DmInboxEntry,
+    ) -> Result<DepositPersistVerdict, String> {
+        let verdict = {
             let mut doc = self.doc.lock().await;
-            match doc.entries.entry(key) {
-                std::collections::btree_map::Entry::Occupied(_) => false,
-                std::collections::btree_map::Entry::Vacant(v) => {
-                    v.insert(entry);
-                    true
+            if doc.entries.contains_key(&key) {
+                DepositPersistVerdict::Duplicate
+            } else {
+                let sender_pending = doc
+                    .entries
+                    .values()
+                    .filter(|e| e.sender_owner == entry.sender_owner)
+                    .count();
+                if sender_pending >= INBOX_PER_SENDER_CAP || doc.entries.len() >= INBOX_GLOBAL_CAP {
+                    return Ok(DepositPersistVerdict::CapExceeded);
                 }
+                doc.entries.insert(key, entry);
+                DepositPersistVerdict::Inserted
             }
         };
         self.engine.notify_dirty();
@@ -338,7 +352,7 @@ impl ButlerDepositCtx for TestButlerCtx {
             .flush_now()
             .await
             .map_err(|e| format!("flush_now: {e}"))?;
-        Ok(inserted)
+        Ok(verdict)
     }
 }
 
@@ -569,13 +583,14 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
 
     // Admission prerequisites on A: the sender owner is an Active friend
     // (pinned master from its cert), and the sender's DM device identity
-    // pub is cached (the inner CidNotify verification resolves it by
-    // signing_device_hash).
+    // is cached UNDER THE SENDER'S OWNER (the inner CidNotify verification
+    // resolves the signing device to its owner and binds it to
+    // frame.sender_owner).
     let a_butler_ctx = TestButlerCtx {
         self_owner: RECIPIENT_OWNER,
         device_id: a_id.clone(),
         friends: [(fx.sender.owner.0, (fx.sender_master, FriendStatus::Active))].into(),
-        identity_pubs: [(fx.dm_device_hash, fx.identity_pub)].into(),
+        device_owners: [(fx.dm_device_hash, (fx.sender.owner.0, fx.identity_pub))].into(),
         butler_sk: a_sk,
         doc: Arc::clone(&a.doc),
         tracker: Arc::clone(&a.tracker),

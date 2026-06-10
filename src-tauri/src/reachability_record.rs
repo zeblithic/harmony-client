@@ -125,10 +125,14 @@ pub struct ReachabilityAnnouncePayload {
 /// to [`crate::butler_deposit::BUTLER_SET_MAX_ENTRIES`]. A missing (zero) or
 /// stale stamp yields an empty vec — the caller falls through to the
 /// existing retry chain (spec §3: a stale ad can never make delivery worse
-/// than today). A `bs_at` in the future (sender/receiver clock skew) is
-/// treated as fresh via `saturating_sub`.
+/// than today). Sender/receiver clock skew is tolerated up to ONE freshness
+/// window FORWARD (`bs_at` ≤ `now_ms + BUTLER_SET_FRESHNESS_MS`); beyond
+/// that the stamp is treated as stale — a maliciously future-stamped record
+/// must not stay "fresh" until the wall clock catches up, pinning the
+/// deposit rung onto dead butlers (PR #221 round 1).
 pub fn fresh_butler_set(blob: &ReachabilityAnnouncePayload, now_ms: u64) -> Vec<ButlerSetEntry> {
     if blob.bs_at == 0
+        || blob.bs_at > now_ms.saturating_add(crate::butler_deposit::BUTLER_SET_FRESHNESS_MS)
         || now_ms.saturating_sub(blob.bs_at) > crate::butler_deposit::BUTLER_SET_FRESHNESS_MS
     {
         return Vec::new();
@@ -429,12 +433,19 @@ mod tests {
 
         let window = crate::butler_deposit::BUTLER_SET_FRESHNESS_MS;
         // Fresh: at the stamp, at the window edge, and slightly in the
-        // future of the reader's clock (skew tolerance via saturating_sub).
+        // future of the reader's clock (bounded forward-skew tolerance).
         assert_eq!(fresh_butler_set(&p, bs_at).len(), 1);
         assert_eq!(fresh_butler_set(&p, bs_at + window).len(), 1);
         assert_eq!(fresh_butler_set(&p, bs_at - 5_000).len(), 1);
+        // Forward-skew edge: reader BEHIND the stamp by a full window
+        // (bs_at == now + window) is still fresh.
+        assert_eq!(fresh_butler_set(&p, bs_at - window).len(), 1);
         // Stale: one past the window → treated as no butler set.
         assert!(fresh_butler_set(&p, bs_at + window + 1).is_empty());
+        // Far-future stamp (window + 1 in the reader's future) → rejected:
+        // a maliciously future-stamped record must not be fresh-forever
+        // (PR #221 round 1).
+        assert!(fresh_butler_set(&p, bs_at - window - 1).is_empty());
         // Missing stamp (legacy / elided) → no butler set, regardless of
         // entries being present.
         p.bs_at = 0;

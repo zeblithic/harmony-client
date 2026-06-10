@@ -12,7 +12,7 @@
 //! protocol — the verification ORDER there is normative) and §5 (`dm-inbox-v1`
 //! dataset).
 //!
-//! ## Verification order (spec §4, plan Task 5)
+//! ## Verification order (spec §4 as amended PR #221 round 1, plan Task 5)
 //!
 //! 0. recipient bind: `frame.recipient_owner` must be THIS owner;
 //! 1. admission: `frame.sender_owner` must be an `Active` friend (yields the
@@ -21,14 +21,26 @@
 //!    extract the cert-bound device verify key;
 //! 3. verify `frame.sig` over `BUTLER_DEPOSIT_SIG_DOMAIN ‖ ro ‖ sealed_blob`
 //!    against that device key;
-//! 4. caps (per-sender + global pending quotas);
-//! 5. decrypt `sealed_blob` (the FIRST crypto-on-content step — steps 0–4 run
+//! 4. decrypt `sealed_blob` (the FIRST crypto-on-content step — steps 0–3 run
 //!    before any decryption, so the butler never decrypts unauthenticated
 //!    bytes);
-//! 6. decode the inner [`crate::butler_deposit::DepositPayload`], verify the CidNotify packet
-//!    signature + sender/space/CID consistency with the storage blob;
-//! 7. insert into [`DmInboxDoc`] + persist (an ack never lies — D7);
-//! 8. ack.
+//! 5. decode the inner [`crate::butler_deposit::DepositPayload`]; resolve the
+//!    signing DEVICE to its owner and require it to equal
+//!    `frame.sender_owner` (device→owner binding — the same binding the
+//!    normal receive path enforces); verify the CidNotify packet signature +
+//!    sender/space/CID consistency with the storage blob;
+//! 6. atomic persist-with-caps into [`DmInboxDoc`] (per-sender + global
+//!    quotas enforced INSIDE the persist critical section; an
+//!    already-present key bypasses the caps — idempotent redelivery; an ack
+//!    never lies — D7);
+//! 7. ack.
+//!
+//! Caps moved from a standalone pre-decrypt step into the persist critical
+//! section (PR #221 round 1): a snapshot-then-insert quota raced under
+//! concurrent connections, and a redelivery of an already-stored entry at a
+//! full inbox was wrongly rejected instead of idempotently re-acked.
+//! Idempotent redelivery + atomicity beat the old caps-before-crypto
+//! ordering; steps 1–3 still gate all content crypto behind cert+sig.
 //!
 //! ## Tauri-free core
 //!
@@ -83,8 +95,10 @@ pub enum DepositReject {
     /// device key.
     #[error("deposit frame signature invalid")]
     BadSig,
-    /// Per-sender or global pending-inbox quota reached
-    /// ([`INBOX_PER_SENDER_CAP`] / [`INBOX_GLOBAL_CAP`]).
+    /// Inserting a NEW inbox key would exceed [`INBOX_PER_SENDER_CAP`] or
+    /// [`INBOX_GLOBAL_CAP`]. Enforced atomically inside `persist_entry`'s
+    /// critical section; a redelivery of an already-stored key is exempt
+    /// (it re-acks idempotently even at a full inbox).
     #[error("inbox cap exceeded")]
     CapExceeded,
     /// `sealed_blob` did not open under this device's X25519 key + the
@@ -96,8 +110,10 @@ pub enum DepositReject {
     /// (codec/shape failures).
     #[error("deposit payload malformed")]
     BadPayload,
-    /// The inner CidNotify packet failed verification: signature, sender
-    /// consistency, or space/CID consistency with the storage blob.
+    /// The inner CidNotify packet failed verification: signature,
+    /// device→owner binding (signing device unknown, ambiguous, or owned by
+    /// a different owner than `frame.sender_owner`), sender consistency, or
+    /// space/CID consistency with the storage blob.
     #[error("inner CidNotify verification failed")]
     InnerVerifyFailed,
     /// The dm-inbox write or its durable flush failed — NO ack may be
@@ -107,10 +123,28 @@ pub enum DepositReject {
     PersistFailed(String),
 }
 
-/// Injectable context for [`handle_deposit_core`]: friend lookup, caps
-/// snapshot, decrypt, identity-pub lookup, and the persist sink. Production
-/// (Task 7) implements this over `NodeState`'s owner-state + dm-inbox engine
-/// handles; tests implement it with probes that record call order.
+/// Outcome of the atomic persist step. Cap enforcement lives INSIDE the
+/// doc-lock critical section (snapshot-then-insert raced under concurrent
+/// connections), and an occupied key bypasses the caps entirely — a
+/// redelivery after a lost ack must re-ack idempotently even at a full
+/// inbox (the entry is already stored; rejecting it would strand the
+/// sender undelivered for a message the butler holds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepositPersistVerdict {
+    Inserted,
+    /// Key already present — flushed again (D7: a redelivery after a failed
+    /// first flush must not ack non-durable state) and acked.
+    Duplicate,
+    /// Inserting a NEW key would exceed INBOX_PER_SENDER_CAP or
+    /// INBOX_GLOBAL_CAP. Nothing inserted, nothing flushed.
+    CapExceeded,
+}
+
+/// Injectable context for [`handle_deposit_core`]: friend lookup, decrypt,
+/// sender-device resolution, and the persist sink (which also enforces the
+/// inbox caps atomically). Production (Task 7) implements this over
+/// `NodeState`'s owner-state + dm-inbox engine handles; tests implement it
+/// with probes that record call order.
 #[async_trait]
 pub trait ButlerDepositCtx: Send + Sync {
     /// This device's owner address bytes (the only recipient we accept for).
@@ -125,20 +159,22 @@ pub trait ButlerDepositCtx: Send + Sync {
     /// (cert timestamps are Unix seconds — ZEB-378).
     fn now_secs(&self) -> u64;
 
-    /// Step 4 caps snapshot: `(pending_entries_from_sender, total_pending)`
-    /// over the dm-inbox doc. "Pending" = deposited-but-not-yet-ingested.
-    async fn caps_snapshot(&self, sender_owner: &[u8; 16]) -> (usize, usize);
-
-    /// Step 5: open the sealed blob. Production:
+    /// Step 4: open the sealed blob. Production:
     /// `open_from_owner_with_info(ed25519_priv_to_x25519(own_device_sk),
     /// sealed, BUTLER_DEPOSIT_SEAL_INFO)`. MUST NOT be reached for a deposit
-    /// that failed steps 0–4 (the tests probe exactly this).
+    /// that failed steps 0–3 (the tests probe exactly this).
     fn decrypt(&self, sealed_blob: &[u8]) -> Result<Vec<u8>, String>;
 
-    /// Step 6: 64-byte combined device-identity pubs
-    /// (`X25519_pub(32) ‖ Ed25519_pub(32)`) for the inner packet's signing
-    /// device, from `OwnerDeviceCache`. `None` → inner verification fails.
-    async fn lookup_identity_pub(&self, device_hash: DeviceIdentityHash) -> Option<[u8; 64]>;
+    /// Resolve the sender DEVICE to its (owner id, identity pub) from the SAME
+    /// snapshot the normal receive path uses (`owner_device_cache`:
+    /// `resolve_signed_origin_owner` + `lookup_pubkey_for_device`, one lock).
+    /// `None` = unknown device OR ambiguous owner — reject; a deposit the
+    /// normal path would refuse must never be persisted+acked (the ack would
+    /// lie: ingestion reuses the normal path and would reject it until TTL).
+    async fn resolve_sender_device(
+        &self,
+        device_hash: DeviceIdentityHash,
+    ) -> Option<([u8; 16], [u8; 64])>;
 
     /// This device's SP1 device id (64-hex), stamped as `deposited_by`.
     fn device_id(&self) -> String;
@@ -146,14 +182,21 @@ pub trait ButlerDepositCtx: Send + Sync {
     /// Mint a fresh monotone HLC for `deposited_at`.
     async fn mint_hlc(&self) -> Hlc;
 
-    /// Step 7: insert `entry` under `key` into the dm-inbox doc (under the
-    /// doc lock) and durably flush (`engine.flush_now().await`) BEFORE
-    /// returning — the ack is only produced after this resolves (D7).
-    /// MUST be insert-once on `key`: an existing entry is left untouched and
-    /// `Ok(false)` returned (idempotent redelivery absorbs lost acks);
-    /// `Ok(true)` = newly inserted. `Err` = nothing durable may be assumed —
-    /// the caller rejects without acking.
-    async fn persist_entry(&self, key: String, entry: DmInboxEntry) -> Result<bool, String>;
+    /// Step 6: atomic persist-with-caps. Under ONE doc-lock critical
+    /// section: an occupied `key` is left untouched (insert-once — see
+    /// [`DepositPersistVerdict::Duplicate`]); a vacant `key` is admitted
+    /// only if inserting it keeps the sender under
+    /// [`INBOX_PER_SENDER_CAP`] and the doc under [`INBOX_GLOBAL_CAP`]
+    /// (else [`DepositPersistVerdict::CapExceeded`] — nothing inserted,
+    /// nothing flushed). On `Inserted`/`Duplicate` the doc is durably
+    /// flushed (`engine.flush_now().await`) BEFORE returning — the ack is
+    /// only produced after this resolves (D7). `Err` = nothing durable may
+    /// be assumed — the caller rejects without acking.
+    async fn persist_entry(
+        &self,
+        key: String,
+        entry: DmInboxEntry,
+    ) -> Result<DepositPersistVerdict, String>;
 }
 
 /// Production [`ButlerDepositCtx`] over real `start_node` handles (ZEB-418
@@ -165,19 +208,26 @@ pub trait ButlerDepositCtx: Send + Sync {
 ///   private (the birational twin of the cert-bound device ed25519 key —
 ///   the SAME key the butler-set advertisement publishes as `vk`, so a
 ///   sender sealing to `birational(vk)` lands here);
-/// * `lookup_identity_pub` sources from `owner_device_cache` via
-///   `dm_outbox::lookup_pubkey_for_device` — the SAME trust source the
-///   normal receive path uses (a deposit from a never-seen sender device
-///   rejects at inner-verify, exactly as the normal path would drop it);
+/// * `resolve_sender_device` sources owner + identity pub from
+///   `owner_device_cache` via `dm_outbox::resolve_signed_origin_owner` +
+///   `lookup_pubkey_for_device` under ONE lock — the SAME trust source and
+///   the SAME resolution the normal receive path's
+///   `verify_cidnotify_admission` uses (a deposit from a never-seen,
+///   ambiguous, or differently-owned sender device rejects at inner-verify,
+///   exactly as the normal path would drop it);
 /// * `mint_hlc` mints from the dm-inbox engine's HLC tracker, mirroring
 ///   how the notes IPC cores mint from the notes tracker;
-/// * `persist_entry` = insert-once under the doc lock, then
+/// * `persist_entry` = atomic persist-with-caps under the doc lock
+///   (occupied key → caps bypassed, idempotent redelivery; vacant key →
+///   per-sender + global LIVE-entry quotas enforced in the same critical
+///   section — counting live doc entries keeps the quota a real bound on
+///   butler storage rather than a flood-resettable counter), then
 ///   `notify_dirty` + `flush_now().await` (durable publish + persist)
 ///   BEFORE returning — persist-before-ack, D7 — then a best-effort nudge
 ///   of the local ingest sweeper (the butler is itself a recipient device:
 ///   without the nudge its own UI delivery would wait for a sibling's
 ///   ig-ack merge, which never comes when the rest of the fleet stays
-///   offline).
+///   offline). A `CapExceeded` verdict inserts and flushes NOTHING.
 pub struct ProdButlerDepositCtx {
     /// This owner's address bytes (`OwnerAddr.0`).
     pub self_owner: [u8; 16],
@@ -223,24 +273,6 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
             .as_secs()
     }
 
-    /// "Pending" = every live entry in the dm-inbox doc. The ingest sweep's
-    /// GC removes entries once `ingested_by` covers the enrolled device
-    /// set (one sweep after the final ig ack lands, so the covering state
-    /// replicates first) or the TTL expires, so doc occupancy IS the
-    /// deposited-but-not-yet-fully-ingested set — counting live entries
-    /// keeps the quota a real bound on butler storage rather than a
-    /// flood-resettable counter.
-    async fn caps_snapshot(&self, sender_owner: &[u8; 16]) -> (usize, usize) {
-        let doc = self.dm_inbox_doc.lock().await;
-        let total = doc.entries.len();
-        let from_sender = doc
-            .entries
-            .values()
-            .filter(|e| e.sender_owner == *sender_owner)
-            .count();
-        (from_sender, total)
-    }
-
     fn decrypt(&self, sealed_blob: &[u8]) -> Result<Vec<u8>, String> {
         crate::dm_signing::open_from_owner_with_info(
             &self.device_x25519_priv,
@@ -250,9 +282,24 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
         .map_err(|e| format!("{e:?}"))
     }
 
-    async fn lookup_identity_pub(&self, device_hash: DeviceIdentityHash) -> Option<[u8; 64]> {
+    async fn resolve_sender_device(
+        &self,
+        device_hash: DeviceIdentityHash,
+    ) -> Option<([u8; 16], [u8; 64])> {
+        // ONE lock acquisition so the owner resolution and the pub lookup
+        // read the SAME `owner_device_cache` snapshot — mirroring the
+        // normal receive path's `verify_cidnotify_admission`, which calls
+        // these two primitives under its single OwnerState borrow.
         let state = self.crdt_state.lock().await;
-        crate::dm_outbox::lookup_pubkey_for_device(&state.owner_device_cache, device_hash)
+        // Unknown AND Ambiguous both collapse to None: a multi-owner match
+        // (corrupted state or cache-poisoning) is not a trustworthy
+        // resolution, exactly as the normal path drops it.
+        let owner =
+            crate::dm_outbox::resolve_signed_origin_owner(&state.owner_device_cache, device_hash)
+                .ok()?;
+        let identity_pub =
+            crate::dm_outbox::lookup_pubkey_for_device(&state.owner_device_cache, device_hash)?;
+        Some((owner.0, identity_pub))
     }
 
     fn device_id(&self) -> String {
@@ -263,15 +310,42 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
         crate::fleet_sync::mint_next_hlc(&self.dm_inbox_tracker, &self.device_id).await
     }
 
-    async fn persist_entry(&self, key: String, entry: DmInboxEntry) -> Result<bool, String> {
-        let inserted = {
+    async fn persist_entry(
+        &self,
+        key: String,
+        entry: DmInboxEntry,
+    ) -> Result<DepositPersistVerdict, String> {
+        let verdict = {
             let mut doc = self.dm_inbox_doc.lock().await;
-            match doc.entries.entry(key) {
-                std::collections::btree_map::Entry::Occupied(_) => false,
-                std::collections::btree_map::Entry::Vacant(v) => {
-                    v.insert(entry);
-                    true
+            if doc.entries.contains_key(&key) {
+                // Occupied key: insert-once leaves it untouched, and the
+                // caps are BYPASSED — the entry is already stored, so a
+                // redelivery after a lost ack re-acks idempotently even at
+                // a full inbox. Falls through to the flush below (D7).
+                DepositPersistVerdict::Duplicate
+            } else {
+                // Caps INSIDE the doc-lock critical section: counting and
+                // inserting under one lock acquisition means concurrent
+                // deposits can never overshoot the quotas (the old
+                // snapshot-then-insert raced). "Live" = every entry in the
+                // doc — the ingest sweep's GC removes entries once
+                // `ingested_by` covers the enrolled device set (one sweep
+                // after the final ig ack lands) or the TTL expires, so doc
+                // occupancy keeps the quota a real bound on butler storage
+                // rather than a flood-resettable counter.
+                let sender_pending = doc
+                    .entries
+                    .values()
+                    .filter(|e| e.sender_owner == entry.sender_owner)
+                    .count();
+                let total = doc.entries.len();
+                if sender_pending >= INBOX_PER_SENDER_CAP || total >= INBOX_GLOBAL_CAP {
+                    // Nothing inserted → nothing to flush; the doc is
+                    // exactly as it was.
+                    return Ok(DepositPersistVerdict::CapExceeded);
                 }
+                doc.entries.insert(key, entry);
+                DepositPersistVerdict::Inserted
             }
         };
         // notify_dirty BEFORE flush_now: if the flush's publish leg fails,
@@ -292,7 +366,7 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
         if let Some(tx) = self.ingest_nudge.upgrade() {
             let _ = tx.try_send(());
         }
-        Ok(inserted)
+        Ok(verdict)
     }
 }
 
@@ -370,25 +444,23 @@ pub async fn handle_deposit_core(
         )
         .map_err(|_| DepositReject::BadSig)?;
 
-    // Step 4 — caps. Checked after authentication (an unauthenticated probe
-    // can't learn quota state) and before decryption (a capped inbox does
-    // zero crypto work on the payload).
-    let (sender_pending, total_pending) = ctx.caps_snapshot(&frame.sender_owner).await;
-    if sender_pending >= INBOX_PER_SENDER_CAP || total_pending >= INBOX_GLOBAL_CAP {
-        return Err(DepositReject::CapExceeded);
-    }
-
-    // Step 5 — decrypt. The FIRST crypto-on-content step: everything above
+    // Step 4 — decrypt. The FIRST crypto-on-content step: everything above
     // ran on authenticated-but-sealed bytes.
     let plaintext = ctx
         .decrypt(&frame.sealed_blob)
         .map_err(|_| DepositReject::DecryptFailed)?;
 
-    // Step 6 — decode the payload and verify the inner CidNotify with the
-    // existing receive-path primitives: packet signature, sender
-    // consistency with the admission-checked frame sender, and space/CID
-    // consistency (the deposited storage blob must hash to the packet's
-    // message_cid under the DM send path's exact for_book flags).
+    // Step 5 — decode the payload and verify the inner CidNotify with the
+    // existing receive-path primitives: device→owner binding (the signing
+    // DEVICE must resolve to exactly `frame.sender_owner` — the same
+    // binding the normal receive path enforces via
+    // `resolve_signed_origin_owner` + the owner-field match; without it
+    // the butler would persist+ack a deposit that ingestion, which reuses
+    // the normal path, rejects forever — the ack would lie, D7), packet
+    // signature, sender consistency with the admission-checked frame
+    // sender, and space/CID consistency (the deposited storage blob must
+    // hash to the packet's message_cid under the DM send path's exact
+    // for_book flags).
     let payload = decode_deposit_payload(&plaintext).map_err(|_| DepositReject::BadPayload)?;
     let packet = decode_packet(&payload.cidnotify_packet).map_err(|_| DepositReject::BadPayload)?;
     let (signed, signature, signed_bytes) = match packet {
@@ -402,10 +474,13 @@ pub async fn handle_deposit_core(
     if signed.sender_owner_addr.0 != frame.sender_owner {
         return Err(DepositReject::InnerVerifyFailed);
     }
-    let identity_pub = ctx
-        .lookup_identity_pub(signed.signing_device_hash)
+    let (resolved_owner, identity_pub) = ctx
+        .resolve_sender_device(signed.signing_device_hash)
         .await
         .ok_or(DepositReject::InnerVerifyFailed)?;
+    if resolved_owner != frame.sender_owner {
+        return Err(DepositReject::InnerVerifyFailed);
+    }
     verify_dm_packet_signature(
         &signed_bytes,
         &signature,
@@ -425,9 +500,11 @@ pub async fn handle_deposit_core(
         return Err(DepositReject::InnerVerifyFailed);
     }
 
-    // Step 7 — insert + durable persist BEFORE the ack exists (D7: an ack
-    // never lies). Insert-once on the key: a redelivery after a lost ack is
-    // absorbed and still acked.
+    // Step 6 — atomic persist-with-caps + durable flush BEFORE the ack
+    // exists (D7: an ack never lies). Insert-once on the key with the
+    // per-sender + global quotas enforced inside the persist critical
+    // section; an occupied key bypasses the caps, so a redelivery after a
+    // lost ack is absorbed and still acked even at a full inbox.
     let key = DmInboxDoc::key(&signed.space_id.0, &signed.message_cid.to_bytes());
     let entry = DmInboxEntry {
         sender_owner: frame.sender_owner,
@@ -437,12 +514,13 @@ pub async fn handle_deposit_core(
         deposited_by: ctx.device_id(),
         ingested_by: BTreeSet::new(),
     };
-    let _newly_inserted = ctx
-        .persist_entry(key, entry)
-        .await
-        .map_err(DepositReject::PersistFailed)?;
+    match ctx.persist_entry(key, entry).await {
+        Ok(DepositPersistVerdict::Inserted) | Ok(DepositPersistVerdict::Duplicate) => {}
+        Ok(DepositPersistVerdict::CapExceeded) => return Err(DepositReject::CapExceeded),
+        Err(e) => return Err(DepositReject::PersistFailed(e)),
+    }
 
-    // Step 8 — ack.
+    // Step 7 — ack.
     Ok(DepositAck {
         space_id: signed.space_id.0,
         message_cid: signed.message_cid.to_bytes().to_vec(),
@@ -739,16 +817,18 @@ mod tests {
         }
     }
 
-    /// Probe ctx: records the order of friend-lookup / caps / decrypt /
-    /// persist calls, and backs persist with an insert-once map so tests can
-    /// assert exactly what was durably written before the ack existed.
+    /// Probe ctx: records the order of friend-lookup / decrypt / resolve /
+    /// persist calls, and backs persist with an insert-once map (with the
+    /// production atomic-cap logic) so tests can assert exactly what was
+    /// durably written before the ack existed.
     struct TestCtx {
         self_owner: [u8; 16],
         friends: BTreeMap<[u8; 16], ([u8; 32], FriendStatus)>,
-        identity_pubs: BTreeMap<DeviceIdentityHash, [u8; 64]>,
+        /// Sender DEVICE → (owner id, identity pub) — the
+        /// `resolve_sender_device` source (mirrors the production
+        /// `owner_device_cache` resolution).
+        device_owners: BTreeMap<DeviceIdentityHash, ([u8; 16], [u8; 64])>,
         butler_sk: SigningKey,
-        sender_pending: usize,
-        global_pending: usize,
         persist_fail: bool,
         store: StdMutex<BTreeMap<String, DmInboxEntry>>,
         events: StdMutex<Vec<String>>,
@@ -756,19 +836,17 @@ mod tests {
 
     impl TestCtx {
         /// Ctx where the fixture's sender is an Active friend and its DM
-        /// device identity is cached.
+        /// device identity is cached under the sender's owner.
         fn for_fixture(f: &Fixture) -> Self {
             let mut friends = BTreeMap::new();
             friends.insert(f.sender_owner, (f.sender_master, FriendStatus::Active));
-            let mut identity_pubs = BTreeMap::new();
-            identity_pubs.insert(f.dm_device_hash, f.identity_pub);
+            let mut device_owners = BTreeMap::new();
+            device_owners.insert(f.dm_device_hash, (f.sender_owner, f.identity_pub));
             Self {
                 self_owner: BUTLER_OWNER,
                 friends,
-                identity_pubs,
+                device_owners,
                 butler_sk: butler_device_sk(),
-                sender_pending: 0,
-                global_pending: 0,
                 persist_fail: false,
                 store: StdMutex::new(BTreeMap::new()),
                 events: StdMutex::new(Vec::new()),
@@ -799,11 +877,6 @@ mod tests {
             1_700_000_100
         }
 
-        async fn caps_snapshot(&self, _sender_owner: &[u8; 16]) -> (usize, usize) {
-            self.push_event("caps");
-            (self.sender_pending, self.global_pending)
-        }
-
         fn decrypt(&self, sealed_blob: &[u8]) -> Result<Vec<u8>, String> {
             self.push_event("decrypt");
             crate::dm_signing::open_from_owner_with_info(
@@ -814,8 +887,12 @@ mod tests {
             .map_err(|e| format!("{e:?}"))
         }
 
-        async fn lookup_identity_pub(&self, device_hash: DeviceIdentityHash) -> Option<[u8; 64]> {
-            self.identity_pubs.get(&device_hash).copied()
+        async fn resolve_sender_device(
+            &self,
+            device_hash: DeviceIdentityHash,
+        ) -> Option<([u8; 16], [u8; 64])> {
+            self.push_event("resolve");
+            self.device_owners.get(&device_hash).copied()
         }
 
         fn device_id(&self) -> String {
@@ -830,19 +907,52 @@ mod tests {
             }
         }
 
-        async fn persist_entry(&self, key: String, entry: DmInboxEntry) -> Result<bool, String> {
+        /// Production atomic-cap logic over the test store: occupied key →
+        /// Duplicate (caps bypassed); vacant key → quota check, then
+        /// insert. A CapExceeded verdict writes nothing and records no
+        /// "persist:" event (nothing was made durable).
+        async fn persist_entry(
+            &self,
+            key: String,
+            entry: DmInboxEntry,
+        ) -> Result<DepositPersistVerdict, String> {
             if self.persist_fail {
                 return Err("simulated flush failure".into());
             }
             let mut store = self.store.lock().unwrap();
-            let inserted = !store.contains_key(&key);
-            if inserted {
-                store.insert(key.clone(), entry);
+            if store.contains_key(&key) {
+                self.push_event(format!("persist:{key}"));
+                return Ok(DepositPersistVerdict::Duplicate);
             }
+            let sender_pending = store
+                .values()
+                .filter(|e| e.sender_owner == entry.sender_owner)
+                .count();
+            if sender_pending >= INBOX_PER_SENDER_CAP || store.len() >= INBOX_GLOBAL_CAP {
+                return Ok(DepositPersistVerdict::CapExceeded);
+            }
+            store.insert(key.clone(), entry);
             // Record AFTER the write so "persist:<key>" in the event log
             // means the entry is durably in the store.
             self.push_event(format!("persist:{key}"));
-            Ok(inserted)
+            Ok(DepositPersistVerdict::Inserted)
+        }
+    }
+
+    /// Minimal store filler for the cap tests — only ever counted by the
+    /// persist-level quota logic, never decoded.
+    fn filler_entry(sender_owner: [u8; 16]) -> DmInboxEntry {
+        DmInboxEntry {
+            sender_owner,
+            cidnotify_packet: Vec::new(),
+            storage_blob: Vec::new(),
+            deposited_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "filler".into(),
+            },
+            deposited_by: "filler".into(),
+            ingested_by: BTreeSet::new(),
         }
     }
 
@@ -873,14 +983,16 @@ mod tests {
             assert!(entry.ingested_by.is_empty());
         }
 
-        // Order probe: admission → caps → decrypt → persist, with persist
-        // the LAST event before the ack was produced.
+        // Order probe: admission → decrypt → device-owner resolve →
+        // persist, with persist the LAST event before the ack was produced
+        // (caps now live INSIDE persist, so there is no standalone caps
+        // step).
         assert_eq!(
             ctx.events(),
             vec![
                 "friend_lookup".to_string(),
-                "caps".to_string(),
                 "decrypt".to_string(),
+                "resolve".to_string(),
                 format!("persist:{key}"),
             ]
         );
@@ -1059,41 +1171,130 @@ mod tests {
         assert_eq!(err, DepositReject::BadSig);
     }
 
+    /// PR #221 round 1: caps are enforced at PERSIST level, atomically
+    /// inside the store critical section — a NEW key at a full inbox gets
+    /// `CapExceeded` and nothing is persisted.
     #[tokio::test]
     async fn per_sender_and_global_caps_enforced() {
         let f = valid_fixture();
+        let key = DmInboxDoc::key(&f.space_id.0, &f.message_cid.to_bytes());
 
-        // Per-sender cap reached → CapExceeded, decrypt never called.
-        let ctx = TestCtx {
-            sender_pending: INBOX_PER_SENDER_CAP,
-            ..TestCtx::for_fixture(&f)
-        };
+        // Per-sender cap: the store already holds CAP live entries from
+        // this sender → CapExceeded, nothing persisted.
+        let ctx = TestCtx::for_fixture(&f);
+        {
+            let mut store = ctx.store.lock().unwrap();
+            for i in 0..INBOX_PER_SENDER_CAP {
+                store.insert(format!("prefill-sender-{i}"), filler_entry(f.sender_owner));
+            }
+        }
         let err = handle_deposit_core(&f.frame, &ctx).await.unwrap_err();
         assert_eq!(err, DepositReject::CapExceeded);
-        assert!(
-            !ctx.events().contains(&"decrypt".to_string()),
-            "capped deposit must reject before decrypt"
-        );
-        assert!(ctx.store.lock().unwrap().is_empty());
+        {
+            let store = ctx.store.lock().unwrap();
+            assert_eq!(
+                store.len(),
+                INBOX_PER_SENDER_CAP,
+                "CapExceeded must persist nothing"
+            );
+            assert!(!store.contains_key(&key));
+        }
 
-        // Global cap reached → CapExceeded.
-        let ctx = TestCtx {
-            global_pending: INBOX_GLOBAL_CAP,
-            ..TestCtx::for_fixture(&f)
-        };
+        // Global cap: CAP live entries from OTHER senders → CapExceeded
+        // even though this sender has zero pending.
+        let ctx = TestCtx::for_fixture(&f);
+        {
+            let mut store = ctx.store.lock().unwrap();
+            for i in 0..INBOX_GLOBAL_CAP {
+                store.insert(format!("prefill-other-{i}"), filler_entry([0xEE; 16]));
+            }
+        }
         let err = handle_deposit_core(&f.frame, &ctx).await.unwrap_err();
         assert_eq!(err, DepositReject::CapExceeded);
+        {
+            let store = ctx.store.lock().unwrap();
+            assert_eq!(store.len(), INBOX_GLOBAL_CAP);
+            assert!(!store.contains_key(&key));
+        }
 
-        // Just below both caps → accepted (boundary pin: the cap is a
-        // strict "already at" check, not "would exceed by 2").
-        let ctx = TestCtx {
-            sender_pending: INBOX_PER_SENDER_CAP - 1,
-            global_pending: INBOX_GLOBAL_CAP - 1,
-            ..TestCtx::for_fixture(&f)
-        };
+        // One below the per-sender cap → accepted (boundary pin: the cap is
+        // a strict "already at" check, not "would exceed by 2").
+        let ctx = TestCtx::for_fixture(&f);
+        {
+            let mut store = ctx.store.lock().unwrap();
+            for i in 0..INBOX_PER_SENDER_CAP - 1 {
+                store.insert(format!("prefill-sender-{i}"), filler_entry(f.sender_owner));
+            }
+        }
         handle_deposit_core(&f.frame, &ctx)
             .await
             .expect("one-below-cap deposit must be accepted");
+        let store = ctx.store.lock().unwrap();
+        assert_eq!(store.len(), INBOX_PER_SENDER_CAP);
+        assert!(store.contains_key(&key));
+    }
+
+    /// PR #221 round 1: an occupied key BYPASSES the caps — a redelivery
+    /// after a lost ack must re-ack idempotently even at a full inbox (the
+    /// entry is already stored; rejecting would strand the sender
+    /// undelivered for a message the butler holds).
+    #[tokio::test]
+    async fn duplicate_deposit_at_full_inbox_still_acks() {
+        let f = valid_fixture();
+        let ctx = TestCtx::for_fixture(&f);
+
+        // First delivery lands normally...
+        let ack1 = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect("first deposit accepted");
+
+        // ...then the inbox fills to the GLOBAL cap with other senders'
+        // entries.
+        {
+            let mut store = ctx.store.lock().unwrap();
+            let mut i = 0;
+            while store.len() < INBOX_GLOBAL_CAP {
+                store.insert(format!("prefill-other-{i}"), filler_entry([0xEE; 16]));
+                i += 1;
+            }
+        }
+
+        // Redelivery of the EXISTING key (lost-ack retry) at the full
+        // inbox: Duplicate verdict path → still acked, no growth.
+        let ack2 = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect("redelivered deposit at a full inbox must still be acked");
+        assert_eq!(ack1, ack2, "duplicate ack must be identical");
+        let store = ctx.store.lock().unwrap();
+        assert_eq!(store.len(), INBOX_GLOBAL_CAP, "no growth at the cap");
+        let key = DmInboxDoc::key(&f.space_id.0, &f.message_cid.to_bytes());
+        assert!(store.contains_key(&key));
+    }
+
+    /// PR #221 round 1 (device→owner binding): the inner packet's signing
+    /// device resolves to a DIFFERENT owner than `frame.sender_owner` —
+    /// the deposit must be rejected and never persisted, because ingestion
+    /// (which reuses the normal receive path's owner-field match) would
+    /// reject it forever: persisting+acking would tell the sender
+    /// "delivered" for a message the recipient never sees.
+    #[tokio::test]
+    async fn deposit_from_device_of_wrong_owner_rejected() {
+        let f = valid_fixture();
+        let mut device_owners = BTreeMap::new();
+        // Same device hash + identity pub, but owned by another owner.
+        device_owners.insert(f.dm_device_hash, ([0xEE; 16], f.identity_pub));
+        let ctx = TestCtx {
+            device_owners,
+            ..TestCtx::for_fixture(&f)
+        };
+
+        let err = handle_deposit_core(&f.frame, &ctx).await.unwrap_err();
+        assert_eq!(err, DepositReject::InnerVerifyFailed);
+        assert!(ctx.store.lock().unwrap().is_empty(), "must not persist");
+        assert!(
+            !ctx.events().iter().any(|e| e.starts_with("persist")),
+            "persist must never be called for a wrong-owner device"
+        );
     }
 
     #[tokio::test]
@@ -1169,10 +1370,10 @@ mod tests {
         assert_eq!(err, DepositReject::InnerVerifyFailed);
         assert!(ctx.store.lock().unwrap().is_empty());
 
-        // (c) Unknown signing device (no cached identity pub) →
+        // (c) Unknown signing device (no cached device→owner binding) →
         // InnerVerifyFailed.
         let ctx = TestCtx {
-            identity_pubs: BTreeMap::new(),
+            device_owners: BTreeMap::new(),
             ..TestCtx::for_fixture(&f)
         };
         let err = handle_deposit_core(&f.frame, &ctx).await.unwrap_err();

@@ -51,25 +51,29 @@ bs_at: <unix_ms>                   # advertised_at freshness stamp for the whole
 
 ## 4. Deposit protocol
 
-New iroh ALPN `harmony/butler-deposit/1` (exact string matched to existing ALPN naming conventions at plan time). One round trip:
+New iroh ALPN `harmony/butler-deposit/1` (exact string matched to existing ALPN naming conventions at plan time). One round trip (verification order amended PR #221 round 1, 2026-06-10):
 
 ```text
 sender                                   butler (recipient-owner device)
   │  DepositFrame                          │
-  │ ──────────────────────────────────────▶│  1. verify sender EnrollmentCert chain
-  │                                        │  2. verify sig over sealed_blob
-  │                                        │  3. admission: sender_owner ∈ local friend graph
-  │                                        │     (or existing DM thread); quota check
+  │ ──────────────────────────────────────▶│  0. recipient bind: frame is for THIS owner
+  │                                        │  1. admission: sender_owner is an Active friend
+  │                                        │     in the local friend graph
+  │                                        │  2. verify sender EnrollmentCert chain
+  │                                        │  3. verify sig over sealed_blob
   │                                        │  4. decrypt sealed_blob (butler device X25519)
-  │                                        │  5. verify inner DM (existing receive-path checks)
-  │                                        │  6. write to dm-inbox-v1 + persist (SP1)
-  │  DepositAck { message_id }             │
-  │ ◀──────────────────────────────────────│  7. ack only after persist succeeds
+  │                                        │  5. verify inner DM: device→owner binding +
+  │                                        │     packet sig + CID bind (receive-path checks)
+  │                                        │  6. atomic write to dm-inbox-v1 + persist (SP1);
+  │  DepositAck { message_id }             │     quotas enforced inside the persist critical
+  │ ◀──────────────────────────────────────│     section (already-stored keys exempt)
+  │                                        │  7. ack only after persist succeeds
 ```
 
-- **DepositFrame:** `{ recipient_owner_id, sender_owner_id, sender_enrollment_cert, sig, sealed_blob }`. `sig` is the sender's cert-bound device ed25519 over a domain-separated `(recipient_owner_id ‖ sealed_blob)` payload (exact bytes pinned by the wire fixture). Steps 1–3 run **before any decryption** — the butler never decrypts unauthenticated bytes.
+- **DepositFrame:** `{ recipient_owner_id, sender_owner_id, sender_enrollment_cert, sig, sealed_blob }`. `sig` is the sender's cert-bound device ed25519 over a domain-separated `(recipient_owner_id ‖ sealed_blob)` payload (exact bytes pinned by the wire fixture). Steps 0–3 run **before any decryption** — the butler never decrypts unauthenticated bytes.
+- **Device→owner binding (amendment PR #221 round 1, 2026-06-10):** step 5 resolves the inner packet's signing DEVICE to its owner from the same `owner_device_cache` the normal receive path uses, and requires it to equal `sender_owner_id` (unknown/ambiguous devices reject). Without it the butler could persist+ack a deposit that ingestion — which reuses the normal receive path — rejects forever: the sender would see "delivered" for a message the recipient never gets (the ack must never lie, D7).
 - **Admission rejections** are cheap, unauthenticated-rate-limited, and unlogged beyond a counter (no oracle for probing the friend graph).
-- **Quotas/retention:** per-contact quota + global inbox cap (values pinned in the plan); 30-day TTL aligned with ZEB-227.
+- **Quotas/retention:** per-contact quota + global inbox cap (values pinned in the plan); 30-day TTL aligned with ZEB-227. **Amendment (PR #221 round 1, 2026-06-10):** the quotas bound LIVE dm-inbox entries (a storage quota) and are enforced atomically INSIDE the persist critical section rather than as a standalone pre-decrypt step — snapshot-then-insert raced under concurrent connections, and a redelivery of an already-stored entry at a full inbox must re-ack idempotently (already-stored keys bypass the caps) instead of stranding a delivered message.
 - **Envelope:** the shipped sealed-ECDH construction byte-for-byte (`ephemeral X25519 ECDH → HKDF-SHA256 → ChaCha20Poly1305`, `32‖12‖ct` layout from `dm_signing.rs`), with a **new HKDF info string** `harmony-zeb-418-butler-deposit-v1` for domain separation. Sealed to the butler device's birational X25519 — derived by the sender as `birational(vk)` from the butler-set entry (§3); under ZEB-372's birational scheme this is identical to the `x25519_pub` field in the device's EnrollmentCert, so either source works and neither requires a cert exchange before depositing.
 - **Idempotency:** deposits are keyed by the DM's message id end-to-end; redelivery after a lost ack is absorbed by §5's dedupe.
 

@@ -61,17 +61,20 @@ pub const BUTLER_SET_MAX_ENTRIES: usize = 2;
 /// can never make delivery worse than today.
 pub const BUTLER_SET_FRESHNESS_MS: u64 = 15 * 60 * 1_000;
 
-/// Per-sender pending-deposit quota (spec §4 "per-contact quota"): a deposit
-/// is REJECTED when the sender already has this many un-ingested
-/// (deposited-but-not-yet-ingested) entries in the `dm-inbox-v1` doc. Checked
-/// AFTER the frame signature verifies (step 4) so an unauthenticated probe
-/// can't learn quota state, and BEFORE any decryption.
+/// Per-sender inbox quota (spec §4 "per-contact quota"): bounds the LIVE
+/// entries a single sender may hold in the `dm-inbox-v1` doc — deposited
+/// and not yet GC'd, including entries partially ingested or awaiting the
+/// one-sweep coverage-GC deferral. This is a butler STORAGE quota, not a
+/// workflow-state count. Enforced atomically INSIDE the deposit ctx's
+/// `persist_entry` critical section (PR #221 round 1); a deposit whose
+/// inbox key is already stored is exempt, so a redelivery after a lost ack
+/// still re-acks at a full inbox.
 pub const INBOX_PER_SENDER_CAP: usize = 64;
 
-/// Global pending-deposit quota (spec §4 "global inbox cap"): a deposit is
-/// REJECTED when the `dm-inbox-v1` doc already holds this many entries in
-/// total, regardless of sender. Same check point as
-/// [`INBOX_PER_SENDER_CAP`].
+/// Global inbox quota (spec §4 "global inbox cap"): bounds the total LIVE
+/// entries in the `dm-inbox-v1` doc regardless of sender — the same
+/// storage-quota semantics, enforcement point, and duplicate-key exemption
+/// as [`INBOX_PER_SENDER_CAP`].
 pub const INBOX_GLOBAL_CAP: usize = 1024;
 
 /// GC TTL for un-ingested dm-inbox deposits (spec §5): an entry is removed
@@ -84,8 +87,9 @@ pub const INBOX_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 /// The sender → butler deposit request body (canonical CBOR, sent inside a
 /// length-prefixed frame). Spec §4: the butler verifies the enrollment cert
-/// chain, the `sig`, and admission (friend graph + quota) BEFORE any
-/// decryption of `sealed_blob`.
+/// chain, the `sig`, and admission (friend graph) BEFORE any decryption of
+/// `sealed_blob`; the inbox quotas are enforced atomically inside the
+/// persist step (PR #221 round 1 — duplicate keys exempt).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DepositFrame {
     /// Recipient OwnerAddr bytes — whose inbox this deposit is for.
