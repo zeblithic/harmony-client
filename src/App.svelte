@@ -1095,10 +1095,17 @@
   // The picker lists Active friends (keyed by master ownerIdHex — the
   // identifier class `add_space` members require), NOT zenoh presence
   // profiles (which are keyed by device identity hash and only exist
-  // for peers whose broadcast traversed our mesh this session). `null`
-  // means "never hydrated" — browser/mock mode stays on the legacy
-  // navService.profiles fallback at the DmCreateDialog call site.
+  // for peers whose broadcast traversed our mesh this session). The
+  // mode split is structural, not temporal (Cursor PR #225 R1): in
+  // Tauri the picker NEVER sees the presence/mock map — pre-hydration
+  // it's just empty — so a device-hash entry can never be selected
+  // even in the boot window before the first listFriends resolves.
+  // Browser/mock demo mode keeps the legacy navService.profiles map.
   let dmContacts: Map<string, Profile> | null = $state(null);
+  const EMPTY_DM_CONTACTS: Map<string, Profile> = new Map();
+  let pickerContacts = $derived(
+    isTauri() ? (dmContacts ?? EMPTY_DM_CONTACTS) : navService.profiles
+  );
   async function refreshDmContacts(): Promise<void> {
     try {
       dmContacts = contactsFromFriends(await friendService.listFriends());
@@ -3097,7 +3104,7 @@
       onclick={(e) => e.stopPropagation()}
     >
       <DmCreateDialog
-        profiles={dmContacts ?? navService.profiles}
+        profiles={pickerContacts}
         initialKind={dmCreateInitialKind}
         onSubmit={handleDmCreate}
         onCancel={() => { dmCreateDialogOpen = false; }}
