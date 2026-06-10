@@ -349,6 +349,227 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     }
 }
 
+// ── ZEB-434: community state-root fetch latch ────────────────────────────────
+
+/// Cooldown between transport-epoch-triggered re-arm queries (60 s).
+/// Spec D7: a flapping link must not storm; deferred, not dropped.
+pub const ROOT_REARM_COOLDOWN_MS: u64 = 60_000;
+
+/// What the root-fetch driver should do next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootFetchAction {
+    /// Send one state-root query (full-state exchange — no `since`).
+    Request,
+    /// Re-poll `next_action` at or after this wall-clock ms.
+    WaitUntil(u64),
+    /// Satisfied — park until `reset()` (transport-recovery re-arm).
+    Idle,
+}
+
+/// Outcome of one root-fetch attempt, as seen by the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootFetch {
+    /// ≥1 responder replied (replies ingest via the engine's normal
+    /// inbound path — receipt is transport-level, same bar as P3a).
+    Answered,
+    /// Zero responders / query aborted — back off and retry.
+    NoReply,
+    /// Engine/adapter permanently gone — stop the driver.
+    EngineGone,
+}
+
+/// Retry latch for one community's state-root pull (ZEB-434 D3).
+///
+/// Page-less sibling of [`BackfillLatch`]: a responder always has a
+/// root, so ≥1 reply satisfies and zero replies means no responder.
+/// Shares the spec backoff schedule (30 s base doubling to a 600 s
+/// cap, retrying forever — the driver enforces shutdown).
+#[derive(Debug, Clone)]
+pub struct RootFetchLatch {
+    satisfied: bool,
+    in_flight: bool,
+    next_retry_at: u64,
+    retry_delay_ms: u64,
+    retry_base_ms: u64,
+    retry_cap_ms: u64,
+}
+
+impl RootFetchLatch {
+    pub fn new() -> Self {
+        Self::new_with_backoff(BACKFILL_RETRY_BASE_MS, BACKFILL_RETRY_CAP_MS)
+    }
+
+    pub fn new_with_backoff(base_ms: u64, cap_ms: u64) -> Self {
+        Self {
+            satisfied: false,
+            in_flight: false,
+            next_retry_at: 0,
+            retry_delay_ms: 0,
+            retry_base_ms: base_ms,
+            retry_cap_ms: cap_ms,
+        }
+    }
+
+    pub fn is_satisfied(&self) -> bool {
+        self.satisfied
+    }
+
+    /// Decide the next driver action at wall-clock `now_ms`.
+    pub fn next_action(&mut self, now_ms: u64) -> RootFetchAction {
+        if self.satisfied {
+            return RootFetchAction::Idle;
+        }
+        if self.in_flight {
+            return RootFetchAction::WaitUntil(self.next_retry_at.max(now_ms));
+        }
+        if now_ms < self.next_retry_at {
+            return RootFetchAction::WaitUntil(self.next_retry_at);
+        }
+        self.in_flight = true;
+        RootFetchAction::Request
+    }
+
+    /// ≥1 responder replied: satisfied, backoff cleared.
+    pub fn on_reply(&mut self, now_ms: u64) {
+        self.in_flight = false;
+        self.satisfied = true;
+        self.retry_delay_ms = 0;
+        self.next_retry_at = now_ms;
+    }
+
+    /// Zero responders: arm the escalating backoff (same schedule and
+    /// clamp semantics as `BackfillLatch::arm_backoff`).
+    pub fn on_no_reply(&mut self, now_ms: u64) {
+        self.in_flight = false;
+        self.retry_delay_ms = if self.retry_delay_ms == 0 {
+            self.retry_base_ms.min(self.retry_cap_ms)
+        } else {
+            (self.retry_delay_ms * 2).min(self.retry_cap_ms)
+        };
+        self.next_retry_at = now_ms + self.retry_delay_ms;
+    }
+
+    /// Transport-recovery re-arm: unsatisfy, clear in-flight + backoff.
+    pub fn reset(&mut self) {
+        *self = Self::new_with_backoff(self.retry_base_ms, self.retry_cap_ms);
+    }
+}
+
+impl Default for RootFetchLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Drive one community's [`RootFetchLatch`]: query at spawn, back off
+/// while unanswered, and — when `epoch_rx` is `Some` — park on
+/// satisfaction and re-arm on transport-epoch bumps (ZEB-434 D6/D7).
+///
+/// - `request_root()` issues one state-root query and resolves to a
+///   [`RootFetch`]. Reply payloads travel through the engine's normal
+///   inbound path; the driver only sees counts.
+/// - `epoch_rx = None` preserves return-on-Idle (used by tests and any
+///   caller without a transport watch).
+/// - Re-arm queries are deferred to [`ROOT_REARM_COOLDOWN_MS`] since
+///   the last request — deferred, not dropped (spec D7).
+/// - `now_ms` injects the wall clock (paused-time testability — same
+///   precedent as `run_backfill_driver`).
+pub async fn run_root_fetch_driver<Rq, RqFut>(
+    mut latch: RootFetchLatch,
+    request_root: Rq,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
+    now_ms: impl Fn() -> u64,
+) where
+    Rq: Fn() -> RqFut,
+    RqFut: std::future::Future<Output = RootFetch>,
+{
+    let mut last_request_at: Option<u64> = None;
+    loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        match latch.next_action(now_ms()) {
+            RootFetchAction::Idle => {
+                if epoch_rx.is_none() {
+                    return;
+                }
+                tokio::select! {
+                    bumped = epoch_bump(&mut epoch_rx) => {
+                        if !bumped { return; }
+                        if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
+                            return;
+                        }
+                        latch.reset();
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() { return; }
+                    }
+                }
+            }
+            RootFetchAction::WaitUntil(target) => {
+                let wait_ms = target
+                    .saturating_sub(now_ms())
+                    .max(BACKFILL_DRIVER_MIN_WAIT_MS);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(wait_ms)) => {}
+                    bumped = epoch_bump(&mut epoch_rx) => {
+                        // Mid-backoff bump: a new peer is exactly the
+                        // signal that retrying now is worthwhile (D7).
+                        if !bumped { return; }
+                        if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
+                            return;
+                        }
+                        latch.reset();
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() { return; }
+                    }
+                }
+            }
+            RootFetchAction::Request => {
+                last_request_at = Some(now_ms());
+                match request_root().await {
+                    RootFetch::Answered => latch.on_reply(now_ms()),
+                    RootFetch::NoReply => latch.on_no_reply(now_ms()),
+                    RootFetch::EngineGone => return,
+                }
+            }
+        }
+    }
+}
+
+/// Wait for a transport-epoch bump. Pends forever when no watch is
+/// wired; returns false when the epoch sender dropped.
+async fn epoch_bump(epoch_rx: &mut Option<tokio::sync::watch::Receiver<u64>>) -> bool {
+    match epoch_rx.as_mut() {
+        Some(rx) => rx.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Defer an epoch-triggered re-arm to the cooldown boundary (deferred,
+/// not dropped). Returns false if shutdown fires during the wait.
+async fn cooldown_wait(
+    last_request_at: Option<u64>,
+    now: u64,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let Some(last) = last_request_at else {
+        return true;
+    };
+    let target = last.saturating_add(ROOT_REARM_COOLDOWN_MS);
+    if now >= target {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_millis(target - now)) => true,
+        changed = shutdown_rx.changed() => {
+            !(changed.is_err() || *shutdown_rx.borrow())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,5 +1082,275 @@ mod tests {
             0,
         );
         assert_eq!(latch.next_action(0), BackfillAction::Idle);
+    }
+
+    // ── ZEB-434: RootFetchLatch + root-fetch driver tests ────────────────
+
+    #[test]
+    fn root_latch_satisfies_on_reply() {
+        let mut latch = RootFetchLatch::new();
+        assert!(!latch.is_satisfied());
+        assert_eq!(latch.next_action(0), RootFetchAction::Request);
+        latch.on_reply(0);
+        assert!(latch.is_satisfied());
+        assert_eq!(latch.next_action(0), RootFetchAction::Idle);
+    }
+
+    #[test]
+    fn root_latch_backs_off_exponentially_with_cap() {
+        let mut latch = RootFetchLatch::new();
+
+        // t=0: first request goes out.
+        assert_eq!(latch.next_action(0), RootFetchAction::Request);
+        // No reply at t=0 → delay becomes BACKFILL_RETRY_BASE_MS (30_000);
+        // next_retry_at = 0 + 30_000 = 30_000.
+        latch.on_no_reply(0);
+        assert_eq!(
+            latch.next_action(0),
+            RootFetchAction::WaitUntil(BACKFILL_RETRY_BASE_MS)
+        );
+
+        // t=30_000: eligible again.
+        assert_eq!(latch.next_action(30_000), RootFetchAction::Request);
+        // No reply at t=30_000 → delay doubles to 60_000;
+        // next_retry_at = 30_000 + 60_000 = 90_000.
+        latch.on_no_reply(30_000);
+        assert_eq!(
+            latch.next_action(30_000),
+            RootFetchAction::WaitUntil(90_000)
+        );
+
+        // t=90_000: request; no reply → delay 120_000;
+        // next_retry_at = 90_000 + 120_000 = 210_000.
+        assert_eq!(latch.next_action(90_000), RootFetchAction::Request);
+        latch.on_no_reply(90_000);
+        assert_eq!(
+            latch.next_action(90_000),
+            RootFetchAction::WaitUntil(210_000)
+        );
+
+        // t=210_000: request; no reply → delay 240_000;
+        // next_retry_at = 210_000 + 240_000 = 450_000.
+        assert_eq!(latch.next_action(210_000), RootFetchAction::Request);
+        latch.on_no_reply(210_000);
+        assert_eq!(
+            latch.next_action(210_000),
+            RootFetchAction::WaitUntil(450_000)
+        );
+
+        // t=450_000: request; no reply → delay 480_000;
+        // next_retry_at = 450_000 + 480_000 = 930_000.
+        assert_eq!(latch.next_action(450_000), RootFetchAction::Request);
+        latch.on_no_reply(450_000);
+        assert_eq!(
+            latch.next_action(450_000),
+            RootFetchAction::WaitUntil(930_000)
+        );
+
+        // t=930_000: request; no reply → doubling would give 960_000,
+        // CAPPED at BACKFILL_RETRY_CAP_MS (600_000);
+        // next_retry_at = 930_000 + 600_000 = 1_530_000 — interval is exactly the cap.
+        assert_eq!(latch.next_action(930_000), RootFetchAction::Request);
+        latch.on_no_reply(930_000);
+        assert_eq!(
+            latch.next_action(930_000),
+            RootFetchAction::WaitUntil(1_530_000)
+        );
+
+        // t=1_530_000: request; no reply → stays capped at 600_000;
+        // next_retry_at = 1_530_000 + 600_000 = 2_130_000.
+        assert_eq!(latch.next_action(1_530_000), RootFetchAction::Request);
+        latch.on_no_reply(1_530_000);
+        assert_eq!(
+            latch.next_action(1_530_000),
+            RootFetchAction::WaitUntil(2_130_000)
+        );
+    }
+
+    #[test]
+    fn root_latch_in_flight_guard() {
+        let mut latch = RootFetchLatch::new();
+        assert_eq!(latch.next_action(0), RootFetchAction::Request);
+        // Second poll while in-flight must NOT hand out another Request.
+        let second = latch.next_action(0);
+        assert!(
+            matches!(second, RootFetchAction::WaitUntil(_)),
+            "expected WaitUntil while in-flight, got {second:?}"
+        );
+    }
+
+    #[test]
+    fn root_latch_reset_unsatisfies() {
+        let mut latch = RootFetchLatch::new();
+        assert_eq!(latch.next_action(0), RootFetchAction::Request);
+        latch.on_reply(0);
+        assert!(latch.is_satisfied());
+        latch.reset();
+        assert!(!latch.is_satisfied());
+        assert_eq!(latch.next_action(0), RootFetchAction::Request);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn root_driver_retries_until_answered_then_parks_when_epoch_some() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_root = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 2 {
+                    RootFetch::NoReply
+                } else {
+                    RootFetch::Answered
+                }
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_root_fetch_driver(
+            RootFetchLatch::new(),
+            request_root,
+            shutdown_rx,
+            Some(epoch_rx),
+            move || start.elapsed().as_millis() as u64,
+        ));
+        // Request #1 fires at spawn (no sleep involved) — yield until
+        // it lands. NOTE: a bare `while < 2 { yield_now }` would
+        // deadlock under start_paused: the busy test task keeps the
+        // runtime non-idle so paused time never auto-advances across
+        // the driver's 30s backoff sleep. Advance the clock EXPLICITLY.
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(30_001)).await;
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Satisfied + epoch_rx Some → the driver must PARK, not return.
+        assert!(
+            !driver.is_finished(),
+            "driver must park on Idle when epoch watch present"
+        );
+        // Epoch bump → re-arm. Cooldown (60s since last request) defers
+        // the re-query; advancing past it lets request #3 fire.
+        epoch_tx.send(1).expect("epoch bump");
+        tokio::time::advance(Duration::from_millis(ROOT_REARM_COOLDOWN_MS + 1)).await;
+        while requests.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        driver.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn root_driver_returns_on_idle_when_epoch_none() {
+        let request_root = move || async move { RootFetch::Answered };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        run_root_fetch_driver(
+            RootFetchLatch::new(),
+            request_root,
+            shutdown_rx,
+            None,
+            move || start.elapsed().as_millis() as u64,
+        )
+        .await;
+        // If we get here without hanging, the driver returned on Idle.
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn root_driver_stops_on_shutdown_while_parked() {
+        let request_root = move || async move { RootFetch::Answered };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_root_fetch_driver(
+            RootFetchLatch::new(),
+            request_root,
+            shutdown_rx,
+            Some(epoch_rx),
+            move || start.elapsed().as_millis() as u64,
+        ));
+        // Let the driver answer and park.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        shutdown_tx.send(true).expect("send shutdown");
+        driver.await.expect("driver task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn root_driver_exits_on_engine_gone() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_root = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                RootFetch::EngineGone
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let start = tokio::time::Instant::now();
+        run_root_fetch_driver(
+            RootFetchLatch::new(),
+            request_root,
+            shutdown_rx,
+            Some(epoch_rx),
+            move || start.elapsed().as_millis() as u64,
+        )
+        .await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "EngineGone must end the driver after exactly one request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn root_driver_epoch_bump_mid_backoff_requeries_after_cooldown() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_root = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                RootFetch::NoReply
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_root_fetch_driver(
+            RootFetchLatch::new(),
+            request_root,
+            shutdown_rx,
+            Some(epoch_rx),
+            move || start.elapsed().as_millis() as u64,
+        ));
+        // Wait for request #1 to fire.
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Bump epoch mid-backoff (driver is sleeping through 30s backoff).
+        epoch_tx.send(1).expect("epoch bump");
+        // Advance past the cooldown (60s since request #1 at t=0).
+        tokio::time::advance(Duration::from_millis(ROOT_REARM_COOLDOWN_MS + 1)).await;
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        driver.abort();
     }
 }
