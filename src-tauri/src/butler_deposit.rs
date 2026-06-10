@@ -309,7 +309,11 @@ pub trait ButlerDepositClient: Send + Sync {
 /// * `sender_enrollment_cert` = the canonical CBOR the acceptor
 ///   strict-decodes (`harmony_owner::cbor::to_canonical` of the
 ///   `state.enrollments` cert).
-pub(crate) fn build_deposit_frame(
+///
+/// `pub` (not `pub(crate)`) so `tests/butler_deposit_integration.rs` — which
+/// compiles against the public API — exercises the EXACT sender construction
+/// rather than a hand-rolled twin (ZEB-418 P1 Task 9).
+pub fn build_deposit_frame(
     recipient_owner: &[u8; 16],
     sender_owner: &[u8; 16],
     sender_enrollment_cert: &[u8],
