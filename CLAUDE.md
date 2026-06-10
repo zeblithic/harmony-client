@@ -78,6 +78,21 @@ Some integration tests (notably `tests/wire_format_channel_log_fixtures.rs`) nee
 
 **Always include `--features test-fixtures` when running tests with `--all-targets` or running integration tests.** Without it, those test files won't compile.
 
+### OS keychain isolation in tests (ZEB-428)
+
+The OS keychain is a **process-global resource** — a test that redirects `HOME`/`USERPROFILE` to a tempdir still reaches the developer's *real* credential store through `KeychainStore::new()`'s fixed service/account names. A full-suite run once silently overwrote a developer's real owner identity this way (unrecoverable; see ZEB-428).
+
+Guard rails now in place:
+
+1. **`KeychainStore::new()` refuses in test builds** (`cfg(test)` or the `test-fixtures` feature — and every integration-test compilation requires the latter). Gated runs behave exactly like Linux CI, where no keychain backend exists: callers fall back to the `HARMONY_PASSPHRASE` encrypted-file store.
+2. **`HARMONY_DISABLE_KEYCHAIN=1`** disables the keychain in *any* build (operator kill-switch; beats all overrides).
+3. **`HARMONY_ALLOW_REAL_KEYCHAIN=1`** re-enables the real keychain in a test build — set it only for a test that deliberately exercises the real credential store, and never in a suite that runs `mint`/`save_owner_state_atomic` paths.
+
+Rules when writing tests that touch identity persistence:
+- Inject `keychain: None` (or a `#[cfg(test)]` mock) through the `*_inner`/`*_with_keychain` seams — never construct `KeychainStore::new()` inside code reachable from tests.
+- Set `HARMONY_PASSPHRASE` in the test so the encrypted-file fallback has a passphrase (see `tests/mint_owner_lifecycle.rs::home_override`).
+- `tests/keychain_isolation.rs` pins the constructor gate; don't weaken it.
+
 ## CI architecture
 
 The `.github/workflows/ci.yml` workflow runs four parallel jobs:

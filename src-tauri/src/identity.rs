@@ -1535,9 +1535,7 @@ impl KeychainStore {
     /// Linux CI, where no keychain backend exists and the suite is green.
     pub fn new() -> Result<Self, String> {
         if std::env::var("HARMONY_DISABLE_KEYCHAIN").is_ok_and(|v| !v.is_empty() && v != "0") {
-            return Err(
-                "OS keychain disabled via HARMONY_DISABLE_KEYCHAIN (ZEB-428)".to_string(),
-            );
+            return Err("OS keychain disabled via HARMONY_DISABLE_KEYCHAIN (ZEB-428)".to_string());
         }
         #[cfg(any(test, feature = "test-fixtures"))]
         {

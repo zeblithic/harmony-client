@@ -1,10 +1,16 @@
 //! Integration test for the rotate-passphrase CLI handler. Tests run against
 //! the public `harmony_app::rotate_passphrase_cli` entry point.
 //!
-//! These tests are `#[ignore]`d by default because they probe the real OS
-//! keychain via `KeychainStore::new()`, and on macOS that may trigger an
-//! interactive Keychain Access prompt that hangs `cargo test` indefinitely
-//! when the keychain holds a `harmony` entry created by a prior GUI run.
+//! These tests are `#[ignore]`d by default because they were written to
+//! probe the real OS keychain via `KeychainStore::new()`, and on macOS that
+//! could trigger an interactive Keychain Access prompt that hangs
+//! `cargo test` indefinitely when the keychain holds a `harmony` entry
+//! created by a prior GUI run.
+//!
+//! ZEB-428 note: `KeychainStore::new()` now refuses in test-fixtures builds
+//! (unless `HARMONY_ALLOW_REAL_KEYCHAIN=1`), so a default `--ignored` run
+//! exercises the no-keychain refusal branches deterministically and can no
+//! longer hang; set the allow env deliberately to probe the real keychain.
 //!
 //! To run them, opt in explicitly:
 //!
