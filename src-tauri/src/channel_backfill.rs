@@ -93,17 +93,34 @@ pub struct BackfillLatch {
     next_retry_at: u64,
     /// Current backoff delay (ms); 0 = no consecutive no-reply yet.
     retry_delay_ms: u64,
+    /// First-retry delay after an unanswered request (ms). Production
+    /// = [`BACKFILL_RETRY_BASE_MS`]; tests inject smaller values via
+    /// [`Self::new_with_backoff`] (threaded from
+    /// `ChannelLogEngineConfig.backfill_retry_base_ms`).
+    retry_base_ms: u64,
+    /// Backoff ceiling (ms). Production = [`BACKFILL_RETRY_CAP_MS`].
+    retry_cap_ms: u64,
 }
 
 impl BackfillLatch {
-    /// New, unsatisfied latch requesting history after `watermark`.
+    /// New, unsatisfied latch requesting history after `watermark`,
+    /// with the production (spec D24) backoff schedule.
     pub fn new(watermark: Option<Hlc>) -> Self {
+        Self::new_with_backoff(watermark, BACKFILL_RETRY_BASE_MS, BACKFILL_RETRY_CAP_MS)
+    }
+
+    /// New latch with an explicit backoff schedule (ZEB-418 P3a Task 6:
+    /// test-injectable; spec D24 base/cap are the production values —
+    /// see [`Self::new`]).
+    pub fn new_with_backoff(watermark: Option<Hlc>, base_ms: u64, cap_ms: u64) -> Self {
         Self {
             since: watermark,
             satisfied: false,
             in_flight: false,
             next_retry_at: 0,
             retry_delay_ms: 0,
+            retry_base_ms: base_ms,
+            retry_cap_ms: cap_ms,
         }
     }
 
@@ -158,22 +175,24 @@ impl BackfillLatch {
 
     /// Record an unanswered request (clears in-flight, arms backoff).
     ///
-    /// Delay schedule: 30 s, doubling per consecutive no-reply, capped
-    /// at 600 s; retries forever (driver enforces shutdown).
+    /// Delay schedule: `retry_base_ms` (production 30 s), doubling per
+    /// consecutive no-reply, capped at `retry_cap_ms` (production
+    /// 600 s); retries forever (driver enforces shutdown).
     pub fn on_no_reply(&mut self, now_ms: u64) {
         self.in_flight = false;
         self.retry_delay_ms = if self.retry_delay_ms == 0 {
-            BACKFILL_RETRY_BASE_MS
+            self.retry_base_ms
         } else {
-            (self.retry_delay_ms * 2).min(BACKFILL_RETRY_CAP_MS)
+            (self.retry_delay_ms * 2).min(self.retry_cap_ms)
         };
         self.next_retry_at = now_ms + self.retry_delay_ms;
     }
 
     /// Re-arm a satisfied latch with a new watermark (transport-recovery
-    /// hook); clears in-flight and backoff state.
+    /// hook); clears in-flight and backoff state. Preserves the
+    /// configured backoff schedule.
     pub fn reset(&mut self, watermark: Option<Hlc>) {
-        *self = Self::new(watermark);
+        *self = Self::new_with_backoff(watermark, self.retry_base_ms, self.retry_cap_ms);
     }
 }
 

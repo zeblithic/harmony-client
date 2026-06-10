@@ -223,6 +223,13 @@ pub struct ChannelLogEngineConfig {
     /// Emit a `channel-backfill-progress` Tauri event every N events
     /// received during a backfill. Default 16.
     pub backfill_progress_event_interval: usize,
+
+    /// ZEB-418 P3a: first-retry delay (ms) after an unanswered
+    /// backfill request. Default 30_000 — test-injectable; spec D24
+    /// base. Threaded from `spawn_inner_now` into each engine's
+    /// `BackfillLatch` (the cap stays the
+    /// `channel_backfill::BACKFILL_RETRY_CAP_MS` constant).
+    pub backfill_retry_base_ms: u64,
 }
 
 impl Default for ChannelLogEngineConfig {
@@ -233,6 +240,7 @@ impl Default for ChannelLogEngineConfig {
             max_dirty_ms: 1000,
             backfill_default_limit: 256,
             backfill_progress_event_interval: 16,
+            backfill_retry_base_ms: crate::channel_backfill::BACKFILL_RETRY_BASE_MS,
         }
     }
 }
@@ -1724,7 +1732,11 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         // Some(watermark) (catch-up). The idempotent already-exists
         // paths above return earlier, so exactly one driver runs per
         // live entry.
-        let latch = crate::channel_backfill::BackfillLatch::new(engine.log_max_hlc().await);
+        let latch = crate::channel_backfill::BackfillLatch::new_with_backoff(
+            engine.log_max_hlc().await,
+            self.config.engine_config.backfill_retry_base_ms,
+            crate::channel_backfill::BACKFILL_RETRY_CAP_MS,
+        );
         let request_engine = Arc::clone(&engine);
         let watermark_engine = Arc::clone(&engine);
         tokio::spawn(crate::channel_backfill::run_backfill_driver(
