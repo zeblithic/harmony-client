@@ -29,6 +29,18 @@ pub struct DeviceView {
     pub trust_decision: TrustDecisionView,
     pub enrolled_at: u64,
     pub fingerprint: String,
+    /// ZEB-418 P2 D17: true iff this device is the owner's pinned butler
+    /// (fleet-net-v1 `pinned` LWW field). False when fleet-net is cold or
+    /// the node is not running. Additive field — older consumers that don't
+    /// read this field are unaffected.
+    #[serde(default)]
+    pub butler_pinned: bool,
+    /// 64-char lowercase hex of the device's 32-byte ed25519 verify key —
+    /// the SP1 device-id form that `set_butler_pin` validates against and
+    /// the fleet-net doc keys on. `device_id` (the 16-byte identity hash)
+    /// cannot be inverted to this form, so it is carried explicitly.
+    #[serde(default)]
+    pub device_vk_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1185,6 +1197,8 @@ mod tests {
                 },
                 enrolled_at: 1_700_000_000,
                 fingerprint: "3e2f·7a91".into(),
+                butler_pinned: false,
+                device_vk_hex: "cc".repeat(32),
             }],
             can_back_up: true,
         };
@@ -1202,6 +1216,10 @@ mod tests {
         assert!(
             json.contains("\"trustDecision\""),
             "expected trustDecision, got {json}"
+        );
+        assert!(
+            json.contains("\"deviceVkHex\""),
+            "expected deviceVkHex, got {json}"
         );
         assert!(
             !json.contains("owner_id"),

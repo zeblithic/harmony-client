@@ -991,3 +991,42 @@ describe('DevicesPanel — backup modal a11y (ZEB-195)', () => {
     resolvePath(null);
   });
 });
+
+describe('DevicesPanel — butler pin toggle ID form (ZEB-418 P2 round-2)', () => {
+  it('passes deviceVkHex (the SP1 verify-key form), never deviceId, to set_butler_pin', async () => {
+    // Round-2 Greptile P1: the backend's enrolled-set check only accepts the
+    // 64-hex VERIFY-KEY id (deviceVkHex). The pre-fix handler sent deviceId
+    // (the 32-hex identity hash) and was rejected for every device.
+    const identityHashHex = 'aa11bb22cc33dd44ee55ff6677889900'; // 32-hex
+    const vkHex = 'cc'.repeat(32); // 64-hex SP1 form
+    const view = {
+      ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+      ownerDisplayName: 'zeblith',
+      devices: [{
+        deviceId: identityHashHex,
+        deviceVkHex: vkHex,
+        displayName: 'KRILE',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+        butlerPinned: false,
+      }],
+      canBackUp: true,
+    };
+    mockedInvoke
+      .mockResolvedValueOnce(view)       // get_owner_state on mount
+      .mockResolvedValueOnce(undefined)  // set_butler_pin
+      .mockResolvedValueOnce(view);      // get_owner_state refresh after toggle
+
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    const toggle = screen.getByRole('checkbox', { name: /set KRILE as always-on butler/i });
+    await fireEvent.click(toggle);
+
+    expect(mockedInvoke).toHaveBeenCalledWith('set_butler_pin', { deviceId: vkHex });
+    expect(mockedInvoke).not.toHaveBeenCalledWith('set_butler_pin', {
+      deviceId: identityHashHex,
+    });
+  });
+});

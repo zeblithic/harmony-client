@@ -440,6 +440,14 @@ pub struct DmOutbox {
     /// `set_butler_deposit_client` at start_node (only when the iroh
     /// endpoint bound); outbox tests inject a mock.
     butler_deposit_client: Option<Arc<dyn crate::butler_deposit::ButlerDepositClient>>,
+    /// ZEB-418 SP2 P2 Task 3: outbound-hold side-table. `None` (default)
+    /// disables the hold write entirely — send_dm behaves exactly as before.
+    /// Production installs both via `set_outhold` at start_node alongside the
+    /// dm-outhold FleetSyncEngine; tests inject a bare doc + flag closure.
+    outhold_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outhold::DmOutholdDoc>>>,
+    /// The engine's `notify_dirty` — called after a successful hold write so
+    /// the debounced publisher picks it up.
+    outhold_notify: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl DmOutbox {
@@ -487,6 +495,8 @@ impl DmOutbox {
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
             butler_deposit_client: None,
+            outhold_doc: None,
+            outhold_notify: None,
         }
     }
 
@@ -519,6 +529,8 @@ impl DmOutbox {
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
             butler_deposit_client: None,
+            outhold_doc: None,
+            outhold_notify: None,
         }
     }
 
@@ -531,6 +543,19 @@ impl DmOutbox {
         client: Arc<dyn crate::butler_deposit::ButlerDepositClient>,
     ) {
         self.butler_deposit_client = Some(client);
+    }
+
+    /// ZEB-418 SP2 P2 Task 3: install the outbound-hold doc + dirty-notify.
+    /// Until this is called the hold write is disabled and send_dm behaves
+    /// exactly as before (spec D12: the hold is additive, never load-bearing
+    /// for the legacy path).
+    pub fn set_outhold(
+        &mut self,
+        doc: std::sync::Arc<tokio::sync::Mutex<crate::dm_outhold::DmOutholdDoc>>,
+        notify: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.outhold_doc = Some(doc);
+        self.outhold_notify = Some(notify);
     }
 
     /// Encrypt `content` under `Space.content_key`, write the storage blob to
@@ -616,6 +641,14 @@ impl DmOutbox {
             },
         )
         .map_err(|e| SendDmError::Encode(format!("ContentId::for_book: {e}")))?;
+        // ZEB-418 P2: clone the blob once before the CAS put so sibling
+        // devices can complete delivery via the outbound hold. Cloned only
+        // when outhold_doc is installed; the CAS put consumes the original.
+        let held_blob = if self.outhold_doc.is_some() {
+            Some(storage_blob.clone())
+        } else {
+            None
+        };
         cas.put(message_cid, storage_blob).await?;
 
         // 6. Mint OutboxEntry, install via apply_outbox.
@@ -651,6 +684,27 @@ impl DmOutbox {
                 // None} fires if a paired device's CidNotify already wrote
                 // this CID first (cross-device race), which is fine — same
                 // payload, idempotent.
+
+                // ZEB-418 P2: record the blob in the outbound hold so siblings
+                // can complete delivery (spec D12). After state mutations, never
+                // held across the CAS await; lock scope is the insert only.
+                if let Some(outhold) = self.outhold_doc.clone() {
+                    let key =
+                        crate::dm_outhold::DmOutholdDoc::key(&space_id.0, &message_cid.to_bytes());
+                    let mut doc = outhold.lock().await;
+                    doc.entries
+                        .entry(key)
+                        .or_insert(crate::dm_outhold::DmOutholdEntry {
+                            storage_blob: held_blob.expect("cloned when outhold_doc is Some"),
+                            space_id: space_id.0,
+                            created_at: sent_at.clone(),
+                        });
+                    drop(doc);
+                    if let Some(notify) = self.outhold_notify.as_ref() {
+                        notify();
+                    }
+                }
+
                 Ok((entry_id, message_cid))
                 // Note: ApplyOutcome::Merged would also reach here. It "should
                 // not happen" because a fresh ULID can't collide with any
@@ -795,10 +849,13 @@ impl DmOutbox {
     ///   - skip if in `in_flight` set already
     ///   - skip if backoff says next attempt is in the future
     ///   - else mark in-flight, call transport.send().
-    ///     - Ok(()): clear in-flight, install AttemptState{failure_count: 1}
-    ///       so the next attempt waits the base backoff (5s) for an ack
-    ///       before re-sending. handle_ack clears the entry on real ack;
-    ///       drain's epilogue clears it on Complete-via-CRDT-merge.
+    ///     - Ok(()): clear in-flight, bump the pair's AttemptState
+    ///       (failure_count ACCUMULATES per unacked window — ZEB-422) so
+    ///       the next attempt waits the exponential backoff (5s base) for
+    ///       an ack before re-sending; from `DEPOSIT_NOACK_WINDOWS` unacked
+    ///       windows onward the butler-deposit rung is also attempted.
+    ///       handle_ack clears the entry on real ack; drain's epilogue
+    ///       clears it on Complete-via-CRDT-merge.
     ///     - Err(_): clear in-flight, bump backoff failure_count + record
     ///       last_attempt_wall_ms (exponential escalation up to 5min cap).
     ///
@@ -969,14 +1026,17 @@ impl DmOutbox {
     ///   that takes the wall-clock past `EXPIRATION_MS` must NOT mark
     ///   the just-sent entry Expired before its ack arrives.
     ///
-    /// ZEB-418 P1 Task 8: additionally returns the butler-deposit
-    /// candidates this tick produced — one per TRANSIENT direct-send
-    /// failure whose `(entry, recipient)` pair already carried an
-    /// `AttemptState` (i.e. the entry has been pending ≥ one backoff
-    /// cycle). Candidates only arise from failure events, and each backoff
-    /// window contains exactly one direct attempt, so the rung fires at
-    /// most once per backoff window by construction (no hot loop). The
-    /// caller runs the deposits AFTER this synchronous phase (unlocked in
+    /// ZEB-418 P1 Task 8 + P2 ZEB-422: additionally returns the
+    /// butler-deposit candidates this tick produced — one per TRANSIENT
+    /// direct-send failure whose `(entry, recipient)` pair already carried
+    /// an `AttemptState` (i.e. the entry has been pending ≥ one backoff
+    /// cycle), and one per Ok-send whose pair has sat sent-but-never-acked
+    /// for ≥ `DEPOSIT_NOACK_WINDOWS` full backoff windows (ZEB-422: the
+    /// cached-but-offline recipient — the butler's PRIMARY scenario).
+    /// Candidates only arise from send events, and each backoff window
+    /// contains exactly one direct attempt, so the rung fires at most once
+    /// per backoff window by construction (no hot loop). The caller runs
+    /// the deposits AFTER this synchronous phase (unlocked in
     /// `drain_lifted`) and routes acks through `mark_ack_delivered`.
     fn drain_phase_c(
         &mut self,
@@ -1022,18 +1082,43 @@ impl DmOutbox {
                     // ~4 sends/sec/recipient against the production
                     // StubTransport (which always returns Ok and has an
                     // unbounded sends Vec). Treat "sent but ack pending"
-                    // as failure_count=1 so the existing exponential
-                    // backoff applies (5s base × 2^(n-1), 5min cap).
-                    // First post-Ok retry waits 5s; if still no ack the
-                    // next waits 10s, etc. The 30-day expiration sweep
-                    // is the eventual terminator.
-                    self.backoff.insert(
-                        (r.entry_id, r.recipient),
-                        AttemptState {
-                            last_attempt_wall_ms: backoff_now_ms,
-                            failure_count: 1,
-                        },
-                    );
+                    // as an accumulating failure_count (ZEB-422 — was
+                    // pinned to 1 every window) so the existing
+                    // exponential backoff applies (5s base × 2^(n-1),
+                    // 5min cap). First post-Ok retry still waits 5s; if
+                    // still no ack the next waits 10s, then 20s, etc.
+                    // The 30-day expiration sweep is the eventual
+                    // terminator.
+                    let st =
+                        self.backoff
+                            .entry((r.entry_id, r.recipient))
+                            .or_insert(AttemptState {
+                                last_attempt_wall_ms: 0,
+                                failure_count: 0,
+                            });
+                    let pre_failure_count = st.failure_count;
+                    st.last_attempt_wall_ms = backoff_now_ms;
+                    st.failure_count = st.failure_count.saturating_add(1);
+                    // ZEB-422: sent-but-never-acked candidacy. The pair has
+                    // completed pre_failure_count full backoff windows
+                    // without an ack; from DEPOSIT_NOACK_WINDOWS onward each
+                    // further window also tries the butler rung. Side
+                    // effect, intentional: direct-send backoff now grows
+                    // toward the 5-min cap for unresponsive recipients (was
+                    // pinned at window 1), matching the Err-path behavior.
+                    // Rung outcomes never touch the AttemptState written
+                    // above (spec §6 / P2 §4 never-worse).
+                    if pre_failure_count >= crate::butler_deposit::DEPOSIT_NOACK_WINDOWS
+                        && self.butler_deposit_client.is_some()
+                    {
+                        self.push_deposit_candidate(
+                            state,
+                            r.entry_id,
+                            r.recipient,
+                            backoff_now_ms,
+                            &mut deposit_candidates,
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1067,26 +1152,13 @@ impl DmOutbox {
                         && pre_failure_count >= 1
                         && self.butler_deposit_client.is_some()
                     {
-                        if let Some(entry) = state.outbox.get(&r.entry_id) {
-                            match self.build_cidnotify_packet_bytes(entry) {
-                                Ok(cidnotify_packet) => deposit_candidates.push(
-                                    crate::butler_deposit::ButlerDepositRequest {
-                                        entry_id: r.entry_id,
-                                        recipient_owner: r.recipient,
-                                        space_id: entry.space_id,
-                                        message_cid: entry.message_cid,
-                                        cidnotify_packet,
-                                        now_ms: backoff_now_ms,
-                                    },
-                                ),
-                                Err(err) => tracing::warn!(
-                                    entry_id = ?r.entry_id,
-                                    recipient = ?r.recipient,
-                                    error = %err,
-                                    "ZEB-418: CidNotify build failed; skipping deposit candidate"
-                                ),
-                            }
-                        }
+                        self.push_deposit_candidate(
+                            state,
+                            r.entry_id,
+                            r.recipient,
+                            backoff_now_ms,
+                            &mut deposit_candidates,
+                        );
                     }
                 }
             }
@@ -1179,6 +1251,42 @@ impl DmOutbox {
         let packet = crate::dm_envelope::build_signed_cidnotify(signed, &self.signing_key)
             .map_err(|e| format!("build_signed_cidnotify: {e}"))?;
         crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
+    }
+
+    /// Build + push one butler-deposit candidate for `(entry_id,
+    /// recipient)` — shared by `drain_phase_c`'s Err-arm transient-failure
+    /// rung (P1 Task 8) and its Ok-arm sent-but-never-acked rung (P2
+    /// ZEB-422). `now_ms` feeds the request's freshness clock; both call
+    /// sites pass Phase C's `backoff_now_ms` (the clock the surrounding
+    /// AttemptState bump anchors to). A CidNotify build failure skips the
+    /// candidate with a warn — it never fails the drain.
+    fn push_deposit_candidate(
+        &self,
+        state: &OwnerState,
+        entry_id: OutboxEntryId,
+        recipient: OwnerAddr,
+        now_ms: u64,
+        out: &mut Vec<crate::butler_deposit::ButlerDepositRequest>,
+    ) {
+        let Some(entry) = state.outbox.get(&entry_id) else {
+            return;
+        };
+        match self.build_cidnotify_packet_bytes(entry) {
+            Ok(cidnotify_packet) => out.push(crate::butler_deposit::ButlerDepositRequest {
+                entry_id,
+                recipient_owner: recipient,
+                space_id: entry.space_id,
+                message_cid: entry.message_cid,
+                cidnotify_packet,
+                now_ms,
+            }),
+            Err(err) => tracing::warn!(
+                entry_id = ?entry_id,
+                recipient = ?recipient,
+                error = %err,
+                "ZEB-418: CidNotify build failed; skipping deposit candidate"
+            ),
+        }
     }
 
     fn is_due(&self, entry_id: OutboxEntryId, recipient: OwnerAddr, wall_now_ms: u64) -> bool {
@@ -3586,6 +3694,182 @@ mod tests {
         let stored = state.outbox.get(&entry_id).expect("entry present");
         assert_eq!(stored.delivered_to.len(), 1, "no duplicate delivered_to");
         assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
+    }
+
+    // =================================================================
+    // ZEB-418 SP2 P2 (ZEB-422): sent-but-never-acked deposit candidacy
+    // =================================================================
+
+    /// ZEB-422: an Ok send that never acks ACCUMULATES `failure_count`
+    /// across backoff windows instead of being overwritten to 1 each
+    /// window — the substrate the sent-but-never-acked candidacy counts
+    /// on. Intentional side effect: direct-send backoff grows toward the
+    /// 5-min cap for unresponsive recipients, matching the Err path.
+    #[tokio::test]
+    async fn ok_send_without_ack_accumulates_failure_count() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let transport = StubTransport::new();
+        let mut o = make_outbox_synthetic("dev", alice);
+
+        // Window 1: Ok send at t=10s -> failure_count 0 -> 1.
+        let _ = o.drain(&mut state, &transport, 10_000).await;
+        // Window 2 (+6s, past the 5s base window): Ok send -> 1 -> 2.
+        // The pre-ZEB-422 Ok-arm overwrote the count back to 1 here.
+        let _ = o.drain(&mut state, &transport, 16_000).await;
+        assert_eq!(transport.sends().len(), 2, "both windows sent");
+
+        let st = o
+            .backoff
+            .get(&(entry_id, bob))
+            .copied()
+            .expect("AttemptState retained while unacked");
+        assert_eq!(
+            st.failure_count, 2,
+            "ZEB-422: sent-but-never-acked windows must ACCUMULATE \
+             failure_count (old Ok-arm overwrote it to 1 every window)"
+        );
+        assert_eq!(st.last_attempt_wall_ms, 16_000);
+    }
+
+    /// ZEB-422: the very first Ok send must NOT consult the deposit rung —
+    /// candidacy starts only once the pair has sat unacked for
+    /// `DEPOSIT_NOACK_WINDOWS` full backoff windows.
+    #[tokio::test]
+    async fn first_ok_send_does_not_trigger_rung() {
+        let (mut state, transport, mut o, mock, _entry_id, _bob) =
+            deposit_rung_fixture(DepositRungOutcome::Acked);
+
+        // StubTransport's default (un-seeded) outcome is Ok(()).
+        let _ = o.drain(&mut state, &transport, 10_000).await;
+        assert_eq!(transport.sends().len(), 1, "direct send fired");
+        assert!(
+            mock.calls().is_empty(),
+            "first Ok send must NOT attempt a deposit (pair has completed \
+             zero unacked backoff windows)"
+        );
+    }
+
+    /// ZEB-422 PRIMARY scenario: a cached-but-offline recipient — every
+    /// direct send returns Ok (enqueued) but never acks. Once the pair has
+    /// sat sent-but-never-acked for `DEPOSIT_NOACK_WINDOWS` full backoff
+    /// windows, the next Ok-send window also tries the butler rung; a
+    /// butler ack then marks the recipient delivered through the same
+    /// idempotent `mark_ack_delivered` path the transient-failure rung
+    /// uses (cf. `deposit_ack_marks_owner_delivered_and_emits_dm_delivered`,
+    /// which drives the Err path).
+    #[tokio::test]
+    async fn noack_after_n_windows_triggers_deposit_rung() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Acked);
+        let space_id = SpaceId([1u8; 16]);
+        let message_cid = ContentId::from_bytes([3u8; 32]);
+        assert_eq!(
+            crate::butler_deposit::DEPOSIT_NOACK_WINDOWS,
+            2,
+            "tick cadence below assumes N=2; update the windows driven \
+             here if the constant changes"
+        );
+
+        // Window 1 (t=10s): Ok send, pre_count=0 -> no rung.
+        let outcome1 = o.drain(&mut state, &transport, 10_000).await;
+        assert!(outcome1.newly_delivered.is_empty());
+        // Window 2 (t=16s, +6s past the 5s window): Ok send, pre_count=1
+        // -> still below DEPOSIT_NOACK_WINDOWS -> no rung.
+        let outcome2 = o.drain(&mut state, &transport, 16_000).await;
+        assert!(outcome2.newly_delivered.is_empty());
+        assert!(
+            mock.calls().is_empty(),
+            "no deposit before DEPOSIT_NOACK_WINDOWS unacked windows"
+        );
+
+        // Window 3 (t=27s, +11s past the 10s window): Ok send,
+        // pre_count=2 == DEPOSIT_NOACK_WINDOWS -> rung fires; mock acks.
+        let outcome3 = o.drain(&mut state, &transport, 27_000).await;
+        let calls = mock.calls();
+        assert!(
+            !calls.is_empty(),
+            "deposit rung must fire once the pair sat unacked for \
+             DEPOSIT_NOACK_WINDOWS full backoff windows"
+        );
+        assert_eq!(calls.len(), 1, "exactly one deposit this window");
+        let req = &calls[0];
+        assert_eq!(req.entry_id, entry_id);
+        assert_eq!(req.recipient_owner, bob);
+        assert_eq!(req.space_id, space_id);
+        assert_eq!(req.message_cid, message_cid);
+        assert_eq!(
+            req.now_ms, 27_000,
+            "freshness clock = this tick's backoff clock (same as Err arm)"
+        );
+
+        // Butler ack -> delivered via mark_ack_delivered (dm-delivered emit).
+        assert_eq!(
+            outcome3.newly_delivered,
+            vec![(space_id, message_cid, bob)],
+            "deposit ack must surface in newly_delivered (dm-delivered emit)"
+        );
+        let stored = state.outbox.get(&entry_id).expect("entry still present");
+        assert!(stored.delivered_to.contains(&bob), "bob marked delivered");
+        assert!(
+            matches!(stored.delivery_status, DeliveryStatus::Complete),
+            "sole recipient acked via butler -> Complete"
+        );
+        // mark_ack_delivered cleared the pair's retry state.
+        assert_eq!(o.backoff_len(), 0);
+        assert_eq!(o.in_flight_len(), 0);
+    }
+
+    /// ZEB-422 never-worse invariant on the Ok path: a Failed rung outcome
+    /// leaves the pair's `AttemptState` EXACTLY as the Ok-arm's own bump
+    /// wrote it — no extra failure_count bump, no clock rewrite, no clear.
+    #[tokio::test]
+    async fn rung_outcome_never_touches_attempt_state_on_ok_path() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Failed("butlers unreachable".into()));
+
+        // Two Ok windows to reach candidacy (failure_count 0 -> 1 -> 2).
+        let _ = o.drain(&mut state, &transport, 10_000).await;
+        let _ = o.drain(&mut state, &transport, 16_000).await;
+        let before = o
+            .backoff
+            .get(&(entry_id, bob))
+            .copied()
+            .expect("AttemptState present after two unacked windows");
+        assert_eq!(before.failure_count, 2);
+        assert_eq!(before.last_attempt_wall_ms, 16_000);
+
+        // Rung-bearing window (t=27s): the Ok-arm bumps 2 -> 3 and anchors
+        // the clock; the rung fires and FAILS — adding nothing on top.
+        let outcome = o.drain(&mut state, &transport, 27_000).await;
+        assert_eq!(mock.calls().len(), 1, "rung consulted exactly once");
+        assert!(
+            outcome.newly_delivered.is_empty(),
+            "failed rung marks nothing"
+        );
+
+        let after = o
+            .backoff
+            .get(&(entry_id, bob))
+            .copied()
+            .expect("AttemptState retained");
+        assert_eq!(
+            after.failure_count,
+            before.failure_count + 1,
+            "exactly the Ok-arm's own bump — the failed rung adds NOTHING"
+        );
+        assert_eq!(
+            after.last_attempt_wall_ms, 27_000,
+            "clock anchored by the Ok-arm only"
+        );
+        let stored = state.outbox.get(&entry_id).expect("entry still present");
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Pending));
+        assert!(stored.delivered_to.is_empty());
     }
 
     #[tokio::test]
@@ -6990,5 +7274,236 @@ mod tests {
             .cloned()
             .expect("tracker has entry");
         assert_eq!(stored, reserved);
+    }
+}
+
+#[cfg(test)]
+mod outhold_write_tests {
+    use super::*;
+    use crate::content_store::InMemoryStub;
+    use crate::owner_state_types::{DmContentKey, Space, TransportBinding};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    fn make_outbox_synthetic_local(device_id: &str, self_owner: OwnerAddr) -> DmOutbox {
+        let private_identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let priv_bytes = private_identity.to_private_bytes();
+        let mut ed_seed = [0u8; 32];
+        ed_seed.copy_from_slice(&priv_bytes[32..64]);
+        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+        let device_hash = DeviceIdentityHash(private_identity.identity.address_hash);
+        let private_identity = std::sync::Arc::new(private_identity);
+        let test_owner = crate::community_membership::mint_test_owner(0xAB);
+        let community_signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &test_owner.device_key.to_bytes(),
+        ));
+        let enrollment_cert = test_owner.cert;
+        DmOutbox::new_synthetic(
+            device_id.into(),
+            self_owner,
+            device_hash,
+            signing_key,
+            private_identity,
+            community_signing_key,
+            enrollment_cert,
+        )
+    }
+
+    fn make_dm_space_local(id_byte: u8, members: Vec<OwnerAddr>) -> Space {
+        Space {
+            id: SpaceId([id_byte; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Bob".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members,
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            content_key: Some(DmContentKey::new([0x42u8; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    fn install_space_local(state: &mut OwnerState, sp: Space) {
+        let outcome = state.apply_space_with_canonicalization(sp);
+        assert!(
+            matches!(outcome, ApplyOutcome::Inserted),
+            "fixture install must succeed, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_dm_writes_outhold_row_alongside_outbox_entry() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let sp = make_dm_space_local(7, vec![alice, bob]);
+        let space_id = sp.id;
+        install_space_local(&mut state, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = make_outbox_synthetic_local("dev", alice);
+
+        // Install outhold doc + notify flag.
+        let outhold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outhold::DmOutholdDoc::default(),
+        ));
+        let notify_fired = Arc::new(AtomicBool::new(false));
+        let notify_fired_clone = Arc::clone(&notify_fired);
+        let notify: std::sync::Arc<dyn Fn() + Send + Sync> =
+            std::sync::Arc::new(move || notify_fired_clone.store(true, Ordering::SeqCst));
+        o.set_outhold(outhold_doc.clone(), notify);
+
+        let (_msg_id, msg_cid) = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"hello outhold".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .expect("send_dm ok");
+
+        // (a) The doc must contain the expected key.
+        let expected_key = crate::dm_outhold::DmOutholdDoc::key(&space_id.0, &msg_cid.to_bytes());
+        let doc_guard = outhold_doc.lock().await;
+        assert!(
+            doc_guard.entries.contains_key(&expected_key),
+            "outhold doc must contain key for the returned message_cid"
+        );
+
+        // (b) The blob in the outhold doc must equal the blob stored in CAS.
+        let outhold_blob = doc_guard.entries[&expected_key].storage_blob.clone();
+        drop(doc_guard);
+        let cas_blob = cas
+            .get(&msg_cid)
+            .await
+            .expect("CAS get ok")
+            .expect("CAS must hold the blob");
+        assert_eq!(
+            outhold_blob, cas_blob,
+            "outhold storage_blob must match what was written to CAS"
+        );
+
+        // (c) The notify closure must have fired.
+        assert!(
+            notify_fired.load(Ordering::SeqCst),
+            "notify closure must fire after a successful hold write"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_dm_without_outhold_installed_unchanged() {
+        // No set_outhold → send_dm must succeed without panicking.
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let sp = make_dm_space_local(7, vec![alice, bob]);
+        let space_id = sp.id;
+        install_space_local(&mut state, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = make_outbox_synthetic_local("dev", alice);
+        // outhold_doc is None by default — no set_outhold call.
+
+        let result = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"no outhold".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "send_dm without outhold must succeed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_dm_rejected_entry_writes_no_outhold_row() {
+        // Drive a rejection via self-only DM (space has only alice as member
+        // after the space is mutated post-construction to bypass the
+        // canonical invariant check, mirroring send_dm_self_only_dm_rejects).
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let mut sp = make_dm_space_local(7, vec![alice, OwnerAddr([0x02; 16])]);
+        // Mutate to single-member after construction; insert directly to skip
+        // apply_space_with_canonicalization's invariant check.
+        sp.members = vec![alice];
+        let space_id = sp.id;
+        state.spaces.insert(space_id, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = make_outbox_synthetic_local("dev", alice);
+
+        let outhold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outhold::DmOutholdDoc::default(),
+        ));
+        let notify_fired = Arc::new(AtomicBool::new(false));
+        let notify_fired_clone = Arc::clone(&notify_fired);
+        let notify: std::sync::Arc<dyn Fn() + Send + Sync> =
+            std::sync::Arc::new(move || notify_fired_clone.store(true, Ordering::SeqCst));
+        o.set_outhold(outhold_doc.clone(), notify);
+
+        let err = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"self-only".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SendDmError::NoRecipients(id) if id == space_id),
+            "expected NoRecipients, got {err:?}"
+        );
+
+        // The outhold doc must remain empty — no row written on rejection.
+        let doc_guard = outhold_doc.lock().await;
+        assert!(
+            doc_guard.entries.is_empty(),
+            "outhold doc must stay empty when send_dm is rejected"
+        );
+        drop(doc_guard);
+
+        // The notify closure must NOT have fired.
+        assert!(
+            !notify_fired.load(Ordering::SeqCst),
+            "notify must not fire when send_dm is rejected"
+        );
     }
 }
