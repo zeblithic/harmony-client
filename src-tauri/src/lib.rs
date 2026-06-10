@@ -5350,6 +5350,52 @@ pub(crate) async fn start_node_inner(
                                  the prior instance"
                             );
                         }
+
+                        // ZEB-418 SP2 P1 Task 8: build the production
+                        // sender-side butler deposit client and inject it
+                        // into the DmOutbox so the drain's deposit rung can
+                        // fire on transient direct-send failures. Same
+                        // identity material as the acceptor above: the
+                        // frame `sig` uses the cert-bound enrolled device
+                        // key (#2, `community_signing_key_arc`) and carries
+                        // this device's own EnrollmentCert as the canonical
+                        // CBOR `handle_deposit_core` strict-decodes. Only
+                        // wired when the iroh endpoint bound — without it
+                        // there is no deposit transport and the rung stays
+                        // disabled (drain behaves exactly as before).
+                        if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
+                            match harmony_owner::cbor::to_canonical(&own_enrollment_cert_for_friend)
+                            {
+                                Ok(cert_bytes) => {
+                                    let deposit_client: std::sync::Arc<
+                                        dyn crate::butler_deposit::ButlerDepositClient,
+                                    > = std::sync::Arc::new(
+                                        crate::butler_deposit::IrohButlerDepositClient {
+                                            endpoint: std::sync::Arc::clone(ep_arc),
+                                            resolver: reachability_resolver.clone(),
+                                            cas: std::sync::Arc::clone(&content_store),
+                                            sender_owner: self_owner.0,
+                                            enrollment_cert_bytes: cert_bytes,
+                                            device_signing_key: std::sync::Arc::clone(
+                                                &community_signing_key_arc,
+                                            ),
+                                            io_deadline: std::time::Duration::from_millis(
+                                                crate::iroh_butler_acceptor::DEFAULT_BUTLER_IO_DEADLINE_MS,
+                                            ),
+                                        },
+                                    );
+                                    outbox
+                                        .lock()
+                                        .await
+                                        .set_butler_deposit_client(deposit_client);
+                                }
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "ZEB-418: cannot canonicalize own enrollment \
+                                     cert; sender deposit rung disabled"
+                                ),
+                            }
+                        }
                     }
 
                     // Lift the per-identity handles out for NodeState

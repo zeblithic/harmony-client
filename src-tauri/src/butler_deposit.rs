@@ -19,12 +19,19 @@
 //!   [`BUTLER_DEPOSIT_SEAL_INFO`] via `seal_to_owner_with_info` /
 //!   `open_from_owner_with_info`.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::owner_state_crypto::{
     canonical_cbor_decode, canonical_cbor_encode, sealed::CanonicalPayloadSealed, CanonicalPayload,
 };
+use crate::owner_state_types::{ContentId, OutboxEntryId, OwnerAddr, SpaceId};
+use crate::reachability_record::{fresh_butler_set, ButlerSetEntry, ReachabilityAnnouncePayload};
 
 /// Domain-separation prefix for the deposit frame signature. The sender's
 /// cert-bound device ed25519 signs `domain ‖ recipient_owner ‖ sealed_blob`
@@ -233,6 +240,273 @@ pub async fn read_length_prefixed<R: AsyncRead + Unpin>(
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
     Ok(body)
+}
+
+// =====================================================================
+// Sender-side deposit rung (ZEB-418 P1 Task 8)
+// =====================================================================
+
+/// One deposit work unit handed from `DmOutbox`'s drain to the
+/// [`ButlerDepositClient`]: everything the rung needs that only the outbox
+/// knows. The CidNotify packet bytes are built by the outbox with the SAME
+/// construction the direct path uses (`dm_envelope::build_signed_cidnotify`
+/// signed by the Reticulum device key), so the butler's inner verification
+/// sees exactly what a direct arrival would carry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ButlerDepositRequest {
+    pub entry_id: OutboxEntryId,
+    pub recipient_owner: OwnerAddr,
+    pub space_id: SpaceId,
+    pub message_cid: ContentId,
+    /// Full signed CidNotify packet bytes (discriminant+body+sig).
+    pub cidnotify_packet: Vec<u8>,
+    /// Wall-clock now (ms) at candidacy time — drives the `bs_at` freshness
+    /// check against the resolved routing blob.
+    pub now_ms: u64,
+}
+
+/// Outcome of one deposit-rung attempt. Spec §6 is normative: NOTHING here
+/// may make delivery worse than today — every non-[`Self::Acked`] outcome
+/// leaves the outbox entry exactly as the transient direct failure that
+/// triggered the rung left it (same shared `AttemptState` backoff; no extra
+/// bump, no clear, no drop).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepositRungOutcome {
+    /// A butler accepted the deposit and acked; the ack's space/CID were
+    /// verified against the request. The caller marks the recipient
+    /// delivered via the existing idempotent `mark_ack_delivered`.
+    Acked,
+    /// The recipient advertises no fresh butler set (missing/stale `bs_at`,
+    /// or no routing record at all) — the rung is skipped silently and the
+    /// existing retry chain proceeds unchanged (spec §6 failure table).
+    SkippedNoFreshButlerSet,
+    /// Fresh butler entries existed but every one failed (dial/IO timeout,
+    /// bad ack, seal/build error, blob unavailable). Treated exactly like
+    /// the skip by the caller; the carried message is debug-telemetry only.
+    Failed(String),
+}
+
+/// Sender-side deposit seam injected into `DmOutbox` (mirrors how
+/// `DmTransport` keeps the wire out of the outbox tests): production is
+/// [`IrohButlerDepositClient`]; outbox unit tests install a mock.
+#[async_trait]
+pub trait ButlerDepositClient: Send + Sync {
+    async fn deposit(&self, req: &ButlerDepositRequest) -> DepositRungOutcome;
+}
+
+/// Build a [`DepositFrame`] for ONE butler-set entry — the exact
+/// construction `iroh_butler_acceptor::handle_deposit_core` verifies:
+///
+/// * `sealed_blob` = [`DepositPayload`] canonical CBOR sealed to
+///   `birational(vk)` of the butler device
+///   (`dm_signing::ed25519_pub_to_x25519` of the entry's
+///   `device_ed25519_verify`) under [`BUTLER_DEPOSIT_SEAL_INFO`];
+/// * `sig` = the sender's CERT-BOUND enrolled device ed25519 (key #2,
+///   ZEB-339 — `DmOutbox::new` pins it to
+///   `enrollment_cert.device_pubkeys.classical.ed25519_verify`, the key the
+///   acceptor extracts from the cert and verifies against) over
+///   [`deposit_sig_payload`];
+/// * `sender_enrollment_cert` = the canonical CBOR the acceptor
+///   strict-decodes (`harmony_owner::cbor::to_canonical` of the
+///   `state.enrollments` cert).
+pub(crate) fn build_deposit_frame(
+    recipient_owner: &[u8; 16],
+    sender_owner: &[u8; 16],
+    sender_enrollment_cert: &[u8],
+    device_signing_key: &ed25519_dalek::SigningKey,
+    butler_device_ed25519_verify: &[u8; 32],
+    payload: &DepositPayload,
+) -> Result<DepositFrame, String> {
+    let payload_bytes =
+        encode_deposit_payload(payload).map_err(|e| format!("encode deposit payload: {e}"))?;
+    let seal_pub = crate::dm_signing::ed25519_pub_to_x25519(butler_device_ed25519_verify)
+        .map_err(|e| format!("butler vk -> x25519: {e:?}"))?;
+    let sealed_blob = crate::dm_signing::seal_to_owner_with_info(
+        &seal_pub,
+        &payload_bytes,
+        BUTLER_DEPOSIT_SEAL_INFO,
+    )
+    .map_err(|e| format!("seal deposit payload: {e:?}"))?;
+    let sig = device_signing_key
+        .sign(&deposit_sig_payload(recipient_owner, &sealed_blob))
+        .to_bytes()
+        .to_vec();
+    Ok(DepositFrame {
+        recipient_owner: *recipient_owner,
+        sender_owner: *sender_owner,
+        sender_enrollment_cert: sender_enrollment_cert.to_vec(),
+        sig,
+        sealed_blob,
+    })
+}
+
+/// Pick the butler set to dial from the recipient's resolved routing blobs:
+/// each of the owner's devices publishes a whole-fleet set (spec §3 — "both
+/// writers describe the same fleet"), so take the FRESH set with the newest
+/// `bs_at` rather than merging across blobs. Freshness + the max-2 cap are
+/// enforced per blob by [`crate::reachability_record::fresh_butler_set`];
+/// an empty return means "no fresh butler set" (rung skipped silently).
+pub(crate) fn freshest_butler_set(
+    blobs: &[ReachabilityAnnouncePayload],
+    now_ms: u64,
+) -> Vec<ButlerSetEntry> {
+    blobs
+        .iter()
+        .map(|b| (b.bs_at, fresh_butler_set(b, now_ms)))
+        .filter(|(_, set)| !set.is_empty())
+        .max_by_key(|(bs_at, _)| *bs_at)
+        .map(|(_, set)| set)
+        .unwrap_or_default()
+}
+
+/// Production [`ButlerDepositClient`] (ZEB-418 P1 Task 8): resolve the
+/// RECIPIENT OWNER's routing record (in-memory CRDT cache first, pkarr
+/// fallback on miss, via `ReachabilityResolver::resolve_async`), read the
+/// freshest advertised butler set, and try each entry in priority order —
+/// dial `harmony/butler-deposit/v1`, write the length-prefixed sealed
+/// frame, read the length-prefixed ack, verify the ack matches the deposit.
+/// First ack wins; every entry failing = rung failure (the caller's retry
+/// chain is untouched either way — spec §6).
+pub struct IrohButlerDepositClient {
+    pub endpoint: Arc<crate::iroh_endpoint::IrohEndpoint>,
+    pub resolver: crate::reachability_resolver::ReachabilityResolver,
+    /// CAS holding the message storage blob (written by `send_dm` step 5).
+    pub cas: Arc<dyn crate::content_store::ContentStore>,
+    /// This (sender) owner's address bytes — `DepositFrame.sender_owner`.
+    pub sender_owner: [u8; 16],
+    /// Canonical CBOR of this device's own Master `EnrollmentCert` (what
+    /// the acceptor strict-decodes; see [`build_deposit_frame`]).
+    pub enrollment_cert_bytes: Vec<u8>,
+    /// The cert-bound enrolled device signing key (#2, ZEB-339) — signs
+    /// `DepositFrame.sig`.
+    pub device_signing_key: Arc<ed25519_dalek::SigningKey>,
+    /// Per-entry deadline bounding the WHOLE dial+frame+ack exchange for
+    /// one butler entry (production uses the acceptor's
+    /// `DEFAULT_BUTLER_IO_DEADLINE_MS`).
+    pub io_deadline: Duration,
+}
+
+impl IrohButlerDepositClient {
+    /// One butler entry: dial → frame → ack, bounded by `io_deadline`.
+    async fn deposit_to_entry(
+        &self,
+        entry: &ButlerSetEntry,
+        frame: &DepositFrame,
+        expect_space: &[u8; 16],
+        expect_cid: &[u8],
+    ) -> Result<(), String> {
+        let exchange = async {
+            let ep_id = iroh::EndpointId::from_bytes(&entry.iroh_endpoint_id)
+                .map_err(|e| format!("butler endpoint id: {e}"))?;
+            let mut addr = iroh::EndpointAddr::new(ep_id);
+            if !entry.home_relay.is_empty() {
+                match entry.home_relay.parse::<iroh::RelayUrl>() {
+                    Ok(url) => addr = addr.with_relay_url(url),
+                    Err(e) => tracing::trace!(
+                        relay = %entry.home_relay,
+                        "ZEB-418: skip malformed butler home_relay: {e}"
+                    ),
+                }
+            }
+            let conn = self
+                .endpoint
+                .inner()
+                .connect(addr, crate::iroh_endpoint::alpn::HARMONY_BUTLER_DEPOSIT_V1)
+                .await
+                .map_err(|e| format!("connect: {e}"))?;
+            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+            let frame_bytes =
+                encode_deposit_frame(frame).map_err(|e| format!("encode frame: {e}"))?;
+            write_length_prefixed(&mut send, &frame_bytes)
+                .await
+                .map_err(|e| format!("write frame: {e}"))?;
+            send.finish().map_err(|e| format!("finish: {e}"))?;
+            let ack_bytes = read_length_prefixed(&mut recv)
+                .await
+                .map_err(|e| format!("read ack: {e}"))?;
+            let ack = decode_deposit_ack(&ack_bytes).map_err(|e| format!("decode ack: {e}"))?;
+            // A reject closes the stream without detail (read fails above);
+            // a present-but-mismatched ack is a butler bug or a confused
+            // exchange — never mark delivered off it.
+            if ack.space_id != *expect_space || ack.message_cid != expect_cid {
+                return Err("ack space/cid mismatch".to_string());
+            }
+            // Dialer-driven close: the butler waits on `conn.closed()` after
+            // writing the ack (acceptor shell), so close from this side.
+            conn.close(0u32.into(), b"");
+            Ok(())
+        };
+        tokio::time::timeout(self.io_deadline, exchange)
+            .await
+            .map_err(|_| "deposit IO timeout".to_string())?
+    }
+}
+
+#[async_trait]
+impl ButlerDepositClient for IrohButlerDepositClient {
+    async fn deposit(&self, req: &ButlerDepositRequest) -> DepositRungOutcome {
+        // 1. Resolve the recipient OWNER's routing blobs and read the
+        // freshest advertised butler set. Missing/stale → rung silently
+        // skipped (spec §6: a stale ad can never make delivery worse).
+        let blobs = self.resolver.resolve_async(&req.recipient_owner).await;
+        let entries = freshest_butler_set(&blobs, req.now_ms);
+        if entries.is_empty() {
+            return DepositRungOutcome::SkippedNoFreshButlerSet;
+        }
+
+        // 2. The deposit payload carries BOTH the CidNotify packet and the
+        // CAS storage blob (the butler re-derives the packet's message_cid
+        // from the blob via ContentId::for_book). Fetched only after a
+        // fresh butler set is confirmed — no CAS work for a skipped rung.
+        let storage_blob = match self.cas.get(&req.message_cid).await {
+            Ok(Some(blob)) => blob,
+            Ok(None) => {
+                return DepositRungOutcome::Failed("storage blob missing from CAS".to_string())
+            }
+            Err(e) => return DepositRungOutcome::Failed(format!("CAS get: {e}")),
+        };
+        let payload = DepositPayload {
+            cidnotify_packet: req.cidnotify_packet.clone(),
+            storage_blob,
+        };
+
+        // 3. Priority order, first ack wins. The frame is rebuilt per
+        // entry: the sealed blob targets THAT entry's device key, and the
+        // sig binds to the sealed bytes.
+        let expect_cid = req.message_cid.to_bytes();
+        let mut last_err = "no butler entries attempted".to_string();
+        for entry in &entries {
+            let frame = match build_deposit_frame(
+                &req.recipient_owner.0,
+                &self.sender_owner,
+                &self.enrollment_cert_bytes,
+                &self.device_signing_key,
+                &entry.device_ed25519_verify,
+                &payload,
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            };
+            match self
+                .deposit_to_entry(entry, &frame, &req.space_id.0, &expect_cid)
+                .await
+            {
+                Ok(()) => return DepositRungOutcome::Acked,
+                Err(e) => {
+                    tracing::debug!(
+                        butler_device = %hex::encode(entry.device_id),
+                        error = %e,
+                        "ZEB-418: butler deposit entry failed; trying next"
+                    );
+                    last_err = e;
+                }
+            }
+        }
+        DepositRungOutcome::Failed(last_err)
+    }
 }
 
 #[cfg(test)]
@@ -455,6 +729,44 @@ mod tests {
             .await
             .expect("at-cap frame must be accepted");
         assert_eq!(body.len(), DEPOSIT_MAX_FRAME_BYTES);
+    }
+
+    /// ZEB-418 P1 Task 8: the sender's butler-set selection takes the FRESH
+    /// set with the newest `bs_at` (no cross-blob merge — every device of
+    /// the owner advertises the same fleet), ignores stale blobs entirely,
+    /// and yields empty (rung skipped) when nothing fresh exists.
+    #[test]
+    fn freshest_butler_set_picks_newest_fresh_blob_and_skips_stale() {
+        use crate::reachability_record::{ButlerSetEntry, ReachabilityAnnouncePayload};
+        let entry = |seed: u8| ButlerSetEntry {
+            device_id: [seed; 16],
+            iroh_endpoint_id: [seed; 32],
+            device_ed25519_verify: [seed; 32],
+            home_relay: "https://use1-1.relay.iroh.network./".into(),
+            pinned: false,
+        };
+        let blob = |bs_at: u64, seeds: &[u8]| ReachabilityAnnouncePayload {
+            iroh_node_id: [0xAB; 32],
+            home_relay_url: "https://derp.example/".into(),
+            direct_addresses: vec![],
+            announced_at_ms: bs_at,
+            identity_signature: [0; 64],
+            butler_set: seeds.iter().map(|s| entry(*s)).collect(),
+            bs_at,
+        };
+        let now = 1_700_000_000_000u64;
+        let stale = blob(now - BUTLER_SET_FRESHNESS_MS - 1, &[0x01]);
+        let older_fresh = blob(now - 60_000, &[0x02]);
+        let newest_fresh = blob(now - 1_000, &[0x03, 0x04]);
+
+        // Stale blob is ignored even though it lists an entry; among the
+        // fresh blobs the newest bs_at wins wholesale, priority order kept.
+        let picked = freshest_butler_set(&[stale.clone(), newest_fresh, older_fresh], now);
+        assert_eq!(picked, vec![entry(0x03), entry(0x04)]);
+
+        // Only stale → empty (rung skipped). No blobs at all → empty.
+        assert!(freshest_butler_set(&[stale], now).is_empty());
+        assert!(freshest_butler_set(&[], now).is_empty());
     }
 
     #[tokio::test]

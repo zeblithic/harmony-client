@@ -901,6 +901,51 @@ mod tests {
         assert!(failing.store.lock().unwrap().is_empty());
     }
 
+    /// ZEB-418 P1 Task 8 cross-check: a frame produced by the SENDER-side
+    /// `butler_deposit::build_deposit_frame` (the exact construction
+    /// `IrohButlerDepositClient` ships) passes the FULL acceptor pipeline —
+    /// cert strict-decode + Master-issuer + owner/master binding, frame sig
+    /// over `domain ‖ ro ‖ sealed_blob`, seal opening under the butler
+    /// device's birational X25519 + butler info string, inner CidNotify
+    /// signature/sender consistency, and `ContentId::for_book` CID
+    /// consistency with the storage blob. Pins sender↔butler wire
+    /// compatibility end to end.
+    #[tokio::test]
+    async fn sender_built_frame_passes_acceptor_pipeline() {
+        let f = valid_fixture();
+        let so = sender();
+        let payload = DepositPayload {
+            cidnotify_packet: f.cidnotify_packet.clone(),
+            storage_blob: f.storage_blob.clone(),
+        };
+        let butler_vk = butler_device_sk().verifying_key().to_bytes();
+        let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
+        let frame = crate::butler_deposit::build_deposit_frame(
+            &BUTLER_OWNER,
+            &so.owner.0,
+            &cert_bytes,
+            &so.device_key,
+            &butler_vk,
+            &payload,
+        )
+        .expect("sender-side frame build must succeed");
+
+        let ctx = TestCtx::for_fixture(&f);
+        let ack = handle_deposit_core(&frame, &ctx)
+            .await
+            .expect("sender-built frame must pass every acceptor check");
+        assert_eq!(ack.space_id, f.space_id.0);
+        assert_eq!(ack.message_cid, f.message_cid.to_bytes().to_vec());
+
+        // The entry the butler persisted carries exactly the payload the
+        // sender sealed.
+        let key = DmInboxDoc::key(&f.space_id.0, &f.message_cid.to_bytes());
+        let store = ctx.store.lock().unwrap();
+        let entry = store.get(&key).expect("entry persisted");
+        assert_eq!(entry.cidnotify_packet, f.cidnotify_packet);
+        assert_eq!(entry.storage_blob, f.storage_blob);
+    }
+
     #[tokio::test]
     async fn deposit_from_non_friend_rejected_before_any_crypto() {
         let f = valid_fixture();
