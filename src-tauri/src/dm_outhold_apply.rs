@@ -1,0 +1,626 @@
+//! ZEB-418 SP2 P2 Task 5: dm-outhold apply sweeper — local CAS admit +
+//! status-driven GC.
+//!
+//! When a `dm-outhold-v1` row replicates to this device its blob is admitted
+//! into the **local CAS** (so this device can serve CidNotify fetch-backs and
+//! build butler deposits for that DM). When the matching `OutboxEntry` is in a
+//! terminal state (`Complete`/`Expired`) or absent (`None` — user-deleted or
+//! not yet arrived on this replica), the row is GC'd. Only the dataset **row**
+//! is removed; CAS copies are retained (spec D14 as amended: they are
+//! legitimate DM-history cache referenced by the replicated `InboxEntry`).
+//!
+//! ## Trigger model
+//!
+//! The `dm-outhold-v1` `FleetSyncEngine`'s `on_applied` callback sends a
+//! nudge via [`outhold_nudge_on_applied`]; [`run_dm_outhold_sweeper`] debounces
+//! the burst and runs one sweep per burst, plus a startup sweep for rows that
+//! arrived while this device was offline.
+//!
+//! ## Resurrection-tolerant GC
+//!
+//! A stale sibling's merge can re-insert a GC'd row (the insert-once merge
+//! sees a missing key as new). The next sweep re-evaluates: if the outbox
+//! entry is still terminal / still absent the row is removed again.
+//! `None`-status rows are also GC'd: if the outbox entry arrives *later* the
+//! outhold row also arrives from any sibling still holding it, gets re-swept,
+//! and re-admits to CAS. `OwnerState` and the outhold doc ride the same
+//! transport, so sustained status-vs-row skew is bounded.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio::sync::{mpsc, Mutex};
+
+use crate::dm_outhold::DmOutholdDoc;
+use crate::owner_state_types::{ContentId, DeliveryStatus};
+
+/// Debounce window — same value as the inbox ingest sweeper's window so
+/// on_applied bursts coalesce into one sweep on both channels.
+pub const OUTHOLD_SWEEP_DEBOUNCE_MS: u64 = crate::dm_inbox_ingest::INGEST_SWEEP_DEBOUNCE_MS;
+
+/// Adapter for `FleetSyncConfig::on_applied`: nudges the outhold sweeper.
+/// `try_send` on a capacity-1 channel — the nudge is a level trigger, so
+/// dropping extras when the buffer is full (a sweep is already pending) is
+/// correct.
+pub fn outhold_nudge_on_applied(nudge_tx: mpsc::Sender<()>) -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(move || {
+        let _ = nudge_tx.try_send(());
+    })
+}
+
+// ── Injectable context ──────────────────────────────────────────────────────
+
+/// Injectable context for [`sweep_once`]: CAS put + outbox-status query.
+/// Production implements this over real `NodeState` handles; tests use a
+/// stub with programmable responses.
+#[async_trait]
+pub trait DmOutholdCtx: Send + Sync {
+    /// Insert `blob` into the local CAS under `cid`.  Idempotent by CID
+    /// (content-addressed, so a duplicate put is a no-op in production).
+    async fn cas_put(
+        &self,
+        cid: crate::owner_state_types::ContentId,
+        blob: Vec<u8>,
+    ) -> Result<(), String>;
+
+    /// Return the current delivery status of the `OutboxEntry` whose
+    /// `(space_id, message_cid)` matches the given pair, or `None` if no
+    /// such entry exists on this replica (deleted, user-GC'd, or not yet
+    /// replicated).
+    ///
+    /// Production: one short lock over `OwnerState`, linear scan of
+    /// `state.outbox.values()` — the outbox is small and sweeps are
+    /// debounced.
+    async fn outbox_status(
+        &self,
+        space_id: &[u8; 16],
+        message_cid: &crate::owner_state_types::ContentId,
+    ) -> Option<crate::owner_state_types::DeliveryStatus>;
+}
+
+// ── Production impl ─────────────────────────────────────────────────────────
+
+/// Production [`DmOutholdCtx`] over the real `start_node` handles.
+pub struct ProdDmOutholdCtx {
+    /// Runtime owner-state CRDT (`NodeState`'s `crdt_state` Arc).
+    pub crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    /// Shared CAS handle (`RuntimeContentStore` in production).
+    pub content_store: Arc<dyn crate::content_store::ContentStore>,
+}
+
+#[async_trait]
+impl DmOutholdCtx for ProdDmOutholdCtx {
+    async fn cas_put(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), String> {
+        self.content_store
+            .put(cid, blob)
+            .await
+            .map_err(|e| format!("cas put: {e}"))
+    }
+
+    async fn outbox_status(
+        &self,
+        space_id: &[u8; 16],
+        message_cid: &ContentId,
+    ) -> Option<DeliveryStatus> {
+        let state = self.crdt_state.lock().await;
+        state
+            .outbox
+            .values()
+            .find(|e| e.space_id.0 == *space_id && &e.message_cid == message_cid)
+            .map(|e| e.delivery_status)
+    }
+}
+
+// ── Sweep stats (testable inner function) ────────────────────────────────────
+
+/// Counters returned by one sweep pass; used in unit tests (callers assert
+/// on these instead of peeking at private doc state directly).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SweepStats {
+    /// Rows for which `cas_put` was called successfully.
+    pub admitted: usize,
+    /// Rows removed (terminal / missing status OR bad key).
+    pub gc_removed: usize,
+    /// Rows left pending because `cas_put` returned an error.
+    pub cas_error_retains: usize,
+}
+
+/// One sweep over the outhold doc.
+///
+/// **Lock discipline:** snapshots the doc under a SHORT lock, releases it,
+/// processes each entry (calling potentially-async ctx methods), then
+/// re-locks to apply removals.  This avoids holding the doc lock across
+/// `ctx.*` awaits, which would invite deadlock when the ProdCtx takes
+/// the `crdt_state` Mutex.
+pub async fn sweep_once(
+    doc: &Arc<Mutex<DmOutholdDoc>>,
+    ctx: &dyn DmOutholdCtx,
+    notify_dirty: &(dyn Fn() + Send + Sync),
+) -> SweepStats {
+    // 1. Snapshot — hold the lock ONLY long enough to clone the entries.
+    let snapshot: Vec<(String, crate::dm_outhold::DmOutholdEntry)> = {
+        let guard = doc.lock().await;
+        guard
+            .entries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+
+    let mut to_remove: Vec<String> = Vec::new();
+    let mut stats = SweepStats::default();
+
+    for (key, entry) in &snapshot {
+        // 2. Parse key "{space_id_hex}:{message_cid_hex}".
+        let parsed = parse_outhold_key(key);
+        let (space_id_bytes, cid) = match parsed {
+            Some(pair) => pair,
+            None => {
+                tracing::warn!(
+                    key = %key,
+                    "ZEB-418 outhold: unparseable key — GC'ing corrupt row"
+                );
+                to_remove.push(key.clone());
+                stats.gc_removed += 1;
+                continue;
+            }
+        };
+
+        // 3. Query outbox status — no doc lock held here.
+        let status = ctx.outbox_status(&space_id_bytes, &cid).await;
+
+        match status {
+            Some(DeliveryStatus::Pending) | Some(DeliveryStatus::Partial) => {
+                // Live entry: admit blob into local CAS.
+                match ctx.cas_put(cid, entry.storage_blob.clone()).await {
+                    Ok(()) => {
+                        stats.admitted += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            key = %key,
+                            "ZEB-418 outhold: CAS put failed; row left pending for retry"
+                        );
+                        stats.cas_error_retains += 1;
+                        // Leave the row — the next nudge/startup sweep retries
+                        // (dirty-latch pattern mirrors dm_inbox_ingest).
+                    }
+                }
+            }
+
+            Some(DeliveryStatus::Complete) | Some(DeliveryStatus::Expired) => {
+                // Terminal outbox entry — GC the row.
+                to_remove.push(key.clone());
+                stats.gc_removed += 1;
+            }
+
+            None => {
+                // No matching OutboxEntry on this replica (user-deleted, or
+                // the entry has not yet replicated here).  GC the row.
+                //
+                // Resurrection-tolerant tradeoff: if the OutboxEntry arrives
+                // later on this replica, the outhold row will also arrive from
+                // any sibling still holding it, get re-swept, and re-admit
+                // to CAS.  OwnerState and the outhold doc ride the same
+                // transport, so sustained skew between the two is bounded.
+                to_remove.push(key.clone());
+                stats.gc_removed += 1;
+            }
+        }
+    }
+
+    // 4. Apply removals under the lock (only if the row is still present and
+    //    its blob unchanged — a concurrent insert-once merge could have
+    //    mutated the doc while we were processing).
+    if !to_remove.is_empty() {
+        let mut guard = doc.lock().await;
+        // Re-check that each key is still present (idempotent GC).
+        for key in &to_remove {
+            guard.entries.remove(key.as_str());
+        }
+        // Publish the removals so siblings learn the row is gone.
+        notify_dirty();
+    }
+
+    stats
+}
+
+/// Parse "{space_id_hex(32 chars)}:{message_cid_hex(64 chars)}" back to
+/// ([u8; 16], ContentId).  Returns None on any parse error.
+fn parse_outhold_key(key: &str) -> Option<([u8; 16], ContentId)> {
+    let (space_hex, cid_hex) = key.split_once(':')?;
+    let space_bytes = hex::decode(space_hex).ok()?;
+    let space_id: [u8; 16] = space_bytes.try_into().ok()?;
+    let cid_bytes = hex::decode(cid_hex).ok()?;
+    let cid_arr: [u8; 32] = cid_bytes.try_into().ok()?;
+    Some((space_id, ContentId::from_bytes(cid_arr)))
+}
+
+// ── Public sweeper task ──────────────────────────────────────────────────────
+
+/// The outhold-sweeper task: one startup sweep (rows that arrived while
+/// this device was offline), then one debounced sweep per `on_applied`
+/// nudge burst.  Exits when all nudge senders are dropped (engine shutdown).
+///
+/// ZEB-418 P2 Task 6: wire this in `start_node` alongside the dm-outhold
+/// `FleetSyncEngine` construction:
+///
+/// ```text
+/// let (nudge_tx, nudge_rx) = tokio::sync::mpsc::channel(1);
+/// // FleetSyncConfig { on_applied: Some(outhold_nudge_on_applied(nudge_tx)), .. }
+/// tokio::spawn(run_dm_outhold_sweeper(
+///     Arc::clone(&dm_outhold_doc),
+///     prod_ctx,
+///     nudge_rx,
+///     Arc::new(move || engine.notify_dirty()),
+///     Duration::from_millis(OUTHOLD_SWEEP_DEBOUNCE_MS),
+/// ));
+/// // Shutdown: drop nudge_tx → recv() yields None → task exits.
+/// ```
+pub async fn run_dm_outhold_sweeper(
+    doc: Arc<Mutex<DmOutholdDoc>>,
+    ctx: Arc<dyn DmOutholdCtx>,
+    mut nudge_rx: mpsc::Receiver<()>,
+    notify_dirty: Arc<dyn Fn() + Send + Sync>,
+    debounce: Duration,
+) {
+    // Startup sweep: process rows deposited while this device was offline.
+    sweep_once(&doc, ctx.as_ref(), notify_dirty.as_ref()).await;
+
+    while nudge_rx.recv().await.is_some() {
+        // Debounce: let the rest of a merge burst land, then drain any
+        // extra nudges so the burst coalesces into one sweep.
+        tokio::time::sleep(debounce).await;
+        while nudge_rx.try_recv().is_ok() {}
+        sweep_once(&doc, ctx.as_ref(), notify_dirty.as_ref()).await;
+    }
+    // recv() == None: all nudge senders dropped (engine shutdown).
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    // ── Stub context ─────────────────────────────────────────────────────────
+
+    struct StubCtx {
+        /// space_id_hex:cid_hex → status (None = entry absent)
+        status_map: StdMutex<HashMap<String, Option<DeliveryStatus>>>,
+        /// Whether cas_put should fail.
+        cas_fail: bool,
+        /// CIDs successfully put.
+        cas_puts: StdMutex<Vec<ContentId>>,
+        /// Total cas_put call count (including failures).
+        cas_call_count: AtomicUsize,
+    }
+
+    impl StubCtx {
+        fn new(entries: impl IntoIterator<Item = (String, Option<DeliveryStatus>)>) -> Self {
+            Self {
+                status_map: StdMutex::new(entries.into_iter().collect()),
+                cas_fail: false,
+                cas_puts: StdMutex::new(Vec::new()),
+                cas_call_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_cas_fail(mut self) -> Self {
+            self.cas_fail = true;
+            self
+        }
+
+        fn cas_puts(&self) -> Vec<ContentId> {
+            self.cas_puts.lock().unwrap().clone()
+        }
+
+        fn cas_calls(&self) -> usize {
+            self.cas_call_count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl DmOutholdCtx for StubCtx {
+        async fn cas_put(&self, cid: ContentId, _blob: Vec<u8>) -> Result<(), String> {
+            self.cas_call_count.fetch_add(1, Ordering::SeqCst);
+            if self.cas_fail {
+                return Err("simulated CAS failure".into());
+            }
+            self.cas_puts.lock().unwrap().push(cid);
+            Ok(())
+        }
+
+        async fn outbox_status(
+            &self,
+            space_id: &[u8; 16],
+            message_cid: &ContentId,
+        ) -> Option<DeliveryStatus> {
+            let key = format!(
+                "{}:{}",
+                hex::encode(space_id),
+                hex::encode(message_cid.to_bytes())
+            );
+            self.status_map.lock().unwrap().get(&key).copied().flatten()
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    const SPACE: [u8; 16] = [0x11u8; 16];
+    const CID_BYTES: [u8; 32] = [0x22u8; 32];
+
+    fn make_doc_with_one_entry() -> (Arc<Mutex<DmOutholdDoc>>, String, ContentId) {
+        let cid = ContentId::from_bytes(CID_BYTES);
+        let key = DmOutholdDoc::key(&SPACE, &CID_BYTES);
+        let entry = crate::dm_outhold::DmOutholdEntry {
+            storage_blob: vec![0xAA, 0xBB],
+            space_id: SPACE,
+            created_at: crate::owner_state_types::Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+        };
+        let mut doc = DmOutholdDoc::default();
+        doc.entries.insert(key.clone(), entry);
+        (Arc::new(Mutex::new(doc)), key, cid)
+    }
+
+    fn stub_key(space: &[u8; 16], cid_bytes: &[u8; 32]) -> String {
+        format!("{}:{}", hex::encode(space), hex::encode(cid_bytes))
+    }
+
+    fn noop_notify() -> Arc<dyn Fn() + Send + Sync> {
+        Arc::new(|| {})
+    }
+
+    fn counting_notify() -> (Arc<dyn Fn() + Send + Sync>, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        (
+            Arc::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+            count,
+        )
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// A pending outbox entry: cas_put called once with the right cid;
+    /// row is retained.
+    #[tokio::test]
+    async fn sweep_inserts_blob_for_pending_entry() {
+        let (doc, key, cid) = make_doc_with_one_entry();
+        let ctx = StubCtx::new([(stub_key(&SPACE, &CID_BYTES), Some(DeliveryStatus::Pending))]);
+
+        let stats = sweep_once(&doc, &ctx, noop_notify().as_ref()).await;
+
+        assert_eq!(stats.admitted, 1);
+        assert_eq!(stats.gc_removed, 0);
+        assert_eq!(stats.cas_error_retains, 0);
+
+        // cas_put called with the correct CID
+        assert_eq!(ctx.cas_puts(), vec![cid]);
+
+        // Row retained (outbox still live)
+        assert!(doc.lock().await.entries.contains_key(&key));
+    }
+
+    /// Partial delivery status should also keep the row and admit the blob.
+    #[tokio::test]
+    async fn sweep_inserts_blob_for_partial_entry() {
+        let (doc, key, cid) = make_doc_with_one_entry();
+        let ctx = StubCtx::new([(stub_key(&SPACE, &CID_BYTES), Some(DeliveryStatus::Partial))]);
+
+        let stats = sweep_once(&doc, &ctx, noop_notify().as_ref()).await;
+        assert_eq!(stats.admitted, 1);
+        assert_eq!(ctx.cas_puts(), vec![cid]);
+        assert!(doc.lock().await.entries.contains_key(&key));
+    }
+
+    /// Complete outbox entry → row removed, no cas_put, notify_dirty fired.
+    #[tokio::test]
+    async fn sweep_gcs_row_when_outbox_complete() {
+        let (doc, key, _cid) = make_doc_with_one_entry();
+        let ctx = StubCtx::new([(stub_key(&SPACE, &CID_BYTES), Some(DeliveryStatus::Complete))]);
+        let (notify, count) = counting_notify();
+
+        let stats = sweep_once(&doc, &ctx, notify.as_ref()).await;
+        assert_eq!(stats.gc_removed, 1);
+        assert_eq!(stats.admitted, 0);
+        assert_eq!(ctx.cas_calls(), 0, "no cas_put for terminal entry");
+        assert!(!doc.lock().await.entries.contains_key(&key));
+        assert_eq!(count.load(Ordering::SeqCst), 1, "notify_dirty fired once");
+    }
+
+    /// Expired outbox entry → row GC'd.
+    #[tokio::test]
+    async fn sweep_gcs_row_when_outbox_expired() {
+        let (doc, key, _cid) = make_doc_with_one_entry();
+        let ctx = StubCtx::new([(stub_key(&SPACE, &CID_BYTES), Some(DeliveryStatus::Expired))]);
+
+        let stats = sweep_once(&doc, &ctx, noop_notify().as_ref()).await;
+        assert_eq!(stats.gc_removed, 1);
+        assert!(!doc.lock().await.entries.contains_key(&key));
+    }
+
+    /// Missing outbox entry (None) → row GC'd.
+    #[tokio::test]
+    async fn sweep_gcs_row_when_outbox_missing() {
+        let (doc, key, _cid) = make_doc_with_one_entry();
+        // status_map has no entry for this key → outbox_status returns None
+        let ctx = StubCtx::new([]);
+
+        let stats = sweep_once(&doc, &ctx, noop_notify().as_ref()).await;
+        assert_eq!(stats.gc_removed, 1);
+        assert!(!doc.lock().await.entries.contains_key(&key));
+    }
+
+    /// Failing cas_put → row retained; a second sweep retries (counter == 2).
+    #[tokio::test]
+    async fn sweep_retries_row_on_cas_failure() {
+        let (doc, key, _cid) = make_doc_with_one_entry();
+        let ctx = Arc::new(
+            StubCtx::new([(stub_key(&SPACE, &CID_BYTES), Some(DeliveryStatus::Pending))])
+                .with_cas_fail(),
+        );
+        let notify = noop_notify();
+
+        // First sweep: cas_put fails → row retained
+        let stats = sweep_once(&doc, ctx.as_ref(), notify.as_ref()).await;
+        assert_eq!(stats.cas_error_retains, 1);
+        assert_eq!(stats.gc_removed, 0);
+        assert_eq!(ctx.cas_calls(), 1);
+        assert!(doc.lock().await.entries.contains_key(&key));
+
+        // Second sweep: still failing, still retained; total calls == 2
+        let stats2 = sweep_once(&doc, ctx.as_ref(), notify.as_ref()).await;
+        assert_eq!(stats2.cas_error_retains, 1);
+        assert_eq!(ctx.cas_calls(), 2);
+        assert!(doc.lock().await.entries.contains_key(&key));
+    }
+
+    /// Bad key → GC'd with a warn; no ctx calls; notify_dirty fired.
+    #[tokio::test]
+    async fn sweep_gcs_unparseable_key() {
+        let cid = ContentId::from_bytes(CID_BYTES);
+        let bad_key = "not-a-valid-key".to_string();
+        let entry = crate::dm_outhold::DmOutholdEntry {
+            storage_blob: vec![1, 2, 3],
+            space_id: SPACE,
+            created_at: crate::owner_state_types::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        let mut raw_doc = DmOutholdDoc::default();
+        raw_doc.entries.insert(bad_key.clone(), entry);
+        let doc = Arc::new(Mutex::new(raw_doc));
+        let ctx = StubCtx::new([(stub_key(&SPACE, &CID_BYTES), Some(DeliveryStatus::Pending))]);
+        let (notify, count) = counting_notify();
+
+        let stats = sweep_once(&doc, &ctx, notify.as_ref()).await;
+        assert_eq!(stats.gc_removed, 1);
+        assert_eq!(ctx.cas_calls(), 0, "corrupt key must not trigger ctx calls");
+        assert!(!doc.lock().await.entries.contains_key(&bad_key));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "notify_dirty fired for bad-key removal"
+        );
+
+        // Suppress unused-variable warning
+        let _ = cid;
+    }
+
+    /// notify_dirty fires exactly when rows were removed; a pure-admit
+    /// sweep (Pending/Partial, no removals) must NOT call notify_dirty.
+    #[tokio::test]
+    async fn gc_publishes_via_notify_dirty() {
+        // Scenario 1: admit-only (Pending) → no notify_dirty
+        let (doc_admit, _key_admit, _) = make_doc_with_one_entry();
+        let ctx_admit =
+            StubCtx::new([(stub_key(&SPACE, &CID_BYTES), Some(DeliveryStatus::Pending))]);
+        let (notify_admit, count_admit) = counting_notify();
+        sweep_once(&doc_admit, &ctx_admit, notify_admit.as_ref()).await;
+        assert_eq!(
+            count_admit.load(Ordering::SeqCst),
+            0,
+            "admit-only sweep must not call notify_dirty"
+        );
+
+        // Scenario 2: GC (Complete) → notify_dirty fired
+        let (doc_gc, _key_gc, _) = make_doc_with_one_entry();
+        let ctx_gc = StubCtx::new([(stub_key(&SPACE, &CID_BYTES), Some(DeliveryStatus::Complete))]);
+        let (notify_gc, count_gc) = counting_notify();
+        sweep_once(&doc_gc, &ctx_gc, notify_gc.as_ref()).await;
+        assert_eq!(
+            count_gc.load(Ordering::SeqCst),
+            1,
+            "GC sweep must call notify_dirty exactly once"
+        );
+    }
+
+    /// outhold_nudge_on_applied is a non-blocking level trigger (like
+    /// ingest_nudge_on_applied): a full buffer drops extras without
+    /// blocking or panicking.
+    #[tokio::test]
+    async fn outhold_nudge_on_applied_is_nonblocking_level_trigger() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let nudge = outhold_nudge_on_applied(tx);
+        nudge();
+        nudge(); // buffer full — must not panic or block
+        assert_eq!(rx.recv().await, Some(()));
+        assert!(rx.try_recv().is_err(), "extras coalesced into one nudge");
+    }
+
+    /// Startup sweep fires without a nudge; a subsequent nudge triggers a
+    /// debounced second sweep.  Validates the run_dm_outhold_sweeper loop
+    /// shape under paused time.
+    #[tokio::test(start_paused = true)]
+    async fn startup_sweep_and_nudge_sweep() {
+        let (doc, key, _cid) = make_doc_with_one_entry();
+        let ctx = Arc::new(StubCtx::new([(
+            stub_key(&SPACE, &CID_BYTES),
+            Some(DeliveryStatus::Pending),
+        )]));
+
+        let dirty = Arc::new(AtomicUsize::new(0));
+        let notify_dirty: Arc<dyn Fn() + Send + Sync> = {
+            let d = Arc::clone(&dirty);
+            Arc::new(move || {
+                d.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+
+        let (nudge_tx, nudge_rx) = mpsc::channel(1);
+
+        let handle = tokio::spawn(run_dm_outhold_sweeper(
+            Arc::clone(&doc),
+            Arc::clone(&ctx) as Arc<dyn DmOutholdCtx>,
+            nudge_rx,
+            notify_dirty,
+            Duration::from_millis(OUTHOLD_SWEEP_DEBOUNCE_MS),
+        ));
+
+        // Startup sweep must have run (cas_put called) without any nudge.
+        // Under paused time, await for one yield cycle.
+        for _ in 0..10_000 {
+            if ctx.cas_calls() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(ctx.cas_calls() >= 1, "startup sweep must admit the row");
+        assert!(
+            doc.lock().await.entries.contains_key(&key),
+            "Pending row retained"
+        );
+
+        // A nudge triggers a debounced follow-up sweep.
+        let calls_before = ctx.cas_calls();
+        nudge_tx.send(()).await.expect("sweeper alive");
+        for _ in 0..10_000 {
+            if ctx.cas_calls() > calls_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(ctx.cas_calls() > calls_before, "nudge sweep ran");
+
+        // Dropping the last nudge sender shuts down cleanly.
+        drop(nudge_tx);
+        tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("sweeper must exit when nudge senders drop")
+            .expect("sweeper must not panic");
+    }
+}

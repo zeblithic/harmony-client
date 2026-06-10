@@ -142,6 +142,7 @@ pub mod dm_inbox_ingest;
 pub mod dm_inbox_persist;
 pub mod dm_outbox;
 pub mod dm_outhold;
+pub mod dm_outhold_apply;
 pub mod dm_outhold_persist;
 pub mod dm_signing;
 pub mod event_loop;
