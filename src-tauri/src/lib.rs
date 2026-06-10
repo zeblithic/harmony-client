@@ -110,6 +110,7 @@ mod zeb398_content_policy_tests {
 mod app_tracing;
 pub mod backup_state;
 pub mod butler_deposit;
+pub mod channel_backfill;
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
 pub mod community_dfrost_crypto;
