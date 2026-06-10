@@ -227,7 +227,11 @@ pub async fn mint_owner_identity(
     // — required by `start_node_inner` — cannot be constructed). Production
     // passes the real node restart.
     let state_ref: &Mutex<crate::NodeState> = state.inner();
-    mint_owner_identity_inner(state_ref, || async {
+    // ZEB-428: the real keychain is acquired HERE (production wrapper) and
+    // injected, mirroring pairing/persist.rs's install_joiner_state — the
+    // inner fn must never construct it internally, so test drivers can't
+    // reach the developer's real credential store.
+    mint_owner_identity_inner(state_ref, KeychainStore::new().ok(), || async {
         crate::start_node_inner(None, &app, state_ref)
             .await
             .map(|_| ())
@@ -244,8 +248,16 @@ pub async fn mint_owner_identity(
 /// `crate::start_node_inner`; tests supply a closure that records invocation
 /// (so they can assert "restart happens after mint, with cbor on disk") or
 /// deliberately fails (to lock the no-rollback invariant below).
+///
+/// `keychain` is injected by the caller (ZEB-428): production passes
+/// `KeychainStore::new().ok()`, the test shim passes `None`. The inner fn
+/// must never construct the real store itself — the OS keychain is a
+/// process-global resource that a test's HOME-to-tempdir redirect cannot
+/// scope, and an internal `new()` here once let a full-suite run overwrite
+/// a developer's real owner identity.
 pub(crate) async fn mint_owner_identity_inner<F, Fut>(
     state: &Mutex<crate::NodeState>,
+    keychain: Option<KeychainStore>,
     restart: F,
 ) -> Result<MintIpcResult, String>
 where
@@ -313,7 +325,7 @@ where
             &owner_state,
             &device_signing_key,
             Some(&*master_seed),
-            KeychainStore::new().ok(),
+            keychain,
         )?;
         let token = insert_token(master_seed.clone());
         let loaded = LoadedOwnerState {
@@ -345,6 +357,12 @@ where
 /// integration tests (a separate crate, no `pub(crate)` visibility) can
 /// drive the mint lifecycle with an injected restart closure. Never
 /// compiled into production (gated behind `test-fixtures`).
+///
+/// ZEB-428: the shim hard-codes `keychain: None` — the mint persists
+/// through the encrypted-file fallback inside the test's tempdir HOME,
+/// never the developer's real OS keychain. (Defense-in-depth: even if a
+/// future caller bypassed this shim, `KeychainStore::new()` refuses in
+/// test-fixtures builds.)
 #[cfg(feature = "test-fixtures")]
 pub async fn mint_owner_identity_inner_for_test<F, Fut>(
     state: &Mutex<crate::NodeState>,
@@ -354,7 +372,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
-    mint_owner_identity_inner(state, restart).await
+    mint_owner_identity_inner(state, None, restart).await
 }
 
 #[tauri::command]

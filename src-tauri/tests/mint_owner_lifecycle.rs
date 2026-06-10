@@ -1,8 +1,19 @@
 //! ZEB-338: self-lifecycle mint IPC integration tests.
 //!
 //! These exercise `mint_owner_identity_inner` end-to-end against a tempdir
-//! identity directory (HOME override). Keychain may be absent in CI; the
-//! cbor file is the load-bearing assertion.
+//! identity directory (HOME override). The cbor file is the load-bearing
+//! assertion.
+//!
+//! ## ZEB-428: this file is keychain-hermetic by construction
+//!
+//! An earlier revision let the mint persist through a real
+//! `KeychainStore::new()` — the HOME override scopes the cbor path but NOT
+//! the OS keychain (fixed service/account names), and a full-suite run
+//! silently overwrote a developer's real owner identity. Now hermetic at
+//! two layers: the `_for_test` shim hard-codes `keychain: None` (the mint
+//! persists via the HARMONY_PASSPHRASE encrypted-file fallback inside the
+//! tempdir), and `KeychainStore::new()` itself refuses in test-fixtures
+//! builds (see tests/keychain_isolation.rs).
 //!
 //! ## Why the inner fn + injected restart, not the real `#[tauri::command]`
 //!
@@ -61,12 +72,11 @@ impl Drop for EnvVarGuard {
 
 /// Set HOME + USERPROFILE to a fresh tempdir so the identity dir resolves
 /// there (`identity.rs::resolve_path` reads $HOME / $USERPROFILE), and set
-/// HARMONY_PASSPHRASE so the encrypted-file fallback is available when the
-/// OS keychain is unavailable in CI (mint hands `save_owner_state_atomic`
-/// a real `KeychainStore` whose *write* may fail — e.g. "no default
-/// keychain" on headless macOS — and `save_secret` then falls through to
-/// the HARMONY_PASSPHRASE-backed encrypted file). Returns the tempdir (keep
-/// alive for the test) and all three guards.
+/// HARMONY_PASSPHRASE so the encrypted-file fallback can persist the mint:
+/// the shim passes `keychain: None` (ZEB-428), so `save_owner_state_atomic`
+/// always writes the HARMONY_PASSPHRASE-backed encrypted file inside this
+/// tempdir — never the OS keychain. Returns the tempdir (keep alive for
+/// the test) and all three guards.
 fn home_override() -> (TempDir, EnvVarGuard, EnvVarGuard, EnvVarGuard) {
     let home = TempDir::new().unwrap();
     let g1 = EnvVarGuard::set("HOME", home.path());
