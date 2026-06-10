@@ -34331,6 +34331,7 @@ async fn connectivity_redeem_invite_iroh(
         channel_log_registry,
         dm_outbox,
         iroh_endpoint,
+        sync_engine,
     ) = {
         let g = state
             .lock()
@@ -34348,6 +34349,12 @@ async fn connectivity_redeem_invite_iroh(
             g.channel_log_registry.clone(),
             g.dm_outbox.clone(),
             g.iroh_endpoint.clone(),
+            // ZEB-427: owner-state SyncEngine for the durable-on-commit
+            // fence in the inner's joined arm. Deliberately NOT part of
+            // the Some(...) gate below — the fence handles None itself
+            // (loud warn), and gating the whole redeem on it would turn
+            // a degraded-durability case into a hard failure.
+            g.sync_engine.clone(),
         )
     };
 
@@ -34478,6 +34485,7 @@ async fn connectivity_redeem_invite_iroh(
         unicast_send_tx,
         dm_outbox,
         channel_log_registry,
+        sync_engine,
         crate::owner_commands::resolve_identity_dir().ok(),
         progress_sink,
         nav_emit_sink,
@@ -34550,6 +34558,16 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime, F>(
     channel_log_registry: std::sync::Arc<
         crate::community_channel_log_engine::ChannelLogRegistry<R>,
     >,
+    // ZEB-427: owner-state SyncEngine handle for the durable-on-commit
+    // fence (ZEB-393 Bug A). This was the ONE join path missing the
+    // fence — `create_community`, the legacy `redeem_invite`, and
+    // `join_open_community` all flush after committing the Space, but
+    // the iroh path (the one the UI drives) committed in-memory only,
+    // so the membership vanished at the next cold boot and re-joining
+    // deadlocked against the persisted per-community dir. `None` only
+    // pre-start_node (where this IPC can't usefully run) — the fence
+    // logs loudly rather than silently skipping in that case.
+    sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
     identity_dir: Option<std::path::PathBuf>,
     progress_sink: impl Fn(ResolutionProgressPayload),
     // ZEB-325 PR #159 R3-1 (Cursor HIGH): sink for the `nav-updated`
@@ -35132,6 +35150,41 @@ where
 
     match result {
         Ok(dto) => {
+            // ZEB-427: durable-on-commit fence (ZEB-393 Bug A), mirroring
+            // the legacy `redeem_invite` IPC. Fence the joined community's
+            // owner-state Space to disk before returning so a non-graceful
+            // exit can't lose this membership — without it the join is
+            // memory-only until some unrelated owner-state write flushes
+            // the doc, and a lost Space deadlocks recovery (the persisted
+            // per-community dir still materializes the joiner as Active →
+            // "already-engaged" blocks re-join, while the missing Space
+            // row → "no engine" blocks leave). Non-fatal: the join already
+            // committed in-memory and the per-community dir is written.
+            // On flush error re-arm the debounce (notify_dirty) so the
+            // persist is retried rather than left until graceful shutdown.
+            // An absent engine logs loudly — a silent skip here is exactly
+            // what hid this hole on the iroh path.
+            match sync_engine.as_ref() {
+                Some(engine) => {
+                    if let Err(e) = engine.flush_now().await {
+                        tracing::warn!(
+                            error = %e,
+                            community_id = %dto.community_id,
+                            "connectivity_redeem_invite_iroh: owner-state flush_now failed; \
+                             re-arming debounce"
+                        );
+                        engine.notify_dirty();
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        community_id = %dto.community_id,
+                        "connectivity_redeem_invite_iroh: no SyncEngine handle — the joined \
+                         community's owner-state Space is NOT persisted until the next \
+                         unrelated owner-state flush (ZEB-427)"
+                    );
+                }
+            }
             // Stage 5/5: `joined` — counter-signed Join applied, joiner
             // is now a community member.
             emit_stage(RedemptionStage::Joined);
