@@ -7155,7 +7155,7 @@ where
                 tokio::select! {
                     biased;
                     maybe = query_request_rx.recv() => {
-                        let Some(req) = maybe else { break; };
+                        let Some(mut req) = maybe else { break; };
                         // Clamp our own request before encoding (defense
                         // in depth — also prevents a misbehaving local
                         // engine from issuing oversized requests). The
@@ -7277,6 +7277,26 @@ where
                         // flipped is racy noise.
                         if drained_clean {
                             (emit_backfill_progress_qr)(fetched, Some(fetched));
+                            // ZEB-418 P3a: page-completion report for
+                            // callers that asked (BackfillLatch).
+                            // `replies` = raw packets drained off the
+                            // reply stream (pre-verification); `limit`
+                            // = the effective clamped limit the GET
+                            // selector above was built with. Send-
+                            // error (receiver dropped) is fine —
+                            // fire-and-forget callers. On the
+                            // !drained_clean shutdown path `req` (and
+                            // the sender) drop without a report, so
+                            // the receiver observes a closed channel
+                            // = "query aborted".
+                            if let Some(tx) = req.outcome_tx.take() {
+                                let _ = tx.send(
+                                    crate::community_channel_log_engine::BackfillPageReport {
+                                        replies: fetched as usize,
+                                        limit,
+                                    },
+                                );
+                            }
                         }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
@@ -7692,6 +7712,110 @@ mod channel_log_adapter_tests {
         // Keep qreq_tx alive until end so the query-request driver
         // doesn't latch the receiver-closed branch before closing
         // is observed.
+        drop(qreq_tx);
+    }
+
+    /// ZEB-418 P3a Task 3: after a backfill query's reply stream
+    /// closes naturally, the qr-driver sends exactly one
+    /// `BackfillPageReport` on the request's `outcome_tx` (when
+    /// `Some`): `replies` = raw packets drained off the Zenoh reply
+    /// stream, `limit` = the effective clamped limit the GET selector
+    /// was built with (here: `limit == 0` in the request → per-engine
+    /// `backfill_default_limit`, which we set to a distinctive 7).
+    ///
+    /// Same single-session in-memory Zenoh shape as the round-trip
+    /// test above: the adapter's own queryable answers the adapter's
+    /// own GET via Zenoh local routing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_log_qr_driver_reports_page_completion_on_stream_close() {
+        use crate::community_channel_log_engine::{BackfillPageReport, BackfillQueryRequest};
+
+        let cfg = zenoh::Config::default();
+        let session = Arc::new(zenoh::open(cfg).await.expect("zenoh open"));
+
+        // pub side unused; keep the sender alive so the publisher
+        // task doesn't exit early.
+        let (_pub_tx, pub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, mut sub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (qreq_tx, qreq_rx) = mpsc::channel::<BackfillQueryRequest>(2);
+
+        // The queryable answers every backfill query with three
+        // packets.
+        let read_for_query = Arc::new(
+            |_since: Option<crate::owner_state_types::Hlc>, _limit: usize| {
+                Box::pin(async move { vec![vec![0xA1_u8], vec![0xA2], vec![0xA3]] })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
+            },
+        );
+
+        let closing = Arc::new(AtomicBool::new(false));
+        let emit_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static> =
+            Arc::new(|_, _| {});
+        const TEST_DEFAULT_LIMIT: usize = 7;
+        let _adapter = spawn_channel_log_zenoh_adapter(
+            Arc::clone(&session),
+            "eeff".repeat(8),
+            "1122".repeat(8),
+            pub_rx,
+            sub_tx,
+            qreq_rx,
+            read_for_query,
+            emit_progress,
+            16,
+            TEST_DEFAULT_LIMIT,
+            Arc::clone(&closing),
+        );
+
+        // The queryable declaration is async; a GET that fires before
+        // it lands gets an immediately-closed reply stream (a clean
+        // zero-reply drain — which itself exercises the report path).
+        // Retry until a report shows all three packets, mirroring the
+        // warmup loop in the round-trip test above.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let report: BackfillPageReport = loop {
+            let (tx, rx) = tokio::sync::oneshot::channel::<BackfillPageReport>();
+            qreq_tx
+                .send(BackfillQueryRequest {
+                    since: None,
+                    limit: 0,
+                    outcome_tx: Some(tx),
+                })
+                .await
+                .expect("qreq send");
+            let report = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+                .await
+                .expect("driver never reported within 2s")
+                .expect("driver dropped outcome_tx without sending a report");
+            assert_eq!(
+                report.limit, TEST_DEFAULT_LIMIT,
+                "limit==0 request must report the clamped per-engine default"
+            );
+            if report.replies == 3 {
+                break report;
+            }
+            assert_eq!(
+                report.replies, 0,
+                "partial drain unexpected with a 3-packet queryable"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queryable never came online within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(report.replies, 3);
+
+        // The drained packets were also forwarded down the normal
+        // subscriber path (reply plumbing unchanged by the report).
+        for _ in 0..3 {
+            let pkt = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+                .await
+                .expect("sub recv timeout")
+                .expect("sub_rx open");
+            assert!(matches!(pkt.as_slice(), [0xA1] | [0xA2] | [0xA3]));
+        }
+
+        closing.store(true, Ordering::SeqCst);
         drop(qreq_tx);
     }
 

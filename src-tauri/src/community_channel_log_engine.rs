@@ -237,15 +237,33 @@ impl Default for ChannelLogEngineConfig {
     }
 }
 
+/// ZEB-418 P3a: what the qr-driver reports after one backfill query's
+/// reply stream closes. `replies` counts raw packets received
+/// (pre-verification — the latch only needs full-page detection; the
+/// post-page watermark is re-read from the log, which only holds
+/// VERIFIED events). `limit` is the effective (clamped) page limit the
+/// GET was issued with.
+#[derive(Debug, Clone, Copy)]
+pub struct BackfillPageReport {
+    pub replies: usize,
+    pub limit: usize,
+}
+
 /// Cross-task message: engine asks adapter to fire a Zenoh query on
 /// its behalf. Per spec §8 — engine cannot touch `zenoh::Session`
 /// directly, so backfill requests cross the boundary as messages.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BackfillQueryRequest {
     /// `None` means "from the earliest available".
     pub since: Option<Hlc>,
     /// `0` means "use server default" (`backfill_default_limit`).
     pub limit: usize,
+    /// ZEB-418 P3a: `Some` → the qr-driver sends exactly one
+    /// `BackfillPageReport` after the query's reply stream closes
+    /// naturally (a shutdown-interrupted drain drops the sender
+    /// instead, so the receiver observes a closed channel). `None` →
+    /// existing fire-and-forget behaviour (IPC path unchanged).
+    pub outcome_tx: Option<tokio::sync::oneshot::Sender<BackfillPageReport>>,
 }
 
 /// Bundles per-instance dependencies + I/O channel endpoints + the
@@ -672,8 +690,39 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
         self: Arc<Self>,
         since: Option<Hlc>,
     ) -> Result<(), ChannelLogEngineError> {
+        self.send_backfill_request(since, None).await
+    }
+
+    /// ZEB-418 P3a: like [`Self::request_backfill`], but threads a
+    /// oneshot through the request so the qr-driver can report when
+    /// the query's reply stream closed and how many raw packets
+    /// arrived (the BackfillLatch's full-page detection input). If the
+    /// query is aborted before a clean stream close (adapter shutdown,
+    /// `session.get` failure), the sender is dropped and `outcome_tx`'s
+    /// receiver resolves to `RecvError` instead of a report.
+    pub async fn request_backfill_with_outcome(
+        self: Arc<Self>,
+        since: Option<Hlc>,
+        outcome_tx: tokio::sync::oneshot::Sender<BackfillPageReport>,
+    ) -> Result<(), ChannelLogEngineError> {
+        self.send_backfill_request(since, Some(outcome_tx)).await
+    }
+
+    /// Shared tail of the two `request_backfill*` entry points.
+    /// `limit: 0` = "qr-driver applies the per-engine
+    /// `backfill_default_limit` (clamped to the adapter-side hard
+    /// max)".
+    async fn send_backfill_request(
+        &self,
+        since: Option<Hlc>,
+        outcome_tx: Option<tokio::sync::oneshot::Sender<BackfillPageReport>>,
+    ) -> Result<(), ChannelLogEngineError> {
         self.query_request_tx
-            .send(BackfillQueryRequest { since, limit: 0 })
+            .send(BackfillQueryRequest {
+                since,
+                limit: 0,
+                outcome_tx,
+            })
             .await
             .map_err(|e| ChannelLogEngineError::BackfillFailed(e.to_string()))
     }
@@ -2850,6 +2899,10 @@ mod tests {
             .expect("timeout")
             .expect("rx open");
         assert!(req.since.is_none());
+        assert!(
+            req.outcome_tx.is_none(),
+            "plain request_backfill must stay fire-and-forget (IPC path)"
+        );
     }
 
     #[tokio::test]
@@ -2874,6 +2927,37 @@ mod tests {
         assert_eq!(got.wall_ms, since.wall_ms);
         assert_eq!(got.logical, since.logical);
         assert_eq!(got.device_id, since.device_id);
+        assert!(
+            req.outcome_tx.is_none(),
+            "plain request_backfill must stay fire-and-forget (IPC path)"
+        );
+    }
+
+    /// ZEB-418 P3a Task 3: `request_backfill_with_outcome` mirrors
+    /// `request_backfill` but threads a oneshot reporting sender
+    /// through the `BackfillQueryRequest` so the qr-driver can tell
+    /// the caller when the reply stream closed (BackfillLatch needs
+    /// full-page detection).
+    #[tokio::test]
+    async fn request_backfill_with_outcome_carries_oneshot() {
+        let mut fix = build_engine_fixture(8, 250, 1000).await;
+
+        let (tx, _rx) = tokio::sync::oneshot::channel::<BackfillPageReport>();
+        Arc::clone(&fix.engine)
+            .request_backfill_with_outcome(None, tx)
+            .await
+            .expect("backfill");
+
+        let req = tokio::time::timeout(Duration::from_millis(500), fix.query_request_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("rx open");
+        assert!(req.since.is_none());
+        assert_eq!(req.limit, 0, "limit 0 = qr-driver applies engine default");
+        assert!(
+            req.outcome_tx.is_some(),
+            "with_outcome variant must carry the oneshot through"
+        );
     }
 
     // ── Sub-task 4A: registry ─────────────────────────────────────────
