@@ -3377,6 +3377,145 @@ mod tests {
         fix.registry.stop(&cid, &chid).await.expect("stop");
     }
 
+    /// ZEB-418 P3a Task 5 (spec D23 trigger 3): a channel CREATED
+    /// MID-SESSION — e.g. a remote member adds #random while this
+    /// device is subscribed — must get a local engine AND a backfill.
+    ///
+    /// Production funnel (verified — no new production code needed):
+    ///   1. the remote `ChannelCreate` materializes via
+    ///      `handle_incoming_publish`, which emits one
+    ///      `CommunityMembershipDelta` per Inserted event
+    ///      (community_state_sync.rs Phase C-pre);
+    ///   2. `run_community_delta_consumer` projects it through
+    ///      `delta_to_channel_config_change` → action `Created`;
+    ///   3. the consumer's registry hook (lib.rs, ZEB-270 Phase 3
+    ///      Task 4.5) hex-decodes the payload ids, derives the
+    ///      channel key from the community engine's membership key
+    ///      and calls `ChannelLogRegistry::spawn`;
+    ///   4. BOTH spawn routes (fast path + transaction-deferred
+    ///      commit drain) funnel through `spawn_inner_now`, which
+    ///      starts the Task-4 backfill driver unconditionally.
+    ///
+    /// This test replays steps 2–4 exactly (same projection fn, same
+    /// id-decode + key-derivation recipe as the production hook)
+    /// against a registry that already has a boot-time channel
+    /// running, and asserts the NEW channel's adapter sees a
+    /// `BackfillQueryRequest { since: None, outcome_tx: Some }`.
+    #[tokio::test(start_paused = true)]
+    async fn mid_session_new_channel_created_spawn_fires_backfill_since_none() {
+        let mut fix = build_backfill_registry_fixture().await;
+        let cid = SpaceId([0xc1; 16]);
+        let boot_chid = ChannelId([0xff; 16]);
+
+        // Mid-session precondition: a boot-time channel (#general
+        // analog) is already live. Drain its adapter request so the
+        // next recv() observes the NEW channel only.
+        let _boot = spawn_under_backfill_fixture(&fix, cid, boot_chid).await;
+        let boot_req = tokio::time::timeout(Duration::from_secs(30), fix.adapter_request_rx.recv())
+            .await
+            .expect("boot adapter request within timeout")
+            .expect("adapter bridge open");
+        assert_eq!(boot_req.channel_id_hex, hex::encode(boot_chid.0));
+
+        // Step 1 analog: a remote member creates #random — the CRDT
+        // apply path emits this delta on Inserted.
+        let new_chid = ChannelId([0xee; 16]);
+        let create_event = crate::community_membership::SignedMembershipEvent {
+            id: [0x0e; 16],
+            community_id: cid,
+            kind: crate::community_membership::MembershipEventKind::ChannelCreate {
+                channel_id: new_chid,
+                name: "random".into(),
+                write_power: 0,
+                kind: crate::community_membership::ChannelKind::Text,
+            },
+            // Remote member, NOT self — mid-session discovery must not
+            // depend on the local device having authored the event.
+            actor: OwnerAddr([0x99; 16]),
+            at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "remote-device".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        };
+
+        // Step 2: the delta consumer's projection.
+        let payload = crate::delta_to_channel_config_change(
+            &crate::community_state_sync::CommunityMembershipDelta {
+                community_id: cid,
+                event: create_event,
+            },
+        )
+        .expect("ChannelCreate must project to a channel-config change");
+        assert_eq!(payload.action, crate::ChannelConfigChangeAction::Created);
+
+        // Step 3: the registry hook's recipe — decode ids from the
+        // payload, derive the channel key, spawn.
+        let cid_bytes: [u8; 16] = hex::decode(&payload.community_id)
+            .expect("community_id hex")
+            .try_into()
+            .expect("16 bytes");
+        let chid_bytes: [u8; 16] = hex::decode(&payload.channel_id)
+            .expect("channel_id hex")
+            .try_into()
+            .expect("16 bytes");
+        let hook_cid = SpaceId(cid_bytes);
+        let hook_chid = ChannelId(chid_bytes);
+        let key = derive_channel_key(&fix.membership_key, &hook_cid, &hook_chid);
+        let outcome = Arc::clone(&fix.registry)
+            .spawn(
+                hook_cid,
+                hook_chid,
+                key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("mid-session spawn");
+        assert!(
+            matches!(outcome, SpawnOutcome::Spawned(_)),
+            "no transaction open mid-session → fast path must return Spawned"
+        );
+
+        // Step 4: the NEW channel's adapter must see the Task-4
+        // backfill driver's first request — fresh log → full history.
+        let adapter_req =
+            tokio::time::timeout(Duration::from_secs(30), fix.adapter_request_rx.recv())
+                .await
+                .expect("new-channel adapter request within timeout")
+                .expect("adapter bridge open");
+        assert_eq!(
+            adapter_req.channel_id_hex,
+            hex::encode(new_chid.0),
+            "adapter request must target the mid-session-created channel"
+        );
+        let mut query_rx = adapter_req.query_request_rx;
+        let query = tokio::time::timeout(Duration::from_secs(30), query_rx.recv())
+            .await
+            .expect("backfill query within timeout")
+            .expect("query channel open");
+        assert_eq!(
+            query.since, None,
+            "brand-new channel has an empty log → watermark None → full history"
+        );
+        assert!(
+            query.outcome_tx.is_some(),
+            "driver requests must thread an outcome oneshot"
+        );
+
+        fix.registry
+            .stop(&cid, &boot_chid)
+            .await
+            .expect("stop boot channel");
+        fix.registry
+            .stop(&hook_cid, &hook_chid)
+            .await
+            .expect("stop new channel");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registry_spawn_idempotent() {
         let fix = build_registry_fixture().await;
