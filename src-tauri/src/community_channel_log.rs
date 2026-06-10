@@ -1242,6 +1242,35 @@ impl ChannelLog {
         ))
     }
 
+    /// Return the highest locally-persisted event HLC for this channel.
+    ///
+    /// This is the **backfill watermark** used by ZEB-418 P3a: when a peer
+    /// joins or reconnects, it passes `max_hlc()` as the `since` argument
+    /// of the history-backfill query so only events newer than the local
+    /// watermark are fetched.
+    ///
+    /// **Invariant:** tail events are strictly newer than any sealed segment
+    /// (seal-order invariant). Every `seal_and_persist` call empties the tail
+    /// and appends a `SegmentDescriptor`; events appended after a seal go into
+    /// the fresh tail. Therefore:
+    ///
+    /// 1. If the tail is non-empty, return the **last** tail event's HLC.
+    ///    (The tail is append-only and per-lane monotone, so the last
+    ///    element carries the highest HLC across all tail entries.)
+    /// 2. Else if the manifest has segments, return the **last segment's
+    ///    upper range bound** (`range.1`). The manifest is kept sorted
+    ///    ascending by `range.0`, so the last entry holds the latest
+    ///    sealed HLC.
+    /// 3. Else `None` — the log is empty; a fresh joiner should request
+    ///    the full history.
+    pub fn max_hlc(&self) -> Option<Hlc> {
+        if let Some(last_event) = self.tail.last() {
+            let SignedChannelEvent::Post { at, .. } = last_event;
+            return Some(at.clone());
+        }
+        self.manifest.segments.last().map(|seg| seg.range.1.clone())
+    }
+
     /// Read all events from a sealed segment. Used by Phase 3 backfill.
     /// Phase 2 ships this for tests (verify seal/reload byte-equality).
     pub fn read_segment(
@@ -2941,5 +2970,112 @@ mod tests {
         let other =
             derive_groupdm_presence_key(&crate::owner_state_types::DmContentKey::new([0x99; 32]));
         assert_ne!(a.as_bytes(), other.as_bytes());
+    }
+
+    // ── ChannelLog::max_hlc tests (ZEB-418 P3a watermark) ──
+
+    #[test]
+    fn max_hlc_none_on_empty_log() {
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig::default(),
+        );
+        assert!(
+            log.max_hlc().is_none(),
+            "fresh empty log must return None — caller requests full history"
+        );
+    }
+
+    #[test]
+    fn max_hlc_reads_tail_when_present() {
+        // Two tail events; max_hlc must return the LAST (newest) one's HLC.
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig {
+                seal_threshold_events: 8,
+            },
+        );
+        let e1 = fixture_signed_event(100_000, 0, "a-dev");
+        let e2 = fixture_signed_event(200_000, 0, "a-dev");
+        log.append(e1).expect("append e1");
+        log.append(e2).expect("append e2");
+        let watermark = log.max_hlc().expect("must be Some with 2 tail events");
+        assert_eq!(
+            watermark.wall_ms, 200_000,
+            "max_hlc must return the last tail event's HLC (wall=200_000)"
+        );
+    }
+
+    #[test]
+    fn max_hlc_reads_last_segment_bound_when_tail_empty() {
+        // One sealed segment ending at a known HLC, empty tail.
+        // max_hlc must return the segment's upper range bound.
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig {
+                seal_threshold_events: 4,
+            },
+        );
+        for i in 0..4u64 {
+            log.append(fixture_signed_event(100_000 + i * 1_000, 0, "a-dev"))
+                .expect("append");
+        }
+        log.seal_and_persist().expect("seal");
+        assert!(log.tail.is_empty(), "tail must be empty after seal");
+        // The sealed segment's range.1 is the last event's HLC: wall=103_000.
+        let watermark = log.max_hlc().expect("must be Some with one segment");
+        assert_eq!(
+            watermark.wall_ms, 103_000,
+            "max_hlc must return the last segment's range.1 HLC when tail is empty"
+        );
+    }
+
+    #[test]
+    fn max_hlc_prefers_tail_over_segments() {
+        // Sealed segment ends at wall=300_000; tail has an event at wall=400_000.
+        // max_hlc must return 400_000 — tail events are strictly newer than any
+        // sealed segment (seal-order invariant).
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig {
+                seal_threshold_events: 4,
+            },
+        );
+        // Build and seal a segment with max HLC at wall=300_000.
+        for i in 0..4u64 {
+            log.append(fixture_signed_event(200_000 + i * 33_000, 0, "a-dev"))
+                .expect("append");
+        }
+        log.seal_and_persist().expect("seal segment");
+        assert_eq!(log.manifest.segments.len(), 1);
+        assert!(log.tail.is_empty());
+        // Add a tail event at wall=400_000 — newer than the segment's range.1.
+        log.append(fixture_signed_event(400_000, 0, "a-dev"))
+            .expect("append tail event");
+        let watermark = log.max_hlc().expect("must be Some");
+        assert_eq!(
+            watermark.wall_ms, 400_000,
+            "max_hlc must prefer tail over sealed segments (tail is always newer)"
+        );
     }
 }
