@@ -57,16 +57,16 @@ pub struct DepositFrame {
     pub sender_owner: [u8; 16],
     /// Canonical CBOR of the sender device's `EnrollmentCert`, verified
     /// against the sender owner's master key.
-    #[serde(rename = "ec")]
+    #[serde(rename = "ec", with = "serde_bytes")]
     pub sender_enrollment_cert: Vec<u8>,
     /// 64-byte device ed25519 signature over
     /// `BUTLER_DEPOSIT_SIG_DOMAIN ‖ recipient_owner ‖ sealed_blob`
     /// ([`deposit_sig_payload`]).
-    #[serde(rename = "sg")]
+    #[serde(rename = "sg", with = "serde_bytes")]
     pub sig: Vec<u8>,
     /// [`DepositPayload`] canonical CBOR, sealed to the butler device's
     /// birational X25519 key with [`BUTLER_DEPOSIT_SEAL_INFO`].
-    #[serde(rename = "sb")]
+    #[serde(rename = "sb", with = "serde_bytes")]
     pub sealed_blob: Vec<u8>,
 }
 
@@ -76,7 +76,7 @@ pub struct DepositFrame {
 pub struct DepositAck {
     #[serde(rename = "sp")]
     pub space_id: [u8; 16],
-    #[serde(rename = "mc")]
+    #[serde(rename = "mc", with = "serde_bytes")]
     pub message_cid: Vec<u8>,
 }
 
@@ -86,10 +86,10 @@ pub struct DepositAck {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DepositPayload {
     /// Full signed CidNotify packet bytes (discriminant+body+sig).
-    #[serde(rename = "cn")]
+    #[serde(rename = "cn", with = "serde_bytes")]
     pub cidnotify_packet: Vec<u8>,
     /// The CAS storage blob ([ver][nonce][ct][tag]).
-    #[serde(rename = "pl")]
+    #[serde(rename = "pl", with = "serde_bytes")]
     pub storage_blob: Vec<u8>,
 }
 
@@ -264,9 +264,11 @@ mod tests {
     /// FIRST VERIFIED RUN of this test (run once with "FILL_AFTER", paste
     /// the actual hex from the panic message). Any change to it after that
     /// first pin means the wire format changed and old peers break.
+    /// (Regenerated ONCE pre-ship, 2026-06-09, when the Vec<u8> payload
+    /// fields moved to serde_bytes/bstr packing — nothing had shipped yet.)
     #[test]
     fn deposit_frame_wire_fixture_pinned() {
-        const EXPECTED_DEPOSIT_FRAME_HEX: &str = "a562726f901111111111111111111111111111111162736f9018221822182218221822182218221822182218221822182218221822182218226265638418e118e218e318e462736798400909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090962736283185b185c185d";
+        const EXPECTED_DEPOSIT_FRAME_HEX: &str = "a562726f901111111111111111111111111111111162736f90182218221822182218221822182218221822182218221822182218221822182262656344e1e2e3e4627367584009090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909627362435b5c5d";
         let bytes = encode_deposit_frame(&fixture_frame()).expect("encode");
         let actual = hex::encode(&bytes);
         assert_eq!(

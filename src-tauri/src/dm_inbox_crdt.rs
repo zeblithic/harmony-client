@@ -15,10 +15,10 @@ pub struct DmInboxEntry {
     #[serde(rename = "so")]
     pub sender_owner: [u8; 16],
     /// Full signed CidNotify packet bytes (discriminant+body+sig).
-    #[serde(rename = "cn")]
+    #[serde(rename = "cn", with = "serde_bytes")]
     pub cidnotify_packet: Vec<u8>,
     /// The CAS storage blob ([ver][nonce][ct][tag]).
-    #[serde(rename = "pl")]
+    #[serde(rename = "pl", with = "serde_bytes")]
     pub storage_blob: Vec<u8>,
     #[serde(rename = "da")]
     pub deposited_at: Hlc,
