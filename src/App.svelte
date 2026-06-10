@@ -1106,16 +1106,20 @@
   let pickerContacts = $derived(
     isTauri() ? (dmContacts ?? EMPTY_DM_CONTACTS) : navService.profiles
   );
-  // Monotonic token so overlapping refreshes (connect + friend-list-changed
-  // + dialog open can race) commit only the newest listFriends response —
-  // an older reply resolving late must not overwrite a newer map
-  // (Cursor PR #225 R2).
-  let dmContactsRefreshGen = 0;
+  // Monotonic sequencing so overlapping refreshes (connect + friend-list-
+  // changed + dialog open can race) never let an older listFriends reply
+  // overwrite a newer committed map (Cursor PR #225 R2). The guard compares
+  // against the last COMMITTED sequence, not the last started one — a newer
+  // call that FAILS carries no data and must not invalidate an older
+  // in-flight success (Cursor R4: failures are inert).
+  let dmContactsRefreshSeq = 0;
+  let dmContactsCommittedSeq = 0;
   async function refreshDmContacts(): Promise<void> {
-    const gen = ++dmContactsRefreshGen;
+    const seq = ++dmContactsRefreshSeq;
     try {
       const friends = await friendService.listFriends();
-      if (gen !== dmContactsRefreshGen) return; // superseded by a newer refresh
+      if (seq <= dmContactsCommittedSeq) return; // a newer success already committed
+      dmContactsCommittedSeq = seq;
       dmContacts = contactsFromFriends(friends);
     } catch (e) {
       // Expected pre-owner-load ("owner not loaded") and in mock mode
@@ -3124,6 +3128,7 @@
     >
       <DmCreateDialog
         profiles={pickerContacts}
+        friendSourced={isTauri()}
         initialKind={dmCreateInitialKind}
         onSubmit={handleDmCreate}
         onCancel={() => { dmCreateDialogOpen = false; }}

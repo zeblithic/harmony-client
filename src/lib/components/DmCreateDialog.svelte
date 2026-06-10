@@ -7,6 +7,7 @@
     onCancel,
     initialKind = 'dm',
     onConvertToCommunity,
+    friendSourced = true,
   }: {
     profiles: Map<string, Profile>;
     onSubmit: (args: { kind: 'dm' | 'group-dm'; members: string[]; name: string }) => void;
@@ -23,6 +24,11 @@
      *  with no orphan button. ZEB-228 acceptance criteria require this
      *  handoff once Sub-C ships. */
     onConvertToCommunity?: () => void;
+    /** ZEB-431: whether `profiles` is sourced from the friend graph (Tauri,
+     *  default) or the legacy presence/mock map (browser demo mode). Picks
+     *  the matching empty-state guidance — "add a friend" is wrong advice
+     *  when the list is presence-fed. */
+    friendSourced?: boolean;
   } = $props();
 
   const MAX_RECIPIENTS = 15;
@@ -111,7 +117,11 @@
     {#if filteredProfiles.length === 0}
       <p class="empty">
         {#if searchQuery === '' && profiles.size === 0}
-          No contacts yet — add a friend to start a DM.
+          {#if friendSourced}
+            No contacts yet — add a friend to start a DM.
+          {:else}
+            No contacts yet — they'll appear here as demo peers come online.
+          {/if}
         {:else if searchQuery === ''}
           No more contacts available.
         {:else}
