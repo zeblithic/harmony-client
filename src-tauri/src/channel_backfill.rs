@@ -29,9 +29,10 @@
 //! (page outcomes, wall-clock milliseconds) and actions come out
 //! ([`BackfillAction::Request`] / [`BackfillAction::WaitUntil`] /
 //! [`BackfillAction::Idle`]), so the full paging/backoff/in-flight state
-//! space is testable without a runtime. The async driver that owns the
-//! transport lands in a later task and merely interprets the actions.
-//! Precedent: `dm_outhold_apply`'s sweeper core.
+//! space is testable without a runtime. [`run_backfill_driver`] is the
+//! async interpreter of those actions — transport access stays behind
+//! injected closures, so the driver too is testable with stubs.
+//! Precedent: `dm_outhold_apply`'s sweeper core + sweeper task split.
 //!
 //! Spec: `docs/specs/2026-06-10-zeb-418-sp2-p3a-channel-backfill-design.md`.
 
@@ -173,6 +174,103 @@ impl BackfillLatch {
     /// hook); clears in-flight and backoff state.
     pub fn reset(&mut self, watermark: Option<Hlc>) {
         *self = Self::new(watermark);
+    }
+}
+
+// ── Async driver (ZEB-418 P3a Task 4) ───────────────────────────────────────
+
+/// Floor for the driver's backoff sleeps (ms). Defensive: guards
+/// against a hot loop if the injected clock ever lags the latch's
+/// `next_retry_at` (the latch's in-flight `WaitUntil` clamp can hand
+/// back a target equal to `now`).
+const BACKFILL_DRIVER_MIN_WAIT_MS: u64 = 250;
+
+/// Drive one channel's [`BackfillLatch`] to satisfaction, then return.
+///
+/// Spawned by `ChannelLogRegistry::spawn` for every freshly inserted
+/// engine entry — running it unconditionally at engine start unifies
+/// the spec's join + reconnect triggers: a fresh joiner's empty log
+/// gives a `None` watermark (request full history), a reconnecting
+/// device's reloaded log gives `Some(watermark)` (catch-up).
+///
+/// - `request_page(since)` issues one backfill query and resolves to
+///   `Some((replies, limit))` after the reply stream closes cleanly,
+///   or `None` on no-reply/abort (mapped to backoff via
+///   [`BackfillLatch::on_no_reply`]).
+/// - `current_watermark()` re-reads the max HLC from the LOG after a
+///   full page. The watermark is deliberately NOT taken from the raw
+///   reply packets: only verified events land in the log, so a hostile
+///   holder serving garbage can't advance `since` past history it
+///   never actually delivered. (Async because the log sits behind a
+///   `tokio::sync::Mutex` — a sync `try_lock` here could miss under
+///   contention and stall `since`, spinning the no-backoff paging
+///   loop.)
+/// - `shutdown_rx` flipping to `true` — or its sender dropping —
+///   ends the driver promptly during a backoff wait.
+/// - `now_ms` injects the wall clock (dm_outhold_apply testability
+///   precedent): production passes a `SystemTime`-based closure;
+///   tests pair a `tokio::time::Instant`-based closure with paused
+///   time so no test ever sleeps for real.
+pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
+    mut latch: BackfillLatch,
+    request_page: Rq,
+    current_watermark: Wm,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    now_ms: impl Fn() -> u64,
+) where
+    Rq: Fn(Option<Hlc>) -> RqFut,
+    RqFut: std::future::Future<Output = Option<(usize, usize)>>,
+    Wm: Fn() -> WmFut,
+    WmFut: std::future::Future<Output = Option<Hlc>>,
+{
+    loop {
+        // Cheap pre-check: covers "stopped before the driver's first
+        // poll" (spawn/stop race) without waiting for a `changed()`.
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        match latch.next_action(now_ms()) {
+            BackfillAction::Idle => return,
+            BackfillAction::WaitUntil(target) => {
+                let wait_ms = target
+                    .saturating_sub(now_ms())
+                    .max(BACKFILL_DRIVER_MIN_WAIT_MS);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(wait_ms)) => {}
+                    changed = shutdown_rx.changed() => {
+                        // Err = sender dropped (registry entry gone):
+                        // same as an explicit shutdown signal.
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
+            BackfillAction::Request { since } => match request_page(since).await {
+                Some((replies, limit)) => {
+                    let full_page = limit > 0 && replies >= limit;
+                    // Watermark re-read from the LOG (only verified
+                    // events land there) rather than trusted from the
+                    // raw reply packets — a hostile holder serving
+                    // garbage can't advance `since`. See the
+                    // `current_watermark` doc above.
+                    let max_hlc_seen = if full_page {
+                        current_watermark().await
+                    } else {
+                        None
+                    };
+                    latch.on_page_complete(
+                        PageOutcome {
+                            events: replies,
+                            max_hlc_seen,
+                            limit,
+                        },
+                        now_ms(),
+                    );
+                }
+                None => latch.on_no_reply(now_ms()),
+            },
+        }
     }
 }
 
@@ -376,6 +474,201 @@ mod tests {
                 since: Some(hlc(900))
             }
         );
+    }
+
+    // ── ZEB-418 P3a Task 4: async driver ─────────────────────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn driver_retries_until_holder_appears_then_satisfies() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        // Calls 1-2: no reply (no holder online). Call 3: a holder
+        // answers with a short page (3 < 256) → satisfied.
+        let request_page = move |_since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 3 {
+                    None
+                } else {
+                    Some((3usize, 256usize))
+                }
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            || async { None::<Hlc> },
+            shutdown_rx,
+            move || start.elapsed().as_millis() as u64,
+        )
+        .await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            3,
+            "exactly three requests: two unanswered, one satisfied"
+        );
+        // Backoff schedule: no-reply at t=0 → retry at 30s; no-reply at
+        // 30s → retry at 90s. Paused time must have advanced past both
+        // marks for the driver future to have completed.
+        assert!(
+            start.elapsed() >= Duration::from_millis(90_000),
+            "driver must wait out the 30s and 90s backoff marks, \
+             elapsed {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn driver_pages_through_full_pages_without_backoff() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let sinces: Arc<StdMutex<Vec<Option<Hlc>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let counter = Arc::clone(&requests);
+        let since_log = Arc::clone(&sinces);
+        // Two full pages (256/256) then a short page (5/256).
+        let request_page = move |since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            let since_log = Arc::clone(&since_log);
+            async move {
+                since_log.lock().unwrap().push(since);
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Some((256usize, 256usize))
+                } else {
+                    Some((5usize, 256usize))
+                }
+            }
+        };
+        // The log-side watermark advances on each read — the driver
+        // must re-read it after every FULL page and pass it as the
+        // next `since`.
+        let watermark_reads = Arc::new(AtomicUsize::new(0));
+        let wm_counter = Arc::clone(&watermark_reads);
+        let current_watermark = move || {
+            let n = wm_counter.fetch_add(1, Ordering::SeqCst) as u64;
+            async move { Some(hlc(1_000 + n)) }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            current_watermark,
+            shutdown_rx,
+            move || start.elapsed().as_millis() as u64,
+        )
+        .await;
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        // Immediate paging: under paused time the future completes
+        // without ever sleeping — any backoff between pages would
+        // show up as auto-advanced elapsed time.
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "full-page paging must re-request immediately with no backoff"
+        );
+        assert_eq!(
+            *sinces.lock().unwrap(),
+            vec![None, Some(hlc(1_000)), Some(hlc(1_001))],
+            "since must advance to the log watermark after each full page"
+        );
+        assert_eq!(
+            watermark_reads.load(Ordering::SeqCst),
+            2,
+            "watermark is re-read once per FULL page only"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn driver_stops_on_shutdown_signal() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_page = move |_since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                None::<(usize, usize)>
+            }
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            || async { None::<Hlc> },
+            shutdown_rx,
+            move || start.elapsed().as_millis() as u64,
+        ));
+        // Let the driver issue request #1 and arm its 30s backoff
+        // sleep. yield_now keeps the test task runnable so paused time
+        // does NOT auto-advance here.
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        shutdown_tx.send(true).expect("send shutdown");
+        driver.await.expect("driver task");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "no retry may fire after the shutdown signal"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn driver_aborted_query_backs_off() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        // Call 1: aborted query (oneshot RecvError maps to None).
+        // Call 2: clean empty page → satisfied.
+        let request_page = move |_since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    None
+                } else {
+                    Some((0usize, 256usize))
+                }
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            || async { None::<Hlc> },
+            shutdown_rx,
+            move || start.elapsed().as_millis() as u64,
+        ));
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Just shy of the 30s backoff: the retry must NOT have fired.
+        tokio::time::advance(Duration::from_millis(29_999)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "second request must wait out the full 30s backoff"
+        );
+        // Cross the 30s mark: retry fires, clean empty page satisfies.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        driver.await.expect("driver task");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     #[test]

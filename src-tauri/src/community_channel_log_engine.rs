@@ -559,6 +559,14 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
         Ok(out)
     }
 
+    /// ZEB-418 P3a: max HLC currently in the verified log (segments +
+    /// tail). The backfill driver's watermark source — only verified
+    /// events land in the log, so a hostile holder serving garbage
+    /// replies can't advance the driver's `since` cursor.
+    pub async fn log_max_hlc(&self) -> Option<Hlc> {
+        self.log.lock().await.max_hlc()
+    }
+
     /// IPC entry: mint a Post event, sign it with self, encrypt with
     /// ChannelKey, send the packet to publisher_tx, locally append to
     /// the log, emit `channel-message-received` Tauri event.
@@ -1136,6 +1144,14 @@ struct EngineEntry<R: tauri::Runtime> {
     /// closing-poll. Independent from the engine's internal closing
     /// flag — see `event_loop::ChannelLogAdapterRequest.closing` doc.
     closing: Arc<AtomicBool>,
+    /// ZEB-418 P3a: shutdown signal for the per-channel backfill
+    /// driver spawned alongside the engine. Lives next to `closing`
+    /// and is flipped to `true` wherever `closing` flips (registry
+    /// `stop`, which `shutdown_all` funnels through). Dropping the
+    /// entry also closes the watch channel, which the driver treats
+    /// as shutdown — so error paths that skip the explicit send still
+    /// end the driver.
+    backfill_shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 // ── CommunityTransactionGuard ─────────────────────────────────────────────────
@@ -1577,6 +1593,10 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
             );
 
         let closing = Arc::new(AtomicBool::new(false));
+        // ZEB-418 P3a: lifecycle signal for the backfill driver
+        // spawned below. The sender lives in the `EngineEntry` next to
+        // `closing`; `stop()` flips both together.
+        let (backfill_shutdown_tx, backfill_shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Re-check under the engines lock — a concurrent spawn may
         // have inserted for the same key while we were doing the
@@ -1611,9 +1631,11 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                     );
                 }
                 // closing flag wasn't published anywhere yet; just
-                // drop it. publisher_rx / subscriber_tx /
-                // query_request_rx are dropped at scope end — never
-                // wired to a Zenoh adapter, so no observable effect.
+                // drop it (same for the backfill watch — the driver
+                // is only spawned after a winning insert, below).
+                // publisher_rx / subscriber_tx / query_request_rx are
+                // dropped at scope end — never wired to a Zenoh
+                // adapter, so no observable effect.
                 return Ok(existing);
             }
             engines.insert(
@@ -1621,6 +1643,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                 EngineEntry {
                     engine: Arc::clone(&engine),
                     closing: Arc::clone(&closing),
+                    backfill_shutdown_tx,
                 },
             );
         }
@@ -1693,6 +1716,54 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
             );
         }
 
+        // ZEB-418 P3a: every freshly inserted engine entry starts a
+        // backfill driver. Running it unconditionally at engine start
+        // unifies the spec's join + reconnect triggers: a fresh
+        // joiner's empty log yields watermark None (request full
+        // history); a reconnecting device's reloaded log yields
+        // Some(watermark) (catch-up). The idempotent already-exists
+        // paths above return earlier, so exactly one driver runs per
+        // live entry.
+        let latch = crate::channel_backfill::BackfillLatch::new(engine.log_max_hlc().await);
+        let request_engine = Arc::clone(&engine);
+        let watermark_engine = Arc::clone(&engine);
+        tokio::spawn(crate::channel_backfill::run_backfill_driver(
+            latch,
+            move |since: Option<Hlc>| {
+                let me = Arc::clone(&request_engine);
+                async move {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    // Send failure = engine shutting down (query
+                    // bridge closed): map to no-reply; the driver
+                    // backs off and the shutdown watch ends it.
+                    if me.request_backfill_with_outcome(since, tx).await.is_err() {
+                        return None;
+                    }
+                    match rx.await {
+                        Ok(report) => Some((report.replies, report.limit)),
+                        // Sender dropped before a clean reply-stream
+                        // close: query aborted (adapter shutdown /
+                        // GET failure) — treat as no-reply → backoff.
+                        Err(_) => None,
+                    }
+                }
+            },
+            move || {
+                let me = Arc::clone(&watermark_engine);
+                // Post-page watermark is re-read from the LOG (only
+                // verified events land there), never taken from raw
+                // reply packets — see `run_backfill_driver` doc.
+                async move { me.log_max_hlc().await }
+            },
+            backfill_shutdown_rx,
+            || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            },
+        ));
+
         Ok(engine)
     }
 
@@ -1746,7 +1817,12 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
             let mut engines = self.engines.lock().await;
             engines.remove(&key)
         };
-        let Some(EngineEntry { engine, closing }) = entry else {
+        let Some(EngineEntry {
+            engine,
+            closing,
+            backfill_shutdown_tx,
+        }) = entry
+        else {
             // Stop-of-unknown is a no-op (mirrors
             // CommunitySyncRegistry::stop_engine semantics).
             return Ok(());
@@ -1755,6 +1831,13 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         engine.shutdown().await?;
 
         closing.store(true, Ordering::SeqCst);
+        // ZEB-418 P3a: stop the backfill driver alongside the adapter
+        // — paired with every `closing` flip (this is the registry's
+        // only one; `shutdown_all` funnels through here). Send fails
+        // only if the driver already exited; either way the sender
+        // drops with this frame, which the driver also treats as
+        // shutdown — so the early-`?` return above ends it too.
+        let _ = backfill_shutdown_tx.send(true);
         // ZEB-270 Phase 3 Task 4.5: the adapter `JoinHandle` is owned
         // by `event_loop::run` (the bridge architecture moved it out
         // of the registry). Flipping `closing` above causes the
@@ -3130,6 +3213,168 @@ mod tests {
     #[allow(dead_code)]
     fn _registry_fixture_field_use(fix: &RegistryFixture) -> OwnerAddr {
         fix.self_owner
+    }
+
+    // ── ZEB-418 P3a Task 4: registry-spawn backfill driver ───────────
+
+    /// Fixture variant for backfill-driver tests: same registry shape
+    /// as `build_registry_fixture`, but the test holds the adapter-
+    /// bridge receiver itself (no Zenoh session, no drainer) so it can
+    /// intercept each spawned channel's `query_request_rx` and observe
+    /// the backfill driver's wire-side requests directly. No Zenoh
+    /// means the default `current_thread` test flavor works here.
+    struct BackfillRegistryFixture {
+        registry: Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+        state: Arc<AlwaysJoinedState>,
+        hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+        membership_key: EpochKey,
+        adapter_request_rx: mpsc::UnboundedReceiver<crate::event_loop::ChannelLogAdapterRequest>,
+        _tmp: TempDir,
+    }
+
+    async fn build_backfill_registry_fixture() -> BackfillRegistryFixture {
+        let tmp = TempDir::new().expect("tempdir");
+
+        let (signing_key_raw, self_owner, _identity_pub_64) = fixture_identity(0x42);
+        let signing_key = Arc::new(signing_key_raw);
+
+        let stub_channel_id = ChannelId([0xff; 16]);
+        let state = Arc::new(AlwaysJoinedState {
+            channel_id: stub_channel_id,
+            owner: self_owner,
+            enrolled_key: signing_key.verifying_key().to_bytes(),
+        });
+
+        let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+
+        let app = tauri::test::mock_app().handle().clone();
+
+        let (adapter_request_tx, adapter_request_rx) =
+            mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
+
+        let config = ChannelLogRegistryConfig {
+            adapter_request_tx,
+            app,
+            identity_dir: tmp.path().to_path_buf(),
+            self_owner,
+            self_device_id: "backfill-test-device".to_string(),
+            signing_key,
+            engine_config: ChannelLogEngineConfig {
+                log_config: ChannelLogConfig {
+                    seal_threshold_events: 8,
+                },
+                ..Default::default()
+            },
+        };
+        let registry = ChannelLogRegistry::new(config);
+
+        BackfillRegistryFixture {
+            registry,
+            state,
+            hlc_tracker,
+            membership_key: EpochKey::new([0x55; 32]),
+            adapter_request_rx,
+            _tmp: tmp,
+        }
+    }
+
+    /// `spawn_under_fixture` twin for the backfill fixture.
+    async fn spawn_under_backfill_fixture(
+        fix: &BackfillRegistryFixture,
+        community_id: SpaceId,
+        channel_id: ChannelId,
+    ) -> Arc<ChannelLogEngine<tauri::test::MockRuntime>> {
+        let key = derive_channel_key(&fix.membership_key, &community_id, &channel_id);
+        match Arc::clone(&fix.registry)
+            .spawn(
+                community_id,
+                channel_id,
+                key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("spawn")
+        {
+            SpawnOutcome::Spawned(engine) => engine,
+            SpawnOutcome::DeferredForCommit => {
+                panic!("no transaction open in backfill fixture tests")
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_spawn_fires_backfill_request_fresh_log_since_none() {
+        let mut fix = build_backfill_registry_fixture().await;
+        let cid = SpaceId([0xc1; 16]);
+        let chid = ChannelId([0xff; 16]);
+
+        // Spawn alone must start the backfill driver — no manual
+        // request_backfill call anywhere in this test.
+        let _engine = spawn_under_backfill_fixture(&fix, cid, chid).await;
+
+        let adapter_req =
+            tokio::time::timeout(Duration::from_secs(30), fix.adapter_request_rx.recv())
+                .await
+                .expect("adapter request within timeout")
+                .expect("adapter bridge open");
+        let mut query_rx = adapter_req.query_request_rx;
+        let query = tokio::time::timeout(Duration::from_secs(30), query_rx.recv())
+            .await
+            .expect("backfill query within timeout")
+            .expect("query channel open");
+        assert_eq!(
+            query.since, None,
+            "fresh joiner's empty log → watermark None → full history"
+        );
+        assert!(
+            query.outcome_tx.is_some(),
+            "driver requests must thread an outcome oneshot"
+        );
+
+        fix.registry.stop(&cid, &chid).await.expect("stop");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_respawn_backfill_request_since_log_watermark() {
+        let mut fix = build_backfill_registry_fixture().await;
+        let cid = SpaceId([0xc1; 16]);
+        let chid = ChannelId([0xff; 16]);
+
+        let engine = spawn_under_backfill_fixture(&fix, cid, chid).await;
+        // Drain spawn #1's adapter request (fresh-log driver).
+        let _req1 = tokio::time::timeout(Duration::from_secs(30), fix.adapter_request_rx.recv())
+            .await
+            .expect("adapter request within timeout")
+            .expect("adapter bridge open");
+
+        // Write one post so the log has a watermark, then stop (which
+        // flushes the tail durably) and respawn — the reconnect path.
+        engine
+            .publish(b"hello".to_vec(), None)
+            .await
+            .expect("publish");
+        let expected = engine.log_max_hlc().await;
+        assert!(expected.is_some(), "publish must set a log watermark");
+        fix.registry.stop(&cid, &chid).await.expect("stop");
+
+        let _engine2 = spawn_under_backfill_fixture(&fix, cid, chid).await;
+        let adapter_req2 =
+            tokio::time::timeout(Duration::from_secs(30), fix.adapter_request_rx.recv())
+                .await
+                .expect("adapter request within timeout")
+                .expect("adapter bridge open");
+        let mut query_rx = adapter_req2.query_request_rx;
+        let query = tokio::time::timeout(Duration::from_secs(30), query_rx.recv())
+            .await
+            .expect("backfill query within timeout")
+            .expect("query channel open");
+        assert_eq!(
+            query.since, expected,
+            "respawned engine must catch up from the persisted log watermark"
+        );
+
+        fix.registry.stop(&cid, &chid).await.expect("stop");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
