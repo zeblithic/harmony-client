@@ -1678,6 +1678,17 @@
               // owner still unavailable — leave selfOwnerId null for a later retry
             }
           }
+          // ZEB-431 (Qodo R3): the connect-time refreshDmContacts fails in
+          // the same owner-loads-after-start_node window as get_owner_state
+          // above, leaving the picker source null (empty picker in Tauri
+          // mode, even for an already-open dialog). Retry once the session
+          // is confirmed up, gated on the never-hydrated state so routine
+          // reconnects don't re-IPC — after first hydration, friend-list-
+          // changed and dialog-open refreshes keep the map fresh. dmContacts
+          // is $state, so an open dialog converges live via pickerContacts.
+          if (dmContacts === null) {
+            void refreshDmContacts();
+          }
           // ZEB-351: (re)attempt the voice-session build on reconnect — the
           // get_self_voice_identity IPC may not have been ready at boot. The
           // one-shot guard inside makes this a no-op once it has succeeded.
