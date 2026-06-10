@@ -41,11 +41,18 @@ fn integration_test_builds_cannot_open_the_real_keychain() {
 fn disable_env_refuses_even_with_allow_override() {
     std::env::set_var("HARMONY_DISABLE_KEYCHAIN", "1");
     std::env::set_var("HARMONY_ALLOW_REAL_KEYCHAIN", "1");
-    let refused = KeychainStore::new().is_err();
+    let result = KeychainStore::new();
     std::env::remove_var("HARMONY_DISABLE_KEYCHAIN");
     std::env::remove_var("HARMONY_ALLOW_REAL_KEYCHAIN");
+    // Assert the DISABLE branch specifically — a bare is_err() would also
+    // pass on the test-build refusal or a backend failure and wouldn't pin
+    // the precedence guarantee (disable beats allow).
+    let err = match result {
+        Ok(_) => panic!("HARMONY_DISABLE_KEYCHAIN must win over the allow override"),
+        Err(e) => e,
+    };
     assert!(
-        refused,
-        "HARMONY_DISABLE_KEYCHAIN must win over the allow override"
+        err.contains("HARMONY_DISABLE_KEYCHAIN"),
+        "expected the disable-branch error, got: {err}"
     );
 }
