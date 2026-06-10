@@ -1106,9 +1106,17 @@
   let pickerContacts = $derived(
     isTauri() ? (dmContacts ?? EMPTY_DM_CONTACTS) : navService.profiles
   );
+  // Monotonic token so overlapping refreshes (connect + friend-list-changed
+  // + dialog open can race) commit only the newest listFriends response —
+  // an older reply resolving late must not overwrite a newer map
+  // (Cursor PR #225 R2).
+  let dmContactsRefreshGen = 0;
   async function refreshDmContacts(): Promise<void> {
+    const gen = ++dmContactsRefreshGen;
     try {
-      dmContacts = contactsFromFriends(await friendService.listFriends());
+      const friends = await friendService.listFriends();
+      if (gen !== dmContactsRefreshGen) return; // superseded by a newer refresh
+      dmContacts = contactsFromFriends(friends);
     } catch (e) {
       // Expected pre-owner-load ("owner not loaded") and in mock mode
       // (no adapter). Keep the last known-good map rather than wiping —
