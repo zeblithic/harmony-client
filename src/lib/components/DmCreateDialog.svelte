@@ -111,7 +111,7 @@
     {#if filteredProfiles.length === 0}
       <p class="empty">
         {#if searchQuery === '' && profiles.size === 0}
-          No contacts yet — they'll appear here as your peers come online.
+          No contacts yet — add a friend to start a DM.
         {:else if searchQuery === ''}
           No more contacts available.
         {:else}

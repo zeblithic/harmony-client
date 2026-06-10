@@ -42,7 +42,7 @@
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
-  import { FriendService } from './lib/friend-service';
+  import { FriendService, contactsFromFriends } from './lib/friend-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
   import { NotificationService } from './lib/notification-service';
@@ -957,6 +957,16 @@
     }
   }
 
+  // ZEB-431: single entry point for the DM-create modal. The refresh
+  // re-pulls the friend graph at open time so a friend added moments
+  // earlier (or on another device, missed-event case) is listed without
+  // waiting for a friend-list-changed emit.
+  function openDmCreate(kind: 'dm' | 'group-dm') {
+    dmCreateInitialKind = kind;
+    dmCreateDialogOpen = true;
+    void refreshDmContacts();
+  }
+
   async function handleDmCreate(args: { kind: 'dm' | 'group-dm'; members: string[]; name: string }) {
     try {
       const { invoke } = await import('@tauri-apps/api/core');
@@ -1081,6 +1091,29 @@
   // FriendsPanel.
   const friendService = new FriendService();
   $effect(() => () => friendService.destroy());
+  // ── ZEB-431: DM contact picker source ──────────────────────────────
+  // The picker lists Active friends (keyed by master ownerIdHex — the
+  // identifier class `add_space` members require), NOT zenoh presence
+  // profiles (which are keyed by device identity hash and only exist
+  // for peers whose broadcast traversed our mesh this session). `null`
+  // means "never hydrated" — browser/mock mode stays on the legacy
+  // navService.profiles fallback at the DmCreateDialog call site.
+  let dmContacts: Map<string, Profile> | null = $state(null);
+  async function refreshDmContacts(): Promise<void> {
+    try {
+      dmContacts = contactsFromFriends(await friendService.listFriends());
+    } catch (e) {
+      // Expected pre-owner-load ("owner not loaded") and in mock mode
+      // (no adapter). Keep the last known-good map rather than wiping —
+      // the friend-list-changed listener and dialog-open refresh retry.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.debug('[harmony-client] refreshDmContacts skipped:', msg);
+    }
+  }
+  // Covers add/remove/accept from any device, incl. ZEB-419 nickname
+  // edits (those emit friend-list-changed too). Listener set is cleared
+  // by friendService.destroy() on unmount.
+  friendService.onFriendsChanged(() => void refreshDmContacts());
   // ZEB-419: a SECOND MemberCardService dedicated to the Friends panel. It must
   // NOT share the roster instance: subscribeVisible(ids) reconciles to EXACTLY
   // the passed set, so friends + roster would unsubscribe each other. The panel
@@ -1510,6 +1543,10 @@
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
       await tryConnect('community', communityService.connectAdapter(adapter));
       await tryConnect('friend', friendService.connectAdapter(adapter));
+      // ZEB-431: hydrate the DM contact picker from the friend graph.
+      // Fire-and-forget: pre-owner-load failure is recovered by the
+      // friend-list-changed listener and the dialog-open refresh.
+      void refreshDmContacts();
       await tryConnect('channelMessage', channelMessageService.connectAdapter(adapter));
       avatarResolver.connectAdapter(adapter);
       // ZEB-345 Task 10: wire the lazy profile-page resolver so panel opens can
@@ -2600,8 +2637,8 @@
         onFolderSelect={handleNavigateFolder}
         filters={fileFilters}
         onFilterChange={(filters) => { fileFilters = filters; }}
-        onNewDm={() => { dmCreateInitialKind = 'dm'; dmCreateDialogOpen = true; }}
-        onNewGroupDm={() => { dmCreateInitialKind = 'group-dm'; dmCreateDialogOpen = true; }}
+        onNewDm={() => openDmCreate('dm')}
+        onNewGroupDm={() => openDmCreate('group-dm')}
         onNewCommunity={() => { showCreateCommunity = true; createError = null; }}
         onRedeemInvite={() => { showRedeemInvite = true; redeemError = null; redeemUrl = ''; }}
         onBrowseLibraries={() => { libraryDirectoryOpen = true; }}
@@ -2612,7 +2649,7 @@
         <button
           type="button"
           class="new-dm-button"
-          onclick={() => { dmCreateInitialKind = 'dm'; dmCreateDialogOpen = true; }}
+          onclick={() => openDmCreate('dm')}
           title="New direct message"
         >
           <span aria-hidden="true">+</span> New DM
@@ -3060,7 +3097,7 @@
       onclick={(e) => e.stopPropagation()}
     >
       <DmCreateDialog
-        profiles={navService.profiles}
+        profiles={dmContacts ?? navService.profiles}
         initialKind={dmCreateInitialKind}
         onSubmit={handleDmCreate}
         onCancel={() => { dmCreateDialogOpen = false; }}
