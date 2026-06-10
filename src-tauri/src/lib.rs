@@ -45415,9 +45415,11 @@ mod butler_pin_tests {
         let unknown_id = "bb".repeat(32);
         let enrolled = enrolled_set(&[&known_id]);
 
-        let mut initial_doc = FleetNetDoc::default();
-        initial_doc.pinned = Some(known_id.clone());
-        initial_doc.pinned_at = hlc(100, "self");
+        let initial_doc = FleetNetDoc {
+            pinned: Some(known_id.clone()),
+            pinned_at: hlc(100, "self"),
+            ..Default::default()
+        };
 
         let doc = Arc::new(Mutex::new(initial_doc.clone()));
 

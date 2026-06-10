@@ -378,13 +378,17 @@ mod tests {
     #[test]
     fn pin_lww_pair_merges() {
         // Remote has a strictly newer pinned_at → both pinned + pinned_at taken.
-        let mut local = FleetNetDoc::default();
-        local.pinned = Some("dev-old".into());
-        local.pinned_at = hlc(5, "dev-x");
+        let mut local = FleetNetDoc {
+            pinned: Some("dev-old".into()),
+            pinned_at: hlc(5, "dev-x"),
+            ..Default::default()
+        };
 
-        let mut remote = FleetNetDoc::default();
-        remote.pinned = Some("dev-new".into());
-        remote.pinned_at = hlc(10, "dev-x");
+        let remote = FleetNetDoc {
+            pinned: Some("dev-new".into()),
+            pinned_at: hlc(10, "dev-x"),
+            ..Default::default()
+        };
 
         let out = local.merge_from(remote);
         assert!(out.changed, "newer remote pin must flag changed");
@@ -394,13 +398,17 @@ mod tests {
 
     #[test]
     fn pin_lww_older_remote_ignored() {
-        let mut local = FleetNetDoc::default();
-        local.pinned = Some("dev-keep".into());
-        local.pinned_at = hlc(20, "dev-x");
+        let mut local = FleetNetDoc {
+            pinned: Some("dev-keep".into()),
+            pinned_at: hlc(20, "dev-x"),
+            ..Default::default()
+        };
 
-        let mut remote = FleetNetDoc::default();
-        remote.pinned = Some("dev-discard".into());
-        remote.pinned_at = hlc(5, "dev-x");
+        let remote = FleetNetDoc {
+            pinned: Some("dev-discard".into()),
+            pinned_at: hlc(5, "dev-x"),
+            ..Default::default()
+        };
 
         let out = local.merge_from(remote);
         assert!(!out.changed);
@@ -410,13 +418,17 @@ mod tests {
     #[test]
     fn pin_lww_same_stamp_local_wins() {
         // Equal pinned_at → is_strictly_newer_than is false → local kept.
-        let mut local = FleetNetDoc::default();
-        local.pinned = Some("dev-local".into());
-        local.pinned_at = hlc(10, "dev-x");
+        let mut local = FleetNetDoc {
+            pinned: Some("dev-local".into()),
+            pinned_at: hlc(10, "dev-x"),
+            ..Default::default()
+        };
 
-        let mut remote = FleetNetDoc::default();
-        remote.pinned = Some("dev-remote".into());
-        remote.pinned_at = hlc(10, "dev-x");
+        let remote = FleetNetDoc {
+            pinned: Some("dev-remote".into()),
+            pinned_at: hlc(10, "dev-x"),
+            ..Default::default()
+        };
 
         local.merge_from(remote);
         assert_eq!(local.pinned.as_deref(), Some("dev-local"));
