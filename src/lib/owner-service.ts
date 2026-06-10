@@ -16,6 +16,11 @@ export interface DeviceView {
   fingerprint: string;
   /** ZEB-418 P2 D17: true iff this device is the owner's pinned butler. */
   butlerPinned: boolean;
+  /**
+   * 64-hex ed25519 verify key — the SP1 device-id form `setButlerPin`
+   * expects. `deviceId` (identity-hash form) is NOT accepted there.
+   */
+  deviceVkHex: string;
 }
 
 export interface TrustDecisionView {

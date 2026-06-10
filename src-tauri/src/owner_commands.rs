@@ -112,6 +112,10 @@ fn build_owner_state_view(
                 enrolled_at: cert.issued_at,
                 fingerprint: format_fingerprint(&cert.device_id),
                 butler_pinned,
+                // Round-2 Greptile P1: the toggle must send THIS value to
+                // `set_butler_pin` — `device_id` above is the 16-byte
+                // identity hash, which the enrolled-set check rejects.
+                device_vk_hex: dev_id_hex,
             }
         })
         .collect();
@@ -661,6 +665,100 @@ mod tests {
         // ExportInfo.path must echo the chosen path.
         let info = result.unwrap();
         assert_eq!(info.path, out.display().to_string());
+    }
+
+    /// ZEB-418 P2 round-2 (Greptile P1): cross-layer contract test pinning the
+    /// device-ID FORMAT across the toggle round trip. The view's
+    /// `device_vk_hex` must be the exact string that `set_butler_pin_inner`
+    /// validates against (64-hex ed25519 verify key, the SP1 form the
+    /// fleet-net doc keys on) AND the value that, fed back as
+    /// `pinned_device_id_hex`, lights up `butler_pinned` on the same row.
+    /// The pre-fix bug shipped `device_id` (the 16-byte identity hash) to the
+    /// toggle — rejected for every device — and an opaque-ID test would miss
+    /// it again, so this test derives everything from ONE enrollment-cert
+    /// fixture.
+    #[tokio::test]
+    async fn device_vk_hex_round_trips_through_set_butler_pin() {
+        use crate::fleet_net::FleetNetDoc;
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+        use std::collections::BTreeSet;
+
+        // ── One fixture: mint an owner (1 enrollment) + enroll a 2nd device ─
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_000).expect("mint");
+        let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+
+        let joiner_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let joiner_pubkey = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let joiner_cert = crate::pairing::cert::sign_enrollment_for_joiner(
+            &master_seed,
+            &state,
+            joiner_pubkey,
+            1_700_000_001,
+        )
+        .expect("sign joiner enrollment");
+        let joiner_identity_hash_hex = hex::encode(joiner_cert.device_id);
+        state.enrollments.insert(joiner_cert.device_id, joiner_cert);
+
+        let loaded = LoadedOwnerState {
+            state,
+            device_signing_key,
+            master_seed: Some(master_seed),
+        };
+
+        // ── (a) Build the view with no pin; take the joiner's device_vk_hex ─
+        let view = build_owner_state_view(&loaded, "this device".into(), None);
+        assert_eq!(view.devices.len(), 2, "mint device + joiner");
+        let joiner_row = view
+            .devices
+            .iter()
+            .find(|d| d.device_id == joiner_identity_hash_hex)
+            .expect("joiner row present in view");
+        let vk_hex = joiner_row.device_vk_hex.clone();
+        // The two ID forms must be distinct: 64-hex VK vs 32-hex identity hash.
+        assert_eq!(vk_hex.len(), 64, "device_vk_hex is the 64-hex VK form");
+        assert_eq!(
+            joiner_row.device_id.len(),
+            32,
+            "device_id is the 32-hex identity-hash form"
+        );
+        assert!(view.devices.iter().all(|d| !d.butler_pinned), "no pin yet");
+
+        // ── (b) Derive the enrolled set EXACTLY as start_node does ──────────
+        let enrolled: BTreeSet<String> = loaded
+            .state
+            .enrollments
+            .values()
+            .map(|cert| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
+            .collect();
+        // Sanity: the identity-hash form (the pre-fix toggle payload) is NOT
+        // in the enrolled set — that is the bug this test pins against.
+        assert!(
+            !enrolled.contains(&joiner_identity_hash_hex),
+            "identity-hash form must not be a valid pin id"
+        );
+
+        // ── (c) set_butler_pin_inner must ACCEPT the view's device_vk_hex ───
+        let doc = tokio::sync::Mutex::new(FleetNetDoc::default());
+        crate::set_butler_pin_inner(&doc, &enrolled, Some(vk_hex.clone()), "self-dev", 1_000)
+            .await
+            .expect("set_butler_pin_inner must accept DeviceView.device_vk_hex");
+        let pinned = doc.lock().await.pinned.clone();
+        assert_eq!(pinned.as_deref(), Some(vk_hex.as_str()));
+
+        // ── (d) Feed the doc's pinned value back; exactly the joiner pins ───
+        let view2 = build_owner_state_view(&loaded, "this device".into(), pinned);
+        for d in &view2.devices {
+            assert_eq!(
+                d.butler_pinned,
+                d.device_id == joiner_identity_hash_hex,
+                "butler_pinned must be true for the pinned joiner only (row {})",
+                d.device_id
+            );
+        }
     }
 
     #[test]

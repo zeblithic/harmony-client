@@ -128,13 +128,16 @@
   let butlerPinError = $state<string | null>(null);
   let butlerPinInFlight = $state(false);
 
-  async function handleButlerPinToggle(device: { deviceId: string; butlerPinned: boolean }) {
+  async function handleButlerPinToggle(device: { deviceVkHex: string; butlerPinned: boolean }) {
     if (butlerPinInFlight) return;
     butlerPinError = null;
     butlerPinInFlight = true;
     try {
       // If already pinned, toggle OFF (clear); otherwise pin this device.
-      const newPin = device.butlerPinned ? null : device.deviceId;
+      // Round-2 Greptile P1: the backend validates against the enrolled set
+      // of 64-hex VERIFY-KEY ids (SP1 form) — `deviceVkHex`, never
+      // `deviceId` (the identity-hash form, which is always rejected).
+      const newPin = device.butlerPinned ? null : device.deviceVkHex;
       await setButlerPin(newPin);
       // Re-fetch the device list so butler_pinned reflects the new state.
       await svc.refresh();
