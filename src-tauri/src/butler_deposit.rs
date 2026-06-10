@@ -61,6 +61,13 @@ pub const BUTLER_SET_MAX_ENTRIES: usize = 2;
 /// can never make delivery worse than today.
 pub const BUTLER_SET_FRESHNESS_MS: u64 = 15 * 60 * 1_000;
 
+/// ZEB-418 P2 (D16): periodic routing-record re-publish cadence — half the
+/// freshness window so `bs_at` never lapses while the device is up.
+pub const BUTLER_SET_REFRESH_MS: u64 = BUTLER_SET_FRESHNESS_MS / 2;
+
+/// ZEB-418 P2 (D16): debounce for fleet-change-triggered re-publishes.
+pub const FLEET_CHANGE_REPUBLISH_DEBOUNCE_MS: u64 = 60_000;
+
 /// Per-sender inbox quota (spec §4 "per-contact quota"): bounds the LIVE
 /// entries a single sender may hold in the `dm-inbox-v1` doc — deposited
 /// and not yet GC'd, including entries partially ingested or awaiting the

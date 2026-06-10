@@ -766,6 +766,15 @@ pub async fn run<R: Runtime>(
     // registers community-root CIDs) and consulted by the content-serve
     // queryable below. Empty for any caller that doesn't publish community roots.
     serve_allowlist: crate::content_store::CommunityServeAllowlist,
+    // ZEB-418 P2 Task 7 (D16): routing-record re-publish trigger. The 250ms
+    // timer arm invokes it every BUTLER_SET_REFRESH_MS (~half the butler-set
+    // freshness window) so the published `bs_at` never lapses while the
+    // device is up. The closure is sync (it spawns its own async work);
+    // production passes the lib.rs closure that re-stamps the fleet-net
+    // self-row and re-registers the active pkarr publications. `None` in
+    // test callers that bypass `start_node` (and when no owner identity is
+    // loaded).
+    routing_republish: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -2601,6 +2610,15 @@ pub async fn run<R: Runtime>(
         .collect();
     let mut peer_refresh_counter: u64 = 0;
 
+    // ZEB-418 P2 Task 7 (D16): periodic routing-record re-publish, counted
+    // in 250ms timer ticks (same pattern as `peer_refresh_counter`).
+    // BUTLER_SET_REFRESH_MS / 250 = one fire per ~half freshness window;
+    // the multiple-of pattern means the FIRST fire lands a full interval
+    // after boot — correct, since start_node's publisher registrations
+    // already published a fresh blob.
+    const ROUTING_REPUBLISH_TICKS: u64 = crate::butler_deposit::BUTLER_SET_REFRESH_MS / 250;
+    let mut routing_republish_counter: u64 = 0;
+
     // Dynamic voice channel subscriptions — keyed by (community, channel).
     let mut voice_subs: std::collections::HashMap<
         (
@@ -2906,6 +2924,17 @@ pub async fn run<R: Runtime>(
                         .await
                         .map(|z| z.to_string())
                         .collect();
+                }
+
+                // ZEB-418 P2 Task 7 (D16): periodic routing-record
+                // re-publish so the advertised butler set's `bs_at` never
+                // lapses while the device is up. The closure is sync and
+                // spawns its own async work — the timer arm never blocks.
+                if let Some(ref republish) = routing_republish {
+                    routing_republish_counter += 1;
+                    if routing_republish_counter.is_multiple_of(ROUTING_REPUBLISH_TICKS) {
+                        republish();
+                    }
                 }
             }
 

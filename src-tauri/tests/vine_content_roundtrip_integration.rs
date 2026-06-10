@@ -254,6 +254,7 @@ fn spawn_event_loop(
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
+                    None, // ZEB-418 P2: routing_republish not exercised
                 )
                 .await;
             });

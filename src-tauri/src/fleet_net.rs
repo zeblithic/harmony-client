@@ -175,6 +175,123 @@ pub fn butler_set_order(doc: &FleetNetDoc, stale_before_ms: u64) -> Vec<(String,
     fresh
 }
 
+/// Map the fleet-net snapshot to the advertised butler set (max
+/// [`crate::butler_deposit::BUTLER_SET_MAX_ENTRIES`]). `self_entry` is the
+/// publishing device's own pre-built entry (always available even when the
+/// snapshot is cold); `vk_lookup` resolves a device-id to its ed25519 verify
+/// key (owner_device cache in prod — devices without a resolvable vk are
+/// skipped with a debug log by the CALLER side; here just skip on `None`).
+///
+/// Guarantees: self_entry's device appears exactly once (the snapshot row
+/// for self is replaced by self_entry's fresher transport data); pinned-first
+/// ordering via [`butler_set_order`]; falls back to `vec![self_entry]` when
+/// the snapshot yields nothing.
+///
+/// Each produced entry's `pinned` flag comes from `doc.pinned`. The wire
+/// `device_id` is the 16-byte signing-identity hash derived from the vk the
+/// same way `start_node` derives `this_device_id_hash` from the device key
+/// (`PubKeyBundle::classical_identity_hash`); fleet-net keys are the SP1
+/// 64-hex device ids (hex of the 32-byte ed25519 vk), so the hash is
+/// re-derived here via `vk_lookup`'s resolved key.
+///
+/// Skips that don't resolve do NOT consume cap slots — the next-ordered
+/// fresh device is considered instead.
+pub fn build_butler_set(
+    doc: &FleetNetDoc,
+    self_device_id: &str,
+    self_entry: crate::reachability_record::ButlerSetEntry,
+    vk_lookup: &dyn Fn(&str) -> Option<[u8; 32]>,
+    stale_before_ms: u64,
+) -> Vec<crate::reachability_record::ButlerSetEntry> {
+    use crate::butler_deposit::BUTLER_SET_MAX_ENTRIES;
+    use harmony_owner::pubkey_bundle::PubKeyBundle;
+
+    let pinned_id = doc.pinned.as_deref();
+    let mut out: Vec<crate::reachability_record::ButlerSetEntry> = Vec::new();
+    for (dev_id, row) in butler_set_order(doc, stale_before_ms) {
+        if out.len() >= BUTLER_SET_MAX_ENTRIES {
+            break;
+        }
+        let pinned = pinned_id == Some(dev_id.as_str());
+        if dev_id == self_device_id {
+            // Self appears exactly once: the snapshot row for self is
+            // replaced by self_entry's fresher transport data (live iroh
+            // endpoint + relay snapshotted at blob-build time); only the
+            // pinned flag comes from the doc.
+            let mut e = self_entry.clone();
+            e.pinned = pinned;
+            out.push(e);
+            continue;
+        }
+        let Some(vk) = vk_lookup(&dev_id) else {
+            // Unresolvable vk: skip without consuming a cap slot (caller
+            // side logs at debug level inside its `vk_lookup`).
+            continue;
+        };
+        out.push(crate::reachability_record::ButlerSetEntry {
+            device_id: PubKeyBundle::classical_identity_hash(&vk),
+            iroh_endpoint_id: row.iroh_endpoint_id,
+            device_ed25519_verify: vk,
+            home_relay: row.home_relay.clone(),
+            pinned,
+        });
+    }
+    if out.is_empty() {
+        // Cold/empty snapshot (or every row stale/unresolvable): degrade to
+        // the P1 self-only advertisement. The pinned flag still reflects the
+        // doc — the pin LWW pair can survive a row wipe.
+        let mut e = self_entry;
+        e.pinned = pinned_id == Some(self_device_id);
+        return vec![e];
+    }
+    out
+}
+
+/// Selection-relevant projection of the fleet-net doc (ZEB-418 P2, D16):
+/// the advertised prefix's (device-id, endpoint, relay, pinned) tuples.
+/// Deliberately EXCLUDES `seen_at` — stamp-only refreshes (the periodic
+/// re-stamp every BUTLER_SET_REFRESH_MS) must not look like fleet changes,
+/// otherwise every sibling heartbeat would schedule a debounced republish.
+pub fn selection_view(
+    doc: &FleetNetDoc,
+    stale_before_ms: u64,
+) -> Vec<(String, [u8; 32], String, bool)> {
+    butler_set_order(doc, stale_before_ms)
+        .into_iter()
+        .take(crate::butler_deposit::BUTLER_SET_MAX_ENTRIES)
+        .map(|(id, row)| {
+            let pinned = doc.pinned.as_deref() == Some(id.as_str());
+            (id, row.iroh_endpoint_id, row.home_relay, pinned)
+        })
+        .collect()
+}
+
+/// Snapshot the SP1-device-id → ed25519-vk map that `build_butler_set`'s
+/// prod `vk_lookup` reads, from the owner_device_cache (spec §5: "`vk` comes
+/// from `owner_device_cache`"). Fleet-net keys are hex(ed25519 vk); the cache
+/// stores 64-byte `X25519_pub(32) || Ed25519_pub(32)` identity pubs, so the
+/// map keys on hex of each cached pub's Ed25519 half. Only the SELF owner's
+/// entry matters (the butler set advertises our own fleet). The publishing
+/// device itself is always inserted (`self_device_id_hex` → `self_vk`), so
+/// self resolves even on a cold cache.
+pub(crate) fn vk_map_from_device_cache(
+    cache: &crate::owner_state_types::OwnerDeviceCache,
+    self_owner: &crate::owner_state_types::OwnerAddr,
+    self_device_id_hex: &str,
+    self_vk: [u8; 32],
+) -> BTreeMap<String, [u8; 32]> {
+    let mut map: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+    if let Some(entry) = cache.devices.get(self_owner) {
+        for pub64 in entry.device_identity_pubs.iter().flatten() {
+            let mut ed: [u8; 32] = [0u8; 32];
+            ed.copy_from_slice(&pub64[32..64]);
+            map.insert(hex::encode(ed), ed);
+        }
+    }
+    map.insert(self_device_id_hex.to_string(), self_vk);
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +518,158 @@ mod tests {
         assert_eq!(order[1].0, "dev-z");
     }
 
+    // ── build_butler_set tests (ZEB-418 P2 Task 7) ────────────────────────────
+
+    use crate::reachability_record::ButlerSetEntry;
+
+    /// 64-hex SP1 device ids + matching test vks. The hex↔vk relation is
+    /// arbitrary here (prod derives the map from owner_device_cache); the
+    /// fn under test only sees `vk_lookup`.
+    fn self_id() -> String {
+        "aa".repeat(32)
+    }
+    fn sib1_id() -> String {
+        "bb".repeat(32)
+    }
+    fn sib2_id() -> String {
+        "cc".repeat(32)
+    }
+
+    fn test_vk_lookup(dev_id: &str) -> Option<[u8; 32]> {
+        if dev_id == sib1_id() {
+            Some([0xBB; 32])
+        } else if dev_id == sib2_id() {
+            Some([0xCC; 32])
+        } else {
+            None
+        }
+    }
+
+    /// The publishing device's pre-built self entry (what the lib.rs blob
+    /// builder snapshots from the live iroh endpoint).
+    fn self_entry() -> ButlerSetEntry {
+        ButlerSetEntry {
+            device_id: [0x5E; 16],
+            iroh_endpoint_id: [0x0E; 32],
+            device_ed25519_verify: [0xAA; 32],
+            home_relay: "relay.live.example".into(),
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn build_set_emits_self_only_on_cold_snapshot() {
+        let doc = FleetNetDoc::default();
+        let set = build_butler_set(&doc, &self_id(), self_entry(), &test_vk_lookup, 0);
+        assert_eq!(
+            set,
+            vec![self_entry()],
+            "cold snapshot must degrade to P1 self-only"
+        );
+    }
+
+    #[test]
+    fn build_set_adds_sibling_secondary() {
+        let mut doc = FleetNetDoc::default();
+        doc.devices
+            .insert(self_id(), row(0x01, "relay.self.snap", hlc(2000, "self")));
+        doc.devices
+            .insert(sib1_id(), row(0x02, "relay.sib1", hlc(1000, "sib1")));
+
+        let set = build_butler_set(&doc, &self_id(), self_entry(), &test_vk_lookup, 0);
+        assert_eq!(set.len(), 2);
+        // Self first (most recent), then the sibling secondary.
+        assert_eq!(set[0].device_id, self_entry().device_id);
+        let sib = &set[1];
+        assert_eq!(sib.device_ed25519_verify, [0xBB; 32]);
+        assert_eq!(
+            sib.device_id,
+            harmony_owner::pubkey_bundle::PubKeyBundle::classical_identity_hash(&[0xBB; 32]),
+            "wire device_id must be the identity hash derived from the resolved vk"
+        );
+        assert_eq!(sib.iroh_endpoint_id, [0x02; 32]);
+        assert_eq!(sib.home_relay, "relay.sib1");
+        assert!(!sib.pinned);
+    }
+
+    #[test]
+    fn build_set_self_appears_exactly_once_with_own_transport_data() {
+        // The snapshot's self row carries STALE transport data; the produced
+        // set must contain self exactly once, with self_entry's live data.
+        let mut doc = FleetNetDoc::default();
+        doc.devices
+            .insert(self_id(), row(0x01, "relay.self.stale", hlc(2000, "self")));
+        doc.devices
+            .insert(sib1_id(), row(0x02, "relay.sib1", hlc(1000, "sib1")));
+
+        let set = build_butler_set(&doc, &self_id(), self_entry(), &test_vk_lookup, 0);
+        let selves: Vec<_> = set
+            .iter()
+            .filter(|e| e.device_id == self_entry().device_id)
+            .collect();
+        assert_eq!(selves.len(), 1, "self must appear exactly once");
+        assert_eq!(selves[0].iroh_endpoint_id, self_entry().iroh_endpoint_id);
+        assert_eq!(selves[0].home_relay, self_entry().home_relay);
+    }
+
+    #[test]
+    fn build_set_pinned_leads() {
+        // sib1 is older than self but pinned → leads the set, pinned flag set.
+        let mut doc = FleetNetDoc::default();
+        doc.devices
+            .insert(self_id(), row(0x01, "relay.self.snap", hlc(2000, "self")));
+        doc.devices
+            .insert(sib1_id(), row(0x02, "relay.sib1", hlc(1000, "sib1")));
+        doc.pinned = Some(sib1_id());
+        doc.pinned_at = hlc(3000, "owner");
+
+        let set = build_butler_set(&doc, &self_id(), self_entry(), &test_vk_lookup, 0);
+        assert_eq!(set.len(), 2);
+        assert_eq!(
+            set[0].device_ed25519_verify, [0xBB; 32],
+            "pinned sibling leads"
+        );
+        assert!(set[0].pinned);
+        assert_eq!(set[1].device_id, self_entry().device_id);
+        assert!(!set[1].pinned);
+    }
+
+    #[test]
+    fn build_set_skips_unresolvable_vk() {
+        // sib-x is the MOST recent but has no resolvable vk → skipped without
+        // consuming a cap slot; the set still fills to two entries.
+        let sibx_id = "dd".repeat(32); // test_vk_lookup → None
+        let mut doc = FleetNetDoc::default();
+        doc.devices
+            .insert(sibx_id, row(0x0D, "relay.sibx", hlc(3000, "sibx")));
+        doc.devices
+            .insert(self_id(), row(0x01, "relay.self.snap", hlc(2000, "self")));
+        doc.devices
+            .insert(sib2_id(), row(0x03, "relay.sib2", hlc(1000, "sib2")));
+
+        let set = build_butler_set(&doc, &self_id(), self_entry(), &test_vk_lookup, 0);
+        assert_eq!(set.len(), 2, "skip must not consume a cap slot");
+        assert_eq!(set[0].device_id, self_entry().device_id);
+        assert_eq!(set[1].device_ed25519_verify, [0xCC; 32]);
+    }
+
+    #[test]
+    fn build_set_caps_at_max_entries() {
+        // Three fresh, resolvable devices → capped to the two most recent.
+        let mut doc = FleetNetDoc::default();
+        doc.devices
+            .insert(self_id(), row(0x01, "relay.self.snap", hlc(3000, "self")));
+        doc.devices
+            .insert(sib1_id(), row(0x02, "relay.sib1", hlc(2000, "sib1")));
+        doc.devices
+            .insert(sib2_id(), row(0x03, "relay.sib2", hlc(1000, "sib2")));
+
+        let set = build_butler_set(&doc, &self_id(), self_entry(), &test_vk_lookup, 0);
+        assert_eq!(set.len(), crate::butler_deposit::BUTLER_SET_MAX_ENTRIES);
+        assert_eq!(set[0].device_id, self_entry().device_id);
+        assert_eq!(set[1].device_ed25519_verify, [0xBB; 32]);
+    }
+
     // ── Wire-format pin fixture ───────────────────────────────────────────────
 
     /// Pins the fleet-net-v1 wire format. NEVER regenerate — any change to
@@ -462,8 +731,9 @@ mod tests {
     /// End-to-end engine-wiring proof (ZEB-418 P2 Task 6): a real
     /// `FleetSyncEngine<FleetNetDoc>` configured exactly as `start_node`
     /// configures it (FleetNetPersist sink, `merge_from` merger,
-    /// `publish_seen: true`, lookup tag `b"fleet-net-v1"`, `on_applied:
-    /// None` — Task 7 adds the snapshot refresh) must emit an outbound
+    /// `publish_seen: true`, lookup tag `b"fleet-net-v1"`; `on_applied`
+    /// stays `None` here — production wires Task 7's snapshot-refresh
+    /// nudge, which is exercised separately) must emit an outbound
     /// wire frame on the publisher channel when a local self-row upsert is
     /// followed by `notify_dirty` + `flush_now`. Mirrors
     /// `dm_inbox_ingest::dm_inbox_engine_publishes_on_local_write`
