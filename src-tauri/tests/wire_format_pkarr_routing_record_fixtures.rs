@@ -17,6 +17,8 @@ fn fixture_routing_payload() -> ReachabilityAnnouncePayload {
         direct_addresses: vec![],
         announced_at_ms: 1_700_000_000_000,
         identity_signature: [0xCD; 64],
+        butler_set: Vec::new(),
+        bs_at: 0,
     }
 }
 

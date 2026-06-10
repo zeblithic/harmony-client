@@ -109,6 +109,7 @@ mod zeb398_content_policy_tests {
 
 mod app_tracing;
 pub mod backup_state;
+pub mod butler_deposit;
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
 pub mod community_dfrost_crypto;
@@ -136,6 +137,9 @@ pub mod content_index;
 pub mod content_store;
 pub mod dm_crypto;
 pub mod dm_envelope;
+pub mod dm_inbox_crdt;
+pub mod dm_inbox_ingest;
+pub mod dm_inbox_persist;
 pub mod dm_outbox;
 pub mod dm_signing;
 pub mod event_loop;
@@ -152,6 +156,7 @@ pub mod identity;
 pub mod identity_commands;
 pub mod inbound_packet;
 pub mod invite_mint;
+pub mod iroh_butler_acceptor;
 pub mod iroh_endpoint;
 pub mod iroh_friend_acceptor;
 pub mod iroh_invite_acceptor;
@@ -862,6 +867,24 @@ pub struct NodeState {
         Option<std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::notes_crdt::NotesDoc>>>,
     pub notes_device_id: Option<String>,
 
+    /// ZEB-418 SP2 P1: butler dm-inbox dataset (deposited-but-not-yet-
+    /// ingested DM deliveries, spec §5). `Some` while the node is running
+    /// and an owner identity is loaded; `None` before the FleetSyncEngine
+    /// is wired at startup or after stop_node. Consumed by the deposit
+    /// acceptor + ingest sweeper (no IPC surface in P1); held here so
+    /// stop_inner can shut the engine down and so a restart re-loads from
+    /// disk. Mirrors the notes handles above field-for-field.
+    pub dm_inbox_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_inbox_crdt::DmInboxDoc>>>,
+    pub dm_inbox_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+    >,
+    pub dm_inbox_sync: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::dm_inbox_crdt::DmInboxDoc>>,
+    >,
+    pub dm_inbox_device_id: Option<String>,
+
     /// ZEB-321 Phase 1 Task 8: iroh endpoint Arc. `Some` while node is
     /// running AND the keychain-resident secret key + bind both succeeded;
     /// `None` otherwise (tests, headless platforms, bind failure). Task 9's
@@ -1182,6 +1205,12 @@ impl Default for NodeState {
             notes_tracker: None,
             notes_sync: None,
             notes_device_id: None,
+            // ZEB-418 SP2 P1: dm-inbox dataset handles stay None until
+            // start_node wires the FleetSyncEngine (mirrors notes).
+            dm_inbox_doc: None,
+            dm_inbox_tracker: None,
+            dm_inbox_sync: None,
+            dm_inbox_device_id: None,
             // ZEB-321 Phase 1 Task 8: iroh handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
             iroh_endpoint: None,
@@ -1413,6 +1442,11 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let notes_sync_for_shutdown: Option<
         std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::notes_crdt::NotesDoc>>,
     >;
+    // ZEB-418 SP2 P1: dm-inbox fleet-sync engine, taken outside the lock
+    // for the same ephemeral-runtime shutdown pattern as notes.
+    let dm_inbox_sync_for_shutdown: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::dm_inbox_crdt::DmInboxDoc>>,
+    >;
     let (
         shutdown_tx,
         thread,
@@ -1589,6 +1623,20 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.notes_doc = None;
         guard.notes_tracker = None;
         guard.notes_device_id = None;
+        // ZEB-418 SP2 P1: take the dm-inbox engine for shutdown and clear
+        // the remaining handles (mirrors notes). The engine shutdown below
+        // ALSO stops the ingest sweeper: the engine task's `on_applied`
+        // closure owns the only STRONG nudge sender (the deposit acceptor
+        // holds a WeakSender), so once the engine task exits the sweeper's
+        // `recv()` yields `None` and the task returns. The deposit acceptor
+        // itself needs no explicit stop — it lives behind the iroh link
+        // manager, which `clear_iroh_handles` + the zenoh session teardown
+        // already tear down with the endpoint (same lifecycle as the
+        // handshake dispatcher).
+        dm_inbox_sync_for_shutdown = guard.dm_inbox_sync.take();
+        guard.dm_inbox_doc = None;
+        guard.dm_inbox_tracker = None;
+        guard.dm_inbox_device_id = None;
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -1927,6 +1975,37 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                         tracing::error!(
                             error = %e,
                             "could not build ephemeral tokio runtime for Notes \
+                             FleetSyncEngine shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-418 SP2 P1: shut down the dm-inbox fleet-sync engine alongside
+    // notes so its final debounced publish + persist pass runs before the
+    // event-loop thread is joined. Same ephemeral-runtime pattern as
+    // mint/notes. This also stops the ingest sweeper (the engine task's
+    // exit drops the only strong nudge sender — see the take above).
+    if let Some(dm_inbox_engine) = dm_inbox_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(dm_inbox_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "dm-inbox FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for dm-inbox \
                              FleetSyncEngine shutdown — final flush skipped"
                         );
                     }
@@ -2546,6 +2625,26 @@ pub(crate) async fn start_node_inner(
         > = None;
         let mut notes_device_id_opt: Option<String> = None;
         let mut notes_sync_handles_opt: Option<crate::event_loop::NotesSyncHandles> = None;
+        // ZEB-418 SP2 P1: dm-inbox fleet-sync engine + its NodeState handles.
+        // Built alongside the notes engine when an owner identity loads;
+        // lifted to outer scope so the NodeState assignment (dm_inbox_doc/
+        // tracker/sync/device_id) and the event_loop::run call site can
+        // reach them. Mirrors the notes opts above field-for-field.
+        let mut dm_inbox_doc_opt: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::dm_inbox_crdt::DmInboxDoc>>,
+        > = None;
+        let mut dm_inbox_tracker_opt: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<
+                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                >,
+            >,
+        > = None;
+        let mut dm_inbox_sync_engine_opt: Option<
+            std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::dm_inbox_crdt::DmInboxDoc>>,
+        > = None;
+        let mut dm_inbox_device_id_opt: Option<String> = None;
+        let mut dm_inbox_sync_handles_opt: Option<crate::event_loop::DmInboxSyncHandles> = None;
         // ZEB-225 Sub-B Phase 2: lift the per-identity handles SyncEngine
         // depends on (device_id, self_owner, crdt_state, tracker,
         // content_store) out of the `if let Some(seed)` block so the
@@ -3309,6 +3408,120 @@ pub(crate) async fn start_node_inner(
                         addr_hex: owner_addr_hex.clone(),
                         outbound_rx: notes_out_rx,
                         inbound_tx: notes_in_tx,
+                    });
+
+                    // ── ZEB-418 SP2 P1: dm-inbox fleet-sync engine + ingestion ─
+                    //
+                    // Butler dm-inbox dataset (spec §5): deposited-but-not-
+                    // yet-ingested DM deliveries, replicated across the
+                    // owner's fleet. Mirrors the notes wiring above
+                    // site-for-site with two deliberate differences:
+                    // `publish_seen` stays true because GC depends on
+                    // sibling ig-acks propagating (spec §5), and
+                    // `on_applied` nudges the ingestion sweeper instead of
+                    // emitting a UI event (the UI event for this dataset is
+                    // the `dm-received` emit fired by ingestion itself).
+                    let dm_inbox_path =
+                        identity_dir.join(crate::dm_inbox_persist::DM_INBOX_FILENAME);
+                    let dm_inbox_replay_path =
+                        identity_dir.join(crate::dm_inbox_persist::DM_INBOX_REPLAY_FILENAME);
+                    let dm_inbox_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::dm_inbox_persist::load_doc_or_recover(&dm_inbox_path),
+                    ));
+                    let dm_inbox_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::dm_inbox_persist::load_replay_or_recover(&dm_inbox_replay_path),
+                    ));
+                    let (dm_inbox_out_tx, dm_inbox_out_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let (dm_inbox_in_tx, dm_inbox_in_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let dm_inbox_merger: crate::fleet_sync::Merger<
+                        crate::dm_inbox_crdt::DmInboxDoc,
+                    > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                    // Ingestion-nudge channel (dm_inbox_ingest.rs trigger
+                    // model): capacity-1 level trigger. The engine's
+                    // `on_applied` closure owns the only STRONG sender, so
+                    // the sweeper exits exactly when the engine shuts down;
+                    // the deposit acceptor gets a WeakSender (its post-
+                    // deposit nudge must never keep the sweeper alive past
+                    // engine shutdown).
+                    let (dm_inbox_nudge_tx, dm_inbox_nudge_rx) =
+                        tokio::sync::mpsc::channel::<()>(1);
+                    let dm_inbox_nudge_weak = dm_inbox_nudge_tx.downgrade();
+                    let dm_inbox_sync =
+                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                            crate::fleet_sync::FleetSyncConfig {
+                                kt: std::sync::Arc::clone(&kt),
+                                device_id: device_id.clone(),
+                                state: std::sync::Arc::clone(&dm_inbox_doc),
+                                merger: dm_inbox_merger,
+                                replay_tracker: std::sync::Arc::clone(&dm_inbox_tracker),
+                                content_store: std::sync::Arc::clone(&content_store),
+                                publisher_tx: dm_inbox_out_tx,
+                                subscriber_rx: dm_inbox_in_rx,
+                                persist: std::sync::Arc::new(
+                                    crate::dm_inbox_persist::DmInboxPersist {
+                                        doc_path: dm_inbox_path,
+                                        replay_path: dm_inbox_replay_path,
+                                    },
+                                ),
+                                lookup_key_tag: b"dm-inbox-v1",
+                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                publish_seen: true,
+                                on_applied: Some(crate::dm_inbox_ingest::ingest_nudge_on_applied(
+                                    dm_inbox_nudge_tx,
+                                )),
+                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                    std::collections::BTreeMap::new(),
+                                )),
+                            },
+                        ));
+                    // Production ingestion context over real handles. The
+                    // enrolled snapshot maps the harmony_owner
+                    // `OwnerState.enrollments` certs through the SP1 64-hex
+                    // device-id form (enrollment changes require a node
+                    // restart, so a start_node-time snapshot tracks the set
+                    // for the engine's lifetime).
+                    let dm_inbox_enrolled: std::collections::BTreeSet<String> = loaded
+                        .state
+                        .enrollments
+                        .values()
+                        .map(|cert| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
+                        .collect();
+                    let dm_inbox_ingest_ctx: std::sync::Arc<
+                        dyn crate::dm_inbox_ingest::DmInboxIngestCtx,
+                    > = std::sync::Arc::new(crate::dm_inbox_ingest::ProdDmInboxIngestCtx {
+                        device_id: device_id.clone(),
+                        crdt_state: std::sync::Arc::clone(&crdt_state),
+                        content_store: std::sync::Arc::clone(&content_store),
+                        app: app.clone(),
+                        enrolled: dm_inbox_enrolled,
+                    });
+                    // The ingest sweeper: one startup sweep (entries
+                    // deposited while this device was offline), then one
+                    // debounced sweep per on_applied nudge burst. Exits when
+                    // the engine shuts down (see the nudge-channel comment
+                    // above) — stop_inner's engine shutdown is its shutdown.
+                    {
+                        let sweeper_engine = std::sync::Arc::clone(&dm_inbox_sync);
+                        tokio::spawn(crate::dm_inbox_ingest::run_dm_inbox_ingest_sweeper(
+                            std::sync::Arc::clone(&dm_inbox_doc),
+                            dm_inbox_ingest_ctx,
+                            dm_inbox_nudge_rx,
+                            std::sync::Arc::new(move || sweeper_engine.notify_dirty()),
+                            std::time::Duration::from_millis(
+                                crate::dm_inbox_ingest::INGEST_SWEEP_DEBOUNCE_MS,
+                            ),
+                        ));
+                    }
+                    dm_inbox_doc_opt = Some(std::sync::Arc::clone(&dm_inbox_doc));
+                    dm_inbox_tracker_opt = Some(std::sync::Arc::clone(&dm_inbox_tracker));
+                    dm_inbox_sync_engine_opt = Some(std::sync::Arc::clone(&dm_inbox_sync));
+                    dm_inbox_device_id_opt = Some(device_id.clone());
+                    dm_inbox_sync_handles_opt = Some(crate::event_loop::DmInboxSyncHandles {
+                        addr_hex: owner_addr_hex.clone(),
+                        outbound_rx: dm_inbox_out_rx,
+                        inbound_tx: dm_inbox_in_tx,
                     });
 
                     // ── ZEB-217 Sub-C Phase 2 + Phase 3 Task 8: per-community state CRDT sync ─
@@ -4730,6 +4943,12 @@ pub(crate) async fn start_node_inner(
                     // sig is sufficient. A Phase 2c follow-up can add a proper
                     // inner sig via `build_signed_payload` if needed.
                     let ep_for_blob = iroh_endpoint_arc.clone();
+                    // ZEB-418 SP2 P1: butler-set self-entry inputs, snapshotted
+                    // before the closure. Both are per-device constants for the
+                    // process lifetime ([u8;16]/[u8;32], Copy).
+                    let butler_self_device_id_hash = this_device_id_hash;
+                    let butler_self_device_vk =
+                        loaded.device_signing_key.verifying_key().to_bytes();
                     let blob_builder: std::sync::Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
                         std::sync::Arc::new(move || {
                             let Some(ref ep) = ep_for_blob else {
@@ -4752,6 +4971,35 @@ pub(crate) async fn start_node_inner(
                                 .unwrap_or_default()
                                 .as_millis()
                                 as u64;
+                            // ZEB-418 SP2 P1: advertise this device as a deposit
+                            // butler (spec §3). P1 publishes SELF ONLY: a sibling
+                            // secondary entry would need the sibling's iroh
+                            // endpoint id + home relay, but `FleetSyncEngine::
+                            // list_online_devices()` is async (this closure is
+                            // the sync pkarr blob contract) and yields only
+                            // device-id hex strings — there is no local
+                            // device-id → (endpoint id, relay) map yet.
+                            // ZEB-418 P2: add a sibling secondary entry once
+                            // fleet presence carries endpoint info, and hook a
+                            // 60s-debounced `list_online_devices()` fleet-change
+                            // re-register where the engine handle is available
+                            // (a self-only set doesn't change on fleet changes,
+                            // so the trigger is moot until then). Note the
+                            // PkarrPublisher rebuilds this blob on every publish
+                            // (register + epoch-schedule slots), so `bs_at` is
+                            // fresh right after boot/opt-in but exceeds
+                            // BUTLER_SET_FRESHNESS_MS between scheduled
+                            // publishes; senders then fall through to the
+                            // normal retry chain (spec §3: never worse than
+                            // today). Periodic refresh is part of the same P2
+                            // follow-up.
+                            let butler_set = vec![crate::reachability_record::ButlerSetEntry {
+                                device_id: butler_self_device_id_hash,
+                                iroh_endpoint_id: iroh_node_id,
+                                device_ed25519_verify: butler_self_device_vk,
+                                home_relay: home_relay_url.clone(),
+                                pinned: false,
+                            }];
                             let payload = crate::reachability_record::ReachabilityAnnouncePayload {
                                 iroh_node_id,
                                 home_relay_url,
@@ -4759,6 +5007,11 @@ pub(crate) async fn start_node_inner(
                                 announced_at_ms,
                                 // identity_signature is zero-filled; see comment above.
                                 identity_signature: [0u8; 64],
+                                butler_set,
+                                // The whole-set freshness stamp (spec §3) —
+                                // written at blob-build time, read via
+                                // `fresh_butler_set`.
+                                bs_at: announced_at_ms,
                             };
                             let mut out = Vec::new();
                             if ciborium::into_writer(&payload, &mut out).is_err() {
@@ -5045,6 +5298,104 @@ pub(crate) async fn start_node_inner(
                                  prior instance"
                             );
                         }
+
+                        // ZEB-418 SP2 P1 Task 7: build the production
+                        // ButlerDepositCtx over the dm-inbox engine handles
+                        // constructed above and late-install the deposit
+                        // acceptor on the iroh link manager (same late-
+                        // install seam as the handshake dispatcher; the
+                        // accept loop closes pre-install
+                        // `harmony/butler-deposit/v1` connections
+                        // gracefully until this set lands).
+                        //
+                        // `community_signing_key_arc` IS this device's
+                        // cert-bound ed25519 signing key (the clone of
+                        // `loaded.device_signing_key` made above) — its
+                        // verify key is what the butler-set advertisement
+                        // publishes as `vk`, so `ed25519_priv_to_x25519`
+                        // of it is exactly the seal target senders derive
+                        // as `birational(vk)`.
+                        let deposit_ctx: std::sync::Arc<
+                            dyn crate::iroh_butler_acceptor::ButlerDepositCtx,
+                        > = std::sync::Arc::new(
+                            crate::iroh_butler_acceptor::ProdButlerDepositCtx {
+                                self_owner: self_owner.0,
+                                device_id: device_id.clone(),
+                                crdt_state: std::sync::Arc::clone(&crdt_state),
+                                device_x25519_priv: crate::dm_signing::ed25519_priv_to_x25519(
+                                    &community_signing_key_arc,
+                                ),
+                                dm_inbox_doc: std::sync::Arc::clone(&dm_inbox_doc),
+                                dm_inbox_tracker: std::sync::Arc::clone(&dm_inbox_tracker),
+                                dm_inbox_engine: std::sync::Arc::clone(&dm_inbox_sync),
+                                ingest_nudge: dm_inbox_nudge_weak.clone(),
+                            },
+                        );
+                        let butler_acceptor = std::sync::Arc::new(
+                            crate::iroh_butler_acceptor::IrohButlerDepositAcceptor::new(
+                                deposit_ctx,
+                            ),
+                        );
+                        if link_mgr
+                            .install_butler_deposit_acceptor(butler_acceptor)
+                            .is_err()
+                        {
+                            // Pre-installed (OnceLock refused the second
+                            // set). Production shouldn't hit this — log so
+                            // it's diagnosable if it ever fires (mirrors
+                            // the handshake-dispatcher branch above).
+                            tracing::warn!(
+                                "ZEB-418: butler deposit acceptor already \
+                                 installed on iroh link manager — keeping \
+                                 the prior instance"
+                            );
+                        }
+
+                        // ZEB-418 SP2 P1 Task 8: build the production
+                        // sender-side butler deposit client and inject it
+                        // into the DmOutbox so the drain's deposit rung can
+                        // fire on transient direct-send failures. Same
+                        // identity material as the acceptor above: the
+                        // frame `sig` uses the cert-bound enrolled device
+                        // key (#2, `community_signing_key_arc`) and carries
+                        // this device's own EnrollmentCert as the canonical
+                        // CBOR `handle_deposit_core` strict-decodes. Only
+                        // wired when the iroh endpoint bound — without it
+                        // there is no deposit transport and the rung stays
+                        // disabled (drain behaves exactly as before).
+                        if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
+                            match harmony_owner::cbor::to_canonical(&own_enrollment_cert_for_friend)
+                            {
+                                Ok(cert_bytes) => {
+                                    let deposit_client: std::sync::Arc<
+                                        dyn crate::butler_deposit::ButlerDepositClient,
+                                    > = std::sync::Arc::new(
+                                        crate::butler_deposit::IrohButlerDepositClient {
+                                            endpoint: std::sync::Arc::clone(ep_arc),
+                                            resolver: reachability_resolver.clone(),
+                                            cas: std::sync::Arc::clone(&content_store),
+                                            sender_owner: self_owner.0,
+                                            enrollment_cert_bytes: cert_bytes,
+                                            device_signing_key: std::sync::Arc::clone(
+                                                &community_signing_key_arc,
+                                            ),
+                                            io_deadline: std::time::Duration::from_millis(
+                                                crate::iroh_butler_acceptor::DEFAULT_BUTLER_IO_DEADLINE_MS,
+                                            ),
+                                        },
+                                    );
+                                    outbox
+                                        .lock()
+                                        .await
+                                        .set_butler_deposit_client(deposit_client);
+                                }
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "ZEB-418: cannot canonicalize own enrollment \
+                                     cert; sender deposit rung disabled"
+                                ),
+                            }
+                        }
                     }
 
                     // Lift the per-identity handles out for NodeState
@@ -5317,6 +5668,9 @@ pub(crate) async fn start_node_inner(
                 // ZEB-417 SP1: thread the Notes adapter handles into
                 // event_loop::run (mirrors mint).
                 let notes_sync_handles_for_loop = notes_sync_handles_opt;
+                // ZEB-418 SP2 P1: thread the dm-inbox adapter handles into
+                // event_loop::run (mirrors notes).
+                let dm_inbox_sync_handles_for_loop = dm_inbox_sync_handles_opt;
                 // ZEB-321 Phase 1 Task 8: shadow the outer-scope binding into
                 // a move-capturable local so the thread closure can take
                 // ownership without disturbing the iroh_endpoint_arc /
@@ -5436,6 +5790,7 @@ pub(crate) async fn start_node_inner(
                                 profile_card_request_rx_for_loop,
                                 mint_sync_handles_for_loop,
                                 notes_sync_handles_for_loop,
+                                dm_inbox_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                                 dial_telemetry_into_loop,
                                 serve_allowlist_for_loop,
@@ -5602,6 +5957,13 @@ pub(crate) async fn start_node_inner(
                         guard.notes_tracker = notes_tracker_opt.clone();
                         guard.notes_sync = notes_sync_engine_opt.clone();
                         guard.notes_device_id = notes_device_id_opt.clone();
+                        // ZEB-418 SP2 P1: store the dm-inbox dataset handles
+                        // (no IPC surface in P1 — stop_inner and the deposit/
+                        // ingest paths constructed above are the consumers).
+                        guard.dm_inbox_doc = dm_inbox_doc_opt.clone();
+                        guard.dm_inbox_tracker = dm_inbox_tracker_opt.clone();
+                        guard.dm_inbox_sync = dm_inbox_sync_engine_opt.clone();
+                        guard.dm_inbox_device_id = dm_inbox_device_id_opt.clone();
                         // ZEB-321 Phase 1 Task 8: stash iroh resources so
                         // Task 9 IPC handlers can reach them via NodeState.
                         // All three are `Option`-shaped because iroh boot
@@ -5806,6 +6168,10 @@ pub(crate) async fn start_node_inner(
             // success path above already stashed a `.clone()` into NodeState,
             // so moving the original out here is safe (mirrors mint).
             notes_sync_engine_opt,
+            // ZEB-418 SP2 P1: same carry-out for the dm-inbox FleetSyncEngine
+            // (mirrors notes; its shutdown on the cleanup path also stops the
+            // ingest sweeper by dropping the engine task's nudge sender).
+            dm_inbox_sync_engine_opt,
             node_addr_for_response,
             freshly_created,
             has_owner_identity,
@@ -5824,6 +6190,7 @@ pub(crate) async fn start_node_inner(
         dfrost_log_registry_for_cleanup,
         mint_engine_for_cleanup,
         notes_engine_for_cleanup,
+        dm_inbox_engine_for_cleanup,
         node_addr_for_response,
         freshly_created,
         has_owner_identity,
@@ -5920,6 +6287,19 @@ pub(crate) async fn start_node_inner(
                 tracing::error!(
                     error = %e,
                     "Notes FleetSyncEngine cleanup after start_node failure"
+                );
+            }
+        }
+        // ZEB-418 SP2 P1: same rationale for the dm-inbox FleetSyncEngine
+        // (mirrors notes — engine construction may have succeeded before a
+        // later step aborted the install). Shutting it down also exits the
+        // ingest sweeper: the engine task's on_applied closure holds the
+        // only strong nudge sender.
+        if let Some(dm_inbox_engine) = dm_inbox_engine_for_cleanup {
+            if let Err(e) = dm_inbox_engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "dm-inbox FleetSyncEngine cleanup after start_node failure"
                 );
             }
         }
@@ -41743,6 +42123,11 @@ mod start_node_race_tests {
             notes_tracker: None,
             notes_sync: None,
             notes_device_id: None,
+            // ZEB-418 SP2 P1: dm-inbox dataset handles unused in race tests.
+            dm_inbox_doc: None,
+            dm_inbox_tracker: None,
+            dm_inbox_sync: None,
+            dm_inbox_device_id: None,
             // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.
             iroh_endpoint: None,
             reachability_resolver: None,
@@ -43328,6 +43713,8 @@ mod zeb_321_event_loop_wiring_tests {
             direct_addresses: vec![],
             announced_at_ms: 1000,
             identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         };
         let mut payload_a2 = payload_a.clone();
         payload_a2.iroh_node_id = [0x02; 32];
@@ -43406,6 +43793,8 @@ mod zeb_321_event_loop_wiring_tests {
             direct_addresses: vec![],
             announced_at_ms: 1000,
             identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         };
         let mut payload_admin = payload_target.clone();
         payload_admin.iroh_node_id = [0xAA; 32];
@@ -43737,6 +44126,8 @@ mod zeb_321_connectivity_ipc_tests {
             direct_addresses: vec![],
             announced_at_ms: 1_700_000_000_000,
             identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         };
         let hlc = Hlc {
             wall_ms: 1_700_000_000_000,

@@ -58,6 +58,13 @@ pub mod alpn {
     /// loop the same way `HARMONY_FRIEND_V1` is (see `iroh_friend_acceptor`'s
     /// `MultiplexHandshakeDispatcher`, which routes it to the PEX acceptor).
     pub const HARMONY_FRIEND_PEX_V1: &[u8] = b"harmony/friend-pex/v1";
+    /// ZEB-418 (SP2 P1): butler-deposit protocol (`DepositFrame` /
+    /// `DepositAck`, see `butler_deposit` + `iroh_butler_acceptor`). Routed
+    /// by the accept loop to the late-installed `IrohButlerDepositAcceptor`
+    /// (see `IrohZenohLinkManager::install_butler_deposit_acceptor`);
+    /// connections arriving before install are closed — the sender's
+    /// fallback chain treats that as a rung-2 failure and retries.
+    pub const HARMONY_BUTLER_DEPOSIT_V1: &[u8] = b"harmony/butler-deposit/v1";
 }
 
 /// OS keychain coordinates for the persistent iroh `SecretKey`.
@@ -102,6 +109,7 @@ impl IrohEndpoint {
                 alpn::HARMONY_PING_V1.to_vec(),
                 alpn::HARMONY_FRIEND_V1.to_vec(),
                 alpn::HARMONY_FRIEND_PEX_V1.to_vec(),
+                alpn::HARMONY_BUTLER_DEPOSIT_V1.to_vec(),
             ])
             .bind()
             .await
@@ -306,6 +314,7 @@ mod tests {
                 alpn::HARMONY_PING_V1.to_vec(),
                 alpn::HARMONY_FRIEND_V1.to_vec(),
                 alpn::HARMONY_FRIEND_PEX_V1.to_vec(),
+                alpn::HARMONY_BUTLER_DEPOSIT_V1.to_vec(),
             ])
             .relay_mode(RelayMode::Disabled)
             .bind()
@@ -333,5 +342,9 @@ mod tests {
         assert_eq!(alpn::HARMONY_PING_V1, b"harmony/ping/v1");
         assert_eq!(alpn::HARMONY_FRIEND_V1, b"harmony/friend/v1");
         assert_eq!(alpn::HARMONY_FRIEND_PEX_V1, b"harmony/friend-pex/v1");
+        assert_eq!(
+            alpn::HARMONY_BUTLER_DEPOSIT_V1,
+            b"harmony/butler-deposit/v1"
+        );
     }
 }

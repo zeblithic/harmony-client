@@ -167,6 +167,8 @@ fn iroh_connect_locators_dedups_and_skips_self() {
         direct_addresses: vec![],
         announced_at_ms: hlc.wall_ms,
         identity_signature: [0; 64],
+        butler_set: Vec::new(),
+        bs_at: 0,
     };
     resolver.update(OwnerAddr([0x01; 16]), mk(self_nid), hlc.clone());
     resolver.update(OwnerAddr([0x02; 16]), mk(peer_nid), hlc.clone());
@@ -298,6 +300,8 @@ async fn forwarder_inner() {
         direct_addresses: ep_a_sockets,
         announced_at_ms: hlc.wall_ms,
         identity_signature: [0; 64],
+        butler_set: Vec::new(),
+        bs_at: 0,
     };
     resolver_b.update(OwnerAddr([0xBB; 16]), payload_a, hlc);
 

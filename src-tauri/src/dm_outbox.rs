@@ -434,6 +434,12 @@ pub struct DmOutbox {
     pub(crate) enrollment_cert: harmony_owner::certs::EnrollmentCert,
     in_flight: HashSet<(OutboxEntryId, OwnerAddr)>,
     backoff: HashMap<(OutboxEntryId, OwnerAddr), AttemptState>,
+    /// ZEB-418 SP2 P1 Task 8: sender-side butler deposit client. `None`
+    /// (default) disables the deposit rung entirely — drain behaves exactly
+    /// as before. Production injects `IrohButlerDepositClient` via
+    /// `set_butler_deposit_client` at start_node (only when the iroh
+    /// endpoint bound); outbox tests inject a mock.
+    butler_deposit_client: Option<Arc<dyn crate::butler_deposit::ButlerDepositClient>>,
 }
 
 impl DmOutbox {
@@ -480,6 +486,7 @@ impl DmOutbox {
             enrollment_cert,
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
+            butler_deposit_client: None,
         }
     }
 
@@ -511,7 +518,19 @@ impl DmOutbox {
             enrollment_cert,
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
+            butler_deposit_client: None,
         }
+    }
+
+    /// ZEB-418 SP2 P1 Task 8: install the sender-side butler deposit
+    /// client. Until this is called the deposit rung is disabled and drain
+    /// behaves exactly as before (spec §6: the butler is a new rung, never
+    /// a replacement).
+    pub fn set_butler_deposit_client(
+        &mut self,
+        client: Arc<dyn crate::butler_deposit::ButlerDepositClient>,
+    ) {
+        self.butler_deposit_client = Some(client);
     }
 
     /// Encrypt `content` under `Space.content_key`, write the storage blob to
@@ -819,7 +838,41 @@ impl DmOutbox {
         // semantics — pass an empty `skipped` Vec to drain_phase_c.
         // Same `wall_now_ms` for both backoff and expiration clocks
         // since tests don't simulate Phase B/C latency.
-        self.drain_phase_c(state, results, Vec::new(), wall_now_ms, wall_now_ms)
+        let (mut outcome, deposit_candidates) =
+            self.drain_phase_c(state, results, Vec::new(), wall_now_ms, wall_now_ms);
+
+        // ZEB-418 P1 Task 8: butler deposit rung (lock-held variant —
+        // production runs it unlocked in `drain_lifted`). An ack routes
+        // through the existing idempotent `mark_ack_delivered`; every
+        // other outcome leaves the entry exactly as the transient direct
+        // failure left it (spec §6).
+        if !deposit_candidates.is_empty() {
+            if let Some(client) = self.butler_deposit_client.clone() {
+                for c in deposit_candidates {
+                    match client.deposit(&c).await {
+                        crate::butler_deposit::DepositRungOutcome::Acked => {
+                            if self.mark_ack_delivered(state, c.entry_id, c.recipient_owner) {
+                                outcome.newly_delivered.push((
+                                    c.space_id,
+                                    c.message_cid,
+                                    c.recipient_owner,
+                                ));
+                            }
+                        }
+                        crate::butler_deposit::DepositRungOutcome::SkippedNoFreshButlerSet => {}
+                        crate::butler_deposit::DepositRungOutcome::Failed(e) => {
+                            tracing::debug!(
+                                entry_id = ?c.entry_id,
+                                recipient = ?c.recipient_owner,
+                                error = %e,
+                                "ZEB-418: butler deposit rung failed; existing retry chain continues"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        outcome
     }
 
     /// Phase A of drain: under the outbox + state locks, collect every
@@ -915,6 +968,16 @@ impl DmOutbox {
     ///   `transport.send()` (or contended Phase C lock acquisition)
     ///   that takes the wall-clock past `EXPIRATION_MS` must NOT mark
     ///   the just-sent entry Expired before its ack arrives.
+    ///
+    /// ZEB-418 P1 Task 8: additionally returns the butler-deposit
+    /// candidates this tick produced — one per TRANSIENT direct-send
+    /// failure whose `(entry, recipient)` pair already carried an
+    /// `AttemptState` (i.e. the entry has been pending ≥ one backoff
+    /// cycle). Candidates only arise from failure events, and each backoff
+    /// window contains exactly one direct attempt, so the rung fires at
+    /// most once per backoff window by construction (no hot loop). The
+    /// caller runs the deposits AFTER this synchronous phase (unlocked in
+    /// `drain_lifted`) and routes acks through `mark_ack_delivered`.
     fn drain_phase_c(
         &mut self,
         state: &mut OwnerState,
@@ -922,8 +985,12 @@ impl DmOutbox {
         skipped: Vec<(OutboxEntryId, OwnerAddr)>,
         backoff_now_ms: u64,
         expiration_now_ms: u64,
-    ) -> DrainOutcome {
+    ) -> (
+        DrainOutcome,
+        Vec<crate::butler_deposit::ButlerDepositRequest>,
+    ) {
         let mut outcome = DrainOutcome::default();
+        let mut deposit_candidates: Vec<crate::butler_deposit::ButlerDepositRequest> = Vec::new();
 
         // 1. Apply each send result.
         for r in results {
@@ -982,8 +1049,45 @@ impl DmOutbox {
                                 last_attempt_wall_ms: 0,
                                 failure_count: 0,
                             });
+                    let pre_failure_count = st.failure_count;
                     st.last_attempt_wall_ms = backoff_now_ms;
                     st.failure_count = st.failure_count.saturating_add(1);
+
+                    // ZEB-418 P1 Task 8: deposit-rung candidacy. Fires only
+                    // for a TRANSIENT failure on a pair that already had an
+                    // AttemptState (pending ≥ one backoff cycle: a prior
+                    // failed attempt OR a sent-but-never-acked attempt).
+                    // Permanent failures are excluded — a butler can't fix
+                    // a broken local pipeline. Failure-event-driven means
+                    // at most one deposit per backoff window (each window
+                    // contains exactly one direct attempt). Rung outcomes
+                    // never touch the AttemptState written above (spec §6:
+                    // delivery is never worse than today).
+                    if matches!(e, TransportError::Transient(_))
+                        && pre_failure_count >= 1
+                        && self.butler_deposit_client.is_some()
+                    {
+                        if let Some(entry) = state.outbox.get(&r.entry_id) {
+                            match self.build_cidnotify_packet_bytes(entry) {
+                                Ok(cidnotify_packet) => deposit_candidates.push(
+                                    crate::butler_deposit::ButlerDepositRequest {
+                                        entry_id: r.entry_id,
+                                        recipient_owner: r.recipient,
+                                        space_id: entry.space_id,
+                                        message_cid: entry.message_cid,
+                                        cidnotify_packet,
+                                        now_ms: backoff_now_ms,
+                                    },
+                                ),
+                                Err(err) => tracing::warn!(
+                                    entry_id = ?r.entry_id,
+                                    recipient = ?r.recipient,
+                                    error = %err,
+                                    "ZEB-418: CidNotify build failed; skipping deposit candidate"
+                                ),
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1055,7 +1159,26 @@ impl DmOutbox {
                 .unwrap_or(false)
         });
         outcome.newly_expired = expired;
-        outcome
+        (outcome, deposit_candidates)
+    }
+
+    /// ZEB-418 P1 Task 8: build the signed CidNotify wire bytes for a
+    /// deposit — the IDENTICAL construction `RuntimeUnicastTransport::send`
+    /// produces for the direct path (same `sender_devices`, same
+    /// `signing_device_hash`, signed by the same Reticulum device key), so
+    /// the butler's inner verification and the recipient's eventual
+    /// ingestion see exactly what a direct arrival would carry.
+    fn build_cidnotify_packet_bytes(&self, entry: &OutboxEntry) -> Result<Vec<u8>, String> {
+        let signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id: entry.space_id,
+            message_cid: entry.message_cid,
+            sender_owner_addr: self.self_owner,
+            sender_devices: vec![self.our_signing_device_hash],
+            signing_device_hash: self.our_signing_device_hash,
+        };
+        let packet = crate::dm_envelope::build_signed_cidnotify(signed, &self.signing_key)
+            .map_err(|e| format!("build_signed_cidnotify: {e}"))?;
+        crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
     }
 
     fn is_due(&self, entry_id: OutboxEntryId, recipient: OwnerAddr, wall_now_ms: u64) -> bool {
@@ -1358,81 +1481,25 @@ impl DmOutbox {
         let (_space_a, resolved_owner) = {
             let outbox_g = outbox_arc.lock().await;
             let mut state_g = state_arc.lock().await;
-            let identity_pub = match lookup_pubkey_for_device(
-                &state_g.owner_device_cache,
-                signed.signing_device_hash,
-            ) {
-                Some(pub_) => pub_,
-                None => {
-                    tracing::warn!(
-                        error = ?DmReceiveError::UnknownSigningKey,
-                        "handle_cidnotify_lifted Phase A: dropping packet"
-                    );
-                    return;
-                }
-            };
-            if let Err(e) = crate::dm_signing::verify_dm_packet_signature(
-                &signed_bytes,
+            // Admission checks extracted verbatim into
+            // `verify_cidnotify_admission` (ZEB-418 P1 Task 6) so butler
+            // dm-inbox ingestion runs deposited packets through EXACTLY
+            // this verification (pubkey lookup, signature, owner
+            // resolution + match, Space lookup, ZEB-275 SpaceKind gate,
+            // membership). Every reject logs the same Phase A drop line
+            // the original inline blocks logged.
+            let (space, resolved_owner, identity_pub) = match verify_cidnotify_admission(
+                &state_g,
+                &signed,
                 &signature,
-                &identity_pub,
-                signed.signing_device_hash,
+                &signed_bytes,
             ) {
-                tracing::warn!(error = ?e, "handle_cidnotify_lifted Phase A: dropping packet");
-                return;
-            }
-            let resolved_owner = match resolve_signed_origin_owner(
-                &state_g.owner_device_cache,
-                signed.signing_device_hash,
-            ) {
-                Ok(addr) => addr,
+                Ok(admitted) => admitted,
                 Err(e) => {
                     tracing::warn!(error = ?e, "handle_cidnotify_lifted Phase A: dropping packet");
                     return;
                 }
             };
-            if signed.sender_owner_addr != resolved_owner {
-                tracing::warn!(
-                    error = ?DmReceiveError::OwnerFieldMismatch,
-                    "handle_cidnotify_lifted Phase A: dropping packet"
-                );
-                return;
-            }
-            let space = match state_g.spaces.get(&signed.space_id) {
-                Some(s) => s.clone(),
-                None => {
-                    tracing::warn!(
-                        error = ?DmReceiveError::SpaceNotFound,
-                        "handle_cidnotify_lifted Phase A: dropping packet"
-                    );
-                    return;
-                }
-            };
-            // ZEB-275: gate on SpaceKind before any decrypt-path work.
-            // Defends against forged CidNotifys targeting Channel /
-            // PublicChannel spaces (which can also have members for
-            // read-access controls). `validate_invariants` guarantees
-            // content_key.is_some() only for Dm/GroupDm — without this
-            // gate, the handler proceeds into Phase B's 500ms CAS fetch
-            // and Phase C, which then log-drops on content_key=None at
-            // line ~1308 with a generic "invariant violation" warning.
-            // The gate fires earlier (cheap path), avoids wasted CAS
-            // bandwidth, and emits the precise SpaceKindMismatch
-            // telemetry. Also defense-in-depth against a future code
-            // change that might reintroduce a panic in the decrypt path.
-            if !matches!(space.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
-                tracing::warn!(
-                    error = ?DmReceiveError::SpaceKindMismatch,
-                    "handle_cidnotify_lifted Phase A: dropping packet"
-                );
-                return;
-            }
-            if !space.members.contains(&resolved_owner) {
-                tracing::warn!(
-                    error = ?DmReceiveError::SenderNotInSpaceMembers,
-                    "handle_cidnotify_lifted Phase A: dropping packet"
-                );
-                return;
-            }
             // Refresh OwnerDeviceCache (Step 8 from the now-deleted
             // handle_cidnotify). MUST happen before lock-drop so the
             // refresh persists even if Phase B's CAS fetch times out
@@ -1514,72 +1581,22 @@ impl DmOutbox {
                 return;
             }
 
-            // Decrypt with current Space + prior_content_keys fallback —
-            // handles content_key rotation between Phase A and Phase C.
-            let aad = match crate::dm_crypto::compute_aad(&space_c) {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::warn!(
-                        error = ?DmReceiveError::AadCompute(e.to_string()),
-                        "handle_cidnotify_lifted Phase C: dropping packet"
-                    );
-                    return;
-                }
-            };
-            // Decrypt with prior-keys fallback. `space_c.content_key`
-            // is non-None for any DM/group-DM Space that passed
-            // `validate_invariants` — the invariant check in
-            // `apply_space_with_canonicalization` (which wrote this
-            // Space into state) rejects DM/group-DM Spaces with
-            // content_key=None. The TOCTOU re-check above re-fetched
-            // `space_c` from the latest state, so any rotation that
-            // landed during Phase B is reflected here; the prior_keys
-            // fallback decrypts blobs that were encrypted with a key
-            // listed in `space_c.prior_content_keys`.
-            //
-            // Defense-in-depth: log + drop instead of expect()/panic.
-            // In the spawned-task path, panic dies silently (no caller
-            // to surface); converting to a graceful drop keeps the
-            // method panic-free as documented and matches the rest of
-            // Phase C's error handling. Reachable only via corrupted
-            // state, migration bug, or direct test insertion that
-            // bypasses validate_invariants — in production this should
-            // never fire, but the failure mode is now observable.
-            let content_key = match space_c.content_key.as_ref() {
-                Some(k) => k,
-                None => {
-                    tracing::warn!(
-                        "handle_cidnotify_lifted Phase C: dropping packet \
-                         (DM Space lacks content_key — invariant violation, \
-                         possibly corrupted state)"
-                    );
-                    return;
-                }
-            };
-            let payload = match crate::dm_crypto::decrypt_dm_message(
-                content_key,
-                &space_c.prior_content_keys,
-                &aad,
-                &blob,
-            ) {
+            // Decrypt + sender binding extracted verbatim into
+            // `decrypt_and_bind_dm_blob` (ZEB-418 P1 Task 6, shared with
+            // butler dm-inbox ingestion): AAD compute, content_key
+            // presence (invariant violation → MissingContentKey, a
+            // graceful drop instead of a silent spawned-task panic),
+            // prior-keys-fallback decryption — the TOCTOU re-check above
+            // re-fetched `space_c` from the latest state, so a rotation
+            // that landed during Phase B is reflected here — and the
+            // payload-sender impersonation check.
+            let payload = match decrypt_and_bind_dm_blob(&space_c, &blob, resolved_owner) {
                 Ok(p) => p,
-                Err(_) => {
-                    tracing::warn!(
-                        error = ?DmReceiveError::DecryptFailed,
-                        "handle_cidnotify_lifted Phase C: dropping packet"
-                    );
+                Err(e) => {
+                    tracing::warn!(error = ?e, "handle_cidnotify_lifted Phase C: dropping packet");
                     return;
                 }
             };
-
-            // Sender-binding check.
-            if crate::dm_crypto::verify_sender_binding(&payload, resolved_owner).is_err() {
-                tracing::warn!(
-                    error = ?DmReceiveError::SenderImpersonation,
-                    "handle_cidnotify_lifted Phase C: dropping packet"
-                );
-                return;
-            }
 
             // NOTE: OwnerDeviceCache refresh (Step 8 in the now-deleted
             // handle_cidnotify) was moved up to Phase A, so it runs
@@ -1673,19 +1690,11 @@ impl DmOutbox {
         }; // locks dropped here
 
         // IPC emit — locks released, safe to fire dm-received events.
+        // Event name + payload builder shared with butler dm-inbox
+        // ingestion (ZEB-418 P1 Task 6) so the frontend cannot observe
+        // which path delivered a message.
         for rm in drain_outcome.newly_received {
-            let _ = app.emit(
-                "dm-received",
-                serde_json::json!({
-                    "spaceId": hex::encode(rm.inbox_entry.space_id.0),
-                    "messageCid": hex::encode(rm.inbox_entry.message_cid.to_bytes()),
-                    "from": hex::encode(rm.inbox_entry.from.0),
-                    "receivedAt": rm.inbox_entry.received_at.wall_ms,
-                    "sentAt": rm.sent_at.wall_ms,
-                    "body": hex::encode(&rm.body),
-                    "mimeType": rm.mime_type,
-                }),
-            );
+            let _ = app.emit(DM_RECEIVED_EVENT, dm_received_event_payload(&rm));
         }
     }
 
@@ -1987,25 +1996,29 @@ pub async fn drain_lifted<R: tauri::Runtime>(
     // returns, the event_loop is free to pump cas_op_rx, so any holder
     // of outbox/state can release.
     tokio::spawn(async move {
-        let mut o_g = outbox.lock().await;
-        let mut s_g = state.lock().await;
-        // ZEB-233 round 1 (Qodo Correctness #1) + round 3 (CodeRabbit
-        // Major): Phase C needs two distinct timestamps. `backoff_now_ms`
-        // is recomputed AFTER lock acquisition — it reflects when the
-        // send outcome was actually recorded, so `last_attempt_wall_ms`
-        // bookkeeping is accurate. `expiration_now_ms` REUSES the
-        // outer `wall_now_ms` from the captured `let` move — it
-        // reflects when Phase A admitted this drain tick as in-flight,
-        // so the 30-day expiration sweep can't expire an entry in the
-        // same tick it was just sent due to Phase B/C latency.
-        let backoff_now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let outcome = o_g.drain_phase_c(&mut s_g, results, skipped, backoff_now_ms, wall_now_ms);
-        // Drop locks before emitting IPC events.
-        drop(s_g);
-        drop(o_g);
+        let (outcome, deposit_candidates, deposit_client) = {
+            let mut o_g = outbox.lock().await;
+            let mut s_g = state.lock().await;
+            // ZEB-233 round 1 (Qodo Correctness #1) + round 3 (CodeRabbit
+            // Major): Phase C needs two distinct timestamps. `backoff_now_ms`
+            // is recomputed AFTER lock acquisition — it reflects when the
+            // send outcome was actually recorded, so `last_attempt_wall_ms`
+            // bookkeeping is accurate. `expiration_now_ms` REUSES the
+            // outer `wall_now_ms` from the captured `let` move — it
+            // reflects when Phase A admitted this drain tick as in-flight,
+            // so the 30-day expiration sweep can't expire an entry in the
+            // same tick it was just sent due to Phase B/C latency.
+            let backoff_now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let (outcome, candidates) =
+                o_g.drain_phase_c(&mut s_g, results, skipped, backoff_now_ms, wall_now_ms);
+            let client = o_g.butler_deposit_client.clone();
+            // Locks drop at the end of this block — before any IPC emit
+            // and before the deposit rung's network I/O below.
+            (outcome, candidates, client)
+        };
         for (space_id, message_cid, recipient) in outcome.newly_delivered {
             let payload = serde_json::json!({
                 "spaceId": hex::encode(space_id.0),
@@ -2020,6 +2033,46 @@ pub async fn drain_lifted<R: tauri::Runtime>(
                 "messageCid": hex::encode(message_cid.to_bytes()),
             });
             let _ = app.emit("dm-expired", payload);
+        }
+
+        // ZEB-418 P1 Task 8 — butler deposit rung. Runs UNLOCKED (pkarr
+        // resolve + up to two iroh dials, each deadline-bounded), after the
+        // direct results' events have already been emitted so a slow
+        // deposit can't delay them. An ack re-acquires the locks briefly
+        // and routes through the existing idempotent `mark_ack_delivered`
+        // (a raced direct ack makes it a no-op); skip/failure outcomes
+        // touch NOTHING — the entry keeps the exact transient-failure
+        // backoff Phase C just recorded (spec §6: never worse than today).
+        let Some(client) = deposit_client else {
+            return;
+        };
+        for c in deposit_candidates {
+            match client.deposit(&c).await {
+                crate::butler_deposit::DepositRungOutcome::Acked => {
+                    let newly = {
+                        let mut o_g = outbox.lock().await;
+                        let mut s_g = state.lock().await;
+                        o_g.mark_ack_delivered(&mut s_g, c.entry_id, c.recipient_owner)
+                    };
+                    if newly {
+                        let payload = serde_json::json!({
+                            "spaceId": hex::encode(c.space_id.0),
+                            "messageCid": hex::encode(c.message_cid.to_bytes()),
+                            "recipientOwnerAddr": hex::encode(c.recipient_owner.0),
+                        });
+                        let _ = app.emit("dm-delivered", payload);
+                    }
+                }
+                crate::butler_deposit::DepositRungOutcome::SkippedNoFreshButlerSet => {}
+                crate::butler_deposit::DepositRungOutcome::Failed(e) => {
+                    tracing::debug!(
+                        entry_id = ?c.entry_id,
+                        recipient = ?c.recipient_owner,
+                        error = %e,
+                        "ZEB-418: butler deposit rung failed; existing retry chain continues"
+                    );
+                }
+            }
         }
     });
 }
@@ -2093,6 +2146,14 @@ pub enum DmReceiveError {
     CasFetchFailed(String),
     #[error("DM blob decryption failed under all candidate keys")]
     DecryptFailed,
+    /// `space.content_key` is None for a Dm/GroupDm Space — invariant
+    /// violation (`validate_invariants` forbids writing such a Space),
+    /// possibly corrupted state. Previously logged inline by
+    /// `handle_cidnotify_lifted` Phase C with this same wording; promoted
+    /// to a variant when the decrypt block was extracted into
+    /// `decrypt_and_bind_dm_blob` (ZEB-418 P1 Task 6).
+    #[error("DM Space lacks content_key — invariant violation, possibly corrupted state")]
+    MissingContentKey,
     #[error("payload sender does not match resolved owner (impersonation)")]
     SenderImpersonation,
     #[error("packet decode failed: {0}")]
@@ -2229,6 +2290,133 @@ pub(crate) fn lookup_pubkey_for_device(
         }
     }
     None
+}
+
+/// Phase A admission checks for an inbound DmCidNotify, extracted verbatim
+/// from `handle_cidnotify_lifted` (ZEB-418 P1 Task 6) so the butler
+/// dm-inbox ingestion path (`dm_inbox_ingest`) runs deposited packets
+/// through EXACTLY the normal receive-path verification instead of a
+/// parallel re-implementation.
+///
+/// Checks, in the original inline order:
+///   1. signing-device pubkey lookup (`UnknownSigningKey` when absent);
+///   2. packet signature verification (includes the key-substitution
+///      defense inside `verify_dm_packet_signature`);
+///   3. signing device → owner resolution (`UnknownSigningDevice` /
+///      `AmbiguousSigningDevice`);
+///   4. `signed.sender_owner_addr` must equal the resolved owner
+///      (`OwnerFieldMismatch`, cache-poisoning defense);
+///   5. Space lookup by `signed.space_id` (`SpaceNotFound`);
+///   6. SpaceKind gate: `Dm | GroupDm` only (`SpaceKindMismatch`) —
+///      ZEB-275: gate BEFORE any decrypt-path work. Defends against
+///      forged CidNotifys targeting Channel / PublicChannel spaces (which
+///      can also have members for read-access controls).
+///      `validate_invariants` guarantees `content_key.is_some()` only for
+///      Dm/GroupDm — without this gate, the handler proceeds into Phase
+///      B's 500ms CAS fetch and Phase C, which then log-drops on
+///      `content_key=None` with a generic "invariant violation" warning.
+///      The gate fires earlier (cheap path), avoids wasted CAS bandwidth,
+///      and emits the precise `SpaceKindMismatch` telemetry. Also
+///      defense-in-depth against a future code change that might
+///      reintroduce a panic in the decrypt path;
+///   7. sender membership in `space.members` (`SenderNotInSpaceMembers`).
+///
+/// Returns the cloned Space, the resolved owner, and the signer's cached
+/// 64-byte identity pub (the normal path feeds it to
+/// `apply_owner_device_update`).
+pub(crate) fn verify_cidnotify_admission(
+    state: &OwnerState,
+    signed: &crate::dm_envelope::DmCidNotifySigned,
+    signature: &[u8; 64],
+    signed_bytes: &[u8],
+) -> Result<(crate::owner_state_types::Space, OwnerAddr, [u8; 64]), DmReceiveError> {
+    let identity_pub =
+        lookup_pubkey_for_device(&state.owner_device_cache, signed.signing_device_hash)
+            .ok_or(DmReceiveError::UnknownSigningKey)?;
+    crate::dm_signing::verify_dm_packet_signature(
+        signed_bytes,
+        signature,
+        &identity_pub,
+        signed.signing_device_hash,
+    )?;
+    let resolved_owner =
+        resolve_signed_origin_owner(&state.owner_device_cache, signed.signing_device_hash)?;
+    if signed.sender_owner_addr != resolved_owner {
+        return Err(DmReceiveError::OwnerFieldMismatch);
+    }
+    let space = state
+        .spaces
+        .get(&signed.space_id)
+        .cloned()
+        .ok_or(DmReceiveError::SpaceNotFound)?;
+    if !matches!(space.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+        return Err(DmReceiveError::SpaceKindMismatch);
+    }
+    if !space.members.contains(&resolved_owner) {
+        return Err(DmReceiveError::SenderNotInSpaceMembers);
+    }
+    Ok((space, resolved_owner, identity_pub))
+}
+
+/// Phase C decrypt + sender binding for an inbound DM storage blob,
+/// extracted verbatim from `handle_cidnotify_lifted` (ZEB-418 P1 Task 6)
+/// and shared with the butler dm-inbox ingestion path.
+///
+/// * AAD is bound to the Space's `dedupe_key` (stable across cross-SpaceId
+///   dedupe collapses).
+/// * `space.content_key` is non-None for any DM/group-DM Space that passed
+///   `validate_invariants` — the invariant check in
+///   `apply_space_with_canonicalization` (which wrote the Space into
+///   state) rejects DM/group-DM Spaces with `content_key=None`. Reachable
+///   only via corrupted state, a migration bug, or direct test insertion
+///   that bypasses `validate_invariants`; the failure mode is a graceful
+///   `MissingContentKey` reject (never a panic — in the spawned-task path
+///   a panic would die silently).
+/// * Decryption tries the current `content_key` then each
+///   `prior_content_keys` entry in stored order, so a rotation landing
+///   between Phase A and Phase C (or between deposit and ingestion) still
+///   decrypts.
+/// * The decrypted payload's `sender` must equal `resolved_owner`
+///   (`SenderImpersonation` defense).
+pub(crate) fn decrypt_and_bind_dm_blob(
+    space: &crate::owner_state_types::Space,
+    blob: &[u8],
+    resolved_owner: OwnerAddr,
+) -> Result<MessagePayload, DmReceiveError> {
+    let aad = compute_aad(space).map_err(|e| DmReceiveError::AadCompute(e.to_string()))?;
+    let content_key = space
+        .content_key
+        .as_ref()
+        .ok_or(DmReceiveError::MissingContentKey)?;
+    let payload =
+        crate::dm_crypto::decrypt_dm_message(content_key, &space.prior_content_keys, &aad, blob)
+            .map_err(|_| DmReceiveError::DecryptFailed)?;
+    crate::dm_crypto::verify_sender_binding(&payload, resolved_owner)
+        .map_err(|_| DmReceiveError::SenderImpersonation)?;
+    Ok(payload)
+}
+
+/// The `dm-received` UI event name, shared by the normal receive path and
+/// butler dm-inbox ingestion (ZEB-418 P1 Task 6) so both deliver through
+/// one event the frontend already listens for.
+pub(crate) const DM_RECEIVED_EVENT: &str = "dm-received";
+
+/// Builds the `dm-received` event payload — the single source of truth for
+/// its shape, shared by `handle_cidnotify_lifted` and butler dm-inbox
+/// ingestion so the frontend cannot observe which path delivered a
+/// message.
+pub(crate) fn dm_received_event_payload(
+    rm: &crate::owner_state_types::ReceivedMessage,
+) -> serde_json::Value {
+    serde_json::json!({
+        "spaceId": hex::encode(rm.inbox_entry.space_id.0),
+        "messageCid": hex::encode(rm.inbox_entry.message_cid.to_bytes()),
+        "from": hex::encode(rm.inbox_entry.from.0),
+        "receivedAt": rm.inbox_entry.received_at.wall_ms,
+        "sentAt": rm.sent_at.wall_ms,
+        "body": hex::encode(&rm.body),
+        "mimeType": rm.mime_type,
+    })
 }
 
 #[cfg(test)]
@@ -2936,7 +3124,7 @@ mod tests {
         }];
         let skipped = vec![(entry_skipped_id, carol)];
 
-        let _outcome = o.drain_phase_c(&mut state, results, skipped, 2_000, 2_000);
+        let (_outcome, _candidates) = o.drain_phase_c(&mut state, results, skipped, 2_000, 2_000);
 
         // Both in_flight markers should be cleared.
         assert!(
@@ -3011,7 +3199,8 @@ mod tests {
                 result: Ok(()),
             },
         ];
-        let _outcome = o.drain_phase_c(&mut state, results, Vec::new(), 2_000, 2_000);
+        let (_outcome, _candidates) =
+            o.drain_phase_c(&mut state, results, Vec::new(), 2_000, 2_000);
 
         // bob's backoff MUST NOT be set — handle_ack already cleared
         // his per-recipient retry state; Phase C must not resurrect.
@@ -3074,7 +3263,7 @@ mod tests {
             recipient: bob,
             result: Ok(()),
         }];
-        let outcome = o.drain_phase_c(
+        let (outcome, _candidates) = o.drain_phase_c(
             &mut state,
             results,
             Vec::new(),
@@ -3106,6 +3295,297 @@ mod tests {
             "backoff uses backoff_now_ms (Phase C clock) — accurate \
              post-send anchor for the next is_due check"
         );
+    }
+
+    // =================================================================
+    // ZEB-418 SP2 P1 Task 8: sender-side butler deposit rung
+    // =================================================================
+
+    use crate::butler_deposit::{ButlerDepositClient, ButlerDepositRequest, DepositRungOutcome};
+
+    /// Mock deposit channel: records every request the drain's deposit
+    /// rung hands it and returns a preset outcome (mirrors how
+    /// `StubTransport` mocks `DmTransport`).
+    struct MockDepositClient {
+        outcome: Mutex<DepositRungOutcome>,
+        calls: Mutex<Vec<ButlerDepositRequest>>,
+    }
+
+    impl MockDepositClient {
+        fn returning(outcome: DepositRungOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                outcome: Mutex::new(outcome),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<ButlerDepositRequest> {
+            self.calls.lock().expect("mock poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ButlerDepositClient for MockDepositClient {
+        async fn deposit(&self, req: &ButlerDepositRequest) -> DepositRungOutcome {
+            self.calls.lock().expect("mock poisoned").push(req.clone());
+            self.outcome.lock().expect("mock poisoned").clone()
+        }
+    }
+
+    /// Shared scaffold for the deposit-rung tests: one Pending entry for
+    /// `bob`, a `StubTransport`, and an outbox with the given mock client
+    /// installed. Returns everything the tests poke at.
+    fn deposit_rung_fixture(
+        outcome: DepositRungOutcome,
+    ) -> (
+        OwnerState,
+        StubTransport,
+        DmOutbox,
+        Arc<MockDepositClient>,
+        OutboxEntryId,
+        OwnerAddr,
+    ) {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let transport = StubTransport::new();
+        let mut o = make_outbox_synthetic("dev", alice);
+        let mock = MockDepositClient::returning(outcome);
+        o.set_butler_deposit_client(mock.clone());
+        (state, transport, o, mock, entry_id, bob)
+    }
+
+    /// Drive one drain tick at `wall_now_ms` with a pre-seeded TRANSIENT
+    /// direct-send failure for `(entry_id, bob)`.
+    async fn drain_with_transient_failure(
+        o: &mut DmOutbox,
+        state: &mut OwnerState,
+        transport: &StubTransport,
+        entry_id: OutboxEntryId,
+        bob: OwnerAddr,
+        wall_now_ms: u64,
+    ) -> DrainOutcome {
+        transport.set_outcome(
+            entry_id,
+            bob,
+            Err(TransportError::Transient("recipient unreachable".into())),
+        );
+        o.drain(state, transport, wall_now_ms).await
+    }
+
+    /// The deposit rung fires on a transient direct failure once the entry
+    /// has been pending ≥ one backoff cycle (an `AttemptState` already
+    /// existed), at most once per backoff window, with a request that
+    /// carries the entry's identity + a CidNotify packet matching what the
+    /// direct path would send.
+    #[tokio::test]
+    async fn transient_direct_failure_with_fresh_butler_set_attempts_deposit() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Failed("butlers unreachable".into()));
+        let space_id = SpaceId([1u8; 16]);
+        let message_cid = ContentId::from_bytes([3u8; 32]);
+
+        // Tick 1 (t=10_000): FIRST attempt fails transiently. No prior
+        // AttemptState → the entry has NOT been pending ≥ one backoff
+        // cycle → the rung must not fire.
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+            .await;
+        assert!(
+            mock.calls().is_empty(),
+            "first transient failure must NOT attempt a deposit (entry not \
+             yet pending >= one backoff cycle)"
+        );
+
+        // Tick 2 (t=15_000, base 5s window elapsed): SECOND attempt also
+        // fails transiently. AttemptState existed → deposit attempted.
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+            .await;
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1, "deposit rung must fire exactly once");
+        let req = &calls[0];
+        assert_eq!(req.entry_id, entry_id);
+        assert_eq!(req.recipient_owner, bob);
+        assert_eq!(req.space_id, space_id);
+        assert_eq!(req.message_cid, message_cid);
+        assert_eq!(req.now_ms, 15_000);
+
+        // The packet rides the SAME construction the direct path sends:
+        // a signed CidNotify for this entry from this device.
+        let packet = crate::dm_envelope::decode_packet(&req.cidnotify_packet)
+            .expect("deposit request must carry a decodable DM packet");
+        match packet {
+            crate::dm_envelope::DmPacket::CidNotify { signed, .. } => {
+                assert_eq!(signed.space_id, space_id);
+                assert_eq!(signed.message_cid, message_cid);
+                assert_eq!(signed.sender_owner_addr, o.self_owner);
+                assert_eq!(signed.signing_device_hash, o.our_signing_device_hash);
+            }
+            other => panic!("expected CidNotify, got {other:?}"),
+        }
+
+        // Tick 3 (t=15_001, inside the new 10s window): direct send not
+        // due → no new failure event → no second deposit (no hot loop).
+        let _ = o.drain(&mut state, &transport, 15_001).await;
+        assert_eq!(
+            mock.calls().len(),
+            1,
+            "deposit must be attempted at most once per backoff window"
+        );
+    }
+
+    /// A butler ack marks the recipient delivered through the existing
+    /// `mark_ack_delivered` path and surfaces in `newly_delivered` (the
+    /// `dm-delivered` IPC emit contract).
+    #[tokio::test]
+    async fn deposit_ack_marks_owner_delivered_and_emits_dm_delivered() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Acked);
+        let space_id = SpaceId([1u8; 16]);
+        let message_cid = ContentId::from_bytes([3u8; 32]);
+
+        let outcome1 =
+            drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+                .await;
+        assert!(outcome1.newly_delivered.is_empty());
+
+        let outcome2 =
+            drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+                .await;
+        assert_eq!(mock.calls().len(), 1, "deposit attempted on tick 2");
+        assert_eq!(
+            outcome2.newly_delivered,
+            vec![(space_id, message_cid, bob)],
+            "deposit ack must surface in newly_delivered (dm-delivered emit)"
+        );
+
+        let stored = state.outbox.get(&entry_id).expect("entry still present");
+        assert!(stored.delivered_to.contains(&bob), "bob marked delivered");
+        assert!(
+            matches!(stored.delivery_status, DeliveryStatus::Complete),
+            "sole recipient acked via butler -> Complete"
+        );
+        // mark_ack_delivered cleared the pair's retry state.
+        assert_eq!(o.backoff_len(), 0);
+        assert_eq!(o.in_flight_len(), 0);
+    }
+
+    /// A stale/missing butler set skips the rung silently: the entry keeps
+    /// the exact transient-failure backoff and the existing direct retry
+    /// chain proceeds unchanged (spec §6: never worse than today).
+    #[tokio::test]
+    async fn stale_or_missing_butler_set_skips_rung_falls_back_to_retry() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::SkippedNoFreshButlerSet);
+
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+            .await;
+        let outcome =
+            drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+                .await;
+        assert_eq!(mock.calls().len(), 1, "rung consulted on tick 2");
+        assert!(outcome.newly_delivered.is_empty(), "skip marks nothing");
+
+        let stored = state.outbox.get(&entry_id).expect("entry still present");
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Pending));
+        assert!(stored.delivered_to.is_empty());
+
+        // Backoff is EXACTLY what the two transient failures left: the
+        // skipped rung neither bumps nor clears it.
+        let st = o
+            .backoff
+            .get(&(entry_id, bob))
+            .copied()
+            .expect("AttemptState retained");
+        assert_eq!(st.failure_count, 2);
+        assert_eq!(st.last_attempt_wall_ms, 15_000);
+
+        // Rung 3: the direct retry chain re-attempts when the shared
+        // backoff window (10s at failure_count=2) elapses.
+        let _ = o.drain(&mut state, &transport, 25_000).await;
+        assert_eq!(
+            transport.sends().len(),
+            3,
+            "direct retry chain must continue exactly as before"
+        );
+    }
+
+    /// A failed deposit (all butlers unreachable / rejected) leaves the
+    /// entry pending under the SAME shared `AttemptState` a transient
+    /// direct failure produces — no extra bump, no drop, no tightening.
+    #[tokio::test]
+    async fn deposit_failure_leaves_entry_pending_with_backoff() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Failed("all entries failed".into()));
+
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+            .await;
+        let outcome =
+            drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+                .await;
+        assert_eq!(mock.calls().len(), 1, "deposit attempted and failed");
+        assert!(outcome.newly_delivered.is_empty());
+
+        let stored = state.outbox.get(&entry_id).expect("entry still present");
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Pending));
+        assert!(stored.delivered_to.is_empty());
+
+        let st = o
+            .backoff
+            .get(&(entry_id, bob))
+            .copied()
+            .expect("shared AttemptState retained");
+        assert_eq!(
+            st.failure_count, 2,
+            "rung failure adds NO extra failure_count bump"
+        );
+        assert_eq!(st.last_attempt_wall_ms, 15_000);
+
+        // The shared backoff window is honored unchanged: no re-send just
+        // before the 10s window ends, one exactly when it elapses.
+        let _ = o.drain(&mut state, &transport, 24_999).await;
+        assert_eq!(transport.sends().len(), 2, "still inside backoff window");
+        let _ = o.drain(&mut state, &transport, 25_000).await;
+        assert_eq!(
+            transport.sends().len(),
+            3,
+            "retry resumes exactly per the shared AttemptState backoff"
+        );
+    }
+
+    /// A late DIRECT ack arriving after the deposit ack already marked the
+    /// recipient delivered must be a no-op — `mark_ack_delivered` is the
+    /// single idempotent path both acks converge on.
+    #[tokio::test]
+    async fn late_direct_ack_after_deposit_ack_is_idempotent() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Acked);
+
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+            .await;
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+            .await;
+        assert_eq!(mock.calls().len(), 1);
+        assert!(state
+            .outbox
+            .get(&entry_id)
+            .expect("entry present")
+            .delivered_to
+            .contains(&bob));
+
+        // Late direct ack for the same (entry, recipient) — the path
+        // handle_ack step 7 drives. Must report NOT newly delivered.
+        let newly = o.mark_ack_delivered(&mut state, entry_id, bob);
+        assert!(
+            !newly,
+            "late direct ack after deposit ack must be a no-op (idempotent)"
+        );
+        let stored = state.outbox.get(&entry_id).expect("entry present");
+        assert_eq!(stored.delivered_to.len(), 1, "no duplicate delivered_to");
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
     }
 
     #[tokio::test]

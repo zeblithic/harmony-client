@@ -213,6 +213,8 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
             // (unlike an invite, the friend token carries no transport composite
             // pub to match against). Any consistent placeholder works here.
             identity_signature: [0xCDu8; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         };
         let alice_routing_blob = {
             let mut buf = Vec::new();

@@ -169,6 +169,17 @@ pub struct IrohZenohLinkManager {
     /// (30s) aging applied. See the module-level constants for
     /// rationale.
     pending_handshakes: TokioMutex<VecDeque<(Connection, Instant)>>,
+    /// ZEB-418 P1: late-installed acceptor for inbound
+    /// `harmony/butler-deposit/v1` connections (Task 7 builds the
+    /// production `ButlerDepositCtx` once `NodeState`'s dm-inbox engine
+    /// handles exist, then installs via
+    /// [`Self::install_butler_deposit_acceptor`]). Unlike the handshake
+    /// ALPNs there is NO boot-window queue: a deposit arriving before
+    /// install is closed without reply, which the sender's fallback chain
+    /// (spec §6) treats as a rung-2 failure — it retries or falls back to
+    /// the existing DmOutbox loop, so dropping is graceful by design.
+    butler_deposit_acceptor:
+        std::sync::OnceLock<Arc<crate::iroh_butler_acceptor::IrohButlerDepositAcceptor>>,
 }
 
 impl IrohZenohLinkManager {
@@ -185,7 +196,20 @@ impl IrohZenohLinkManager {
             pending_handshakes: TokioMutex::new(VecDeque::with_capacity(
                 HANDSHAKE_PENDING_QUEUE_CAP,
             )),
+            butler_deposit_acceptor: std::sync::OnceLock::new(),
         }
+    }
+
+    /// ZEB-418 P1: install the butler-deposit acceptor used by the accept
+    /// loop to route inbound `harmony/butler-deposit/v1` connections.
+    /// Install-once (mirrors the handshake dispatcher's lifecycle); a second
+    /// install returns the supplied acceptor back as `Err`. No pending
+    /// queue — see the field docs for why dropping pre-install is graceful.
+    pub fn install_butler_deposit_acceptor(
+        &self,
+        acceptor: Arc<crate::iroh_butler_acceptor::IrohButlerDepositAcceptor>,
+    ) -> Result<(), Arc<crate::iroh_butler_acceptor::IrohButlerDepositAcceptor>> {
+        self.butler_deposit_acceptor.set(acceptor)
     }
 
     /// ZEB-368: expose the resolver so the event loop can enumerate known peers
@@ -380,6 +404,23 @@ impl IrohZenohLinkManager {
                                 "ZEB-325 PR #159 R2: queued inbound handshake (dispatcher \
                                  not yet installed; will drain after owner identity loads)"
                             );
+                        }
+                    } else if alpn_used == alpn::HARMONY_BUTLER_DEPOSIT_V1 {
+                        // ZEB-418 P1: butler deposit. Spawn so a slow/hung
+                        // depositor can't block the accept loop (same
+                        // rationale as HARMONY_PING_V1 below). No boot-window
+                        // queue: pre-install deposits are closed and the
+                        // sender's fallback chain retries (spec §6 — a failed
+                        // deposit rung can never make delivery worse).
+                        if let Some(acceptor) = mgr.butler_deposit_acceptor.get().cloned() {
+                            tokio::spawn(async move {
+                                acceptor.handle_connection(conn).await;
+                            });
+                        } else {
+                            tracing::debug!(
+                                "ZEB-418: butler deposit before acceptor installed; closing"
+                            );
+                            conn.close(0u32.into(), b"");
                         }
                     } else if alpn_used == alpn::HARMONY_PING_V1 {
                         // ZEB-329 Task 5 (option B): fold HARMONY_PING_V1
@@ -642,6 +683,8 @@ mod tests {
             direct_addresses: vec![],
             announced_at_ms: 1_700_000_000_000,
             identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         };
         let hlc = Hlc {
             wall_ms: 1_700_000_000_000,

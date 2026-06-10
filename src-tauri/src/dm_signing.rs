@@ -67,6 +67,20 @@ pub fn seal_to_owner(
     recipient_x25519_pub: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, DmSignError> {
+    seal_to_owner_with_info(recipient_x25519_pub, plaintext, ZEB_249_EPOCH_KEY_SEAL_INFO)
+}
+
+/// [`seal_to_owner`] with a caller-supplied HKDF domain-separation `info`
+/// string. Identical envelope layout (`32-byte ephemeral X25519 ‖ 12-byte
+/// nonce ‖ ct+tag`) and identical low-order-point checks — only the AEAD
+/// key derivation is domain-separated, so a ciphertext sealed for one
+/// context can never be opened in another (ZEB-418 butler deposits use
+/// `butler_deposit::BUTLER_DEPOSIT_SEAL_INFO`).
+pub fn seal_to_owner_with_info(
+    recipient_x25519_pub: &[u8; 32],
+    plaintext: &[u8],
+    info: &[u8],
+) -> Result<Vec<u8>, DmSignError> {
     let recipient_pub = PublicKey::from(*recipient_x25519_pub);
     let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let ephemeral_pub_bytes = *PublicKey::from(&ephemeral).as_bytes();
@@ -80,7 +94,7 @@ pub fn seal_to_owner(
     if shared.as_bytes() == &[0u8; 32] {
         return Err(DmSignError::InvalidPublicKey);
     }
-    let key_bytes = derive_seal_key(shared.as_bytes());
+    let key_bytes = derive_seal_key_with_info(shared.as_bytes(), info);
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key_bytes.as_ref()));
 
     let mut nonce_bytes = [0u8; 12];
@@ -105,6 +119,17 @@ pub fn open_from_owner(
     recipient_x25519_priv: &[u8; 32],
     sealed: &[u8],
 ) -> Result<Vec<u8>, DmSignError> {
+    open_from_owner_with_info(recipient_x25519_priv, sealed, ZEB_249_EPOCH_KEY_SEAL_INFO)
+}
+
+/// [`open_from_owner`] with a caller-supplied HKDF domain-separation `info`
+/// string. Inverse of [`seal_to_owner_with_info`] — `info` must match the
+/// sealing side or decryption fails with `DecryptionFailed` (tag mismatch).
+pub fn open_from_owner_with_info(
+    recipient_x25519_priv: &[u8; 32],
+    sealed: &[u8],
+    info: &[u8],
+) -> Result<Vec<u8>, DmSignError> {
     if sealed.len() < 32 + 12 + 16 {
         return Err(DmSignError::MalformedSealedEnvelope);
     }
@@ -125,7 +150,7 @@ pub fn open_from_owner(
     if shared.as_bytes() == &[0u8; 32] {
         return Err(DmSignError::InvalidPublicKey);
     }
-    let key_bytes = derive_seal_key(shared.as_bytes());
+    let key_bytes = derive_seal_key_with_info(shared.as_bytes(), info);
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key_bytes.as_ref()));
 
     cipher
@@ -177,16 +202,31 @@ pub fn ed25519_priv_to_x25519(
     x_priv
 }
 
+/// HKDF info string for ZEB-249 epoch-key sealed envelopes — the original
+/// (and default) domain for `seal_to_owner`/`open_from_owner`. The byte
+/// value is FROZEN: existing ZEB-249 ciphertexts in the wild derive their
+/// AEAD key from it.
+const ZEB_249_EPOCH_KEY_SEAL_INFO: &[u8] = b"harmony-zeb-249-epoch-key-seal";
+
 /// HKDF-derive a 32-byte ChaCha20-Poly1305 key from a 32-byte ECDH
-/// shared secret. Empty salt, domain-separated info string.
-/// Returns `Zeroizing<[u8; 32]>` so the HKDF-derived material is
-/// zeroized on drop, matching the protection level of EpochKey itself.
+/// shared secret, using the ZEB-249 epoch-key-seal domain. Kept as the
+/// named single entry point for the legacy domain; delegates to
+/// [`derive_seal_key_with_info`].
+#[allow(dead_code)] // retained for symmetry with seal_to_owner/open_from_owner
 fn derive_seal_key(shared_secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    derive_seal_key_with_info(shared_secret, ZEB_249_EPOCH_KEY_SEAL_INFO)
+}
+
+/// HKDF-derive a 32-byte ChaCha20-Poly1305 key from a 32-byte ECDH
+/// shared secret. Empty salt, caller-supplied domain-separation `info`
+/// string. Returns `Zeroizing<[u8; 32]>` so the HKDF-derived material is
+/// zeroized on drop, matching the protection level of EpochKey itself.
+fn derive_seal_key_with_info(shared_secret: &[u8; 32], info: &[u8]) -> Zeroizing<[u8; 32]> {
     use hkdf::Hkdf;
 
     let hk = Hkdf::<Sha256>::new(None, shared_secret);
     let mut okm = Zeroizing::new([0u8; 32]);
-    hk.expand(b"harmony-zeb-249-epoch-key-seal", okm.as_mut())
+    hk.expand(info, okm.as_mut())
         .expect("HKDF expand to 32 bytes always succeeds");
     okm
 }

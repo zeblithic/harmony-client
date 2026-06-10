@@ -340,6 +340,8 @@ mod tests {
             direct_addresses: vec![],
             announced_at_ms,
             identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         }
     }
 
@@ -640,6 +642,8 @@ mod fallback_tests {
             direct_addresses: vec![],
             announced_at_ms,
             identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         }
     }
 

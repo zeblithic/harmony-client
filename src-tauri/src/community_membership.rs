@@ -6201,6 +6201,8 @@ mod tests {
             direct_addresses: vec![],
             announced_at_ms: 1_700_000_000_000,
             identity_signature: [0xCD; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         };
         let kind = MembershipEventKind::ReachabilityAnnounce {
             payload: payload.clone(),
@@ -6223,6 +6225,8 @@ mod tests {
                 direct_addresses: vec![],
                 announced_at_ms: 0,
                 identity_signature: [0; 64],
+                butler_set: Vec::new(),
+                bs_at: 0,
             },
         };
         let bytes = crate::owner_state_crypto::canonical_cbor_encode(&kind).expect("encode");
@@ -9935,6 +9939,8 @@ mod zeb_321_reachability_verify_tests {
             direct_addresses,
             announced_at_ms,
             identity_signature,
+            butler_set: Vec::new(),
+            bs_at: 0,
         };
         let payload = EventPayload {
             id: [0x42; 16],
@@ -10100,6 +10106,8 @@ mod zeb_321_reachability_verify_tests {
             direct_addresses: vec![],
             announced_at_ms: 1_000_000,
             identity_signature: [0u8; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         };
         let payload = EventPayload {
             id: [0x99; 16],
