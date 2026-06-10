@@ -580,15 +580,15 @@ pub enum CommunitySyncError {
     #[error("publisher signature invalid for addr {addr:?}")]
     PublisherSigInvalid { addr: OwnerAddr },
 
-    /// `publish_root_now` detected an epoch change between the pre-snapshot
+    /// `encode_root_packet` detected an epoch change between the pre-snapshot
     /// key read and the post-snapshot key read on every retry attempt.
     /// This should be unreachable in a correct cluster (rotations are rare
     /// and bounded by the number of members); if it fires it indicates
     /// continuous rapid epoch rotation, which is a bug or an adversarial
     /// condition. ZEB-249 PR #106 R5 (CodeRabbit Critical).
     #[error(
-        "publish_root_now: epoch changed on every retry attempt (5); \
-         publish aborted to prevent encrypting post-rotation snapshot \
+        "encode_root_packet: epoch changed on every retry attempt (5); \
+         encode aborted to prevent encrypting post-rotation snapshot \
          under pre-rotation key"
     )]
     PublishRetryExhausted,
@@ -769,6 +769,12 @@ pub struct CommunityMembershipDelta {
     pub event: SignedMembershipEvent,
 }
 
+/// ZEB-434 D1/D2: a state-root query-serve request. The queryable task
+/// in event_loop sends one per inbound zenoh query; the engine's
+/// single-writer task replies with a fresh wire packet (or an error
+/// string for logging).
+pub type RootServeRequest = tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>;
+
 /// Construction-time config bag for `CommunitySyncEngine::new`. Bundles
 /// the per-community key + identity, the shared CRDT + tracker arcs,
 /// the wire channels, the persist paths, and the optional degraded-path
@@ -860,6 +866,14 @@ pub struct CommunitySyncEngineConfig {
     /// false }`. `None` for admin engines and for tests that don't assert on
     /// IPC events.
     pub nav_emitter: Option<NavPendingClearEmitter>,
+
+    /// ZEB-434 D1/D2: receive half of the state-root query-serve
+    /// channel. The event_loop queryable task holds the sender and
+    /// forwards one `RootServeRequest` per inbound zenoh query; the
+    /// engine's single-writer task replies with a freshly encoded wire
+    /// packet. `None` for engines without the catch-up pull plane
+    /// wired (legacy callers, most tests).
+    pub root_serve_rx: Option<mpsc::Receiver<RootServeRequest>>,
 }
 
 /// Per-community state-CRDT sync engine. Owns a tokio task that
@@ -1067,6 +1081,7 @@ impl CommunitySyncEngine {
             crdt_state: crdt_state_for_task,
             admin_identity_pub: admin_pub_lock_for_task,
             nav_emitter: nav_emitter_for_task,
+            root_serve_rx: cfg.root_serve_rx,
         }));
 
         Self {
@@ -1741,6 +1756,11 @@ struct InternalCtx {
     /// Shared with the engine struct via `Arc` clone so both paths observe the
     /// same configured callback. `None` for admin engines and tests.
     nav_emitter: Option<NavPendingClearEmitter>,
+
+    /// ZEB-434 D2: query-serve request channel. `internal_task` takes
+    /// it out of the ctx at start (`Option<Receiver>` can't be polled
+    /// inside `select!` directly). `None` disables the serve arm.
+    root_serve_rx: Option<mpsc::Receiver<RootServeRequest>>,
 }
 
 // ── ZEB-254 Task 10: auto-counter-sign helper ────────────────────────────────
@@ -2236,6 +2256,16 @@ async fn internal_task(mut ctx: InternalCtx) {
     // publish-only mode. Mirrors owner_state_sync's same latch.
     let mut inbound_closed = false;
 
+    // ZEB-434 D2: the query-serve request channel. `Option<Receiver>`
+    // can't be polled inside `select!` directly, so take it out of the
+    // ctx once here; `None` (no queryable wired — legacy callers, most
+    // tests) leaves the serve arm permanently disabled. Re-set to
+    // `None` when the sender side closes — same hazard class as the
+    // `inbound_closed` latch above: without it a closed channel would
+    // yield `None` from `recv()` on every loop iteration and busy-spin
+    // the task.
+    let mut root_serve_rx = ctx.root_serve_rx.take();
+
     let notify = Arc::clone(&ctx.notify_dirty);
     let notified = notify.notified();
     tokio::pin!(notified);
@@ -2370,6 +2400,57 @@ async fn internal_task(mut ctx: InternalCtx) {
                             error = %e,
                             "community persist after merge failed"
                         );
+                    }
+                }
+            }
+            serve_req = async {
+                match root_serve_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    // Unreachable under the `if` guard below; kept so
+                    // the block type-checks for the `None` case.
+                    None => std::future::pending().await,
+                }
+            }, if root_serve_rx.is_some() => {
+                match serve_req {
+                    Some(reply_tx) => {
+                        // ZEB-434 D2: serve a FRESH packet through this
+                        // single-writer task so publish, flush, and
+                        // query-serve can never disagree about HLC
+                        // state. encode advances next_hlc via the
+                        // tracker — persist the replay tracker on
+                        // success, mirroring the publish arms' "never
+                        // advance the tracker unpersisted" rule. The
+                        // CRDT itself did not change →
+                        // persist_replay_only.
+                        let result = encode_root_packet(&ctx).await;
+                        match &result {
+                            Ok(_) => {
+                                if let Err(e) = persist_replay_only(&ctx).await {
+                                    tracing::warn!(
+                                        community_id = ?ctx.community_id,
+                                        error = %e,
+                                        "community persist after query-serve encode failed"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    community_id = ?ctx.community_id,
+                                    error = %e,
+                                    "community query-serve encode failed"
+                                );
+                            }
+                        }
+                        // Receiver dropped (querier gone) is fine —
+                        // fire and forget.
+                        let _ = reply_tx.send(result.map_err(|e| e.to_string()));
+                    }
+                    None => {
+                        // Sender side dropped (queryable adapter gone):
+                        // disable the arm permanently instead of
+                        // busy-spinning on a closed channel. Mirrors
+                        // the `inbound_closed` latch on subscriber_rx.
+                        root_serve_rx = None;
                     }
                 }
             }
@@ -2557,7 +2638,7 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
                 epoch_before = ?epoch_before,
                 epoch_after = ?epoch_after,
                 retries_left = retries,
-                "publish_root_now: epoch changed mid-publish, retrying"
+                "encode_root_packet: epoch changed mid-encode, retrying"
             );
         }
     };
@@ -2591,8 +2672,8 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
     //    put, then (production RuntimeContentStore only) records root_cid in the
     //    shared serve-allowlist so the content-serve queryable will serve it
     //    despite the encrypted flag. Registration completes before the state-
-    //    root envelope announcing root_cid is published below, so no peer can
-    //    request the CID before it is allowlisted.
+    //    root envelope announcing root_cid is returned for publish/serve, so
+    //    no peer can request the CID before it is allowlisted.
     ctx.content_store
         .put_serveable(root_cid, blob_ciphertext)
         .await?;
@@ -2636,7 +2717,8 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
 /// identical packets without duplicating crypto/HLC logic.
 async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     let wire = encode_root_packet(ctx).await?;
-    // 9. Send onto outbound channel — Zenoh adapter (Task 11) forwards.
+    // Ship the encoded packet onto the outbound channel — Zenoh adapter
+    // forwards.
     ctx.publisher_tx
         .send(wire)
         .await
@@ -4295,6 +4377,10 @@ impl CommunitySyncRegistry {
             // the engine can fire nav-updated on joiner-side countersign.
             // `None` for test registries that don't supply one.
             nav_emitter: self.nav_emitter.clone(),
+            // ZEB-434: the registry spawn path doesn't wire the
+            // query-serve channel yet — the queryable task (later
+            // ZEB-434 task) threads a `Some(receiver)` through here.
+            root_serve_rx: None,
         }));
 
         engines.insert(community_id, engine);
@@ -5355,6 +5441,256 @@ mod tests {
 
         // Commit guard for X to release rollback obligation cleanly.
         guard.commit();
+    }
+
+    // ── ZEB-434 D2: query-serve arm ─────────────────────────────────
+
+    /// In-memory CAS servicer shared by both engines, mirroring
+    /// `community_channel_config_integration::spawn_shared_cas` so blobs
+    /// engine A `put_serveable`s are visible to engine B's `GetOrFetch`.
+    fn spawn_shared_cas() -> mpsc::Sender<crate::content_store::CasOp> {
+        use crate::content_store::CasOp;
+        let cas: Arc<Mutex<std::collections::HashMap<harmony_content::cid::ContentId, Vec<u8>>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(64);
+        let cas_for_servicer = Arc::clone(&cas);
+        tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                match op {
+                    CasOp::PutLocal { cid, blob, reply } => {
+                        cas_for_servicer.lock().await.insert(cid, blob);
+                        if let Some(r) = reply {
+                            let _ = r.send(Ok(()));
+                        }
+                    }
+                    CasOp::GetOrFetch {
+                        cid,
+                        timeout: _,
+                        reply,
+                    } => {
+                        let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                        let _ = reply.send(Ok(v));
+                    }
+                    CasOp::GetLocal { cid, reply } => {
+                        let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                        let _ = reply.send(v);
+                    }
+                }
+            }
+        });
+        cas_op_tx
+    }
+
+    /// ZEB-434 D2: the engine's query-serve arm replies with a fresh
+    /// root packet that a PEER engine ingests through its FULL inbound
+    /// verification pipeline (decrypt, membership-at-HLC gate,
+    /// publisher-sig verify, replay guard, merge, materialize).
+    ///
+    /// Fixture mirrors
+    /// `community_channel_config_integration::alice_creates_channel_bob_materializes_via_state_sync`
+    /// (same shared-CAS stub, same membership_key wiring, same
+    /// EnrollmentCert-bearing bootstrap Join + OOB cold-cache seed into
+    /// the receiver), but builds the engines directly via
+    /// `CommunitySyncEngine::new` so engine A's config can carry
+    /// `root_serve_rx: Some(..)`. Engine A's `publisher_rx` is drained
+    /// and DISCARDED — the packet reaching B travels exclusively
+    /// through the query-serve reply, proving the serve path works
+    /// without any pub/sub traffic from A.
+    #[tokio::test]
+    async fn query_serve_arm_replies_packet_that_peer_engine_ingests() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
+            SignedMembershipEvent,
+        };
+        use crate::community_state_crdt::InsertOutcome;
+
+        let alice = mint_test_owner(0xAA);
+        let bob = mint_test_owner(0xBB);
+        let alice_addr = alice.owner;
+        let bob_addr = bob.owner;
+        let alice_sk = Arc::new(alice.device_key.clone());
+        let bob_sk = Arc::new(bob.device_key.clone());
+
+        // ZEB-339: signer resolution uses the carried EnrollmentCert
+        // (Join) / materialized enrolled keys (steady-state), not the
+        // resolver — NopResolver matches the integration fixture's
+        // unused-pub resolver.
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+
+        let cas_op_tx = spawn_shared_cas();
+        let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_secs(2),
+        ));
+        let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+
+        let community_id = SpaceId([0x3A; 16]);
+        let membership_key = EpochKey::new([0x55; 32]);
+
+        // Engine A (admin): query-serve channel wired. Its publisher_rx
+        // is drained + discarded below — no pub/sub traffic reaches B.
+        let (serve_tx, serve_rx) = mpsc::channel::<RootServeRequest>(4);
+        let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_a_sub_tx_held, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
+
+        let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice_addr,
+            signing_key: Arc::clone(&alice_sk),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityRootHlcTracker::default())),
+            content_store: cs_a,
+            publisher_tx: a_pub_tx,
+            subscriber_rx: a_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_a.path().join("crdt.cbor"),
+                replay: dir_a.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: Some(serve_rx),
+        });
+
+        // Engine B (member, same community/key, no serve channel). We
+        // hold b_sub_tx to inject the served packet and b_pub_rx so B's
+        // own debounced publishes don't latch transport_closed.
+        let (b_pub_tx, _b_pub_rx_held) = mpsc::channel::<Vec<u8>>(64);
+        let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+
+        let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            community_id,
+            membership_key,
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "bob-dev".into(),
+            self_owner: bob_addr,
+            signing_key: Arc::clone(&bob_sk),
+            state: Arc::clone(&b_state),
+            tracker: Arc::new(Mutex::new(CommunityRootHlcTracker::default())),
+            content_store: cs_b,
+            publisher_tx: b_pub_tx,
+            subscriber_rx: b_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_b.path().join("crdt.cbor"),
+                replay: dir_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+
+        // Alice's EnrollmentCert-bearing bootstrap Join (admin power 100).
+        let alice_join_at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let alice_join_payload = EventPayload {
+            id: [0x10; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice_addr,
+            at: alice_join_at.clone(),
+        };
+        let alice_join = SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign join")
+        };
+        let outcome = engine_a
+            .insert_local_event(alice_join.clone())
+            .await
+            .expect("alice bootstrap insert");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        // ZEB-256 cold-cache simulation (mirrors the integration
+        // fixture): OOB-seed Alice's bootstrap Join into B so B's
+        // membership-at-HLC gate admits the served packet. Production
+        // wires this via the invite URL's admin_bootstrap field.
+        let outcome = engine_b
+            .insert_local_event(alice_join)
+            .await
+            .expect("bob OOB-seeds Alice's bootstrap Join");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        // Alice's ChannelCreate at (bootstrap.wall, bootstrap.logical+1).
+        let ch_id = ChannelId([0x42; 16]);
+        let alice_create_payload = EventPayload {
+            id: [0x11; 16],
+            community_id,
+            kind: MembershipEventKind::ChannelCreate {
+                channel_id: ch_id,
+                name: "general".into(),
+                write_power: 0,
+                kind: ChannelKind::Text,
+            },
+            actor: alice_addr,
+            at: Hlc {
+                wall_ms: alice_join_at.wall_ms,
+                logical: alice_join_at.logical + 1,
+                device_id: alice_join_at.device_id.clone(),
+            },
+        };
+        let alice_create =
+            sign_event(&alice_create_payload, alice_sk.as_ref()).expect("sign channel create");
+        let outcome = engine_a
+            .insert_local_event(alice_create)
+            .await
+            .expect("alice channel-create insert");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        // Drive the query-serve arm: one oneshot in, one fresh packet out.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        serve_tx.send(reply_tx).await.expect("send serve request");
+        let packet = reply_rx.await.expect("engine replied").expect("encode ok");
+
+        // Feed the served packet into B's inbound pipeline — full
+        // verification (decrypt, replay guard, membership check) must
+        // pass for the channel to materialize.
+        b_sub_tx.send(packet).await.expect("inject packet into B");
+
+        let mut materialized = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mat = {
+                let g = b_state.lock().await;
+                g.materialize_now(alice_addr)
+            };
+            if let Some(info) = mat.channels.get(&ch_id) {
+                assert_eq!(info.name, "general");
+                assert_eq!(info.write_power, 0);
+                assert!(info.deleted_at.is_none());
+                materialized = true;
+                break;
+            }
+        }
+        assert!(
+            materialized,
+            "channel from the query-serve packet must materialize on engine B"
+        );
     }
 }
 
