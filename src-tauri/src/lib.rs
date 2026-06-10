@@ -19706,12 +19706,69 @@ where
         }
     }
 
+    // ZEB-436: orphaned-dir adoption pre-check. The engine spawned at
+    // step 6 loaded any persisted per-community CRDT from disk. If those
+    // REAL events (the `events.is_empty()` gate excludes the bootstrap
+    // hint we just seeded — that's the invite's own claim and must never
+    // vouch for a first-time join) already materialize self as Joined,
+    // and the owner-state holds no functional Space row, this redeem is
+    // a REPAIR, not a join: the ZEB-427 lost-row split-brain left a
+    // fully-populated dir behind, and the membership rules (correctly)
+    // refuse to re-admit a Joined actor — P6 rejects a fresh PendingJoin
+    // ("already-engaged", the recovery deadlock), and an open re-Join
+    // would only append a redundant self-Join (the ZEB-260 nominal-cost
+    // path). Both sides already agree on membership, so skip step 7's
+    // membership-event mint entirely and fall through to commit the
+    // Space row from THIS invite's fresh epoch key. A row that is
+    // missing, left-marked, or keyless is equally non-functional — each
+    // leaves the boot engine sweep unable to spawn this community.
+    let adopt_orphaned_membership: bool = {
+        let self_joined_in_dir = {
+            let state = engine_arc.state();
+            let g = state.lock().await;
+            if g.events.is_empty() {
+                false
+            } else {
+                g.materialized(payload.admin_addr)
+                    .members
+                    .get(&self_owner)
+                    .map(|m| {
+                        matches!(m.status, crate::community_membership::MemberStatus::Joined)
+                    })
+                    .unwrap_or(false)
+            }
+        };
+        if self_joined_in_dir {
+            let g = crdt_state.lock().await;
+            let functional_row_exists = g
+                .spaces
+                .get(&minted.community_id)
+                .map(|s| s.left_at.is_none() && s.current_epoch_key.is_some())
+                .unwrap_or(false);
+            !functional_row_exists
+        } else {
+            false
+        }
+    };
+
     // 7. Branch on payload.is_invite_only.
     // ZEB-254: tracks whether the invite-only fast-path 5s timeout fired
     // without a counter-sign landing. Always false for open communities.
     // Set inside the invite-only branch by the timeout match arm.
     let mut pending_redemption_timed_out: bool = false;
-    if !payload.is_invite_only {
+    if adopt_orphaned_membership {
+        // ZEB-436: repair path — no membership event to mint, no
+        // countersign to await. Loud info (not debug): adoption should be
+        // rare, and a log line is the breadcrumb when a user reports
+        // "my community came back".
+        tracing::info!(
+            community_id = %hex::encode(minted.community_id.0),
+            "ZEB-436: adopting orphaned community dir — persisted membership \
+             already materializes self as Joined and the owner-state row is \
+             missing or non-functional; skipping the membership-event mint and \
+             committing the Space row from the invite's epoch key"
+        );
+    } else if !payload.is_invite_only {
         // OPEN: insert bootstrap_join via the engine. The engine's
         // `insert_local_event` runs verify_event (which authorizes the
         // open Join via signature alone) and fires `notify_dirty` on
@@ -20859,6 +20916,10 @@ mod redeem_invite_inner_tests {
         pub(super) dm_outbox: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
         pub(super) channel_log_registry:
             std::sync::Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+        // ZEB-436: tempdir root (== the registry's identity_dir) so the
+        // orphan-adoption tests can load `communities/{hex}/crdt.cbor`
+        // directly for ground-truth assertions.
+        pub(super) identity_dir: std::path::PathBuf,
         // Held alive so channels don't report Closed.
         _community_adapter_rx:
             tokio::sync::mpsc::Receiver<crate::event_loop::CommunityAdapterRequest>,
@@ -21002,6 +21063,7 @@ mod redeem_invite_inner_tests {
             unicast_send_tx,
             dm_outbox,
             channel_log_registry,
+            identity_dir: tmp.path().to_path_buf(),
             _community_adapter_rx,
             _unicast_rx,
             _channel_log_adapter_rx,
@@ -22140,6 +22202,522 @@ mod redeem_invite_inner_tests {
             }
             other => panic!("expected PendingJoin kind, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod zeb436_orphan_adoption_tests {
+    //! ZEB-436: redeem-time adoption of an orphaned community dir.
+    //!
+    //! "Orphaned" = the per-community dir (`communities/{hex}/crdt.cbor`)
+    //! materializes self as `Joined`, but owner-state holds no functional
+    //! Space row — the ZEB-427 lost-row split-brain. Pre-fix, redeeming a
+    //! fresh invite deadlocked on the membership P6/J rules (a Join or
+    //! PendingJoin with prior = Joined is rejected), so victims with
+    //! complete local data and a willing inviter had no way back in.
+
+    use super::redeem_invite_inner_tests::{
+        build_redeem_invite_test_fixture, RedeemInviteTestFixture,
+    };
+    use crate::community_invite::CommunityInvitePayload;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
+    use harmony_identity::PrivateIdentity;
+
+    /// OPEN-community invite URL for `community_id`, minted by the same
+    /// fixture admin (`seed [0xAA; 32]`) the registry's resolver admits.
+    /// `key_byte` varies the epoch key so a "fresh re-invite" carries
+    /// different key material than the original join, like production.
+    fn open_invite_url(community_id: SpaceId, key_byte: u8) -> String {
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+        let membership_key = EpochKey::new([key_byte; 32]);
+        let payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "OrphanRepairCom".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: None,
+            untargeted_decrypt_key: None,
+        };
+        crate::community_invite::encode_invite_url(&payload).expect("encode invite url")
+    }
+
+    /// Call `redeem_invite_inner` with the fixture's plumbing but an
+    /// explicit owner-state arc (so tests can present a "rebooted" empty
+    /// owner-state) and a controllable generation fence.
+    async fn redeem_with(
+        fixture: &RedeemInviteTestFixture,
+        url: String,
+        crdt_state: &std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
+        fence_ok: bool,
+    ) -> Result<super::RedeemInviteResultDto, String> {
+        super::redeem_invite_inner(
+            url,
+            std::sync::Arc::clone(crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            fixture.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&fixture.dm_outbox),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            move || {
+                if fence_ok {
+                    Ok(())
+                } else {
+                    Err("node stopped (test fence)".to_string())
+                }
+            },
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// Path of the persisted per-community CRDT inside the fixture tempdir.
+    fn crdt_path_for(fixture: &RedeemInviteTestFixture, community_id: SpaceId) -> std::path::PathBuf {
+        fixture
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0))
+            .join("crdt.cbor")
+    }
+
+    /// Orphan a freshly-joined community the way ZEB-427 did in
+    /// production: stop the engine (process exit) and present an
+    /// owner-state that never durably learned the Space row (crash
+    /// before the owner-state flush). Returns the "rebooted" empty
+    /// owner-state and the on-disk membership event count.
+    async fn orphan_after_join(
+        fixture: &RedeemInviteTestFixture,
+        community_id: SpaceId,
+    ) -> (std::sync::Arc<tokio::sync::Mutex<OwnerState>>, usize) {
+        // Snapshot the engine's membership events BEFORE stopping it.
+        let events = {
+            let state_arc = fixture
+                .community_registry
+                .state_for(&community_id)
+                .await
+                .expect("baseline join must have spawned an engine");
+            let g = state_arc.lock().await;
+            g.events.clone()
+        };
+        assert!(
+            !events.is_empty(),
+            "fixture sanity: baseline join inserted membership events"
+        );
+
+        // stop_engine removes the engine from the registry map FIRST, then
+        // drives engine.shutdown(). The shutdown's final flush fails in
+        // this fixture (no CAS event loop — same intentional gap as the
+        // ZEB-274 guard tests), which also means the engine never persists
+        // crdt.cbor itself here. Production's orphaned dirs were written
+        // by healthy engines with live event loops; materialize the same
+        // on-disk artifact directly from the snapshotted events.
+        if let Err(e) = fixture.community_registry.stop_engine(&community_id).await {
+            tracing::debug!("fixture stop_engine: tolerated shutdown error: {e}");
+        }
+        let crdt_path = crdt_path_for(fixture, community_id);
+        std::fs::create_dir_all(crdt_path.parent().expect("crdt path has parent"))
+            .expect("create community dir");
+        let mut on_disk = crate::community_state_crdt::CommunityState::new(community_id);
+        let event_count = events.len();
+        on_disk.events = events;
+        crate::community_state_persist::save_crdt(&crdt_path, &on_disk)
+            .expect("persist orphaned community CRDT");
+
+        let rebooted = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+        (rebooted, event_count)
+    }
+
+    /// The ZEB-427 recovery deadlock, end to end. Baseline join succeeds;
+    /// the owner-state row is lost; the engine is gone. Redeeming a FRESH
+    /// invite must ADOPT: reconstruct the Space row from the invite's key
+    /// material without minting a duplicate membership event (both sides
+    /// already materialize self as Joined — adoption is owner-state-only).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redeem_adopts_orphaned_dir_when_self_already_joined() {
+        let fixture = build_redeem_invite_test_fixture().await;
+        let community_id = SpaceId([0xd7; 16]);
+
+        let first = redeem_with(
+            &fixture,
+            open_invite_url(community_id, 0x42),
+            &fixture.crdt_state,
+            true,
+        )
+        .await;
+        assert!(first.is_ok(), "baseline join must succeed: {first:?}");
+
+        let (rebooted_owner_state, events_before) =
+            orphan_after_join(&fixture, community_id).await;
+        assert_eq!(
+            events_before, 1,
+            "fixture sanity: exactly the baseline self-Join persisted on disk"
+        );
+
+        let repaired = redeem_with(
+            &fixture,
+            open_invite_url(community_id, 0x43),
+            &rebooted_owner_state,
+            true,
+        )
+        .await;
+        assert!(
+            repaired.is_ok(),
+            "re-redeem over an orphaned dir must adopt, not deadlock on P6: {repaired:?}"
+        );
+        assert!(
+            !repaired.expect("checked ok").pending,
+            "adoption reattaches an existing membership — never a pending join"
+        );
+
+        {
+            let g = rebooted_owner_state.lock().await;
+            let row = g
+                .spaces
+                .get(&community_id)
+                .expect("adoption must reconstruct the owner-state Space row");
+            assert!(row.left_at.is_none(), "adopted row is live");
+            assert!(
+                row.pending_join_at.is_none(),
+                "already Joined — no pending marker"
+            );
+            assert_eq!(
+                row.current_epoch_key
+                    .as_ref()
+                    .map(|k| *k.as_bytes()),
+                Some([0x43; 32]),
+                "adopted row carries the FRESH invite's epoch key, not the stale one"
+            );
+        }
+
+        let state_arc = fixture
+            .community_registry
+            .state_for(&community_id)
+            .await
+            .expect("repair redeem must (re)spawn the community engine");
+        let events_after = {
+            let g = state_arc.lock().await;
+            g.events.len()
+        };
+        assert_eq!(
+            events_after, events_before,
+            "adoption must not mint a duplicate Join/PendingJoin event"
+        );
+    }
+
+    /// The actual ZEB-427 recovery deadlock, invite-only flavor — the
+    /// exact shape of the preserved Test1 fixture. The persisted dir
+    /// materializes self as Joined; the owner-state row is gone. Pre-fix,
+    /// redeeming a FRESH invite dies on the membership P6 rule ("engine
+    /// rejected local PendingJoin insert: ... already-engaged") because
+    /// PendingJoin only admits prior None | Left — and the victim cannot
+    /// leave either ("no engine"). Post-fix, the adoption pre-check fires
+    /// before the invite-only branch ever mints a PendingJoin: no admin
+    /// round-trip, no countersign wait, owner-state-only repair.
+    ///
+    /// Inline cert-model fixture (mirrors
+    /// `redeem_invite_inner_allow_no_reticulum_destinations_skips_fast_fail`):
+    /// the shared fixture's resolver doesn't admit a cert-model admin, and
+    /// the invite-only path needs the admin bootstrap + token signed by an
+    /// enrolled device key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invite_only_redeem_adopts_orphaned_dir_instead_of_p6_deadlock() {
+        use crate::community_channel_log_engine::{
+            ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
+        };
+        use crate::community_state_sync::{CommunityRegistryConfig, CommunitySyncRegistry};
+        use crate::content_store::{ContentStore, RuntimeContentStore};
+        use crate::dm_outbox::{DmOutbox, UnicastSendRequest};
+        use crate::owner_state_types::{DeviceIdentityHash, Hlc};
+        use tokio::sync::mpsc;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let joiner_owner = crate::community_membership::mint_test_owner(0xBB);
+        let joiner_self_owner = joiner_owner.owner;
+        let signing_key = std::sync::Arc::new(joiner_owner.device_key.clone());
+        let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let admin_owner = crate::community_membership::mint_test_owner(0xAA);
+        let admin_addr = admin_owner.owner;
+        let admin_pub = {
+            let ed25519_pub = admin_owner.cert.device_pubkeys.classical.ed25519_verify;
+            let mut combined = [0u8; 64];
+            combined[32..].copy_from_slice(&ed25519_pub);
+            combined
+        };
+        let joiner_pub_64 = {
+            let x25519_priv = crate::dm_signing::ed25519_priv_to_x25519(&signing_key);
+            let x25519_pub =
+                x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
+            let ed25519_pub = signing_key.verifying_key().to_bytes();
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(x25519_pub.as_bytes());
+            combined[32..].copy_from_slice(&ed25519_pub);
+            combined
+        };
+
+        struct TwoOwnerResolver {
+            admin: OwnerAddr,
+            admin_pub: [u8; 64],
+            joiner: OwnerAddr,
+            joiner_pub: [u8; 64],
+        }
+        #[async_trait::async_trait]
+        impl crate::community_state_sync::IdentityResolver for TwoOwnerResolver {
+            async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+                if *addr == self.admin {
+                    Some(self.admin_pub)
+                } else if *addr == self.joiner {
+                    Some(self.joiner_pub)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+        let cs: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_millis(1000),
+        ));
+        let community_registry =
+            std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_id: "joiner-dev".into(),
+                content_store: cs,
+                identity_resolver: std::sync::Arc::new(TwoOwnerResolver {
+                    admin: admin_addr,
+                    admin_pub,
+                    joiner: joiner_self_owner,
+                    joiner_pub: joiner_pub_64,
+                }),
+                identity_dir: tmp.path().to_path_buf(),
+                debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
+                error_tx: None,
+                delta_tx: None,
+                self_owner: joiner_self_owner,
+                signing_key: std::sync::Arc::clone(&signing_key),
+                crdt_state: None,
+                nav_emitter: None,
+            }));
+
+        let (community_adapter_tx, _community_adapter_rx) =
+            mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
+        let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
+
+        let dm_owner = crate::community_membership::mint_test_owner(0xE3);
+        let dm_signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &dm_owner.device_key.to_bytes(),
+        ));
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new_synthetic(
+            "joiner-dev".into(),
+            joiner_self_owner,
+            DeviceIdentityHash(joiner_identity.identity.address_hash),
+            std::sync::Arc::clone(&signing_key),
+            std::sync::Arc::new(joiner_identity),
+            dm_signing_key,
+            dm_owner.cert,
+        )));
+
+        let (channel_log_adapter_tx, _channel_log_adapter_rx) =
+            mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
+        let app = tauri::test::mock_app().handle().clone();
+        let channel_log_registry =
+            std::sync::Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
+                adapter_request_tx: channel_log_adapter_tx,
+                app,
+                identity_dir: tmp.path().to_path_buf(),
+                self_owner: joiner_self_owner,
+                self_device_id: "joiner-dev".into(),
+                signing_key: std::sync::Arc::clone(&signing_key),
+                engine_config: ChannelLogEngineConfig::default(),
+            }));
+
+        let community_id = SpaceId([0xf7; 16]);
+
+        // ── Fabricate the orphaned dir exactly as a healthy engine left
+        // it: the admin's cert-bearing bootstrap Join plus self's Join
+        // (the materialized end-state of PendingJoin + JoinCountersign).
+        let admin_bootstrap = {
+            let payload = crate::community_membership::EventPayload {
+                id: [0x11; 16],
+                community_id,
+                kind: crate::community_membership::MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 900,
+                    logical: 0,
+                    device_id: "admin-dev".into(),
+                },
+            };
+            let mut ev = crate::community_membership::sign_event(&payload, &admin_owner.device_key)
+                .expect("sign admin bootstrap");
+            ev.enrollment = Some(admin_owner.cert.clone());
+            ev
+        };
+        let self_join = {
+            let payload = crate::community_membership::EventPayload {
+                id: [0x22; 16],
+                community_id,
+                kind: crate::community_membership::MembershipEventKind::Join,
+                actor: joiner_self_owner,
+                at: Hlc {
+                    wall_ms: 1_000,
+                    logical: 0,
+                    device_id: "joiner-dev".into(),
+                },
+            };
+            let mut ev = crate::community_membership::sign_event(&payload, &joiner_owner.device_key)
+                .expect("sign self join");
+            ev.enrollment = Some(joiner_owner.cert.clone());
+            ev
+        };
+        let mut orphaned = crate::community_state_crdt::CommunityState::new(community_id);
+        orphaned.events.insert(admin_bootstrap.id, admin_bootstrap.clone());
+        orphaned.events.insert(self_join.id, self_join);
+        let crdt_path = tmp
+            .path()
+            .join("communities")
+            .join(hex::encode(community_id.0))
+            .join("crdt.cbor");
+        std::fs::create_dir_all(crdt_path.parent().expect("parent")).expect("create dir");
+        crate::community_state_persist::save_crdt(&crdt_path, &orphaned)
+            .expect("persist orphaned community CRDT");
+
+        // ── Fresh invite from the admin (valid token + sealed epoch key,
+        // exactly what a willing inviter would mint for the victim).
+        let membership_key = EpochKey::new([0x43; 32]);
+        let token_minted_at = Hlc {
+            wall_ms: 950,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        };
+        let placeholder_token = crate::community_invite::InviteToken {
+            inviter: admin_addr,
+            invitee_hint: Some(joiner_self_owner),
+            minted_at: token_minted_at.clone(),
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let token_payload_bytes =
+            crate::community_invite::canonical_invite_token_bytes(&placeholder_token)
+                .expect("canonical token bytes");
+        let token_sig = {
+            use ed25519_dalek::Signer as _;
+            admin_owner.device_key.sign(&token_payload_bytes).to_bytes()
+        };
+        let invite_token = crate::community_invite::InviteToken {
+            inviter: admin_addr,
+            invitee_hint: Some(joiner_self_owner),
+            minted_at: token_minted_at,
+            expires_at: None,
+            sig: token_sig,
+        };
+        let sealed_epoch_key = {
+            let joiner_ed25519_pub32 = signing_key.verifying_key().to_bytes();
+            let x25519_pub = crate::dm_signing::ed25519_pub_to_x25519(&joiner_ed25519_pub32)
+                .expect("ed25519→x25519");
+            crate::dm_signing::seal_to_owner(&x25519_pub, membership_key.as_bytes())
+                .expect("seal epoch key")
+        };
+        let invite_payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key,
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "OrphanRepairInviteOnly".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(invite_token),
+            admin_bootstrap: Some(admin_bootstrap),
+            admin_identity_pub: Some(admin_pub),
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA1).cert),
+            untargeted_decrypt_key: None,
+        };
+        let invite_url =
+            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
+
+        // ── Redeem against an owner-state that never learned the row.
+        let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::BTreeMap::new(),
+        ));
+        let result = super::redeem_invite_inner(
+            invite_url,
+            std::sync::Arc::clone(&crdt_state),
+            std::sync::Arc::clone(&hlc_tracker),
+            "joiner-dev".to_string(),
+            joiner_self_owner,
+            std::sync::Arc::clone(&signing_key),
+            joiner_owner.cert.clone(),
+            std::sync::Arc::clone(&community_registry),
+            community_adapter_tx,
+            unicast_send_tx,
+            std::sync::Arc::clone(&dm_outbox),
+            std::sync::Arc::clone(&channel_log_registry),
+            || Ok(()),
+            None,
+            true, // allow_no_reticulum_destinations
+        )
+        .await;
+
+        let dto = result.expect(
+            "invite-only re-redeem over an orphaned dir must adopt instead of \
+             dying on the P6 already-engaged rejection",
+        );
+        assert!(
+            !dto.pending,
+            "self is already Joined — adoption must not report a pending join"
+        );
+
+        {
+            let g = crdt_state.lock().await;
+            let row = g
+                .spaces
+                .get(&community_id)
+                .expect("adoption must reconstruct the owner-state Space row");
+            assert!(row.left_at.is_none());
+            assert!(row.pending_join_at.is_none());
+            assert_eq!(
+                row.current_epoch_key.as_ref().map(|k| *k.as_bytes()),
+                Some([0x43; 32]),
+                "adopted row carries the fresh invite's (unsealed) epoch key"
+            );
+        }
+
+        let state_arc = community_registry
+            .state_for(&community_id)
+            .await
+            .expect("repair redeem must (re)spawn the community engine");
+        let events_after = {
+            let g = state_arc.lock().await;
+            g.events.len()
+        };
+        assert_eq!(
+            events_after, 2,
+            "adoption must not mint a PendingJoin on top of the two persisted events"
+        );
     }
 }
 
