@@ -1249,26 +1249,46 @@ impl ChannelLog {
     /// of the history-backfill query so only events newer than the local
     /// watermark are fetched.
     ///
-    /// **Invariant:** tail events are strictly newer than any sealed segment
-    /// (seal-order invariant). Every `seal_and_persist` call empties the tail
-    /// and appends a `SegmentDescriptor`; events appended after a seal go into
-    /// the fresh tail. Therefore:
+    /// **Why a max over everything:** HLCs are per-author/device
+    /// monotonic only; arrival order and seal ranges can interleave, so
+    /// the watermark is the max across all segments' upper bounds and
+    /// all tail events. Neither "the last tail event" nor "the last
+    /// segment's `range.1`" is guaranteed to carry the channel-wide
+    /// max: the tail appends in ARRIVAL order (a cross-lane straggler
+    /// can land after the newest event), and the manifest sorts by
+    /// `range.0` — a late seal from a lagging lane can put a segment
+    /// whose `range.1` understates an earlier segment's bound last
+    /// (e.g. ranges (100,300),(200,200) sort with 200 last; true max
+    /// is 300). Returns `None` for an empty log (fresh joiner requests
+    /// full history).
     ///
-    /// 1. If the tail is non-empty, return the **last** tail event's HLC.
-    ///    (The tail is append-only and per-lane monotone, so the last
-    ///    element carries the highest HLC across all tail entries.)
-    /// 2. Else if the manifest has segments, return the **last segment's
-    ///    upper range bound** (`range.1`). The manifest is kept sorted
-    ///    ascending by `range.0`, so the last entry holds the latest
-    ///    sealed HLC.
-    /// 3. Else `None` — the log is empty; a fresh joiner should request
-    ///    the full history.
+    /// A stale-LOW watermark is merely wasteful (the replay tracker
+    /// dedupes re-served events) but interacts badly with the paging
+    /// loop, which reads a non-advancing watermark on a full page as
+    /// no-progress and backs off.
     pub fn max_hlc(&self) -> Option<Hlc> {
-        if let Some(last_event) = self.tail.last() {
-            let SignedChannelEvent::Post { at, .. } = last_event;
-            return Some(at.clone());
-        }
-        self.manifest.segments.last().map(|seg| seg.range.1.clone())
+        // Hlc has no `Ord` impl (the device_id String tuple position
+        // would force allocation in any Ord impl), so use
+        // is_strictly_newer_than via max_by — same pattern as
+        // seal_and_persist's range computation.
+        self.manifest
+            .segments
+            .iter()
+            .map(|seg| &seg.range.1)
+            .chain(self.tail.iter().map(|e| {
+                let SignedChannelEvent::Post { at, .. } = e;
+                at
+            }))
+            .max_by(|a, b| {
+                if a.is_strictly_newer_than(b) {
+                    std::cmp::Ordering::Greater
+                } else if b.is_strictly_newer_than(a) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .cloned()
     }
 
     /// Read all events from a sealed segment. Used by Phase 3 backfill.
@@ -2993,7 +3013,7 @@ mod tests {
 
     #[test]
     fn max_hlc_reads_tail_when_present() {
-        // Two tail events; max_hlc must return the LAST (newest) one's HLC.
+        // Two tail events; max_hlc must return the max (newest) HLC.
         let cid = fixture_community(0xc0);
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
@@ -3012,7 +3032,7 @@ mod tests {
         let watermark = log.max_hlc().expect("must be Some with 2 tail events");
         assert_eq!(
             watermark.wall_ms, 200_000,
-            "max_hlc must return the last tail event's HLC (wall=200_000)"
+            "max_hlc must return the max tail HLC (wall=200_000)"
         );
     }
 
@@ -3048,8 +3068,10 @@ mod tests {
     #[test]
     fn max_hlc_prefers_tail_over_segments() {
         // Sealed segment ends at wall=300_000; tail has an event at wall=400_000.
-        // max_hlc must return 400_000 — tail events are strictly newer than any
-        // sealed segment (seal-order invariant).
+        // max_hlc must return 400_000 — here the tail carries the channel-wide
+        // max (max_hlc takes the max over ALL segment bounds and tail events;
+        // there is no "tail strictly newer than segments" invariant — HLCs are
+        // only per-author/device monotonic).
         let cid = fixture_community(0xc0);
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
@@ -3075,7 +3097,90 @@ mod tests {
         let watermark = log.max_hlc().expect("must be Some");
         assert_eq!(
             watermark.wall_ms, 400_000,
-            "max_hlc must prefer tail over sealed segments (tail is always newer)"
+            "max_hlc must take the tail event when it carries the channel max"
+        );
+    }
+
+    #[test]
+    fn max_hlc_takes_max_across_overlapping_segments() {
+        // Two sealed segments with ranges (100_000, 300_000) and
+        // (200_000, 200_000): the manifest sorts ascending by range.0,
+        // so the LAST segment's range.1 (200_000) understates the true
+        // max (300_000). HLCs are only per-author/device monotonic —
+        // seal ranges can interleave like this when a lagging lane
+        // seals late. max_hlc must take the max across ALL segments'
+        // upper bounds, not the last one's.
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig {
+                seal_threshold_events: 4,
+            },
+        );
+        // Segment 1: range (100_000, 300_000).
+        for wall in [100_000u64, 150_000, 250_000, 300_000] {
+            log.append(fixture_signed_event(wall, 0, "a-dev"))
+                .expect("append");
+        }
+        log.seal_and_persist().expect("seal segment 1");
+        // Segment 2: four events at wall=200_000 (logical 0..=3) →
+        // range (200_000, 200_000), sorted AFTER segment 1 by range.0.
+        for logical in 0..4u32 {
+            log.append(fixture_signed_event(200_000, logical, "b-dev"))
+                .expect("append");
+        }
+        log.seal_and_persist().expect("seal segment 2");
+        assert_eq!(log.manifest.segments.len(), 2);
+        assert!(log.tail.is_empty());
+        assert_eq!(
+            log.manifest
+                .segments
+                .last()
+                .expect("two segments")
+                .range
+                .1
+                .wall_ms,
+            200_000,
+            "fixture precondition: last-sorted segment's bound understates the max"
+        );
+        let watermark = log.max_hlc().expect("must be Some with two segments");
+        assert_eq!(
+            watermark.wall_ms, 300_000,
+            "max_hlc must take the max across ALL segments' range.1, \
+             not the last-sorted segment's"
+        );
+    }
+
+    #[test]
+    fn max_hlc_takes_max_within_unordered_tail() {
+        // The tail appends in ARRIVAL order: a cross-lane straggler can
+        // land after the newest event (HLCs are only per-author/device
+        // monotonic). Tail = [wall=300_000 ("a-dev"), wall=200_000
+        // ("b-dev")] in arrival order — max_hlc must return 300_000,
+        // not the last-appended event's 200_000.
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig {
+                seal_threshold_events: 8,
+            },
+        );
+        log.append(fixture_signed_event(300_000, 0, "a-dev"))
+            .expect("append newest first");
+        log.append(fixture_signed_event(200_000, 0, "b-dev"))
+            .expect("append straggler last");
+        let watermark = log.max_hlc().expect("must be Some with 2 tail events");
+        assert_eq!(
+            watermark.wall_ms, 300_000,
+            "max_hlc must take the max across tail events, not the last-appended"
         );
     }
 }

@@ -62,7 +62,7 @@ Backfilled events face exactly the gates live events face (D25): author-auth aga
 
 ## 5. Data flow
 
-```
+```text
 JOIN:      redeem → membership materialized → for each channel:
            schedule_backfill(ch, None) ──zenoh get──► any online holder device
            ◄── replies (wire-identical to live) ── streamed

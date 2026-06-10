@@ -1745,18 +1745,25 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                 let me = Arc::clone(&request_engine);
                 async move {
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    // Send failure = engine shutting down (query
-                    // bridge closed): map to no-reply; the driver
-                    // backs off and the shutdown watch ends it.
+                    // Send failure = query bridge closed: the
+                    // engine/adapter is gone for good (no recovery
+                    // hook exists) — stop the driver instead of
+                    // burning eternal futile retries.
                     if me.request_backfill_with_outcome(since, tx).await.is_err() {
-                        return None;
+                        return crate::channel_backfill::PageFetch::EngineGone;
                     }
                     match rx.await {
-                        Ok(report) => Some((report.replies, report.limit)),
+                        Ok(report) => crate::channel_backfill::PageFetch::Completed(
+                            report.replies,
+                            report.limit,
+                        ),
                         // Sender dropped before a clean reply-stream
                         // close: query aborted (adapter shutdown /
-                        // GET failure) — treat as no-reply → backoff.
-                        Err(_) => None,
+                        // GET failure) — could be a transient
+                        // teardown race during shutdown, so treat as
+                        // no-reply → backoff; the shutdown watch ends
+                        // the driver promptly anyway.
+                        Err(_) => crate::channel_backfill::PageFetch::NoReply,
                     }
                 }
             },

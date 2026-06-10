@@ -12,9 +12,15 @@
 //! - **Satisfied** means a *completed* short or empty page was received:
 //!   a served "nothing more" is an answer; an unanswered query is not.
 //! - **Full page** (`events >= limit`, `limit > 0`) means the holder hit
-//!   its page cap and more history may remain: advance `since` to the max
-//!   HLC seen and re-request **immediately** — no backoff between pages.
-//!   This is the paging loop.
+//!   its page cap and more history may remain. If the verified watermark
+//!   moved (`max_hlc_seen` is `Some` and differs from the requested
+//!   `since`), advance `since` and re-request **immediately** — no
+//!   backoff between progressing pages. This is the paging loop. A full
+//!   page that does NOT move the watermark (hostile holder serving
+//!   garbage that fails verification, all-duplicate replies,
+//!   cross-config limits) instead arms the same backoff as a no-reply:
+//!   the latch stays unsatisfied (history may genuinely remain) but
+//!   stops hammering the same window.
 //! - **No reply** (zero responders) backs off exponentially: first retry
 //!   after [`BACKFILL_RETRY_BASE_MS`] (30 s), doubling per consecutive
 //!   miss, capped at [`BACKFILL_RETRY_CAP_MS`] (600 s) between attempts,
@@ -149,27 +155,50 @@ impl BackfillLatch {
         }
     }
 
-    /// Record a completed reply page (clears in-flight, resets backoff).
+    /// Record a completed reply page (clears in-flight).
     ///
-    /// Full page (`events >= limit`, `limit > 0`) advances `since` to the
-    /// max HLC seen and leaves the latch unsatisfied so the next
-    /// `next_action(now)` re-requests immediately. Short or empty page
-    /// satisfies the latch (spec D24: a served "nothing" is an answer).
+    /// Short or empty page satisfies the latch (spec D24: a served
+    /// "nothing" is an answer) and resets backoff. Full page (`events
+    /// >= limit`, `limit > 0`) means more history may remain:
+    ///
+    /// - **Progress** (`max_hlc_seen` is `Some` and differs from the
+    ///   current `since`): advance `since`, reset backoff, and leave
+    ///   the latch unsatisfied so the next `next_action(now)`
+    ///   re-requests immediately — the paging loop.
+    /// - **No progress** (`max_hlc_seen` is `None` or equals the
+    ///   current `since`): see the no-progress branch below.
     pub fn on_page_complete(&mut self, outcome: PageOutcome, now_ms: u64) {
         self.in_flight = false;
-        // Any answer resets the no-reply backoff and makes the next
-        // request immediately eligible.
-        self.retry_delay_ms = 0;
-        self.next_retry_at = now_ms;
 
         let full_page = outcome.limit > 0 && outcome.events >= outcome.limit;
-        if full_page {
-            // Paging loop: more history may remain behind the cap.
-            if let Some(max_hlc) = outcome.max_hlc_seen {
-                self.since = Some(max_hlc);
-            }
-        } else {
+        if !full_page {
+            // Spec D24: a served "nothing more" is an answer.
             self.satisfied = true;
+            self.retry_delay_ms = 0;
+            self.next_retry_at = now_ms;
+            return;
+        }
+        let progressed = outcome.max_hlc_seen.is_some() && outcome.max_hlc_seen != self.since;
+        if progressed {
+            // Paging loop: more history may remain behind the cap and
+            // the verified watermark moved — re-request immediately
+            // from the new window, resetting the no-reply backoff.
+            self.since = outcome.max_hlc_seen;
+            self.retry_delay_ms = 0;
+            self.next_retry_at = now_ms;
+        } else {
+            // No-progress full page: the verified watermark did not
+            // move past the window we asked for, so an immediate
+            // re-request would replay the exact same window — a
+            // hostile holder serving garbage that fails verification
+            // (or one that keeps serving already-held duplicates)
+            // would otherwise drive a tight zero-backoff request loop
+            // until shutdown. Arm the same escalating backoff as
+            // [`Self::on_no_reply`] WITHOUT satisfying the latch:
+            // history may genuinely remain, and the holder set can
+            // change, so backing off (rather than declaring done)
+            // keeps liveness.
+            self.arm_backoff(now_ms);
         }
     }
 
@@ -180,8 +209,18 @@ impl BackfillLatch {
     /// 600 s); retries forever (driver enforces shutdown).
     pub fn on_no_reply(&mut self, now_ms: u64) {
         self.in_flight = false;
+        self.arm_backoff(now_ms);
+    }
+
+    /// Escalate the retry backoff and arm `next_retry_at`. Shared by
+    /// [`Self::on_no_reply`] and the no-progress full-page branch of
+    /// [`Self::on_page_complete`]. First retry waits `retry_base_ms`
+    /// clamped to `retry_cap_ms` (a misconfigured base > cap must not
+    /// violate the cap on the first retry), then doubles per
+    /// consecutive miss up to the cap.
+    fn arm_backoff(&mut self, now_ms: u64) {
         self.retry_delay_ms = if self.retry_delay_ms == 0 {
-            self.retry_base_ms
+            self.retry_base_ms.min(self.retry_cap_ms)
         } else {
             (self.retry_delay_ms * 2).min(self.retry_cap_ms)
         };
@@ -198,6 +237,17 @@ impl BackfillLatch {
 
 // ── Async driver (ZEB-418 P3a Task 4) ───────────────────────────────────────
 
+/// Outcome of one page-fetch attempt, as seen by the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageFetch {
+    /// Query completed cleanly (replies, effective_limit).
+    Completed(usize, usize),
+    /// No responders / query aborted — transient; back off and retry.
+    NoReply,
+    /// The engine/adapter is gone for good — stop the driver.
+    EngineGone,
+}
+
 /// Floor for the driver's backoff sleeps (ms). Defensive: guards
 /// against a hot loop if the injected clock ever lags the latch's
 /// `next_retry_at` (the latch's in-flight `WaitUntil` clamp can hand
@@ -213,9 +263,11 @@ const BACKFILL_DRIVER_MIN_WAIT_MS: u64 = 250;
 /// device's reloaded log gives `Some(watermark)` (catch-up).
 ///
 /// - `request_page(since)` issues one backfill query and resolves to
-///   `Some((replies, limit))` after the reply stream closes cleanly,
-///   or `None` on no-reply/abort (mapped to backoff via
-///   [`BackfillLatch::on_no_reply`]).
+///   a [`PageFetch`]: `Completed(replies, limit)` after the reply
+///   stream closes cleanly; `NoReply` on no-reply/abort (mapped to
+///   backoff via [`BackfillLatch::on_no_reply`]); `EngineGone` when
+///   the engine/adapter is permanently gone (no recovery hook exists
+///   — the driver returns instead of retrying forever).
 /// - `current_watermark()` re-reads the max HLC from the LOG after a
 ///   full page. The watermark is deliberately NOT taken from the raw
 ///   reply packets: only verified events land in the log, so a hostile
@@ -238,7 +290,7 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     now_ms: impl Fn() -> u64,
 ) where
     Rq: Fn(Option<Hlc>) -> RqFut,
-    RqFut: std::future::Future<Output = Option<(usize, usize)>>,
+    RqFut: std::future::Future<Output = PageFetch>,
     Wm: Fn() -> WmFut,
     WmFut: std::future::Future<Output = Option<Hlc>>,
 {
@@ -266,7 +318,7 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                 }
             }
             BackfillAction::Request { since } => match request_page(since).await {
-                Some((replies, limit)) => {
+                PageFetch::Completed(replies, limit) => {
                     let full_page = limit > 0 && replies >= limit;
                     // Watermark re-read from the LOG (only verified
                     // events land there) rather than trusted from the
@@ -287,7 +339,11 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         now_ms(),
                     );
                 }
-                None => latch.on_no_reply(now_ms()),
+                PageFetch::NoReply => latch.on_no_reply(now_ms()),
+                // Permanent: the engine/adapter is gone for good and
+                // no recovery hook exists — stop instead of burning
+                // eternal futile retries until engine stop.
+                PageFetch::EngineGone => return,
             },
         }
     }
@@ -342,6 +398,60 @@ mod tests {
             }
         );
         assert!(!latch.is_satisfied());
+    }
+
+    #[test]
+    fn full_page_without_progress_backs_off_instead_of_spinning() {
+        let mut latch = BackfillLatch::new(Some(hlc(100)));
+        assert_eq!(
+            latch.next_action(0),
+            BackfillAction::Request {
+                since: Some(hlc(100))
+            }
+        );
+        // Full page whose verified watermark equals the requested
+        // `since`: nothing new landed in the log (hostile holder
+        // serving garbage that fails verification, or all-duplicate
+        // replies). Re-requesting immediately would replay the same
+        // window in a tight zero-backoff loop.
+        latch.on_page_complete(
+            PageOutcome {
+                events: 1000,
+                max_hlc_seen: Some(hlc(100)),
+                limit: 1000,
+            },
+            0,
+        );
+        assert!(
+            !latch.is_satisfied(),
+            "no-progress must NOT satisfy — history may genuinely remain"
+        );
+        // Backs off like a no-reply instead of an immediate Request.
+        assert_eq!(
+            latch.next_action(0),
+            BackfillAction::WaitUntil(BACKFILL_RETRY_BASE_MS)
+        );
+        // Once past the delay, the request fires again (same window) —
+        // the holder set can change, so liveness is preserved.
+        assert_eq!(
+            latch.next_action(BACKFILL_RETRY_BASE_MS),
+            BackfillAction::Request {
+                since: Some(hlc(100))
+            }
+        );
+    }
+
+    #[test]
+    fn first_retry_respects_cap_when_base_exceeds_cap() {
+        // Misconfigured base > cap: the first retry must clamp to the
+        // cap rather than wait the full (over-cap) base.
+        let mut latch = BackfillLatch::new_with_backoff(None, 1_000, 300);
+        assert!(matches!(
+            latch.next_action(0),
+            BackfillAction::Request { .. }
+        ));
+        latch.on_no_reply(0);
+        assert_eq!(latch.next_action(0), BackfillAction::WaitUntil(300));
     }
 
     #[test]
@@ -512,9 +622,9 @@ mod tests {
             async move {
                 let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
                 if n < 3 {
-                    None
+                    PageFetch::NoReply
                 } else {
-                    Some((3usize, 256usize))
+                    PageFetch::Completed(3, 256)
                 }
             }
         };
@@ -558,9 +668,9 @@ mod tests {
                 since_log.lock().unwrap().push(since);
                 let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
                 if n < 3 {
-                    Some((256usize, 256usize))
+                    PageFetch::Completed(256, 256)
                 } else {
-                    Some((5usize, 256usize))
+                    PageFetch::Completed(5, 256)
                 }
             }
         };
@@ -612,7 +722,7 @@ mod tests {
             let counter = Arc::clone(&counter);
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
-                None::<(usize, usize)>
+                PageFetch::NoReply
             }
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -646,16 +756,16 @@ mod tests {
     async fn driver_aborted_query_backs_off() {
         let requests = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&requests);
-        // Call 1: aborted query (oneshot RecvError maps to None).
+        // Call 1: aborted query (oneshot RecvError maps to NoReply).
         // Call 2: clean empty page → satisfied.
         let request_page = move |_since: Option<Hlc>| {
             let counter = Arc::clone(&counter);
             async move {
                 let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
                 if n == 1 {
-                    None
+                    PageFetch::NoReply
                 } else {
-                    Some((0usize, 256usize))
+                    PageFetch::Completed(0, 256)
                 }
             }
         };
@@ -688,6 +798,44 @@ mod tests {
         tokio::time::advance(Duration::from_millis(2)).await;
         driver.await.expect("driver task");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn driver_exits_on_engine_gone() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        // The request closure reports the engine/adapter permanently
+        // gone (query bridge closed): the driver must return instead
+        // of arming eternal futile retries.
+        let request_page = move |_since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                PageFetch::EngineGone
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            || async { None::<Hlc> },
+            shutdown_rx,
+            move || start.elapsed().as_millis() as u64,
+        )
+        .await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "EngineGone must end the driver after exactly one request"
+        );
+        // Under paused time any backoff sleep would auto-advance the
+        // clock — zero elapsed proves the driver exited immediately.
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "driver must exit without arming any backoff wait"
+        );
     }
 
     #[test]
