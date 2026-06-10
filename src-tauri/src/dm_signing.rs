@@ -701,4 +701,78 @@ mod tests {
             verify_dm_packet_signature(body, &sig_via_module, &identity_pub, device_hash).is_ok()
         );
     }
+
+    /// ZEB-372 Phase 2 — THE cross-repo proof the ticket exists for: the
+    /// pinned harmony rev populates `EnrollmentCert.device_pubkeys.classical
+    /// .x25519_pub` with the real birational X25519, this client seals to
+    /// that exact cert field, and the device opens with
+    /// `ed25519_priv_to_x25519(device_signing_key)`. If this fails after a
+    /// pin bump, the two repos' derivations have drifted — that is a
+    /// sealed-blob-orphaning compat break, not a fixture to refresh.
+    /// Select the enrollment cert belonging to `minted.device_signing_key`
+    /// (NOT `.values().next()` — if `mint_owner` ever enrolls more than one
+    /// device, an arbitrary pick would validate the wrong cert and the
+    /// round-trip below would fail confusingly, or worse, pass against a
+    /// cert the device key can't actually open for). Qodo, PR #220.
+    fn minted_device_cert(
+        minted: &harmony_owner::lifecycle::MintResult,
+    ) -> &harmony_owner::certs::EnrollmentCert {
+        let device_vk = minted.device_signing_key.verifying_key().to_bytes();
+        minted
+            .state
+            .enrollments
+            .values()
+            .find(|c| c.device_pubkeys.classical.ed25519_verify == device_vk)
+            .expect("an enrollment cert for the minted device signing key")
+    }
+
+    #[test]
+    fn zeb372_cert_x25519_seals_and_device_key_opens() {
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint fresh owner");
+        let cert = minted_device_cert(&minted);
+        let cert_x = cert.device_pubkeys.classical.x25519_pub;
+        assert_ne!(
+            cert_x, [0u8; 32],
+            "pinned harmony rev still ships the pre-ZEB-372 zeroed X25519 stub"
+        );
+
+        let msg = b"ZEB-372 phase 2: seal to the cert key, open with the device key";
+        let sealed = seal_to_owner(&cert_x, msg).expect("seal to cert-carried X25519");
+        let device_x_priv = ed25519_priv_to_x25519(&minted.device_signing_key);
+        let opened = open_from_owner(&device_x_priv, &sealed).expect("device key opens");
+        assert_eq!(opened, msg);
+    }
+
+    /// ZEB-372 Phase 2 parity pin: harmony-owner's `ed25519_pub_to_x25519`
+    /// and this module's implementation must agree forever, for both the
+    /// device bundle and the master bundle (read from the device cert's
+    /// `Master` issuer). Guards the same drift as the round-trip test but
+    /// localizes a failure to the derivation rather than the seal path.
+    #[test]
+    fn zeb372_cert_x25519_matches_client_birational_derivation() {
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint fresh owner");
+        let cert = minted_device_cert(&minted);
+
+        let bundles = [
+            ("device", &cert.device_pubkeys),
+            (
+                "master",
+                match &cert.issuer {
+                    harmony_owner::certs::EnrollmentIssuer::Master { master_pubkey } => {
+                        master_pubkey
+                    }
+                    other => panic!("device #1 cert must be Master-issued, got {other:?}"),
+                },
+            ),
+        ];
+        for (which, bundle) in bundles {
+            let expected = ed25519_pub_to_x25519(&bundle.classical.ed25519_verify)
+                .expect("freshly minted key converts");
+            assert_eq!(
+                bundle.classical.x25519_pub, expected,
+                "{which} bundle: harmony-owner and harmony-client birational \
+                 implementations disagree — cross-repo derivation drift"
+            );
+        }
+    }
 }

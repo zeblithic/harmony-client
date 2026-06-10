@@ -78,29 +78,26 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Harmony crates — harmony-runtime is the core sans-I/O runtime.
 # harmony-identity and harmony-content are direct deps because we use
 # their types (PrivateIdentity, PqPrivateIdentity, MemoryBookStore, etc.).
-# Pinned to harmony main 1ccf42bf, which unifies two cross-repo bumps that
-# conflicted on merge: ZEB-342 (#275 c2a825b7, mint_owner publishes device #1
-# liveness — this PR) and ZEB-378 (#276, EnrollmentCert expiry — already on
-# client main via #211, which pinned only harmony-owner to the pre-squash tip
-# 8f2d2f13). 1ccf42bf is a descendant of c2a825b7 and its harmony-owner tree is
-# byte-identical to 8f2d2f13, so this carries both changes with no behaviour
-# delta versus what client main already builds against.
-harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
-harmony-identity = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
-harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
-harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
-harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
-harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af" }
-harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "1ccf42bf37f5e54b53a021389a4e78cf6d4cd8af", features = ["recovery"] }
-# ZEB-323 Phase 2b: pkarr-based discovery policies. Pinned to harmony main
-# 2aaf403 (ZEB-380 PR1, harmony#274: hot-swappable RelayPool + per-relay health —
-# RelayConfig / RelayHealth / RelayState / RelayOutcome + RelayClient::{set_relays,
-# relay_health, with_config}). Contains eccf85b (ZEB-382: real pkarr wire format —
-# z-base-32 keys + BEP44 big-endian seq + DNS-packet payload via the upstream
-# pkarr 3.10.0 codec, harmony#273; proven live against relay.pkarr.org), which it
-# supersedes. test-fixtures feature is activated only for the dev-dependency below
+# Pinned to harmony main c9820799 (ZEB-372, harmony#277): PubKeyBundle now
+# carries the REAL birational X25519 (RFC 7748 §5) for master + device
+# bundles instead of the zeroed stub — EnrollmentCert.device_pubkeys
+# .classical.x25519_pub is finally a usable seal target (butler deposits,
+# targeted invites). identity_hash() excludes encryption keys, so no
+# owner/device ids change. Descendant of the previous pin 1ccf42bf.
+# Cross-repo agreement is pinned by tests in dm_signing.rs (ZEB-372 Phase 2).
+harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
+harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
+harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
+harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
+harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
+harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1", features = ["recovery"] }
+# ZEB-323 Phase 2b: pkarr-based discovery policies. Now pinned to the same
+# workspace-wide rev as the crates above (was 2aaf403b, ZEB-380 PR1 — see
+# git history for the RelayPool/health + real-wire-format provenance).
+# test-fixtures feature is activated only for the dev-dependency below
 # so MockPkarrRelay is excluded from release binaries (round-1 review fix).
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "2aaf403bbb90e064892a08737fca7ed0fd30ff79" }
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
 # ZEB-380: relay-URL validation (scheme + host checks) in pkarr_settings.rs.
 # Already in the lock transitively (reqwest/iroh); a direct entry just makes it importable.
 url = "2"
@@ -175,7 +172,7 @@ tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
 # Activate test-fixtures feature for harmony-pkarr in dev/test builds only,
 # so MockPkarrRelay (an axum HTTP server) is excluded from release binaries.
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "2aaf403bbb90e064892a08737fca7ed0fd30ff79", features = ["test-fixtures"] }
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1", features = ["test-fixtures"] }
 
 # ZEB-156: harmony-runtime (pinned 04449d60 above) provides the narrow
 # `NodeRuntime::remove_content` + `StorageTier::remove` delegates this
