@@ -1,4 +1,5 @@
 import type { TauriAdapter } from './zenoh-service';
+import type { Profile } from './types';
 
 /**
  * ZEB-370 Phase 1 + ZEB-371 Phase 1b: frontend friend-graph service. Mirrors
@@ -106,6 +107,37 @@ export interface ReferralView {
   display: string | null;
   /** Whether we already have this peer as an Active/Pending friend. */
   alreadyFriend: boolean;
+}
+
+/**
+ * ZEB-431: derive the DM contact-picker entries from the friend graph.
+ *
+ * The picker previously rendered `navService.profiles`, which is fed only by
+ * live zenoh `profile-update` presence broadcasts AND is keyed by Reticulum
+ * device identity hash — the wrong identifier class for `add_space`, whose
+ * `members[]` are 16-byte master `OwnerAddr`s (both are 16 bytes, so the
+ * mismatch decoded silently). Active friends are the correct contact set:
+ * `ownerIdHex` is exactly the `OwnerAddr` the DM path resolves through
+ * `OwnerDeviceCache`, and the SP2 butler deposit acceptor requires
+ * friend-Active admission anyway, so a non-friend entry could never receive.
+ *
+ * Pending friends are excluded (no DM until the request is accepted).
+ * Display precedence: local nickname (ZEB-419) → published display name →
+ * short-hex prefix (which also keeps the entry findable by typing the hex).
+ * Empty strings are treated as absent.
+ */
+export function contactsFromFriends(friends: FriendDto[]): Map<string, Profile> {
+  const contacts = new Map<string, Profile>();
+  for (const f of friends) {
+    if (f.status !== 'active') continue;
+    const shortHex =
+      f.ownerIdHex.length > 8 ? f.ownerIdHex.slice(0, 8) + '…' : f.ownerIdHex;
+    contacts.set(f.ownerIdHex, {
+      address: f.ownerIdHex,
+      displayName: f.nickname || f.display || shortHex,
+    });
+  }
+  return contacts;
 }
 
 export class FriendService {
