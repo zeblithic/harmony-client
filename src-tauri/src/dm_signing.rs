@@ -709,15 +709,27 @@ mod tests {
     /// `ed25519_priv_to_x25519(device_signing_key)`. If this fails after a
     /// pin bump, the two repos' derivations have drifted — that is a
     /// sealed-blob-orphaning compat break, not a fixture to refresh.
-    #[test]
-    fn zeb372_cert_x25519_seals_and_device_key_opens() {
-        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint fresh owner");
-        let cert = minted
+    /// Select the enrollment cert belonging to `minted.device_signing_key`
+    /// (NOT `.values().next()` — if `mint_owner` ever enrolls more than one
+    /// device, an arbitrary pick would validate the wrong cert and the
+    /// round-trip below would fail confusingly, or worse, pass against a
+    /// cert the device key can't actually open for). Qodo, PR #220.
+    fn minted_device_cert(
+        minted: &harmony_owner::lifecycle::MintResult,
+    ) -> &harmony_owner::certs::EnrollmentCert {
+        let device_vk = minted.device_signing_key.verifying_key().to_bytes();
+        minted
             .state
             .enrollments
             .values()
-            .next()
-            .expect("device #1 enrollment cert");
+            .find(|c| c.device_pubkeys.classical.ed25519_verify == device_vk)
+            .expect("an enrollment cert for the minted device signing key")
+    }
+
+    #[test]
+    fn zeb372_cert_x25519_seals_and_device_key_opens() {
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint fresh owner");
+        let cert = minted_device_cert(&minted);
         let cert_x = cert.device_pubkeys.classical.x25519_pub;
         assert_ne!(
             cert_x, [0u8; 32],
@@ -739,12 +751,7 @@ mod tests {
     #[test]
     fn zeb372_cert_x25519_matches_client_birational_derivation() {
         let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint fresh owner");
-        let cert = minted
-            .state
-            .enrollments
-            .values()
-            .next()
-            .expect("device #1 enrollment cert");
+        let cert = minted_device_cert(&minted);
 
         let bundles = [
             ("device", &cert.device_pubkeys),
