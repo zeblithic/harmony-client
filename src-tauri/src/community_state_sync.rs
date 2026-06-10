@@ -2466,9 +2466,12 @@ async fn live_epoch_key(
     }
 }
 
-/// Snapshot the local CRDT, encrypt it, write to CAS, build a
-/// `CommunityRootPublishPayload`, AEAD-wrap it for the wire, and ship
-/// it on `publisher_tx`.
+/// Build one complete state-root wire packet: epoch-stable snapshot,
+/// blob encrypt + CAS pin (put_serveable), signed payload with a
+/// strictly-newer HLC, wire-envelope encrypt. Shared by the debounced
+/// publish path and the ZEB-434 query-serve arm — both produce
+/// byte-class-identical packets, which is what keeps "no new wire
+/// format" true.
 ///
 /// Snapshot-clone-under-brief-lock: we hold `state.lock()` only long
 /// enough to `clone()` the CRDT, then drop the guard before the
@@ -2490,7 +2493,7 @@ async fn live_epoch_key(
 /// Don't swap them — sharing a deterministic-nonce wire-side would
 /// make every retransmit byte-identical and hide replay errors;
 /// sharing a random-nonce CAS-side would defeat ContentId dedup.
-async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
+async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncError> {
     use crate::owner_state_crypto::canonical_cbor_encode;
     use ed25519_dalek::Signer;
 
@@ -2621,13 +2624,23 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     //    ZEB-249 §10.6: uses `current_key` (live epoch key).
     let wire = encrypt_root_publish(&current_key, &payload_bytes)?;
 
+    Ok(wire)
+}
+
+/// Snapshot the local CRDT, encrypt it, write to CAS, build a
+/// `CommunityRootPublishPayload`, AEAD-wrap it for the wire, and ship
+/// it on `publisher_tx`.
+///
+/// Delegates encoding to [`encode_root_packet`], which is also shared
+/// by the ZEB-434 query-serve arm so both paths produce byte-class-
+/// identical packets without duplicating crypto/HLC logic.
+async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
+    let wire = encode_root_packet(ctx).await?;
     // 9. Send onto outbound channel — Zenoh adapter (Task 11) forwards.
     ctx.publisher_tx
         .send(wire)
         .await
-        .map_err(|_| CommunitySyncError::TransportClosed)?;
-
-    Ok(())
+        .map_err(|_| CommunitySyncError::TransportClosed)
 }
 
 /// Build an HLC that is strictly newer than every prior HLC published
