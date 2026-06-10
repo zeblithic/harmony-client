@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { FriendService, type FriendDto, type AddFriendOutcome } from './friend-service';
+import {
+  FriendService,
+  contactsFromFriends,
+  type FriendDto,
+  type AddFriendOutcome,
+} from './friend-service';
 import type { TauriAdapter } from './zenoh-service';
 
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
@@ -365,5 +370,68 @@ describe('FriendService', () => {
     await service.connectAdapter(adapter);
     adapter.listeners.get('friend-request-received')!({ payload: null });
     expect(pendingCb).not.toHaveBeenCalled();
+  });
+});
+
+describe('contactsFromFriends', () => {
+  const base = { establishedVia: 'mutual_key' as const, referrable: false };
+
+  it('maps active friends into Profile entries keyed by ownerIdHex', () => {
+    const friends: FriendDto[] = [
+      { ownerIdHex: 'd6ff9d98ca9b20df7838abdbddc7d57f', display: 'ZEBbot', status: 'active', ...base },
+      { ownerIdHex: '11223344556677889900aabbccddeeff', display: 'Bob', status: 'active', ...base },
+    ];
+    const contacts = contactsFromFriends(friends);
+    expect(contacts.size).toBe(2);
+    expect(contacts.get('d6ff9d98ca9b20df7838abdbddc7d57f')).toEqual({
+      address: 'd6ff9d98ca9b20df7838abdbddc7d57f',
+      displayName: 'ZEBbot',
+    });
+  });
+
+  it('prefers the local nickname over the published display name', () => {
+    const friends: FriendDto[] = [
+      {
+        ownerIdHex: 'd6ff9d98ca9b20df7838abdbddc7d57f',
+        display: 'ZEBbot',
+        nickname: 'Ildwyn',
+        status: 'active',
+        ...base,
+      },
+    ];
+    const contacts = contactsFromFriends(friends);
+    expect(contacts.get('d6ff9d98ca9b20df7838abdbddc7d57f')?.displayName).toBe('Ildwyn');
+  });
+
+  it('falls back to display, then to a short-hex prefix when neither name is set', () => {
+    const friends: FriendDto[] = [
+      { ownerIdHex: 'aabbccdd00112233aabbccdd00112233', display: 'Carol', nickname: null, status: 'active', ...base },
+      { ownerIdHex: 'deadbeefdeadbeefdeadbeefdeadbeef', display: null, status: 'active', ...base },
+    ];
+    const contacts = contactsFromFriends(friends);
+    expect(contacts.get('aabbccdd00112233aabbccdd00112233')?.displayName).toBe('Carol');
+    expect(contacts.get('deadbeefdeadbeefdeadbeefdeadbeef')?.displayName).toBe('deadbeef…');
+  });
+
+  it('treats empty-string names as absent', () => {
+    const friends: FriendDto[] = [
+      { ownerIdHex: 'deadbeefdeadbeefdeadbeefdeadbeef', display: '', nickname: '', status: 'active', ...base },
+    ];
+    const contacts = contactsFromFriends(friends);
+    expect(contacts.get('deadbeefdeadbeefdeadbeefdeadbeef')?.displayName).toBe('deadbeef…');
+  });
+
+  it('excludes pending friends (they cannot receive DMs yet)', () => {
+    const friends: FriendDto[] = [
+      { ownerIdHex: 'aabbccdd00112233aabbccdd00112233', display: 'NotYet', status: 'pending', ...base },
+      { ownerIdHex: '11223344556677889900aabbccddeeff', display: 'Bob', status: 'active', ...base },
+    ];
+    const contacts = contactsFromFriends(friends);
+    expect(contacts.size).toBe(1);
+    expect(contacts.has('aabbccdd00112233aabbccdd00112233')).toBe(false);
+  });
+
+  it('returns an empty map for an empty friend list', () => {
+    expect(contactsFromFriends([]).size).toBe(0);
   });
 });

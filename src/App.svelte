@@ -42,7 +42,7 @@
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
-  import { FriendService } from './lib/friend-service';
+  import { FriendService, contactsFromFriends } from './lib/friend-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
   import { NotificationService } from './lib/notification-service';
@@ -957,6 +957,16 @@
     }
   }
 
+  // ZEB-431: single entry point for the DM-create modal. The refresh
+  // re-pulls the friend graph at open time so a friend added moments
+  // earlier (or on another device, missed-event case) is listed without
+  // waiting for a friend-list-changed emit.
+  function openDmCreate(kind: 'dm' | 'group-dm') {
+    dmCreateInitialKind = kind;
+    dmCreateDialogOpen = true;
+    void refreshDmContacts();
+  }
+
   async function handleDmCreate(args: { kind: 'dm' | 'group-dm'; members: string[]; name: string }) {
     try {
       const { invoke } = await import('@tauri-apps/api/core');
@@ -1081,6 +1091,48 @@
   // FriendsPanel.
   const friendService = new FriendService();
   $effect(() => () => friendService.destroy());
+  // ── ZEB-431: DM contact picker source ──────────────────────────────
+  // The picker lists Active friends (keyed by master ownerIdHex — the
+  // identifier class `add_space` members require), NOT zenoh presence
+  // profiles (which are keyed by device identity hash and only exist
+  // for peers whose broadcast traversed our mesh this session). The
+  // mode split is structural, not temporal (Cursor PR #225 R1): in
+  // Tauri the picker NEVER sees the presence/mock map — pre-hydration
+  // it's just empty — so a device-hash entry can never be selected
+  // even in the boot window before the first listFriends resolves.
+  // Browser/mock demo mode keeps the legacy navService.profiles map.
+  let dmContacts: Map<string, Profile> | null = $state(null);
+  const EMPTY_DM_CONTACTS: Map<string, Profile> = new Map();
+  let pickerContacts = $derived(
+    isTauri() ? (dmContacts ?? EMPTY_DM_CONTACTS) : navService.profiles
+  );
+  // Monotonic sequencing so overlapping refreshes (connect + friend-list-
+  // changed + dialog open can race) never let an older listFriends reply
+  // overwrite a newer committed map (Cursor PR #225 R2). The guard compares
+  // against the last COMMITTED sequence, not the last started one — a newer
+  // call that FAILS carries no data and must not invalidate an older
+  // in-flight success (Cursor R4: failures are inert).
+  let dmContactsRefreshSeq = 0;
+  let dmContactsCommittedSeq = 0;
+  async function refreshDmContacts(): Promise<void> {
+    const seq = ++dmContactsRefreshSeq;
+    try {
+      const friends = await friendService.listFriends();
+      if (seq <= dmContactsCommittedSeq) return; // a newer success already committed
+      dmContactsCommittedSeq = seq;
+      dmContacts = contactsFromFriends(friends);
+    } catch (e) {
+      // Expected pre-owner-load ("owner not loaded") and in mock mode
+      // (no adapter). Keep the last known-good map rather than wiping —
+      // the friend-list-changed listener and dialog-open refresh retry.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.debug('[harmony-client] refreshDmContacts skipped:', msg);
+    }
+  }
+  // Covers add/remove/accept from any device, incl. ZEB-419 nickname
+  // edits (those emit friend-list-changed too). Listener set is cleared
+  // by friendService.destroy() on unmount.
+  friendService.onFriendsChanged(() => void refreshDmContacts());
   // ZEB-419: a SECOND MemberCardService dedicated to the Friends panel. It must
   // NOT share the roster instance: subscribeVisible(ids) reconciles to EXACTLY
   // the passed set, so friends + roster would unsubscribe each other. The panel
@@ -1510,6 +1562,10 @@
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
       await tryConnect('community', communityService.connectAdapter(adapter));
       await tryConnect('friend', friendService.connectAdapter(adapter));
+      // ZEB-431: hydrate the DM contact picker from the friend graph.
+      // Fire-and-forget: pre-owner-load failure is recovered by the
+      // friend-list-changed listener and the dialog-open refresh.
+      void refreshDmContacts();
       await tryConnect('channelMessage', channelMessageService.connectAdapter(adapter));
       avatarResolver.connectAdapter(adapter);
       // ZEB-345 Task 10: wire the lazy profile-page resolver so panel opens can
@@ -1625,6 +1681,17 @@
             } catch {
               // owner still unavailable — leave selfOwnerId null for a later retry
             }
+          }
+          // ZEB-431 (Qodo R3): the connect-time refreshDmContacts fails in
+          // the same owner-loads-after-start_node window as get_owner_state
+          // above, leaving the picker source null (empty picker in Tauri
+          // mode, even for an already-open dialog). Retry once the session
+          // is confirmed up, gated on the never-hydrated state so routine
+          // reconnects don't re-IPC — after first hydration, friend-list-
+          // changed and dialog-open refreshes keep the map fresh. dmContacts
+          // is $state, so an open dialog converges live via pickerContacts.
+          if (dmContacts === null) {
+            void refreshDmContacts();
           }
           // ZEB-351: (re)attempt the voice-session build on reconnect — the
           // get_self_voice_identity IPC may not have been ready at boot. The
@@ -2600,8 +2667,8 @@
         onFolderSelect={handleNavigateFolder}
         filters={fileFilters}
         onFilterChange={(filters) => { fileFilters = filters; }}
-        onNewDm={() => { dmCreateInitialKind = 'dm'; dmCreateDialogOpen = true; }}
-        onNewGroupDm={() => { dmCreateInitialKind = 'group-dm'; dmCreateDialogOpen = true; }}
+        onNewDm={() => openDmCreate('dm')}
+        onNewGroupDm={() => openDmCreate('group-dm')}
         onNewCommunity={() => { showCreateCommunity = true; createError = null; }}
         onRedeemInvite={() => { showRedeemInvite = true; redeemError = null; redeemUrl = ''; }}
         onBrowseLibraries={() => { libraryDirectoryOpen = true; }}
@@ -2612,7 +2679,7 @@
         <button
           type="button"
           class="new-dm-button"
-          onclick={() => { dmCreateInitialKind = 'dm'; dmCreateDialogOpen = true; }}
+          onclick={() => openDmCreate('dm')}
           title="New direct message"
         >
           <span aria-hidden="true">+</span> New DM
@@ -3060,7 +3127,8 @@
       onclick={(e) => e.stopPropagation()}
     >
       <DmCreateDialog
-        profiles={navService.profiles}
+        profiles={pickerContacts}
+        friendSourced={isTauri()}
         initialKind={dmCreateInitialKind}
         onSubmit={handleDmCreate}
         onCancel={() => { dmCreateDialogOpen = false; }}

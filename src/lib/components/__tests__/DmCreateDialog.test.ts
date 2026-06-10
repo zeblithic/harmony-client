@@ -32,6 +32,29 @@ describe('DmCreateDialog', () => {
     expect(getByText(/0 of 15/i)).toBeInTheDocument();
   });
 
+  // ZEB-431: empty-state guidance must match the contacts source — the
+  // friend-graph copy ("add a friend") is wrong advice in browser demo
+  // mode, where the map is presence/mock-fed (Cursor PR #225 R4).
+  it('empty state points at friending when friend-sourced (default)', () => {
+    const { getByText } = render(DmCreateDialog, {
+      props: { profiles: new Map(), onSubmit: vi.fn(), onCancel: vi.fn() },
+    });
+    expect(getByText(/add a friend to start a DM/i)).toBeInTheDocument();
+  });
+
+  it('empty state uses presence copy when not friend-sourced (demo mode)', () => {
+    const { getByText, queryByText } = render(DmCreateDialog, {
+      props: {
+        profiles: new Map(),
+        friendSourced: false,
+        onSubmit: vi.fn(),
+        onCancel: vi.fn(),
+      },
+    });
+    expect(getByText(/demo peers come online/i)).toBeInTheDocument();
+    expect(queryByText(/add a friend/i)).not.toBeInTheDocument();
+  });
+
   it('calls onSubmit with kind=dm + 1 recipient when one selected', async () => {
     const onSubmit = vi.fn();
     const { getByText } = render(DmCreateDialog, {
