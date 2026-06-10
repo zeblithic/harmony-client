@@ -18459,10 +18459,15 @@ async fn create_community(
     // (notify_dirty) so the persist is retried, rather than left until graceful
     // shutdown. `None` only pre-start_node, where mint can't run.
     if let Some(engine) = sync_engine.as_ref() {
-        if let Err(e) = engine.flush_now().await {
-            tracing::warn!(error = %e, "create_community: owner-state flush_now failed");
-            engine.notify_dirty();
-        }
+        // Qodo (PR #226 R1): bounded — an unbounded flush_now await could
+        // hang the IPC forever on a wedged engine task.
+        fence_owner_state_flush(
+            engine,
+            OWNER_STATE_FENCE_TIMEOUT,
+            "create_community",
+            &community_id,
+        )
+        .await;
     }
 
     // ZEB-265: surface the new community to the nav listener. emit
@@ -20536,10 +20541,14 @@ async fn redeem_invite(
     // non-graceful exit can't lose this membership. Non-fatal; `None` only
     // pre-start_node.
     if let Some(engine) = sync_engine.as_ref() {
-        if let Err(e) = engine.flush_now().await {
-            tracing::warn!(error = %e, "redeem_invite: owner-state flush_now failed");
-            engine.notify_dirty();
-        }
+        // Qodo (PR #226 R1): bounded — see fence_owner_state_flush.
+        fence_owner_state_flush(
+            engine,
+            OWNER_STATE_FENCE_TIMEOUT,
+            "redeem_invite",
+            &dto.community_id,
+        )
+        .await;
     }
 
     // ZEB-265: surface the redeemed community to the nav listener.
@@ -20781,10 +20790,14 @@ async fn join_open_community(
     // non-graceful exit can't lose this membership. Non-fatal; `None` only
     // pre-start_node.
     if let Some(engine) = sync_engine.as_ref() {
-        if let Err(e) = engine.flush_now().await {
-            tracing::warn!(error = %e, "join_open_community: owner-state flush_now failed");
-            engine.notify_dirty();
-        }
+        // Qodo (PR #226 R1): bounded — see fence_owner_state_flush.
+        fence_owner_state_flush(
+            engine,
+            OWNER_STATE_FENCE_TIMEOUT,
+            "join_open_community",
+            &dto.community_id,
+        )
+        .await;
     }
 
     if let Err(e) = app.emit(
@@ -34495,6 +34508,123 @@ async fn connectivity_redeem_invite_iroh(
     .await
 }
 
+/// Upper bound on a durable-on-commit fence's `flush_now().await`.
+/// Qodo (PR #226 R1): `flush_now` waits on a oneshot reply from the
+/// engine's internal task; a stalled task (or backpressure in its
+/// publish/persist path) would otherwise hang the calling IPC forever.
+/// 5s is far above a healthy flush (file write + channel send, both
+/// sub-millisecond in practice) while still returning control to the
+/// UI promptly when the engine is wedged.
+pub(crate) const OWNER_STATE_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// ZEB-393 Bug A durable-on-commit fence, bounded (Qodo PR #226 R1).
+///
+/// Flush the owner-state SyncEngine so a just-committed Space mutation
+/// (community create / join / leave-adjacent write) reaches
+/// `owner_state_crdt.cbor` before the calling IPC returns. Non-fatal by
+/// design: on flush error OR timeout we log a warning and re-arm the
+/// debounce (`notify_dirty`) so the persist is retried, rather than
+/// failing an operation that has already committed in-memory.
+///
+/// `context` names the calling IPC in the warning; `community_id` is
+/// the hex space id for log correlation.
+pub(crate) async fn fence_owner_state_flush(
+    engine: &crate::owner_state_sync::SyncEngine,
+    timeout: std::time::Duration,
+    context: &'static str,
+    community_id: &str,
+) {
+    match tokio::time::timeout(timeout, engine.flush_now()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                community_id = %community_id,
+                "{context}: owner-state flush_now failed; re-arming debounce"
+            );
+            engine.notify_dirty();
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis() as u64,
+                community_id = %community_id,
+                "{context}: owner-state flush_now timed out; re-arming debounce"
+            );
+            engine.notify_dirty();
+        }
+    }
+}
+
+#[cfg(test)]
+mod zeb427_fence_tests {
+    use super::*;
+
+    /// Qodo (PR #226 R1): the fence must return within its bound even
+    /// when the engine's internal task is wedged. Rig the stall by
+    /// giving the engine a capacity-1 publisher channel whose receiver
+    /// is alive but never drained: the first flush fills the channel,
+    /// the second blocks inside the engine task on the publisher send,
+    /// so its oneshot reply never arrives and only the timeout can
+    /// return control.
+    #[tokio::test]
+    async fn fence_owner_state_flush_returns_on_stalled_engine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = crate::owner_state_sync::PersistPaths {
+            crdt: dir.path().join("owner_state_crdt.cbor"),
+            replay: dir.path().join("state_root_replay.cbor"),
+        };
+        let kt = std::sync::Arc::new(
+            crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"),
+        );
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let engine = crate::owner_state_sync::SyncEngine::new(
+            kt,
+            "fence-test-dev".into(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::owner_state_crdt::OwnerState::default(),
+            )),
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            600_000,
+        );
+
+        // First flush fills the capacity-1 publisher channel (rx alive,
+        // never drained), wedging the engine task on its next publish.
+        engine
+            .flush_now()
+            .await
+            .expect("first flush must succeed (channel has capacity)");
+
+        let started = std::time::Instant::now();
+        fence_owner_state_flush(
+            &engine,
+            std::time::Duration::from_millis(100),
+            "zeb427_fence_test",
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "bounded fence must return promptly on a stalled engine; took {:?}",
+            started.elapsed()
+        );
+        // The publisher channel is provably full (capacity 1, one prior
+        // flush, receiver never drained), so the only way back is the
+        // timeout branch — elapsed must reflect the bound actually firing.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(100),
+            "fence returned before its bound on a stalled engine ({:?}) — \
+             the stall rig is broken and this test is vacuous",
+            started.elapsed()
+        );
+        drop(pub_rx);
+    }
+}
+
 /// Inner orchestration body of `connectivity_redeem_invite_iroh`, split out
 /// so integration tests can drive it with explicit resources rather than
 /// the full Tauri AppState. ZEB-325 Phase 2c **option A**: direct iroh
@@ -35166,15 +35296,13 @@ where
             // what hid this hole on the iroh path.
             match sync_engine.as_ref() {
                 Some(engine) => {
-                    if let Err(e) = engine.flush_now().await {
-                        tracing::warn!(
-                            error = %e,
-                            community_id = %dto.community_id,
-                            "connectivity_redeem_invite_iroh: owner-state flush_now failed; \
-                             re-arming debounce"
-                        );
-                        engine.notify_dirty();
-                    }
+                    fence_owner_state_flush(
+                        engine,
+                        OWNER_STATE_FENCE_TIMEOUT,
+                        "connectivity_redeem_invite_iroh",
+                        &dto.community_id,
+                    )
+                    .await;
                 }
                 None => {
                     tracing::warn!(
