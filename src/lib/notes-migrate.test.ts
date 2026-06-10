@@ -97,6 +97,27 @@ describe('migrateLocalNotes (ZEB-417 one-time import)', () => {
     expect(localStorage.getItem('harmony-notes-migrated:owner-sup')).toBe('1');
   });
 
+  it('skips a plain-string "superseded" rejection (production Tauri shape)', async () => {
+    // Production Tauri IPC rejects with plain strings, not Error objects
+    // (tests above use Error for the vitest mock convenience). The
+    // superseded detection must handle both shapes. (PR #218 CodeRabbit
+    // follow-up, carried per the review thread.)
+    localStorage.setItem('harmony-notes:owner-sup-str', JSON.stringify([
+      { id: 'a', text: 'one', timestamp: 1 },
+      { id: 'b', text: 'gone', timestamp: 2 },
+      { id: 'c', text: 'three', timestamp: 3 },
+    ]));
+    const inv = vi.fn().mockImplementation((_cmd, args: { id?: string }) =>
+      args.id === 'b'
+        ? Promise.reject('note upsert was superseded (a newer edit or delete already won)')
+        : Promise.resolve({}),
+    );
+    await migrateLocalNotes('owner-sup-str', inv);
+    expect(inv).toHaveBeenCalledTimes(3); // all three attempted, none aborted
+    expect(inv).toHaveBeenCalledWith('notes_upsert', { id: 'c', text: 'three' });
+    expect(localStorage.getItem('harmony-notes-migrated:owner-sup-str')).toBe('1');
+  });
+
   it('re-throws a non-superseded error and leaves the flag unset (retry next launch)', async () => {
     localStorage.setItem('harmony-notes:owner-err', JSON.stringify([
       { id: 'a', text: 'one', timestamp: 1 },
