@@ -1510,7 +1510,47 @@ pub struct KeychainStore {
 
 impl KeychainStore {
     /// Create a store backed by the real OS keychain.
+    ///
+    /// ## ZEB-428 — the real keychain is a process-global resource that
+    /// tempdir-based test isolation cannot scope
+    ///
+    /// A `--workspace --all-targets --features test-fixtures` sweep once
+    /// silently overwrote a developer's real owner identity: a test
+    /// redirected `HOME` to a tempdir, but this constructor addresses the
+    /// OS keychain by fixed service/account names, so the test's mint
+    /// persisted into the developer's real credential store. The tempdir
+    /// evaporated; the foreign keychain entry stayed; the next boot failed
+    /// the enrollment gate and the identity was unrecoverable.
+    ///
+    /// Two gates close that class:
+    /// 1. `HARMONY_DISABLE_KEYCHAIN` (non-empty, not `"0"`) → `Err` in every
+    ///    build. An explicit operator kill-switch; beats all overrides.
+    /// 2. In test builds (`cfg(test)` or the `test-fixtures` feature — every
+    ///    integration-test compilation requires the latter) → `Err` unless
+    ///    `HARMONY_ALLOW_REAL_KEYCHAIN=1`. Production builds don't compile
+    ///    this branch, so the app's keychain behavior is unchanged.
+    ///
+    /// Every caller already tolerates `Err` (`.ok()` → encrypted-file
+    /// fallback, or propagation) — a gated test run behaves exactly like
+    /// Linux CI, where no keychain backend exists and the suite is green.
     pub fn new() -> Result<Self, String> {
+        if std::env::var("HARMONY_DISABLE_KEYCHAIN").is_ok_and(|v| !v.is_empty() && v != "0") {
+            return Err(
+                "OS keychain disabled via HARMONY_DISABLE_KEYCHAIN (ZEB-428)".to_string(),
+            );
+        }
+        #[cfg(any(test, feature = "test-fixtures"))]
+        {
+            if std::env::var("HARMONY_ALLOW_REAL_KEYCHAIN").as_deref() != Ok("1") {
+                return Err(
+                    "real OS keychain refused in test builds (ZEB-428): tempdir isolation \
+                     cannot scope the OS keychain, so tests must inject None or a mock; \
+                     set HARMONY_ALLOW_REAL_KEYCHAIN=1 only for a test that deliberately \
+                     exercises the real credential store"
+                        .to_string(),
+                );
+            }
+        }
         let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
             .map_err(|e| format!("keychain entry creation failed: {e}"))?;
         Ok(Self { entry })
@@ -2330,6 +2370,79 @@ mod tests {
         let path = dir.path().join("nonexistent.key");
         let store = FileStore::new(path);
         assert!(store.load().unwrap().is_none());
+    }
+
+    // ── ZEB-428: test builds must never open the real OS keychain ──────
+    // A full `--all-targets --features test-fixtures` sweep on Ildwyn's
+    // Windows machine silently overwrote the developer's real owner
+    // identity in CredMan (tests/mint_owner_lifecycle.rs persisted through
+    // `KeychainStore::new()` — the HOME-to-tempdir redirect does not scope
+    // the OS keychain). These tests pin the constructor-level gate that
+    // makes that class of clobber impossible by construction.
+
+    #[test]
+    #[serial]
+    fn keychain_new_is_disabled_in_test_builds() {
+        std::env::remove_var("HARMONY_ALLOW_REAL_KEYCHAIN");
+        std::env::remove_var("HARMONY_DISABLE_KEYCHAIN");
+        let err = match KeychainStore::new() {
+            Ok(_) => panic!(
+                "test builds (cfg(test) / test-fixtures) must refuse to open the real OS keychain"
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("ZEB-428"),
+            "gate error should reference the incident ticket for discoverability: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keychain_new_escape_hatch_overrides_test_gate() {
+        std::env::set_var("HARMONY_ALLOW_REAL_KEYCHAIN", "1");
+        std::env::remove_var("HARMONY_DISABLE_KEYCHAIN");
+        // With the explicit override the constructor must proceed to the
+        // real keyring entry. Entry CREATION succeeds without touching the
+        // credential itself (no read/write happens until load/save), so
+        // this is safe to run on a dev machine.
+        let result = KeychainStore::new();
+        std::env::remove_var("HARMONY_ALLOW_REAL_KEYCHAIN");
+        assert!(
+            result.is_ok(),
+            "HARMONY_ALLOW_REAL_KEYCHAIN=1 must re-enable the real keychain: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keychain_new_disable_env_wins_over_escape_hatch() {
+        std::env::set_var("HARMONY_DISABLE_KEYCHAIN", "1");
+        std::env::set_var("HARMONY_ALLOW_REAL_KEYCHAIN", "1");
+        let result = KeychainStore::new();
+        std::env::remove_var("HARMONY_DISABLE_KEYCHAIN");
+        std::env::remove_var("HARMONY_ALLOW_REAL_KEYCHAIN");
+        let err = match result {
+            Ok(_) => panic!("explicit disable must beat the allow override"),
+            Err(e) => e,
+        };
+        assert!(err.contains("HARMONY_DISABLE_KEYCHAIN"), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn keychain_new_disable_env_zero_or_empty_means_off() {
+        std::env::set_var("HARMONY_ALLOW_REAL_KEYCHAIN", "1");
+        for benign in ["0", ""] {
+            std::env::set_var("HARMONY_DISABLE_KEYCHAIN", benign);
+            assert!(
+                KeychainStore::new().is_ok(),
+                "HARMONY_DISABLE_KEYCHAIN={benign:?} must not disable the keychain"
+            );
+        }
+        std::env::remove_var("HARMONY_DISABLE_KEYCHAIN");
+        std::env::remove_var("HARMONY_ALLOW_REAL_KEYCHAIN");
     }
 
     #[test]
