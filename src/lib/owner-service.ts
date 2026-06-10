@@ -14,6 +14,8 @@ export interface DeviceView {
   trustDecision: TrustDecisionView;
   enrolledAt: number;
   fingerprint: string;
+  /** ZEB-418 P2 D17: true iff this device is the owner's pinned butler. */
+  butlerPinned: boolean;
 }
 
 export interface TrustDecisionView {

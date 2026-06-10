@@ -29,6 +29,12 @@ pub struct DeviceView {
     pub trust_decision: TrustDecisionView,
     pub enrolled_at: u64,
     pub fingerprint: String,
+    /// ZEB-418 P2 D17: true iff this device is the owner's pinned butler
+    /// (fleet-net-v1 `pinned` LWW field). False when fleet-net is cold or
+    /// the node is not running. Additive field — older consumers that don't
+    /// read this field are unaffected.
+    #[serde(default)]
+    pub butler_pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1185,6 +1191,7 @@ mod tests {
                 },
                 enrolled_at: 1_700_000_000,
                 fingerprint: "3e2f·7a91".into(),
+                butler_pinned: false,
             }],
             can_back_up: true,
         };

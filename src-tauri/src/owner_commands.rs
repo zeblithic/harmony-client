@@ -64,7 +64,17 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn build_owner_state_view(loaded: &LoadedOwnerState, this_device_name: String) -> OwnerStateView {
+/// Build an `OwnerStateView` from a loaded state.
+///
+/// `pinned_device_id_hex`: the 64-hex fleet-net `pinned` field (from the
+/// in-memory `FleetNetDoc`). When `Some`, the matching device row receives
+/// `butler_pinned: true`. Defaults to `false` when `None` (fleet-net cold
+/// or node not running).
+fn build_owner_state_view(
+    loaded: &LoadedOwnerState,
+    this_device_name: String,
+    pinned_device_id_hex: Option<String>,
+) -> OwnerStateView {
     let now = now_unix();
     let active_window = trust::DEFAULT_ACTIVE_WINDOW_SECS;
     let freshness = trust::DEFAULT_FRESHNESS_WINDOW_SECS;
@@ -82,6 +92,14 @@ fn build_owner_state_view(loaded: &LoadedOwnerState, this_device_name: String) -
                 trust::TrustDecision::Provisional => (TrustKind::Provisional, None),
                 trust::TrustDecision::Refused(r) => (TrustKind::Refused, Some(format!("{r:?}"))),
             };
+            // The fleet-net doc keys on hex of the 32-byte ed25519 verify key;
+            // enrollment certs carry the ed25519 verify key directly (first 32
+            // bytes of the classical bundle). Compare device_id hex forms.
+            let dev_id_hex = hex::encode(cert.device_pubkeys.classical.ed25519_verify);
+            let butler_pinned = pinned_device_id_hex
+                .as_deref()
+                .map(|p| p == dev_id_hex)
+                .unwrap_or(false);
             DeviceView {
                 device_id: hex::encode(cert.device_id),
                 display_name: if cert.device_id == this_device_id {
@@ -93,6 +111,7 @@ fn build_owner_state_view(loaded: &LoadedOwnerState, this_device_name: String) -
                 trust_decision: TrustDecisionView { kind, reason },
                 enrolled_at: cert.issued_at,
                 fingerprint: format_fingerprint(&cert.device_id),
+                butler_pinned,
             }
         })
         .collect();
@@ -134,7 +153,26 @@ pub(crate) fn resolve_identity_dir() -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-pub async fn get_owner_state(_app: tauri::AppHandle) -> Result<Option<OwnerStateView>, String> {
+pub async fn get_owner_state(
+    _app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<crate::NodeState>>,
+) -> Result<Option<OwnerStateView>, String> {
+    // ZEB-418 P2 D17: snapshot the fleet-net pinned device ID before entering
+    // the blocking task. Reads under the NodeState lock; the Arc clone is cheap
+    // and the tokio Mutex lock is async — we do it here (async context) and pass
+    // the resolved `Option<String>` into the blocking closure (no async in there).
+    let pinned_device_id_hex: Option<String> = {
+        let fleet_net_doc_arc = {
+            let g = state
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            g.fleet_net_doc.clone()
+        };
+        match fleet_net_doc_arc {
+            Some(arc) => arc.lock().await.pinned.clone(),
+            None => None,
+        }
+    };
     let identity_dir = resolve_identity_dir()?;
     let display_name = "this device".to_string();
     run_blocking(move || {
@@ -165,7 +203,11 @@ pub async fn get_owner_state(_app: tauri::AppHandle) -> Result<Option<OwnerState
             }
             loaded
         };
-        Ok(Some(build_owner_state_view(&loaded, display_name)))
+        Ok(Some(build_owner_state_view(
+            &loaded,
+            display_name,
+            pinned_device_id_hex,
+        )))
     })
     .await
 }
@@ -276,7 +318,9 @@ where
             master_seed: Some(master_seed),
         };
         Ok(MintIpcResult {
-            state: build_owner_state_view(&loaded, display_name),
+            // Mint happens before the node restarts — fleet-net is not yet
+            // running so `butler_pinned` is always false here (fresh identity).
+            state: build_owner_state_view(&loaded, display_name, None),
             recovery_token: token.to_string(),
         })
     })

@@ -3,6 +3,7 @@
   import { OwnerService, extractError, type OwnerStateView } from '../owner-service';
   import { loadProfile } from '../profile-service';
   import { loadDeviceLabel, saveDeviceLabel, resolveDefaultDeviceLabel } from '../device-label-service';
+  import { setButlerPin, extractButlerPinError } from '../butler-pin-service';
   import {
     MAX_RECOVERY_COMMENT_BYTES,
     MIN_RECOVERY_PASSPHRASE_LEN,
@@ -119,6 +120,29 @@
 
   function cancelRename() {
     renamingDeviceId = null;
+  }
+
+  // ZEB-418 P2 D17: butler pin toggle. Single-select: toggling ON pins the
+  // device; toggling the already-pinned device OFF clears the pin. Low-risk
+  // action (advisory ordering, always reversible) — no confirmation tier.
+  let butlerPinError = $state<string | null>(null);
+  let butlerPinInFlight = $state(false);
+
+  async function handleButlerPinToggle(device: { deviceId: string; butlerPinned: boolean }) {
+    if (butlerPinInFlight) return;
+    butlerPinError = null;
+    butlerPinInFlight = true;
+    try {
+      // If already pinned, toggle OFF (clear); otherwise pin this device.
+      const newPin = device.butlerPinned ? null : device.deviceId;
+      await setButlerPin(newPin);
+      // Re-fetch the device list so butler_pinned reflects the new state.
+      await svc.refresh();
+    } catch (e) {
+      butlerPinError = extractButlerPinError(e);
+    } finally {
+      butlerPinInFlight = false;
+    }
   }
 
   async function openBackup() {
@@ -386,9 +410,28 @@
                 <span class="separator">·</span>
                 <span class="fingerprint">{device.fingerprint}</span>
               </div>
+              <!-- ZEB-418 P2 D17: always-on butler toggle -->
+              <div class="butler-row">
+                <label class="butler-label">
+                  <input
+                    type="checkbox"
+                    class="butler-checkbox"
+                    checked={device.butlerPinned}
+                    disabled={butlerPinInFlight}
+                    onchange={() => handleButlerPinToggle(device)}
+                    aria-label={device.butlerPinned
+                      ? `Remove always-on butler from ${device.displayName}`
+                      : `Set ${device.displayName} as always-on butler`}
+                  />
+                  <span class="butler-label-text">Always-on butler</span>
+                </label>
+              </div>
             </div>
           </div>
         {/each}
+        {#if butlerPinError}
+          <p class="error" role="alert">{butlerPinError}</p>
+        {/if}
       </div>
 
       <!-- ③ Add-another-device footer -->
@@ -660,5 +703,28 @@
   }
   .rename-btn:hover {
     background: var(--bg-tertiary);
+  }
+  /* ZEB-418 P2 D17: butler pin toggle */
+  .butler-row {
+    margin-top: 6px;
+  }
+  .butler-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .butler-checkbox {
+    cursor: pointer;
+    accent-color: var(--accent);
+  }
+  .butler-checkbox:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+  .butler-label-text {
+    font-size: 12px;
+    color: var(--text-secondary);
   }
 </style>

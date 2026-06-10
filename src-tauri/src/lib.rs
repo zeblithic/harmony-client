@@ -911,8 +911,8 @@ pub struct NodeState {
     /// owner-level pinned butler, spec §5–§6). `Some` while the node is
     /// running and an owner identity is loaded; `None` before the
     /// FleetSyncEngine is wired at startup or after stop_node. Mirrors the
-    /// dm_inbox handle shapes (no device_id field — the fleet-net IPC
-    /// surface arrives with a later P2 task).
+    /// dm_inbox handle shapes. `fleet_net_snapshot` and `fleet_net_device_id`
+    /// are added here (P2 Task 8: set_butler_pin IPC needs them).
     pub fleet_net_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::fleet_net::FleetNetDoc>>>,
     pub fleet_net_tracker: Option<
         std::sync::Arc<
@@ -921,6 +921,18 @@ pub struct NodeState {
     >,
     pub fleet_net_sync:
         Option<std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::fleet_net::FleetNetDoc>>>,
+    /// ZEB-418 P2 Task 8: the same std::sync::RwLock snapshot that feeds the
+    /// pkarr blob-builder — also readable from `set_butler_pin` to push the
+    /// local pin write into the sync path without re-acquiring the tokio mutex.
+    pub fleet_net_snapshot:
+        Option<std::sync::Arc<std::sync::RwLock<crate::fleet_net::FleetNetDoc>>>,
+    /// ZEB-418 P2 Task 8: the 64-hex SP1 device id for this node — needed by
+    /// `set_butler_pin_inner` to stamp the new `pinned_at` HLC.
+    pub fleet_net_device_id: Option<String>,
+    /// ZEB-418 P2 Task 8: snapshot of enrolled device IDs (64-hex ed25519 vk)
+    /// for `set_butler_pin` validation. Same derivation as `dm_inbox_enrolled`
+    /// at start_node time.
+    pub fleet_net_enrolled: Option<std::collections::BTreeSet<String>>,
 
     /// ZEB-321 Phase 1 Task 8: iroh endpoint Arc. `Some` while node is
     /// running AND the keychain-resident secret key + bind both succeeded;
@@ -1258,6 +1270,9 @@ impl Default for NodeState {
             fleet_net_doc: None,
             fleet_net_tracker: None,
             fleet_net_sync: None,
+            fleet_net_snapshot: None,
+            fleet_net_device_id: None,
+            fleet_net_enrolled: None,
             // ZEB-321 Phase 1 Task 8: iroh handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
             iroh_endpoint: None,
@@ -1708,6 +1723,9 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         fleet_net_sync_for_shutdown = guard.fleet_net_sync.take();
         guard.fleet_net_doc = None;
         guard.fleet_net_tracker = None;
+        guard.fleet_net_snapshot = None;
+        guard.fleet_net_device_id = None;
+        guard.fleet_net_enrolled = None;
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -2806,6 +2824,12 @@ pub(crate) async fn start_node_inner(
         let mut fleet_net_sync_engine_opt: Option<
             std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::fleet_net::FleetNetDoc>>,
         > = None;
+        // ZEB-418 P2 Task 8: extra fleet-net handles for set_butler_pin IPC.
+        let mut fleet_net_snapshot_opt: Option<
+            std::sync::Arc<std::sync::RwLock<crate::fleet_net::FleetNetDoc>>,
+        > = None;
+        let mut fleet_net_device_id_opt: Option<String> = None;
+        let mut fleet_net_enrolled_opt: Option<std::collections::BTreeSet<String>> = None;
         let mut p2_sync_handles_opt: Option<crate::event_loop::P2SyncHandles> = None;
         // ZEB-418 P2 Task 7 (D16): the routing-record re-publish closure,
         // built in the pkarr block below (it captures the case publishers)
@@ -3910,6 +3934,17 @@ pub(crate) async fn start_node_inner(
                     fleet_net_doc_opt = Some(std::sync::Arc::clone(&fleet_net_doc));
                     fleet_net_tracker_opt = Some(std::sync::Arc::clone(&fleet_net_tracker));
                     fleet_net_sync_engine_opt = Some(std::sync::Arc::clone(&fleet_net_sync));
+                    // ZEB-418 P2 Task 8: wire the extra handles for set_butler_pin.
+                    fleet_net_snapshot_opt = Some(std::sync::Arc::clone(&fleet_net_snapshot));
+                    fleet_net_device_id_opt = Some(device_id.clone());
+                    fleet_net_enrolled_opt = Some(
+                        loaded
+                            .state
+                            .enrollments
+                            .values()
+                            .map(|cert| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
+                            .collect(),
+                    );
                     p2_sync_handles_opt = Some(crate::event_loop::P2SyncHandles {
                         outhold: crate::event_loop::DatasetSyncHandles {
                             addr_hex: owner_addr_hex.clone(),
@@ -6694,6 +6729,9 @@ pub(crate) async fn start_node_inner(
                         guard.fleet_net_doc = fleet_net_doc_opt.clone();
                         guard.fleet_net_tracker = fleet_net_tracker_opt.clone();
                         guard.fleet_net_sync = fleet_net_sync_engine_opt.clone();
+                        guard.fleet_net_snapshot = fleet_net_snapshot_opt.clone();
+                        guard.fleet_net_device_id = fleet_net_device_id_opt.clone();
+                        guard.fleet_net_enrolled = fleet_net_enrolled_opt.clone();
                         // ZEB-321 Phase 1 Task 8: stash iroh resources so
                         // Task 9 IPC handlers can reach them via NodeState.
                         // All three are `Option`-shaped because iroh boot
@@ -39055,6 +39093,110 @@ fn quit_app(app_handle: tauri::AppHandle) {
     app_handle.exit(0);
 }
 
+// ── ZEB-418 P2 D17: set_butler_pin ───────────────────────────────────────────
+
+/// Core of `set_butler_pin`, extracted for testability (mirrors many other
+/// `_inner` variants in this file).
+///
+/// - `device_id`: `Some(hex)` → pin that device; `None` → clear the pin.
+/// - `enrolled`: the enrolled device ID set (64-hex ed25519 verify keys), used
+///   to reject unknown IDs.  Derived from `OwnerState.enrollments` at
+///   `start_node` time — same recipe as `dm_inbox_enrolled`.
+/// - `now_ms`: wall clock in milliseconds (injectable for tests).
+///
+/// LWW correctness: the new `pinned_at` stamp is seeded from the CURRENT
+/// `doc.pinned_at` so it strictly exceeds any stamp this replica has
+/// observed — same `next_hlc`-style recipe as `dm_outbox.rs:next_hlc`.
+pub(crate) async fn set_butler_pin_inner(
+    doc: &tokio::sync::Mutex<crate::fleet_net::FleetNetDoc>,
+    enrolled: &std::collections::BTreeSet<String>,
+    device_id: Option<String>,
+    self_device_id: &str,
+    now_ms: u64,
+) -> Result<(), String> {
+    if let Some(ref id) = device_id {
+        if !enrolled.contains(id) {
+            return Err(format!(
+                "set_butler_pin: device '{id}' is not in the enrolled device set"
+            ));
+        }
+    }
+    let mut guard = doc.lock().await;
+    let new_stamp = crate::dm_outbox::next_hlc(Some(&guard.pinned_at), now_ms, self_device_id);
+    guard.pinned = device_id;
+    guard.pinned_at = new_stamp;
+    Ok(())
+}
+
+/// ZEB-418 P2 D17: IPC to set or clear the pinned butler device.
+///
+/// `device_id`: `Some(hex)` → pin; `null` (JS) / `None` (Rust) → clear.
+/// Validates that the supplied id is in the current enrolled set.  Writes
+/// through the fleet-net doc (LWW-correct stamp), updates the sync snapshot,
+/// notifies the engine, and flushes. Flush errors are log-warn only — the
+/// dirty latch retries.
+#[tauri::command]
+async fn set_butler_pin(
+    device_id: Option<String>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    // Snapshot the handles needed (fleet_net_doc, fleet_net_sync, enrolled
+    // set, device_id, snapshot arc) from the NodeState lock — drop the lock
+    // before the async doc lock acquisition.
+    let (fleet_net_doc_arc, fleet_net_sync_arc, fleet_net_snapshot_arc, enrolled, self_device_id) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let doc = g.fleet_net_doc.clone().ok_or_else(|| {
+            "set_butler_pin: fleet-net not running (node not started)".to_string()
+        })?;
+        let sync = g
+            .fleet_net_sync
+            .clone()
+            .ok_or_else(|| "set_butler_pin: fleet-net engine not running".to_string())?;
+        let snapshot = g
+            .fleet_net_snapshot
+            .clone()
+            .ok_or_else(|| "set_butler_pin: fleet-net snapshot not available".to_string())?;
+        let enrolled = g.fleet_net_enrolled.clone().unwrap_or_default();
+        let self_device_id = g.fleet_net_device_id.clone().unwrap_or_default();
+        (doc, sync, snapshot, enrolled, self_device_id)
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    set_butler_pin_inner(
+        &fleet_net_doc_arc,
+        &enrolled,
+        device_id,
+        &self_device_id,
+        now_ms,
+    )
+    .await?;
+
+    // Refresh the sync snapshot (same pattern as the Task-7 self-row upsert:
+    // clone under the doc lock so the RwLock write and the tokio Mutex lock
+    // don't nest). Local writes don't fire `on_applied`, so we do it here.
+    {
+        let cloned_doc = fleet_net_doc_arc.lock().await.clone();
+        *fleet_net_snapshot_arc
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = cloned_doc;
+    }
+
+    fleet_net_sync_arc.notify_dirty();
+    if let Err(e) = fleet_net_sync_arc.flush_now().await {
+        tracing::warn!(
+            error = %e,
+            "set_butler_pin: fleet-net flush failed; dirty latch will retry on next cycle"
+        );
+    }
+    Ok(())
+}
+
 pub fn run() {
     // ZEB-379: install the tracing subscriber before anything else so RUST_LOG
     // works in the desktop app and early-boot spans land in the log file.
@@ -39426,6 +39568,8 @@ pub fn run() {
             notes_commands::notes_list,
             notes_commands::notes_upsert,
             notes_commands::notes_delete,
+            // ZEB-418 P2 D17: pin-a-butler IPC.
+            set_butler_pin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -42895,6 +43039,9 @@ mod start_node_race_tests {
             fleet_net_doc: None,
             fleet_net_tracker: None,
             fleet_net_sync: None,
+            fleet_net_snapshot: None,
+            fleet_net_device_id: None,
+            fleet_net_enrolled: None,
             // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.
             iroh_endpoint: None,
             reachability_resolver: None,
@@ -45234,5 +45381,116 @@ mod start_node_response_wire_tests {
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["hasOwnerIdentity"], true);
+    }
+}
+
+// ── ZEB-418 P2 D17: set_butler_pin_inner unit tests ──────────────────────────
+
+#[cfg(test)]
+mod butler_pin_tests {
+    use super::set_butler_pin_inner;
+    use crate::fleet_net::FleetNetDoc;
+    use crate::owner_state_types::Hlc;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn hlc(wall_ms: u64, device_id: &str) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        }
+    }
+
+    fn enrolled_set(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `set_butler_pin_inner` must reject an unknown device ID and leave
+    /// the doc unchanged.
+    #[tokio::test]
+    async fn set_butler_pin_rejects_unknown_device() {
+        let known_id = "aa".repeat(32); // 64-hex
+        let unknown_id = "bb".repeat(32);
+        let enrolled = enrolled_set(&[&known_id]);
+
+        let mut initial_doc = FleetNetDoc::default();
+        initial_doc.pinned = Some(known_id.clone());
+        initial_doc.pinned_at = hlc(100, "self");
+
+        let doc = Arc::new(Mutex::new(initial_doc.clone()));
+
+        let result =
+            set_butler_pin_inner(&doc, &enrolled, Some(unknown_id.clone()), "self-dev", 200).await;
+
+        assert!(result.is_err(), "should reject unknown device id, got Ok");
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains(&unknown_id) || err_msg.contains("enrolled"),
+            "error should mention the unknown id or 'enrolled', got: {err_msg}"
+        );
+        // Doc must be unchanged.
+        let guard = doc.lock().await;
+        assert_eq!(
+            guard.pinned.as_deref(),
+            Some(known_id.as_str()),
+            "doc.pinned must not change on reject"
+        );
+        assert_eq!(
+            guard.pinned_at.wall_ms, 100,
+            "doc.pinned_at must not change"
+        );
+    }
+
+    /// Pin a device, re-pin to a different device, then clear — each step
+    /// must produce a strictly-newer stamp and the correct value.
+    #[tokio::test]
+    async fn set_butler_pin_roundtrip() {
+        let dev_a = "aa".repeat(32);
+        let dev_b = "bb".repeat(32);
+        let enrolled = enrolled_set(&[&dev_a, &dev_b]);
+        let doc = Arc::new(Mutex::new(FleetNetDoc::default()));
+
+        // ── Step 1: pin dev_a ────────────────────────────────────────────────
+        set_butler_pin_inner(&doc, &enrolled, Some(dev_a.clone()), "self-dev", 1000)
+            .await
+            .expect("pin dev_a should succeed");
+        {
+            let g = doc.lock().await;
+            assert_eq!(g.pinned.as_deref(), Some(dev_a.as_str()), "pinned = dev_a");
+            assert!(
+                g.pinned_at.wall_ms >= 1000,
+                "stamp >= now_ms after first pin"
+            );
+        }
+
+        // ── Step 2: re-pin to dev_b ──────────────────────────────────────────
+        let stamp_after_first = { doc.lock().await.pinned_at.clone() };
+        set_butler_pin_inner(&doc, &enrolled, Some(dev_b.clone()), "self-dev", 2000)
+            .await
+            .expect("re-pin dev_b should succeed");
+        {
+            let g = doc.lock().await;
+            assert_eq!(g.pinned.as_deref(), Some(dev_b.as_str()), "pinned = dev_b");
+            assert!(
+                g.pinned_at.is_strictly_newer_than(&stamp_after_first),
+                "stamp after re-pin must be strictly newer"
+            );
+        }
+
+        // ── Step 3: clear the pin ────────────────────────────────────────────
+        let stamp_after_repin = { doc.lock().await.pinned_at.clone() };
+        set_butler_pin_inner(&doc, &enrolled, None, "self-dev", 3000)
+            .await
+            .expect("clear pin should succeed");
+        {
+            let g = doc.lock().await;
+            assert!(g.pinned.is_none(), "pinned must be None after clear");
+            assert!(
+                g.pinned_at.is_strictly_newer_than(&stamp_after_repin),
+                "stamp after clear must be strictly newer"
+            );
+        }
     }
 }
