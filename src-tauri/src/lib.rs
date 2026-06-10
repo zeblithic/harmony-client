@@ -20225,6 +20225,13 @@ where
         // timed out (admin offline). For non-invite-only or
         // counter-signed-in-time paths, pending_join_at stays None.
         let mut space_to_commit = minted.space.clone();
+        // ZEB-427 Half B: rejoin-after-leave — the row was retained
+        // with `left_at` set, and this freshly-minted Space carries a
+        // new `created_at` that the same-SpaceId immutability invariant
+        // would reject. Adopt the existing row's pins so the commit
+        // lands and the LWW replace clears `left_at` (relisting the
+        // community in nav). No-op on first join.
+        adopt_existing_space_pins(&state_g, &mut space_to_commit);
         if pending_redemption_timed_out {
             space_to_commit.pending_join_at = Some(minted.space.created_at.clone());
         }
@@ -22250,12 +22257,14 @@ const LEAVE_SOLO_SENTINEL: &str = "no remaining members — solo leave, no rotat
 // ── ZEB-217 Sub-C Phase 3 Task 11: leave_community ───────────────────
 //
 // Mints a self-Leave SignedMembershipEvent and inserts it into the
-// per-community engine. Does NOT mutate owner-state Space (per spec
-// line 514): the Space row stays around with its existing fields so
-// the user can see "you've left this community" in the UI and choose
-// to remove it later via the existing `remove_space` IPC. The Leave
-// event in the CRDT is what peers see + what the materialized member
-// list reflects.
+// per-community engine. ZEB-427 Half B amended the original "never
+// mutate owner-state" stance: the Space row is still RETAINED (it
+// holds chat-history keys and enables reversible rejoin) but its
+// `left_at` is now set + fenced so the community doesn't resurrect in
+// the nav at reboot. NOTE: the `remove_space` IPC this comment once
+// called "existing" was never built — that permanent local cleanup is
+// ZEB-435. The Leave event in the CRDT is what peers see + what the
+// materialized member list reflects.
 //
 // Engine lifecycle: Phase 3 does NOT call registry.stop_engine on
 // leave. The Leave event must publish to peers and the engine's
@@ -23401,13 +23410,107 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
     }))
 }
 
+/// ZEB-427 Half B: durably mark a community Space as left in the
+/// owner-state CRDT. The row is RETAINED, not removed — the spec's
+/// `remove_space` (ZEB-435, unbuilt) is the separate irreversible
+/// cleanup. Setting `left_at` is what hides the community from nav
+/// rehydration (`communities_for_nav`), the boot engine sweep, and the
+/// profile-broadcast shared-set — all of which already filter on it;
+/// before this writer existed, a left community resurrected in the nav
+/// on every restart because nothing ever set the flag.
+///
+/// HLC: derives a write HLC strictly newer than the row's own
+/// `updated_at` (same idiom as the ZEB-254 R3 boot heal) rather than
+/// reusing the membership Leave event's HLC — the two CRDTs advance on
+/// separate HLC streams, and a fleet peer's clock-skewed row write
+/// could otherwise make this apply land as Rejected(StaleHlc).
+///
+/// Reversible by design (nav-tree spec "Tombstones vs leaves"): a
+/// later redemption Space (left_at: None, newer updated_at) clears the
+/// flag via LWW — pinned by `left_at_is_lww_reversible` and
+/// `rejoin_overwrite_clears_left_at_and_relists`.
+pub(crate) fn mark_community_space_left(
+    state: &mut crate::owner_state_crdt::OwnerState,
+    space_id: crate::owner_state_types::SpaceId,
+    wall_now_ms: u64,
+) -> Result<(), String> {
+    let space = state.spaces.get(&space_id).ok_or_else(|| {
+        format!(
+            "no Space {} in owner-state — cannot mark left",
+            hex::encode(space_id.0)
+        )
+    })?;
+    if space.kind != crate::owner_state_types::SpaceKind::Community {
+        return Err(format!(
+            "Space {} is not a community (kind {:?})",
+            hex::encode(space_id.0),
+            space.kind
+        ));
+    }
+    let new_hlc = if wall_now_ms > space.updated_at.wall_ms {
+        crate::owner_state_types::Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: space.updated_at.device_id.clone(),
+        }
+    } else {
+        crate::owner_state_types::Hlc {
+            wall_ms: space.updated_at.wall_ms,
+            logical: space.updated_at.logical.saturating_add(1),
+            device_id: space.updated_at.device_id.clone(),
+        }
+    };
+    let mut updated = space.clone();
+    updated.left_at = Some(new_hlc.clone());
+    updated.updated_at = new_hlc;
+    match state.apply_space_with_canonicalization(updated) {
+        crate::owner_state_crdt::ApplyOutcome::Inserted
+        | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => Ok(()),
+        crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => Err(format!(
+            "apply_space rejected left_at write for {}: {reason}",
+            hex::encode(space_id.0)
+        )),
+    }
+}
+
+/// ZEB-427 Half B companion: a redemption Space is minted with
+/// `created_at = join_hlc` (a fresh local HLC). When owner-state
+/// already holds a row for this community — the rejoin-after-leave
+/// path, where `leave_community` retains the row with `left_at` set —
+/// the same-SpaceId `created_at` immutability invariant (the
+/// anti-backdating creator-pin) would reject the commit outright,
+/// stranding the user Active in the membership CRDT but left-flagged
+/// and hidden in the nav. Adopt the existing row's pinned `created_at`
+/// (preserving, not changing, the pin), and re-derive `updated_at` to
+/// be strictly newer than the existing row's so the LWW replace —
+/// which is what clears `left_at` — can never be Rejected(StaleHlc).
+/// No-op when no row exists (the common first-join case).
+pub(crate) fn adopt_existing_space_pins(
+    state: &crate::owner_state_crdt::OwnerState,
+    space_to_commit: &mut crate::owner_state_types::Space,
+) {
+    if let Some(existing) = state.spaces.get(&space_to_commit.id) {
+        space_to_commit.created_at = existing.created_at.clone();
+        if space_to_commit.updated_at.wall_ms <= existing.updated_at.wall_ms {
+            space_to_commit.updated_at = crate::owner_state_types::Hlc {
+                wall_ms: existing.updated_at.wall_ms,
+                logical: existing.updated_at.logical.saturating_add(1),
+                device_id: space_to_commit.updated_at.device_id.clone(),
+            };
+        }
+    }
+}
+
 /// it to peers. Advances the local HLC tracker on success.
 ///
-/// Owner-state Space NOT mutated (per spec line 514): the Space row
-/// stays around so the UI can show "you've left this community" and
-/// the user can choose to call `remove_space` later. The membership
-/// CRDT is the source of truth for community membership; `Space.left_at`
-/// is only meaningful for DM Spaces (which have no membership CRDT).
+/// Owner-state Space mutation (ZEB-427 Half B): after the Leave
+/// commits to the membership CRDT, `mark_community_space_left` sets
+/// `Space.left_at` and the write is fenced to disk. The row is
+/// RETAINED (it holds chat-history keys and enables reversible
+/// rejoin); permanent local cleanup is the unbuilt `remove_space`
+/// (ZEB-435). Semantics per the nav-tree spec's "Tombstones vs
+/// leaves": leave sets `left_at` (reversible — a later redemption
+/// clears it via LWW), only an explicit tombstone is irreversible.
 ///
 /// Snapshot-then-spawn-equivalent fence: after minting but before
 /// engine ops we re-acquire the std `NodeState` lock and check
@@ -23436,7 +23539,16 @@ async fn leave_community(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        sync_engine,
+        snapshot_generation,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -23446,6 +23558,12 @@ async fn leave_community(
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            // ZEB-427 Half B: needed for the post-Leave left_at write.
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            // May be None pre-start_node; the fence below degrades to a
+            // loud warn rather than failing the leave (same policy as
+            // the redeem/create paths).
+            g.sync_engine.clone(),
             g.generation,
         )
     };
@@ -23670,6 +23788,46 @@ async fn leave_community(
         }
     }
 
+    // ZEB-427 Half B: the Leave has committed to the membership CRDT —
+    // now durably mark the owner-state Space row as left so the
+    // community doesn't resurrect in the nav at next boot
+    // (`communities_for_nav` and the boot engine sweep filter on
+    // `left_at`, but until now nothing ever set it for communities).
+    // Non-fatal on failure: the membership Leave above is the
+    // definitive event and has already committed; the worst case is
+    // the pre-existing ZEB-427 symptom (row resurrects at reboot), so
+    // warn loudly rather than mislead the caller into thinking the
+    // leave itself failed.
+    {
+        let mut state_g = crdt_state.lock().await;
+        if let Err(e) = mark_community_space_left(&mut state_g, space_id, wall_now_ms) {
+            tracing::warn!(
+                community_id = %hex::encode(space_id.0),
+                error = %e,
+                "leave_community: owner-state left_at write failed — community \
+                 will resurrect in nav at next boot (ZEB-427)"
+            );
+        }
+    }
+    match &sync_engine {
+        Some(engine) => {
+            fence_owner_state_flush(
+                engine,
+                OWNER_STATE_FENCE_TIMEOUT,
+                "leave_community",
+                &hex::encode(space_id.0),
+            )
+            .await;
+        }
+        None => {
+            tracing::warn!(
+                community_id = %hex::encode(space_id.0),
+                "leave_community: no SyncEngine handle — the left_at write is \
+                 NOT persisted until the next unrelated owner-state flush (ZEB-427)"
+            );
+        }
+    }
+
     // ZEB-265: notify the nav layer so the community node disappears
     // from the tree. emit failure is non-fatal — the leave already
     // committed, and worst case the node lingers until reload.
@@ -23756,6 +23914,251 @@ mod leave_community_inner_tests {
         // the engine's verify_event runs the same check on insert.
         crate::community_membership::verify_signature(&event, &identity_pub)
             .expect("self-leave signature must verify against leaver identity_pub");
+    }
+}
+
+#[cfg(test)]
+mod zeb427_leave_left_at_tests {
+    use super::*;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+    fn hlc_at(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn community_space(id: u8, updated_wall_ms: u64) -> Space {
+        Space {
+            id: SpaceId([id; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: format!("community-{id}"),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc_at(updated_wall_ms),
+            updated_at: hlc_at(updated_wall_ms),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([7u8; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([9u8; 16])),
+            is_invite_only: Some(false),
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    #[test]
+    fn marks_left_and_hides_from_nav() {
+        let mut st = OwnerState::default();
+        let s = community_space(1, 100);
+        st.spaces.insert(s.id, s);
+        assert_eq!(communities_for_nav(&st).len(), 1, "listed before leave");
+
+        mark_community_space_left(&mut st, SpaceId([1; 16]), 200).expect("mark left");
+
+        let row = st
+            .spaces
+            .get(&SpaceId([1; 16]))
+            .expect("row retained, not removed");
+        assert!(row.left_at.is_some(), "left_at must be set");
+        assert!(
+            communities_for_nav(&st).is_empty(),
+            "left community must be hidden from nav rehydration"
+        );
+    }
+
+    #[test]
+    fn missing_space_errs() {
+        let mut st = OwnerState::default();
+        let err =
+            mark_community_space_left(&mut st, SpaceId([1; 16]), 200).expect_err("no row → Err");
+        assert!(err.contains("no Space"), "got: {err}");
+    }
+
+    #[test]
+    fn non_community_space_errs() {
+        let mut st = OwnerState::default();
+        let mut s = community_space(2, 100);
+        s.kind = SpaceKind::Folder;
+        s.current_epoch = None;
+        s.current_epoch_key = None;
+        s.admin_addr = None;
+        s.is_invite_only = None;
+        st.spaces.insert(s.id, s);
+
+        let err =
+            mark_community_space_left(&mut st, SpaceId([2; 16]), 200).expect_err("folder → Err");
+        assert!(err.contains("not a community"), "got: {err}");
+        assert!(
+            st.spaces.get(&SpaceId([2; 16])).unwrap().left_at.is_none(),
+            "non-community row must be untouched"
+        );
+    }
+
+    #[test]
+    fn write_is_monotonic_when_row_clock_is_ahead() {
+        // A fleet peer with a skewed clock may have stamped updated_at
+        // ahead of our wall clock. The write must still land (logical
+        // bump per the lib.rs boot-heal idiom), never Rejected(StaleHlc).
+        let mut st = OwnerState::default();
+        let s = community_space(3, 5_000);
+        st.spaces.insert(s.id, s);
+
+        mark_community_space_left(&mut st, SpaceId([3; 16]), 1_000).expect("mark left");
+
+        let row = st.spaces.get(&SpaceId([3; 16])).unwrap();
+        assert!(row.left_at.is_some());
+        assert_eq!(row.updated_at.wall_ms, 5_000, "row wall clock held");
+        assert_eq!(row.updated_at.logical, 1, "logical bumped past row HLC");
+    }
+
+    #[test]
+    fn rejoin_overwrite_clears_left_at_and_relists() {
+        // Mirrors the redeem path: a fresh redemption Space (left_at:
+        // None, newer updated_at) lands via
+        // apply_space_with_canonicalization (lib.rs redeem commit) — LWW
+        // must clear left_at so the community relists. Spec
+        // (2026-04-30-zeb-206-nav-tree-design.md): re-invitation clears
+        // left_at; leave is reversible, only remove_space tombstones.
+        let mut st = OwnerState::default();
+        let s = community_space(4, 100);
+        st.spaces.insert(s.id, s);
+        mark_community_space_left(&mut st, SpaceId([4; 16]), 200).expect("mark left");
+        assert!(communities_for_nav(&st).is_empty());
+
+        // Model the real redeem commit: a freshly-minted redemption
+        // Space carries created_at = join_hlc (NOT the original row's
+        // pin), and the commit path adopts the existing row's pins
+        // before applying — without the adopt, the same-SpaceId
+        // created_at immutability invariant rejects the commit.
+        let mut rejoined = community_space(4, 10_000);
+        adopt_existing_space_pins(&st, &mut rejoined);
+        assert_eq!(
+            rejoined.created_at.wall_ms, 100,
+            "adopt must preserve the original created_at pin"
+        );
+        let outcome = st.apply_space_with_canonicalization(rejoined);
+        assert!(
+            matches!(
+                outcome,
+                crate::owner_state_crdt::ApplyOutcome::Inserted
+                    | crate::owner_state_crdt::ApplyOutcome::Merged { .. }
+            ),
+            "rejoin apply must land, got {outcome:?}"
+        );
+        assert!(
+            st.spaces.get(&SpaceId([4; 16])).unwrap().left_at.is_none(),
+            "rejoin must clear left_at"
+        );
+        assert_eq!(communities_for_nav(&st).len(), 1, "relisted after rejoin");
+    }
+
+    #[test]
+    fn rejoin_lands_even_when_existing_row_clock_is_ahead() {
+        // A skewed fleet write left the row's updated_at ahead of this
+        // device's clock; the adopted commit must still be strictly
+        // newer (logical bump) or the LWW replace would StaleHlc-reject
+        // and the community would stay hidden after a successful
+        // membership rejoin.
+        let mut st = OwnerState::default();
+        let s = community_space(5, 50_000);
+        st.spaces.insert(s.id, s);
+        mark_community_space_left(&mut st, SpaceId([5; 16]), 50_001).expect("mark left");
+        assert!(communities_for_nav(&st).is_empty());
+
+        let mut rejoined = community_space(5, 200); // local clock far behind
+        adopt_existing_space_pins(&st, &mut rejoined);
+        let outcome = st.apply_space_with_canonicalization(rejoined);
+        assert!(
+            matches!(
+                outcome,
+                crate::owner_state_crdt::ApplyOutcome::Inserted
+                    | crate::owner_state_crdt::ApplyOutcome::Merged { .. }
+            ),
+            "skew-adopted rejoin must land, got {outcome:?}"
+        );
+        let row = st.spaces.get(&SpaceId([5; 16])).unwrap();
+        assert!(row.left_at.is_none(), "left_at cleared despite clock skew");
+        assert_eq!(communities_for_nav(&st).len(), 1, "relisted after rejoin");
+    }
+
+    /// End-to-end durability half: mark left → fence through a real
+    /// SyncEngine → decode the CBOR back off disk. The 10-minute
+    /// debounce guarantees only the fence can have written, so a
+    /// persisted `left_at` proves the leave_community wiring's write +
+    /// fence pair is sufficient for the row to survive a cold boot.
+    #[tokio::test]
+    async fn marked_left_survives_fenced_flush_to_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crdt_path = dir.path().join("owner_state_crdt.cbor");
+        let paths = crate::owner_state_sync::PersistPaths {
+            crdt: crdt_path.clone(),
+            replay: dir.path().join("state_root_replay.cbor"),
+        };
+        let kt = std::sync::Arc::new(
+            crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"),
+        );
+        // Healthy rig (unlike the stall test): roomy channel, receiver
+        // alive — flushes must succeed.
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+        {
+            let mut g = state.lock().await;
+            let s = community_space(7, 100);
+            g.spaces.insert(s.id, s);
+        }
+
+        let engine = crate::owner_state_sync::SyncEngine::new(
+            kt,
+            "left-at-test-dev".into(),
+            std::sync::Arc::clone(&state),
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            600_000,
+        );
+
+        {
+            let mut g = state.lock().await;
+            mark_community_space_left(&mut g, SpaceId([7; 16]), 200).expect("mark left");
+        }
+        fence_owner_state_flush(
+            &engine,
+            OWNER_STATE_FENCE_TIMEOUT,
+            "zeb427_left_at_durability_test",
+            "07070707070707070707070707070707",
+        )
+        .await;
+
+        assert!(crdt_path.exists(), "fence must have written the crdt file");
+        let loaded =
+            crate::owner_state_persist::load_crdt(&crdt_path).expect("crdt file must decode");
+        let row = loaded
+            .spaces
+            .get(&SpaceId([7; 16]))
+            .expect("row persisted to disk");
+        assert!(
+            row.left_at.is_some(),
+            "left_at survived the disk round-trip"
+        );
+        assert!(
+            communities_for_nav(&loaded).is_empty(),
+            "rehydrated state must hide the left community"
+        );
     }
 }
 
