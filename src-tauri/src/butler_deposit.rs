@@ -67,6 +67,14 @@ pub const INBOX_PER_SENDER_CAP: usize = 64;
 /// [`INBOX_PER_SENDER_CAP`].
 pub const INBOX_GLOBAL_CAP: usize = 1024;
 
+/// GC TTL for un-ingested dm-inbox deposits (spec §5): an entry is removed
+/// once `deposited_at.wall_ms + INBOX_TTL_MS < now`, regardless of how many
+/// enrolled devices have ingested it. 30 days, deliberately equal to
+/// `dm_outbox::EXPIRATION_MS` (ZEB-227 alignment): once the sender's own
+/// outbox has given up retrying, a parked deposit no longer has a delivery
+/// path worth pinning fleet storage for.
+pub const INBOX_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+
 /// The sender → butler deposit request body (canonical CBOR, sent inside a
 /// length-prefixed frame). Spec §4: the butler verifies the enrollment cert
 /// chain, the `sig`, and admission (friend graph + quota) BEFORE any

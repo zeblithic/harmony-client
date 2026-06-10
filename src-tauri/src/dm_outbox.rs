@@ -1358,81 +1358,25 @@ impl DmOutbox {
         let (_space_a, resolved_owner) = {
             let outbox_g = outbox_arc.lock().await;
             let mut state_g = state_arc.lock().await;
-            let identity_pub = match lookup_pubkey_for_device(
-                &state_g.owner_device_cache,
-                signed.signing_device_hash,
-            ) {
-                Some(pub_) => pub_,
-                None => {
-                    tracing::warn!(
-                        error = ?DmReceiveError::UnknownSigningKey,
-                        "handle_cidnotify_lifted Phase A: dropping packet"
-                    );
-                    return;
-                }
-            };
-            if let Err(e) = crate::dm_signing::verify_dm_packet_signature(
-                &signed_bytes,
+            // Admission checks extracted verbatim into
+            // `verify_cidnotify_admission` (ZEB-418 P1 Task 6) so butler
+            // dm-inbox ingestion runs deposited packets through EXACTLY
+            // this verification (pubkey lookup, signature, owner
+            // resolution + match, Space lookup, ZEB-275 SpaceKind gate,
+            // membership). Every reject logs the same Phase A drop line
+            // the original inline blocks logged.
+            let (space, resolved_owner, identity_pub) = match verify_cidnotify_admission(
+                &state_g,
+                &signed,
                 &signature,
-                &identity_pub,
-                signed.signing_device_hash,
+                &signed_bytes,
             ) {
-                tracing::warn!(error = ?e, "handle_cidnotify_lifted Phase A: dropping packet");
-                return;
-            }
-            let resolved_owner = match resolve_signed_origin_owner(
-                &state_g.owner_device_cache,
-                signed.signing_device_hash,
-            ) {
-                Ok(addr) => addr,
+                Ok(admitted) => admitted,
                 Err(e) => {
                     tracing::warn!(error = ?e, "handle_cidnotify_lifted Phase A: dropping packet");
                     return;
                 }
             };
-            if signed.sender_owner_addr != resolved_owner {
-                tracing::warn!(
-                    error = ?DmReceiveError::OwnerFieldMismatch,
-                    "handle_cidnotify_lifted Phase A: dropping packet"
-                );
-                return;
-            }
-            let space = match state_g.spaces.get(&signed.space_id) {
-                Some(s) => s.clone(),
-                None => {
-                    tracing::warn!(
-                        error = ?DmReceiveError::SpaceNotFound,
-                        "handle_cidnotify_lifted Phase A: dropping packet"
-                    );
-                    return;
-                }
-            };
-            // ZEB-275: gate on SpaceKind before any decrypt-path work.
-            // Defends against forged CidNotifys targeting Channel /
-            // PublicChannel spaces (which can also have members for
-            // read-access controls). `validate_invariants` guarantees
-            // content_key.is_some() only for Dm/GroupDm — without this
-            // gate, the handler proceeds into Phase B's 500ms CAS fetch
-            // and Phase C, which then log-drops on content_key=None at
-            // line ~1308 with a generic "invariant violation" warning.
-            // The gate fires earlier (cheap path), avoids wasted CAS
-            // bandwidth, and emits the precise SpaceKindMismatch
-            // telemetry. Also defense-in-depth against a future code
-            // change that might reintroduce a panic in the decrypt path.
-            if !matches!(space.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
-                tracing::warn!(
-                    error = ?DmReceiveError::SpaceKindMismatch,
-                    "handle_cidnotify_lifted Phase A: dropping packet"
-                );
-                return;
-            }
-            if !space.members.contains(&resolved_owner) {
-                tracing::warn!(
-                    error = ?DmReceiveError::SenderNotInSpaceMembers,
-                    "handle_cidnotify_lifted Phase A: dropping packet"
-                );
-                return;
-            }
             // Refresh OwnerDeviceCache (Step 8 from the now-deleted
             // handle_cidnotify). MUST happen before lock-drop so the
             // refresh persists even if Phase B's CAS fetch times out
@@ -1514,72 +1458,22 @@ impl DmOutbox {
                 return;
             }
 
-            // Decrypt with current Space + prior_content_keys fallback —
-            // handles content_key rotation between Phase A and Phase C.
-            let aad = match crate::dm_crypto::compute_aad(&space_c) {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::warn!(
-                        error = ?DmReceiveError::AadCompute(e.to_string()),
-                        "handle_cidnotify_lifted Phase C: dropping packet"
-                    );
-                    return;
-                }
-            };
-            // Decrypt with prior-keys fallback. `space_c.content_key`
-            // is non-None for any DM/group-DM Space that passed
-            // `validate_invariants` — the invariant check in
-            // `apply_space_with_canonicalization` (which wrote this
-            // Space into state) rejects DM/group-DM Spaces with
-            // content_key=None. The TOCTOU re-check above re-fetched
-            // `space_c` from the latest state, so any rotation that
-            // landed during Phase B is reflected here; the prior_keys
-            // fallback decrypts blobs that were encrypted with a key
-            // listed in `space_c.prior_content_keys`.
-            //
-            // Defense-in-depth: log + drop instead of expect()/panic.
-            // In the spawned-task path, panic dies silently (no caller
-            // to surface); converting to a graceful drop keeps the
-            // method panic-free as documented and matches the rest of
-            // Phase C's error handling. Reachable only via corrupted
-            // state, migration bug, or direct test insertion that
-            // bypasses validate_invariants — in production this should
-            // never fire, but the failure mode is now observable.
-            let content_key = match space_c.content_key.as_ref() {
-                Some(k) => k,
-                None => {
-                    tracing::warn!(
-                        "handle_cidnotify_lifted Phase C: dropping packet \
-                         (DM Space lacks content_key — invariant violation, \
-                         possibly corrupted state)"
-                    );
-                    return;
-                }
-            };
-            let payload = match crate::dm_crypto::decrypt_dm_message(
-                content_key,
-                &space_c.prior_content_keys,
-                &aad,
-                &blob,
-            ) {
+            // Decrypt + sender binding extracted verbatim into
+            // `decrypt_and_bind_dm_blob` (ZEB-418 P1 Task 6, shared with
+            // butler dm-inbox ingestion): AAD compute, content_key
+            // presence (invariant violation → MissingContentKey, a
+            // graceful drop instead of a silent spawned-task panic),
+            // prior-keys-fallback decryption — the TOCTOU re-check above
+            // re-fetched `space_c` from the latest state, so a rotation
+            // that landed during Phase B is reflected here — and the
+            // payload-sender impersonation check.
+            let payload = match decrypt_and_bind_dm_blob(&space_c, &blob, resolved_owner) {
                 Ok(p) => p,
-                Err(_) => {
-                    tracing::warn!(
-                        error = ?DmReceiveError::DecryptFailed,
-                        "handle_cidnotify_lifted Phase C: dropping packet"
-                    );
+                Err(e) => {
+                    tracing::warn!(error = ?e, "handle_cidnotify_lifted Phase C: dropping packet");
                     return;
                 }
             };
-
-            // Sender-binding check.
-            if crate::dm_crypto::verify_sender_binding(&payload, resolved_owner).is_err() {
-                tracing::warn!(
-                    error = ?DmReceiveError::SenderImpersonation,
-                    "handle_cidnotify_lifted Phase C: dropping packet"
-                );
-                return;
-            }
 
             // NOTE: OwnerDeviceCache refresh (Step 8 in the now-deleted
             // handle_cidnotify) was moved up to Phase A, so it runs
@@ -1673,19 +1567,11 @@ impl DmOutbox {
         }; // locks dropped here
 
         // IPC emit — locks released, safe to fire dm-received events.
+        // Event name + payload builder shared with butler dm-inbox
+        // ingestion (ZEB-418 P1 Task 6) so the frontend cannot observe
+        // which path delivered a message.
         for rm in drain_outcome.newly_received {
-            let _ = app.emit(
-                "dm-received",
-                serde_json::json!({
-                    "spaceId": hex::encode(rm.inbox_entry.space_id.0),
-                    "messageCid": hex::encode(rm.inbox_entry.message_cid.to_bytes()),
-                    "from": hex::encode(rm.inbox_entry.from.0),
-                    "receivedAt": rm.inbox_entry.received_at.wall_ms,
-                    "sentAt": rm.sent_at.wall_ms,
-                    "body": hex::encode(&rm.body),
-                    "mimeType": rm.mime_type,
-                }),
-            );
+            let _ = app.emit(DM_RECEIVED_EVENT, dm_received_event_payload(&rm));
         }
     }
 
@@ -2093,6 +1979,14 @@ pub enum DmReceiveError {
     CasFetchFailed(String),
     #[error("DM blob decryption failed under all candidate keys")]
     DecryptFailed,
+    /// `space.content_key` is None for a Dm/GroupDm Space — invariant
+    /// violation (`validate_invariants` forbids writing such a Space),
+    /// possibly corrupted state. Previously logged inline by
+    /// `handle_cidnotify_lifted` Phase C with this same wording; promoted
+    /// to a variant when the decrypt block was extracted into
+    /// `decrypt_and_bind_dm_blob` (ZEB-418 P1 Task 6).
+    #[error("DM Space lacks content_key — invariant violation, possibly corrupted state")]
+    MissingContentKey,
     #[error("payload sender does not match resolved owner (impersonation)")]
     SenderImpersonation,
     #[error("packet decode failed: {0}")]
@@ -2229,6 +2123,133 @@ pub(crate) fn lookup_pubkey_for_device(
         }
     }
     None
+}
+
+/// Phase A admission checks for an inbound DmCidNotify, extracted verbatim
+/// from `handle_cidnotify_lifted` (ZEB-418 P1 Task 6) so the butler
+/// dm-inbox ingestion path (`dm_inbox_ingest`) runs deposited packets
+/// through EXACTLY the normal receive-path verification instead of a
+/// parallel re-implementation.
+///
+/// Checks, in the original inline order:
+///   1. signing-device pubkey lookup (`UnknownSigningKey` when absent);
+///   2. packet signature verification (includes the key-substitution
+///      defense inside `verify_dm_packet_signature`);
+///   3. signing device → owner resolution (`UnknownSigningDevice` /
+///      `AmbiguousSigningDevice`);
+///   4. `signed.sender_owner_addr` must equal the resolved owner
+///      (`OwnerFieldMismatch`, cache-poisoning defense);
+///   5. Space lookup by `signed.space_id` (`SpaceNotFound`);
+///   6. SpaceKind gate: `Dm | GroupDm` only (`SpaceKindMismatch`) —
+///      ZEB-275: gate BEFORE any decrypt-path work. Defends against
+///      forged CidNotifys targeting Channel / PublicChannel spaces (which
+///      can also have members for read-access controls).
+///      `validate_invariants` guarantees `content_key.is_some()` only for
+///      Dm/GroupDm — without this gate, the handler proceeds into Phase
+///      B's 500ms CAS fetch and Phase C, which then log-drops on
+///      `content_key=None` with a generic "invariant violation" warning.
+///      The gate fires earlier (cheap path), avoids wasted CAS bandwidth,
+///      and emits the precise `SpaceKindMismatch` telemetry. Also
+///      defense-in-depth against a future code change that might
+///      reintroduce a panic in the decrypt path;
+///   7. sender membership in `space.members` (`SenderNotInSpaceMembers`).
+///
+/// Returns the cloned Space, the resolved owner, and the signer's cached
+/// 64-byte identity pub (the normal path feeds it to
+/// `apply_owner_device_update`).
+pub(crate) fn verify_cidnotify_admission(
+    state: &OwnerState,
+    signed: &crate::dm_envelope::DmCidNotifySigned,
+    signature: &[u8; 64],
+    signed_bytes: &[u8],
+) -> Result<(crate::owner_state_types::Space, OwnerAddr, [u8; 64]), DmReceiveError> {
+    let identity_pub =
+        lookup_pubkey_for_device(&state.owner_device_cache, signed.signing_device_hash)
+            .ok_or(DmReceiveError::UnknownSigningKey)?;
+    crate::dm_signing::verify_dm_packet_signature(
+        signed_bytes,
+        signature,
+        &identity_pub,
+        signed.signing_device_hash,
+    )?;
+    let resolved_owner =
+        resolve_signed_origin_owner(&state.owner_device_cache, signed.signing_device_hash)?;
+    if signed.sender_owner_addr != resolved_owner {
+        return Err(DmReceiveError::OwnerFieldMismatch);
+    }
+    let space = state
+        .spaces
+        .get(&signed.space_id)
+        .cloned()
+        .ok_or(DmReceiveError::SpaceNotFound)?;
+    if !matches!(space.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+        return Err(DmReceiveError::SpaceKindMismatch);
+    }
+    if !space.members.contains(&resolved_owner) {
+        return Err(DmReceiveError::SenderNotInSpaceMembers);
+    }
+    Ok((space, resolved_owner, identity_pub))
+}
+
+/// Phase C decrypt + sender binding for an inbound DM storage blob,
+/// extracted verbatim from `handle_cidnotify_lifted` (ZEB-418 P1 Task 6)
+/// and shared with the butler dm-inbox ingestion path.
+///
+/// * AAD is bound to the Space's `dedupe_key` (stable across cross-SpaceId
+///   dedupe collapses).
+/// * `space.content_key` is non-None for any DM/group-DM Space that passed
+///   `validate_invariants` — the invariant check in
+///   `apply_space_with_canonicalization` (which wrote the Space into
+///   state) rejects DM/group-DM Spaces with `content_key=None`. Reachable
+///   only via corrupted state, a migration bug, or direct test insertion
+///   that bypasses `validate_invariants`; the failure mode is a graceful
+///   `MissingContentKey` reject (never a panic — in the spawned-task path
+///   a panic would die silently).
+/// * Decryption tries the current `content_key` then each
+///   `prior_content_keys` entry in stored order, so a rotation landing
+///   between Phase A and Phase C (or between deposit and ingestion) still
+///   decrypts.
+/// * The decrypted payload's `sender` must equal `resolved_owner`
+///   (`SenderImpersonation` defense).
+pub(crate) fn decrypt_and_bind_dm_blob(
+    space: &crate::owner_state_types::Space,
+    blob: &[u8],
+    resolved_owner: OwnerAddr,
+) -> Result<MessagePayload, DmReceiveError> {
+    let aad = compute_aad(space).map_err(|e| DmReceiveError::AadCompute(e.to_string()))?;
+    let content_key = space
+        .content_key
+        .as_ref()
+        .ok_or(DmReceiveError::MissingContentKey)?;
+    let payload =
+        crate::dm_crypto::decrypt_dm_message(content_key, &space.prior_content_keys, &aad, blob)
+            .map_err(|_| DmReceiveError::DecryptFailed)?;
+    crate::dm_crypto::verify_sender_binding(&payload, resolved_owner)
+        .map_err(|_| DmReceiveError::SenderImpersonation)?;
+    Ok(payload)
+}
+
+/// The `dm-received` UI event name, shared by the normal receive path and
+/// butler dm-inbox ingestion (ZEB-418 P1 Task 6) so both deliver through
+/// one event the frontend already listens for.
+pub(crate) const DM_RECEIVED_EVENT: &str = "dm-received";
+
+/// Builds the `dm-received` event payload — the single source of truth for
+/// its shape, shared by `handle_cidnotify_lifted` and butler dm-inbox
+/// ingestion so the frontend cannot observe which path delivered a
+/// message.
+pub(crate) fn dm_received_event_payload(
+    rm: &crate::owner_state_types::ReceivedMessage,
+) -> serde_json::Value {
+    serde_json::json!({
+        "spaceId": hex::encode(rm.inbox_entry.space_id.0),
+        "messageCid": hex::encode(rm.inbox_entry.message_cid.to_bytes()),
+        "from": hex::encode(rm.inbox_entry.from.0),
+        "receivedAt": rm.inbox_entry.received_at.wall_ms,
+        "sentAt": rm.sent_at.wall_ms,
+        "body": hex::encode(&rm.body),
+        "mimeType": rm.mime_type,
+    })
 }
 
 #[cfg(test)]
