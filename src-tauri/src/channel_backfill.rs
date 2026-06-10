@@ -214,16 +214,11 @@ impl BackfillLatch {
 
     /// Escalate the retry backoff and arm `next_retry_at`. Shared by
     /// [`Self::on_no_reply`] and the no-progress full-page branch of
-    /// [`Self::on_page_complete`]. First retry waits `retry_base_ms`
-    /// clamped to `retry_cap_ms` (a misconfigured base > cap must not
-    /// violate the cap on the first retry), then doubles per
-    /// consecutive miss up to the cap.
+    /// [`Self::on_page_complete`]. Delegates the step computation to
+    /// [`arm_backoff_step`].
     fn arm_backoff(&mut self, now_ms: u64) {
-        self.retry_delay_ms = if self.retry_delay_ms == 0 {
-            self.retry_base_ms.min(self.retry_cap_ms)
-        } else {
-            (self.retry_delay_ms * 2).min(self.retry_cap_ms)
-        };
+        self.retry_delay_ms =
+            arm_backoff_step(self.retry_delay_ms, self.retry_base_ms, self.retry_cap_ms);
         self.next_retry_at = now_ms + self.retry_delay_ms;
     }
 
@@ -349,6 +344,20 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     }
 }
 
+// ── Shared backoff helper ────────────────────────────────────────────────────
+
+/// One escalation step of the shared retry-backoff schedule: first
+/// retry waits `base` clamped to `cap` (a misconfigured base > cap
+/// must not violate the cap), then doubles per consecutive miss up to
+/// the cap. Shared by [`BackfillLatch`] and [`RootFetchLatch`].
+fn arm_backoff_step(current_delay_ms: u64, base_ms: u64, cap_ms: u64) -> u64 {
+    if current_delay_ms == 0 {
+        base_ms.min(cap_ms)
+    } else {
+        (current_delay_ms * 2).min(cap_ms)
+    }
+}
+
 // ── ZEB-434: community state-root fetch latch ────────────────────────────────
 
 /// Cooldown between transport-epoch-triggered re-arm queries (60 s).
@@ -395,10 +404,13 @@ pub struct RootFetchLatch {
 }
 
 impl RootFetchLatch {
+    /// New, unsatisfied latch with the production (spec D3) backoff schedule.
     pub fn new() -> Self {
         Self::new_with_backoff(BACKFILL_RETRY_BASE_MS, BACKFILL_RETRY_CAP_MS)
     }
 
+    /// New latch with an explicit backoff schedule (test-injectable; mirrors
+    /// [`BackfillLatch::new_with_backoff`]).
     pub fn new_with_backoff(base_ms: u64, cap_ms: u64) -> Self {
         Self {
             satisfied: false,
@@ -410,6 +422,7 @@ impl RootFetchLatch {
         }
     }
 
+    /// True once at least one responder has replied.
     pub fn is_satisfied(&self) -> bool {
         self.satisfied
     }
@@ -441,11 +454,8 @@ impl RootFetchLatch {
     /// clamp semantics as `BackfillLatch::arm_backoff`).
     pub fn on_no_reply(&mut self, now_ms: u64) {
         self.in_flight = false;
-        self.retry_delay_ms = if self.retry_delay_ms == 0 {
-            self.retry_base_ms.min(self.retry_cap_ms)
-        } else {
-            (self.retry_delay_ms * 2).min(self.retry_cap_ms)
-        };
+        self.retry_delay_ms =
+            arm_backoff_step(self.retry_delay_ms, self.retry_base_ms, self.retry_cap_ms);
         self.next_retry_at = now_ms + self.retry_delay_ms;
     }
 
@@ -1267,7 +1277,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn root_driver_stops_on_shutdown_while_parked() {
-        let request_root = move || async move { RootFetch::Answered };
+        let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let answered_clone = Arc::clone(&answered);
+        let request_root = move || {
+            let answered_clone = Arc::clone(&answered_clone);
+            async move {
+                answered_clone.store(true, Ordering::SeqCst);
+                RootFetch::Answered
+            }
+        };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
         let start = tokio::time::Instant::now();
@@ -1278,8 +1296,13 @@ mod tests {
             Some(epoch_rx),
             move || start.elapsed().as_millis() as u64,
         ));
-        // Let the driver answer and park.
-        for _ in 0..32 {
+        // Wait deterministically until the request has been answered,
+        // then let the driver advance from the completed request into
+        // the parked select!.
+        while !answered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
             tokio::task::yield_now().await;
         }
         shutdown_tx.send(true).expect("send shutdown");
