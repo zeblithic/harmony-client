@@ -2758,6 +2758,7 @@ pub(crate) async fn start_node_inner(
             &identity_dir,
             crate::identity::KeychainStore::new().ok(),
         )?;
+        tracing::info!("BOOT-PROBE 01: owner state loaded (keychain reads done)");
         // ZEB-338: snapshot before owner_loaded is moved/destructured downstream.
         let has_owner_identity = owner_loaded.is_some();
 
@@ -3404,6 +3405,7 @@ pub(crate) async fn start_node_inner(
                         inbound_tx: in_tx,
                     });
 
+                    tracing::info!("BOOT-PROBE 02: iroh/pkarr/profile sections done, entering mint sync engine");
                     // ── Mint Phase 2 sync engine ─────────────────────────────
                     //
                     // Construct MintSyncEngine now that kt, device_id, and
@@ -3556,6 +3558,7 @@ pub(crate) async fn start_node_inner(
                         });
                     }
 
+                    tracing::info!("BOOT-PROBE 03: mint engine constructed");
                     // ── ZEB-417 SP1: Notes fleet-sync engine ────────────────
                     //
                     // Owner-private Notes dataset. Construct the generic
@@ -3614,6 +3617,7 @@ pub(crate) async fn start_node_inner(
                         inbound_tx: notes_in_tx,
                     });
 
+                    tracing::info!("BOOT-PROBE 04: notes engine constructed");
                     // ── ZEB-418 SP2 P1: dm-inbox fleet-sync engine + ingestion ─
                     //
                     // Butler dm-inbox dataset (spec §5): deposited-but-not-
@@ -3728,6 +3732,7 @@ pub(crate) async fn start_node_inner(
                         inbound_tx: dm_inbox_in_tx,
                     });
 
+                    tracing::info!("BOOT-PROBE 05: dm-inbox engine constructed");
                     // ── ZEB-418 SP2 P2 Task 6: dm-outhold fleet-sync engine ─
                     //
                     // Sender-side outbound-hold dataset (spec D12):
@@ -3817,6 +3822,7 @@ pub(crate) async fn start_node_inner(
                     dm_outhold_sync_engine_opt = Some(std::sync::Arc::clone(&dm_outhold_sync));
                     dm_outhold_device_id_opt = Some(device_id.clone());
 
+                    tracing::info!("BOOT-PROBE 06: dm-outhold engine constructed");
                     // ── ZEB-418 SP2 P2 Task 6: fleet-net fleet-sync engine ─
                     //
                     // Per-device network info (iroh endpoint id + home
@@ -3894,6 +3900,9 @@ pub(crate) async fn start_node_inner(
                                 )),
                             },
                         ));
+                    tracing::info!(
+                        "BOOT-PROBE 07: fleet-net engine constructed, writing self-row + flush"
+                    );
                     // Fleet-net self-row upsert: when the iroh endpoint
                     // bound (it binds earlier in start_node, before this
                     // owner-loaded block), record this device's network
@@ -3916,6 +3925,9 @@ pub(crate) async fn start_node_inner(
                         )
                         .await;
                         {
+                            tracing::info!(
+                                "BOOT-PROBE 07a: self-row HLC reserved, locking fleet-net doc"
+                            );
                             let mut doc = fleet_net_doc.lock().await;
                             doc.devices.insert(
                                 device_id.clone(),
@@ -3935,13 +3947,29 @@ pub(crate) async fn start_node_inner(
                                 .write()
                                 .unwrap_or_else(|p| p.into_inner()) = doc.clone();
                         }
+                        tracing::info!("BOOT-PROBE 07b: self-row written + snapshot updated, deferring boot flush");
                         fleet_net_sync.notify_dirty();
-                        if let Err(e) = fleet_net_sync.flush_now().await {
-                            tracing::warn!(
-                                error = %e,
-                                "ZEB-418 P2: fleet-net self-row flush failed at start_node; \
-                                 the debounced publisher will retry on the next dirty mark"
-                            );
+                        // Deferred boot flush (same pattern as the mint/notes/
+                        // dm-inbox/outhold boot flushes above): flush_now's
+                        // publish round-trips through ContentStore::put, whose
+                        // CasOp reply is only serviced once event_loop::run
+                        // spawns (far below). Awaiting it inline here deadlocks
+                        // start_node — the event loop can never start because
+                        // start_node never returns. The self-row itself is
+                        // already staged in the doc + snapshot above; this
+                        // flush only publishes to siblings + persists, both of
+                        // which are safe to complete after the loop is up.
+                        {
+                            let boot_flush = std::sync::Arc::clone(&fleet_net_sync);
+                            tokio::spawn(async move {
+                                if let Err(e) = boot_flush.flush_now().await {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "ZEB-418 P2: fleet-net self-row boot flush failed; \
+                                         the debounced publisher will retry on the next dirty mark"
+                                    );
+                                }
+                            });
                         }
                     }
                     fleet_net_doc_opt = Some(std::sync::Arc::clone(&fleet_net_doc));
@@ -3971,6 +3999,7 @@ pub(crate) async fn start_node_inner(
                         },
                     });
 
+                    tracing::info!("BOOT-PROBE 08: fleet-net self-row staged (flush deferred), entering per-community CRDT sync");
                     // ── ZEB-217 Sub-C Phase 2 + Phase 3 Task 8: per-community state CRDT sync ─
                     //
                     // Build the registry (owns the multi-community engine pool)
@@ -4727,6 +4756,9 @@ pub(crate) async fn start_node_inner(
                         }
                     }
 
+                    tracing::info!(
+                        "BOOT-PROBE 09: community engines constructed, entering rehydrate pass"
+                    );
                     // ZEB-254 R4-4: restart-time rehydrate pass for the
                     // engine's `admin_identity_pub` OnceLock. The R3-C1
                     // pre-bind at spawn time calls
@@ -4935,6 +4967,9 @@ pub(crate) async fn start_node_inner(
 
                     community_registry_arc = Some(std::sync::Arc::clone(&registry));
 
+                    tracing::info!(
+                        "BOOT-PROBE 10: rehydrate+healing done, entering reachability replay"
+                    );
                     // ── ZEB-321 Phase 1 PR #157 round 2 (Cursor HIGH): replay
                     //    ReachabilityAnnounce history into the resolver ──
                     //
