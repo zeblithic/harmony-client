@@ -841,6 +841,10 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             s.bob_unicast_tx.clone(),
             Arc::clone(&s.bob_dm_outbox),
             Arc::clone(&s.bob_channel_log_registry),
+            // ZEB-427: legacy tests predate the durability fence; pass no
+            // engine (the fence logs and skips — behavior under test in
+            // zeb427_iroh_redeem_fences_owner_state_space_to_disk).
+            None,
             None,
             |_| {},
             // ZEB-325 PR #159 R4-3 (CodeRabbit NITPICK): record each
@@ -1137,6 +1141,10 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
             s.bob_unicast_tx.clone(),
             Arc::clone(&s.bob_dm_outbox),
             Arc::clone(&s.bob_channel_log_registry),
+            // ZEB-427: legacy tests predate the durability fence; pass no
+            // engine (the fence logs and skips — behavior under test in
+            // zeb427_iroh_redeem_fences_owner_state_space_to_disk).
+            None,
             None,
             |_| {},
             move |payload: harmony_app::NavUpdatedPayload| {
@@ -1253,4 +1261,194 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
     })
     .await
     .expect("invite_only_untargeted_generate_then_redeem_roundtrip timed out at 60s");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// ZEB-427: durability fence on the iroh-handshake redemption path.
+//
+// This was the ONE join path missing ZEB-393 Bug A's durable-on-commit
+// fence: `create_community`, the legacy `redeem_invite`, and
+// `join_open_community` all flush the owner-state SyncEngine after
+// committing the Space, but the iroh path (the one the UI drives) did
+// not — so a join stayed memory-only until some unrelated owner-state
+// write happened to flush the doc. On the next cold boot the membership
+// vanished, and re-joining deadlocked: the persisted per-community dir
+// still materialized the joiner as Active ("PendingJoin actor's prior
+// state is already-engaged") while the missing Space row blocked engine
+// spawn ("no engine — not currently joined"). Live repro 2026-06-10,
+// documented on ZEB-427.
+//
+// The engine here is constructed with a debounce far longer than the
+// test budget (10 min vs 60 s), so a debounced write can never satisfy
+// the assertion — the persisted file can only exist because the
+// explicit `flush_now` fence ran before the IPC returned.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let s = setup_two_party_iroh_handshake().await;
+
+        // Targeted invite-only invite URL — same construction as
+        // `bob_joins_alice_via_iroh_handshake_option_a` (see that test
+        // for the field-by-field rationale).
+        let token_minted_at = Hlc {
+            wall_ms: 100_500,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let invite_token_unsigned = InviteToken {
+            inviter: s.alice_addr,
+            invitee_hint: Some(s.bob_addr),
+            minted_at: token_minted_at.clone(),
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let token_payload_bytes =
+            canonical_invite_token_bytes(&invite_token_unsigned).expect("canonical token bytes");
+        let token_sig: [u8; 64] = s.alice_comm_sk.sign(&token_payload_bytes).to_bytes();
+        let invite_token = InviteToken {
+            inviter: s.alice_addr,
+            invitee_hint: Some(s.bob_addr),
+            minted_at: token_minted_at,
+            expires_at: None,
+            sig: token_sig,
+        };
+        let bob_x25519_pub = {
+            let verifying_bytes = s.bob_comm_sk.verifying_key().to_bytes();
+            harmony_app::dm_signing::ed25519_pub_to_x25519(&verifying_bytes)
+                .expect("bob_comm ed25519→x25519")
+        };
+        let sealed_epoch_key = harmony_app::dm_signing::seal_to_owner(
+            &bob_x25519_pub,
+            s.alice_minted.membership_key.as_bytes(),
+        )
+        .expect("seal epoch key to bob");
+        let invite_payload = CommunityInvitePayload {
+            community_id: s.community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key,
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr: s.alice_addr,
+            community_name: "Zeb427FenceCommunity".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(invite_token),
+            admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
+            admin_identity_pub: Some(s.alice_pub),
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: Some(s.alice_comm.cert.clone()),
+            untargeted_decrypt_key: None,
+        };
+        let invite_url =
+            community_invite::encode_invite_url(&invite_payload).expect("encode invite");
+
+        s.invite_pub.register_invite(&invite_payload).await;
+        let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+
+        // ── Bob's owner-state SyncEngine over a temp identity dir. ──────
+        // Shares the SAME `bob_crdt_state` Arc the redeem mutates, so the
+        // fence's snapshot includes the Space row the join inserts —
+        // mirroring production wiring (start_node hands the engine the
+        // same Arc the IPC handlers mutate).
+        let persist_dir = tempfile::tempdir().expect("persist dir");
+        let persist_paths = harmony_app::owner_state_sync::PersistPaths {
+            crdt: persist_dir.path().join("owner_state_crdt.cbor"),
+            replay: persist_dir.path().join("state_root_replay.cbor"),
+        };
+        let kt = Arc::new(
+            harmony_app::owner_state_crypto::KeyTree::derive(&[0xB7u8; 32]).expect("keytree"),
+        );
+        let (engine_pub_tx, mut engine_pub_rx) = mpsc::channel::<Vec<u8>>(16);
+        // Drain the engine's outbound publishes so flush_now can never
+        // block on a full channel.
+        let drain = tokio::spawn(async move { while engine_pub_rx.recv().await.is_some() {} });
+        let (_engine_sub_tx, engine_sub_rx) = mpsc::channel::<Vec<u8>>(16);
+        let sync_engine = Arc::new(harmony_app::owner_state_sync::SyncEngine::new(
+            kt,
+            "bob-dev".to_string(),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            Arc::new(harmony_app::content_store::InMemoryStub::default()) as Arc<dyn ContentStore>,
+            engine_pub_tx,
+            engine_sub_rx,
+            persist_paths.clone(),
+            // Debounce >> test budget: only the explicit fence can write.
+            600_000,
+        ));
+
+        let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
+            invite_url,
+            Some(Arc::clone(&s.pkarr_resolver)),
+            Some(s.bob_reachability.clone()),
+            Some(Arc::clone(&s.bob_ep)),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            s.bob_unicast_tx.clone(),
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            // ZEB-427: the engine under test — the fence must flush it
+            // before the inner returns "joined".
+            Some(Arc::clone(&sync_engine)),
+            None,
+            |_| {},
+            |_payload: harmony_app::NavUpdatedPayload| {},
+            harmony_app::HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(10_000),
+                open_bi_timeout: Duration::from_millis(10_000),
+                response_read_timeout: Duration::from_millis(10_000),
+                write_timeout: Duration::from_millis(10_000),
+            },
+            || Ok(()),
+        )
+        .await
+        .expect("connectivity_redeem_invite_iroh_inner must Ok");
+
+        assert_eq!(
+            outcome.status, "joined",
+            "happy path must join; got status={:?} community_id={:?}",
+            outcome.status, outcome.community_id
+        );
+
+        // THE load-bearing assertion: the joined community's Space row is
+        // on disk by the time the IPC returns. With a 10-minute debounce
+        // and no other owner-state writes in this test, only the ZEB-427
+        // fence can have produced this file.
+        let loaded = harmony_app::owner_state_persist::load_crdt(&persist_paths.crdt).expect(
+            "owner_state_crdt.cbor must exist and decode immediately after the joined \
+             outcome — the ZEB-427 durability fence did not run",
+        );
+        assert!(
+            loaded.spaces.contains_key(&s.community_id),
+            "persisted owner-state must contain the joined community's Space row; \
+             persisted space ids = {:?}",
+            loaded.spaces.keys().collect::<Vec<_>>()
+        );
+
+        // Graceful teardown (mirrors the option_a test) + engine shutdown.
+        let _ = sync_engine.shutdown().await;
+        drain.abort();
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("zeb427_iroh_redeem_fences_owner_state_space_to_disk timed out at 60s");
 }
