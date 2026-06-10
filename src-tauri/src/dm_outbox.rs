@@ -440,6 +440,14 @@ pub struct DmOutbox {
     /// `set_butler_deposit_client` at start_node (only when the iroh
     /// endpoint bound); outbox tests inject a mock.
     butler_deposit_client: Option<Arc<dyn crate::butler_deposit::ButlerDepositClient>>,
+    /// ZEB-418 SP2 P2 Task 3: outbound-hold side-table. `None` (default)
+    /// disables the hold write entirely — send_dm behaves exactly as before.
+    /// Production installs both via `set_outhold` at start_node alongside the
+    /// dm-outhold FleetSyncEngine; tests inject a bare doc + flag closure.
+    outhold_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outhold::DmOutholdDoc>>>,
+    /// The engine's `notify_dirty` — called after a successful hold write so
+    /// the debounced publisher picks it up.
+    outhold_notify: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl DmOutbox {
@@ -487,6 +495,8 @@ impl DmOutbox {
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
             butler_deposit_client: None,
+            outhold_doc: None,
+            outhold_notify: None,
         }
     }
 
@@ -519,6 +529,8 @@ impl DmOutbox {
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
             butler_deposit_client: None,
+            outhold_doc: None,
+            outhold_notify: None,
         }
     }
 
@@ -531,6 +543,19 @@ impl DmOutbox {
         client: Arc<dyn crate::butler_deposit::ButlerDepositClient>,
     ) {
         self.butler_deposit_client = Some(client);
+    }
+
+    /// ZEB-418 SP2 P2 Task 3: install the outbound-hold doc + dirty-notify.
+    /// Until this is called the hold write is disabled and send_dm behaves
+    /// exactly as before (spec D12: the hold is additive, never load-bearing
+    /// for the legacy path).
+    pub fn set_outhold(
+        &mut self,
+        doc: std::sync::Arc<tokio::sync::Mutex<crate::dm_outhold::DmOutholdDoc>>,
+        notify: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.outhold_doc = Some(doc);
+        self.outhold_notify = Some(notify);
     }
 
     /// Encrypt `content` under `Space.content_key`, write the storage blob to
@@ -616,6 +641,14 @@ impl DmOutbox {
             },
         )
         .map_err(|e| SendDmError::Encode(format!("ContentId::for_book: {e}")))?;
+        // ZEB-418 P2: clone the blob once before the CAS put so sibling
+        // devices can complete delivery via the outbound hold. Cloned only
+        // when outhold_doc is installed; the CAS put consumes the original.
+        let held_blob = if self.outhold_doc.is_some() {
+            Some(storage_blob.clone())
+        } else {
+            None
+        };
         cas.put(message_cid, storage_blob).await?;
 
         // 6. Mint OutboxEntry, install via apply_outbox.
@@ -651,6 +684,27 @@ impl DmOutbox {
                 // None} fires if a paired device's CidNotify already wrote
                 // this CID first (cross-device race), which is fine — same
                 // payload, idempotent.
+
+                // ZEB-418 P2: record the blob in the outbound hold so siblings
+                // can complete delivery (spec D12). After state mutations, never
+                // held across the CAS await; lock scope is the insert only.
+                if let Some(outhold) = self.outhold_doc.clone() {
+                    let key =
+                        crate::dm_outhold::DmOutholdDoc::key(&space_id.0, &message_cid.to_bytes());
+                    let mut doc = outhold.lock().await;
+                    doc.entries
+                        .entry(key)
+                        .or_insert(crate::dm_outhold::DmOutholdEntry {
+                            storage_blob: held_blob.expect("cloned when outhold_doc is Some"),
+                            space_id: space_id.0,
+                            created_at: sent_at.clone(),
+                        });
+                    drop(doc);
+                    if let Some(notify) = self.outhold_notify.as_ref() {
+                        notify();
+                    }
+                }
+
                 Ok((entry_id, message_cid))
                 // Note: ApplyOutcome::Merged would also reach here. It "should
                 // not happen" because a fresh ULID can't collide with any
@@ -6990,5 +7044,236 @@ mod tests {
             .cloned()
             .expect("tracker has entry");
         assert_eq!(stored, reserved);
+    }
+}
+
+#[cfg(test)]
+mod outhold_write_tests {
+    use super::*;
+    use crate::content_store::InMemoryStub;
+    use crate::owner_state_types::{DmContentKey, Space, TransportBinding};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    fn make_outbox_synthetic_local(device_id: &str, self_owner: OwnerAddr) -> DmOutbox {
+        let private_identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let priv_bytes = private_identity.to_private_bytes();
+        let mut ed_seed = [0u8; 32];
+        ed_seed.copy_from_slice(&priv_bytes[32..64]);
+        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+        let device_hash = DeviceIdentityHash(private_identity.identity.address_hash);
+        let private_identity = std::sync::Arc::new(private_identity);
+        let test_owner = crate::community_membership::mint_test_owner(0xAB);
+        let community_signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &test_owner.device_key.to_bytes(),
+        ));
+        let enrollment_cert = test_owner.cert;
+        DmOutbox::new_synthetic(
+            device_id.into(),
+            self_owner,
+            device_hash,
+            signing_key,
+            private_identity,
+            community_signing_key,
+            enrollment_cert,
+        )
+    }
+
+    fn make_dm_space_local(id_byte: u8, members: Vec<OwnerAddr>) -> Space {
+        Space {
+            id: SpaceId([id_byte; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Bob".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members,
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            content_key: Some(DmContentKey::new([0x42u8; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    fn install_space_local(state: &mut OwnerState, sp: Space) {
+        let outcome = state.apply_space_with_canonicalization(sp);
+        assert!(
+            matches!(outcome, ApplyOutcome::Inserted),
+            "fixture install must succeed, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_dm_writes_outhold_row_alongside_outbox_entry() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let sp = make_dm_space_local(7, vec![alice, bob]);
+        let space_id = sp.id;
+        install_space_local(&mut state, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = make_outbox_synthetic_local("dev", alice);
+
+        // Install outhold doc + notify flag.
+        let outhold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outhold::DmOutholdDoc::default(),
+        ));
+        let notify_fired = Arc::new(AtomicBool::new(false));
+        let notify_fired_clone = Arc::clone(&notify_fired);
+        let notify: std::sync::Arc<dyn Fn() + Send + Sync> =
+            std::sync::Arc::new(move || notify_fired_clone.store(true, Ordering::SeqCst));
+        o.set_outhold(outhold_doc.clone(), notify);
+
+        let (_msg_id, msg_cid) = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"hello outhold".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .expect("send_dm ok");
+
+        // (a) The doc must contain the expected key.
+        let expected_key = crate::dm_outhold::DmOutholdDoc::key(&space_id.0, &msg_cid.to_bytes());
+        let doc_guard = outhold_doc.lock().await;
+        assert!(
+            doc_guard.entries.contains_key(&expected_key),
+            "outhold doc must contain key for the returned message_cid"
+        );
+
+        // (b) The blob in the outhold doc must equal the blob stored in CAS.
+        let outhold_blob = doc_guard.entries[&expected_key].storage_blob.clone();
+        drop(doc_guard);
+        let cas_blob = cas
+            .get(&msg_cid)
+            .await
+            .expect("CAS get ok")
+            .expect("CAS must hold the blob");
+        assert_eq!(
+            outhold_blob, cas_blob,
+            "outhold storage_blob must match what was written to CAS"
+        );
+
+        // (c) The notify closure must have fired.
+        assert!(
+            notify_fired.load(Ordering::SeqCst),
+            "notify closure must fire after a successful hold write"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_dm_without_outhold_installed_unchanged() {
+        // No set_outhold → send_dm must succeed without panicking.
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let sp = make_dm_space_local(7, vec![alice, bob]);
+        let space_id = sp.id;
+        install_space_local(&mut state, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = make_outbox_synthetic_local("dev", alice);
+        // outhold_doc is None by default — no set_outhold call.
+
+        let result = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"no outhold".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "send_dm without outhold must succeed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_dm_rejected_entry_writes_no_outhold_row() {
+        // Drive a rejection via self-only DM (space has only alice as member
+        // after the space is mutated post-construction to bypass the
+        // canonical invariant check, mirroring send_dm_self_only_dm_rejects).
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let mut sp = make_dm_space_local(7, vec![alice, OwnerAddr([0x02; 16])]);
+        // Mutate to single-member after construction; insert directly to skip
+        // apply_space_with_canonicalization's invariant check.
+        sp.members = vec![alice];
+        let space_id = sp.id;
+        state.spaces.insert(space_id, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = make_outbox_synthetic_local("dev", alice);
+
+        let outhold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outhold::DmOutholdDoc::default(),
+        ));
+        let notify_fired = Arc::new(AtomicBool::new(false));
+        let notify_fired_clone = Arc::clone(&notify_fired);
+        let notify: std::sync::Arc<dyn Fn() + Send + Sync> =
+            std::sync::Arc::new(move || notify_fired_clone.store(true, Ordering::SeqCst));
+        o.set_outhold(outhold_doc.clone(), notify);
+
+        let err = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"self-only".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SendDmError::NoRecipients(id) if id == space_id),
+            "expected NoRecipients, got {err:?}"
+        );
+
+        // The outhold doc must remain empty — no row written on rejection.
+        let doc_guard = outhold_doc.lock().await;
+        assert!(
+            doc_guard.entries.is_empty(),
+            "outhold doc must stay empty when send_dm is rejected"
+        );
+        drop(doc_guard);
+
+        // The notify closure must NOT have fired.
+        assert!(
+            !notify_fired.load(Ordering::SeqCst),
+            "notify must not fire when send_dm is rejected"
+        );
     }
 }
