@@ -727,7 +727,7 @@ mod tests {
 
         // Exactly-at-cap is accepted (boundary pin) — body present.
         let mut at_cap_wire = (DEPOSIT_MAX_FRAME_BYTES as u32).to_le_bytes().to_vec();
-        at_cap_wire.extend(std::iter::repeat(0xAA).take(DEPOSIT_MAX_FRAME_BYTES));
+        at_cap_wire.extend(std::iter::repeat_n(0xAA, DEPOSIT_MAX_FRAME_BYTES));
         let mut reader = at_cap_wire.as_slice();
         let body = read_length_prefixed(&mut reader)
             .await
