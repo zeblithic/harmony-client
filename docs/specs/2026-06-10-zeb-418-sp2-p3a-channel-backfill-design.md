@@ -80,7 +80,7 @@ NO HOLDER: zero replies → latch Unsatisfied → backoff re-request → converg
 
 | Failure | Behavior |
 |---|---|
-| No holder online | Latch unsatisfied; backoff re-request (30 s → 10 min cap) while the engine runs; converges when any holder appears (D21). |
+| No holder online | **Amended at implementation time (T6 finding):** zenoh resolves a GET against *currently-matched* queryables, so a query with zero online holders completes as a clean empty reply stream — indistinguishable on the wire from "a holder served nothing" — and the latch satisfies. In-session retry therefore fires only on genuine aborts (adapter teardown, GET failure). The no-holder case heals at the next engine start via the watermark re-sync; the common cases are unaffected (a joiner's countersigner is online by construction; restarts re-sync). In-session healing (empty-marker reply protocol, periodic watermark re-sync, or the transport-recovery `reset()` hook) is a follow-up — see §9. |
 | Holder serves partial history | Satisfied this round; the engine-start watermark trigger re-requests on every restart, healing gaps over time (D24 accepted gap). |
 | Backfilled event fails author-auth or membership-at-HLC | Rejected by the shared verification path; warn + telemetry counter. Same as a bad live event — never a backfill-specific bypass (D25). |
 | Duplicates (overlapping holders, re-requests) | Replay tracker dedupes — already proven on the live path; replies are wire-identical (D26). |
