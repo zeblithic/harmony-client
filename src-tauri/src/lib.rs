@@ -23767,7 +23767,7 @@ async fn leave_community(
         }
         .await;
 
-    match leave_rotation_bundle {
+    let rotation_gap: Option<String> = match leave_rotation_bundle {
         Ok(rotation) => {
             // §4.1 happy path: submit leave + rotation atomically.
             // ZEB-249 PR #106 R5 (CodeRabbit Major): rotation rejection is now
@@ -23787,19 +23787,13 @@ async fn leave_community(
                 return Err(membership_outcome_err("leave_community", &leave_outcome));
             }
 
-            // ZEB-427 Half B (CodeAnt, PR #228 R1): the Leave is
-            // committed as of this point — persist left_at BEFORE the
-            // rotation-rejection check below can early-return, or the
-            // partially-successful leave resurrects at reboot.
-            persist_community_left_at(&crdt_state, &sync_engine, space_id, wall_now_ms, &device_id)
-                .await;
-
-            // Surface rotation rejection as a warning and return Err —
-            // the leaver has committed Leave + lost repair authority, so
-            // the caller needs to know the leave is only partially
-            // successful. The admin self-healing observer will synthesize
-            // the rotation, but the caller cannot assume secrecy is
-            // fully enforced yet.
+            // Surface rotation rejection as a warning and a DEFERRED
+            // Err (Cursor, PR #228 R2) — the leaver has committed
+            // Leave + lost repair authority, so the caller must know
+            // the leave is only partially successful, but the
+            // post-commit tail below (left_at persist, nav emit, pkarr
+            // unregister) still has to run first. The admin
+            // self-healing observer will synthesize the rotation.
             if let crate::community_state_crdt::InsertOutcome::Rejected(ref rot_err) = rot_outcome {
                 tracing::warn!(
                     community_id = %hex::encode(space_id.0),
@@ -23808,9 +23802,11 @@ async fn leave_community(
                     "leave_community: Leave committed but paired EpochRotation was \
                      rejected — admin self-healing observer will synthesize rotation"
                 );
-                return Err(format!(
+                Some(format!(
                     "leave_community committed Leave but paired EpochRotation was rejected: {rot_err}"
-                ));
+                ))
+            } else {
+                None
             }
         }
         Err(e) => {
@@ -23837,28 +23833,30 @@ async fn leave_community(
             ) {
                 return Err(membership_outcome_err("leave_community", &outcome));
             }
-            // ZEB-427 Half B (CodeAnt, PR #228 R1): Leave committed —
-            // persist left_at before the rotation-gap early return.
-            persist_community_left_at(&crdt_state, &sync_engine, space_id, wall_now_ms, &device_id)
-                .await;
             // CR Major (PR #106 R7): "survivors exist but we couldn't mint companion
             // EpochRotation" is NOT a successful leave — backward secrecy is broken
-            // until the admin self-healing observer synthesizes the rotation. Return
-            // Err so callers can distinguish this from a true solo-leave (Ok(())).
+            // until the admin self-healing observer synthesizes the rotation. Defer
+            // the Err so callers can distinguish this from a true solo-leave
+            // (Ok(())) while the post-commit tail still runs (Cursor, PR #228 R2).
             if !is_solo {
-                return Err(format!(
+                Some(format!(
                     "leave_community committed Leave but could not mint paired EpochRotation: {e}"
-                ));
+                ))
+            } else {
+                // Solo-leave: no rotation needed.
+                None
             }
-            // Solo-leave: no rotation needed; fall through to nav-update and Ok(()).
         }
-    }
+    };
 
-    // ZEB-427 Half B: left_at is already persisted — both match arms
-    // above call persist_community_left_at immediately after their
-    // Leave insert commits, so every committed path (full success,
-    // solo leave, and the rotation-gap partial successes that
-    // early-return Err) ran it exactly once.
+    // ZEB-427 Half B (CodeAnt + Cursor, PR #228 R1/R2): the Leave has
+    // committed on every path that reaches here — including the
+    // rotation-gap partial successes, which now DEFER their Err until
+    // after this post-commit tail (durable left_at + fence, nav
+    // "removed" emit, pkarr unregister). Returning early instead left
+    // owner-state, the sidebar, and the pkarr publication out of sync
+    // with the committed Leave until reload/reboot.
+    persist_community_left_at(&crdt_state, &sync_engine, space_id, wall_now_ms, &device_id).await;
 
     // ZEB-265: notify the nav layer so the community node disappears
     // from the tree. emit failure is non-fatal — the leave already
@@ -23896,6 +23894,14 @@ async fn leave_community(
                 "ZEB-323 Phase 2b: unregistered case-C pkarr publication after leave"
             );
         }
+    }
+
+    // The deferred rotation gap surfaces only after the post-commit
+    // tail: local state is already consistent with the committed
+    // Leave, but the caller must know backward secrecy isn't enforced
+    // yet.
+    if let Some(gap) = rotation_gap {
+        return Err(gap);
     }
 
     Ok(())
