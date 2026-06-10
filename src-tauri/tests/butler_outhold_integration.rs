@@ -21,7 +21,9 @@
 //!      sent-but-never-acked windows (StubTransport = Ok-enqueued, never
 //!      acks) until the deposit rung fires; the test deposit client
 //!      builds the REAL sender frame (`build_deposit_frame`, the Task 8
-//!      construction) and drives owner B's REAL acceptor pipeline
+//!      construction) signed with A2's OWN distinct enrollment cert (not
+//!      A1's — proving cross-device acceptance, PR #222 round 1) and
+//!      drives owner B's REAL acceptor pipeline
 //!      (`handle_deposit_core`, Task 5/P1) in-process; B persists into
 //!      its dm-inbox doc and acks; the ack marks the recipient delivered
 //!      → `DeliveryStatus::Complete` (1:1 DM, single recipient).
@@ -39,7 +41,7 @@
 //! (10s/16s/27s) copy the T4 unit test
 //! `noack_after_n_windows_triggers_deposit_rung` window arithmetic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -105,17 +107,73 @@ fn master_from_cert(cert: &EnrollmentCert) -> [u8; 32] {
     }
 }
 
+/// Mint a SECOND enrolled device under the same owner that
+/// `mint_test_owner(master_seed)` produces: the same master key + bundle, a
+/// NEW device key from `device_seed`, and a Master-signed `EnrollmentCert`
+/// binding them (mirrors `mint_test_owner` in community_membership.rs
+/// step-for-step). Lets the capstone prove the P1 acceptor admits a deposit
+/// signed by a DIFFERENT enrolled device of the sender's fleet — the PR's
+/// load-bearing "any online device can complete delivery" claim.
+///
+/// Seed caveat (documented on `mint_test_owner`): seeds `N` and `N ^ 0xFF`
+/// share raw key material. The seeds chosen in this file — master 0x51
+/// (default device 0x51^0xFF = 0xAE), sibling device 0x55 (complement
+/// 0xAA), DM-transport identities 0x53/0x54/0x61, PrivateIdentity seeds
+/// 0x71/0x72 — avoid every such pairing.
+fn mint_sibling_device(master_seed: u8, device_seed: u8) -> (SigningKey, EnrollmentCert) {
+    use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+    assert_ne!(device_seed, master_seed, "would duplicate the master key");
+    assert_ne!(
+        device_seed,
+        master_seed ^ 0xFF,
+        "would duplicate the owner's default device key"
+    );
+    let master_sk = SigningKey::from_bytes(&[master_seed; 32]);
+    let master_bundle = PubKeyBundle {
+        classical: ClassicalKeys {
+            ed25519_verify: master_sk.verifying_key().to_bytes(),
+            x25519_pub: [0u8; 32],
+        },
+        post_quantum: None,
+    };
+    let device_sk = SigningKey::from_bytes(&[device_seed; 32]);
+    let device_bundle = PubKeyBundle {
+        classical: ClassicalKeys {
+            ed25519_verify: device_sk.verifying_key().to_bytes(),
+            x25519_pub: [0u8; 32],
+        },
+        post_quantum: None,
+    };
+    let device_id = device_bundle.identity_hash();
+    let cert = EnrollmentCert::sign_master(
+        &master_sk,
+        master_bundle,
+        device_id,
+        device_bundle,
+        1_700_000_000,
+        None,
+    )
+    .expect("sign_master sibling cert");
+    cert.verify(0).expect("sibling cert verifies");
+    (device_sk, cert)
+}
+
 /// A production-checked `DmOutbox` for one of owner A's devices: shared
-/// owner identity (self_owner + Master cert + cert-bound community key
-/// from `mint_test_owner`) but a per-device DM-transport identity.
-/// Routes through `DmOutbox::new` so the ZEB-339 cert↔owner↔key asserts
-/// run (the material is fully consistent).
+/// owner identity but a per-device DM-transport identity AND per-device
+/// enrolled deposit credentials (`deposit_device_key` + `deposit_cert` —
+/// the cert-bound key that signs deposit frames). A1 passes the owner's
+/// default device creds; A2 passes the DISTINCT sibling-device creds from
+/// `mint_sibling_device`, so the capstone proves cross-device deposit
+/// acceptance. Routes through `DmOutbox::new` so the ZEB-339
+/// cert↔owner↔key asserts run (the material is fully consistent).
 fn make_owner_outbox(
     device_id: &str,
     owner: &TestOwner,
     dm_sk: &SigningKey,
     dm_hash: DeviceIdentityHash,
     identity_seed: u8,
+    deposit_device_key: &SigningKey,
+    deposit_cert: EnrollmentCert,
 ) -> DmOutbox {
     DmOutbox::new(
         device_id.to_string(),
@@ -125,8 +183,8 @@ fn make_owner_outbox(
         Arc::new(harmony_identity::PrivateIdentity::from_seed(
             &[identity_seed; 32],
         )),
-        Arc::new(SigningKey::from_bytes(&owner.device_key.to_bytes())),
-        owner.cert.clone(),
+        Arc::new(SigningKey::from_bytes(&deposit_device_key.to_bytes())),
+        deposit_cert,
     )
 }
 
@@ -504,6 +562,16 @@ async fn sibling_completes_delivery_via_butler_after_originator_stops() {
 
     // ----- Stage 1: owner A fleet (A1 + A2) + identities -----------------
     let owner_a = mint_test_owner(0x51);
+    // A2's OWN enrolled-device credentials (distinct device key + its own
+    // Master-signed cert under the same owner). The deposit A2 builds in
+    // stage 4 must verify against THIS cert — proving the acceptor admits
+    // a sibling device's deposit, not just the originator's.
+    let (a2_device_sk, a2_cert) = mint_sibling_device(0x51, 0x55);
+    assert_ne!(
+        a2_cert.device_pubkeys.classical.ed25519_verify,
+        owner_a.cert.device_pubkeys.classical.ed25519_verify,
+        "sibling cert must bind a DISTINCT enrolled device key"
+    );
     let owner_b_addr = OwnerAddr(RECIPIENT_OWNER);
     let (a1_dm_sk, _a1_identity_pub, a1_dm_hash) = dm_identity(0x53);
     let (a2_dm_sk, a2_identity_pub, a2_dm_hash) = dm_identity(0x54);
@@ -551,7 +619,15 @@ async fn sibling_completes_delivery_via_butler_after_originator_stops() {
     install_space(&mut a1_state, space);
 
     // ----- Stage 2: A1 sends with the outhold installed ------------------
-    let mut a1_outbox = make_owner_outbox(&a1_id, &owner_a, &a1_dm_sk, a1_dm_hash, 0x71);
+    let mut a1_outbox = make_owner_outbox(
+        &a1_id,
+        &owner_a,
+        &a1_dm_sk,
+        a1_dm_hash,
+        0x71,
+        &owner_a.device_key,
+        owner_a.cert.clone(),
+    );
     let a1_notify: Arc<dyn Fn() + Send + Sync> = {
         let engine = Arc::clone(&a1.engine);
         Arc::new(move || engine.notify_dirty())
@@ -635,7 +711,18 @@ async fn sibling_completes_delivery_via_butler_after_originator_stops() {
         let engine = Arc::clone(&a2.engine);
         move || engine.notify_dirty()
     };
-    let stats = sweep_once(&a2.doc, &a2_sweep_ctx, &a2_engine_notify).await;
+    // One orphan-grace tracker for the lifetime of A2's sweeper (the
+    // run_dm_outhold_sweeper ownership shape). Unused by these sweeps —
+    // the statuses here are Pending then Complete, never None.
+    let mut a2_orphan_tracker = HashMap::new();
+    let stats = sweep_once(
+        &a2.doc,
+        &a2_sweep_ctx,
+        &a2_engine_notify,
+        &mut a2_orphan_tracker,
+        5_000,
+    )
+    .await;
     assert_eq!(stats.admitted, 1, "A2's sweep admits the pending row");
     assert_eq!(stats.gc_removed, 0, "live row is retained");
     let a2_blob = a2_cas
@@ -680,18 +767,29 @@ async fn sibling_completes_delivery_via_butler_after_originator_stops() {
         tracker: Arc::clone(&b.tracker),
         engine: Arc::clone(&b.engine),
     });
-    let cert_bytes = harmony_owner::cbor::to_canonical(&owner_a.cert).expect("encode cert");
+    // A2 deposits with its OWN sibling cert + device key (NOT the
+    // originator A1's): the acceptor must verify the frame against the
+    // sibling's distinct enrollment under owner A's pinned master.
+    let cert_bytes = harmony_owner::cbor::to_canonical(&a2_cert).expect("encode sibling cert");
     let client = Arc::new(InProcessButlerClient {
         butler_ctx,
         butler_device_vk: b1_sk.verifying_key().to_bytes(),
         sender_owner: owner_a.owner.0,
         enrollment_cert_bytes: cert_bytes,
-        device_signing_key: SigningKey::from_bytes(&owner_a.device_key.to_bytes()),
+        device_signing_key: SigningKey::from_bytes(&a2_device_sk.to_bytes()),
         cas: Arc::clone(&a2_cas),
         requests: StdMutex::new(Vec::new()),
     });
 
-    let mut a2_outbox = make_owner_outbox(&a2_id, &owner_a, &a2_dm_sk, a2_dm_hash, 0x72);
+    let mut a2_outbox = make_owner_outbox(
+        &a2_id,
+        &owner_a,
+        &a2_dm_sk,
+        a2_dm_hash,
+        0x72,
+        &a2_device_sk,
+        a2_cert.clone(),
+    );
     a2_outbox.set_butler_deposit_client(Arc::clone(&client) as Arc<dyn ButlerDepositClient>);
 
     // StubTransport's default outcome is Ok — exactly the "Ok-enqueued,
@@ -783,7 +881,14 @@ async fn sibling_completes_delivery_via_butler_after_originator_stops() {
             engine.notify_dirty();
         }
     };
-    let stats = sweep_once(&a2.doc, &a2_sweep_ctx, &gc_notify).await;
+    let stats = sweep_once(
+        &a2.doc,
+        &a2_sweep_ctx,
+        &gc_notify,
+        &mut a2_orphan_tracker,
+        30_000,
+    )
+    .await;
     assert_eq!(stats.gc_removed, 1, "Complete outbox status GCs the row");
     assert_eq!(stats.admitted, 0, "no re-admit during the GC sweep");
     assert!(
@@ -838,7 +943,15 @@ async fn outhold_row_replicates_with_blob_intact() {
     let space_id = space.id;
     install_space(&mut a1_state, space);
 
-    let mut a1_outbox = make_owner_outbox(&a1_id, &owner_a, &a1_dm_sk, a1_dm_hash, 0x71);
+    let mut a1_outbox = make_owner_outbox(
+        &a1_id,
+        &owner_a,
+        &a1_dm_sk,
+        a1_dm_hash,
+        0x71,
+        &owner_a.device_key,
+        owner_a.cert.clone(),
+    );
     let a1_notify: Arc<dyn Fn() + Send + Sync> = {
         let engine = Arc::clone(&a1.engine);
         Arc::new(move || engine.notify_dirty())

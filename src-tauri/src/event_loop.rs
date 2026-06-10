@@ -461,6 +461,11 @@ async fn emit_moderation_changed<R: Runtime>(
 /// `dataset` is the topic suffix (e.g. `"dm-outhold-v1"`); `degraded_event`
 /// is the Tauri event emitted on adapter degradation (e.g.
 /// `"dm-outhold-sync-degraded"`).
+///
+/// `max_payload_bytes` bounds each inbound sample BEFORE it is copied into
+/// an owned Vec — these are peer-fed topics, so an unbounded copy would be
+/// attacker-driven allocation (PR #222 round 1). Oversize samples are
+/// dropped with a warn and the loop continues as if nothing arrived.
 async fn spawn_dataset_sync_zenoh_adapter<R: Runtime>(
     session: &zenoh::Session,
     app: &AppHandle<R>,
@@ -468,6 +473,7 @@ async fn spawn_dataset_sync_zenoh_adapter<R: Runtime>(
     handles: DatasetSyncHandles,
     dataset: &'static str,
     degraded_event: &'static str,
+    max_payload_bytes: usize,
 ) {
     let topic = format!("harmony/owner/{}/ds/{}", handles.addr_hex, dataset);
     let emit_degraded = |reason: &str| {
@@ -517,6 +523,22 @@ async fn spawn_dataset_sync_zenoh_adapter<R: Runtime>(
                                 match current_sub.recv_async().await {
                                     Ok(sample) => {
                                         backoff_ms = 100; // reset on success
+                                                          // Size-gate BEFORE the owned copy:
+                                                          // peer-fed topic — an unbounded
+                                                          // to_vec() would be attacker-driven
+                                                          // allocation. Drop and move on (a
+                                                          // non-event, not a subscriber error).
+                                        let len = sample.payload().len();
+                                        if len > max_payload_bytes {
+                                            tracing::warn!(
+                                                dataset,
+                                                len,
+                                                max = max_payload_bytes,
+                                                "dataset payload exceeds size cap; \
+                                                 dropping sample"
+                                            );
+                                            continue;
+                                        }
                                         let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
                                         if inbound_tx.send(bytes).await.is_err() {
                                             // Engine dropped its receiver — clean shutdown.
@@ -1483,6 +1505,7 @@ pub async fn run<R: Runtime>(
             p2.outhold,
             "dm-outhold-v1",
             "dm-outhold-sync-degraded",
+            crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES,
         )
         .await;
         spawn_dataset_sync_zenoh_adapter(
@@ -1492,6 +1515,7 @@ pub async fn run<R: Runtime>(
             p2.fleet_net,
             "fleet-net-v1",
             "fleet-net-sync-degraded",
+            crate::fleet_net::FLEET_NET_DATASET_MAX_BYTES,
         )
         .await;
     }

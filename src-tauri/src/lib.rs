@@ -933,6 +933,13 @@ pub struct NodeState {
     /// for `set_butler_pin` validation. Same derivation as `dm_inbox_enrolled`
     /// at start_node time.
     pub fleet_net_enrolled: Option<std::collections::BTreeSet<String>>,
+    /// ZEB-418 P2: fire-and-forget routing-record republish trigger
+    /// (re-stamps the self fleet-net row + re-registers identity/community/
+    /// friend pkarr records). Stored so `set_butler_pin` can publish a pin
+    /// change immediately — local writes bypass the `on_applied` debounce
+    /// path (which only sees inbound merges). The closure spawns its own
+    /// tokio task, so calling it is cheap and non-blocking.
+    pub routing_republish: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 
     /// ZEB-321 Phase 1 Task 8: iroh endpoint Arc. `Some` while node is
     /// running AND the keychain-resident secret key + bind both succeeded;
@@ -1273,6 +1280,7 @@ impl Default for NodeState {
             fleet_net_snapshot: None,
             fleet_net_device_id: None,
             fleet_net_enrolled: None,
+            routing_republish: None,
             // ZEB-321 Phase 1 Task 8: iroh handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
             iroh_endpoint: None,
@@ -1726,6 +1734,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.fleet_net_snapshot = None;
         guard.fleet_net_device_id = None;
         guard.fleet_net_enrolled = None;
+        // ZEB-418 P2: drop the republish trigger with the rest of the
+        // fleet-net handles — it captures the pkarr publishers and the
+        // fleet-net engine, all of which die with this stop.
+        guard.routing_republish = None;
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -6434,7 +6446,10 @@ pub(crate) async fn start_node_inner(
                 let serve_allowlist_for_loop = serve_allowlist.clone();
                 // ZEB-418 P2 Task 7 (D16): thread the routing-record
                 // re-publish closure into the event loop's periodic tick.
-                let routing_republish_for_loop = routing_republish_opt;
+                // Clone (not move) — the NodeState assignment block below
+                // also stores it so `set_butler_pin` can fire an immediate
+                // republish.
+                let routing_republish_for_loop = routing_republish_opt.clone();
                 let thread_result = thread::Builder::new()
                     .name("harmony-runtime".to_string())
                     // Windows debug builds overflow the default ~2 MiB stack inside
@@ -6732,6 +6747,12 @@ pub(crate) async fn start_node_inner(
                         guard.fleet_net_snapshot = fleet_net_snapshot_opt.clone();
                         guard.fleet_net_device_id = fleet_net_device_id_opt.clone();
                         guard.fleet_net_enrolled = fleet_net_enrolled_opt.clone();
+                        // ZEB-418 P2 (PR #222 round 1): store the routing-
+                        // republish trigger so `set_butler_pin` can fire an
+                        // immediate pkarr republish on a local pin write —
+                        // local writes never reach the on_applied debounce
+                        // path, which only sees inbound merges.
+                        guard.routing_republish = routing_republish_opt.clone();
                         // ZEB-321 Phase 1 Task 8: stash iroh resources so
                         // Task 9 IPC handlers can reach them via NodeState.
                         // All three are `Option`-shaped because iroh boot
@@ -39134,16 +39155,25 @@ pub(crate) async fn set_butler_pin_inner(
 /// Validates that the supplied id is in the current enrolled set.  Writes
 /// through the fleet-net doc (LWW-correct stamp), updates the sync snapshot,
 /// notifies the engine, and flushes. Flush errors are log-warn only — the
-/// dirty latch retries.
+/// dirty latch retries. Finishes by firing the routing-republish trigger so
+/// the pkarr-advertised butler set reflects the new pin immediately (local
+/// writes bypass the `on_applied` debounce path).
 #[tauri::command]
 async fn set_butler_pin(
     device_id: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
     // Snapshot the handles needed (fleet_net_doc, fleet_net_sync, enrolled
-    // set, device_id, snapshot arc) from the NodeState lock — drop the lock
-    // before the async doc lock acquisition.
-    let (fleet_net_doc_arc, fleet_net_sync_arc, fleet_net_snapshot_arc, enrolled, self_device_id) = {
+    // set, device_id, snapshot arc, republish trigger) from the NodeState
+    // lock — drop the lock before the async doc lock acquisition.
+    let (
+        fleet_net_doc_arc,
+        fleet_net_sync_arc,
+        fleet_net_snapshot_arc,
+        enrolled,
+        self_device_id,
+        routing_republish,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -39160,7 +39190,15 @@ async fn set_butler_pin(
             .ok_or_else(|| "set_butler_pin: fleet-net snapshot not available".to_string())?;
         let enrolled = g.fleet_net_enrolled.clone().unwrap_or_default();
         let self_device_id = g.fleet_net_device_id.clone().unwrap_or_default();
-        (doc, sync, snapshot, enrolled, self_device_id)
+        let routing_republish = g.routing_republish.clone();
+        (
+            doc,
+            sync,
+            snapshot,
+            enrolled,
+            self_device_id,
+            routing_republish,
+        )
     };
 
     let now_ms = std::time::SystemTime::now()
@@ -39193,6 +39231,19 @@ async fn set_butler_pin(
             error = %e,
             "set_butler_pin: fleet-net flush failed; dirty latch will retry on next cycle"
         );
+    }
+
+    // ZEB-418 P2 (PR #222 round 1): a pin change is a deliberate user
+    // action — republish the pkarr routing record immediately. Local
+    // writes never fire `on_applied`, so the debounced fleet-change
+    // republish task can't see this change (its 60s debounce only covers
+    // inbound merge churn); without this the advertised butler set would
+    // stay stale until the periodic re-stamp tick. Fired regardless of the
+    // flush_now outcome above — the doc + snapshot are already updated and
+    // the blob builder reads the snapshot. The closure spawns its own
+    // tokio task (fire-and-forget), so calling it inline is fine.
+    if let Some(rp) = routing_republish {
+        rp();
     }
     Ok(())
 }
@@ -43042,6 +43093,7 @@ mod start_node_race_tests {
             fleet_net_snapshot: None,
             fleet_net_device_id: None,
             fleet_net_enrolled: None,
+            routing_republish: None,
             // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.
             iroh_endpoint: None,
             reachability_resolver: None,

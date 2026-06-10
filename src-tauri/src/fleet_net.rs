@@ -9,6 +9,12 @@ use crate::owner_state_types::Hlc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Inbound zenoh size cap for fleet-net-v1 full-doc sync frames (ZEB-418
+/// P2, PR #222 round 1). Rows are ~100 bytes/device; 64 KiB covers hundreds
+/// of devices with margin — anything larger is a malformed or hostile peer
+/// frame and is dropped before allocation.
+pub const FLEET_NET_DATASET_MAX_BYTES: usize = 64 * 1024;
+
 /// Skip-serializing sentinel: true when `h` was never set (zero wall_ms,
 /// zero logical, empty device_id). Used to omit `pinned_at` from the
 /// canonical CBOR map when the owner has never pinned a device.
@@ -182,10 +188,15 @@ pub fn butler_set_order(doc: &FleetNetDoc, stale_before_ms: u64) -> Vec<(String,
 /// key (owner_device cache in prod — devices without a resolvable vk are
 /// skipped with a debug log by the CALLER side; here just skip on `None`).
 ///
-/// Guarantees: self_entry's device appears exactly once (the snapshot row
-/// for self is replaced by self_entry's fresher transport data); pinned-first
-/// ordering via [`butler_set_order`]; falls back to `vec![self_entry]` when
-/// the snapshot yields nothing.
+/// Guarantees: self_entry's device appears exactly once, enforced
+/// UNCONDITIONALLY. When self's snapshot row is fresh it is replaced
+/// in-order by self_entry's fresher transport data; when self's row is
+/// stale or missing (cold snapshot, or fresh siblings filled the cap)
+/// self_entry is force-inserted at the front — after a pinned sibling, if
+/// any — evicting the lowest-priority entry if the set is full. Rationale:
+/// the publisher is by definition online at blob-build time (it is
+/// publishing), so its live transport data is fresher than any seen_at
+/// row. Pinned-first ordering via [`butler_set_order`].
 ///
 /// Each produced entry's `pinned` flag comes from `doc.pinned`. The wire
 /// `device_id` is the 16-byte signing-identity hash derived from the vk the
@@ -208,6 +219,7 @@ pub fn build_butler_set(
 
     let pinned_id = doc.pinned.as_deref();
     let mut out: Vec<crate::reachability_record::ButlerSetEntry> = Vec::new();
+    let mut saw_self = false;
     for (dev_id, row) in butler_set_order(doc, stale_before_ms) {
         if out.len() >= BUTLER_SET_MAX_ENTRIES {
             break;
@@ -218,6 +230,7 @@ pub fn build_butler_set(
             // replaced by self_entry's fresher transport data (live iroh
             // endpoint + relay snapshotted at blob-build time); only the
             // pinned flag comes from the doc.
+            saw_self = true;
             let mut e = self_entry.clone();
             e.pinned = pinned;
             out.push(e);
@@ -236,13 +249,26 @@ pub fn build_butler_set(
             pinned,
         });
     }
-    if out.is_empty() {
-        // Cold/empty snapshot (or every row stale/unresolvable): degrade to
-        // the P1 self-only advertisement. The pinned flag still reflects the
+    if !saw_self {
+        // Self's snapshot row is stale or missing (cold snapshot, or fresh
+        // siblings filled the cap). The publisher is by definition online
+        // NOW — it is publishing this very record — so force-include
+        // self_entry's live transport data, evicting the lowest-priority
+        // sibling if the set is full. The pinned flag still reflects the
         // doc — the pin LWW pair can survive a row wipe.
         let mut e = self_entry;
         e.pinned = pinned_id == Some(self_device_id);
-        return vec![e];
+        if out.len() >= BUTLER_SET_MAX_ENTRIES {
+            out.pop();
+        }
+        // A pinned sibling keeps slot 0 (pinned-first contract); otherwise
+        // self leads.
+        let idx = if !e.pinned && out.first().is_some_and(|f| f.pinned) {
+            1
+        } else {
+            0
+        };
+        out.insert(idx.min(out.len()), e);
     }
     out
 }
@@ -663,6 +689,106 @@ mod tests {
         assert_eq!(set.len(), 2, "skip must not consume a cap slot");
         assert_eq!(set[0].device_id, self_entry().device_id);
         assert_eq!(set[1].device_ed25519_verify, [0xCC; 32]);
+    }
+
+    #[test]
+    fn build_set_force_includes_self_when_own_row_stale() {
+        // Self's row is STALE while two fresh siblings would fill the cap.
+        // Self must still be force-included (the publisher is online at
+        // blob-build time), exactly once, at the front, evicting the
+        // lowest-priority sibling.
+        let stale_before = 1500u64;
+        let mut doc = FleetNetDoc::default();
+        doc.devices
+            .insert(self_id(), row(0x01, "relay.self.stale", hlc(1000, "self")));
+        doc.devices
+            .insert(sib1_id(), row(0x02, "relay.sib1", hlc(3000, "sib1")));
+        doc.devices
+            .insert(sib2_id(), row(0x03, "relay.sib2", hlc(2000, "sib2")));
+
+        let set = build_butler_set(
+            &doc,
+            &self_id(),
+            self_entry(),
+            &test_vk_lookup,
+            stale_before,
+        );
+        let selves: Vec<_> = set
+            .iter()
+            .filter(|e| e.device_id == self_entry().device_id)
+            .collect();
+        assert_eq!(selves.len(), 1, "self must appear exactly once");
+        assert_eq!(
+            set[0].device_id,
+            self_entry().device_id,
+            "force-inserted self leads the set"
+        );
+        assert_eq!(
+            set.len(),
+            crate::butler_deposit::BUTLER_SET_MAX_ENTRIES,
+            "cap still respected (lowest-priority sibling evicted)"
+        );
+    }
+
+    #[test]
+    fn build_set_self_stale_pinned_sibling_keeps_slot_zero() {
+        // Self's row is stale; a fresh PINNED sibling exists. The pinned
+        // sibling keeps slot 0 (pinned-first contract); self is inserted
+        // right behind it.
+        let stale_before = 1500u64;
+        let mut doc = FleetNetDoc {
+            pinned: Some(sib1_id()),
+            pinned_at: hlc(5000, "owner"),
+            ..Default::default()
+        };
+        doc.devices
+            .insert(self_id(), row(0x01, "relay.self.stale", hlc(1000, "self")));
+        doc.devices
+            .insert(sib1_id(), row(0x02, "relay.sib1", hlc(3000, "sib1")));
+
+        let set = build_butler_set(
+            &doc,
+            &self_id(),
+            self_entry(),
+            &test_vk_lookup,
+            stale_before,
+        );
+        assert_eq!(set.len(), 2);
+        assert_eq!(
+            set[0].device_ed25519_verify, [0xBB; 32],
+            "pinned sibling keeps slot 0"
+        );
+        assert!(set[0].pinned);
+        assert_eq!(
+            set[1].device_id,
+            self_entry().device_id,
+            "force-inserted self goes behind the pinned sibling"
+        );
+        assert!(!set[1].pinned);
+    }
+
+    #[test]
+    fn build_set_self_row_missing_but_pinned_self_leads() {
+        // Self has NO row at all (e.g. wiped doc) but doc.pinned == self:
+        // the force-inserted self leads with pinned=true (the pin LWW pair
+        // can survive a row wipe).
+        let mut doc = FleetNetDoc {
+            pinned: Some(self_id()),
+            pinned_at: hlc(5000, "owner"),
+            ..Default::default()
+        };
+        doc.devices
+            .insert(sib1_id(), row(0x02, "relay.sib1", hlc(3000, "sib1")));
+
+        let set = build_butler_set(&doc, &self_id(), self_entry(), &test_vk_lookup, 0);
+        assert_eq!(set.len(), 2);
+        assert_eq!(
+            set[0].device_id,
+            self_entry().device_id,
+            "pinned self leads despite missing row"
+        );
+        assert!(set[0].pinned, "pinned flag from the doc's pin LWW pair");
+        assert_eq!(set[1].device_ed25519_verify, [0xBB; 32]);
     }
 
     #[test]

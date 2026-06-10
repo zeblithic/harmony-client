@@ -9,6 +9,15 @@ use crate::owner_state_types::Hlc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Inbound zenoh size cap for dm-outhold-v1 full-doc CRDT sync frames
+/// (ZEB-418 P2, PR #222 round 1). The dataset replicates the WHOLE doc per
+/// frame, so the cap bounds a doc of ~64 max-size deposit blobs
+/// ([`crate::butler_deposit::DEPOSIT_MAX_FRAME_BYTES`] each — 16 MiB
+/// total). Outbox expiry GC bounds real growth well below this; anything
+/// larger is a malformed or hostile peer frame and is dropped before
+/// allocation.
+pub const DM_OUTHOLD_DATASET_MAX_BYTES: usize = 64 * crate::butler_deposit::DEPOSIT_MAX_FRAME_BYTES;
+
 /// Key = "{space_id_hex}:{message_cid_hex}" — same composite as DmInboxDoc::key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DmOutholdEntry {
