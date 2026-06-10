@@ -54,6 +54,19 @@ pub const BUTLER_SET_MAX_ENTRIES: usize = 2;
 /// can never make delivery worse than today.
 pub const BUTLER_SET_FRESHNESS_MS: u64 = 15 * 60 * 1_000;
 
+/// Per-sender pending-deposit quota (spec §4 "per-contact quota"): a deposit
+/// is REJECTED when the sender already has this many un-ingested
+/// (deposited-but-not-yet-ingested) entries in the `dm-inbox-v1` doc. Checked
+/// AFTER the frame signature verifies (step 4) so an unauthenticated probe
+/// can't learn quota state, and BEFORE any decryption.
+pub const INBOX_PER_SENDER_CAP: usize = 64;
+
+/// Global pending-deposit quota (spec §4 "global inbox cap"): a deposit is
+/// REJECTED when the `dm-inbox-v1` doc already holds this many entries in
+/// total, regardless of sender. Same check point as
+/// [`INBOX_PER_SENDER_CAP`].
+pub const INBOX_GLOBAL_CAP: usize = 1024;
+
 /// The sender → butler deposit request body (canonical CBOR, sent inside a
 /// length-prefixed frame). Spec §4: the butler verifies the enrollment cert
 /// chain, the `sig`, and admission (friend graph + quota) BEFORE any
