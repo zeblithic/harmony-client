@@ -145,6 +145,8 @@ pub mod dm_outhold;
 pub mod dm_outhold_persist;
 pub mod dm_signing;
 pub mod event_loop;
+pub mod fleet_net;
+pub mod fleet_net_persist;
 pub mod fleet_sync;
 pub mod folder_ingest;
 pub mod folders;
