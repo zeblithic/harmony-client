@@ -146,6 +146,8 @@ async fn inner() {
         direct_addresses: ep_a.bound_sockets(),
         announced_at_ms: hlc.wall_ms,
         identity_signature: [0; 64],
+        butler_set: Vec::new(),
+        bs_at: 0,
     };
     let payload_b = ReachabilityAnnouncePayload {
         iroh_node_id: *ep_b.node_id().as_bytes(),
@@ -153,6 +155,8 @@ async fn inner() {
         direct_addresses: ep_b_sockets,
         announced_at_ms: hlc.wall_ms,
         identity_signature: [0; 64],
+        butler_set: Vec::new(),
+        bs_at: 0,
     };
 
     resolver_a.update(owner_b, payload_b.clone(), hlc.clone());

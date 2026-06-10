@@ -494,6 +494,8 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
         direct_addresses: alice_bound.clone(),
         announced_at_ms: 1_700_000_000_000,
         identity_signature: [0xCDu8; 64],
+        butler_set: Vec::new(),
+        bs_at: 0,
     };
     let alice_routing_blob = {
         let mut buf = Vec::new();

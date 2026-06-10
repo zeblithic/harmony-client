@@ -42,6 +42,18 @@ pub const BUTLER_DEPOSIT_SEAL_INFO: &[u8] = b"harmony-zeb-418-butler-deposit-v1"
 /// allocated.
 pub const DEPOSIT_MAX_FRAME_BYTES: usize = 256 * 1024;
 
+/// Maximum number of [`crate::reachability_record::ButlerSetEntry`]s carried
+/// in the pkarr routing blob's butler set (spec §3: ordered priority list,
+/// max 2 in v1). Readers truncate anything longer (defence against oversized
+/// adversarial ads); the builder never produces more.
+pub const BUTLER_SET_MAX_ENTRIES: usize = 2;
+
+/// Freshness window for the routing blob's `bs_at` stamp (spec §3, ~15 min).
+/// Senders treat a butler set whose `bs_at` is older than this as *no
+/// butler set* and fall through to the existing retry chain — a stale ad
+/// can never make delivery worse than today.
+pub const BUTLER_SET_FRESHNESS_MS: u64 = 15 * 60 * 1_000;
+
 /// The sender → butler deposit request body (canonical CBOR, sent inside a
 /// length-prefixed frame). Spec §4: the butler verifies the enrollment cert
 /// chain, the `sig`, and admission (friend graph + quota) BEFORE any

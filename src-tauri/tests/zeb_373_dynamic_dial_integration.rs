@@ -77,6 +77,8 @@ fn payload_for(ep: &IrohEndpoint, announced_at_ms: u64) -> ReachabilityAnnounceP
         direct_addresses: ep.bound_sockets(),
         announced_at_ms,
         identity_signature: [0; 64],
+        butler_set: Vec::new(),
+        bs_at: 0,
     }
 }
 

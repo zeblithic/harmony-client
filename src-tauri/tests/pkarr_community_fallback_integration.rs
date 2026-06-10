@@ -35,6 +35,8 @@ fn fixture_routing_blob(iroh_node_id: [u8; 32]) -> Vec<u8> {
         direct_addresses: vec![],
         announced_at_ms: 1_700_000_000_000,
         identity_signature: [0xFFu8; 64],
+        butler_set: Vec::new(),
+        bs_at: 0,
     };
     let mut buf = Vec::new();
     ciborium::into_writer(&payload, &mut buf).expect("encode routing_blob");

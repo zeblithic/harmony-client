@@ -4733,6 +4733,12 @@ pub(crate) async fn start_node_inner(
                     // sig is sufficient. A Phase 2c follow-up can add a proper
                     // inner sig via `build_signed_payload` if needed.
                     let ep_for_blob = iroh_endpoint_arc.clone();
+                    // ZEB-418 SP2 P1: butler-set self-entry inputs, snapshotted
+                    // before the closure. Both are per-device constants for the
+                    // process lifetime ([u8;16]/[u8;32], Copy).
+                    let butler_self_device_id_hash = this_device_id_hash;
+                    let butler_self_device_vk =
+                        loaded.device_signing_key.verifying_key().to_bytes();
                     let blob_builder: std::sync::Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
                         std::sync::Arc::new(move || {
                             let Some(ref ep) = ep_for_blob else {
@@ -4755,6 +4761,35 @@ pub(crate) async fn start_node_inner(
                                 .unwrap_or_default()
                                 .as_millis()
                                 as u64;
+                            // ZEB-418 SP2 P1: advertise this device as a deposit
+                            // butler (spec §3). P1 publishes SELF ONLY: a sibling
+                            // secondary entry would need the sibling's iroh
+                            // endpoint id + home relay, but `FleetSyncEngine::
+                            // list_online_devices()` is async (this closure is
+                            // the sync pkarr blob contract) and yields only
+                            // device-id hex strings — there is no local
+                            // device-id → (endpoint id, relay) map yet.
+                            // ZEB-418 P2: add a sibling secondary entry once
+                            // fleet presence carries endpoint info, and hook a
+                            // 60s-debounced `list_online_devices()` fleet-change
+                            // re-register where the engine handle is available
+                            // (a self-only set doesn't change on fleet changes,
+                            // so the trigger is moot until then). Note the
+                            // PkarrPublisher rebuilds this blob on every publish
+                            // (register + epoch-schedule slots), so `bs_at` is
+                            // fresh right after boot/opt-in but exceeds
+                            // BUTLER_SET_FRESHNESS_MS between scheduled
+                            // publishes; senders then fall through to the
+                            // normal retry chain (spec §3: never worse than
+                            // today). Periodic refresh is part of the same P2
+                            // follow-up.
+                            let butler_set = vec![crate::reachability_record::ButlerSetEntry {
+                                device_id: butler_self_device_id_hash,
+                                iroh_endpoint_id: iroh_node_id,
+                                device_ed25519_verify: butler_self_device_vk,
+                                home_relay: home_relay_url.clone(),
+                                pinned: false,
+                            }];
                             let payload = crate::reachability_record::ReachabilityAnnouncePayload {
                                 iroh_node_id,
                                 home_relay_url,
@@ -4762,6 +4797,11 @@ pub(crate) async fn start_node_inner(
                                 announced_at_ms,
                                 // identity_signature is zero-filled; see comment above.
                                 identity_signature: [0u8; 64],
+                                butler_set,
+                                // The whole-set freshness stamp (spec §3) —
+                                // written at blob-build time, read via
+                                // `fresh_butler_set`.
+                                bs_at: announced_at_ms,
                             };
                             let mut out = Vec::new();
                             if ciborium::into_writer(&payload, &mut out).is_err() {
@@ -43331,6 +43371,8 @@ mod zeb_321_event_loop_wiring_tests {
             direct_addresses: vec![],
             announced_at_ms: 1000,
             identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         };
         let mut payload_a2 = payload_a.clone();
         payload_a2.iroh_node_id = [0x02; 32];
@@ -43409,6 +43451,8 @@ mod zeb_321_event_loop_wiring_tests {
             direct_addresses: vec![],
             announced_at_ms: 1000,
             identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         };
         let mut payload_admin = payload_target.clone();
         payload_admin.iroh_node_id = [0xAA; 32];
@@ -43740,6 +43784,8 @@ mod zeb_321_connectivity_ipc_tests {
             direct_addresses: vec![],
             announced_at_ms: 1_700_000_000_000,
             identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
         };
         let hlc = Hlc {
             wall_ms: 1_700_000_000_000,
