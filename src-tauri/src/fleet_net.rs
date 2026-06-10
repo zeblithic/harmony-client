@@ -456,4 +456,78 @@ mod tests {
             "FleetNetDoc wire encoding drifted from pinned fixture.\nactual hex: {actual}"
         );
     }
+
+    // ── Engine-wiring proof ───────────────────────────────────────────────────
+
+    /// End-to-end engine-wiring proof (ZEB-418 P2 Task 6): a real
+    /// `FleetSyncEngine<FleetNetDoc>` configured exactly as `start_node`
+    /// configures it (FleetNetPersist sink, `merge_from` merger,
+    /// `publish_seen: true`, lookup tag `b"fleet-net-v1"`, `on_applied:
+    /// None` — Task 7 adds the snapshot refresh) must emit an outbound
+    /// wire frame on the publisher channel when a local self-row upsert is
+    /// followed by `notify_dirty` + `flush_now`. Mirrors
+    /// `dm_inbox_ingest::dm_inbox_engine_publishes_on_local_write`
+    /// site-for-site.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fleet_net_engine_publishes_on_local_write() {
+        use crate::content_store::{ContentStore, InMemoryStub};
+        use crate::fleet_net_persist::FleetNetPersist;
+        use crate::fleet_sync::{FleetSyncConfig, FleetSyncEngine, Merger, DEFAULT_DEBOUNCE_MS};
+        use crate::owner_state_crypto::KeyTree;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::{mpsc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let kt = Arc::new(KeyTree::derive(&[0x66u8; 32]).expect("derive kt"));
+        let doc = Arc::new(Mutex::new(FleetNetDoc::default()));
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let merger: Merger<FleetNetDoc> = Arc::new(|local, remote| local.merge_from(remote));
+
+        let engine = FleetSyncEngine::<FleetNetDoc>::new(FleetSyncConfig {
+            kt,
+            device_id: "dev-A".to_string(),
+            state: Arc::clone(&doc),
+            merger,
+            replay_tracker: Arc::clone(&tracker),
+            content_store: cas,
+            publisher_tx: out_tx,
+            subscriber_rx: in_rx,
+            persist: Arc::new(FleetNetPersist {
+                doc_path: dir.path().join("fleet_net.cbor"),
+                replay_path: dir.path().join("fleet_net_replay.cbor"),
+            }),
+            lookup_key_tag: b"fleet-net-v1",
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            publish_seen: true,
+            on_applied: None,
+            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+        });
+
+        // A local self-row upsert (what start_node's post-bind upsert
+        // does under the doc lock), then force the engine to publish.
+        {
+            let mut guard = doc.lock().await;
+            guard.devices.insert(
+                "aaaa".repeat(16),
+                row(0x01, "relay.example.com", hlc(1000, "dev-A")),
+            );
+        }
+        engine.notify_dirty();
+        engine.flush_now().await.unwrap();
+
+        // The local write must have driven a (non-empty) publish frame
+        // onto the outbound channel.
+        let frame = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("publish frame produced within 5s")
+            .expect("publisher channel yielded Some(frame)");
+        assert!(!frame.is_empty(), "published wire frame must be non-empty");
+
+        let _ = engine.shutdown().await;
+    }
 }

@@ -623,4 +623,83 @@ mod tests {
             .expect("sweeper must exit when nudge senders drop")
             .expect("sweeper must not panic");
     }
+
+    /// End-to-end engine-wiring proof (ZEB-418 P2 Task 6): a real
+    /// `FleetSyncEngine<DmOutholdDoc>` configured exactly as `start_node`
+    /// configures it (DmOutholdPersist sink, `merge_from` merger,
+    /// `publish_seen: true`, lookup tag `b"dm-outhold-v1"`, `on_applied` =
+    /// the outhold nudge) must emit an outbound wire frame on the publisher
+    /// channel when a local hold write is followed by `notify_dirty` +
+    /// `flush_now`. Mirrors
+    /// `dm_inbox_ingest::dm_inbox_engine_publishes_on_local_write`
+    /// site-for-site.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dm_outhold_engine_publishes_on_local_write() {
+        use crate::content_store::{ContentStore, InMemoryStub};
+        use crate::dm_outhold_persist::DmOutholdPersist;
+        use crate::fleet_sync::{FleetSyncConfig, FleetSyncEngine, Merger, DEFAULT_DEBOUNCE_MS};
+        use crate::owner_state_crypto::KeyTree;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kt = Arc::new(KeyTree::derive(&[0x55u8; 32]).expect("derive kt"));
+        let doc = Arc::new(Mutex::new(DmOutholdDoc::default()));
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let merger: Merger<DmOutholdDoc> = Arc::new(|local, remote| local.merge_from(remote));
+        // The nudge channel exactly as start_node wires it (the receiver
+        // half would feed `run_dm_outhold_sweeper`; this test proves the
+        // ENGINE wiring, so the rx is simply held).
+        let (nudge_tx, _nudge_rx) = mpsc::channel::<()>(1);
+
+        let engine = FleetSyncEngine::<DmOutholdDoc>::new(FleetSyncConfig {
+            kt,
+            device_id: "dev-A".to_string(),
+            state: Arc::clone(&doc),
+            merger,
+            replay_tracker: Arc::clone(&tracker),
+            content_store: cas,
+            publisher_tx: out_tx,
+            subscriber_rx: in_rx,
+            persist: Arc::new(DmOutholdPersist {
+                doc_path: dir.path().join("dm_outhold.cbor"),
+                replay_path: dir.path().join("dm_outhold_replay.cbor"),
+            }),
+            lookup_key_tag: b"dm-outhold-v1",
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            publish_seen: true,
+            on_applied: Some(outhold_nudge_on_applied(nudge_tx)),
+            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+        });
+
+        // A local hold write (what send_dm's Task-3 hold path does under
+        // the doc lock), then force the engine to publish.
+        {
+            let key = DmOutholdDoc::key(&SPACE, &CID_BYTES);
+            let entry = crate::dm_outhold::DmOutholdEntry {
+                storage_blob: vec![0xAA, 0xBB],
+                space_id: SPACE,
+                created_at: crate::owner_state_types::Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "dev-A".into(),
+                },
+            };
+            doc.lock().await.entries.insert(key, entry);
+        }
+        engine.notify_dirty();
+        engine.flush_now().await.unwrap();
+
+        // The local write must have driven a (non-empty) publish frame
+        // onto the outbound channel.
+        let frame = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("publish frame produced within 5s")
+            .expect("publisher channel yielded Some(frame)");
+        assert!(!frame.is_empty(), "published wire frame must be non-empty");
+
+        let _ = engine.shutdown().await;
+    }
 }

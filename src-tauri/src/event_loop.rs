@@ -79,6 +79,32 @@ pub struct DmInboxSyncHandles {
     pub inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
+/// ZEB-418 SP2 P2: generic owner-dataset fleet-sync Zenoh adapter handles.
+/// Same shape as [`DmInboxSyncHandles`] / [`NotesSyncHandles`] — constructed
+/// in `start_node` alongside a `FleetSyncEngine`, consumed inside
+/// `event_loop::run` once the Zenoh session is open. The topic is
+/// `harmony/owner/{addr_hex}/ds/{dataset}` where `{dataset}` is supplied at
+/// the consumption site (see [`P2SyncHandles`]).
+pub struct DatasetSyncHandles {
+    /// Hex-encoded OWNER identity address — forms the per-dataset topic key
+    /// `harmony/owner/{addr_hex}/ds/{dataset}`.
+    pub addr_hex: String,
+    /// Encrypted bytes from the engine's publish path → Zenoh put.
+    pub outbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Encrypted bytes from Zenoh → the engine's subscribe path.
+    pub inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+/// ZEB-418 SP2 P2: the two P2 dataset adapter handle pairs, bundled so
+/// `run(...)` grows ONE parameter instead of two. `None` when no owner
+/// identity is loaded (and in test callers that bypass `start_node`).
+pub struct P2SyncHandles {
+    /// dm-outhold-v1 — sender-side outbound-hold blobs (spec D12).
+    pub outhold: DatasetSyncHandles,
+    /// fleet-net-v1 — per-device network info + pinned butler (spec §5–§6).
+    pub fleet_net: DatasetSyncHandles,
+}
+
 /// One per-community adapter request handed from `start_node` (lib.rs)
 /// into the event loop's Zenoh-session scope.
 ///
@@ -425,6 +451,148 @@ async fn emit_moderation_changed<R: Runtime>(
     );
 }
 
+/// ZEB-418 SP2 P2: wire one [`DatasetSyncHandles`] pair to a Zenoh pub/sub
+/// on `harmony/owner/{addr_hex}/ds/{dataset}`. Parameterized copy of the
+/// dm-inbox consumption block inside `run` (same outbound drain → put loop,
+/// same backoff-resubscribe inbound loop, same degraded-event emits) —
+/// extracted because P2 wires TWO datasets (dm-outhold-v1 + fleet-net-v1)
+/// with identical plumbing.
+///
+/// `dataset` is the topic suffix (e.g. `"dm-outhold-v1"`); `degraded_event`
+/// is the Tauri event emitted on adapter degradation (e.g.
+/// `"dm-outhold-sync-degraded"`).
+async fn spawn_dataset_sync_zenoh_adapter<R: Runtime>(
+    session: &zenoh::Session,
+    app: &AppHandle<R>,
+    closing: &Arc<AtomicBool>,
+    handles: DatasetSyncHandles,
+    dataset: &'static str,
+    degraded_event: &'static str,
+) {
+    let topic = format!("harmony/owner/{}/ds/{}", handles.addr_hex, dataset);
+    let emit_degraded = |reason: &str| {
+        let _ = app.emit(
+            degraded_event,
+            serde_json::json!({
+                "reason": reason,
+                "topic": &topic,
+            }),
+        );
+    };
+    match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
+        Ok(key_expr) => {
+            // Outbound: drain engine publisher → Zenoh put.
+            let session_pub = session.clone();
+            let key_pub = key_expr.clone();
+            let mut outbound_rx = handles.outbound_rx;
+            let closing_pub = Arc::clone(closing);
+            tokio::spawn(async move {
+                while let Some(bytes) = outbound_rx.recv().await {
+                    if let Err(e) = session_pub.put(&key_pub, bytes).await {
+                        if !closing_pub.load(Ordering::SeqCst) {
+                            tracing::warn!(error = %e, dataset, "dataset-root publish failed");
+                        }
+                    }
+                }
+            });
+
+            // Inbound: Zenoh subscriber → engine subscriber_rx.
+            // On transient recv_async errors, re-declare the subscriber
+            // with exponential backoff. The only terminal condition is
+            // `closing` becoming true (node shutdown) or `inbound_tx.send`
+            // failing (engine dropped its receiver).
+            match session.declare_subscriber(&key_expr).await {
+                Ok(sub) => {
+                    let inbound_tx = handles.inbound_tx;
+                    let closing_sub = Arc::clone(closing);
+                    let app_late = app.clone();
+                    let topic_late = topic.clone();
+                    let session_sub = session.clone();
+                    let key_expr_sub = key_expr.clone();
+                    tokio::spawn(async move {
+                        let mut current_sub = sub;
+                        let mut backoff_ms: u64 = 100;
+                        'outer: loop {
+                            loop {
+                                match current_sub.recv_async().await {
+                                    Ok(sample) => {
+                                        backoff_ms = 100; // reset on success
+                                        let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                        if inbound_tx.send(bytes).await.is_err() {
+                                            // Engine dropped its receiver — clean shutdown.
+                                            break 'outer;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        if closing_sub.load(Ordering::SeqCst) {
+                                            break 'outer;
+                                        }
+                                        tracing::warn!(
+                                            backoff_ms,
+                                            dataset,
+                                            "dataset-root subscriber closed unexpectedly; \
+                                             will re-declare after backoff"
+                                        );
+                                        let _ = app_late.emit(
+                                            degraded_event,
+                                            serde_json::json!({
+                                                "reason": "subscriber_closed",
+                                                "topic": &topic_late,
+                                            }),
+                                        );
+                                        break; // break inner, retry outer
+                                    }
+                                }
+                            }
+                            if closing_sub.load(Ordering::SeqCst) {
+                                break 'outer;
+                            }
+                            // Exponential backoff before re-declaring.
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            backoff_ms = (backoff_ms * 2).min(30_000);
+                            match session_sub.declare_subscriber(&key_expr_sub).await {
+                                Ok(new_sub) => {
+                                    tracing::info!(
+                                        dataset,
+                                        "dataset-root subscriber re-declared successfully"
+                                    );
+                                    current_sub = new_sub;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        backoff_ms,
+                                        dataset,
+                                        "dataset-root subscriber re-declare failed; retrying"
+                                    );
+                                    // Don't reset backoff — keep backing off.
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        dataset,
+                        "failed to declare dataset-root subscriber"
+                    );
+                    emit_degraded("declare_subscriber_failed");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                %topic,
+                dataset,
+                "dataset-root key_expr invalid; FleetSyncEngine Zenoh adapter skipped"
+            );
+            emit_degraded("key_expr_invalid");
+        }
+    }
+}
+
 /// Run the NodeRuntime event loop as a background task.
 ///
 /// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
@@ -576,6 +744,11 @@ pub async fn run<R: Runtime>(
     // Zenoh on `harmony/owner/{addr_hex}/ds/dm-inbox-v1`. `None` when no
     // owner identity is loaded (and in test callers that bypass `start_node`).
     mut dm_inbox_sync_handles: Option<DmInboxSyncHandles>,
+    // ZEB-418 SP2 P2: the two P2 dataset channel pairs (dm-outhold-v1 +
+    // fleet-net-v1), bridged to Zenoh on
+    // `harmony/owner/{addr_hex}/ds/{dataset}`. `None` when no owner
+    // identity is loaded (and in test callers that bypass `start_node`).
+    mut p2_sync_handles: Option<P2SyncHandles>,
     // ZEB-321 Phase 1 Task 8: bundle of iroh-transport resources built in
     // `start_node`. When `Some`, the event loop spawns the link-manager
     // accept loop + publisher driver as background tasks; when `None`
@@ -1285,6 +1458,33 @@ pub async fn run<R: Runtime>(
                 emit_dm_inbox_degraded("key_expr_invalid");
             }
         }
+    }
+
+    // ── ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync Zenoh adapters ─
+    // Same plumbing as the dm-inbox block above (extracted into
+    // `spawn_dataset_sync_zenoh_adapter` because P2 wires two datasets):
+    // outbound bytes from each FleetSyncEngine's publish path → Zenoh put;
+    // inbound bytes from Zenoh → the engine's subscriber path. `None` when
+    // no owner identity is loaded.
+    if let Some(p2) = p2_sync_handles.take() {
+        spawn_dataset_sync_zenoh_adapter(
+            &session,
+            &app,
+            &closing,
+            p2.outhold,
+            "dm-outhold-v1",
+            "dm-outhold-sync-degraded",
+        )
+        .await;
+        spawn_dataset_sync_zenoh_adapter(
+            &session,
+            &app,
+            &closing,
+            p2.fleet_net,
+            "fleet-net-v1",
+            "fleet-net-sync-degraded",
+        )
+        .await;
     }
 
     // ── ZEB-217 Sub-C Phase 2: per-community state-CRDT Zenoh adapters ──

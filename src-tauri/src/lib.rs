@@ -890,6 +890,38 @@ pub struct NodeState {
     >,
     pub dm_inbox_device_id: Option<String>,
 
+    /// ZEB-418 SP2 P2: dm-outhold dataset (sender-side outbound-hold blobs,
+    /// spec D12). `Some` while the node is running and an owner identity is
+    /// loaded; `None` before the FleetSyncEngine is wired at startup or
+    /// after stop_node. Consumed by `DmOutbox::send_dm`'s hold write (via
+    /// `set_outhold`) + the apply sweeper; held here so stop_inner can shut
+    /// the engine down and so a restart re-loads from disk. Mirrors the
+    /// dm_inbox handles above field-for-field.
+    pub dm_outhold_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outhold::DmOutholdDoc>>>,
+    pub dm_outhold_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+    >,
+    pub dm_outhold_sync:
+        Option<std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::dm_outhold::DmOutholdDoc>>>,
+    pub dm_outhold_device_id: Option<String>,
+
+    /// ZEB-418 SP2 P2: fleet-net dataset (per-device network info +
+    /// owner-level pinned butler, spec §5–§6). `Some` while the node is
+    /// running and an owner identity is loaded; `None` before the
+    /// FleetSyncEngine is wired at startup or after stop_node. Mirrors the
+    /// dm_inbox handle shapes (no device_id field — the fleet-net IPC
+    /// surface arrives with a later P2 task).
+    pub fleet_net_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::fleet_net::FleetNetDoc>>>,
+    pub fleet_net_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+    >,
+    pub fleet_net_sync:
+        Option<std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::fleet_net::FleetNetDoc>>>,
+
     /// ZEB-321 Phase 1 Task 8: iroh endpoint Arc. `Some` while node is
     /// running AND the keychain-resident secret key + bind both succeeded;
     /// `None` otherwise (tests, headless platforms, bind failure). Task 9's
@@ -1216,6 +1248,16 @@ impl Default for NodeState {
             dm_inbox_tracker: None,
             dm_inbox_sync: None,
             dm_inbox_device_id: None,
+            // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles stay
+            // None until start_node wires the FleetSyncEngines (mirrors
+            // dm-inbox).
+            dm_outhold_doc: None,
+            dm_outhold_tracker: None,
+            dm_outhold_sync: None,
+            dm_outhold_device_id: None,
+            fleet_net_doc: None,
+            fleet_net_tracker: None,
+            fleet_net_sync: None,
             // ZEB-321 Phase 1 Task 8: iroh handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
             iroh_endpoint: None,
@@ -1452,6 +1494,14 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let dm_inbox_sync_for_shutdown: Option<
         std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::dm_inbox_crdt::DmInboxDoc>>,
     >;
+    // ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync engines, taken
+    // outside the lock for the same ephemeral-runtime shutdown pattern.
+    let dm_outhold_sync_for_shutdown: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::dm_outhold::DmOutholdDoc>>,
+    >;
+    let fleet_net_sync_for_shutdown: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::fleet_net::FleetNetDoc>>,
+    >;
     let (
         shutdown_tx,
         thread,
@@ -1642,6 +1692,22 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.dm_inbox_doc = None;
         guard.dm_inbox_tracker = None;
         guard.dm_inbox_device_id = None;
+        // ZEB-418 SP2 P2: take the dm-outhold + fleet-net engines for
+        // shutdown and clear the remaining handles (mirrors dm-inbox). The
+        // dm-outhold engine shutdown ALSO stops the apply sweeper: the
+        // engine task's `on_applied` closure owns the only nudge sender, so
+        // once the engine task exits the sweeper's `recv()` yields `None`
+        // and the task returns. The DmOutbox's installed outhold handles
+        // (doc Arc + notify_dirty closure) die with the outbox itself —
+        // stop_inner drops the whole DmOutbox alongside the runtime, and a
+        // restart constructs a fresh outbox + fresh `set_outhold` install.
+        dm_outhold_sync_for_shutdown = guard.dm_outhold_sync.take();
+        guard.dm_outhold_doc = None;
+        guard.dm_outhold_tracker = None;
+        guard.dm_outhold_device_id = None;
+        fleet_net_sync_for_shutdown = guard.fleet_net_sync.take();
+        guard.fleet_net_doc = None;
+        guard.fleet_net_tracker = None;
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -2011,6 +2077,64 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                         tracing::error!(
                             error = %e,
                             "could not build ephemeral tokio runtime for dm-inbox \
+                             FleetSyncEngine shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-418 SP2 P2: shut down the dm-outhold fleet-sync engine alongside
+    // dm-inbox so its final debounced publish + persist pass runs before
+    // the event-loop thread is joined. Same ephemeral-runtime pattern.
+    // This also stops the apply sweeper (the engine task's exit drops the
+    // only nudge sender — see the take above).
+    if let Some(dm_outhold_engine) = dm_outhold_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(dm_outhold_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "dm-outhold FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for dm-outhold \
+                             FleetSyncEngine shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-418 SP2 P2: shut down the fleet-net fleet-sync engine the same way.
+    if let Some(fleet_net_engine) = fleet_net_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(fleet_net_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "fleet-net FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for fleet-net \
                              FleetSyncEngine shutdown — final flush skipped"
                         );
                     }
@@ -2650,6 +2774,39 @@ pub(crate) async fn start_node_inner(
         > = None;
         let mut dm_inbox_device_id_opt: Option<String> = None;
         let mut dm_inbox_sync_handles_opt: Option<crate::event_loop::DmInboxSyncHandles> = None;
+        // ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync engines + their
+        // NodeState handles. Built alongside the dm-inbox engine when an
+        // owner identity loads; lifted to outer scope so the NodeState
+        // assignment and the event_loop::run call site can reach them.
+        // Mirrors the dm_inbox opts above field-for-field.
+        let mut dm_outhold_doc_opt: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::dm_outhold::DmOutholdDoc>>,
+        > = None;
+        let mut dm_outhold_tracker_opt: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<
+                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                >,
+            >,
+        > = None;
+        let mut dm_outhold_sync_engine_opt: Option<
+            std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::dm_outhold::DmOutholdDoc>>,
+        > = None;
+        let mut dm_outhold_device_id_opt: Option<String> = None;
+        let mut fleet_net_doc_opt: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::fleet_net::FleetNetDoc>>,
+        > = None;
+        let mut fleet_net_tracker_opt: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<
+                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                >,
+            >,
+        > = None;
+        let mut fleet_net_sync_engine_opt: Option<
+            std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::fleet_net::FleetNetDoc>>,
+        > = None;
+        let mut p2_sync_handles_opt: Option<crate::event_loop::P2SyncHandles> = None;
         // ZEB-225 Sub-B Phase 2: lift the per-identity handles SyncEngine
         // depends on (device_id, self_owner, crdt_state, tracker,
         // content_store) out of the `if let Some(seed)` block so the
@@ -3527,6 +3684,206 @@ pub(crate) async fn start_node_inner(
                         addr_hex: owner_addr_hex.clone(),
                         outbound_rx: dm_inbox_out_rx,
                         inbound_tx: dm_inbox_in_tx,
+                    });
+
+                    // ── ZEB-418 SP2 P2 Task 6: dm-outhold fleet-sync engine ─
+                    //
+                    // Sender-side outbound-hold dataset (spec D12):
+                    // send_dm's storage blobs replicated across the owner's
+                    // fleet so siblings can serve CidNotify fetch-backs and
+                    // build butler deposits. Mirrors the dm-inbox wiring
+                    // above site-for-site. `on_applied` nudges the apply
+                    // sweeper (CAS admit + status-driven GC). Unlike
+                    // dm-inbox there is NO acceptor-side nudger — the
+                    // engine's `on_applied` closure holds the only sender,
+                    // so a plain channel(1) suffices (no WeakSender split).
+                    let dm_outhold_path =
+                        identity_dir.join(crate::dm_outhold_persist::DM_OUTHOLD_FILENAME);
+                    let dm_outhold_replay_path =
+                        identity_dir.join(crate::dm_outhold_persist::DM_OUTHOLD_REPLAY_FILENAME);
+                    let dm_outhold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::dm_outhold_persist::load_doc_or_recover(&dm_outhold_path),
+                    ));
+                    let dm_outhold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::dm_outhold_persist::load_replay_or_recover(&dm_outhold_replay_path),
+                    ));
+                    let (dm_outhold_out_tx, dm_outhold_out_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let (dm_outhold_in_tx, dm_outhold_in_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let dm_outhold_merger: crate::fleet_sync::Merger<
+                        crate::dm_outhold::DmOutholdDoc,
+                    > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                    let (dm_outhold_nudge_tx, dm_outhold_nudge_rx) =
+                        tokio::sync::mpsc::channel::<()>(1);
+                    let dm_outhold_sync =
+                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                            crate::fleet_sync::FleetSyncConfig {
+                                kt: std::sync::Arc::clone(&kt),
+                                device_id: device_id.clone(),
+                                state: std::sync::Arc::clone(&dm_outhold_doc),
+                                merger: dm_outhold_merger,
+                                replay_tracker: std::sync::Arc::clone(&dm_outhold_tracker),
+                                content_store: std::sync::Arc::clone(&content_store),
+                                publisher_tx: dm_outhold_out_tx,
+                                subscriber_rx: dm_outhold_in_rx,
+                                persist: std::sync::Arc::new(
+                                    crate::dm_outhold_persist::DmOutholdPersist {
+                                        doc_path: dm_outhold_path,
+                                        replay_path: dm_outhold_replay_path,
+                                    },
+                                ),
+                                lookup_key_tag: b"dm-outhold-v1",
+                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                publish_seen: true,
+                                on_applied: Some(
+                                    crate::dm_outhold_apply::outhold_nudge_on_applied(
+                                        dm_outhold_nudge_tx,
+                                    ),
+                                ),
+                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                    std::collections::BTreeMap::new(),
+                                )),
+                            },
+                        ));
+                    // The apply sweeper: one startup sweep (rows that
+                    // replicated while this device was offline), then one
+                    // debounced sweep per on_applied nudge burst. Exits when
+                    // the engine shuts down (its on_applied closure owns the
+                    // only nudge sender) — stop_inner's engine shutdown is
+                    // its shutdown. Mirrors the dm-inbox sweeper spawn.
+                    {
+                        let dm_outhold_ctx: std::sync::Arc<
+                            dyn crate::dm_outhold_apply::DmOutholdCtx,
+                        > = std::sync::Arc::new(crate::dm_outhold_apply::ProdDmOutholdCtx {
+                            crdt_state: std::sync::Arc::clone(&crdt_state),
+                            content_store: std::sync::Arc::clone(&content_store),
+                        });
+                        let sweeper_engine = std::sync::Arc::clone(&dm_outhold_sync);
+                        tokio::spawn(crate::dm_outhold_apply::run_dm_outhold_sweeper(
+                            std::sync::Arc::clone(&dm_outhold_doc),
+                            dm_outhold_ctx,
+                            dm_outhold_nudge_rx,
+                            std::sync::Arc::new(move || sweeper_engine.notify_dirty()),
+                            std::time::Duration::from_millis(
+                                crate::dm_outhold_apply::OUTHOLD_SWEEP_DEBOUNCE_MS,
+                            ),
+                        ));
+                    }
+                    dm_outhold_doc_opt = Some(std::sync::Arc::clone(&dm_outhold_doc));
+                    dm_outhold_tracker_opt = Some(std::sync::Arc::clone(&dm_outhold_tracker));
+                    dm_outhold_sync_engine_opt = Some(std::sync::Arc::clone(&dm_outhold_sync));
+                    dm_outhold_device_id_opt = Some(device_id.clone());
+
+                    // ── ZEB-418 SP2 P2 Task 6: fleet-net fleet-sync engine ─
+                    //
+                    // Per-device network info (iroh endpoint id + home
+                    // relay) + owner-level pinned butler (spec §5–§6),
+                    // feeding the butler-set advertisement in the owner's
+                    // pkarr routing record. Same recipe as dm-outhold.
+                    let fleet_net_path =
+                        identity_dir.join(crate::fleet_net_persist::FLEET_NET_FILENAME);
+                    let fleet_net_replay_path =
+                        identity_dir.join(crate::fleet_net_persist::FLEET_NET_REPLAY_FILENAME);
+                    let fleet_net_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::fleet_net_persist::load_doc_or_recover(&fleet_net_path),
+                    ));
+                    let fleet_net_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::fleet_net_persist::load_replay_or_recover(&fleet_net_replay_path),
+                    ));
+                    let (fleet_net_out_tx, fleet_net_out_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let (fleet_net_in_tx, fleet_net_in_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let fleet_net_merger: crate::fleet_sync::Merger<crate::fleet_net::FleetNetDoc> =
+                        std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                    let fleet_net_sync =
+                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                            crate::fleet_sync::FleetSyncConfig {
+                                kt: std::sync::Arc::clone(&kt),
+                                device_id: device_id.clone(),
+                                state: std::sync::Arc::clone(&fleet_net_doc),
+                                merger: fleet_net_merger,
+                                replay_tracker: std::sync::Arc::clone(&fleet_net_tracker),
+                                content_store: std::sync::Arc::clone(&content_store),
+                                publisher_tx: fleet_net_out_tx,
+                                subscriber_rx: fleet_net_in_rx,
+                                persist: std::sync::Arc::new(
+                                    crate::fleet_net_persist::FleetNetPersist {
+                                        doc_path: fleet_net_path,
+                                        replay_path: fleet_net_replay_path,
+                                    },
+                                ),
+                                lookup_key_tag: b"fleet-net-v1",
+                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                publish_seen: true,
+                                // ZEB-418 P2 Task 7: the pkarr butler-set
+                                // snapshot refresh hooks in here (an applied
+                                // remote row changes the advertised set).
+                                on_applied: None,
+                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                    std::collections::BTreeMap::new(),
+                                )),
+                            },
+                        ));
+                    // Fleet-net self-row upsert: when the iroh endpoint
+                    // bound (it binds earlier in start_node, before this
+                    // owner-loaded block), record this device's network
+                    // coordinates so the doc contains our row by the end of
+                    // start_node. `home_relay` may still be empty this soon
+                    // after bind (`unwrap_or_default`, same as the pkarr
+                    // blob_builder snapshot) — Task 7's refresh re-stamps
+                    // it. The HLC comes from `reserve_next_hlc_for_device`
+                    // over the owner HLC tracker (same recipe as the
+                    // reachability publisher's startup-time stamps; no
+                    // outbox lock needed). Failure to flush is log-warn
+                    // only — never fails start_node.
+                    if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let seen_at = crate::dm_outbox::reserve_next_hlc_for_device(
+                            &tracker, &device_id, now_ms,
+                        )
+                        .await;
+                        {
+                            let mut doc = fleet_net_doc.lock().await;
+                            doc.devices.insert(
+                                device_id.clone(),
+                                crate::fleet_net::FleetNetRow {
+                                    iroh_endpoint_id: *ep_arc.node_id().as_bytes(),
+                                    home_relay: ep_arc
+                                        .home_relay()
+                                        .map(|r| r.to_string())
+                                        .unwrap_or_default(),
+                                    seen_at,
+                                },
+                            );
+                        }
+                        fleet_net_sync.notify_dirty();
+                        if let Err(e) = fleet_net_sync.flush_now().await {
+                            tracing::warn!(
+                                error = %e,
+                                "ZEB-418 P2: fleet-net self-row flush failed at start_node; \
+                                 the debounced publisher will retry on the next dirty mark"
+                            );
+                        }
+                    }
+                    fleet_net_doc_opt = Some(std::sync::Arc::clone(&fleet_net_doc));
+                    fleet_net_tracker_opt = Some(std::sync::Arc::clone(&fleet_net_tracker));
+                    fleet_net_sync_engine_opt = Some(std::sync::Arc::clone(&fleet_net_sync));
+                    p2_sync_handles_opt = Some(crate::event_loop::P2SyncHandles {
+                        outhold: crate::event_loop::DatasetSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: dm_outhold_out_rx,
+                            inbound_tx: dm_outhold_in_tx,
+                        },
+                        fleet_net: crate::event_loop::DatasetSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: fleet_net_out_rx,
+                            inbound_tx: fleet_net_in_tx,
+                        },
                     });
 
                     // ── ZEB-217 Sub-C Phase 2 + Phase 3 Task 8: per-community state CRDT sync ─
@@ -5403,6 +5760,21 @@ pub(crate) async fn start_node_inner(
                         }
                     }
 
+                    // ZEB-418 SP2 P2 Task 6: install the outbound-hold
+                    // handles on the DmOutbox so send_dm's hold write
+                    // (Task 3) fires. Installed UNCONDITIONALLY (outside
+                    // the iroh-gated deposit-client block above): the hold
+                    // write is a local CRDT mutation replicated over the
+                    // zenoh fleet-sync path — it does not depend on the
+                    // iroh butler transport being up.
+                    {
+                        let outhold_engine = std::sync::Arc::clone(&dm_outhold_sync);
+                        outbox.lock().await.set_outhold(
+                            std::sync::Arc::clone(&dm_outhold_doc),
+                            std::sync::Arc::new(move || outhold_engine.notify_dirty()),
+                        );
+                    }
+
                     // Lift the per-identity handles out for NodeState
                     // assignment below.
                     device_id_for_state = Some(device_id);
@@ -5676,6 +6048,9 @@ pub(crate) async fn start_node_inner(
                 // ZEB-418 SP2 P1: thread the dm-inbox adapter handles into
                 // event_loop::run (mirrors notes).
                 let dm_inbox_sync_handles_for_loop = dm_inbox_sync_handles_opt;
+                // ZEB-418 SP2 P2: thread the dm-outhold + fleet-net adapter
+                // handle bundle into event_loop::run (mirrors dm-inbox).
+                let p2_sync_handles_for_loop = p2_sync_handles_opt;
                 // ZEB-321 Phase 1 Task 8: shadow the outer-scope binding into
                 // a move-capturable local so the thread closure can take
                 // ownership without disturbing the iroh_endpoint_arc /
@@ -5796,6 +6171,7 @@ pub(crate) async fn start_node_inner(
                                 mint_sync_handles_for_loop,
                                 notes_sync_handles_for_loop,
                                 dm_inbox_sync_handles_for_loop,
+                                p2_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                                 dial_telemetry_into_loop,
                                 serve_allowlist_for_loop,
@@ -5969,6 +6345,17 @@ pub(crate) async fn start_node_inner(
                         guard.dm_inbox_tracker = dm_inbox_tracker_opt.clone();
                         guard.dm_inbox_sync = dm_inbox_sync_engine_opt.clone();
                         guard.dm_inbox_device_id = dm_inbox_device_id_opt.clone();
+                        // ZEB-418 SP2 P2: store the dm-outhold + fleet-net
+                        // dataset handles (no IPC surface yet — stop_inner
+                        // and the send_dm hold-write/apply-sweeper paths
+                        // constructed above are the consumers).
+                        guard.dm_outhold_doc = dm_outhold_doc_opt.clone();
+                        guard.dm_outhold_tracker = dm_outhold_tracker_opt.clone();
+                        guard.dm_outhold_sync = dm_outhold_sync_engine_opt.clone();
+                        guard.dm_outhold_device_id = dm_outhold_device_id_opt.clone();
+                        guard.fleet_net_doc = fleet_net_doc_opt.clone();
+                        guard.fleet_net_tracker = fleet_net_tracker_opt.clone();
+                        guard.fleet_net_sync = fleet_net_sync_engine_opt.clone();
                         // ZEB-321 Phase 1 Task 8: stash iroh resources so
                         // Task 9 IPC handlers can reach them via NodeState.
                         // All three are `Option`-shaped because iroh boot
@@ -6177,6 +6564,11 @@ pub(crate) async fn start_node_inner(
             // (mirrors notes; its shutdown on the cleanup path also stops the
             // ingest sweeper by dropping the engine task's nudge sender).
             dm_inbox_sync_engine_opt,
+            // ZEB-418 SP2 P2: same carry-out for the dm-outhold + fleet-net
+            // FleetSyncEngines (the dm-outhold shutdown also stops the apply
+            // sweeper by dropping the engine task's nudge sender).
+            dm_outhold_sync_engine_opt,
+            fleet_net_sync_engine_opt,
             node_addr_for_response,
             freshly_created,
             has_owner_identity,
@@ -6196,6 +6588,8 @@ pub(crate) async fn start_node_inner(
         mint_engine_for_cleanup,
         notes_engine_for_cleanup,
         dm_inbox_engine_for_cleanup,
+        dm_outhold_engine_for_cleanup,
+        fleet_net_engine_for_cleanup,
         node_addr_for_response,
         freshly_created,
         has_owner_identity,
@@ -6305,6 +6699,27 @@ pub(crate) async fn start_node_inner(
                 tracing::error!(
                     error = %e,
                     "dm-inbox FleetSyncEngine cleanup after start_node failure"
+                );
+            }
+        }
+        // ZEB-418 SP2 P2: same rationale for the dm-outhold + fleet-net
+        // FleetSyncEngines (mirrors dm-inbox — construction may have
+        // succeeded before a later step aborted the install). The
+        // dm-outhold shutdown also exits the apply sweeper: the engine
+        // task's on_applied closure holds the only nudge sender.
+        if let Some(dm_outhold_engine) = dm_outhold_engine_for_cleanup {
+            if let Err(e) = dm_outhold_engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "dm-outhold FleetSyncEngine cleanup after start_node failure"
+                );
+            }
+        }
+        if let Some(fleet_net_engine) = fleet_net_engine_for_cleanup {
+            if let Err(e) = fleet_net_engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "fleet-net FleetSyncEngine cleanup after start_node failure"
                 );
             }
         }
@@ -42133,6 +42548,15 @@ mod start_node_race_tests {
             dm_inbox_tracker: None,
             dm_inbox_sync: None,
             dm_inbox_device_id: None,
+            // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles unused
+            // in race tests.
+            dm_outhold_doc: None,
+            dm_outhold_tracker: None,
+            dm_outhold_sync: None,
+            dm_outhold_device_id: None,
+            fleet_net_doc: None,
+            fleet_net_tracker: None,
+            fleet_net_sync: None,
             // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.
             iroh_endpoint: None,
             reachability_resolver: None,
