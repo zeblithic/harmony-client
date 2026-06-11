@@ -2423,30 +2423,38 @@ async fn internal_task(mut ctx: InternalCtx) {
                         // single-writer task so publish, flush, and
                         // query-serve can never disagree about HLC
                         // state. encode advances next_hlc via the
-                        // tracker — persist the replay tracker on
-                        // success, mirroring the publish arms' "never
-                        // advance the tracker unpersisted" rule. The
-                        // CRDT itself did not change →
-                        // persist_replay_only.
-                        let result = encode_root_packet(&ctx).await;
-                        match &result {
-                            Ok(_) => {
-                                if let Err(e) = persist_replay_only(&ctx).await {
+                        // tracker — and replay-tracker persistence is
+                        // part of the serve SUCCESS condition: a reply
+                        // hands the querier an HLC advance this node
+                        // must durably remember across restarts. The
+                        // pub/sub arms can only log-and-swallow a
+                        // persist failure (they can't un-publish); a
+                        // query CAN be left unanswered — on Err the
+                        // adapter withholds the zenoh reply and the
+                        // querier backs off and retries, possibly
+                        // against another responder. The CRDT itself
+                        // did not change → persist_replay_only.
+                        let result = match encode_root_packet(&ctx).await {
+                            Ok(packet) => match persist_replay_only(&ctx).await {
+                                Ok(()) => Ok(packet),
+                                Err(e) => {
                                     tracing::warn!(
                                         community_id = ?ctx.community_id,
                                         error = %e,
-                                        "community persist after query-serve encode failed"
+                                        "community persist after query-serve encode failed — withholding reply"
                                     );
+                                    Err(e)
                                 }
-                            }
+                            },
                             Err(e) => {
                                 tracing::warn!(
                                     community_id = ?ctx.community_id,
                                     error = %e,
                                     "community query-serve encode failed"
                                 );
+                                Err(e)
                             }
-                        }
+                        };
                         // Receiver dropped (querier gone) is fine —
                         // fire and forget.
                         let _ = reply_tx.send(result.map_err(|e| e.to_string()));
@@ -6103,6 +6111,88 @@ mod tests {
             materialized,
             "channel from the query-serve packet must materialize on engine B"
         );
+    }
+
+    /// PR #230 review (Qodo + CodeRabbit): replay-tracker persistence
+    /// is part of the query-serve SUCCESS condition. encode advances
+    /// `next_hlc`, so a served packet implies an HLC this node must
+    /// durably remember — if `persist_replay_only` fails, the engine
+    /// must reply `Err` (the adapter then withholds the zenoh reply and
+    /// the querier retries) instead of handing out the packet.
+    ///
+    /// Fault injection: a DIRECTORY pre-created at the replay path
+    /// makes the tracker save fail deterministically while everything
+    /// else (encode, CAS put, signing) succeeds.
+    #[tokio::test]
+    async fn query_serve_arm_withholds_packet_when_replay_persist_fails() {
+        use crate::community_membership::mint_test_owner;
+
+        let alice = mint_test_owner(0xAD);
+        let alice_addr = alice.owner;
+        let alice_sk = Arc::new(alice.device_key.clone());
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+
+        let cas_op_tx = spawn_shared_cas();
+        let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+
+        let dir = tempfile::tempdir().expect("dir");
+        let replay_path = dir.path().join("replay.cbor");
+        std::fs::create_dir(&replay_path).expect("pre-create dir at replay path");
+
+        let community_id = SpaceId([0x3B; 16]);
+        let (serve_tx, serve_rx) = mpsc::channel::<RootServeRequest>(4);
+        let (pub_tx, mut pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_sub_tx_held, sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while pub_rx.recv().await.is_some() {} });
+
+        let _engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            community_id,
+            membership_key: EpochKey::new([0x66; 32]),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice_addr,
+            signing_key: alice_sk,
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityRootHlcTracker::default())),
+            content_store: cs,
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            paths: PersistPaths {
+                crdt: dir.path().join("crdt.cbor"),
+                replay: replay_path,
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: Some(serve_rx),
+        });
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        serve_tx.send(reply_tx).await.expect("send serve request");
+        let served = reply_rx.await.expect("engine replied");
+        let err = served.expect_err("persist failure must withhold the packet");
+        assert!(
+            err.to_lowercase().contains("persist"),
+            "error must come from the persist step (not encode): {err}"
+        );
+
+        // The arm survives the failure (warn + Err, not task death):
+        // a second request still gets a reply.
+        let (reply_tx2, reply_rx2) = tokio::sync::oneshot::channel();
+        serve_tx
+            .send(reply_tx2)
+            .await
+            .expect("second serve request");
+        assert!(reply_rx2.await.expect("engine replied again").is_err());
     }
 
     /// ZEB-434 Task 10: end-to-end repro pin for the live bug — a

@@ -6064,6 +6064,16 @@ const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 /// zid; because the seen-set never forgets, a flap does not re-bump the
 /// transport epoch (the fetch drivers' 60s cooldown is then a
 /// second-layer defense, not the only one).
+/// Cap on the accumulated seen-zid set. Zenoh session ids are
+/// per-session, so reconnect churn would grow the set forever on a
+/// long-lived node if left unpruned (PR #230 review, Qodo). Overflow
+/// prunes to the current snapshot: a departed zid that later RETURNS
+/// (link flap, surviving session) then re-bumps the epoch — a
+/// legitimate "transport recovered" signal, and re-arm queries are
+/// cooldown-limited per driver (spec D7), so the prune trades
+/// unbounded memory for at most one extra re-query per flap.
+pub(crate) const TRANSPORT_SEEN_ZIDS_CAP: usize = 4096;
+
 pub(crate) fn merge_peers_detect_new(
     seen: &mut std::collections::HashSet<String>,
     refreshed: &[String],
@@ -6078,6 +6088,10 @@ pub(crate) fn merge_peers_detect_new(
             seen.insert(zid.clone());
             any_new = true;
         }
+    }
+    if seen.len() > TRANSPORT_SEEN_ZIDS_CAP {
+        let current: std::collections::HashSet<&String> = refreshed.iter().collect();
+        seen.retain(|z| current.contains(z));
     }
     any_new
 }
@@ -6151,6 +6165,26 @@ mod transport_epoch_tests {
             &mut seen,
             &["a".to_string(), "c".to_string()]
         ));
+    }
+
+    /// PR #230 review (Qodo): the seen-set must not grow without bound
+    /// under session churn on a long-lived node. Overflow past
+    /// [`super::TRANSPORT_SEEN_ZIDS_CAP`] prunes to the current
+    /// snapshot; a pruned zid returning later re-bumps (accepted —
+    /// cooldown-limited "transport recovered" signal).
+    #[test]
+    fn seen_set_prunes_to_current_snapshot_when_over_cap() {
+        let mut seen: std::collections::HashSet<String> = (0..=super::TRANSPORT_SEEN_ZIDS_CAP)
+            .map(|i| format!("z{i}"))
+            .collect();
+        let refreshed = vec!["z0".to_string(), "fresh".to_string()];
+        // "fresh" is new → bump; the merged set overflows the cap and
+        // prunes down to exactly the current snapshot.
+        assert!(merge_peers_detect_new(&mut seen, &refreshed));
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains("z0") && seen.contains("fresh"));
+        // A pruned zid coming back re-bumps — accepted semantics.
+        assert!(merge_peers_detect_new(&mut seen, &["z1".to_string()]));
     }
 }
 

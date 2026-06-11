@@ -8,13 +8,14 @@
 
 **Tech Stack:** Rust (tokio, zenoh 1.9), existing `community_state_sync` / `channel_backfill` / `event_loop` modules. Spec: `docs/specs/2026-06-10-zeb-434-community-state-reconnect-catchup-design.md` (commit `e953f64c`).
 
-**House rules for every task:** work directly on branch `zeb-434-community-state-catchup` (NO worktrees). Commit BEFORE running gates. Per-task gates (lib-scoped):
+**House rules for every task:** work directly on branch `zeb-434-community-state-catchup` (NO worktrees). Commit BEFORE running gates. Per-task gates — clippy/nextest are lib-scoped for iteration speed (a harmony-app lib change relinks ~97 integration-test binaries under `--all-targets`, ~25 min), but every task ALSO runs the `--all-targets` compile check so cross-target breakage (struct-literal sites in `tests/*.rs`, etc.) cannot hide behind the lib scope; the final Task 11 sweep runs full `--all-targets` clippy + nextest per the repo-wide gate policy:
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
 cargo fmt --all
 cargo clippy --locked -p harmony-app --lib --features test-fixtures --no-deps -- -D warnings
 cargo nextest run --locked -p harmony-app --lib --features test-fixtures
+cargo check --locked --all-targets --features test-fixtures
 ```
 
 10-minute wall-clock kill switch per gate command (Bash timeout param; macOS has no `timeout` cmd). `set -o pipefail` when piping. Statuses: DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED. Implementers do NOT push.
