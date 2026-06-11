@@ -3957,13 +3957,29 @@ impl CommunitySyncRegistry {
         }
 
         // ZEB-436: capture DATA freshness before the spawn can create
-        // anything on disk. `paths_for(...).crdt` is the durable marker —
-        // if it already exists, this spawn is re-adopting persisted state
-        // (orphan repair, rejoin-after-leave) and a later rollback must
-        // stop the engine without deleting the dir.
-        let preexisting_persistence = tokio::fs::try_exists(&self.paths_for(community_id).crdt)
-            .await
-            .unwrap_or(false);
+        // anything on disk. PR #229 R1 (Qodo + CodeRabbit): the marker is
+        // the community DIR, not `crdt.cbor` — `channels/...` holds
+        // durable history that can outlive a quarantined `crdt.cbor` —
+        // and a probe failure defaults to PRESERVE: when freshness can't
+        // be determined, a leaked dir (reconcile_from_state recovers at
+        // next start_node) beats deleting a user's history.
+        let community_dir = self
+            .cfg
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0));
+        let preexisting_persistence = match tokio::fs::try_exists(&community_dir).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::warn!(
+                    community_id = ?community_id,
+                    path = ?community_dir,
+                    error = %e,
+                    "pre-spawn persistence probe failed; preserving persistence on rollback"
+                );
+                true
+            }
+        };
 
         // Step 1: spawn the engine via the inner helper.
         let freshly_created = self
@@ -5022,7 +5038,7 @@ mod tests {
         // the (pre-fix) deletion is sequenced immediately after the engine
         // stop, so a short grace period gives the bug a real chance to
         // manifest before the survival assertion.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
         while fix.registry.has_engine(&community_id).await && std::time::Instant::now() < deadline {
             tokio::task::yield_now().await;
         }
@@ -5035,6 +5051,64 @@ mod tests {
             crdt_path.exists(),
             "rollback must NOT delete a pre-existing persistence dir \
              (the user's community history)"
+        );
+    }
+
+    /// ZEB-436 PR #229 R1 (Qodo): the pre-existence marker must be the
+    /// community DIR, not `crdt.cbor` — durable channel-log history
+    /// lives under `channels/...` and can exist while `crdt.cbor` is
+    /// absent (e.g. quarantined after a corrupt decode). Pre-fix such a
+    /// dir probed as "fresh" and a rollback deleted the user's channel
+    /// history.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_preserves_dir_with_channel_history_but_no_crdt_zeb436() {
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0xc7; 16]);
+
+        let dir = fix
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0));
+        let channel_dir = dir.join("channels").join("00ff");
+        std::fs::create_dir_all(&channel_dir).expect("create channel dir");
+        let manifest = channel_dir.join("manifest.cbor");
+        std::fs::write(&manifest, b"durable channel history").expect("seed manifest");
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        {
+            let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+            let _engine = std::sync::Arc::clone(&fix.registry)
+                .spawn_engine_with_guard(
+                    &mut guard,
+                    community_id,
+                    fix.membership_key.clone(),
+                    fix.admin_addr,
+                    false,
+                    pub_tx,
+                    sub_rx,
+                    pub_rx,
+                    sub_tx,
+                    fix.community_adapter_tx.clone(),
+                )
+                .await
+                .expect("spawn_engine_with_guard");
+            // guard drops here without commit → rollback
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
+        while fix.registry.has_engine(&community_id).await && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !fix.registry.has_engine(&community_id).await,
+            "rollback must still stop the freshly-spawned engine"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            manifest.exists(),
+            "rollback must NOT delete a pre-existing community dir even \
+             when crdt.cbor is absent — channels/ holds durable history"
         );
     }
 

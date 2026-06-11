@@ -19448,6 +19448,86 @@ pub struct RedeemInviteOverrides {
 /// `Fn` (not `FnOnce`) so future-proof retries can re-call without
 /// consuming.
 ///
+/// ZEB-436: dir-side adoption eligibility, shared verbatim by
+/// `redeem_invite_inner_with_overrides`' pre-check (on the spawned
+/// engine's state) and the iroh wrapper's read-only disk probe
+/// (`invite_targets_orphaned_community_dir`) so the two sites cannot
+/// drift.
+///
+/// Eligible iff:
+/// 1. the persisted CRDT holds REAL events — never the bootstrap hint,
+///    which is the invite's own claim and must not vouch for itself —
+///    that materialize `self_owner` as `Joined`; and
+/// 2. for invite-only payloads, the invite clears the SAME authenticity
+///    bar the normal redeem path enforces. CodeAnt PR #229 R1
+///    (Critical): a sealed epoch key proves only knowledge of the
+///    victim's PUBLIC key — anyone can seal to it — so without these
+///    checks a forged URL could drive attacker-chosen key material into
+///    owner-state through the repair path. We run
+///    `verify_admin_bootstrap` on the payload, then mirror the
+///    PendingJoin P2–P5 token gates against OUR OWN persisted
+///    membership: inviter == admin binding (P2), invitee_hint == self
+///    (P3), unexpired at `now_wall_ms` (P4), and the token signature
+///    against the inviter's enrolled keys (P5).
+///
+/// On any failure this returns false and the caller falls through to
+/// the normal redeem flow, which rejects the invite with its usual
+/// error surface — adoption is never a weaker door than a first-time
+/// join. Open-community payloads skip the authenticity arm: their key
+/// material is raw bytes in the URL by design, identical to what a
+/// normal open re-join would trust.
+fn orphan_dir_adoption_eligible(
+    dir_state: &crate::community_state_crdt::CommunityState,
+    payload: &crate::community_invite::CommunityInvitePayload,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    now_wall_ms: u64,
+) -> bool {
+    if dir_state.events.is_empty() {
+        return false;
+    }
+    let materialized = dir_state.materialized(payload.admin_addr);
+    let self_joined = materialized
+        .members
+        .get(&self_owner)
+        .map(|m| matches!(m.status, crate::community_membership::MemberStatus::Joined))
+        .unwrap_or(false);
+    if !self_joined {
+        return false;
+    }
+    if payload.is_invite_only {
+        if crate::community_invite::verify_admin_bootstrap(payload).is_err() {
+            return false;
+        }
+        let Some(token) = payload.invite_token.as_ref() else {
+            return false;
+        };
+        // P2: token minted by the community admin.
+        if token.inviter != payload.admin_addr {
+            return false;
+        }
+        // P3: invitee hint (when present) names us.
+        if let Some(hint) = token.invitee_hint {
+            if hint != self_owner {
+                return false;
+            }
+        }
+        // P4: token unexpired.
+        if let Some(exp) = token.expires_at {
+            if now_wall_ms >= exp {
+                return false;
+            }
+        }
+        // P5: token signature against the inviter's enrolled keys from
+        // our own materialized membership.
+        if crate::community_membership::verify_invite_token_sig_with_enrolled(token, &materialized)
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// **Overrides.** Thin wrapper around `redeem_invite_inner_with_overrides`
 /// that passes the default (no overrides). Existing callers stay
 /// unchanged; the iroh-handshake redemption path (ZEB-325 Phase 2c
@@ -19707,12 +19787,11 @@ where
     }
 
     // ZEB-436: orphaned-dir adoption pre-check. The engine spawned at
-    // step 6 loaded any persisted per-community CRDT from disk. If those
-    // REAL events (the `events.is_empty()` gate excludes the bootstrap
-    // hint we just seeded — that's the invite's own claim and must never
-    // vouch for a first-time join) already materialize self as Joined,
-    // and the owner-state holds no functional Space row, this redeem is
-    // a REPAIR, not a join: the ZEB-427 lost-row split-brain left a
+    // step 6 loaded any persisted per-community CRDT from disk; when
+    // `orphan_dir_adoption_eligible` (real-events gate, self Joined, and
+    // the full invite-authenticity bar for invite-only payloads — see its
+    // doc) holds AND owner-state has no functional Space row, this redeem
+    // is a REPAIR, not a join: the ZEB-427 lost-row split-brain left a
     // fully-populated dir behind, and the membership rules (correctly)
     // refuse to re-admit a Joined actor — P6 rejects a fresh PendingJoin
     // ("already-engaged", the recovery deadlock), and an open re-Join
@@ -19723,20 +19802,12 @@ where
     // missing, left-marked, or keyless is equally non-functional — each
     // leaves the boot engine sweep unable to spawn this community.
     let adopt_orphaned_membership: bool = {
-        let self_joined_in_dir = {
+        let dir_side_eligible = {
             let state = engine_arc.state();
             let g = state.lock().await;
-            if g.events.is_empty() {
-                false
-            } else {
-                g.materialized(payload.admin_addr)
-                    .members
-                    .get(&self_owner)
-                    .map(|m| matches!(m.status, crate::community_membership::MemberStatus::Joined))
-                    .unwrap_or(false)
-            }
+            orphan_dir_adoption_eligible(&g, &payload, self_owner, wall_now_ms)
         };
-        if self_joined_in_dir {
+        if dir_side_eligible {
             let g = crdt_state.lock().await;
             let functional_row_exists = g
                 .spaces
@@ -22460,7 +22531,7 @@ mod zeb436_orphan_adoption_tests {
         // a short grace period gives the bug a real chance to manifest
         // before the survival assertion.
         let crdt_path = crdt_path_for(&fixture, community_id);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
         while fixture
             .community_registry
             .state_for(&community_id)
@@ -22538,7 +22609,16 @@ mod zeb436_orphan_adoption_tests {
     /// the shared fixture's resolver doesn't admit a cert-model admin, and
     /// the invite-only path needs the admin bootstrap + token signed by an
     /// enrolled device key.
-    async fn build_invite_only_orphan_rig(community_id: SpaceId) -> InviteOnlyOrphanRig {
+    ///
+    /// `token_signer`: `None` signs the invite token with the admin's
+    /// device key (a genuine invite); `Some(key)` signs it with that key
+    /// instead (a forged invite whose only defect is the token signature —
+    /// the admin bootstrap stays genuine, since an attacker can always
+    /// copy the admin's public bootstrap Join).
+    async fn build_invite_only_orphan_rig(
+        community_id: SpaceId,
+        token_signer: Option<&ed25519_dalek::SigningKey>,
+    ) -> InviteOnlyOrphanRig {
         use crate::community_channel_log_engine::{
             ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
         };
@@ -22720,7 +22800,10 @@ mod zeb436_orphan_adoption_tests {
                 .expect("canonical token bytes");
         let token_sig = {
             use ed25519_dalek::Signer as _;
-            admin_owner.device_key.sign(&token_payload_bytes).to_bytes()
+            match token_signer {
+                Some(key) => key.sign(&token_payload_bytes).to_bytes(),
+                None => admin_owner.device_key.sign(&token_payload_bytes).to_bytes(),
+            }
         };
         let invite_token = crate::community_invite::InviteToken {
             inviter: admin_addr,
@@ -22796,7 +22879,7 @@ mod zeb436_orphan_adoption_tests {
     /// round-trip, no countersign wait, owner-state-only repair.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn invite_only_redeem_adopts_orphaned_dir_instead_of_p6_deadlock() {
-        let rig = build_invite_only_orphan_rig(SpaceId([0xf7; 16])).await;
+        let rig = build_invite_only_orphan_rig(SpaceId([0xf7; 16]), None).await;
 
         let result = super::redeem_invite_inner(
             rig.invite_url.clone(),
@@ -22868,7 +22951,7 @@ mod zeb436_orphan_adoption_tests {
     /// the fresh epoch key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn iroh_wrapper_routes_orphan_repair_without_any_connectivity() {
-        let rig = build_invite_only_orphan_rig(SpaceId([0xf8; 16])).await;
+        let rig = build_invite_only_orphan_rig(SpaceId([0xf8; 16]), None).await;
 
         let nav_events: std::sync::Arc<std::sync::Mutex<Vec<super::NavUpdatedPayload>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -22925,6 +23008,82 @@ mod zeb436_orphan_adoption_tests {
             nav[0].pending,
             Some(false),
             "adoption reattaches an existing membership — never pending"
+        );
+    }
+
+    /// CodeAnt PR #229 R1 (Critical): adoption must never be a WEAKER
+    /// authentication path than a first-time join. A sealed epoch key
+    /// proves only knowledge of the victim's PUBLIC key — anyone can seal
+    /// to it — so an attacker who copies the admin's public bootstrap
+    /// Join and forges the rest of an invite-only URL could otherwise
+    /// drive attacker-chosen key material straight into the victim's
+    /// owner-state through the orphan-repair path. (Pre-fix, the same
+    /// forged URL died at the normal path's admin-bootstrap / P5 token
+    /// checks, which adoption skipped wholesale.) The forged invite must
+    /// be rejected with nothing committed — and the orphaned dir must
+    /// survive the failed attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invite_only_adoption_rejects_forged_invite_token() {
+        let attacker = crate::community_membership::mint_test_owner(0xEE);
+        let rig =
+            build_invite_only_orphan_rig(SpaceId([0xf9; 16]), Some(&attacker.device_key)).await;
+
+        let result = super::redeem_invite_inner(
+            rig.invite_url.clone(),
+            std::sync::Arc::clone(&rig.crdt_state),
+            std::sync::Arc::clone(&rig.hlc_tracker),
+            "joiner-dev".to_string(),
+            rig.joiner_self_owner,
+            std::sync::Arc::clone(&rig.signing_key),
+            rig.joiner_cert.clone(),
+            std::sync::Arc::clone(&rig.community_registry),
+            rig.community_adapter_tx.clone(),
+            rig.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&rig.dm_outbox),
+            std::sync::Arc::clone(&rig.channel_log_registry),
+            || Ok(()),
+            None,
+            true, // allow_no_reticulum_destinations
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "an invite whose token signature does not verify against the \
+             inviter's enrolled keys must not redeem over an orphan: {result:?}"
+        );
+        {
+            let g = rig.crdt_state.lock().await;
+            assert!(
+                !g.spaces.contains_key(&rig.community_id),
+                "forged invite must not commit any Space row (no attacker \
+                 key material in owner-state)"
+            );
+        }
+
+        // The failed attempt's rollback must also preserve the orphaned
+        // dir (the guard preservation fix, exercised through the real
+        // redeem path). Wait for the spawned rollback to finish, then
+        // hold the line.
+        let crdt_path = rig
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(rig.community_id.0))
+            .join("crdt.cbor");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
+        while rig
+            .community_registry
+            .state_for(&rig.community_id)
+            .await
+            .is_some()
+            && std::time::Instant::now() < deadline
+        {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            crdt_path.exists(),
+            "the orphaned dir must survive the rejected forged-invite attempt"
         );
     }
 }
@@ -35898,16 +36057,14 @@ async fn invite_targets_orphaned_community_dir(
         Ok(Ok(s)) => s,
         _ => return false,
     };
-    if state.events.is_empty() {
-        return false;
-    }
-    let self_joined = state
-        .materialized(payload.admin_addr)
-        .members
-        .get(&self_owner)
-        .map(|m| matches!(m.status, crate::community_membership::MemberStatus::Joined))
-        .unwrap_or(false);
-    if !self_joined {
+    let now_wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    // Shared dir-side eligibility (real-events gate, self Joined, and —
+    // for invite-only — the full authenticity bar). Single implementation
+    // with the inner's pre-check so the two sites cannot drift.
+    if !orphan_dir_adoption_eligible(&state, payload, self_owner, now_wall_ms) {
         return false;
     }
     let g = crdt_state.lock().await;
