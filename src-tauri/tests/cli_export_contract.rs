@@ -16,6 +16,26 @@ use serial_test::serial;
 /// the spawned child, so both resolve the same encrypted-file store.
 const CHILD_PASSPHRASE: &str = "cli-contract-test-passphrase";
 
+/// RAII guard: removes the env var on drop, even when an assertion panics
+/// mid-test. nextest runs each test in its own process, but plain
+/// `cargo test` shares one — without the guard a failing test would leak
+/// HARMONY_PASSPHRASE into later tests. Mirrors the EnvVarGuard idiom in
+/// the owner_state/owner_commands unit tests.
+struct EnvVarGuard(&'static str);
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        std::env::set_var(name, value);
+        Self(name)
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
+}
+
 struct CliOutput {
     stdout: String,
     stderr: String,
@@ -135,7 +155,7 @@ fn export_owner_mnemonic_end_to_end_through_real_binary() {
     // save runs in THIS process (test-fixtures build: real keychain refuses;
     // keychain is injected as None anyway) against the encrypted-file store,
     // so the passphrase must match what run_cli hands the child.
-    std::env::set_var("HARMONY_PASSPHRASE", CHILD_PASSPHRASE);
+    let _passphrase_guard = EnvVarGuard::set("HARMONY_PASSPHRASE", CHILD_PASSPHRASE);
     let MintResult {
         state,
         recovery_artifact,
@@ -150,7 +170,6 @@ fn export_owner_mnemonic_end_to_end_through_real_binary() {
         None,
     )
     .unwrap();
-    std::env::remove_var("HARMONY_PASSPHRASE");
 
     let out = run_cli(home.path(), &["export", "owner-mnemonic"], "info");
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
@@ -181,14 +200,23 @@ fn export_help_lists_both_mnemonic_subcommands() {
     let home = tempfile::tempdir().unwrap();
     let out = run_cli(home.path(), &["export", "--help"], "info");
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    // Exact-token matching: "mnemonic" is a substring of "owner-mnemonic",
+    // so a naive contains() would still pass if the plain subcommand
+    // disappeared from the help output (CodeAnt round-1 catch). Match the
+    // first whitespace-delimited token of each help line instead.
+    let lists_subcommand = |name: &str| {
+        out.stdout
+            .lines()
+            .any(|l| l.split_whitespace().next() == Some(name))
+    };
     assert!(
-        out.stdout.contains("owner-mnemonic"),
+        lists_subcommand("owner-mnemonic"),
         "export --help must list owner-mnemonic; got:\n{}",
         out.stdout
     );
     assert!(
-        out.stdout.contains("mnemonic"),
-        "export --help must list mnemonic; got:\n{}",
+        lists_subcommand("mnemonic"),
+        "export --help must list the plain mnemonic subcommand; got:\n{}",
         out.stdout
     );
 }
