@@ -41084,10 +41084,38 @@ async fn network_health_export_payload(
 /// ZEB-356: real application exit. A tray-resident app does NOT quit when its
 /// last window is hidden/destroyed (the tray keeps the process alive), so the
 /// FE Quit path runs its voice/call teardown and then invokes this to terminate
-/// the process. Distinct from the window-close path, which now only hides.
+/// the process. Distinct from the window-close path, which hides when the tray
+/// exists (ZEB-433: with no tray, close exits instead — see [`TrayActive`]).
 #[tauri::command]
 fn quit_app(app_handle: tauri::AppHandle) {
     app_handle.exit(0);
+}
+
+/// ZEB-433: whether the system tray was actually created at setup. The FE
+/// reads this once via `tray_active` and hides-to-tray on close ONLY when
+/// true: a hidden window with no tray has no restore/quit affordance, so the
+/// node would linger headless and invisible (the original ZEB-433 trap).
+/// When false the FE lets the close proceed and the process exits via the
+/// last-window-closed default.
+pub(crate) struct TrayActive(pub(crate) bool);
+
+/// ZEB-433: FE queries this once at Tauri-init to pick the close behavior
+/// (hide-to-tray vs real close). See [`TrayActive`].
+#[tauri::command]
+fn tray_active(state: tauri::State<'_, TrayActive>) -> bool {
+    state.0
+}
+
+#[cfg(test)]
+mod tray_active_tests {
+    /// ZEB-433: the embedded fallback icon must exist and decode non-empty —
+    /// it is what the tray uses when `default_window_icon()` is `None` (the
+    /// degraded path that used to skip tray creation entirely).
+    #[test]
+    fn bundled_tray_fallback_icon_is_nonempty() {
+        let img = tauri::include_image!("icons/32x32.png");
+        assert!(img.width() > 0 && img.height() > 0);
+    }
 }
 
 // ── ZEB-418 P2 D17: set_butler_pin ───────────────────────────────────────────
@@ -41278,9 +41306,19 @@ pub fn run() {
             // ── ZEB-356: system tray (close-to-tray reachability). ──────────
             // Tray click / "Show Harmony" → raise the window. "Quit Harmony"
             // emits `quit-requested`; the FE runs voice/call teardown then
-            // invokes `quit_app`. The window never destroys on close (the FE's
-            // onCloseRequested only hides), so the last-window-closed auto-exit
-            // never fires — quit_app is the sole exit path.
+            // invokes `quit_app`.
+            //
+            // ZEB-433: tray creation is best-effort and its outcome is
+            // published as the managed `TrayActive` state. While the tray
+            // exists, the FE's onCloseRequested only hides, the
+            // last-window-closed auto-exit never fires, and quit_app is the
+            // sole exit path. With NO tray a hidden window would be
+            // unreachable (no restore/quit affordance; the node lingers
+            // headless — the original ZEB-433 trap), so the FE lets close
+            // proceed and the auto-exit applies. Accordingly: failures here
+            // degrade (warn + close-to-quit) instead of aborting setup, and
+            // the icon no longer depends on `default_window_icon()` (observed
+            // `None` in some builds) — it falls back to the bundled 32x32.
             {
                 use tauri::menu::{Menu, MenuItem};
                 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -41294,10 +41332,16 @@ pub fn run() {
                     }
                 }
 
-                let show_i = MenuItem::with_id(app, "show", "Show Harmony", true, None::<&str>)?;
-                let quit_i = MenuItem::with_id(app, "quit", "Quit Harmony", true, None::<&str>)?;
-                let tray_menu = Menu::with_items(app, &[&show_i, &quit_i])?;
-                if let Some(icon) = app.default_window_icon().cloned() {
+                let tray_result = (|| -> tauri::Result<()> {
+                    let show_i =
+                        MenuItem::with_id(app, "show", "Show Harmony", true, None::<&str>)?;
+                    let quit_i =
+                        MenuItem::with_id(app, "quit", "Quit Harmony", true, None::<&str>)?;
+                    let tray_menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+                    let icon = app
+                        .default_window_icon()
+                        .cloned()
+                        .unwrap_or_else(|| tauri::include_image!("icons/32x32.png"));
                     let _tray = TrayIconBuilder::with_id("main-tray")
                         .icon(icon)
                         .tooltip("Harmony")
@@ -41332,9 +41376,15 @@ pub fn run() {
                             }
                         })
                         .build(app)?;
-                } else {
-                    tracing::warn!("ZEB-356: no default window icon; tray not created");
+                    Ok(())
+                })();
+                if let Err(ref e) = tray_result {
+                    tracing::warn!(
+                        error = %e,
+                        "ZEB-433: tray creation failed; window close will exit instead of hiding"
+                    );
                 }
+                app.manage(TrayActive(tray_result.is_ok()));
             }
 
             Ok(())
@@ -41376,6 +41426,7 @@ pub fn run() {
             start_node,
             stop_node,
             quit_app,
+            tray_active,
             connect_zenoh,
             disconnect_zenoh,
             publish_profile,
