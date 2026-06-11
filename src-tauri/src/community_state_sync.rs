@@ -5291,6 +5291,11 @@ mod tests {
                     pub_rx,
                     sub_tx,
                     fix.community_adapter_tx.clone(),
+                    None,
+                    None,
+                    None,
+                    dummy_root_serve_tx(),
+                    dummy_fetch_request_rx(),
                 )
                 .await
                 .expect("spawn_engine_with_guard");
@@ -5353,6 +5358,11 @@ mod tests {
                     pub_rx,
                     sub_tx,
                     fix.community_adapter_tx.clone(),
+                    None,
+                    None,
+                    None,
+                    dummy_root_serve_tx(),
+                    dummy_fetch_request_rx(),
                 )
                 .await
                 .expect("spawn_engine_with_guard");

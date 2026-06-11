@@ -22524,6 +22524,7 @@ mod zeb436_orphan_adoption_tests {
             fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
@@ -22908,6 +22909,7 @@ mod zeb436_orphan_adoption_tests {
             self_device_id: "joiner-dev".into(),
             signing_key: std::sync::Arc::clone(&signing_key),
             engine_config: ChannelLogEngineConfig::default(),
+            transport_epoch_rx: None,
         });
 
         // ── Fabricate the orphaned dir exactly as a healthy engine left
@@ -23073,6 +23075,7 @@ mod zeb436_orphan_adoption_tests {
             rig.joiner_cert.clone(),
             std::sync::Arc::clone(&rig.community_registry),
             rig.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             rig.unicast_send_tx.clone(),
             std::sync::Arc::clone(&rig.dm_outbox),
             std::sync::Arc::clone(&rig.channel_log_registry),
@@ -23152,6 +23155,7 @@ mod zeb436_orphan_adoption_tests {
             rig.joiner_cert.clone(),
             std::sync::Arc::clone(&rig.community_registry),
             rig.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             rig.unicast_send_tx.clone(),
             std::sync::Arc::clone(&rig.dm_outbox),
             std::sync::Arc::clone(&rig.channel_log_registry),
@@ -23220,6 +23224,7 @@ mod zeb436_orphan_adoption_tests {
             rig.joiner_cert.clone(),
             std::sync::Arc::clone(&rig.community_registry),
             rig.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             rig.unicast_send_tx.clone(),
             std::sync::Arc::clone(&rig.dm_outbox),
             std::sync::Arc::clone(&rig.channel_log_registry),
@@ -36427,6 +36432,11 @@ where
             enrollment_cert,
             community_registry,
             community_adapter_tx,
+            // ZEB-434 D6: the adoption path spawns a REAL engine over the
+            // orphaned dir — its root-fetch driver needs the same
+            // transport-epoch watch the handshake path threads through
+            // (short-circuit returns, so the move is fine).
+            transport_epoch_rx,
             unicast_send_tx,
             dm_outbox,
             channel_log_registry,
