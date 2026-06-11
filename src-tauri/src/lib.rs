@@ -174,6 +174,7 @@ pub mod mint;
 pub mod mint_sync;
 pub mod mint_sync_persist;
 pub mod mint_sync_types;
+pub mod node_event_sink;
 pub mod notes_commands;
 pub mod notes_crdt;
 pub mod notes_persist;
