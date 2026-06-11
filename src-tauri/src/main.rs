@@ -48,9 +48,16 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum ExportFormat {
-    /// Print 24-word BIP39 mnemonic (bare to stdout, warning + identity-hash to stderr).
+    /// Print the RETICULUM IDENTITY seed (node keypair) as 24 BIP39 words
+    /// (bare to stdout, warning + identity-hash to stderr). Does NOT back up
+    /// the owner identity (friends/communities) — use `owner-mnemonic`.
     Mnemonic,
-    /// Write a passphrase-encrypted recovery file. Requires
+    /// Print the OWNER master seed (friends, communities, device
+    /// enrollments) as 24 BIP39 words (bare to stdout, warning + owner-id
+    /// to stderr).
+    OwnerMnemonic,
+    /// Write a passphrase-encrypted recovery file for the Reticulum
+    /// identity seed. Requires
     /// HARMONY_RECOVERY_PASSPHRASE / HARMONY_RECOVERY_PASSPHRASE_FILE.
     RecoveryFile {
         #[arg(long, value_name = "PATH")]
@@ -116,6 +123,9 @@ fn main() {
                 let result = match format {
                     ExportFormat::Mnemonic => {
                         harmony_app::recovery_cli::export_mnemonic_cli(&plaintext_path)
+                    }
+                    ExportFormat::OwnerMnemonic => {
+                        harmony_app::recovery_cli::export_owner_mnemonic_cli(&plaintext_path)
                     }
                     ExportFormat::RecoveryFile {
                         out,
@@ -204,7 +214,12 @@ fn main() {
 fn init_tracing() {
     // try_init (not init) so a second subscriber install never panics; the GUI
     // path (lib.rs run()) installs its own via app_tracing. ZEB-379.
+    //
+    // Writer is stderr, NOT the fmt default of stdout: CLI subcommands promise
+    // machine-readable stdout (`export mnemonic > backup.txt` must capture the
+    // words and nothing else), so log lines must never interleave. ZEB-430.
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
