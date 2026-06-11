@@ -19455,9 +19455,13 @@ pub struct RedeemInviteOverrides {
 /// drift.
 ///
 /// Eligible iff:
-/// 1. the persisted CRDT holds REAL events — never the bootstrap hint,
-///    which is the invite's own claim and must not vouch for itself —
-///    that materialize `self_owner` as `Joined`; and
+/// 1. the persisted CRDT holds REAL events that materialize `self_owner`
+///    as `Joined`. The `events.is_empty()` gate is what keeps the seeded
+///    bootstrap hint out of this decision: the hint lives outside
+///    `events` (a separately-stored `MaterializedMembership`) and is
+///    only served by `materialized()` while the event map is empty, so
+///    requiring a non-empty map structurally prevents the invite's own
+///    snapshot from vouching for itself; and
 /// 2. for invite-only payloads, the invite clears the SAME authenticity
 ///    bar the normal redeem path enforces. CodeAnt PR #229 R1
 ///    (Critical): a sealed epoch key proves only knowledge of the
@@ -19801,6 +19805,18 @@ where
     // Space row from THIS invite's fresh epoch key. A row that is
     // missing, left-marked, or keyless is equally non-functional — each
     // leaves the boot engine sweep unable to spawn this community.
+    //
+    // TOCTOU note (Greptile PR #229 R2): the engine-state and owner-state
+    // locks are taken sequentially, so a concurrent redeem for the SAME
+    // community could commit a functional row in the gap, and this
+    // adoption would then LWW-replace its epoch key at step 9. Accepted:
+    // both writers are local same-user IPC calls racing within
+    // microseconds, both keys cleared the same authenticity bar, and the
+    // row stays consistent with one of the two invites — the same LWW
+    // outcome two concurrent non-adoptive redeems already produce.
+    // Closing it would mean holding the owner-state lock across the
+    // whole step-7 skip decision, broadening a lock this function
+    // deliberately keeps narrow.
     let adopt_orphaned_membership: bool = {
         let dir_side_eligible = {
             let state = engine_arc.state();
