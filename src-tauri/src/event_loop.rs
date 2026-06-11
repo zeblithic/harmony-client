@@ -6070,6 +6070,10 @@ pub(crate) fn merge_peers_detect_new(
 ) -> bool {
     let mut any_new = false;
     for zid in refreshed {
+        // contains-then-insert is deliberate (not the single-lookup
+        // `insert(zid.clone())` form): it clones only never-seen zids,
+        // while insert-with-clone would allocate for EVERY zid on
+        // every 5s refresh tick.
         if !seen.contains(zid) {
             seen.insert(zid.clone());
             any_new = true;
@@ -6842,7 +6846,10 @@ pub fn spawn_community_state_zenoh_adapter(
         let key_qbl = key_expr.clone();
         let topic_qbl = topic.clone();
         let closing_qbl = Arc::clone(&closing);
-        // Clone for the queryable task; the original parameter stays alive until the outer join, so the engine's serve channel closes only at full adapter teardown (the engine latches recv()==None either way).
+        // Clone for the queryable task. The original parameter stays
+        // alive until the outer join, so the engine's serve channel
+        // closes only at full adapter teardown (the engine latches
+        // recv()==None either way).
         let root_serve_tx_qbl = root_serve_tx.clone();
         let qbl_handle = tokio::spawn(async move {
             let qbl = match session_qbl.declare_queryable(&key_qbl).await {
