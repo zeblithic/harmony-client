@@ -5901,6 +5901,355 @@ mod tests {
             "channel from the query-serve packet must materialize on engine B"
         );
     }
+
+    /// ZEB-434 Task 10: end-to-end repro pin for the live bug — a
+    /// channel created while a member was offline stayed invisible to
+    /// them indefinitely (the root publish fired into the void; no
+    /// pull path existed).
+    ///
+    /// Fixture mirrors `query_serve_arm_replies_packet_that_peer_engine_ingests`
+    /// (two engines, shared CAS, EnrollmentCert bootstrap Join OOB-seeded
+    /// into B, A's publisher drained into the void = "B was offline for
+    /// the publish"). The deltas over that test:
+    ///
+    /// 1. The pull is driven BY [`run_root_fetch_driver`] through a
+    ///    request closure that bridges to A's query-serve channel and
+    ///    forwards the reply into B's subscriber inbound — exactly what
+    ///    the production adapter's fetch task + queryable do across
+    ///    zenoh, with the wire collapsed.
+    /// 2. Idempotency: a SECOND fetch through the same bridge must be
+    ///    AlreadyKnown-only on B — no event growth, channel map
+    ///    unchanged. The equality assertion is guarded against a
+    ///    too-short settle window by first polling B's replay tracker
+    ///    until its `(alice, alice-dev)` high-water mark advances past
+    ///    the first packet's HLC (the second packet carries a strictly
+    ///    newer HLC from A's fresh encode, and the tracker records it
+    ///    at step 14, AFTER the merge) — proving the second packet was
+    ///    fully processed before we compare counts.
+    #[tokio::test]
+    async fn offline_created_channel_heals_via_root_fetch_pull() {
+        use crate::channel_backfill::{run_root_fetch_driver, RootFetch, RootFetchLatch};
+        use crate::community_membership::{
+            mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
+            SignedMembershipEvent,
+        };
+        use crate::community_state_crdt::InsertOutcome;
+
+        let alice = mint_test_owner(0xAA);
+        let bob = mint_test_owner(0xBB);
+        let alice_addr = alice.owner;
+        let bob_addr = bob.owner;
+        let alice_sk = Arc::new(alice.device_key.clone());
+        let bob_sk = Arc::new(bob.device_key.clone());
+
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+
+        let cas_op_tx = spawn_shared_cas();
+        let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_secs(2),
+        ));
+        let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+
+        let community_id = SpaceId([0x3B; 16]);
+        let membership_key = EpochKey::new([0x55; 32]);
+
+        // Engine A (admin): query-serve channel wired. A's publisher_rx
+        // is drained + DISCARDED — its root publish for the
+        // ChannelCreate "fires into the void" exactly like the live
+        // repro where B was offline. No pub/sub bytes can reach B: B's
+        // subscriber_tx is held by this test and fed ONLY by the
+        // root-fetch bridge below.
+        let (serve_tx, serve_rx) = mpsc::channel::<RootServeRequest>(4);
+        let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_a_sub_tx_held, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
+
+        let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice_addr,
+            signing_key: Arc::clone(&alice_sk),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityRootHlcTracker::default())),
+            content_store: cs_a,
+            publisher_tx: a_pub_tx,
+            subscriber_rx: a_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_a.path().join("crdt.cbor"),
+                replay: dir_a.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: Some(serve_rx),
+        });
+
+        // Engine B (member): we hold its tracker Arc so the test can
+        // observe the per-(addr, device) replay high-water mark — the
+        // settle guard for the idempotency phase.
+        let (b_pub_tx, _b_pub_rx_held) = mpsc::channel::<Vec<u8>>(64);
+        let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+        let b_tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+
+        let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            community_id,
+            membership_key,
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "bob-dev".into(),
+            self_owner: bob_addr,
+            signing_key: Arc::clone(&bob_sk),
+            state: Arc::clone(&b_state),
+            tracker: Arc::clone(&b_tracker),
+            content_store: cs_b,
+            publisher_tx: b_pub_tx,
+            subscriber_rx: b_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_b.path().join("crdt.cbor"),
+                replay: dir_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+
+        // Alice's EnrollmentCert-bearing bootstrap Join (admin power 100).
+        let alice_join_at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let alice_join_payload = EventPayload {
+            id: [0x20; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice_addr,
+            at: alice_join_at.clone(),
+        };
+        let alice_join = SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign join")
+        };
+        let outcome = engine_a
+            .insert_local_event(alice_join.clone())
+            .await
+            .expect("alice bootstrap insert");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        // ZEB-256 cold-cache simulation: OOB-seed Alice's bootstrap
+        // Join into B so B's membership-at-HLC gate admits the served
+        // packet. Production wires this via the invite URL's
+        // admin_bootstrap field.
+        let outcome = engine_b
+            .insert_local_event(alice_join)
+            .await
+            .expect("bob OOB-seeds Alice's bootstrap Join");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        // THE REPRO MOMENT: Alice creates a channel while Bob is
+        // "offline". The debounced root publish for this insert lands
+        // in the drained a_pub_rx void — Bob never sees it via pub/sub.
+        let ch_id = ChannelId([0x43; 16]);
+        let alice_create_payload = EventPayload {
+            id: [0x21; 16],
+            community_id,
+            kind: MembershipEventKind::ChannelCreate {
+                channel_id: ch_id,
+                name: "created-while-offline".into(),
+                write_power: 0,
+                kind: ChannelKind::Text,
+            },
+            actor: alice_addr,
+            at: Hlc {
+                wall_ms: alice_join_at.wall_ms,
+                logical: alice_join_at.logical + 1,
+                device_id: alice_join_at.device_id.clone(),
+            },
+        };
+        let alice_create =
+            sign_event(&alice_create_payload, alice_sk.as_ref()).expect("sign channel create");
+        let outcome = engine_a
+            .insert_local_event(alice_create)
+            .await
+            .expect("alice channel-create insert");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        // The bridge closure — production's queryable + fetch task
+        // collapsed onto one in-process hop: send a RootServeRequest
+        // oneshot into A's serve channel, await the fresh packet,
+        // forward it into B's inbound subscriber channel.
+        let request_root = {
+            let serve_tx = serve_tx.clone();
+            let b_sub_tx = b_sub_tx.clone();
+            move || {
+                let serve_tx = serve_tx.clone();
+                let b_sub_tx = b_sub_tx.clone();
+                async move {
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    if serve_tx.send(reply_tx).await.is_err() {
+                        return RootFetch::EngineGone;
+                    }
+                    match reply_rx.await {
+                        Ok(Ok(packet)) => {
+                            if b_sub_tx.send(packet).await.is_err() {
+                                return RootFetch::EngineGone;
+                            }
+                            RootFetch::Answered
+                        }
+                        _ => RootFetch::NoReply,
+                    }
+                }
+            }
+        };
+
+        // Bob "comes online": the root-fetch driver pulls. epoch_rx =
+        // None → the driver returns once the latch is satisfied. The
+        // 30 s timeout turns a serve-arm regression (NoReply → real
+        // backoff sleeps forever) into a test FAILURE instead of a hang.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_root_fetch_driver(
+                RootFetchLatch::new(),
+                request_root.clone(),
+                shutdown_rx,
+                None,
+                // Real wall clock is fine — the driver satisfies on the
+                // first request; no backoff sleeps on the happy path.
+                || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0)
+                },
+            ),
+        )
+        .await
+        .expect("root-fetch driver must be Answered and return within 30s");
+
+        // The healed state: the offline-created channel materializes on
+        // B through its FULL inbound verification pipeline.
+        let mut materialized = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mat = {
+                let g = b_state.lock().await;
+                g.materialize_now(alice_addr)
+            };
+            if let Some(info) = mat.channels.get(&ch_id) {
+                assert_eq!(info.name, "created-while-offline");
+                assert_eq!(info.write_power, 0);
+                assert!(info.deleted_at.is_none());
+                materialized = true;
+                break;
+            }
+        }
+        assert!(
+            materialized,
+            "offline-created channel must heal onto engine B via the root-fetch pull"
+        );
+
+        // Baseline for the idempotency phase. The tracker records the
+        // packet HLC at step 14, AFTER the merge that materialize
+        // observed above — poll briefly for it.
+        let tracker_key = (alice_addr, "alice-dev".to_string());
+        let mut first_hlc: Option<Hlc> = None;
+        for _ in 0..40 {
+            let entry = {
+                let g = b_tracker.lock().await;
+                g.per_device.get(&tracker_key).cloned()
+            };
+            if let Some(h) = entry {
+                first_hlc = Some(h);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let first_hlc =
+            first_hlc.expect("B's replay tracker must record A's packet HLC after first ingest");
+        let (events_before, channels_before) = {
+            let g = b_state.lock().await;
+            (g.events.len(), g.materialize_now(alice_addr).channels.len())
+        };
+        assert_eq!(
+            events_before, 2,
+            "B holds exactly the bootstrap Join + the pulled ChannelCreate"
+        );
+
+        // Idempotency: a SECOND fetch through the same bridge must be
+        // a no-op on B's CRDT (every event AlreadyKnown).
+        let outcome = request_root().await;
+        assert_eq!(outcome, RootFetch::Answered);
+
+        // Settle guard: A's fresh encode stamps a strictly-newer HLC,
+        // and B records it only after the full receive pipeline ran —
+        // so a tracker advance PROVES the second packet was processed,
+        // making the unchanged-count assertion below meaningful (a
+        // too-short wait can't false-pass).
+        let mut second_processed = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let entry = {
+                let g = b_tracker.lock().await;
+                g.per_device.get(&tracker_key).cloned()
+            };
+            if let Some(h) = entry {
+                if h.is_strictly_newer_than(&first_hlc) {
+                    second_processed = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            second_processed,
+            "B's replay tracker must advance past the first packet's HLC — \
+             the second served packet carries a fresh, strictly-newer HLC"
+        );
+
+        let (events_after, channels_after) = {
+            let g = b_state.lock().await;
+            (g.events.len(), g.materialize_now(alice_addr).channels.len())
+        };
+        assert_eq!(
+            events_before, events_after,
+            "second root fetch must be AlreadyKnown-only — no event growth"
+        );
+        assert_eq!(
+            channels_before, channels_after,
+            "second root fetch must not change the materialized channel map"
+        );
+        let mat = {
+            let g = b_state.lock().await;
+            g.materialize_now(alice_addr)
+        };
+        let info = mat
+            .channels
+            .get(&ch_id)
+            .expect("channel still present after idempotent re-fetch");
+        assert_eq!(info.name, "created-while-offline");
+    }
 }
 
 #[cfg(test)]
