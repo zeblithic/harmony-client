@@ -1899,13 +1899,25 @@
       try {
         trayActive = (await invoke('tray_active')) as boolean;
       } catch (e) {
-        console.warn('[harmony-client] tray_active query failed; window close will exit', e);
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn('[harmony-client] tray_active query failed; window close will exit:', msg);
       }
-      const notif = await import('@tauri-apps/plugin-notification');
+      // The tray notice is best-effort: a notification-plugin import failure
+      // must not abort the lifecycle wiring below (close handler +
+      // quit-requested listener), so it gets its own try with a no-op
+      // fallback notifier.
+      let notifyTrayResident: () => Promise<boolean> = async () => false;
+      try {
+        const notif = await import('@tauri-apps/plugin-notification');
+        notifyTrayResident = makeTrayResidentNotifier(notif);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn('[harmony-client] notification plugin unavailable; tray notice disabled:', msg);
+      }
       const unlistenClose = await appWin.onCloseRequested(
         makeCloseRequestedHandler(trayActive, {
           hide: () => appWin.hide(),
-          notifyTrayResident: makeTrayResidentNotifier(notif),
+          notifyTrayResident,
           storage: localStorage,
         }),
       );
