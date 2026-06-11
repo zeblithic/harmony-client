@@ -4299,7 +4299,9 @@ impl CommunitySyncRegistry {
     /// `fetch_request_tx` is the driver half of the fetch-request
     /// channel — when `Some`, a `run_root_fetch_driver` task is spawned
     /// after successful insertion (with `transport_epoch_rx` as its
-    /// re-arm watch, `None` until Task 6 wires the transport epoch).
+    /// re-arm watch; `None` in legacy/test callers or the restart-race
+    /// window, where the generation fence prevents the spawn from
+    /// completing anyway).
     /// Legacy/test callers pass `None, None, None`.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_engine_inner_now(

@@ -2987,7 +2987,7 @@ pub async fn run<R: Runtime>(
                     // ZEB-434 D6: any never-seen zid bumps the transport
                     // epoch — community root-fetch / channel-backfill /
                     // mail-root latches re-arm (their drivers subscribe).
-                    if merge_peers_detect_new(&mut transport_seen_zids, refreshed.clone()) {
+                    if merge_peers_detect_new(&mut transport_seen_zids, &refreshed) {
                         transport_epoch_tx.send_modify(|e| *e = e.wrapping_add(1));
                     }
                     direct_peer_zids = refreshed.into_iter().collect();
@@ -6013,11 +6013,12 @@ const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 /// second-layer defense, not the only one).
 pub(crate) fn merge_peers_detect_new(
     seen: &mut std::collections::HashSet<String>,
-    refreshed: Vec<String>,
+    refreshed: &[String],
 ) -> bool {
     let mut any_new = false;
     for zid in refreshed {
-        if seen.insert(zid) {
+        if !seen.contains(zid) {
+            seen.insert(zid.clone());
             any_new = true;
         }
     }
@@ -6035,21 +6036,21 @@ mod transport_epoch_tests {
         // Same set → no bump.
         assert!(!merge_peers_detect_new(
             &mut seen,
-            vec!["a".into(), "b".into()]
+            &["a".to_string(), "b".to_string()]
         ));
         // Peer disappears → no bump (loss is not recovery).
-        assert!(!merge_peers_detect_new(&mut seen, vec!["a".into()]));
+        assert!(!merge_peers_detect_new(&mut seen, &["a".to_string()]));
         // New zid (rebooted peer = fresh session zid) → bump.
         assert!(merge_peers_detect_new(
             &mut seen,
-            vec!["a".into(), "c".into()]
+            &["a".to_string(), "c".to_string()]
         ));
         // Accumulating: c stays known even after flapping out and back —
         // a flapping link does not re-bump; genuine new sessions do.
-        assert!(!merge_peers_detect_new(&mut seen, vec!["c".into()]));
+        assert!(!merge_peers_detect_new(&mut seen, &["c".to_string()]));
         assert!(!merge_peers_detect_new(
             &mut seen,
-            vec!["a".into(), "c".into()]
+            &["a".to_string(), "c".to_string()]
         ));
     }
 }
