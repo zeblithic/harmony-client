@@ -174,6 +174,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         crdt_state: None,
         admin_identity_pub: None,
         nav_emitter: None,
+        root_serve_rx: None,
     });
 
     // Insert the bootstrap Join (Alice's self-Join, which gives her

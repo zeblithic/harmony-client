@@ -195,6 +195,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         crdt_state: None,
         admin_identity_pub: None,
         nav_emitter: None,
+        root_serve_rx: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
         community_id,
@@ -221,6 +222,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         crdt_state: None,
         admin_identity_pub: None,
         nav_emitter: None,
+        root_serve_rx: None,
     });
 
     // ── Step 1: A inserts its bootstrap Join. ─────────────────────────
@@ -538,6 +540,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         crdt_state: None,
         admin_identity_pub: None,
         nav_emitter: None,
+        root_serve_rx: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
         community_id,
@@ -564,6 +567,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         crdt_state: None,
         admin_identity_pub: None,
         nav_emitter: None,
+        root_serve_rx: None,
     });
 
     // ── A bootstrap → B converges ─────────────────────────────────────

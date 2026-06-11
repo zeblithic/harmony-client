@@ -2254,6 +2254,7 @@ mod task3_kick_setpower_round_trip {
             crdt_state: None,
             admin_identity_pub: None,
             nav_emitter: None,
+            root_serve_rx: None,
         });
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
@@ -2280,6 +2281,7 @@ mod task3_kick_setpower_round_trip {
             crdt_state: None,
             admin_identity_pub: None,
             nav_emitter: None,
+            root_serve_rx: None,
         });
 
         // Step 1: A inserts its bootstrap Join.
