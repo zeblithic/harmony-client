@@ -231,6 +231,46 @@ impl BackfillLatch {
     }
 }
 
+// ── Shared epoch re-arm helpers (ZEB-434) ───────────────────────────────────
+
+/// Cooldown between transport-epoch-triggered re-arm queries (60 s).
+/// Spec D7: a flapping link must not storm; deferred, not dropped.
+/// Governs BOTH [`run_backfill_driver`] and [`run_root_fetch_driver`].
+pub const EPOCH_REARM_COOLDOWN_MS: u64 = 60_000;
+
+/// Wait for a transport-epoch bump. Pends forever when no watch is
+/// wired; returns false when the epoch sender dropped.
+async fn epoch_bump(epoch_rx: &mut Option<tokio::sync::watch::Receiver<u64>>) -> bool {
+    match epoch_rx.as_mut() {
+        Some(rx) => rx.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Defer an epoch-triggered re-arm to the cooldown boundary (deferred,
+/// not dropped). Returns false if shutdown fires during the wait.
+async fn cooldown_wait(
+    last_request_at: Option<u64>,
+    now: u64,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let Some(last) = last_request_at else {
+        return true;
+    };
+    let target = last.saturating_add(EPOCH_REARM_COOLDOWN_MS);
+    if now >= target {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_millis(target - now)) => true,
+        changed = shutdown_rx.changed() => {
+            // Err = sender dropped (registry entry gone):
+            // same as an explicit shutdown signal.
+            !(changed.is_err() || *shutdown_rx.borrow())
+        }
+    }
+}
+
 // ── Async driver (ZEB-418 P3a Task 4) ───────────────────────────────────────
 
 /// Outcome of one page-fetch attempt, as seen by the driver.
@@ -284,7 +324,7 @@ const BACKFILL_DRIVER_MIN_WAIT_MS: u64 = 250;
 ///   `current_watermark()` read — the verified log watermark at re-arm
 ///   time, never the spawn-time one and never anything reply-derived,
 ///   so a hostile holder can't have advanced it. Re-arm queries are
-///   deferred to [`ROOT_REARM_COOLDOWN_MS`] since the last request —
+///   deferred to [`EPOCH_REARM_COOLDOWN_MS`] since the last request —
 ///   deferred, not dropped (same flap-storm guard as
 ///   [`run_root_fetch_driver`], spec D7).
 /// - `now_ms` injects the wall clock (dm_outhold_apply testability
@@ -325,6 +365,8 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         latch.reset(current_watermark().await);
                     }
                     changed = shutdown_rx.changed() => {
+                        // Err = sender dropped (registry entry gone):
+                        // same as an explicit shutdown signal.
                         if changed.is_err() || *shutdown_rx.borrow() { return; }
                     }
                 }
@@ -403,10 +445,6 @@ fn arm_backoff_step(current_delay_ms: u64, base_ms: u64, cap_ms: u64) -> u64 {
 }
 
 // ── ZEB-434: community state-root fetch latch ────────────────────────────────
-
-/// Cooldown between transport-epoch-triggered re-arm queries (60 s).
-/// Spec D7: a flapping link must not storm; deferred, not dropped.
-pub const ROOT_REARM_COOLDOWN_MS: u64 = 60_000;
 
 /// What the root-fetch driver should do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -524,7 +562,7 @@ impl Default for RootFetchLatch {
 ///   inbound path; the driver only sees counts.
 /// - `epoch_rx = None` preserves return-on-Idle (used by tests and any
 ///   caller without a transport watch).
-/// - Re-arm queries are deferred to [`ROOT_REARM_COOLDOWN_MS`] since
+/// - Re-arm queries are deferred to [`EPOCH_REARM_COOLDOWN_MS`] since
 ///   the last request — deferred, not dropped (spec D7).
 /// - `now_ms` injects the wall clock (paused-time testability — same
 ///   precedent as `run_backfill_driver`).
@@ -557,6 +595,8 @@ pub async fn run_root_fetch_driver<Rq, RqFut>(
                         latch.reset();
                     }
                     changed = shutdown_rx.changed() => {
+                        // Err = sender dropped (registry entry gone):
+                        // same as an explicit shutdown signal.
                         if changed.is_err() || *shutdown_rx.borrow() { return; }
                     }
                 }
@@ -577,6 +617,8 @@ pub async fn run_root_fetch_driver<Rq, RqFut>(
                         latch.reset();
                     }
                     changed = shutdown_rx.changed() => {
+                        // Err = sender dropped (registry entry gone):
+                        // same as an explicit shutdown signal.
                         if changed.is_err() || *shutdown_rx.borrow() { return; }
                     }
                 }
@@ -589,37 +631,6 @@ pub async fn run_root_fetch_driver<Rq, RqFut>(
                     RootFetch::EngineGone => return,
                 }
             }
-        }
-    }
-}
-
-/// Wait for a transport-epoch bump. Pends forever when no watch is
-/// wired; returns false when the epoch sender dropped.
-async fn epoch_bump(epoch_rx: &mut Option<tokio::sync::watch::Receiver<u64>>) -> bool {
-    match epoch_rx.as_mut() {
-        Some(rx) => rx.changed().await.is_ok(),
-        None => std::future::pending().await,
-    }
-}
-
-/// Defer an epoch-triggered re-arm to the cooldown boundary (deferred,
-/// not dropped). Returns false if shutdown fires during the wait.
-async fn cooldown_wait(
-    last_request_at: Option<u64>,
-    now: u64,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
-) -> bool {
-    let Some(last) = last_request_at else {
-        return true;
-    };
-    let target = last.saturating_add(ROOT_REARM_COOLDOWN_MS);
-    if now >= target {
-        return true;
-    }
-    tokio::select! {
-        _ = tokio::time::sleep(std::time::Duration::from_millis(target - now)) => true,
-        changed = shutdown_rx.changed() => {
-            !(changed.is_err() || *shutdown_rx.borrow())
         }
     }
 }
@@ -1158,7 +1169,7 @@ mod tests {
         }
         assert!(!driver.is_finished(), "must park on Idle with epoch watch");
         epoch_tx.send(1).expect("bump");
-        tokio::time::advance(Duration::from_millis(ROOT_REARM_COOLDOWN_MS + 1)).await;
+        tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
         while requests.load(Ordering::SeqCst) < 2 {
             tokio::task::yield_now().await;
         }
@@ -1353,7 +1364,7 @@ mod tests {
         // Epoch bump → re-arm. Cooldown (60s since last request) defers
         // the re-query; advancing past it lets request #3 fire.
         epoch_tx.send(1).expect("epoch bump");
-        tokio::time::advance(Duration::from_millis(ROOT_REARM_COOLDOWN_MS + 1)).await;
+        tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
         while requests.load(Ordering::SeqCst) < 3 {
             tokio::task::yield_now().await;
         }
@@ -1471,7 +1482,87 @@ mod tests {
         // Bump epoch mid-backoff (driver is sleeping through 30s backoff).
         epoch_tx.send(1).expect("epoch bump");
         // Advance past the cooldown (60s since request #1 at t=0).
-        tokio::time::advance(Duration::from_millis(ROOT_REARM_COOLDOWN_MS + 1)).await;
+        tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        driver.abort();
+    }
+
+    /// Pins the "deferred, not dropped" semantics of `cooldown_wait`.
+    ///
+    /// Sequence (paused time, all clocks start at 0):
+    ///   t=0:     request #1 fires and is answered (latch satisfied).
+    ///   t≈0:     epoch bump arrives a few yields later.
+    ///   t≈0:     cooldown_wait measures from `last_request_at` = 0,
+    ///            so the boundary is EPOCH_REARM_COOLDOWN_MS (60_000 ms).
+    ///
+    /// Assertion 1 (deferred): at t = 60_000 − 1 the re-arm query must
+    ///   NOT have fired — the cooldown has not been crossed.
+    ///
+    /// Assertion 2 (not dropped): advancing 2 ms more (to t = 60_001)
+    ///   crosses the boundary; the re-arm MUST fire.
+    ///
+    /// This test would fail if `cooldown_wait` were deleted (the re-arm
+    /// would fire immediately after the epoch bump, so the "deferred"
+    /// assertion at 60_000 − 1 would see count = 2, not 1).
+    #[tokio::test(start_paused = true)]
+    async fn root_driver_epoch_rearm_defers_to_cooldown_boundary() {
+        // Satisfied latch parks; epoch bump arrives immediately after
+        // the first request. The re-query must NOT fire before the
+        // 60s cooldown boundary (deferred), and MUST fire after it
+        // (not dropped).
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_root = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                RootFetch::Answered
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_root_fetch_driver(
+            RootFetchLatch::new(),
+            request_root,
+            shutdown_rx,
+            Some(epoch_rx),
+            move || start.elapsed().as_millis() as u64,
+        ));
+        // Wait for request #1 (answered → satisfied). `last_request_at`
+        // is stamped at this point, which is t ≈ 0 under paused time.
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Send the epoch bump. The driver is now parked in the Idle
+        // select!; it will receive the bump and enter cooldown_wait.
+        // Paused time does NOT auto-advance (the test task keeps
+        // running), so cooldown_wait's sleep does not fire yet.
+        epoch_tx.send(1).expect("bump");
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Just shy of the boundary: deferred, not yet fired.
+        // The cooldown target = last_request_at(≈0) + 60_000 = 60_000.
+        // Advancing to 60_000 − 1 must leave the count at 1.
+        tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS - 1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "re-arm query must wait out the cooldown boundary"
+        );
+        // Cross it: fired (not dropped).
+        // Advancing 2 ms brings us to 60_001, past the 60_000 boundary.
+        tokio::time::advance(Duration::from_millis(2)).await;
         while requests.load(Ordering::SeqCst) < 2 {
             tokio::task::yield_now().await;
         }
