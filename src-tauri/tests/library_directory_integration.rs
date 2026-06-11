@@ -857,6 +857,7 @@ async fn click_to_join_redeem_invite_smoke() {
         self_device_id: "joiner-dev".into(),
         signing_key: Arc::clone(&joiner_signing_key),
         engine_config: ChannelLogEngineConfig::default(),
+        transport_epoch_rx: None,
     }));
 
     let crdt_state = Arc::new(Mutex::new(OwnerState::default()));

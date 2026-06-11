@@ -604,6 +604,7 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
         self_device_id: "bob-dev".into(),
         signing_key: Arc::clone(&bob_comm_sk),
         engine_config: ChannelLogEngineConfig::default(),
+        transport_epoch_rx: None,
     });
 
     let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));

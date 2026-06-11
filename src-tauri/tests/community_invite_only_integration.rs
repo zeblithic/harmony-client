@@ -502,6 +502,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         self_device_id: "bob-dev".into(),
         signing_key: Arc::clone(&bob_sk),
         engine_config: ChannelLogEngineConfig::default(),
+        transport_epoch_rx: None,
     });
 
     // Bob redeems. redeem_invite_inner spawns Bob's engine (fresh, no

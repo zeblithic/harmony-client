@@ -27,7 +27,8 @@
 //!   retrying forever — the async driver enforces shutdown, not the
 //!   latch.
 //! - [`BackfillLatch::reset`] re-arms a satisfied latch with a new
-//!   watermark (future transport-recovery hook).
+//!   watermark (transport-recovery hook — wired to transport-epoch
+//!   bumps by [`run_backfill_driver`] since ZEB-434 Task 7).
 //!
 //! ## Why pure logic
 //!
@@ -249,7 +250,10 @@ pub enum PageFetch {
 /// back a target equal to `now`).
 const BACKFILL_DRIVER_MIN_WAIT_MS: u64 = 250;
 
-/// Drive one channel's [`BackfillLatch`] to satisfaction, then return.
+/// Drive one channel's [`BackfillLatch`] to satisfaction, then — when
+/// `epoch_rx` is `Some` — park and re-arm on transport-epoch bumps
+/// (ZEB-434 Task 7, closing P3a spec §9's deferred transport-recovery
+/// hook).
 ///
 /// Spawned by `ChannelLogRegistry::spawn` for every freshly inserted
 /// engine entry — running it unconditionally at engine start unifies
@@ -273,6 +277,16 @@ const BACKFILL_DRIVER_MIN_WAIT_MS: u64 = 250;
 ///   loop.)
 /// - `shutdown_rx` flipping to `true` — or its sender dropping —
 ///   ends the driver promptly during a backoff wait.
+/// - `epoch_rx = None` preserves the legacy contract exactly:
+///   return-on-Idle, no parking (used by tests and any caller without
+///   a transport watch). With `Some`, a bump while Idle (or
+///   mid-backoff) re-arms via [`BackfillLatch::reset`] with a FRESH
+///   `current_watermark()` read — the verified log watermark at re-arm
+///   time, never the spawn-time one and never anything reply-derived,
+///   so a hostile holder can't have advanced it. Re-arm queries are
+///   deferred to [`ROOT_REARM_COOLDOWN_MS`] since the last request —
+///   deferred, not dropped (same flap-storm guard as
+///   [`run_root_fetch_driver`], spec D7).
 /// - `now_ms` injects the wall clock (dm_outhold_apply testability
 ///   precedent): production passes a `SystemTime`-based closure;
 ///   tests pair a `tokio::time::Instant`-based closure with paused
@@ -282,6 +296,7 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     request_page: Rq,
     current_watermark: Wm,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     now_ms: impl Fn() -> u64,
 ) where
     Rq: Fn(Option<Hlc>) -> RqFut,
@@ -289,6 +304,7 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     Wm: Fn() -> WmFut,
     WmFut: std::future::Future<Output = Option<Hlc>>,
 {
+    let mut last_request_at: Option<u64> = None;
     loop {
         // Cheap pre-check: covers "stopped before the driver's first
         // poll" (spawn/stop race) without waiting for a `changed()`.
@@ -296,13 +312,38 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
             return;
         }
         match latch.next_action(now_ms()) {
-            BackfillAction::Idle => return,
+            BackfillAction::Idle => {
+                if epoch_rx.is_none() {
+                    return;
+                }
+                tokio::select! {
+                    bumped = epoch_bump(&mut epoch_rx) => {
+                        if !bumped { return; }
+                        if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
+                            return;
+                        }
+                        latch.reset(current_watermark().await);
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() { return; }
+                    }
+                }
+            }
             BackfillAction::WaitUntil(target) => {
                 let wait_ms = target
                     .saturating_sub(now_ms())
                     .max(BACKFILL_DRIVER_MIN_WAIT_MS);
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(wait_ms)) => {}
+                    bumped = epoch_bump(&mut epoch_rx) => {
+                        // Mid-backoff bump: a new peer is exactly the
+                        // signal that retrying now is worthwhile (D7).
+                        if !bumped { return; }
+                        if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
+                            return;
+                        }
+                        latch.reset(current_watermark().await);
+                    }
                     changed = shutdown_rx.changed() => {
                         // Err = sender dropped (registry entry gone):
                         // same as an explicit shutdown signal.
@@ -312,34 +353,37 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                     }
                 }
             }
-            BackfillAction::Request { since } => match request_page(since).await {
-                PageFetch::Completed(replies, limit) => {
-                    let full_page = limit > 0 && replies >= limit;
-                    // Watermark re-read from the LOG (only verified
-                    // events land there) rather than trusted from the
-                    // raw reply packets — a hostile holder serving
-                    // garbage can't advance `since`. See the
-                    // `current_watermark` doc above.
-                    let max_hlc_seen = if full_page {
-                        current_watermark().await
-                    } else {
-                        None
-                    };
-                    latch.on_page_complete(
-                        PageOutcome {
-                            events: replies,
-                            max_hlc_seen,
-                            limit,
-                        },
-                        now_ms(),
-                    );
+            BackfillAction::Request { since } => {
+                last_request_at = Some(now_ms());
+                match request_page(since).await {
+                    PageFetch::Completed(replies, limit) => {
+                        let full_page = limit > 0 && replies >= limit;
+                        // Watermark re-read from the LOG (only verified
+                        // events land there) rather than trusted from the
+                        // raw reply packets — a hostile holder serving
+                        // garbage can't advance `since`. See the
+                        // `current_watermark` doc above.
+                        let max_hlc_seen = if full_page {
+                            current_watermark().await
+                        } else {
+                            None
+                        };
+                        latch.on_page_complete(
+                            PageOutcome {
+                                events: replies,
+                                max_hlc_seen,
+                                limit,
+                            },
+                            now_ms(),
+                        );
+                    }
+                    PageFetch::NoReply => latch.on_no_reply(now_ms()),
+                    // Permanent: the engine/adapter is gone for good and
+                    // no recovery hook exists — stop instead of burning
+                    // eternal futile retries until engine stop.
+                    PageFetch::EngineGone => return,
                 }
-                PageFetch::NoReply => latch.on_no_reply(now_ms()),
-                // Permanent: the engine/adapter is gone for good and
-                // no recovery hook exists — stop instead of burning
-                // eternal futile retries until engine stop.
-                PageFetch::EngineGone => return,
-            },
+            }
         }
     }
 }
@@ -866,6 +910,7 @@ mod tests {
             request_page,
             || async { None::<Hlc> },
             shutdown_rx,
+            None,
             move || start.elapsed().as_millis() as u64,
         )
         .await;
@@ -921,6 +966,7 @@ mod tests {
             request_page,
             current_watermark,
             shutdown_rx,
+            None,
             move || start.elapsed().as_millis() as u64,
         )
         .await;
@@ -963,6 +1009,7 @@ mod tests {
             request_page,
             || async { None::<Hlc> },
             shutdown_rx,
+            None,
             move || start.elapsed().as_millis() as u64,
         ));
         // Let the driver issue request #1 and arm its 30s backoff
@@ -1007,6 +1054,7 @@ mod tests {
             request_page,
             || async { None::<Hlc> },
             shutdown_rx,
+            None,
             move || start.elapsed().as_millis() as u64,
         ));
         while requests.load(Ordering::SeqCst) < 1 {
@@ -1052,6 +1100,7 @@ mod tests {
             request_page,
             || async { None::<Hlc> },
             shutdown_rx,
+            None,
             move || start.elapsed().as_millis() as u64,
         )
         .await;
@@ -1067,6 +1116,59 @@ mod tests {
             Duration::ZERO,
             "driver must exit without arming any backoff wait"
         );
+    }
+
+    // ZEB-434 Task 7: epoch-park/re-arm on the channel-log driver.
+    // (The legacy return-on-Idle path with `epoch_rx = None` is pinned
+    // by `driver_retries_until_holder_appears_then_satisfies` above,
+    // which awaits driver completion — satisfied → Idle → return.)
+    #[tokio::test(start_paused = true)]
+    async fn backfill_driver_rearms_on_epoch_bump_with_fresh_watermark() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let sinces: Arc<StdMutex<Vec<Option<Hlc>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let counter = Arc::clone(&requests);
+        let since_log = Arc::clone(&sinces);
+        // Every request answers with a short page (immediately satisfied).
+        let request_page = move |since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            let since_log = Arc::clone(&since_log);
+            async move {
+                since_log.lock().unwrap().push(since);
+                counter.fetch_add(1, Ordering::SeqCst);
+                PageFetch::Completed(0, 256)
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(Some(hlc(100))),
+            request_page,
+            // Watermark moved to 200 by the time the re-arm fires.
+            || async { Some(hlc(200)) },
+            shutdown_rx,
+            Some(epoch_rx),
+            move || start.elapsed().as_millis() as u64,
+        ));
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!driver.is_finished(), "must park on Idle with epoch watch");
+        epoch_tx.send(1).expect("bump");
+        tokio::time::advance(Duration::from_millis(ROOT_REARM_COOLDOWN_MS + 1)).await;
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        // Re-arm must reset() with the CURRENT log watermark, not the
+        // spawn-time one.
+        assert_eq!(
+            sinces.lock().unwrap().clone(),
+            vec![Some(hlc(100)), Some(hlc(200))]
+        );
+        driver.abort();
     }
 
     #[test]

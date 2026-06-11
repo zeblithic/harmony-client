@@ -2053,6 +2053,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         self_device_id: "test-dev".into(),
         signing_key: Arc::clone(&signing_key),
         engine_config: ChannelLogEngineConfig::default(),
+        transport_epoch_rx: None,
     });
 
     // Pre-call snapshot of owner-state's canonical byte encoding. Any
@@ -2873,6 +2874,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         self_device_id: "bob-dev".into(),
         signing_key: Arc::clone(&bob_signing_key),
         engine_config: ChannelLogEngineConfig::default(),
+        transport_epoch_rx: None,
     });
 
     // Pre-call snapshot of owner-state's canonical encoding. Any

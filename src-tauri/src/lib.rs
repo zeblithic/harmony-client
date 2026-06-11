@@ -4177,6 +4177,12 @@ pub(crate) async fn start_node_inner(
                             engine_config:
                                 crate::community_channel_log_engine::ChannelLogEngineConfig::default(
                                 ),
+                            // ZEB-434 Task 7: same transport-epoch watch the
+                            // community root-fetch drivers use (built above,
+                            // sender lives in event_loop::run's 5s peer
+                            // refresh) — channel-log backfill drivers park on
+                            // Idle and re-arm on peer arrival/recovery.
+                            transport_epoch_rx: Some(transport_epoch_rx.clone()),
                         },
                     );
                     // Clones of the registry: one for the delta
@@ -18771,6 +18777,7 @@ mod create_community_inner_tests {
             self_device_id: "test-dev".into(),
             signing_key: std::sync::Arc::clone(&signing_key),
             engine_config: ChannelLogEngineConfig::default(),
+            transport_epoch_rx: None,
         });
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
@@ -21114,6 +21121,7 @@ mod redeem_invite_inner_tests {
             self_device_id: "joiner-dev".into(),
             signing_key: std::sync::Arc::clone(&signing_key),
             engine_config: ChannelLogEngineConfig::default(),
+            transport_epoch_rx: None,
         });
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
@@ -21389,6 +21397,7 @@ mod redeem_invite_inner_tests {
                 self_device_id: "joiner-dev".into(),
                 signing_key: std::sync::Arc::clone(&signing_key),
                 engine_config: ChannelLogEngineConfig::default(),
+                transport_epoch_rx: None,
             }));
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
@@ -21685,6 +21694,7 @@ mod redeem_invite_inner_tests {
                 self_device_id: "joiner-dev".into(),
                 signing_key: std::sync::Arc::clone(&signing_key),
                 engine_config: ChannelLogEngineConfig::default(),
+                transport_epoch_rx: None,
             }));
 
         let baseline_err = redeem_invite_inner(
