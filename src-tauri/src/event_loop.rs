@@ -2647,12 +2647,22 @@ pub async fn run<R: Runtime>(
                     }
                 });
             }
+            // ZEB-443: the retry driver re-invokes this closure forever
+            // (600s cap), so UI error reporting is deduped to state
+            // TRANSITIONS — first failure since the last successful
+            // reply surfaces, repeats are log-only. The one-shot it
+            // replaced surfaced at most one error per boot; without the
+            // dedup an unreachable gateway would re-emit an identical
+            // error event every backoff attempt indefinitely.
+            let mail_error_reported = Arc::new(AtomicBool::new(false));
             let request_root = move || {
                 let session = session_mail.clone();
                 let key = key_mail.clone();
                 let sync = Arc::clone(&sync_mail);
+                let reported = Arc::clone(&mail_error_reported);
                 async move {
                     let result = query_mail_root(&session, &key, "startup").await;
+                    let surface_error = mail_root_error_transition(&reported, &result);
                     match &result {
                         Ok(Some(payload)) => {
                             // Empty payload routes through the same handler:
@@ -2668,13 +2678,17 @@ pub async fn run<R: Runtime>(
                             tracing::info!(
                                 "startup root query: no responder — retrying with backoff; live push also catches up on next gateway publish"
                             );
-                            sync.report_query_error(
-                                "no gateway responded to startup query".to_string(),
-                            );
+                            if surface_error {
+                                sync.report_query_error(
+                                    "no gateway responded to startup query".to_string(),
+                                );
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "startup root query failed; retrying with backoff");
-                            sync.report_query_error(format!("startup query failed: {e}"));
+                            if surface_error {
+                                sync.report_query_error(format!("startup query failed: {e}"));
+                            }
                         }
                     }
                     map_mail_root_outcome(&result)
@@ -6108,6 +6122,25 @@ fn map_mail_root_outcome(
     }
 }
 
+/// ZEB-443: dedup the mail-root retry driver's UI error reporting to
+/// state TRANSITIONS. Returns true only for the FIRST failure since the
+/// last successful reply (`reported` latches across the retry loop);
+/// success resets the latch so a later outage surfaces again. Every
+/// attempt still logs — only `report_query_error` (which rewrites
+/// `SyncState::Error` and re-emits a UI status event per call) is gated.
+fn mail_root_error_transition(
+    reported: &AtomicBool,
+    result: &Result<Option<Vec<u8>>, String>,
+) -> bool {
+    match result {
+        Ok(Some(_)) => {
+            reported.store(false, Ordering::Relaxed);
+            false
+        }
+        Ok(None) | Err(_) => !reported.swap(true, Ordering::Relaxed),
+    }
+}
+
 #[cfg(test)]
 mod mail_root_outcome_tests {
     use super::map_mail_root_outcome;
@@ -6135,6 +6168,31 @@ mod mail_root_outcome_tests {
             map_mail_root_outcome(&Err("boom".to_string())),
             RootFetch::NoReply
         );
+    }
+
+    /// ZEB-443: UI error reporting is deduped to transitions — first
+    /// failure since the last success reports, repeats are suppressed,
+    /// a successful reply re-arms reporting for the next outage.
+    #[test]
+    fn mail_root_error_reporting_dedupes_to_transitions() {
+        use super::mail_root_error_transition;
+        use std::sync::atomic::AtomicBool;
+
+        let reported = AtomicBool::new(false);
+        let no_responder: Result<Option<Vec<u8>>, String> = Ok(None);
+        let failed: Result<Option<Vec<u8>>, String> = Err("boom".to_string());
+        let answered: Result<Option<Vec<u8>>, String> = Ok(Some(vec![1]));
+
+        // First failure → report.
+        assert!(mail_root_error_transition(&reported, &no_responder));
+        // Repeats (either failure kind) → suppressed.
+        assert!(!mail_root_error_transition(&reported, &no_responder));
+        assert!(!mail_root_error_transition(&reported, &failed));
+        // Success → never reports, and re-arms the latch.
+        assert!(!mail_root_error_transition(&reported, &answered));
+        // Next outage after a success → reports again.
+        assert!(mail_root_error_transition(&reported, &failed));
+        assert!(!mail_root_error_transition(&reported, &failed));
     }
 }
 
