@@ -2647,6 +2647,15 @@ pub async fn run<R: Runtime>(
                     }
                 });
             }
+            // ZEB-443: the retry driver re-invokes this closure forever
+            // (600s cap). UI error spam is prevented inside
+            // `report_query_error` itself — identical-message reports
+            // while already in `Error` are suppressed, and ANY
+            // transition away from `Error` (startup reply, successful
+            // manual refresh) re-arms reporting. Deduping here with a
+            // closure-side latch instead would desync from refresh_now:
+            // a successful manual refresh would clear the UI to idle
+            // while the latch stayed set, silencing an ongoing outage.
             let request_root = move || {
                 let session = session_mail.clone();
                 let key = key_mail.clone();

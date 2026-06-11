@@ -197,17 +197,34 @@ impl<R: Runtime> MailSync<R> {
     /// Public so the cold-start spawn in `event_loop` can use the same
     /// channel as `refresh_now`.
     ///
+    /// ZEB-443: dedup is derived from the CURRENT state — an identical
+    /// message while already in `Error` is suppressed (no rewrite, no
+    /// re-emit). The mail-root retry driver re-reports indefinitely at
+    /// its backoff cap; without this, a node that can't reach a gateway
+    /// re-emits the same UI event every attempt. Deriving from state
+    /// (rather than a caller-side latch) means ANY transition away from
+    /// `Error` — a startup reply, a successful manual `refresh_now` —
+    /// naturally re-arms reporting for the next outage.
+    ///
     /// If the walker is mid-`Walking`, the in-flight pass is left alone —
     /// it will emit its own terminal status when it finishes. Recording
     /// the error during a Walking pass would also trip `finish_walk`'s
     /// pending-root accounting. The transient emit is informational; the
     /// active walk is the source of truth.
-    pub fn report_query_error(self: &Arc<Self>, message: String) {
+    ///
+    /// Returns whether the error was surfaced (false = identical
+    /// duplicate suppressed).
+    pub fn report_query_error(self: &Arc<Self>, message: String) -> bool {
         {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             match &*state {
                 SyncState::Walking { .. } => {
                     // Don't overwrite Walking; the active pass owns the state.
+                }
+                SyncState::Error { last_error, .. } if *last_error == message => {
+                    // Same error already surfaced and still current —
+                    // suppress the duplicate state rewrite and emit.
+                    return false;
                 }
                 SyncState::Idle { last_walked_root }
                 | SyncState::Error {
@@ -225,6 +242,7 @@ impl<R: Runtime> MailSync<R> {
             state: "error",
             error: Some(message),
         });
+        true
     }
 
     /// Lazy body fetch. Called from the fetch_mail_body Tauri command.
@@ -1575,6 +1593,40 @@ mod tests {
             "expected Idle after empty reply, got {:?}",
             *guard
         );
+    }
+
+    /// ZEB-443: identical consecutive errors are suppressed — the mail-
+    /// root retry driver re-reports indefinitely at its backoff cap, and
+    /// without state-derived dedup an unreachable gateway re-emits the
+    /// same UI event every attempt. A DIFFERENT message is new
+    /// information and surfaces; ANY transition away from `Error` (here
+    /// a successful empty startup reply — the same path a successful
+    /// manual refresh takes) re-arms reporting for the next outage.
+    #[tokio::test]
+    async fn report_query_error_dedupes_identical_consecutive_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, _fetch_rx) = mpsc::channel::<FetchRequest>(8);
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr);
+
+        // First failure surfaces.
+        assert!(sync.report_query_error("no gateway".to_string()));
+        // Identical repeat (the retry loop) is suppressed.
+        assert!(!sync.report_query_error("no gateway".to_string()));
+        // A different message is new information — surfaces.
+        assert!(sync.report_query_error("timed out".to_string()));
+        assert!(!sync.report_query_error("timed out".to_string()));
+
+        // Success clears Error → reporting re-arms for the next outage.
+        sync.clone().handle_startup_query_reply(Some(b"")).await;
+        assert!(matches!(
+            &*sync.state.lock().unwrap(),
+            SyncState::Idle { .. }
+        ));
+        assert!(sync.report_query_error("no gateway".to_string()));
     }
 
     /// A successful "no mail yet" reply (empty payload) following a prior
