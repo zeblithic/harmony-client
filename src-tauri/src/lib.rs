@@ -19732,9 +19732,7 @@ where
                 g.materialized(payload.admin_addr)
                     .members
                     .get(&self_owner)
-                    .map(|m| {
-                        matches!(m.status, crate::community_membership::MemberStatus::Joined)
-                    })
+                    .map(|m| matches!(m.status, crate::community_membership::MemberStatus::Joined))
                     .unwrap_or(false)
             }
         };
@@ -22290,7 +22288,10 @@ mod zeb436_orphan_adoption_tests {
     }
 
     /// Path of the persisted per-community CRDT inside the fixture tempdir.
-    fn crdt_path_for(fixture: &RedeemInviteTestFixture, community_id: SpaceId) -> std::path::PathBuf {
+    fn crdt_path_for(
+        fixture: &RedeemInviteTestFixture,
+        community_id: SpaceId,
+    ) -> std::path::PathBuf {
         fixture
             .identity_dir
             .join("communities")
@@ -22364,8 +22365,7 @@ mod zeb436_orphan_adoption_tests {
         .await;
         assert!(first.is_ok(), "baseline join must succeed: {first:?}");
 
-        let (rebooted_owner_state, events_before) =
-            orphan_after_join(&fixture, community_id).await;
+        let (rebooted_owner_state, events_before) = orphan_after_join(&fixture, community_id).await;
         assert_eq!(
             events_before, 1,
             "fixture sanity: exactly the baseline self-Join persisted on disk"
@@ -22399,9 +22399,7 @@ mod zeb436_orphan_adoption_tests {
                 "already Joined — no pending marker"
             );
             assert_eq!(
-                row.current_epoch_key
-                    .as_ref()
-                    .map(|k| *k.as_bytes()),
+                row.current_epoch_key.as_ref().map(|k| *k.as_bytes()),
                 Some([0x43; 32]),
                 "adopted row carries the FRESH invite's epoch key, not the stale one"
             );
@@ -22445,8 +22443,7 @@ mod zeb436_orphan_adoption_tests {
         )
         .await;
         assert!(first.is_ok(), "baseline join must succeed: {first:?}");
-        let (rebooted_owner_state, events_before) =
-            orphan_after_join(&fixture, community_id).await;
+        let (rebooted_owner_state, events_before) = orphan_after_join(&fixture, community_id).await;
 
         let failed = redeem_with(
             &fixture,
@@ -22501,23 +22498,47 @@ mod zeb436_orphan_adoption_tests {
         );
     }
 
-    /// The actual ZEB-427 recovery deadlock, invite-only flavor — the
-    /// exact shape of the preserved Test1 fixture. The persisted dir
-    /// materializes self as Joined; the owner-state row is gone. Pre-fix,
-    /// redeeming a FRESH invite dies on the membership P6 rule ("engine
-    /// rejected local PendingJoin insert: ... already-engaged") because
-    /// PendingJoin only admits prior None | Left — and the victim cannot
-    /// leave either ("no engine"). Post-fix, the adoption pre-check fires
-    /// before the invite-only branch ever mints a PendingJoin: no admin
-    /// round-trip, no countersign wait, owner-state-only repair.
-    ///
-    /// Inline cert-model fixture (mirrors
+    /// Everything an invite-only orphan scenario needs: a registry whose
+    /// resolver admits the cert-model admin + joiner, a fabricated
+    /// orphaned dir on disk (admin bootstrap Join + self Join — the
+    /// materialized end-state of PendingJoin + JoinCountersign, the exact
+    /// shape of the preserved Test1 fixture), an owner-state that never
+    /// learned the Space row, and a fresh valid invite URL from the
+    /// admin. Shared by the inner-adoption test and the iroh-wrapper
+    /// routing test.
+    struct InviteOnlyOrphanRig {
+        community_id: SpaceId,
+        identity_dir: std::path::PathBuf,
+        joiner_self_owner: OwnerAddr,
+        signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+        joiner_cert: harmony_owner::certs::EnrollmentCert,
+        community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+        community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+        unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
+        dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+        channel_log_registry: std::sync::Arc<
+            crate::community_channel_log_engine::ChannelLogRegistry<tauri::test::MockRuntime>,
+        >,
+        invite_url: String,
+        crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
+        hlc_tracker: std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+        // Held alive so channels don't report Closed.
+        _community_adapter_rx:
+            tokio::sync::mpsc::Receiver<crate::event_loop::CommunityAdapterRequest>,
+        _unicast_rx: tokio::sync::mpsc::Receiver<crate::dm_outbox::UnicastSendRequest>,
+        _channel_log_adapter_rx:
+            tokio::sync::mpsc::UnboundedReceiver<crate::event_loop::ChannelLogAdapterRequest>,
+        _tmp: tempfile::TempDir,
+    }
+
+    /// Inline cert-model rig (mirrors
     /// `redeem_invite_inner_allow_no_reticulum_destinations_skips_fast_fail`):
     /// the shared fixture's resolver doesn't admit a cert-model admin, and
     /// the invite-only path needs the admin bootstrap + token signed by an
     /// enrolled device key.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn invite_only_redeem_adopts_orphaned_dir_instead_of_p6_deadlock() {
+    async fn build_invite_only_orphan_rig(community_id: SpaceId) -> InviteOnlyOrphanRig {
         use crate::community_channel_log_engine::{
             ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
         };
@@ -22617,18 +22638,15 @@ mod zeb436_orphan_adoption_tests {
         let (channel_log_adapter_tx, _channel_log_adapter_rx) =
             mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
         let app = tauri::test::mock_app().handle().clone();
-        let channel_log_registry =
-            std::sync::Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
-                adapter_request_tx: channel_log_adapter_tx,
-                app,
-                identity_dir: tmp.path().to_path_buf(),
-                self_owner: joiner_self_owner,
-                self_device_id: "joiner-dev".into(),
-                signing_key: std::sync::Arc::clone(&signing_key),
-                engine_config: ChannelLogEngineConfig::default(),
-            }));
-
-        let community_id = SpaceId([0xf7; 16]);
+        let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+            adapter_request_tx: channel_log_adapter_tx,
+            app,
+            identity_dir: tmp.path().to_path_buf(),
+            self_owner: joiner_self_owner,
+            self_device_id: "joiner-dev".into(),
+            signing_key: std::sync::Arc::clone(&signing_key),
+            engine_config: ChannelLogEngineConfig::default(),
+        });
 
         // ── Fabricate the orphaned dir exactly as a healthy engine left
         // it: the admin's cert-bearing bootstrap Join plus self's Join
@@ -22662,13 +22680,16 @@ mod zeb436_orphan_adoption_tests {
                     device_id: "joiner-dev".into(),
                 },
             };
-            let mut ev = crate::community_membership::sign_event(&payload, &joiner_owner.device_key)
-                .expect("sign self join");
+            let mut ev =
+                crate::community_membership::sign_event(&payload, &joiner_owner.device_key)
+                    .expect("sign self join");
             ev.enrollment = Some(joiner_owner.cert.clone());
             ev
         };
         let mut orphaned = crate::community_state_crdt::CommunityState::new(community_id);
-        orphaned.events.insert(admin_bootstrap.id, admin_bootstrap.clone());
+        orphaned
+            .events
+            .insert(admin_bootstrap.id, admin_bootstrap.clone());
         orphaned.events.insert(self_join.id, self_join);
         let crdt_path = tmp
             .path()
@@ -22737,24 +22758,59 @@ mod zeb436_orphan_adoption_tests {
         let invite_url =
             crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
 
-        // ── Redeem against an owner-state that never learned the row.
+        // Owner-state that never learned the row (the lost-row half of
+        // the ZEB-427 split-brain).
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
-        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-            std::collections::BTreeMap::new(),
-        ));
-        let result = super::redeem_invite_inner(
-            invite_url,
-            std::sync::Arc::clone(&crdt_state),
-            std::sync::Arc::clone(&hlc_tracker),
-            "joiner-dev".to_string(),
+        let hlc_tracker =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+        InviteOnlyOrphanRig {
+            community_id,
+            identity_dir: tmp.path().to_path_buf(),
             joiner_self_owner,
-            std::sync::Arc::clone(&signing_key),
-            joiner_owner.cert.clone(),
-            std::sync::Arc::clone(&community_registry),
+            signing_key,
+            joiner_cert: joiner_owner.cert.clone(),
+            community_registry,
             community_adapter_tx,
             unicast_send_tx,
-            std::sync::Arc::clone(&dm_outbox),
-            std::sync::Arc::clone(&channel_log_registry),
+            dm_outbox,
+            channel_log_registry,
+            invite_url,
+            crdt_state,
+            hlc_tracker,
+            _community_adapter_rx,
+            _unicast_rx,
+            _channel_log_adapter_rx,
+            _tmp: tmp,
+        }
+    }
+
+    /// The actual ZEB-427 recovery deadlock, invite-only flavor — the
+    /// exact shape of the preserved Test1 fixture. The persisted dir
+    /// materializes self as Joined; the owner-state row is gone. Pre-fix,
+    /// redeeming a FRESH invite dies on the membership P6 rule ("engine
+    /// rejected local PendingJoin insert: ... already-engaged") because
+    /// PendingJoin only admits prior None | Left — and the victim cannot
+    /// leave either ("no engine"). Post-fix, the adoption pre-check fires
+    /// before the invite-only branch ever mints a PendingJoin: no admin
+    /// round-trip, no countersign wait, owner-state-only repair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invite_only_redeem_adopts_orphaned_dir_instead_of_p6_deadlock() {
+        let rig = build_invite_only_orphan_rig(SpaceId([0xf7; 16])).await;
+
+        let result = super::redeem_invite_inner(
+            rig.invite_url.clone(),
+            std::sync::Arc::clone(&rig.crdt_state),
+            std::sync::Arc::clone(&rig.hlc_tracker),
+            "joiner-dev".to_string(),
+            rig.joiner_self_owner,
+            std::sync::Arc::clone(&rig.signing_key),
+            rig.joiner_cert.clone(),
+            std::sync::Arc::clone(&rig.community_registry),
+            rig.community_adapter_tx.clone(),
+            rig.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&rig.dm_outbox),
+            std::sync::Arc::clone(&rig.channel_log_registry),
             || Ok(()),
             None,
             true, // allow_no_reticulum_destinations
@@ -22771,10 +22827,10 @@ mod zeb436_orphan_adoption_tests {
         );
 
         {
-            let g = crdt_state.lock().await;
+            let g = rig.crdt_state.lock().await;
             let row = g
                 .spaces
-                .get(&community_id)
+                .get(&rig.community_id)
                 .expect("adoption must reconstruct the owner-state Space row");
             assert!(row.left_at.is_none());
             assert!(row.pending_join_at.is_none());
@@ -22785,8 +22841,9 @@ mod zeb436_orphan_adoption_tests {
             );
         }
 
-        let state_arc = community_registry
-            .state_for(&community_id)
+        let state_arc = rig
+            .community_registry
+            .state_for(&rig.community_id)
             .await
             .expect("repair redeem must (re)spawn the community engine");
         let events_after = {
@@ -22796,6 +22853,78 @@ mod zeb436_orphan_adoption_tests {
         assert_eq!(
             events_after, 2,
             "adoption must not mint a PendingJoin on top of the two persisted events"
+        );
+    }
+
+    /// ZEB-436 UI reachability: the iroh wrapper (the path the UI's
+    /// redeem dialog actually drives) must route an orphan repair to the
+    /// local adoption path BEFORE touching any connectivity. Pre-fix the
+    /// wrapper either failed at the resolver guards ("inviter_unreachable",
+    /// as forced here with zero connectivity handles) or — with
+    /// connectivity up — dialed the admin, whose verify correctly rejects
+    /// our PendingJoin as already-engaged (P6), killing the handshake
+    /// before `redeem_invite_inner`'s adoption path could ever run.
+    /// Adoption needs no transport at all: the invite URL itself carries
+    /// the fresh epoch key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iroh_wrapper_routes_orphan_repair_without_any_connectivity() {
+        let rig = build_invite_only_orphan_rig(SpaceId([0xf8; 16])).await;
+
+        let nav_events: std::sync::Arc<std::sync::Mutex<Vec<super::NavUpdatedPayload>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let nav_events_sink = std::sync::Arc::clone(&nav_events);
+
+        let outcome = super::connectivity_redeem_invite_iroh_inner(
+            rig.invite_url.clone(),
+            None, // pkarr_resolver — the repair must not need it
+            None, // reachability_resolver
+            None, // iroh_endpoint
+            std::sync::Arc::clone(&rig.crdt_state),
+            std::sync::Arc::clone(&rig.hlc_tracker),
+            "joiner-dev".to_string(),
+            rig.joiner_self_owner,
+            std::sync::Arc::clone(&rig.signing_key),
+            rig.joiner_cert.clone(),
+            std::sync::Arc::clone(&rig.community_registry),
+            rig.community_adapter_tx.clone(),
+            rig.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&rig.dm_outbox),
+            std::sync::Arc::clone(&rig.channel_log_registry),
+            None, // sync_engine: fence warn path (pre-start_node shape)
+            Some(rig.identity_dir.clone()),
+            |_progress| {},
+            move |nav| nav_events_sink.lock().expect("nav events").push(nav),
+            super::HandshakeDialConfig {
+                connect_timeout: std::time::Duration::from_millis(50),
+                open_bi_timeout: std::time::Duration::from_millis(50),
+                response_read_timeout: std::time::Duration::from_millis(50),
+                write_timeout: std::time::Duration::from_millis(50),
+            },
+            || Ok(()),
+        )
+        .await
+        .expect("wrapper must not Err on the repair path");
+
+        assert_eq!(
+            outcome.status, "joined",
+            "orphan repair through the iroh wrapper must succeed with zero \
+             connectivity; got status={} community_id={:?}",
+            outcome.status, outcome.community_id
+        );
+        {
+            let g = rig.crdt_state.lock().await;
+            assert!(
+                g.spaces.contains_key(&rig.community_id),
+                "adopted Space row must exist after the wrapper repair"
+            );
+        }
+        let nav = nav_events.lock().expect("nav events");
+        assert_eq!(nav.len(), 1, "exactly one nav-updated emit on repair");
+        assert_eq!(nav[0].action, "added");
+        assert_eq!(
+            nav[0].pending,
+            Some(false),
+            "adoption reattaches an existing membership — never pending"
         );
     }
 }
@@ -35730,6 +35859,66 @@ mod zeb427_fence_tests {
     }
 }
 
+/// ZEB-436: read-only orphan probe for the iroh redemption wrapper.
+/// True when the invite targets a community whose persisted dir already
+/// materializes self as `Joined` (from REAL events on disk) while the
+/// owner-state holds no functional Space row — the ZEB-427 lost-row
+/// split-brain. In that state the handshake is worse than useless: the
+/// admin-side verify correctly rejects a fresh PendingJoin as
+/// already-engaged (P6), so the dial can only fail, while
+/// `redeem_invite_inner`'s adoption path needs no transport at all.
+///
+/// Routing-only: `redeem_invite_inner` re-derives the decision
+/// authoritatively from the spawned engine's state. A stale `true` here
+/// (e.g. a functional row landing between probe and inner) just means
+/// the inner runs its normal non-adoptive flow, with the PendingJoin
+/// reaching the admin via Zenoh CRDT sync.
+async fn invite_targets_orphaned_community_dir(
+    identity_dir: Option<&std::path::Path>,
+    payload: &crate::community_invite::CommunityInvitePayload,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+) -> bool {
+    let Some(dir) = identity_dir else {
+        return false;
+    };
+    let crdt_path = dir
+        .join("communities")
+        .join(hex::encode(payload.community_id.0))
+        .join("crdt.cbor");
+    let community_id = payload.community_id;
+    // Blocking file read off the async path (same discipline as engine
+    // spawn's phase-1 spawn_blocking). A missing file loads as an empty
+    // state, which the events gate below treats as "not an orphan".
+    let state = match tokio::task::spawn_blocking(move || {
+        crate::community_state_persist::load_crdt(&crdt_path, community_id)
+    })
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return false,
+    };
+    if state.events.is_empty() {
+        return false;
+    }
+    let self_joined = state
+        .materialized(payload.admin_addr)
+        .members
+        .get(&self_owner)
+        .map(|m| matches!(m.status, crate::community_membership::MemberStatus::Joined))
+        .unwrap_or(false);
+    if !self_joined {
+        return false;
+    }
+    let g = crdt_state.lock().await;
+    let functional_row_exists = g
+        .spaces
+        .get(&payload.community_id)
+        .map(|s| s.left_at.is_none() && s.current_epoch_key.is_some())
+        .unwrap_or(false);
+    !functional_row_exists
+}
+
 /// Inner orchestration body of `connectivity_redeem_invite_iroh`, split out
 /// so integration tests can drive it with explicit resources rather than
 /// the full Tauri AppState. ZEB-325 Phase 2c **option A**: direct iroh
@@ -35852,6 +36041,107 @@ where
     // case-A guards so the UI shows "looking up" even on early-exit
     // paths (missing token, missing admin_id_pub).
     emit_stage(RedemptionStage::Resolving);
+
+    // ZEB-436: orphan repair short-circuit — BEFORE the case-A guards
+    // and any connectivity. If the persisted dir already materializes
+    // self as Joined while the owner-state row is missing or
+    // non-functional, the handshake below can only fail: the admin-side
+    // verify correctly rejects our fresh PendingJoin as already-engaged
+    // (P6). The inner's adoption path needs no transport, so route
+    // straight to it. Sitting above the case-A token guard also lets
+    // open-community orphans repair through this wrapper instead of
+    // bouncing as "inviter_unreachable".
+    if invite_targets_orphaned_community_dir(
+        identity_dir.as_deref(),
+        &payload,
+        self_owner,
+        crdt_state.as_ref(),
+    )
+    .await
+    {
+        tracing::info!(
+            community_id = %hex::encode(payload.community_id.0),
+            "ZEB-436: invite targets an orphaned community dir — skipping the \
+             iroh handshake and routing to the local adoption path"
+        );
+        let result = redeem_invite_inner(
+            invite_url,
+            crdt_state,
+            hlc_tracker,
+            device_id,
+            self_owner,
+            signing_key,
+            enrollment_cert,
+            community_registry,
+            community_adapter_tx,
+            unicast_send_tx,
+            dm_outbox,
+            channel_log_registry,
+            fence_check,
+            identity_dir,
+            // Adoption mints no membership event and awaits no
+            // countersign. If the inner's authoritative re-check declines
+            // to adopt (probe raced a concurrent commit), the minted
+            // PendingJoin still reaches the admin via the engine's Zenoh
+            // state-root publish — the same contract as the handshake
+            // path's `true` at step 12 below.
+            true,
+        )
+        .await;
+        return match result {
+            Ok(dto) => {
+                // Mirrors the handshake path's post-success tail (fence →
+                // stage emit → nav emit) at the bottom of this function.
+                // Kept inline: hoisting that tail above the handshake's
+                // dozen early-returns would reindent the entire dial
+                // sequence for the sake of two call sites.
+                match sync_engine.as_ref() {
+                    Some(engine) => {
+                        fence_owner_state_flush(
+                            engine,
+                            OWNER_STATE_FENCE_TIMEOUT,
+                            "connectivity_redeem_invite_iroh (ZEB-436 adoption)",
+                            &dto.community_id,
+                        )
+                        .await;
+                    }
+                    None => {
+                        tracing::warn!(
+                            community_id = %dto.community_id,
+                            "connectivity_redeem_invite_iroh (ZEB-436 adoption): no \
+                             SyncEngine handle — the adopted Space is NOT persisted \
+                             until the next unrelated owner-state flush (ZEB-427)"
+                        );
+                    }
+                }
+                emit_stage(RedemptionStage::Joined);
+                nav_emit_sink(NavUpdatedPayload {
+                    action: "added",
+                    space_id: dto.community_id.clone(),
+                    kind: "community",
+                    name: dto.community_name.clone(),
+                    members: None,
+                    parent_id: None,
+                    pending: Some(dto.pending),
+                });
+                Ok(RedemptionOutcome {
+                    status: "joined".to_string(),
+                    community_id: Some(dto.community_id),
+                })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    community_id = %hex::encode(payload.community_id.0),
+                    "ZEB-436: local adoption redeem failed"
+                );
+                Ok(RedemptionOutcome {
+                    status: "join_failed".to_string(),
+                    community_id: Some(hex::encode(payload.community_id.0)),
+                })
+            }
+        };
+    }
 
     // 2. Case-A keying material guards.
     let Some(ref token) = payload.invite_token else {

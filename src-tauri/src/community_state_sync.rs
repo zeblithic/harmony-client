@@ -5023,9 +5023,7 @@ mod tests {
         // stop, so a short grace period gives the bug a real chance to
         // manifest before the survival assertion.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
-        while fix.registry.has_engine(&community_id).await
-            && std::time::Instant::now() < deadline
-        {
+        while fix.registry.has_engine(&community_id).await && std::time::Instant::now() < deadline {
             tokio::task::yield_now().await;
         }
         assert!(
