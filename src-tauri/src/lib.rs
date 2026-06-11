@@ -264,6 +264,47 @@ impl<R: tauri::Runtime> crate::iroh_friend_acceptor::FriendEventEmit for tauri::
     }
 }
 
+/// ZEB-445: Tauri-free equivalent of `app.path().app_data_dir()`. Tauri
+/// resolves the app-data dir as `dirs::data_dir()/<identifier>` with
+/// identifier "net.zeblith.harmony" (tauri.conf.json:5). serve mode must
+/// resolve the IDENTICAL path or GUI and headless would split-brain the
+/// profile.
+pub(crate) fn resolve_app_data_dir() -> Result<std::path::PathBuf, String> {
+    dirs::data_dir()
+        .map(|d| d.join("net.zeblith.harmony"))
+        .ok_or_else(|| "cannot resolve platform data dir".to_string())
+}
+
+/// ZEB-445: sink-trait adapter so `Arc<dyn NodeEventSink>` satisfies the
+/// `AppHandleEmit` bound (payload shape mirrors the AppHandle impl above).
+impl crate::community_invite::AppHandleEmit
+    for std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>
+{
+    fn emit_degraded(&self, community_id_hex: &str, reason_tag: &'static str) {
+        self.emit(
+            "community-state-sync-degraded",
+            serde_json::json!({
+                "communityId": community_id_hex,
+                "reason": reason_tag,
+            }),
+        );
+    }
+}
+
+/// ZEB-445: sink-trait adapter so `Arc<dyn NodeEventSink>` satisfies the
+/// `FriendEventEmit` bound. Tauri serializes `()` as JSON `null`, so
+/// `Value::Null` is wire-identical to the AppHandle impl above.
+impl crate::iroh_friend_acceptor::FriendEventEmit
+    for std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>
+{
+    fn emit_friend_list_changed(&self) {
+        self.emit("friend-list-changed", serde_json::Value::Null);
+    }
+    fn emit_friend_request_received(&self) {
+        self.emit("friend-request-received", serde_json::Value::Null);
+    }
+}
+
 // ── Chunked ingest (ZEB-154 + ZEB-161 nested-bundle streaming) ───────────
 
 /// Errors raised by the internal path-based ingest helpers
