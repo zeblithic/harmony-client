@@ -1,8 +1,19 @@
 //! CLI subcommand entry points for identity backup/restore.
 //!
-//! Each entry point composes [`crate::identity::read_seed_from_disk`] /
-//! [`crate::identity::write_seed_to_disk`] with the appropriate
-//! [`harmony_owner::recovery`] API. The recovery passphrase
+//! Two distinct root secrets pass through here — do not conflate them
+//! (ZEB-430):
+//!
+//! - The **Reticulum identity seed** (`identity.enc` / identity keychain
+//!   slot): the node's network keypair. `export mnemonic`,
+//!   `export recovery-file`, and both `restore` subcommands operate on
+//!   THIS seed via [`crate::identity::read_seed_from_disk`] /
+//!   [`crate::identity::write_seed_to_disk`].
+//! - The **owner master seed** (`master_seed.enc` / owner keychain slot):
+//!   the root of friendships, communities, and device enrollments.
+//!   `export owner-mnemonic` operates on this seed via
+//!   [`crate::owner_state::load_owner_state`].
+//!
+//! The recovery passphrase
 //! (`HARMONY_RECOVERY_PASSPHRASE` / `HARMONY_RECOVERY_PASSPHRASE_FILE`) is
 //! resolved separately from the at-rest passphrase
 //! (`HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`) — neither variable
@@ -59,10 +70,15 @@ pub(crate) fn resolve_recovery_passphrase() -> Result<SecretString, String> {
     Ok(SecretString::from(s))
 }
 
-/// Export the master seed as a 24-word BIP39 English mnemonic.
+/// Export the RETICULUM IDENTITY seed as a 24-word BIP39 English mnemonic.
+///
+/// This is the node keypair — NOT the owner master seed; for the owner
+/// identity (friends/communities) see [`export_owner_mnemonic_cli`].
 ///
 /// Side effects:
-///   - Reads the seed via the standard resolution chain (keychain → encrypted file).
+///   - Reads the identity seed via the standard resolution chain
+///     (keychain → encrypted file), MINTING a fresh identity on an empty
+///     install.
 ///   - Writes the bare 24 words on a single line to stdout, terminated by `\n`.
 ///   - Writes a warning preamble + `identity-hash: <hex32>` to stderr.
 ///
@@ -94,12 +110,29 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
 
     let map_err = |stream: &'static str| move |e: std::io::Error| format!("{stream}: {e}");
 
-    writeln!(stderr, "*** Identity recovery mnemonic ***").map_err(map_err("stderr"))?;
-    writeln!(stderr, "Write these 24 words on paper. Anyone with these")
+    writeln!(stderr, "*** Reticulum identity mnemonic ***").map_err(map_err("stderr"))?;
+    writeln!(
+        stderr,
+        "These 24 words back up your network (Reticulum) keypair"
+    )
+    .map_err(map_err("stderr"))?;
+    writeln!(
+        stderr,
+        "ONLY - NOT your owner identity (friends, communities,"
+    )
+    .map_err(map_err("stderr"))?;
+    writeln!(
+        stderr,
+        "device enrollments). For that, run: export owner-mnemonic"
+    )
+    .map_err(map_err("stderr"))?;
+    writeln!(stderr, "Write them on paper. Anyone with these words can")
         .map_err(map_err("stderr"))?;
-    writeln!(stderr, "words can impersonate you. Storing in a digital")
-        .map_err(map_err("stderr"))?;
-    writeln!(stderr, "file is dangerous.").map_err(map_err("stderr"))?;
+    writeln!(
+        stderr,
+        "impersonate your node; a digital copy is dangerous."
+    )
+    .map_err(map_err("stderr"))?;
     writeln!(stderr).map_err(map_err("stderr"))?;
     writeln!(stderr, "identity-hash: {}", hex::encode(id_hash)).map_err(map_err("stderr"))?;
 
@@ -107,7 +140,7 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     Ok(())
 }
 
-/// Read the seed from disk and convert to 24 BIP39 words.
+/// Read the RETICULUM IDENTITY seed from disk and convert to 24 BIP39 words.
 ///
 /// Returns `(words, identity_hash_bytes)` — the hash bytes are derived
 /// directly from the artifact so callers (e.g. `export_mnemonic_to_writers`
@@ -132,9 +165,107 @@ pub fn export_mnemonic_words_with_keychain(
     Ok((words, id_hash))
 }
 
-/// Export the master seed as a passphrase-encrypted recovery file at `out`.
+/// Export the OWNER master seed as a 24-word BIP39 English mnemonic (ZEB-430).
 ///
-/// Reads the seed via the standard resolution chain. The recovery passphrase
+/// Headless counterpart of the GUI Devices-panel backup
+/// (`owner_commands::export_owner_recovery`). Reads the owner master seed
+/// (OS-keychain master-seed slot / `master_seed.enc`) via
+/// [`crate::owner_state::load_owner_state`] — NOT the Reticulum identity
+/// seed that `export mnemonic` prints.
+///
+/// Stdout/stderr contract mirrors [`export_mnemonic_cli`]: bare 24 words on
+/// a single line to stdout; warning preamble + `owner-id: <hex32>` to
+/// stderr. The owner-id is the fingerprint the UI surfaces everywhere
+/// (`OwnerState.owner_id`), so an operator can eyeball-match the backup
+/// against their profile during incident response.
+pub fn export_owner_mnemonic_cli(plaintext_path: &Path) -> Result<(), String> {
+    let identity_dir = plaintext_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    export_owner_mnemonic_to_writers(
+        &identity_dir,
+        KeychainStore::new().ok(),
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
+}
+
+/// Inner entry point — accepts an injected keychain AND output writers so
+/// tests can both stay hermetic AND assert the exact stdout/stderr contract.
+/// Production callers go through [`export_owner_mnemonic_cli`].
+pub fn export_owner_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
+    identity_dir: &Path,
+    keychain: Option<KeychainStore>,
+    stdout: &mut W1,
+    stderr: &mut W2,
+) -> Result<(), String> {
+    let (words, owner_id) = export_owner_mnemonic_words_with_keychain(identity_dir, keychain)?;
+    let phrase = words.join(" ");
+
+    let map_err = |stream: &'static str| move |e: std::io::Error| format!("{stream}: {e}");
+
+    writeln!(stderr, "*** Owner identity recovery mnemonic ***").map_err(map_err("stderr"))?;
+    writeln!(
+        stderr,
+        "These 24 words are your OWNER master seed - the root of"
+    )
+    .map_err(map_err("stderr"))?;
+    writeln!(
+        stderr,
+        "your friendships, communities, and device enrollments."
+    )
+    .map_err(map_err("stderr"))?;
+    writeln!(stderr, "Write them on paper. Anyone with these words can")
+        .map_err(map_err("stderr"))?;
+    writeln!(stderr, "impersonate you; a digital copy is dangerous.").map_err(map_err("stderr"))?;
+    writeln!(stderr).map_err(map_err("stderr"))?;
+    writeln!(stderr, "owner-id: {}", hex::encode(owner_id)).map_err(map_err("stderr"))?;
+
+    writeln!(stdout, "{phrase}").map_err(map_err("stdout"))?;
+    Ok(())
+}
+
+/// Read the owner master seed and convert to 24 BIP39 words.
+///
+/// Returns `(words, owner_id)`. Hard-fails when no owner identity has been
+/// minted, when the master seed has been wiped (joiner / cert-only model),
+/// or when the seed on disk no longer derives the `owner_id` recorded in
+/// `owner_state.cbor` — a mismatched export would be a paper backup that
+/// silently cannot restore this identity (same invariant
+/// `pairing/cert.rs::sign_enrollment_for_joiner` enforces before signing).
+pub fn export_owner_mnemonic_words_with_keychain(
+    identity_dir: &Path,
+    keychain: Option<KeychainStore>,
+) -> Result<(Vec<String>, [u8; 16]), String> {
+    let loaded = crate::owner_state::load_owner_state(identity_dir, keychain)?
+        .ok_or_else(|| "Owner identity has not been minted on this device.".to_string())?;
+    let seed = loaded.master_seed.ok_or_else(|| {
+        "Master seed has been wiped from this device — backup is no longer possible.".to_string()
+    })?;
+    let artifact = RecoveryArtifact::from_seed(*seed);
+    let owner_id = artifact.master_pubkey_bundle().identity_hash();
+    if owner_id != loaded.state.owner_id {
+        return Err(format!(
+            "master seed / owner-state mismatch: seed derives owner-id {} but owner_state.cbor \
+             records {} — refusing to export a backup that could not restore this identity",
+            hex::encode(owner_id),
+            hex::encode(loaded.state.owner_id),
+        ));
+    }
+    let mnemonic = artifact.to_mnemonic();
+    let words = mnemonic
+        .as_str()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    Ok((words, owner_id))
+}
+
+/// Export the RETICULUM IDENTITY seed as a passphrase-encrypted recovery
+/// file at `out`.
+///
+/// Reads the identity seed via the standard resolution chain. The recovery passphrase
 /// is read from `HARMONY_RECOVERY_PASSPHRASE` / `HARMONY_RECOVERY_PASSPHRASE_FILE`
 /// (DISTINCT from the at-rest `HARMONY_PASSPHRASE`).
 ///
@@ -251,7 +382,7 @@ pub fn sidecar_path(out: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Export the master seed + (optionally) an owner-state sidecar.
+/// Export the RETICULUM IDENTITY seed + (optionally) an owner-state sidecar.
 ///
 /// `include_state == true` AND owner-state file exists ⇒ emit pair.
 /// `include_state == false` OR owner-state file absent ⇒ emit HRMR only.
@@ -699,7 +830,7 @@ pub fn now_hlc() -> Hlc {
     }
 }
 
-/// Restore the master seed from a 24-word mnemonic file.
+/// Restore the RETICULUM IDENTITY seed from a 24-word mnemonic file.
 ///
 /// Reads the mnemonic from `mnemonic_file` (whitespace-tolerant,
 /// case-insensitive, ASCII-only — non-ASCII rejected). Writes the seed via
@@ -771,7 +902,7 @@ pub fn restore_mnemonic_with_keychain(
     Ok(())
 }
 
-/// Restore the master seed from a passphrase-encrypted recovery file.
+/// Restore the RETICULUM IDENTITY seed from a passphrase-encrypted recovery file.
 ///
 /// Reads the encrypted file from `in_path`. Decrypts using the recovery
 /// passphrase (`HARMONY_RECOVERY_PASSPHRASE` / `_FILE`). Writes the seed
@@ -1102,15 +1233,189 @@ mod tests {
 
         // Stderr: warning preamble + identity-hash. Don't pin the exact prose
         // (it's user-facing text that may evolve) but pin the load-bearing
-        // markers.
+        // markers: the preamble must NAME the Reticulum identity seed and
+        // point owner-backup seekers at `export owner-mnemonic` (ZEB-430 —
+        // an operator following "back up your identity" used to get a
+        // mnemonic that does not recover friends/communities, with nothing
+        // telling them so).
         assert!(
-            stderr_str.contains("Identity recovery mnemonic"),
-            "stderr must include warning preamble; got: {stderr_str:?}"
+            stderr_str.contains("Reticulum identity mnemonic"),
+            "stderr must name the Reticulum identity seed; got: {stderr_str:?}"
+        );
+        assert!(
+            stderr_str.contains("owner-mnemonic"),
+            "stderr must point at export owner-mnemonic for owner backup; got: {stderr_str:?}"
         );
         assert!(
             stderr_str.contains("identity-hash:"),
             "stderr must include identity-hash; got: {stderr_str:?}"
         );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    // ── ZEB-430: export owner-mnemonic (owner MASTER seed, not the
+    // Reticulum identity seed) ─────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn export_owner_mnemonic_writes_words_to_stdout_and_owner_id_to_stderr() {
+        use harmony_owner::lifecycle::{mint_owner, MintResult};
+        let dir = tempfile::tempdir().unwrap();
+
+        std::env::set_var("HARMONY_PASSPHRASE", "owner-mnemonic-export-test");
+        let MintResult {
+            state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_000).unwrap();
+        let master_seed = *recovery_artifact.as_bytes();
+        crate::owner_state::save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            Some(&master_seed),
+            None,
+        )
+        .unwrap();
+
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        export_owner_mnemonic_to_writers(dir.path(), None, &mut stdout, &mut stderr)
+            .expect("export must succeed");
+
+        let stdout_str = String::from_utf8(stdout).expect("stdout is utf-8");
+        let stderr_str = String::from_utf8(stderr).expect("stderr is utf-8");
+
+        // Stdout: bare 24 words on a single line, terminated by exactly one \n
+        // — same contract as `export mnemonic`, so `> backup.txt` is pure.
+        assert!(
+            stdout_str.ends_with('\n'),
+            "stdout must end with newline; got: {stdout_str:?}"
+        );
+        let line = stdout_str.trim_end_matches('\n');
+        assert!(
+            !line.contains('\n'),
+            "stdout must be a single line; got: {line:?}"
+        );
+        let words: Vec<&str> = line.split(' ').collect();
+        assert_eq!(
+            words.len(),
+            24,
+            "stdout must be exactly 24 words; got: {line:?}"
+        );
+
+        // The words must round-trip to the OWNER master seed — the whole
+        // point of ZEB-430 is that this is NOT the Reticulum identity seed.
+        let parsed = RecoveryArtifact::from_mnemonic(line).expect("words parse");
+        assert_eq!(
+            *parsed.as_bytes(),
+            master_seed,
+            "stdout words must encode the owner master seed"
+        );
+
+        // Stderr: owner-flavored warning + an `owner-id:` fingerprint that
+        // matches OwnerState.owner_id — the id the user sees in the UI.
+        assert!(
+            stderr_str.contains("Owner identity recovery mnemonic"),
+            "stderr must include owner warning preamble; got: {stderr_str:?}"
+        );
+        assert!(
+            stderr_str.contains(&format!("owner-id: {}", hex::encode(state.owner_id))),
+            "stderr owner-id must match OwnerState.owner_id; got: {stderr_str:?}"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn export_owner_mnemonic_errors_when_owner_not_minted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HARMONY_PASSPHRASE", "owner-mnemonic-unminted-test");
+
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let err = export_owner_mnemonic_to_writers(dir.path(), None, &mut stdout, &mut stderr)
+            .expect_err("must fail on un-minted install");
+        assert!(err.contains("not been minted"), "actual: {err}");
+        assert!(
+            stdout.is_empty(),
+            "no words may reach stdout on failure; got: {:?}",
+            String::from_utf8_lossy(&stdout)
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn export_owner_mnemonic_errors_when_master_seed_wiped() {
+        use harmony_owner::lifecycle::{mint_owner, MintResult};
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HARMONY_PASSPHRASE", "owner-mnemonic-wiped-test");
+
+        // Joiner / cert-only model: owner state exists but no master seed
+        // (save with None also clears any stale seed slot).
+        let MintResult {
+            state,
+            device_signing_key,
+            ..
+        } = mint_owner(1_700_000_001).unwrap();
+        crate::owner_state::save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let err = export_owner_mnemonic_to_writers(dir.path(), None, &mut stdout, &mut stderr)
+            .expect_err("must fail when master seed absent");
+        assert!(err.contains("wiped"), "actual: {err}");
+        assert!(stdout.is_empty(), "no words may reach stdout on failure");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn export_owner_mnemonic_refuses_seed_that_mismatches_owner_id() {
+        use harmony_owner::lifecycle::{mint_owner, MintResult};
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HARMONY_PASSPHRASE", "owner-mnemonic-mismatch-test");
+
+        // Corrupt install: owner_state.cbor from mint A, master seed from
+        // mint B. Exporting B's words would produce a "backup" that cannot
+        // restore A's identity — the export must refuse, not hand the user
+        // a paper artifact that silently fails years later.
+        let MintResult {
+            state,
+            device_signing_key,
+            ..
+        } = mint_owner(1_700_000_002).unwrap();
+        let MintResult {
+            recovery_artifact: other_artifact,
+            ..
+        } = mint_owner(1_700_000_003).unwrap();
+        crate::owner_state::save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            Some(other_artifact.as_bytes()),
+            None,
+        )
+        .unwrap();
+
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let err = export_owner_mnemonic_to_writers(dir.path(), None, &mut stdout, &mut stderr)
+            .expect_err("must refuse mismatched seed/state");
+        assert!(err.contains("mismatch"), "actual: {err}");
+        assert!(stdout.is_empty(), "no words may reach stdout on refusal");
 
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
