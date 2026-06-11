@@ -152,6 +152,7 @@ async fn pending_join_accepted_via_engine_insert_after_bind_admin_identity_pub()
         crdt_state: None,
         admin_identity_pub: None, // starts unset — bind_admin_identity_pub sets it below
         nav_emitter: None,
+        root_serve_rx: None,
     });
 
     // ZEB-254 R1 fix: bind the admin identity pub so the engine's P5 gate
@@ -289,6 +290,7 @@ fn build_engine_with_resolver(
         crdt_state: None,
         admin_identity_pub: admin_pub,
         nav_emitter: None,
+        root_serve_rx: None,
     });
     engine
 }
@@ -695,6 +697,7 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
         crdt_state: Some(Arc::clone(&crdt_state)),
         admin_identity_pub: Some(admin_pub),
         nav_emitter: Some(Arc::clone(&nav_cb)),
+        root_serve_rx: None,
     });
 
     // Step 1: insert admin's bootstrap Join (so admin is Joined in the

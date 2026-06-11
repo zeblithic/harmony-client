@@ -341,6 +341,9 @@ async fn alice_redeems_invite_only_against_bob_admin() {
             true,
             alice_pub_tx,
             alice_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn alice engine");
@@ -499,6 +502,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         self_device_id: "bob-dev".into(),
         signing_key: Arc::clone(&bob_sk),
         engine_config: ChannelLogEngineConfig::default(),
+        transport_epoch_rx: None,
     });
 
     // Bob redeems. redeem_invite_inner spawns Bob's engine (fresh, no
@@ -518,6 +522,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         harmony_app::community_membership::mint_test_owner(0).cert,
         Arc::clone(&registry_b),
         bob_adapter_tx,
+        None, // ZEB-434: no transport-epoch watch in this test
         bob_unicast_tx,
         Arc::clone(&bob_dm_outbox),
         bob_channel_log_registry,

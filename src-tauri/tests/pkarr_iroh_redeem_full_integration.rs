@@ -431,6 +431,9 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
             true,
             alice_pub_tx,
             alice_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn alice engine");
@@ -601,6 +604,7 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
         self_device_id: "bob-dev".into(),
         signing_key: Arc::clone(&bob_comm_sk),
         engine_config: ChannelLogEngineConfig::default(),
+        transport_epoch_rx: None,
     });
 
     let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
@@ -838,6 +842,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             s.bob_comm.cert.clone(),
             Arc::clone(&s.registry_bob),
             s.bob_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             s.bob_unicast_tx.clone(),
             Arc::clone(&s.bob_dm_outbox),
             Arc::clone(&s.bob_channel_log_registry),
@@ -1138,6 +1143,7 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
             s.bob_comm.cert.clone(),
             Arc::clone(&s.registry_bob),
             s.bob_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             s.bob_unicast_tx.clone(),
             Arc::clone(&s.bob_dm_outbox),
             Arc::clone(&s.bob_channel_log_registry),
@@ -1401,6 +1407,7 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
             s.bob_comm.cert.clone(),
             Arc::clone(&s.registry_bob),
             s.bob_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             s.bob_unicast_tx.clone(),
             Arc::clone(&s.bob_dm_outbox),
             Arc::clone(&s.bob_channel_log_registry),

@@ -224,6 +224,7 @@ fn build_registry(session: &Arc<zenoh::Session>, seed: u8, device_id: &str) -> R
             backfill_retry_base_ms: TEST_RETRY_BASE_MS,
             ..Default::default()
         },
+        transport_epoch_rx: None,
     });
     RegistryHandle {
         registry,

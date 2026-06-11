@@ -136,6 +136,21 @@ pub struct CommunityAdapterRequest {
     /// community topic are forwarded here, where the engine reads
     /// them out via its paired `subscriber_rx`.
     pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// ZEB-434 D1: queryable → engine serve requests (engine holds rx).
+    /// Cost per served query: CRDT clone + CBOR encode + 2×AEAD + CAS
+    /// put_serveable + fsync(replay). The mpsc capacity at the lib.rs
+    /// call site (8) is the back-pressure bound; zenoh-facing rate
+    /// limiting beyond that is future work.
+    pub root_serve_tx: tokio::sync::mpsc::Sender<crate::community_state_sync::RootServeRequest>,
+    /// ZEB-434 D3/D4: fetch driver → adapter query requests.
+    pub fetch_request_rx: tokio::sync::mpsc::Receiver<CommunityRootFetchRequest>,
+}
+
+/// ZEB-434: one root-fetch query request from the per-community fetch
+/// driver. The adapter executes the GET and reports the reply count.
+pub struct CommunityRootFetchRequest {
+    /// Reply-count report (fire-and-forget; drop = query aborted).
+    pub report: tokio::sync::oneshot::Sender<usize>,
 }
 
 /// ZEB-298+ZEB-312 PR 1: per-community voting-log adapter request.
@@ -797,6 +812,16 @@ pub async fn run<R: Runtime>(
     // test callers that bypass `start_node` (and when no owner identity is
     // loaded).
     routing_republish: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    // ZEB-434 D6: transport-epoch watch SENDER. The 5s peer-refresh arm
+    // bumps the value whenever a never-before-seen zenoh session id
+    // appears (zids are per-session, so a rebooted peer always presents
+    // a fresh one → "new zid" = peer arrival/recovery). Per-community
+    // root-fetch drivers (and the Task 7/9 channel-log / mail-root
+    // subscribers) hold receiver clones and re-arm their satisfied
+    // latches on each bump. Test callers that don't exercise the
+    // catch-up path pass `tokio::sync::watch::channel(0u64).0` (a
+    // sender with no receivers — send_modify is then a no-op).
+    transport_epoch_tx: tokio::sync::watch::Sender<u64>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -1550,6 +1575,8 @@ pub async fn run<R: Runtime>(
             req.id_hex,
             req.publisher_rx,
             req.subscriber_tx,
+            req.root_serve_tx,
+            req.fetch_request_rx,
             Arc::clone(&closing),
         );
     }
@@ -2587,31 +2614,84 @@ pub async fn run<R: Runtime>(
     let _ = ready_tx.send(Ok(()));
 
     // Phase 2: cold-start root query. Pulls current root via Zenoh `get` in
-    // case the gateway last published before this client subscribed. 10s
-    // budget — on failure or timeout, the normal publish-on-next-write
-    // flow still delivers eventually.
+    // case the gateway last published before this client subscribed. ZEB-434
+    // D9: latch-driven retries (30s base doubling to a 600s cap) replace the
+    // old one-shot, which raced link establishment — a slow-linking boot no
+    // longer misses until the gateway's next publish. The empty-vs-none
+    // discrimination maps to Answered-vs-NoReply: an empty payload is the
+    // gateway's valid "no mail yet" sentinel (satisfies the latch), while
+    // zero responders / query failure back off and retry. Once satisfied the
+    // driver parks and re-arms on transport-epoch bumps, so a recovered link
+    // re-queries (with the EPOCH_REARM_COOLDOWN_MS cooldown).
     if let Some(ref sync) = mail_sync {
         if !own_root_key.is_empty() {
-            let sync = Arc::clone(sync);
-            let session_clone = session.clone();
-            let key = own_root_key.clone();
-            tokio::spawn(async move {
-                match query_mail_root(&session_clone, &key, "startup").await {
-                    Ok(Some(payload)) => sync.handle_startup_query_reply(Some(&payload)).await,
-                    Ok(None) => {
-                        tracing::warn!(
-                            "startup root query: no responder — live push will catch up on next gateway publish"
-                        );
-                        sync.report_query_error(
-                            "no gateway responded to startup query".to_string(),
-                        );
+            let session_mail = session.clone();
+            let key_mail = own_root_key.clone();
+            let sync_mail = Arc::clone(sync);
+            // event_loop holds the watch SENDER (the 5s peer-refresh arm
+            // does the bumping); internal consumers derive receivers.
+            let epoch_rx_mail = Some(transport_epoch_tx.subscribe());
+            // Shutdown bridge: flip the watch when the loop's closing flag
+            // flips (1s poll — mirrors the adapter tasks' closing-poll
+            // discipline).
+            let (mail_shutdown_tx, mail_shutdown_rx) = tokio::sync::watch::channel(false);
+            {
+                let closing_mail = Arc::clone(&closing);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        if closing_mail.load(Ordering::SeqCst) {
+                            let _ = mail_shutdown_tx.send(true);
+                            return;
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "startup root query failed");
-                        sync.report_query_error(format!("startup query failed: {e}"));
+                });
+            }
+            let request_root = move || {
+                let session = session_mail.clone();
+                let key = key_mail.clone();
+                let sync = Arc::clone(&sync_mail);
+                async move {
+                    let result = query_mail_root(&session, &key, "startup").await;
+                    match &result {
+                        Ok(Some(payload)) => {
+                            // Empty payload routes through the same handler:
+                            // it clears any prior error to idle ("no mail
+                            // yet"). Re-entry on a later epoch-bump re-query
+                            // is safe — start_or_queue_walk single-flights
+                            // and dedups repeated roots.
+                            Arc::clone(&sync)
+                                .handle_startup_query_reply(Some(payload.as_slice()))
+                                .await;
+                        }
+                        Ok(None) => {
+                            tracing::info!(
+                                "startup root query: no responder — retrying with backoff; live push also catches up on next gateway publish"
+                            );
+                            sync.report_query_error(
+                                "no gateway responded to startup query".to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "startup root query failed; retrying with backoff");
+                            sync.report_query_error(format!("startup query failed: {e}"));
+                        }
                     }
+                    map_mail_root_outcome(&result)
                 }
-            });
+            };
+            tokio::spawn(crate::channel_backfill::run_root_fetch_driver(
+                crate::channel_backfill::RootFetchLatch::new(),
+                request_root,
+                mail_shutdown_rx,
+                epoch_rx_mail,
+                || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0)
+                },
+            ));
         }
     }
 
@@ -2632,6 +2712,15 @@ pub async fn run<R: Runtime>(
         .await
         .map(|z| z.to_string())
         .collect();
+    // ZEB-434 D6: accumulating set of every zenoh session id ever seen
+    // this event-loop lifetime, kept SEPARATE from the overwrite-style
+    // `direct_peer_zids` above (whose hop-distance consumers need the
+    // current-snapshot semantics). SEEDED from the same boot-time
+    // snapshot WITHOUT bumping the transport epoch: boot-time peers are
+    // not "recovered" — the per-community spawn-time latch query
+    // already covers them, and a bump here would just burn the fetch
+    // drivers' first cooldown window for no benefit.
+    let mut transport_seen_zids: std::collections::HashSet<String> = direct_peer_zids.clone();
     let mut peer_refresh_counter: u64 = 0;
 
     // ZEB-418 P2 Task 7 (D16): periodic routing-record re-publish, counted
@@ -2942,12 +3031,19 @@ pub async fn run<R: Runtime>(
                 // peers_zid() calls under high message traffic.
                 peer_refresh_counter += 1;
                 if peer_refresh_counter.is_multiple_of(20) {
-                    direct_peer_zids = session
+                    let refreshed: Vec<String> = session
                         .info()
                         .peers_zid()
                         .await
                         .map(|z| z.to_string())
                         .collect();
+                    // ZEB-434 D6: any never-seen zid bumps the transport
+                    // epoch — community root-fetch / channel-backfill /
+                    // mail-root latches re-arm (their drivers subscribe).
+                    if merge_peers_detect_new(&mut transport_seen_zids, &refreshed) {
+                        transport_epoch_tx.send_modify(|e| *e = e.wrapping_add(1));
+                    }
+                    direct_peer_zids = refreshed.into_iter().collect();
                 }
 
                 // ZEB-418 P2 Task 7 (D16): periodic routing-record
@@ -4946,6 +5042,8 @@ pub async fn run<R: Runtime>(
                     req.id_hex,
                     req.publisher_rx,
                     req.subscriber_tx,
+                    req.root_serve_tx,
+                    req.fetch_request_rx,
                     Arc::clone(&closing),
                 );
             }
@@ -5955,6 +6053,141 @@ where
 /// behavior. See CodeRabbit R2 on PR #125.
 const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// ZEB-434 D6: fold a fresh peers_zid() snapshot into the accumulating
+/// seen-set; true iff at least one never-before-seen zid appeared.
+///
+/// Why an ACCUMULATING set (separate from the overwrite-style
+/// `direct_peer_zids` the hop-distance logic uses): zenoh session ids
+/// are per-session, so a REBOOTED peer always shows up with a fresh
+/// zid — "new zid" reliably means peer arrival/recovery. Conversely, a
+/// link that flaps down/up within one peer session re-presents the SAME
+/// zid; because the seen-set never forgets, a flap does not re-bump the
+/// transport epoch (the fetch drivers' 60s cooldown is then a
+/// second-layer defense, not the only one).
+/// Cap on the accumulated seen-zid set. Zenoh session ids are
+/// per-session, so reconnect churn would grow the set forever on a
+/// long-lived node if left unpruned (PR #230 review, Qodo). Overflow
+/// prunes to the current snapshot: a departed zid that later RETURNS
+/// (link flap, surviving session) then re-bumps the epoch — a
+/// legitimate "transport recovered" signal, and re-arm queries are
+/// cooldown-limited per driver (spec D7), so the prune trades
+/// unbounded memory for at most one extra re-query per flap.
+pub(crate) const TRANSPORT_SEEN_ZIDS_CAP: usize = 4096;
+
+pub(crate) fn merge_peers_detect_new(
+    seen: &mut std::collections::HashSet<String>,
+    refreshed: &[String],
+) -> bool {
+    let mut any_new = false;
+    for zid in refreshed {
+        // contains-then-insert is deliberate (not the single-lookup
+        // `insert(zid.clone())` form): it clones only never-seen zids,
+        // while insert-with-clone would allocate for EVERY zid on
+        // every 5s refresh tick.
+        if !seen.contains(zid) {
+            seen.insert(zid.clone());
+            any_new = true;
+        }
+    }
+    if seen.len() > TRANSPORT_SEEN_ZIDS_CAP {
+        let current: std::collections::HashSet<&String> = refreshed.iter().collect();
+        seen.retain(|z| current.contains(z));
+    }
+    any_new
+}
+
+/// ZEB-434 D9: classify a mail-root query result for the retry latch.
+/// An empty-payload reply is a VALID answer (the "no mail yet" sentinel —
+/// see [`query_mail_root`]); only zero-responders / query failure retries.
+fn map_mail_root_outcome(
+    result: &Result<Option<Vec<u8>>, String>,
+) -> crate::channel_backfill::RootFetch {
+    match result {
+        Ok(Some(_)) => crate::channel_backfill::RootFetch::Answered,
+        Ok(None) | Err(_) => crate::channel_backfill::RootFetch::NoReply,
+    }
+}
+
+#[cfg(test)]
+mod mail_root_outcome_tests {
+    use super::map_mail_root_outcome;
+    use crate::channel_backfill::RootFetch;
+
+    /// ZEB-434 D9: an EMPTY reply payload is the gateway's valid "no mail
+    /// yet" sentinel — it must satisfy the retry latch (Answered) exactly
+    /// like a real root CID. Only zero-responders / query failure retries.
+    #[test]
+    fn mail_root_outcome_mapping_discriminates_empty_from_none() {
+        // Empty payload = valid "no mail yet" sentinel → Answered.
+        assert_eq!(
+            map_mail_root_outcome(&Ok(Some(vec![]))),
+            RootFetch::Answered
+        );
+        // Real root payload → Answered.
+        assert_eq!(
+            map_mail_root_outcome(&Ok(Some(vec![1, 2, 3]))),
+            RootFetch::Answered
+        );
+        // Zero responders → retry.
+        assert_eq!(map_mail_root_outcome(&Ok(None)), RootFetch::NoReply);
+        // Query failure → retry.
+        assert_eq!(
+            map_mail_root_outcome(&Err("boom".to_string())),
+            RootFetch::NoReply
+        );
+    }
+}
+
+#[cfg(test)]
+mod transport_epoch_tests {
+    use super::merge_peers_detect_new;
+
+    #[test]
+    fn transport_epoch_bumps_only_on_new_zids() {
+        let mut seen: std::collections::HashSet<String> =
+            ["a".to_string(), "b".to_string()].into_iter().collect();
+        // Same set → no bump.
+        assert!(!merge_peers_detect_new(
+            &mut seen,
+            &["a".to_string(), "b".to_string()]
+        ));
+        // Peer disappears → no bump (loss is not recovery).
+        assert!(!merge_peers_detect_new(&mut seen, &["a".to_string()]));
+        // New zid (rebooted peer = fresh session zid) → bump.
+        assert!(merge_peers_detect_new(
+            &mut seen,
+            &["a".to_string(), "c".to_string()]
+        ));
+        // Accumulating: c stays known even after flapping out and back —
+        // a flapping link does not re-bump; genuine new sessions do.
+        assert!(!merge_peers_detect_new(&mut seen, &["c".to_string()]));
+        assert!(!merge_peers_detect_new(
+            &mut seen,
+            &["a".to_string(), "c".to_string()]
+        ));
+    }
+
+    /// PR #230 review (Qodo): the seen-set must not grow without bound
+    /// under session churn on a long-lived node. Overflow past
+    /// [`super::TRANSPORT_SEEN_ZIDS_CAP`] prunes to the current
+    /// snapshot; a pruned zid returning later re-bumps (accepted —
+    /// cooldown-limited "transport recovered" signal).
+    #[test]
+    fn seen_set_prunes_to_current_snapshot_when_over_cap() {
+        let mut seen: std::collections::HashSet<String> = (0..=super::TRANSPORT_SEEN_ZIDS_CAP)
+            .map(|i| format!("z{i}"))
+            .collect();
+        let refreshed = vec!["z0".to_string(), "fresh".to_string()];
+        // "fresh" is new → bump; the merged set overflows the cap and
+        // prunes down to exactly the current snapshot.
+        assert!(merge_peers_detect_new(&mut seen, &refreshed));
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains("z0") && seen.contains("fresh"));
+        // A pruned zid coming back re-bumps — accepted semantics.
+        assert!(merge_peers_detect_new(&mut seen, &["z1".to_string()]));
+    }
+}
+
 #[cfg(test)]
 mod descendants_tests {
     use super::collect_descendants;
@@ -6545,20 +6778,26 @@ fn emit_frontend_event<R: Runtime>(
 // the channel close on transport failure and trusts the engine's
 // `subscriber_channel_closed` degraded report to surface it.
 
-/// Spawn a Zenoh publisher + subscriber for one community's state-root
-/// topic (`harmony/community/{id_hex}/state-root-v1`).
+/// Spawn a Zenoh publisher + subscriber + queryable + root-fetch driver
+/// for one community's state-root topic
+/// (`harmony/community/{id_hex}/state-root-v1`).
 ///
 /// Wires:
 ///   - `publisher_rx` (engine's outbound bytes) → `session.put(key, bytes)`
 ///   - Zenoh subscriber on the same key → `subscriber_tx` (engine's inbound)
+///   - Zenoh queryable on the same key → `root_serve_tx` (engine encodes a
+///     fresh root packet per query; ZEB-434 D1/D2)
+///   - `fetch_request_rx` (per-community fetch driver) → Zenoh GET on the
+///     same key, replies piped into `subscriber_tx` (ZEB-434 D3/D4)
 ///
 /// `closing` is the event-loop-wide shutdown flag; when set, transport
 /// errors are downgraded to silence so a clean `stop_node` doesn't spam
 /// "publish failed" / "subscriber closed unexpectedly" warnings.
 ///
 /// Returns a `JoinHandle<()>` so the registry / `start_node` can await
-/// teardown if needed. Internally spawns two child tasks (publisher and
-/// subscriber) and joins them before the outer handle resolves.
+/// teardown if needed. Internally spawns four child tasks (publisher,
+/// queryable, root-fetch driver, subscriber) and joins them before the
+/// outer handle resolves.
 ///
 /// On failure to construct a `KeyExpr` from the topic string, the function
 /// logs and returns a JoinHandle that resolves immediately — both
@@ -6569,6 +6808,8 @@ pub fn spawn_community_state_zenoh_adapter(
     community_id_hex: String,
     mut publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    root_serve_tx: tokio::sync::mpsc::Sender<crate::community_state_sync::RootServeRequest>,
+    mut fetch_request_rx: tokio::sync::mpsc::Receiver<CommunityRootFetchRequest>,
     closing: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     let topic = format!("harmony/community/{}/state-root-v1", community_id_hex);
@@ -6625,6 +6866,130 @@ pub fn spawn_community_state_zenoh_adapter(
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                         if closing_pub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // ZEB-434 D1/D2: queryable on the state-root key. Each inbound
+        // query is forwarded to the engine via `root_serve_tx`; the
+        // engine's single-writer task encodes a fresh wire packet and
+        // replies through the oneshot. No selector parsing — the key
+        // carries no parameters (full-state exchange, no `since`).
+        let session_qbl = Arc::clone(&session);
+        let key_qbl = key_expr.clone();
+        let topic_qbl = topic.clone();
+        let closing_qbl = Arc::clone(&closing);
+        // Clone for the queryable task. The original parameter stays
+        // alive until the outer join, so the engine's serve channel
+        // closes only at full adapter teardown (the engine latches
+        // recv()==None either way).
+        let root_serve_tx_qbl = root_serve_tx.clone();
+        let qbl_handle = tokio::spawn(async move {
+            let qbl = match session_qbl.declare_queryable(&key_qbl).await {
+                Ok(q) => q,
+                Err(e) => {
+                    if !closing_qbl.load(Ordering::SeqCst) {
+                        tracing::error!(topic = %topic_qbl, error = %e,
+                            "failed to declare community state-root queryable");
+                    }
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    res = qbl.recv_async() => {
+                        let Ok(query) = res else { break; };
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        if root_serve_tx_qbl.send(reply_tx).await.is_err() {
+                            // Engine gone — stop serving.
+                            break;
+                        }
+                        // Non-Ok(Ok(..)) outcomes are skipped: encode
+                        // error already logged engine-side; dropped
+                        // oneshot = engine shutdown race.
+                        if let Ok(Ok(packet)) = reply_rx.await {
+                            if let Err(e) = query.reply(query.key_expr(), packet).await {
+                                tracing::warn!(topic = %topic_qbl, error = %e,
+                                    "community state-root queryable reply failed");
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_qbl.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // ZEB-434 D3/D4: root-fetch query driver. The per-community
+        // fetch driver (registry-spawned `run_root_fetch_driver`) sends
+        // one `CommunityRootFetchRequest` per attempt; this task
+        // executes the zenoh GET, pipes every reply into the engine's
+        // normal inbound path (`subscriber_tx`), and reports the reply
+        // count. Simplified channel-log query-request driver: no
+        // paging/progress, 10s GET timeout. ConsolidationMode::None so
+        // multiple responders' roots all reach the engine (the CRDT
+        // merge dedupes).
+        let session_rf = Arc::clone(&session);
+        let key_rf = topic.clone();
+        let subscriber_tx_rf = subscriber_tx.clone();
+        let closing_rf = Arc::clone(&closing);
+        let rf_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe = fetch_request_rx.recv() => {
+                        let Some(req) = maybe else { break; };
+                        let receiver = match session_rf
+                            .get(&key_rf)
+                            .consolidation(zenoh::query::ConsolidationMode::None)
+                            .timeout(std::time::Duration::from_secs(10))
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                if !closing_rf.load(Ordering::SeqCst) {
+                                    tracing::warn!(key = %key_rf, error = %e,
+                                        "community state-root fetch query failed");
+                                }
+                                // req.report drops → driver maps to NoReply.
+                                continue;
+                            }
+                        };
+                        // Inner reply-drain loop with closing-poll arm
+                        // (mirrors the channel-log query driver): a hung
+                        // peer must not block teardown past ~500ms.
+                        let mut replies: usize = 0;
+                        let drained_clean: bool = loop {
+                            tokio::select! {
+                                biased;
+                                res = receiver.recv_async() => {
+                                    let Ok(reply) = res else { break true; };
+                                    if let Ok(sample) = reply.into_result() {
+                                        let bytes: Vec<u8> =
+                                            sample.payload().to_bytes().to_vec();
+                                        if subscriber_tx_rf.send(bytes).await.is_err() {
+                                            return; // engine teardown
+                                        }
+                                        replies = replies.saturating_add(1);
+                                    }
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                                    if closing_rf.load(Ordering::SeqCst) { break false; }
+                                }
+                            }
+                        };
+                        if drained_clean {
+                            let _ = req.report.send(replies);
+                        }
+                        // !drained_clean: report drops without a value →
+                        // fetch driver sees NoReply (its shutdown watch
+                        // ends it promptly during teardown anyway).
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_rf.load(Ordering::SeqCst) { break; }
                     }
                 }
             }
@@ -6715,6 +7080,8 @@ pub fn spawn_community_state_zenoh_adapter(
         });
 
         let _ = pub_handle.await;
+        let _ = qbl_handle.await;
+        let _ = rf_handle.await;
         let _ = sub_handle.await;
     })
 }

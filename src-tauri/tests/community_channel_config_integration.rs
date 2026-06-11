@@ -228,6 +228,9 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
             false,
             alice_pub_tx,
             alice_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn alice engine");
@@ -239,6 +242,9 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
             false,
             bob_pub_tx,
             bob_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn bob engine");
@@ -448,6 +454,9 @@ async fn joined_sub_mod_member_channel_create_rejected_with_channel_admin_insuff
             false,
             bob_pub_tx,
             bob_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn bob engine");
@@ -622,6 +631,9 @@ async fn default_general_channel_round_trips_through_state_sync() {
             false,
             alice_pub_tx,
             alice_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn alice engine");
@@ -633,6 +645,9 @@ async fn default_general_channel_round_trips_through_state_sync() {
             false,
             bob_pub_tx,
             bob_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn bob engine");
