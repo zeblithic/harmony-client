@@ -2093,6 +2093,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         identity.cert.clone(),
         Arc::clone(&registry),
         adapter_tx,
+        None, // ZEB-434: no transport-epoch watch in this test
         channel_log_registry,
         0, // snapshot_generation; fence not reached on this path
         &node_state,
@@ -2897,6 +2898,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         bob_owner.cert.clone(),
         Arc::clone(&registry),
         adapter_tx,
+        None, // ZEB-434: no transport-epoch watch in this test
         unicast_tx,
         Arc::clone(&dm_outbox),
         channel_log_registry,

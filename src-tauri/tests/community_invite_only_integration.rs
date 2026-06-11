@@ -521,6 +521,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         harmony_app::community_membership::mint_test_owner(0).cert,
         Arc::clone(&registry_b),
         bob_adapter_tx,
+        None, // ZEB-434: no transport-epoch watch in this test
         bob_unicast_tx,
         Arc::clone(&bob_dm_outbox),
         bob_channel_log_registry,

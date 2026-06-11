@@ -882,6 +882,7 @@ async fn click_to_join_redeem_invite_smoke() {
         joiner.cert.clone(),
         Arc::clone(&community_registry),
         community_adapter_tx,
+        None, // ZEB-434: no transport-epoch watch in this test
         unicast_send_tx,
         Arc::clone(&dm_outbox),
         Arc::clone(&channel_log_registry),

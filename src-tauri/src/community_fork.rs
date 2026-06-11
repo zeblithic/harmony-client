@@ -222,6 +222,7 @@ pub async fn fork_community(
         self_owner,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         channel_log_registry,
         dm_outbox,
         snapshot_generation,
@@ -242,6 +243,10 @@ pub async fn fork_community(
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
+            // ZEB-434 D6: pass-through Option (no ok_or) — a missing
+            // receiver degrades to a non-re-arming fetch driver rather
+            // than failing the IPC.
+            g.transport_epoch_rx.clone(),
             g.channel_log_registry
                 .clone()
                 .ok_or("channel_log_registry missing — node not running?")?,
@@ -542,8 +547,7 @@ pub async fn fork_community(
             community_adapter_tx,
             Some(root_serve_rx),
             Some(fetch_request_tx),
-            // Transport-epoch re-arm watch lands in ZEB-434 Task 6.
-            None,
+            transport_epoch_rx,
             root_serve_tx,
             fetch_request_rx,
         )

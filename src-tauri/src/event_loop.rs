@@ -812,6 +812,16 @@ pub async fn run<R: Runtime>(
     // test callers that bypass `start_node` (and when no owner identity is
     // loaded).
     routing_republish: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    // ZEB-434 D6: transport-epoch watch SENDER. The 5s peer-refresh arm
+    // bumps the value whenever a never-before-seen zenoh session id
+    // appears (zids are per-session, so a rebooted peer always presents
+    // a fresh one → "new zid" = peer arrival/recovery). Per-community
+    // root-fetch drivers (and the Task 7/9 channel-log / mail-root
+    // subscribers) hold receiver clones and re-arm their satisfied
+    // latches on each bump. Test callers that don't exercise the
+    // catch-up path pass `tokio::sync::watch::channel(0u64).0` (a
+    // sender with no receivers — send_modify is then a no-op).
+    transport_epoch_tx: tokio::sync::watch::Sender<u64>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -2649,6 +2659,15 @@ pub async fn run<R: Runtime>(
         .await
         .map(|z| z.to_string())
         .collect();
+    // ZEB-434 D6: accumulating set of every zenoh session id ever seen
+    // this event-loop lifetime, kept SEPARATE from the overwrite-style
+    // `direct_peer_zids` above (whose hop-distance consumers need the
+    // current-snapshot semantics). SEEDED from the same boot-time
+    // snapshot WITHOUT bumping the transport epoch: boot-time peers are
+    // not "recovered" — the per-community spawn-time latch query
+    // already covers them, and a bump here would just burn the fetch
+    // drivers' first cooldown window for no benefit.
+    let mut transport_seen_zids: std::collections::HashSet<String> = direct_peer_zids.clone();
     let mut peer_refresh_counter: u64 = 0;
 
     // ZEB-418 P2 Task 7 (D16): periodic routing-record re-publish, counted
@@ -2959,12 +2978,19 @@ pub async fn run<R: Runtime>(
                 // peers_zid() calls under high message traffic.
                 peer_refresh_counter += 1;
                 if peer_refresh_counter.is_multiple_of(20) {
-                    direct_peer_zids = session
+                    let refreshed: Vec<String> = session
                         .info()
                         .peers_zid()
                         .await
                         .map(|z| z.to_string())
                         .collect();
+                    // ZEB-434 D6: any never-seen zid bumps the transport
+                    // epoch — community root-fetch / channel-backfill /
+                    // mail-root latches re-arm (their drivers subscribe).
+                    if merge_peers_detect_new(&mut transport_seen_zids, refreshed.clone()) {
+                        transport_epoch_tx.send_modify(|e| *e = e.wrapping_add(1));
+                    }
+                    direct_peer_zids = refreshed.into_iter().collect();
                 }
 
                 // ZEB-418 P2 Task 7 (D16): periodic routing-record
@@ -5973,6 +5999,60 @@ where
 /// elsewhere, in which case best-effort skip-the-admit is the right
 /// behavior. See CodeRabbit R2 on PR #125.
 const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// ZEB-434 D6: fold a fresh peers_zid() snapshot into the accumulating
+/// seen-set; true iff at least one never-before-seen zid appeared.
+///
+/// Why an ACCUMULATING set (separate from the overwrite-style
+/// `direct_peer_zids` the hop-distance logic uses): zenoh session ids
+/// are per-session, so a REBOOTED peer always shows up with a fresh
+/// zid — "new zid" reliably means peer arrival/recovery. Conversely, a
+/// link that flaps down/up within one peer session re-presents the SAME
+/// zid; because the seen-set never forgets, a flap does not re-bump the
+/// transport epoch (the fetch drivers' 60s cooldown is then a
+/// second-layer defense, not the only one).
+pub(crate) fn merge_peers_detect_new(
+    seen: &mut std::collections::HashSet<String>,
+    refreshed: Vec<String>,
+) -> bool {
+    let mut any_new = false;
+    for zid in refreshed {
+        if seen.insert(zid) {
+            any_new = true;
+        }
+    }
+    any_new
+}
+
+#[cfg(test)]
+mod transport_epoch_tests {
+    use super::merge_peers_detect_new;
+
+    #[test]
+    fn transport_epoch_bumps_only_on_new_zids() {
+        let mut seen: std::collections::HashSet<String> =
+            ["a".to_string(), "b".to_string()].into_iter().collect();
+        // Same set → no bump.
+        assert!(!merge_peers_detect_new(
+            &mut seen,
+            vec!["a".into(), "b".into()]
+        ));
+        // Peer disappears → no bump (loss is not recovery).
+        assert!(!merge_peers_detect_new(&mut seen, vec!["a".into()]));
+        // New zid (rebooted peer = fresh session zid) → bump.
+        assert!(merge_peers_detect_new(
+            &mut seen,
+            vec!["a".into(), "c".into()]
+        ));
+        // Accumulating: c stays known even after flapping out and back —
+        // a flapping link does not re-bump; genuine new sessions do.
+        assert!(!merge_peers_detect_new(&mut seen, vec!["c".into()]));
+        assert!(!merge_peers_detect_new(
+            &mut seen,
+            vec!["a".into(), "c".into()]
+        ));
+    }
+}
 
 #[cfg(test)]
 mod descendants_tests {

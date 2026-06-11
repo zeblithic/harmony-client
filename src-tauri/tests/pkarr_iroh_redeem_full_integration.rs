@@ -841,6 +841,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             s.bob_comm.cert.clone(),
             Arc::clone(&s.registry_bob),
             s.bob_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             s.bob_unicast_tx.clone(),
             Arc::clone(&s.bob_dm_outbox),
             Arc::clone(&s.bob_channel_log_registry),
@@ -1141,6 +1142,7 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
             s.bob_comm.cert.clone(),
             Arc::clone(&s.registry_bob),
             s.bob_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             s.bob_unicast_tx.clone(),
             Arc::clone(&s.bob_dm_outbox),
             Arc::clone(&s.bob_channel_log_registry),
@@ -1404,6 +1406,7 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
             s.bob_comm.cert.clone(),
             Arc::clone(&s.registry_bob),
             s.bob_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             s.bob_unicast_tx.clone(),
             Arc::clone(&s.bob_dm_outbox),
             Arc::clone(&s.bob_channel_log_registry),
