@@ -2614,31 +2614,84 @@ pub async fn run<R: Runtime>(
     let _ = ready_tx.send(Ok(()));
 
     // Phase 2: cold-start root query. Pulls current root via Zenoh `get` in
-    // case the gateway last published before this client subscribed. 10s
-    // budget — on failure or timeout, the normal publish-on-next-write
-    // flow still delivers eventually.
+    // case the gateway last published before this client subscribed. ZEB-434
+    // D9: latch-driven retries (30s base doubling to a 600s cap) replace the
+    // old one-shot, which raced link establishment — a slow-linking boot no
+    // longer misses until the gateway's next publish. The empty-vs-none
+    // discrimination maps to Answered-vs-NoReply: an empty payload is the
+    // gateway's valid "no mail yet" sentinel (satisfies the latch), while
+    // zero responders / query failure back off and retry. Once satisfied the
+    // driver parks and re-arms on transport-epoch bumps, so a recovered link
+    // re-queries (with the EPOCH_REARM_COOLDOWN_MS cooldown).
     if let Some(ref sync) = mail_sync {
         if !own_root_key.is_empty() {
-            let sync = Arc::clone(sync);
-            let session_clone = session.clone();
-            let key = own_root_key.clone();
-            tokio::spawn(async move {
-                match query_mail_root(&session_clone, &key, "startup").await {
-                    Ok(Some(payload)) => sync.handle_startup_query_reply(Some(&payload)).await,
-                    Ok(None) => {
-                        tracing::warn!(
-                            "startup root query: no responder — live push will catch up on next gateway publish"
-                        );
-                        sync.report_query_error(
-                            "no gateway responded to startup query".to_string(),
-                        );
+            let session_mail = session.clone();
+            let key_mail = own_root_key.clone();
+            let sync_mail = Arc::clone(sync);
+            // event_loop holds the watch SENDER (the 5s peer-refresh arm
+            // does the bumping); internal consumers derive receivers.
+            let epoch_rx_mail = Some(transport_epoch_tx.subscribe());
+            // Shutdown bridge: flip the watch when the loop's closing flag
+            // flips (1s poll — mirrors the adapter tasks' closing-poll
+            // discipline).
+            let (mail_shutdown_tx, mail_shutdown_rx) = tokio::sync::watch::channel(false);
+            {
+                let closing_mail = Arc::clone(&closing);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        if closing_mail.load(Ordering::SeqCst) {
+                            let _ = mail_shutdown_tx.send(true);
+                            return;
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "startup root query failed");
-                        sync.report_query_error(format!("startup query failed: {e}"));
+                });
+            }
+            let request_root = move || {
+                let session = session_mail.clone();
+                let key = key_mail.clone();
+                let sync = Arc::clone(&sync_mail);
+                async move {
+                    let result = query_mail_root(&session, &key, "startup").await;
+                    match &result {
+                        Ok(Some(payload)) => {
+                            // Empty payload routes through the same handler:
+                            // it clears any prior error to idle ("no mail
+                            // yet"). Re-entry on a later epoch-bump re-query
+                            // is safe — start_or_queue_walk single-flights
+                            // and dedups repeated roots.
+                            Arc::clone(&sync)
+                                .handle_startup_query_reply(Some(payload.as_slice()))
+                                .await;
+                        }
+                        Ok(None) => {
+                            tracing::info!(
+                                "startup root query: no responder — retrying with backoff; live push also catches up on next gateway publish"
+                            );
+                            sync.report_query_error(
+                                "no gateway responded to startup query".to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "startup root query failed; retrying with backoff");
+                            sync.report_query_error(format!("startup query failed: {e}"));
+                        }
                     }
+                    map_mail_root_outcome(&result)
                 }
-            });
+            };
+            tokio::spawn(crate::channel_backfill::run_root_fetch_driver(
+                crate::channel_backfill::RootFetchLatch::new(),
+                request_root,
+                mail_shutdown_rx,
+                epoch_rx_mail,
+                || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0)
+                },
+            ));
         }
     }
 
@@ -6023,6 +6076,48 @@ pub(crate) fn merge_peers_detect_new(
         }
     }
     any_new
+}
+
+/// ZEB-434 D9: classify a mail-root query result for the retry latch.
+/// An empty-payload reply is a VALID answer (the "no mail yet" sentinel —
+/// see [`query_mail_root`]); only zero-responders / query failure retries.
+fn map_mail_root_outcome(
+    result: &Result<Option<Vec<u8>>, String>,
+) -> crate::channel_backfill::RootFetch {
+    match result {
+        Ok(Some(_)) => crate::channel_backfill::RootFetch::Answered,
+        Ok(None) | Err(_) => crate::channel_backfill::RootFetch::NoReply,
+    }
+}
+
+#[cfg(test)]
+mod mail_root_outcome_tests {
+    use super::map_mail_root_outcome;
+    use crate::channel_backfill::RootFetch;
+
+    /// ZEB-434 D9: an EMPTY reply payload is the gateway's valid "no mail
+    /// yet" sentinel — it must satisfy the retry latch (Answered) exactly
+    /// like a real root CID. Only zero-responders / query failure retries.
+    #[test]
+    fn mail_root_outcome_mapping_discriminates_empty_from_none() {
+        // Empty payload = valid "no mail yet" sentinel → Answered.
+        assert_eq!(
+            map_mail_root_outcome(&Ok(Some(vec![]))),
+            RootFetch::Answered
+        );
+        // Real root payload → Answered.
+        assert_eq!(
+            map_mail_root_outcome(&Ok(Some(vec![1, 2, 3]))),
+            RootFetch::Answered
+        );
+        // Zero responders → retry.
+        assert_eq!(map_mail_root_outcome(&Ok(None)), RootFetch::NoReply);
+        // Query failure → retry.
+        assert_eq!(
+            map_mail_root_outcome(&Err("boom".to_string())),
+            RootFetch::NoReply
+        );
+    }
 }
 
 #[cfg(test)]
