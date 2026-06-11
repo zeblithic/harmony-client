@@ -262,6 +262,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             },
             ..Default::default()
         },
+        transport_epoch_rx: None,
     });
     let registry_b = ChannelLogRegistry::new(ChannelLogRegistryConfig {
         adapter_request_tx: adapter_tx_b,
@@ -276,6 +277,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             },
             ..Default::default()
         },
+        transport_epoch_rx: None,
     });
 
     // ── Listen for B's channel-message-received events ──────────────

@@ -1136,6 +1136,15 @@ pub struct ChannelLogRegistryConfig<R: tauri::Runtime> {
     /// `log_config.seal_threshold_events` to exercise seal/reload
     /// paths in reasonable time.
     pub engine_config: ChannelLogEngineConfig,
+    /// ZEB-434 Task 7: transport-epoch watch receiver (bumped by the
+    /// event loop's 5s peer refresh whenever a never-before-seen zenoh
+    /// zid appears). Cloned into every spawned channel-log backfill
+    /// driver so a satisfied driver parks on Idle and re-arms — with a
+    /// fresh verified-log watermark — when a peer arrives/recovers
+    /// (closes P3a spec §9's deferred transport-recovery hook). `None`
+    /// (tests, callers without a transport watch) preserves the legacy
+    /// return-on-Idle driver behavior.
+    pub transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
 }
 
 /// One registered channel: the running engine and the adapter's
@@ -1775,6 +1784,9 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                 async move { me.log_max_hlc().await }
             },
             backfill_shutdown_rx,
+            // ZEB-434 Task 7: park-on-Idle + re-arm on transport-epoch
+            // bumps (None preserves the legacy return-on-Idle path).
+            self.config.transport_epoch_rx.clone(),
             || {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3180,6 +3192,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            transport_epoch_rx: None,
         };
         let registry = ChannelLogRegistry::new(config);
 
@@ -3284,6 +3297,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            transport_epoch_rx: None,
         };
         let registry = ChannelLogRegistry::new(config);
 

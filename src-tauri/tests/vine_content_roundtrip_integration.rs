@@ -255,6 +255,7 @@ fn spawn_event_loop(
                     None, // ZEB-373: dial telemetry not exercised in this test
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
                     None, // ZEB-418 P2: routing_republish not exercised
+                    tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
                 )
                 .await;
             });

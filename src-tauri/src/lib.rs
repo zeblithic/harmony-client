@@ -662,6 +662,18 @@ pub struct NodeState {
     /// loop's channel.
     community_adapter_request_tx:
         Option<tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>>,
+    /// ZEB-434 D6: transport-epoch watch RECEIVER. The matching sender
+    /// lives in the event loop, whose 5s peer refresh bumps the value
+    /// whenever a never-before-seen zenoh session id appears (= peer
+    /// arrival/recovery). IPC handlers that spawn community engines at
+    /// runtime (`create_community`, `redeem_invite`, the iroh redeem
+    /// path, `fork_community`) clone this into
+    /// `spawn_engine_with_guard` so each engine's root-fetch driver can
+    /// re-arm its satisfied latch on a bump. Rides the same
+    /// NodeState vehicle as `community_adapter_request_tx`; set in
+    /// `start_node`, cleared in `stop_inner` / restart so a stale
+    /// receiver never outlives its event loop's sender.
+    transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     /// ZEB-298+ZEB-312 PR 1: per-community voting-log adapter request
     /// channel. `ensure_voting_engine_for` sends a `VotingLogAdapterRequest`
     /// here; event_loop::run drains it and calls
@@ -1192,6 +1204,9 @@ impl Default for NodeState {
             unicast_send_tx: None,
             dm_identity_pub_64: None,
             community_adapter_request_tx: None,
+            // ZEB-434 D6: stays None until start_node wires the
+            // transport-epoch watch.
+            transport_epoch_rx: None,
             // ZEB-298+ZEB-312 PR 1: cleared until start_node wires it.
             voting_log_adapter_request_tx: None,
             // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle captured
@@ -1616,6 +1631,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // create_community calls in this lifetime) so a restart's
         // fresh `Sender` doesn't collide with a leaked one.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-434 D6: drop the transport-epoch receiver so it doesn't
+        // outlive the event loop's sender; a restart wires a fresh
+        // watch pair.
+        let _ = guard.transport_epoch_rx.take();
         // ZEB-352: drop the voice-signal relay sender. The event_loop's
         // matching receiver gets None on next recv(); the relay arm goes
         // dormant. Cleared even when unused so a restart's fresh Sender
@@ -2490,6 +2509,10 @@ pub(crate) async fn start_node_inner(
         // loop. The new event loop is constructed below with a fresh
         // channel pair.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-434 D6: clear the previous transport-epoch receiver so it
+        // doesn't outlive the previous event loop's sender. A fresh
+        // watch pair is constructed below.
+        let _ = guard.transport_epoch_rx.take();
         // ZEB-352: clear the previous voice-signal relay sender so it
         // doesn't outlive the previous event loop. A fresh channel pair is
         // constructed below.
@@ -2906,6 +2929,17 @@ pub(crate) async fn start_node_inner(
         > = None;
         let mut community_adapter_requests: Vec<crate::event_loop::CommunityAdapterRequest> =
             Vec::new();
+        // ZEB-434 D6: transport-epoch watch. The SENDER goes into
+        // `event_loop::run`, whose 5s peer refresh bumps the value
+        // whenever a never-before-seen zenoh session id appears (zids
+        // are per-session, so a rebooted peer always presents a fresh
+        // one → "new zid" = peer arrival/recovery). RECEIVER clones go
+        // into every community engine spawn (boot loop below +
+        // NodeState for the create/redeem/fork IPC paths) so each
+        // root-fetch driver can re-arm its satisfied latch on a bump.
+        // Built unconditionally — without an owner identity no
+        // receivers exist and the event loop's send_modify is a no-op.
+        let (transport_epoch_tx, transport_epoch_rx) = tokio::sync::watch::channel(0u64);
         // ZEB-270 Phase 3 Task 4.5: bridge channel for the channel-log
         // adapter requests. Built unconditionally — even when no owner
         // identity is loaded, `event_loop::run` needs to be passed the
@@ -4143,6 +4177,12 @@ pub(crate) async fn start_node_inner(
                             engine_config:
                                 crate::community_channel_log_engine::ChannelLogEngineConfig::default(
                                 ),
+                            // ZEB-434 Task 7: same transport-epoch watch the
+                            // community root-fetch drivers use (built above,
+                            // sender lives in event_loop::run's 5s peer
+                            // refresh) — channel-log backfill drivers park on
+                            // Idle and re-arm on peer arrival/recovery.
+                            transport_epoch_rx: Some(transport_epoch_rx.clone()),
                         },
                     );
                     // Clones of the registry: one for the delta
@@ -4678,6 +4718,17 @@ pub(crate) async fn start_node_inner(
                     for (space_id, mk, admin, is_invite_only) in community_snapshots {
                         let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                         let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        // ZEB-434: queryable-serve + root-fetch channel
+                        // pairs. Engine/driver halves go into the spawn;
+                        // adapter halves ride the CommunityAdapterRequest.
+                        // Capacity 8 = the back-pressure bound on served
+                        // queries (see CommunityAdapterRequest docs).
+                        let (root_serve_tx, root_serve_rx) = tokio::sync::mpsc::channel::<
+                            crate::community_state_sync::RootServeRequest,
+                        >(8);
+                        let (fetch_request_tx, fetch_request_rx) = tokio::sync::mpsc::channel::<
+                            crate::event_loop::CommunityRootFetchRequest,
+                        >(4);
 
                         if let Err(e) = registry
                             .spawn_engine_inner_now(
@@ -4687,6 +4738,9 @@ pub(crate) async fn start_node_inner(
                                 is_invite_only,
                                 pub_tx,
                                 sub_rx,
+                                Some(root_serve_rx),
+                                Some(fetch_request_tx),
+                                Some(transport_epoch_rx.clone()),
                             )
                             .await
                         {
@@ -4706,8 +4760,31 @@ pub(crate) async fn start_node_inner(
                                 id_hex: hex::encode(space_id.0),
                                 publisher_rx: pub_rx,
                                 subscriber_tx: sub_tx,
+                                root_serve_tx,
+                                fetch_request_rx,
                             },
                         );
+
+                        // ZEB-434 D5: boot-hook flush — emit the local
+                        // snapshot shortly after startup so peers that
+                        // are already online receive our current state
+                        // (the dirty bit does not survive restarts and
+                        // clears on publish-into-the-void, so this is
+                        // deliberately unconditional; receivers dedup
+                        // via AlreadyKnown → tracker-only persist).
+                        // Mirrors the mint engine boot flush above.
+                        {
+                            let boot_registry = std::sync::Arc::clone(&registry);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    crate::community_state_sync::COMMUNITY_BOOT_FLUSH_DELAY_MS,
+                                ))
+                                .await;
+                                // Ignore error — engine may have shut
+                                // down before the boot delay elapsed.
+                                let _ = boot_registry.flush_now(&space_id).await;
+                            });
+                        }
 
                         // ZEB-270 Phase 3 Task 4.5: walk this
                         // community's materialized channels map and
@@ -6599,6 +6676,10 @@ pub(crate) async fn start_node_inner(
                                 dial_telemetry_into_loop,
                                 serve_allowlist_for_loop,
                                 routing_republish_for_loop,
+                                // ZEB-434 D6: transport-epoch sender — the
+                                // 5s peer-refresh arm bumps it on every
+                                // never-before-seen zenoh session id.
+                                transport_epoch_tx,
                             )
                             .await;
                         });
@@ -6688,6 +6769,12 @@ pub(crate) async fn start_node_inner(
                         // `CommunityAdapterRequest`s into the event loop. The
                         // matching rx was moved into event_loop::run above.
                         guard.community_adapter_request_tx = Some(community_adapter_request_tx);
+                        // ZEB-434 D6: store the transport-epoch receiver
+                        // so the create_community / redeem_invite / iroh
+                        // redeem / fork_community IPC paths can clone it
+                        // into their engine spawns. The matching sender
+                        // was moved into event_loop::run above.
+                        guard.transport_epoch_rx = Some(transport_epoch_rx);
                         // ZEB-298+ZEB-312 PR 1: store the voting-log adapter-
                         // request sender so `ensure_voting_engine_for` can
                         // dispatch `VotingLogAdapterRequest`s into the event
@@ -18058,6 +18145,12 @@ pub async fn create_community_inner<R: tauri::Runtime>(
     enrollment_cert: harmony_owner::certs::EnrollmentCert,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    // ZEB-434 D6: transport-epoch watch receiver for the engine's
+    // root-fetch driver (re-arms the satisfied latch when the event
+    // loop detects a new peer zid). Production IPC passes the
+    // NodeState-held clone; tests that don't exercise catch-up pass
+    // `None` (driver then parks permanently once satisfied).
+    transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     channel_log_registry: std::sync::Arc<
         crate::community_channel_log_engine::ChannelLogRegistry<R>,
     >,
@@ -18134,9 +18227,14 @@ pub async fn create_community_inner<R: tauri::Runtime>(
     // path: pub_tx / sub_rx feed the engine, pub_rx / sub_tx feed the
     // Zenoh adapter. The CommunityAdapterRequest carries the adapter
     // halves into event_loop via the mpsc; the event loop spawns the
-    // adapter against its live session.
+    // adapter against its live session. ZEB-434 adds the queryable-
+    // serve + root-fetch pairs (same engine-half/adapter-half split).
     let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (root_serve_tx, root_serve_rx) =
+        tokio::sync::mpsc::channel::<crate::community_state_sync::RootServeRequest>(8);
+    let (fetch_request_tx, fetch_request_rx) =
+        tokio::sync::mpsc::channel::<crate::event_loop::CommunityRootFetchRequest>(4);
 
     let engine_arc = community_registry
         .spawn_engine_with_guard(
@@ -18150,6 +18248,11 @@ pub async fn create_community_inner<R: tauri::Runtime>(
             pub_rx,
             sub_tx,
             community_adapter_tx,
+            Some(root_serve_rx),
+            Some(fetch_request_tx),
+            transport_epoch_rx,
+            root_serve_tx,
+            fetch_request_rx,
         )
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
@@ -18394,6 +18497,7 @@ async fn create_community(
         self_owner,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         channel_log_registry,
         dm_outbox,
         snapshot_generation,
@@ -18411,6 +18515,10 @@ async fn create_community(
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
+            // ZEB-434 D6: pass-through Option (no ok_or) — a missing
+            // receiver degrades to a non-re-arming fetch driver rather
+            // than failing the IPC.
+            g.transport_epoch_rx.clone(),
             g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
@@ -18442,6 +18550,7 @@ async fn create_community(
         enrollment_cert,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         channel_log_registry,
         snapshot_generation,
         &state_lock,
@@ -18689,6 +18798,7 @@ mod create_community_inner_tests {
             self_device_id: "test-dev".into(),
             signing_key: std::sync::Arc::clone(&signing_key),
             engine_config: ChannelLogEngineConfig::default(),
+            transport_epoch_rx: None,
         });
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
@@ -18846,6 +18956,7 @@ mod create_community_inner_tests {
             fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             std::sync::Arc::clone(&fixture.channel_log_registry),
             snapshot_gen,
             &fixture.node_state,
@@ -18936,6 +19047,7 @@ mod create_community_inner_tests {
             fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             std::sync::Arc::clone(&fixture.channel_log_registry),
             snapshot_gen, // stale — node_state.generation is now snapshot_gen + 1
             &fixture.node_state,
@@ -18979,6 +19091,7 @@ mod create_community_inner_tests {
             fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             std::sync::Arc::clone(&fixture.channel_log_registry),
             snapshot_gen,
             &fixture.node_state,
@@ -19549,6 +19662,12 @@ pub async fn redeem_invite_inner<R: tauri::Runtime, F>(
     enrollment_cert: harmony_owner::certs::EnrollmentCert,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    // ZEB-434 D6: transport-epoch watch receiver for the engine's
+    // root-fetch driver (re-arms the satisfied latch when the event
+    // loop detects a new peer zid). Production IPC passes the
+    // NodeState-held clone; tests that don't exercise catch-up pass
+    // `None` (driver then parks permanently once satisfied).
+    transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<
@@ -19571,6 +19690,7 @@ where
         enrollment_cert,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         unicast_send_tx,
         dm_outbox,
         channel_log_registry,
@@ -19604,6 +19724,12 @@ pub async fn redeem_invite_inner_with_overrides<R: tauri::Runtime, F>(
     enrollment_cert: harmony_owner::certs::EnrollmentCert,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    // ZEB-434 D6: transport-epoch watch receiver for the engine's
+    // root-fetch driver (re-arms the satisfied latch when the event
+    // loop detects a new peer zid). Production IPC passes the
+    // NodeState-held clone; tests that don't exercise catch-up pass
+    // `None` (driver then parks permanently once satisfied).
+    transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<
@@ -19731,6 +19857,13 @@ where
     //    live adapter pair).
     let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    // ZEB-434: queryable-serve + root-fetch pairs — a joiner's engine is
+    // exactly the one that needs the spawn-time root pull (the admin's
+    // root predates our subscriber).
+    let (root_serve_tx, root_serve_rx) =
+        tokio::sync::mpsc::channel::<crate::community_state_sync::RootServeRequest>(8);
+    let (fetch_request_tx, fetch_request_rx) =
+        tokio::sync::mpsc::channel::<crate::event_loop::CommunityRootFetchRequest>(4);
 
     // ZEB-274: spawn engine + dispatch adapter atomically via the guard.
     // Internalizes the freshness flag — no separate freshness local (the
@@ -19752,6 +19885,11 @@ where
             pub_rx,
             sub_tx,
             community_adapter_tx,
+            Some(root_serve_rx),
+            Some(fetch_request_tx),
+            transport_epoch_rx,
+            root_serve_tx,
+            fetch_request_rx,
         )
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
@@ -20593,6 +20731,7 @@ async fn redeem_invite(
         self_owner,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         unicast_send_tx,
         channel_log_registry,
         dm_outbox,
@@ -20611,6 +20750,10 @@ async fn redeem_invite(
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
+            // ZEB-434 D6: pass-through Option (no ok_or) — a missing
+            // receiver degrades to a non-re-arming fetch driver rather
+            // than failing the IPC.
+            g.transport_epoch_rx.clone(),
             g.unicast_send_tx.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -20676,6 +20819,7 @@ async fn redeem_invite(
         enrollment_cert,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         unicast_send_tx,
         dm_outbox,
         channel_log_registry,
@@ -20789,6 +20933,12 @@ async fn join_open_community_inner<R, F>(
     enrollment_cert: harmony_owner::certs::EnrollmentCert,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    // ZEB-434 D6: transport-epoch watch receiver for the engine's
+    // root-fetch driver (re-arms the satisfied latch when the event
+    // loop detects a new peer zid). Production IPC passes the
+    // NodeState-held clone; tests that don't exercise catch-up pass
+    // `None` (driver then parks permanently once satisfied).
+    transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<
@@ -20815,6 +20965,7 @@ where
         enrollment_cert,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         unicast_send_tx,
         dm_outbox,
         channel_log_registry,
@@ -20851,6 +21002,7 @@ async fn join_open_community(
         self_owner,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         unicast_send_tx,
         channel_log_registry,
         dm_outbox,
@@ -20870,6 +21022,10 @@ async fn join_open_community(
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
+            // ZEB-434 D6: pass-through Option (no ok_or) — a missing
+            // receiver degrades to a non-re-arming fetch driver rather
+            // than failing the IPC.
+            g.transport_epoch_rx.clone(),
             g.unicast_send_tx.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -20926,6 +21082,7 @@ async fn join_open_community(
         enrollment_cert,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         unicast_send_tx,
         dm_outbox,
         channel_log_registry,
@@ -21131,6 +21288,7 @@ mod redeem_invite_inner_tests {
             self_device_id: "joiner-dev".into(),
             signing_key: std::sync::Arc::clone(&signing_key),
             engine_config: ChannelLogEngineConfig::default(),
+            transport_epoch_rx: None,
         });
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
@@ -21216,6 +21374,7 @@ mod redeem_invite_inner_tests {
             fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
@@ -21406,6 +21565,7 @@ mod redeem_invite_inner_tests {
                 self_device_id: "joiner-dev".into(),
                 signing_key: std::sync::Arc::clone(&signing_key),
                 engine_config: ChannelLogEngineConfig::default(),
+                transport_epoch_rx: None,
             }));
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
@@ -21521,6 +21681,7 @@ mod redeem_invite_inner_tests {
             enrollment_cert.clone(),
             std::sync::Arc::clone(&community_registry),
             community_adapter_tx,
+            None, // ZEB-434: no transport-epoch watch in this test
             unicast_send_tx,
             std::sync::Arc::clone(&dm_outbox),
             std::sync::Arc::clone(&channel_log_registry),
@@ -21701,6 +21862,7 @@ mod redeem_invite_inner_tests {
                 self_device_id: "joiner-dev".into(),
                 signing_key: std::sync::Arc::clone(&signing_key),
                 engine_config: ChannelLogEngineConfig::default(),
+                transport_epoch_rx: None,
             }));
 
         let baseline_err = redeem_invite_inner(
@@ -21713,6 +21875,7 @@ mod redeem_invite_inner_tests {
             enrollment_cert_b.clone(),
             std::sync::Arc::clone(&community_registry2),
             adapter_tx2,
+            None, // ZEB-434: no transport-epoch watch in this test
             unicast_tx2,
             std::sync::Arc::clone(&dm_outbox_b),
             std::sync::Arc::clone(&channel_log_registry_b),
@@ -21877,6 +22040,7 @@ mod redeem_invite_inner_tests {
             fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
@@ -22003,6 +22167,7 @@ mod redeem_invite_inner_tests {
             fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
@@ -22110,6 +22275,7 @@ mod redeem_invite_inner_tests {
             fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
@@ -22358,6 +22524,7 @@ mod zeb436_orphan_adoption_tests {
             fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
@@ -22742,6 +22909,7 @@ mod zeb436_orphan_adoption_tests {
             self_device_id: "joiner-dev".into(),
             signing_key: std::sync::Arc::clone(&signing_key),
             engine_config: ChannelLogEngineConfig::default(),
+            transport_epoch_rx: None,
         });
 
         // ── Fabricate the orphaned dir exactly as a healthy engine left
@@ -22907,6 +23075,7 @@ mod zeb436_orphan_adoption_tests {
             rig.joiner_cert.clone(),
             std::sync::Arc::clone(&rig.community_registry),
             rig.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             rig.unicast_send_tx.clone(),
             std::sync::Arc::clone(&rig.dm_outbox),
             std::sync::Arc::clone(&rig.channel_log_registry),
@@ -22986,6 +23155,7 @@ mod zeb436_orphan_adoption_tests {
             rig.joiner_cert.clone(),
             std::sync::Arc::clone(&rig.community_registry),
             rig.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             rig.unicast_send_tx.clone(),
             std::sync::Arc::clone(&rig.dm_outbox),
             std::sync::Arc::clone(&rig.channel_log_registry),
@@ -23054,6 +23224,7 @@ mod zeb436_orphan_adoption_tests {
             rig.joiner_cert.clone(),
             std::sync::Arc::clone(&rig.community_registry),
             rig.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             rig.unicast_send_tx.clone(),
             std::sync::Arc::clone(&rig.dm_outbox),
             std::sync::Arc::clone(&rig.channel_log_registry),
@@ -23193,6 +23364,7 @@ mod join_open_community_tests {
             fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
             fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
@@ -35749,6 +35921,7 @@ async fn connectivity_redeem_invite_iroh(
         self_owner,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         unicast_send_tx,
         channel_log_registry,
         dm_outbox,
@@ -35767,6 +35940,11 @@ async fn connectivity_redeem_invite_iroh(
             g.dm_self_owner,
             g.community_registry.clone(),
             g.community_adapter_request_tx.clone(),
+            // ZEB-434 D6: pass-through Option — deliberately NOT part
+            // of the Some(...) gate below (same rationale as
+            // sync_engine: a missing receiver degrades to a
+            // non-re-arming fetch driver, not a hard failure).
+            g.transport_epoch_rx.clone(),
             g.unicast_send_tx.clone(),
             g.channel_log_registry.clone(),
             g.dm_outbox.clone(),
@@ -35904,6 +36082,7 @@ async fn connectivity_redeem_invite_iroh(
         enrollment_cert,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         unicast_send_tx,
         dm_outbox,
         channel_log_registry,
@@ -36150,6 +36329,12 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime, F>(
     enrollment_cert: harmony_owner::certs::EnrollmentCert,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    // ZEB-434 D6: transport-epoch watch receiver for the engine's
+    // root-fetch driver (re-arms the satisfied latch when the event
+    // loop detects a new peer zid). Production IPC passes the
+    // NodeState-held clone; tests that don't exercise catch-up pass
+    // `None` (driver then parks permanently once satisfied).
+    transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<
@@ -36247,6 +36432,11 @@ where
             enrollment_cert,
             community_registry,
             community_adapter_tx,
+            // ZEB-434 D6: the adoption path spawns a REAL engine over the
+            // orphaned dir — its root-fetch driver needs the same
+            // transport-epoch watch the handshake path threads through
+            // (short-circuit returns, so the move is fine).
+            transport_epoch_rx,
             unicast_send_tx,
             dm_outbox,
             channel_log_registry,
@@ -36836,6 +37026,7 @@ where
         enrollment_cert,
         community_registry,
         community_adapter_tx,
+        transport_epoch_rx,
         unicast_send_tx,
         dm_outbox,
         channel_log_registry,
@@ -44822,6 +45013,7 @@ mod start_node_race_tests {
             dm_send_stopping: None,
             dm_identity_pub_64: None,
             community_adapter_request_tx: None,
+            transport_epoch_rx: None,
             voting_log_adapter_request_tx: None,
             app_handle_wry: None,
             channel_log_registry: None,

@@ -234,11 +234,31 @@ async fn two_members_dag_sync_full_event_log() {
     let (_a_sub_tx, a_sub_rx) = mpsc::channel(8);
 
     registry_a
-        .spawn_engine_inner_now(community_id, mk.clone(), admin, false, a_pub_tx, a_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk.clone(),
+            admin,
+            false,
+            a_pub_tx,
+            a_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn a");
     registry_b
-        .spawn_engine_inner_now(community_id, mk, admin, false, b_pub_tx, b_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk,
+            admin,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn b");
 
@@ -429,7 +449,17 @@ async fn forged_signature_event_is_rejected_on_receive() {
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
 
     registry_b
-        .spawn_engine_inner_now(community_id, mk.clone(), admin, false, b_pub_tx, b_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk.clone(),
+            admin,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn b");
 
@@ -661,11 +691,31 @@ async fn malformed_wire_packet_does_not_panic_engine() {
     let (_a_sub_tx, a_sub_rx) = mpsc::channel(8);
 
     registry_a
-        .spawn_engine_inner_now(community_id, mk.clone(), admin, false, a_pub_tx, a_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk.clone(),
+            admin,
+            false,
+            a_pub_tx,
+            a_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn a");
     registry_b
-        .spawn_engine_inner_now(community_id, mk, admin, false, b_pub_tx, b_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk,
+            admin,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn b");
 
@@ -860,11 +910,31 @@ async fn replay_of_same_root_publish_is_idempotent() {
     let (_a_sub_tx, a_sub_rx) = mpsc::channel(8);
 
     registry_a
-        .spawn_engine_inner_now(community_id, mk.clone(), admin, false, a_pub_tx, a_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk.clone(),
+            admin,
+            false,
+            a_pub_tx,
+            a_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn a");
     registry_b
-        .spawn_engine_inner_now(community_id, mk, admin, false, b_pub_tx, b_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk,
+            admin,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn b");
 
@@ -1171,6 +1241,9 @@ async fn spoofed_publish_does_not_block_real_publisher() {
             false,
             a_pub_tx,
             a_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn a");
@@ -1182,6 +1255,9 @@ async fn spoofed_publish_does_not_block_real_publisher() {
             false,
             b_pub_tx,
             b_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn b");
@@ -1626,6 +1702,9 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
             false,
             a_pub_tx,
             a_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn a");
@@ -1637,6 +1716,9 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
             false,
             b_pub_tx,
             b_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn b");
@@ -1971,6 +2053,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         self_device_id: "test-dev".into(),
         signing_key: Arc::clone(&signing_key),
         engine_config: ChannelLogEngineConfig::default(),
+        transport_epoch_rx: None,
     });
 
     // Pre-call snapshot of owner-state's canonical byte encoding. Any
@@ -2011,6 +2094,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         identity.cert.clone(),
         Arc::clone(&registry),
         adapter_tx,
+        None, // ZEB-434: no transport-epoch watch in this test
         channel_log_registry,
         0, // snapshot_generation; fence not reached on this path
         &node_state,
@@ -2254,6 +2338,7 @@ mod task3_kick_setpower_round_trip {
             crdt_state: None,
             admin_identity_pub: None,
             nav_emitter: None,
+            root_serve_rx: None,
         });
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
@@ -2280,6 +2365,7 @@ mod task3_kick_setpower_round_trip {
             crdt_state: None,
             admin_identity_pub: None,
             nav_emitter: None,
+            root_serve_rx: None,
         });
 
         // Step 1: A inserts its bootstrap Join.
@@ -2788,6 +2874,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         self_device_id: "bob-dev".into(),
         signing_key: Arc::clone(&bob_signing_key),
         engine_config: ChannelLogEngineConfig::default(),
+        transport_epoch_rx: None,
     });
 
     // Pre-call snapshot of owner-state's canonical encoding. Any
@@ -2813,6 +2900,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         bob_owner.cert.clone(),
         Arc::clone(&registry),
         adapter_tx,
+        None, // ZEB-434: no transport-epoch watch in this test
         unicast_tx,
         Arc::clone(&dm_outbox),
         channel_log_registry,
