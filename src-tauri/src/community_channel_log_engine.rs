@@ -74,9 +74,9 @@ pub enum ChannelLogEngineError {
 /// spawn during an open community transaction is deferred until commit;
 /// a spawn outside a transaction follows the existing fast-path and
 /// returns the live engine.
-pub enum SpawnOutcome<R: tauri::Runtime> {
+pub enum SpawnOutcome {
     /// The engine was constructed and inserted into the registry.
-    Spawned(Arc<ChannelLogEngine<R>>),
+    Spawned(Arc<ChannelLogEngine>),
     /// A community transaction is open for this `community_id`; the
     /// spawn was queued and will fire on `commit()`.
     DeferredForCommit,
@@ -289,7 +289,7 @@ pub struct BackfillQueryRequest {
 /// HLC reservation tracker. See ZEB-267 for the rationale; existing
 /// callers (`send_dm`, `create_community`, `redeem_invite`, channel-
 /// config IPCs) all use this same per-device tracker.
-pub struct ChannelLogEngineParams<R: tauri::Runtime> {
+pub struct ChannelLogEngineParams {
     pub community_id: SpaceId,
     pub channel_id: ChannelId,
     pub channel_key: Arc<ChannelKey>,
@@ -299,7 +299,7 @@ pub struct ChannelLogEngineParams<R: tauri::Runtime> {
     pub self_device_id: String,
     pub signing_key: Arc<SigningKey>,
     pub hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
-    pub app: tauri::AppHandle<R>,
+    pub sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
     pub config: ChannelLogEngineConfig,
 
     /// Publisher channel (engine → adapter → Zenoh `put`).
@@ -317,7 +317,7 @@ pub struct ChannelLogEngineParams<R: tauri::Runtime> {
 /// error mapping.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
-pub struct ChannelLogEngine<R: tauri::Runtime> {
+pub struct ChannelLogEngine {
     community_id: SpaceId,
     channel_id: ChannelId,
     channel_key: Arc<ChannelKey>,
@@ -328,7 +328,7 @@ pub struct ChannelLogEngine<R: tauri::Runtime> {
     self_device_id: String,
     signing_key: Arc<SigningKey>,
     hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
-    app: tauri::AppHandle<R>,
+    sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
     config: ChannelLogEngineConfig,
 
     publisher_tx: mpsc::Sender<Vec<u8>>,
@@ -349,12 +349,12 @@ pub struct ChannelLogEngine<R: tauri::Runtime> {
     closing_notify: Arc<Notify>,
 }
 
-impl<R: tauri::Runtime> ChannelLogEngine<R> {
+impl ChannelLogEngine {
     /// Construct + spawn receive/flush loops. Takes ownership of the
     /// subscriber receiver from `params`; the registry passes one end
     /// of an `mpsc::channel` and keeps the sender in the adapter.
     pub async fn new(
-        params: ChannelLogEngineParams<R>,
+        params: ChannelLogEngineParams,
     ) -> Result<Arc<Self>, ChannelLogEngineError> {
         // Per spec §14.2 acceptance criterion + §17.4 (segments persist
         // across stop/respawn): on construction, attempt to reload any
@@ -420,7 +420,7 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
             self_device_id: params.self_device_id,
             signing_key: params.signing_key,
             hlc_tracker: params.hlc_tracker,
-            app: params.app,
+            sink: params.sink,
             config: params.config,
             publisher_tx: params.publisher_tx,
             query_request_tx: params.query_request_tx,
@@ -746,21 +746,13 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
     // ── Internal helpers ────────────────────────────────────────────────
 
     fn emit_message_received(&self, event: &SignedChannelEvent) {
-        use tauri::Emitter;
         let dto = self.message_dto_for_event(event);
         let payload = ChannelMessageReceivedPayload {
             community_id: hex::encode(self.community_id.0),
             channel_id: hex::encode(self.channel_id.0),
             message: dto,
         };
-        if let Err(e) = self.app.emit("channel-message-received", &payload) {
-            tracing::warn!(
-                community_id = ?self.community_id,
-                channel_id = ?self.channel_id,
-                err = ?e,
-                "failed to emit channel-message-received"
-            );
-        }
+        crate::node_event_sink::emit_ser(&*self.sink, "channel-message-received", &payload);
     }
 
     /// Public accessor: project a `SignedChannelEvent` to the IPC
@@ -809,15 +801,12 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
     }
 
     fn emit_degraded(&self, reason: &str) {
-        use tauri::Emitter;
         let payload = serde_json::json!({
             "communityId": hex::encode(self.community_id.0),
             "channelId": hex::encode(self.channel_id.0),
             "reason": reason,
         });
-        if let Err(e) = self.app.emit("channel-log-degraded", &payload) {
-            tracing::warn!(err = ?e, "failed to emit channel-log-degraded");
-        }
+        self.sink.emit("channel-log-degraded", payload);
     }
 
     async fn process_inbound_packet(self: &Arc<Self>, packet: Vec<u8>) {
@@ -1046,7 +1035,7 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
 // ── Test-only accessors ────────────────────────────────────────────────────
 
 #[cfg(test)]
-impl<R: tauri::Runtime> ChannelLogEngine<R> {
+impl ChannelLogEngine {
     pub(crate) fn log_for_test(&self) -> &Arc<Mutex<ChannelLog>> {
         &self.log
     }
@@ -1055,12 +1044,12 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
         self.flush_dirty.notify_one();
     }
 
-    pub(crate) fn app_handle_for_test(&self) -> &tauri::AppHandle<R> {
-        &self.app
+    pub(crate) fn sink_for_test(&self) -> &Arc<dyn crate::node_event_sink::NodeEventSink> {
+        &self.sink
     }
 }
 
-impl<R: tauri::Runtime> ChannelLogEngine<R> {
+impl ChannelLogEngine {
     /// Borrow the per-channel encryption key. Used by the registry's
     /// `read_for_query` callback to encrypt backfill replies in the
     /// same wire shape as live broadcast packets (spec §17.1).
@@ -1094,7 +1083,7 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
 /// the session lifetime — which was load-bearing because the registry
 /// is constructed in `start_node`'s scope, where the session isn't
 /// reachable.
-pub struct ChannelLogRegistryConfig<R: tauri::Runtime> {
+pub struct ChannelLogRegistryConfig {
     /// Adapter-request bridge to `event_loop::run`. Each
     /// `ChannelLogRegistry::spawn` call enqueues one
     /// `ChannelLogAdapterRequest`; the event loop drains the matching
@@ -1111,10 +1100,10 @@ pub struct ChannelLogRegistryConfig<R: tauri::Runtime> {
     /// closure; for a user with 1000 channels, the queued requests
     /// are O(KB).
     pub adapter_request_tx: mpsc::UnboundedSender<crate::event_loop::ChannelLogAdapterRequest>,
-    /// Tauri AppHandle — propagated into each engine for
-    /// `channel-message-received` / `channel-log-degraded` /
+    /// ZEB-445: mode-agnostic event sink — propagated into each engine
+    /// for `channel-message-received` / `channel-log-degraded` /
     /// `channel-backfill-progress` event emission.
-    pub app: tauri::AppHandle<R>,
+    pub sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
     /// Filesystem root under which per-(community, channel) directories
     /// live (`identity_dir/communities/{cid_hex}/channels/{ch_id_hex}/`).
     /// Mirrors `CommunityRegistryConfig.identity_dir` — same convention.
@@ -1152,8 +1141,8 @@ pub struct ChannelLogRegistryConfig<R: tauri::Runtime> {
 /// atomically on both. Storing them in a single map (rather than two
 /// parallel maps) eliminates a spawn-stop race that previously could
 /// orphan an adapter task — see `ChannelLogRegistry` doc.
-struct EngineEntry<R: tauri::Runtime> {
-    engine: Arc<ChannelLogEngine<R>>,
+struct EngineEntry {
+    engine: Arc<ChannelLogEngine>,
     /// Closing flag for the per-channel adapter task that
     /// `event_loop::run` spawned in response to the spawn-time
     /// `ChannelLogAdapterRequest`. Flipping it to `true` causes the
@@ -1184,14 +1173,14 @@ struct EngineEntry<R: tauri::Runtime> {
 /// `tx_id` tags the guard so a stale guard's deferred abort is a no-op
 /// after a fresh `begin_transaction(same community_id)` has overwritten
 /// the slot (spec §5.4).
-pub struct CommunityTransactionGuard<R: tauri::Runtime> {
-    registry: Arc<ChannelLogRegistry<R>>,
+pub struct CommunityTransactionGuard {
+    registry: Arc<ChannelLogRegistry>,
     community_id: SpaceId,
     tx_id: u64,
     completed: std::sync::atomic::AtomicBool,
 }
 
-impl<R: tauri::Runtime> CommunityTransactionGuard<R> {
+impl CommunityTransactionGuard {
     /// Drain the queue and fire the deferred spawns sequentially.
     /// On failure of any spawn, the remaining items are STILL attempted —
     /// only the first error is returned; subsequent errors are logged at
@@ -1286,7 +1275,7 @@ impl<R: tauri::Runtime> CommunityTransactionGuard<R> {
     }
 }
 
-impl<R: tauri::Runtime> Drop for CommunityTransactionGuard<R> {
+impl Drop for CommunityTransactionGuard {
     fn drop(&mut self) {
         if !self.completed.load(std::sync::atomic::Ordering::Acquire) {
             tracing::warn!(
@@ -1350,9 +1339,9 @@ impl<R: tauri::Runtime> Drop for CommunityTransactionGuard<R> {
 /// concurrent `spawn` + `stop` for the same key cannot orphan the
 /// adapter: `stop` removes the entire `EngineEntry` (engine + closing)
 /// in one map op, so the closing flag goes with the engine.
-pub struct ChannelLogRegistry<R: tauri::Runtime> {
-    engines: Mutex<HashMap<(SpaceId, ChannelId), EngineEntry<R>>>,
-    config: ChannelLogRegistryConfig<R>,
+pub struct ChannelLogRegistry {
+    engines: Mutex<HashMap<(SpaceId, ChannelId), EngineEntry>>,
+    config: ChannelLogRegistryConfig,
     // ZEB-271: per-community deferred-spawn queue gated by an explicit
     // CommunityTransactionGuard. See spec §3.1 for the rationale.
     // std::sync::Mutex (not tokio) — critical sections never span an
@@ -1361,13 +1350,13 @@ pub struct ChannelLogRegistry<R: tauri::Runtime> {
     next_tx_id: std::sync::atomic::AtomicU64,
 }
 
-impl<R: tauri::Runtime> ChannelLogRegistry<R> {
+impl ChannelLogRegistry {
     /// Production constructor. Wires the registry to the
     /// adapter-request bridge defined in `ChannelLogRegistryConfig`.
     /// Each `spawn` call enqueues a `ChannelLogAdapterRequest` over
     /// the bridge; `event_loop::run` drains the matching receiver and
     /// spawns the per-channel Zenoh adapter against the live session.
-    pub fn new(config: ChannelLogRegistryConfig<R>) -> Arc<Self> {
+    pub fn new(config: ChannelLogRegistryConfig) -> Arc<Self> {
         Arc::new(Self {
             engines: Mutex::new(HashMap::new()),
             config,
@@ -1388,7 +1377,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
     pub fn begin_transaction(
         self: &Arc<Self>,
         community_id: SpaceId,
-    ) -> CommunityTransactionGuard<R> {
+    ) -> CommunityTransactionGuard {
         let tx_id = self
             .next_tx_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1489,7 +1478,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         channel_key: ChannelKey,
         state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
         hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
-    ) -> Result<SpawnOutcome<R>, ChannelLogEngineError> {
+    ) -> Result<SpawnOutcome, ChannelLogEngineError> {
         // ZEB-271: queue iff an open transaction targets this community.
         // Sync lock — critical section is just a HashMap mutation.
         {
@@ -1528,7 +1517,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         self: &Arc<Self>,
         community_id: SpaceId,
         ds: DeferredSpawn,
-    ) -> Result<Arc<ChannelLogEngine<R>>, ChannelLogEngineError> {
+    ) -> Result<Arc<ChannelLogEngine>, ChannelLogEngineError> {
         let key = (community_id, ds.channel_id);
 
         // Cheap pre-check under the engines lock — returns Arc-cloned
@@ -1568,7 +1557,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
             self_device_id: self.config.self_device_id.clone(),
             signing_key: Arc::clone(&self.config.signing_key),
             hlc_tracker: ds.hlc_tracker,
-            app: self.config.app.clone(),
+            sink: self.config.sink.clone(),
             config: self.config.engine_config.clone(),
             publisher_tx,
             subscriber_rx,
@@ -1679,30 +1668,26 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         // can't apply back-pressure. See `adapter_request_tx` doc on
         // ChannelLogRegistryConfig for why.
         // Per spec §10: emit `channel-backfill-progress` from the
-        // adapter's qr task. The adapter is runtime-erased (sees no
-        // `tauri::AppHandle<R>`), so the registry constructs a closure
-        // that captures the AppHandle (typed at registry-creation
-        // time) and emits a `ChannelBackfillProgressPayload`.
-        let app_progress = self.config.app.clone();
+        // adapter's qr task. The adapter is emission-agnostic (sees no
+        // sink type), so the registry constructs a closure that
+        // captures the NodeEventSink and emits a
+        // `ChannelBackfillProgressPayload`.
+        let sink_progress = self.config.sink.clone();
         let community_id_hex_progress = hex::encode(community_id.0);
         let channel_id_hex_progress = hex::encode(ds.channel_id.0);
         let emit_backfill_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static> =
             Arc::new(move |fetched: u32, total_estimate: Option<u32>| {
-                use tauri::Emitter;
                 let payload = ChannelBackfillProgressPayload {
                     community_id: community_id_hex_progress.clone(),
                     channel_id: channel_id_hex_progress.clone(),
                     fetched,
                     total_estimate,
                 };
-                if let Err(e) = app_progress.emit("channel-backfill-progress", &payload) {
-                    tracing::warn!(
-                        community_id = %community_id_hex_progress,
-                        channel_id = %channel_id_hex_progress,
-                        err = ?e,
-                        "failed to emit channel-backfill-progress"
-                    );
-                }
+                crate::node_event_sink::emit_ser(
+                    &*sink_progress,
+                    "channel-backfill-progress",
+                    &payload,
+                );
             });
         let backfill_progress_interval = self.config.engine_config.backfill_progress_event_interval;
         let backfill_default_limit = self.config.engine_config.backfill_default_limit;
@@ -1887,7 +1872,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         &self,
         community_id: &SpaceId,
         channel_id: &ChannelId,
-    ) -> Option<Arc<ChannelLogEngine<R>>> {
+    ) -> Option<Arc<ChannelLogEngine>> {
         self.engines
             .lock()
             .await
@@ -2087,7 +2072,7 @@ mod tests {
     }
 
     struct EngineFixture {
-        engine: Arc<ChannelLogEngine<tauri::test::MockRuntime>>,
+        engine: Arc<ChannelLogEngine>,
         publisher_rx: mpsc::Receiver<Vec<u8>>,
         subscriber_tx: mpsc::Sender<Vec<u8>>,
         query_request_rx: mpsc::Receiver<BackfillQueryRequest>,
@@ -2097,6 +2082,21 @@ mod tests {
         community_id: SpaceId,
         channel_id: ChannelId,
         tmp: TempDir,
+        /// ZEB-445: recording handle onto the engine's event sink so
+        /// tests can assert on emitted frames.
+        sink: Arc<crate::node_event_sink::RecordingSink>,
+    }
+
+    /// ZEB-445: build a (recording handle, dyn sink) pair. NodeEventSink
+    /// is impl'd on `Arc<RecordingSink>`, so the dyn coercion wraps the
+    /// Arc once more.
+    fn recording_sink_pair() -> (
+        Arc<crate::node_event_sink::RecordingSink>,
+        Arc<dyn crate::node_event_sink::NodeEventSink>,
+    ) {
+        let rec = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> = Arc::new(Arc::clone(&rec));
+        (rec, sink)
     }
 
     async fn build_engine_fixture(
@@ -2131,7 +2131,7 @@ mod tests {
         let (subscriber_tx, subscriber_rx) = mpsc::channel(64);
         let (query_request_tx, query_request_rx) = mpsc::channel(8);
 
-        let app = tauri::test::mock_app().handle().clone();
+        let (rec_sink, sink) = recording_sink_pair();
 
         let config = ChannelLogEngineConfig {
             log_config: ChannelLogConfig {
@@ -2152,7 +2152,7 @@ mod tests {
             self_device_id: "test-device".to_string(),
             signing_key: Arc::clone(&signing_key),
             hlc_tracker,
-            app,
+            sink,
             config,
             publisher_tx,
             subscriber_rx,
@@ -2172,6 +2172,7 @@ mod tests {
             community_id,
             channel_id,
             tmp,
+            sink: rec_sink,
         }
     }
 
@@ -2471,26 +2472,12 @@ mod tests {
 
     #[tokio::test]
     async fn publish_emits_channel_message_received_event() {
-        // Spec §14.1 requires "log mutation + Tauri event" for the
+        // Spec §14.1 requires "log mutation + event emission" for the
         // publish + receive paths. The other publish test only checks
-        // log mutation; this one closes the gap by installing a real
-        // Tauri listener on the mock runtime and asserting the
-        // channel-message-received payload shape.
-        use std::sync::Mutex as StdMutex;
-        use tauri::Listener;
-
+        // log mutation; this one closes the gap by asserting the
+        // channel-message-received payload shape on the recording sink
+        // (ZEB-445: emission goes through NodeEventSink, not Tauri).
         let fix = build_engine_fixture(8, 250, 1000).await;
-
-        let captured: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
-        let captured_for_listener = Arc::clone(&captured);
-        fix.engine
-            .app_handle_for_test()
-            .listen("channel-message-received", move |event| {
-                captured_for_listener
-                    .lock()
-                    .expect("captured lock")
-                    .push(event.payload().to_string());
-            });
 
         let body = b"emit-test-body".to_vec();
         let msg_id = Arc::clone(&fix.engine)
@@ -2498,21 +2485,20 @@ mod tests {
             .await
             .expect("publish");
 
-        let captured_payload = wait_for(
+        let payload = wait_for(
             || {
-                let captured = Arc::clone(&captured);
+                let sink = Arc::clone(&fix.sink);
                 async move {
-                    let v = captured.lock().expect("captured lock");
-                    v.first().cloned()
+                    sink.frames()
+                        .iter()
+                        .find(|(name, _)| name == "channel-message-received")
+                        .map(|(_, payload)| payload.clone())
                 }
             },
             Duration::from_secs(1),
         )
         .await
-        .expect("listener must receive channel-message-received within 1s");
-
-        let payload: serde_json::Value =
-            serde_json::from_str(&captured_payload).expect("payload is JSON");
+        .expect("sink must record channel-message-received within 1s");
 
         assert_eq!(
             payload["communityId"].as_str(),
@@ -2868,7 +2854,7 @@ mod tests {
         let (publisher_tx, _publisher_rx) = mpsc::channel(64);
         let (subscriber_tx, subscriber_rx) = mpsc::channel(64);
         let (query_request_tx, _query_request_rx) = mpsc::channel(8);
-        let app = tauri::test::mock_app().handle().clone();
+        let (_rec_sink, sink) = recording_sink_pair();
         let config = ChannelLogEngineConfig {
             log_config: ChannelLogConfig {
                 seal_threshold_events: 3,
@@ -2887,7 +2873,7 @@ mod tests {
             self_device_id: "test-device".to_string(),
             signing_key: Arc::clone(&signing_key),
             hlc_tracker,
-            app,
+            sink,
             config,
             publisher_tx,
             subscriber_rx,
@@ -3086,7 +3072,7 @@ mod tests {
     /// drainer exits cleanly when `adapter_request_tx` drops on
     /// fixture teardown.
     struct RegistryFixture {
-        registry: Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+        registry: Arc<ChannelLogRegistry>,
         state: Arc<AlwaysJoinedState>,
         hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
         membership_key: EpochKey,
@@ -3137,7 +3123,7 @@ mod tests {
 
         let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
-        let app = tauri::test::mock_app().handle().clone();
+        let (_rec_sink, sink) = recording_sink_pair();
 
         // In-memory Zenoh session for the test-side adapter drainer.
         let cfg = zenoh::Config::default();
@@ -3181,7 +3167,7 @@ mod tests {
 
         let config = ChannelLogRegistryConfig {
             adapter_request_tx,
-            app,
+            sink,
             identity_dir: tmp.path().to_path_buf(),
             self_owner,
             self_device_id: "registry-test-device".to_string(),
@@ -3217,7 +3203,7 @@ mod tests {
         fix: &RegistryFixture,
         community_id: SpaceId,
         channel_id: ChannelId,
-    ) -> Arc<ChannelLogEngine<tauri::test::MockRuntime>> {
+    ) -> Arc<ChannelLogEngine> {
         let key = derive_channel_key(&fix.membership_key, &community_id, &channel_id);
         match Arc::clone(&fix.registry)
             .spawn(
@@ -3256,7 +3242,7 @@ mod tests {
     /// the backfill driver's wire-side requests directly. No Zenoh
     /// means the default `current_thread` test flavor works here.
     struct BackfillRegistryFixture {
-        registry: Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+        registry: Arc<ChannelLogRegistry>,
         state: Arc<AlwaysJoinedState>,
         hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
         membership_key: EpochKey,
@@ -3279,14 +3265,14 @@ mod tests {
 
         let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
-        let app = tauri::test::mock_app().handle().clone();
+        let (_rec_sink, sink) = recording_sink_pair();
 
         let (adapter_request_tx, adapter_request_rx) =
             mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
 
         let config = ChannelLogRegistryConfig {
             adapter_request_tx,
-            app,
+            sink,
             identity_dir: tmp.path().to_path_buf(),
             self_owner,
             self_device_id: "backfill-test-device".to_string(),
@@ -3316,7 +3302,7 @@ mod tests {
         fix: &BackfillRegistryFixture,
         community_id: SpaceId,
         channel_id: ChannelId,
-    ) -> Arc<ChannelLogEngine<tauri::test::MockRuntime>> {
+    ) -> Arc<ChannelLogEngine> {
         let key = derive_channel_key(&fix.membership_key, &community_id, &channel_id);
         match Arc::clone(&fix.registry)
             .spawn(
@@ -3876,7 +3862,7 @@ mod tests {
     /// transaction for `community_id`, or `timeout` elapses.
     /// Returns `true` if the condition was met before the deadline.
     async fn wait_until_no_pending_tx(
-        registry: &ChannelLogRegistry<tauri::test::MockRuntime>,
+        registry: &ChannelLogRegistry,
         community_id: &SpaceId,
         timeout: std::time::Duration,
     ) -> bool {
