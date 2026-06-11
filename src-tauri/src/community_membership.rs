@@ -1274,7 +1274,12 @@ fn resolve_enrolled_signer(
 /// ZEB-339: verify an InviteToken's signature against the inviter's enrolled
 /// device key(s), resolved from materialized membership. The inviter is a
 /// Joined member whose enrolled key is in `prior_state`.
-fn verify_invite_token_sig_with_enrolled(
+///
+/// `pub(crate)` since ZEB-436: `orphan_dir_adoption_eligible` (lib.rs)
+/// mirrors the PendingJoin P5 gate against the orphaned dir's own
+/// materialized membership, so adoption is never a weaker
+/// authentication path than a first-time join.
+pub(crate) fn verify_invite_token_sig_with_enrolled(
     token: &crate::community_invite::InviteToken,
     prior_state: &MaterializedMembership,
 ) -> Result<(), VerifyError> {
