@@ -4428,10 +4428,6 @@ impl CommunitySyncRegistry {
         }));
 
         engines.insert(community_id, engine);
-        // ZEB-434: release the engines lock before touching
-        // root_fetch_shutdowns below (lock-discipline: the two locks
-        // are only ever taken sequentially, never nested).
-        drop(engines);
 
         // ZEB-434 D3/D4: spawn the per-community root-fetch driver.
         // It paces state-root pull queries (spawn-time query, backoff
@@ -4439,12 +4435,33 @@ impl CommunitySyncRegistry {
         // attempt to the zenoh adapter via `fetch_request_tx`; replies
         // ingest through the engine's normal inbound path, so the
         // driver only ever sees reply counts.
-        if let Some(fetch_tx) = fetch_request_tx {
+        //
+        // Lock order: `engines` may be held while taking
+        // `root_fetch_shutdowns` (spawn path only); the reverse never
+        // happens — stop_engine/shutdown_all take them strictly
+        // sequentially. Inserting the shutdown sender under the
+        // engines guard makes engine+driver-entry visibility atomic:
+        // a concurrent stop_engine that removes the engine AFTER our
+        // guard drops is guaranteed to find (and flip) this entry. If
+        // it flips before the driver task below first polls, the
+        // driver reads `borrow() == true` (watch retains the last
+        // value across sender drop) and exits immediately.
+        let driver_shutdown_rx = if let Some(fetch_tx) = fetch_request_tx {
             let (driver_shutdown_tx, driver_shutdown_rx) = tokio::sync::watch::channel(false);
             self.root_fetch_shutdowns
                 .lock()
                 .await
                 .insert(community_id, driver_shutdown_tx);
+            Some((fetch_tx, driver_shutdown_rx))
+        } else {
+            None
+        };
+
+        // Release the engines guard now that both inserts are done.
+        // The driver spawn below intentionally runs outside the lock.
+        drop(engines);
+
+        if let Some((fetch_tx, driver_shutdown_rx)) = driver_shutdown_rx {
             let request_root = move || {
                 let fetch_tx = fetch_tx.clone();
                 async move {
