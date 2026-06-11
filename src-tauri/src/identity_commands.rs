@@ -231,6 +231,10 @@ pub fn current_identity_hash_helper(
 
 /// Return the 24 BIP39 words for the backup wizard's blurred-grid display.
 ///
+/// These are the RETICULUM IDENTITY seed words (node keypair) — the owner
+/// master seed has its own backup flow (`owner_commands::export_owner_recovery`
+/// in the GUI, `export owner-mnemonic` headless). ZEB-430.
+///
 /// Threads `keychain` through to match the running node's identity-resolution
 /// chain. Tests inject `None`.
 pub fn export_mnemonic_words_helper(

@@ -1,8 +1,19 @@
 //! CLI subcommand entry points for identity backup/restore.
 //!
-//! Each entry point composes [`crate::identity::read_seed_from_disk`] /
-//! [`crate::identity::write_seed_to_disk`] with the appropriate
-//! [`harmony_owner::recovery`] API. The recovery passphrase
+//! Two distinct root secrets pass through here — do not conflate them
+//! (ZEB-430):
+//!
+//! - The **Reticulum identity seed** (`identity.enc` / identity keychain
+//!   slot): the node's network keypair. `export mnemonic`,
+//!   `export recovery-file`, and both `restore` subcommands operate on
+//!   THIS seed via [`crate::identity::read_seed_from_disk`] /
+//!   [`crate::identity::write_seed_to_disk`].
+//! - The **owner master seed** (`master_seed.enc` / owner keychain slot):
+//!   the root of friendships, communities, and device enrollments.
+//!   `export owner-mnemonic` operates on this seed via
+//!   [`crate::owner_state::load_owner_state`].
+//!
+//! The recovery passphrase
 //! (`HARMONY_RECOVERY_PASSPHRASE` / `HARMONY_RECOVERY_PASSPHRASE_FILE`) is
 //! resolved separately from the at-rest passphrase
 //! (`HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`) — neither variable
@@ -59,10 +70,15 @@ pub(crate) fn resolve_recovery_passphrase() -> Result<SecretString, String> {
     Ok(SecretString::from(s))
 }
 
-/// Export the master seed as a 24-word BIP39 English mnemonic.
+/// Export the RETICULUM IDENTITY seed as a 24-word BIP39 English mnemonic.
+///
+/// This is the node keypair — NOT the owner master seed; for the owner
+/// identity (friends/communities) see [`export_owner_mnemonic_cli`].
 ///
 /// Side effects:
-///   - Reads the seed via the standard resolution chain (keychain → encrypted file).
+///   - Reads the identity seed via the standard resolution chain
+///     (keychain → encrypted file), MINTING a fresh identity on an empty
+///     install.
 ///   - Writes the bare 24 words on a single line to stdout, terminated by `\n`.
 ///   - Writes a warning preamble + `identity-hash: <hex32>` to stderr.
 ///
@@ -94,12 +110,29 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
 
     let map_err = |stream: &'static str| move |e: std::io::Error| format!("{stream}: {e}");
 
-    writeln!(stderr, "*** Identity recovery mnemonic ***").map_err(map_err("stderr"))?;
-    writeln!(stderr, "Write these 24 words on paper. Anyone with these")
+    writeln!(stderr, "*** Reticulum identity mnemonic ***").map_err(map_err("stderr"))?;
+    writeln!(
+        stderr,
+        "These 24 words back up your network (Reticulum) keypair"
+    )
+    .map_err(map_err("stderr"))?;
+    writeln!(
+        stderr,
+        "ONLY - NOT your owner identity (friends, communities,"
+    )
+    .map_err(map_err("stderr"))?;
+    writeln!(
+        stderr,
+        "device enrollments). For that, run: export owner-mnemonic"
+    )
+    .map_err(map_err("stderr"))?;
+    writeln!(stderr, "Write them on paper. Anyone with these words can")
         .map_err(map_err("stderr"))?;
-    writeln!(stderr, "words can impersonate you. Storing in a digital")
-        .map_err(map_err("stderr"))?;
-    writeln!(stderr, "file is dangerous.").map_err(map_err("stderr"))?;
+    writeln!(
+        stderr,
+        "impersonate your node; a digital copy is dangerous."
+    )
+    .map_err(map_err("stderr"))?;
     writeln!(stderr).map_err(map_err("stderr"))?;
     writeln!(stderr, "identity-hash: {}", hex::encode(id_hash)).map_err(map_err("stderr"))?;
 
@@ -107,7 +140,7 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     Ok(())
 }
 
-/// Read the seed from disk and convert to 24 BIP39 words.
+/// Read the RETICULUM IDENTITY seed from disk and convert to 24 BIP39 words.
 ///
 /// Returns `(words, identity_hash_bytes)` — the hash bytes are derived
 /// directly from the artifact so callers (e.g. `export_mnemonic_to_writers`
@@ -185,8 +218,7 @@ pub fn export_owner_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     .map_err(map_err("stderr"))?;
     writeln!(stderr, "Write them on paper. Anyone with these words can")
         .map_err(map_err("stderr"))?;
-    writeln!(stderr, "impersonate you; a digital copy is dangerous.")
-        .map_err(map_err("stderr"))?;
+    writeln!(stderr, "impersonate you; a digital copy is dangerous.").map_err(map_err("stderr"))?;
     writeln!(stderr).map_err(map_err("stderr"))?;
     writeln!(stderr, "owner-id: {}", hex::encode(owner_id)).map_err(map_err("stderr"))?;
 
@@ -230,9 +262,10 @@ pub fn export_owner_mnemonic_words_with_keychain(
     Ok((words, owner_id))
 }
 
-/// Export the master seed as a passphrase-encrypted recovery file at `out`.
+/// Export the RETICULUM IDENTITY seed as a passphrase-encrypted recovery
+/// file at `out`.
 ///
-/// Reads the seed via the standard resolution chain. The recovery passphrase
+/// Reads the identity seed via the standard resolution chain. The recovery passphrase
 /// is read from `HARMONY_RECOVERY_PASSPHRASE` / `HARMONY_RECOVERY_PASSPHRASE_FILE`
 /// (DISTINCT from the at-rest `HARMONY_PASSPHRASE`).
 ///
@@ -349,7 +382,7 @@ pub fn sidecar_path(out: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Export the master seed + (optionally) an owner-state sidecar.
+/// Export the RETICULUM IDENTITY seed + (optionally) an owner-state sidecar.
 ///
 /// `include_state == true` AND owner-state file exists ⇒ emit pair.
 /// `include_state == false` OR owner-state file absent ⇒ emit HRMR only.
@@ -797,7 +830,7 @@ pub fn now_hlc() -> Hlc {
     }
 }
 
-/// Restore the master seed from a 24-word mnemonic file.
+/// Restore the RETICULUM IDENTITY seed from a 24-word mnemonic file.
 ///
 /// Reads the mnemonic from `mnemonic_file` (whitespace-tolerant,
 /// case-insensitive, ASCII-only — non-ASCII rejected). Writes the seed via
@@ -869,7 +902,7 @@ pub fn restore_mnemonic_with_keychain(
     Ok(())
 }
 
-/// Restore the master seed from a passphrase-encrypted recovery file.
+/// Restore the RETICULUM IDENTITY seed from a passphrase-encrypted recovery file.
 ///
 /// Reads the encrypted file from `in_path`. Decrypts using the recovery
 /// passphrase (`HARMONY_RECOVERY_PASSPHRASE` / `_FILE`). Writes the seed
@@ -1200,10 +1233,18 @@ mod tests {
 
         // Stderr: warning preamble + identity-hash. Don't pin the exact prose
         // (it's user-facing text that may evolve) but pin the load-bearing
-        // markers.
+        // markers: the preamble must NAME the Reticulum identity seed and
+        // point owner-backup seekers at `export owner-mnemonic` (ZEB-430 —
+        // an operator following "back up your identity" used to get a
+        // mnemonic that does not recover friends/communities, with nothing
+        // telling them so).
         assert!(
-            stderr_str.contains("Identity recovery mnemonic"),
-            "stderr must include warning preamble; got: {stderr_str:?}"
+            stderr_str.contains("Reticulum identity mnemonic"),
+            "stderr must name the Reticulum identity seed; got: {stderr_str:?}"
+        );
+        assert!(
+            stderr_str.contains("owner-mnemonic"),
+            "stderr must point at export owner-mnemonic for owner backup; got: {stderr_str:?}"
         );
         assert!(
             stderr_str.contains("identity-hash:"),
