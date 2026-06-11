@@ -4765,6 +4765,27 @@ pub(crate) async fn start_node_inner(
                             },
                         );
 
+                        // ZEB-434 D5: boot-hook flush — emit the local
+                        // snapshot shortly after startup so peers that
+                        // are already online receive our current state
+                        // (the dirty bit does not survive restarts and
+                        // clears on publish-into-the-void, so this is
+                        // deliberately unconditional; receivers dedup
+                        // via AlreadyKnown → tracker-only persist).
+                        // Mirrors the mint engine boot flush above.
+                        {
+                            let boot_registry = std::sync::Arc::clone(&registry);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    crate::community_state_sync::COMMUNITY_BOOT_FLUSH_DELAY_MS,
+                                ))
+                                .await;
+                                // Ignore error — engine may have shut
+                                // down before the boot delay elapsed.
+                                let _ = boot_registry.flush_now(&space_id).await;
+                            });
+                        }
+
                         // ZEB-270 Phase 3 Task 4.5: walk this
                         // community's materialized channels map and
                         // spawn a per-channel engine for each live

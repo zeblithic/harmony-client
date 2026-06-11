@@ -444,6 +444,12 @@ pub fn decrypt_for_topic(
 /// enough to collapse keystroke-rate mutations into one publish.
 pub const DEFAULT_DEBOUNCE_MS: u64 = 250;
 
+/// ZEB-434 D5: delay before the boot-time unconditional root flush —
+/// same value as `mint_sync::DEFAULT_BOOT_FLUSH_DELAY_MS` (500 ms,
+/// long enough for the zenoh adapter to wire up, short enough to beat
+/// any human interaction).
+pub const COMMUNITY_BOOT_FLUSH_DELAY_MS: u64 = 500;
+
 /// ZEB-262 Phase 4: shared per-EventId oneshot map. The
 /// `CommunitySyncRegistry` owns the `Arc` and exposes
 /// `register_pending_redemption` / `take_pending_redemption` /
