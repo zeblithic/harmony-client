@@ -22422,6 +22422,85 @@ mod zeb436_orphan_adoption_tests {
         );
     }
 
+    /// ZEB-436, second bug at the same seam: a redeem that fails AFTER the
+    /// engine spawn must not destroy a pre-existing dir. The ZEB-274
+    /// rollback conflated engine-freshness (registry map insertion) with
+    /// data-freshness and ran `remove_dir_all` unconditionally — so a
+    /// failed repair attempt (here: the generation fence rejecting because
+    /// the node stopped mid-redeem) wiped the victim's entire community
+    /// history, the very data the repair existed to recover. Same exposure
+    /// for a rejoin-after-leave failing mid-flight (ZEB-427 Half B retains
+    /// dirs of left communities). The orphaned dir must survive a failed
+    /// redeem intact, and the repair must still be possible afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_redeem_over_orphaned_dir_must_not_delete_history() {
+        let fixture = build_redeem_invite_test_fixture().await;
+        let community_id = SpaceId([0xd8; 16]);
+
+        let first = redeem_with(
+            &fixture,
+            open_invite_url(community_id, 0x42),
+            &fixture.crdt_state,
+            true,
+        )
+        .await;
+        assert!(first.is_ok(), "baseline join must succeed: {first:?}");
+        let (rebooted_owner_state, events_before) =
+            orphan_after_join(&fixture, community_id).await;
+
+        let failed = redeem_with(
+            &fixture,
+            open_invite_url(community_id, 0x43),
+            &rebooted_owner_state,
+            false, // generation fence rejects → post-spawn early return
+        )
+        .await;
+        assert!(failed.is_err(), "fence rejection must surface as Err");
+
+        // The rollback runs as a task spawned by the guard's Drop. Wait
+        // for it to remove the engine, then hold the line: the (pre-fix)
+        // dir deletion is sequenced immediately after the engine stop, so
+        // a short grace period gives the bug a real chance to manifest
+        // before the survival assertion.
+        let crdt_path = crdt_path_for(&fixture, community_id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        while fixture
+            .community_registry
+            .state_for(&community_id)
+            .await
+            .is_some()
+            && std::time::Instant::now() < deadline
+        {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            crdt_path.exists(),
+            "failed redeem must NOT delete the pre-existing community dir \
+             (the user's entire local history)"
+        );
+        let survived = crate::community_state_persist::load_crdt(&crdt_path, community_id)
+            .expect("orphaned CRDT must remain loadable after the failed attempt");
+        assert_eq!(
+            survived.events.len(),
+            events_before,
+            "membership history must be intact after the failed repair attempt"
+        );
+
+        // A subsequent repair attempt must still succeed.
+        let repaired = redeem_with(
+            &fixture,
+            open_invite_url(community_id, 0x44),
+            &rebooted_owner_state,
+            true,
+        )
+        .await;
+        assert!(
+            repaired.is_ok(),
+            "repair must still succeed after a previously failed attempt: {repaired:?}"
+        );
+    }
+
     /// The actual ZEB-427 recovery deadlock, invite-only flavor — the
     /// exact shape of the preserved Test1 fixture. The persisted dir
     /// materializes self as Joined; the owner-state row is gone. Pre-fix,

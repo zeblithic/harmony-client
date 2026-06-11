@@ -3691,13 +3691,15 @@ pub struct CommunitySyncRegistry {
 ///
 /// Drop without explicit `commit()` or `abort()` triggers a
 /// `Handle::try_current()` safety-net that calls
-/// `shutdown_engine_and_cleanup_persistence` (only if THIS call
-/// freshly created the engine — concurrent-redeem race losers per
-/// ZEB-260 PR #90 round-5 are no-ops on Drop).
+/// `rollback_fresh_spawn` (only if THIS call freshly created the
+/// engine — concurrent-redeem race losers per ZEB-260 PR #90 round-5
+/// are no-ops on Drop). ZEB-436: the rollback removes the persistence
+/// dir only when this spawn also created it; a dir that predates the
+/// spawn (orphan re-adoption, rejoin-after-leave) is preserved.
 ///
 /// **No-runtime fallback:** unlike ZEB-271's `CommunityTransactionGuard`
 /// (whose `abort_transaction_internal` is sync map cleanup),
-/// `shutdown_engine_and_cleanup_persistence` is fundamentally async
+/// the rollback is fundamentally async
 /// (`engine.shutdown().await` flushes pending writes). When `Drop`
 /// runs without a tokio runtime, we log a warn and accept the leak —
 /// `reconcile_from_state` at next `start_node` will detect the
@@ -3713,6 +3715,17 @@ pub struct CommunitySyncSpawnGuard {
     /// `spawn_engine_with_guard` returns the guard to the caller, then
     /// only read by Drop.
     freshly_created: bool,
+    /// ZEB-436: true when the per-community `crdt.cbor` already existed
+    /// on disk BEFORE this spawn. `freshly_created` tracks ENGINE
+    /// freshness (registry map insertion); this tracks DATA freshness.
+    /// A fresh engine over pre-existing data — orphan re-adoption
+    /// (ZEB-427), rejoin-after-leave — must roll back by stopping the
+    /// engine WITHOUT deleting the dir: it holds the user's entire
+    /// community history, which the unconditional cleanup here used to
+    /// destroy. Plain `bool`, same single-writer discipline as
+    /// `freshly_created` (set once by `spawn_engine_with_guard`, then
+    /// only read by `abort`/`Drop`).
+    preserve_persistence: bool,
     /// Set to `true` by `commit()` to bypass `Drop`'s rollback path.
     /// `AtomicBool` (mirrors ZEB-271) for Acquire/Release ordering
     /// across the Drop visibility boundary.
@@ -3738,22 +3751,24 @@ impl CommunitySyncSpawnGuard {
         // self drops here; Drop sees completed=true and runs no cleanup.
     }
 
-    /// Explicit rollback. Calls `shutdown_engine_and_cleanup_persistence`
-    /// if `freshly_created`. Sets `completed = true` so `Drop` is a
-    /// no-op. Sync entry point but spawns the async cleanup as a tokio
-    /// task internally (mirrors ZEB-271 `CommunityTransactionGuard::abort`
-    /// shape). If no tokio runtime is present, logs a warn and accepts
-    /// the leak (per spec §10.2 — no sync alternative for
-    /// `engine.shutdown().await`).
+    /// Explicit rollback. Runs `rollback_fresh_spawn` if
+    /// `freshly_created` (engine stop, plus dir cleanup ONLY when this
+    /// spawn also created the persistence dir — ZEB-436). Sets
+    /// `completed = true` so `Drop` is a no-op. Sync entry point but
+    /// spawns the async cleanup as a tokio task internally (mirrors
+    /// ZEB-271 `CommunityTransactionGuard::abort` shape). If no tokio
+    /// runtime is present, logs a warn and accepts the leak (per spec
+    /// §10.2 — no sync alternative for `engine.shutdown().await`).
     pub fn abort(self) {
         if self.freshly_created {
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
                     let registry = std::sync::Arc::clone(&self.registry);
                     let community_id = self.community_id;
+                    let preserve_persistence = self.preserve_persistence;
                     handle.spawn(async move {
                         if let Err(e) = registry
-                            .shutdown_engine_and_cleanup_persistence(&community_id)
+                            .rollback_fresh_spawn(&community_id, preserve_persistence)
                             .await
                         {
                             tracing::warn!(
@@ -3794,9 +3809,10 @@ impl Drop for CommunitySyncSpawnGuard {
                 Ok(handle) => {
                     let registry = std::sync::Arc::clone(&self.registry);
                     let community_id = self.community_id;
+                    let preserve_persistence = self.preserve_persistence;
                     handle.spawn(async move {
                         if let Err(e) = registry
-                            .shutdown_engine_and_cleanup_persistence(&community_id)
+                            .rollback_fresh_spawn(&community_id, preserve_persistence)
                             .await
                         {
                             tracing::warn!(
@@ -3854,6 +3870,7 @@ impl CommunitySyncRegistry {
             registry: std::sync::Arc::clone(self),
             community_id,
             freshly_created: false,
+            preserve_persistence: false,
             completed: std::sync::atomic::AtomicBool::new(false),
             used: std::sync::atomic::AtomicBool::new(false),
         }
@@ -3870,9 +3887,10 @@ impl CommunitySyncRegistry {
     ///   2. If freshly created, `community_adapter_tx.try_send(...)` to
     ///      dispatch the adapter request to event_loop.
     ///   3. If try_send fails AND freshly created, immediately `.await`
-    ///      `shutdown_engine_and_cleanup_persistence` to undo the spawn.
-    ///      Returns Err. Guard's `freshly_created` flag is NEVER set to
-    ///      true (so Drop is a no-op).
+    ///      `rollback_fresh_spawn` to undo the spawn (ZEB-436:
+    ///      preservation-aware — a persistence dir that predates the
+    ///      spawn survives). Returns Err. Guard's `freshly_created` flag
+    ///      is NEVER set to true (so Drop is a no-op).
     ///   4. On full success, set `guard.freshly_created = true` (or false
     ///      for the idempotent path) and return Ok(engine).
     #[allow(clippy::too_many_arguments)]
@@ -3938,6 +3956,15 @@ impl CommunitySyncRegistry {
             )));
         }
 
+        // ZEB-436: capture DATA freshness before the spawn can create
+        // anything on disk. `paths_for(...).crdt` is the durable marker —
+        // if it already exists, this spawn is re-adopting persisted state
+        // (orphan repair, rejoin-after-leave) and a later rollback must
+        // stop the engine without deleting the dir.
+        let preexisting_persistence = tokio::fs::try_exists(&self.paths_for(community_id).crdt)
+            .await
+            .unwrap_or(false);
+
         // Step 1: spawn the engine via the inner helper.
         let freshly_created = self
             .spawn_engine_inner_now(
@@ -3958,6 +3985,7 @@ impl CommunitySyncRegistry {
         // arming-early, the rare engine_arc lookup-fail path would leave
         // the engine in the registry without cleanup.
         guard.freshly_created = freshly_created;
+        guard.preserve_persistence = preexisting_persistence;
 
         // Step 2: if fresh, dispatch the adapter request.
         if freshly_created {
@@ -3969,8 +3997,10 @@ impl CommunitySyncRegistry {
                 })
             {
                 // Step 3: try_send failed → undo the spawn inline.
+                // ZEB-436: preservation-aware — never delete a dir this
+                // spawn didn't create.
                 match self
-                    .shutdown_engine_and_cleanup_persistence(&community_id)
+                    .rollback_fresh_spawn(&community_id, preexisting_persistence)
                     .await
                 {
                     Ok(_) => {
@@ -4083,6 +4113,26 @@ impl CommunitySyncRegistry {
     /// "I just spawned this; no one else has a handle yet." If a
     /// handle has leaked elsewhere, those holders see `TransportClosed`
     /// once teardown completes.
+    /// ZEB-436: rollback for a freshly-spawned engine. Always stops the
+    /// engine; removes the persistence dir ONLY when the spawn itself
+    /// created it (`preserve_persistence == false`). A fresh ENGINE over
+    /// PRE-EXISTING data — orphan re-adoption (ZEB-427), rejoin-after-
+    /// leave — must roll back to exactly the pre-spawn disk state: the
+    /// dir holds the user's entire community history, which is precisely
+    /// what the repair attempt exists to recover.
+    pub(crate) async fn rollback_fresh_spawn(
+        &self,
+        community_id: &SpaceId,
+        preserve_persistence: bool,
+    ) -> Result<(), CommunitySyncError> {
+        if preserve_persistence {
+            self.stop_engine(community_id).await
+        } else {
+            self.shutdown_engine_and_cleanup_persistence(community_id)
+                .await
+        }
+    }
+
     pub async fn shutdown_engine_and_cleanup_persistence(
         &self,
         community_id: &SpaceId,
@@ -4916,6 +4966,77 @@ mod tests {
         assert!(
             !dir.exists(),
             "persistence dir must be removed after guard drops"
+        );
+    }
+
+    /// ZEB-436: a guard rollback must NOT delete a persistence dir that
+    /// predates the spawn. `freshly_created` tracks ENGINE freshness
+    /// (registry map insertion) — an orphan re-adoption (ZEB-427) or a
+    /// rejoin-after-leave (ZEB-427 Half B retains dirs of left
+    /// communities) freshly spawns an engine over a dir holding the
+    /// user's entire community history. Pre-fix, the rollback's
+    /// unconditional `remove_dir_all` destroyed exactly the data the
+    /// repair existed to recover. Counterpart to
+    /// `guard_drop_without_commit_tears_down_fresh`, which pins that a
+    /// dir CREATED by the failed spawn is still removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_drop_preserves_preexisting_persistence_zeb436() {
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0xc6; 16]);
+
+        // Pre-existing persistence: a crdt.cbor written BEFORE the spawn
+        // (what an orphaned community dir looks like on disk).
+        let dir = fix
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0));
+        std::fs::create_dir_all(&dir).expect("create community dir");
+        let crdt_path = dir.join("crdt.cbor");
+        let preexisting = CommunityState::new(community_id);
+        crate::community_state_persist::save_crdt(&crdt_path, &preexisting)
+            .expect("seed pre-existing crdt.cbor");
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        {
+            let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+            let _engine = std::sync::Arc::clone(&fix.registry)
+                .spawn_engine_with_guard(
+                    &mut guard,
+                    community_id,
+                    fix.membership_key.clone(),
+                    fix.admin_addr,
+                    false,
+                    pub_tx,
+                    sub_rx,
+                    pub_rx,
+                    sub_tx,
+                    fix.community_adapter_tx.clone(),
+                )
+                .await
+                .expect("spawn_engine_with_guard");
+            // guard drops here without commit → rollback
+        }
+
+        // Wait for the rollback to remove the engine, then hold the line:
+        // the (pre-fix) deletion is sequenced immediately after the engine
+        // stop, so a short grace period gives the bug a real chance to
+        // manifest before the survival assertion.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        while fix.registry.has_engine(&community_id).await
+            && std::time::Instant::now() < deadline
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !fix.registry.has_engine(&community_id).await,
+            "rollback must still stop the freshly-spawned engine"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            crdt_path.exists(),
+            "rollback must NOT delete a pre-existing persistence dir \
+             (the user's community history)"
         );
     }
 
