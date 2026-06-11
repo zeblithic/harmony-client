@@ -1,6 +1,7 @@
 <script lang="ts">
   import './app.css';
   import Layout from './lib/components/Layout.svelte';
+  import { makeCloseRequestedHandler, makeTrayResidentNotifier } from './lib/window-close';
   import NavPanel from './lib/components/NavPanel.svelte';
   import TextFeed from './lib/components/TextFeed.svelte';
   import NotesView from './lib/components/NotesView.svelte';
@@ -1884,15 +1885,42 @@
 
       const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const appWin = getCurrentWebviewWindow();
-      // ── ZEB-356: close-to-tray (reverses ZEB-353 close-to-quit). ─────
+      // ── ZEB-356/ZEB-433: conditional close-to-tray. ─────
       // Closing the window hides it to the tray and keeps the process, the
       // Zenoh node, and any ACTIVE CALL alive (hide-during-call = "minimize to
       // keep talking"). The real exit is the tray "Quit Harmony" item, handled
       // by the quit-requested listener below. No teardown here.
-      const unlistenClose = await appWin.onCloseRequested(async (event) => {
-        event.preventDefault();
-        await appWin.hide();
-      });
+      //
+      // ZEB-433: hide ONLY when the tray actually exists. If tray creation
+      // failed (tray_active=false — or this query itself fails), hiding would
+      // strand the node headless with no restore/quit affordance, so the
+      // close proceeds and the process exits via last-window-closed.
+      let trayActive = false;
+      try {
+        trayActive = (await invoke('tray_active')) as boolean;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn('[harmony-client] tray_active query failed; window close will exit:', msg);
+      }
+      // The tray notice is best-effort: a notification-plugin import failure
+      // must not abort the lifecycle wiring below (close handler +
+      // quit-requested listener), so it gets its own try with a no-op
+      // fallback notifier.
+      let notifyTrayResident: () => Promise<boolean> = async () => false;
+      try {
+        const notif = await import('@tauri-apps/plugin-notification');
+        notifyTrayResident = makeTrayResidentNotifier(notif);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn('[harmony-client] notification plugin unavailable; tray notice disabled:', msg);
+      }
+      const unlistenClose = await appWin.onCloseRequested(
+        makeCloseRequestedHandler(trayActive, {
+          hide: () => appWin.hide(),
+          notifyTrayResident,
+          storage: localStorage,
+        }),
+      );
       fileManagerService.addUnlisten(unlistenClose);
 
       // ── ZEB-356: real quit path. The tray "Quit Harmony" item emits

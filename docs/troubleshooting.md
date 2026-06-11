@@ -105,6 +105,21 @@ Until ZEB-202 ships, treat the alpha as **non-recoverable** — if you lose the 
 
 The `BackupStalenessWarning` reminds you to back up the identity. For v0.1.0-alpha there's no in-app backup flow yet (ZEB-202); the warning is informational. You can dismiss it for now.
 
+## Window + app lifecycle
+
+### "I closed the window but Harmony is still running"
+
+Intended: closing the window hides Harmony to the **system tray** and keeps your node online (presence, message sync, and any active call continue). The first time this happens, a notification reminds you. To actually quit, right-click the tray icon → **Quit Harmony**.
+
+- **Windows 11 note:** new tray icons land in the hidden overflow flyout — click the `^` chevron next to the clock if you don't see the Harmony icon.
+- If the tray could not be created (the log shows `tray creation failed; window close will exit`), closing the window **does** quit the app — Harmony never runs hidden without a tray icon to bring it back.
+
+### "I relaunched Harmony but it didn't restart"
+
+Also intended: Harmony is single-instance. Launching it while it's already running (including hidden in the tray) re-opens the existing window in the same process — the node is not restarted. To truly restart: tray → Quit Harmony (or, for test drivers, invoke the `quit_app` IPC / kill the process), then launch again.
+
+Test-driver note: a hidden-to-tray instance keeps its PID and process start time; only the webview page target changes on reattach. Scripted "offline" phases must verify the process actually exited rather than trusting a window close.
+
 ## Help + feedback
 
 ### "I want to send feedback"
