@@ -4678,6 +4678,17 @@ pub(crate) async fn start_node_inner(
                     for (space_id, mk, admin, is_invite_only) in community_snapshots {
                         let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                         let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        // ZEB-434: queryable-serve + root-fetch channel
+                        // pairs. Engine/driver halves go into the spawn;
+                        // adapter halves ride the CommunityAdapterRequest.
+                        // Capacity 8 = the back-pressure bound on served
+                        // queries (see CommunityAdapterRequest docs).
+                        let (root_serve_tx, root_serve_rx) = tokio::sync::mpsc::channel::<
+                            crate::community_state_sync::RootServeRequest,
+                        >(8);
+                        let (fetch_request_tx, fetch_request_rx) = tokio::sync::mpsc::channel::<
+                            crate::event_loop::CommunityRootFetchRequest,
+                        >(4);
 
                         if let Err(e) = registry
                             .spawn_engine_inner_now(
@@ -4687,6 +4698,11 @@ pub(crate) async fn start_node_inner(
                                 is_invite_only,
                                 pub_tx,
                                 sub_rx,
+                                Some(root_serve_rx),
+                                Some(fetch_request_tx),
+                                // Transport-epoch re-arm watch lands in
+                                // ZEB-434 Task 6.
+                                None,
                             )
                             .await
                         {
@@ -4706,6 +4722,8 @@ pub(crate) async fn start_node_inner(
                                 id_hex: hex::encode(space_id.0),
                                 publisher_rx: pub_rx,
                                 subscriber_tx: sub_tx,
+                                root_serve_tx,
+                                fetch_request_rx,
                             },
                         );
 
@@ -18134,9 +18152,14 @@ pub async fn create_community_inner<R: tauri::Runtime>(
     // path: pub_tx / sub_rx feed the engine, pub_rx / sub_tx feed the
     // Zenoh adapter. The CommunityAdapterRequest carries the adapter
     // halves into event_loop via the mpsc; the event loop spawns the
-    // adapter against its live session.
+    // adapter against its live session. ZEB-434 adds the queryable-
+    // serve + root-fetch pairs (same engine-half/adapter-half split).
     let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (root_serve_tx, root_serve_rx) =
+        tokio::sync::mpsc::channel::<crate::community_state_sync::RootServeRequest>(8);
+    let (fetch_request_tx, fetch_request_rx) =
+        tokio::sync::mpsc::channel::<crate::event_loop::CommunityRootFetchRequest>(4);
 
     let engine_arc = community_registry
         .spawn_engine_with_guard(
@@ -18150,6 +18173,12 @@ pub async fn create_community_inner<R: tauri::Runtime>(
             pub_rx,
             sub_tx,
             community_adapter_tx,
+            Some(root_serve_rx),
+            Some(fetch_request_tx),
+            // Transport-epoch re-arm watch lands in ZEB-434 Task 6.
+            None,
+            root_serve_tx,
+            fetch_request_rx,
         )
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
@@ -19647,6 +19676,13 @@ where
     //    live adapter pair).
     let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    // ZEB-434: queryable-serve + root-fetch pairs — a joiner's engine is
+    // exactly the one that needs the spawn-time root pull (the admin's
+    // root predates our subscriber).
+    let (root_serve_tx, root_serve_rx) =
+        tokio::sync::mpsc::channel::<crate::community_state_sync::RootServeRequest>(8);
+    let (fetch_request_tx, fetch_request_rx) =
+        tokio::sync::mpsc::channel::<crate::event_loop::CommunityRootFetchRequest>(4);
 
     // ZEB-274: spawn engine + dispatch adapter atomically via the guard.
     // Internalizes the freshness flag — no separate freshness local (the
@@ -19668,6 +19704,12 @@ where
             pub_rx,
             sub_tx,
             community_adapter_tx,
+            Some(root_serve_rx),
+            Some(fetch_request_tx),
+            // Transport-epoch re-arm watch lands in ZEB-434 Task 6.
+            None,
+            root_serve_tx,
+            fetch_request_rx,
         )
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;

@@ -341,6 +341,9 @@ async fn alice_redeems_invite_only_against_bob_admin() {
             true,
             alice_pub_tx,
             alice_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn alice engine");

@@ -192,6 +192,9 @@ async fn run_fork_inner(
             false,
             fork_pub_tx,
             fork_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn fork engine");
@@ -454,14 +457,34 @@ impl PairedEngines {
         let (a_pub_tx, _) = mpsc::channel::<Vec<u8>>(8);
         let (_, a_sub_rx) = mpsc::channel::<Vec<u8>>(8);
         registry_a
-            .spawn_engine_inner_now(community_id, mk.clone(), a_addr, false, a_pub_tx, a_sub_rx)
+            .spawn_engine_inner_now(
+                community_id,
+                mk.clone(),
+                a_addr,
+                false,
+                a_pub_tx,
+                a_sub_rx,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("spawn original engine on A");
 
         let (b_pub_tx, _) = mpsc::channel::<Vec<u8>>(8);
         let (_, b_sub_rx) = mpsc::channel::<Vec<u8>>(8);
         registry_b
-            .spawn_engine_inner_now(community_id, mk.clone(), a_addr, false, b_pub_tx, b_sub_rx)
+            .spawn_engine_inner_now(
+                community_id,
+                mk.clone(),
+                a_addr,
+                false,
+                b_pub_tx,
+                b_sub_rx,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("spawn original engine on B");
 

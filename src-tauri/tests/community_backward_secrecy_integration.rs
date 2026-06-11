@@ -844,6 +844,9 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
             false,
             pub_tx,
             sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("engine spawn");

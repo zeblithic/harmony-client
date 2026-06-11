@@ -3776,6 +3776,18 @@ pub struct CommunitySyncRegistry {
     /// to every spawned engine so each can fire the joiner-side
     /// pending-clear hook independently. `None` for tests.
     nav_emitter: Option<NavPendingClearEmitter>,
+
+    /// ZEB-434 D3/D4: per-community shutdown senders for the spawned
+    /// `run_root_fetch_driver` tasks. Inserted when a spawn wires a
+    /// `fetch_request_tx`; removed + flipped by `stop_engine` /
+    /// `shutdown_all` so the driver ends with its engine.
+    ///
+    /// **Lock-discipline:** never held together with the `engines`
+    /// lock — every site acquires them strictly sequentially (engines
+    /// guard dropped first). `watch::Sender::send` is sync, so no
+    /// `.await` happens with the guard alive.
+    root_fetch_shutdowns:
+        tokio::sync::Mutex<std::collections::HashMap<SpaceId, tokio::sync::watch::Sender<bool>>>,
 }
 
 // ── CommunitySyncSpawnGuard (ZEB-274) ─────────────────────────────────────────
@@ -3929,6 +3941,7 @@ impl CommunitySyncRegistry {
                 std::collections::HashMap::new(),
             )),
             nav_emitter,
+            root_fetch_shutdowns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -3970,6 +3983,15 @@ impl CommunitySyncRegistry {
     ///      true (so Drop is a no-op).
     ///   4. On full success, set `guard.freshly_created = true` (or false
     ///      for the idempotent path) and return Ok(engine).
+    ///
+    /// **ZEB-434**: mirrors `spawn_engine_inner_now`'s catch-up params —
+    /// `root_serve_rx` / `fetch_request_tx` / `transport_epoch_rx` are
+    /// the engine/driver halves forwarded to the inner spawn (legacy/
+    /// test callers pass `None, None, None`); `root_serve_tx` /
+    /// `fetch_request_rx` are the adapter halves packed into the
+    /// `CommunityAdapterRequest`. On the idempotent path all five are
+    /// dropped alongside the pub/sub adapter halves (the existing
+    /// engine + adapter already own their live channels).
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_engine_with_guard(
         self: &std::sync::Arc<Self>,
@@ -3983,6 +4005,11 @@ impl CommunitySyncRegistry {
         publisher_rx: mpsc::Receiver<Vec<u8>>,
         subscriber_tx: mpsc::Sender<Vec<u8>>,
         community_adapter_tx: mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+        root_serve_rx: Option<mpsc::Receiver<RootServeRequest>>,
+        fetch_request_tx: Option<mpsc::Sender<crate::event_loop::CommunityRootFetchRequest>>,
+        transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
+        root_serve_tx: mpsc::Sender<RootServeRequest>,
+        fetch_request_rx: mpsc::Receiver<crate::event_loop::CommunityRootFetchRequest>,
     ) -> Result<std::sync::Arc<CommunitySyncEngine>, CommunitySyncError> {
         // Defensive: guard must be for the same registry instance AND the
         // same community_id. Programming errors otherwise — the IPC handler
@@ -4042,6 +4069,9 @@ impl CommunitySyncRegistry {
                 is_invite_only,
                 publisher_tx,
                 subscriber_rx,
+                root_serve_rx,
+                fetch_request_tx,
+                transport_epoch_rx,
             )
             .await?;
 
@@ -4061,6 +4091,8 @@ impl CommunitySyncRegistry {
                     id_hex: hex::encode(community_id.0),
                     publisher_rx,
                     subscriber_tx,
+                    root_serve_tx,
+                    fetch_request_rx,
                 })
             {
                 // Step 3: try_send failed → undo the spawn inline.
@@ -4261,6 +4293,15 @@ impl CommunitySyncRegistry {
     /// also call this directly because they don't exercise the
     /// IPC-handler RAII surface; the method stays `pub` (not
     /// `pub(crate)`) so those tests compile against the public API.
+    ///
+    /// **ZEB-434**: `root_serve_rx` is the engine half of the
+    /// queryable-serve channel (threaded into the engine config);
+    /// `fetch_request_tx` is the driver half of the fetch-request
+    /// channel — when `Some`, a `run_root_fetch_driver` task is spawned
+    /// after successful insertion (with `transport_epoch_rx` as its
+    /// re-arm watch, `None` until Task 6 wires the transport epoch).
+    /// Legacy/test callers pass `None, None, None`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_engine_inner_now(
         &self,
         community_id: SpaceId,
@@ -4269,6 +4310,9 @@ impl CommunitySyncRegistry {
         is_invite_only: bool,
         publisher_tx: mpsc::Sender<Vec<u8>>,
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
+        root_serve_rx: Option<mpsc::Receiver<RootServeRequest>>,
+        fetch_request_tx: Option<mpsc::Sender<crate::event_loop::CommunityRootFetchRequest>>,
+        transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     ) -> Result<bool, CommunitySyncError> {
         // Phase 1: blocking disk I/O off the runtime entirely. Both
         // load_crdt and load_replay call std::fs::read, so even with
@@ -4377,13 +4421,66 @@ impl CommunitySyncRegistry {
             // the engine can fire nav-updated on joiner-side countersign.
             // `None` for test registries that don't supply one.
             nav_emitter: self.nav_emitter.clone(),
-            // ZEB-434: the registry spawn path doesn't wire the
-            // query-serve channel yet — the queryable task (later
-            // ZEB-434 task) threads a `Some(receiver)` through here.
-            root_serve_rx: None,
+            // ZEB-434 D1/D2: engine half of the queryable-serve
+            // channel; the event_loop queryable task holds the
+            // matching sender. `None` for legacy/test callers.
+            root_serve_rx,
         }));
 
         engines.insert(community_id, engine);
+        // ZEB-434: release the engines lock before touching
+        // root_fetch_shutdowns below (lock-discipline: the two locks
+        // are only ever taken sequentially, never nested).
+        drop(engines);
+
+        // ZEB-434 D3/D4: spawn the per-community root-fetch driver.
+        // It paces state-root pull queries (spawn-time query, backoff
+        // while unanswered, transport-epoch re-arm) and forwards each
+        // attempt to the zenoh adapter via `fetch_request_tx`; replies
+        // ingest through the engine's normal inbound path, so the
+        // driver only ever sees reply counts.
+        if let Some(fetch_tx) = fetch_request_tx {
+            let (driver_shutdown_tx, driver_shutdown_rx) = tokio::sync::watch::channel(false);
+            self.root_fetch_shutdowns
+                .lock()
+                .await
+                .insert(community_id, driver_shutdown_tx);
+            let request_root = move || {
+                let fetch_tx = fetch_tx.clone();
+                async move {
+                    let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+                    if fetch_tx
+                        .send(crate::event_loop::CommunityRootFetchRequest { report: report_tx })
+                        .await
+                        .is_err()
+                    {
+                        // Adapter bridge closed for good.
+                        return crate::channel_backfill::RootFetch::EngineGone;
+                    }
+                    match report_rx.await {
+                        Ok(n) if n > 0 => crate::channel_backfill::RootFetch::Answered,
+                        // Zero replies = no responder (a community-root
+                        // responder always has a root to serve); aborted
+                        // query (sender dropped) is transient — both
+                        // back off and retry.
+                        Ok(_) | Err(_) => crate::channel_backfill::RootFetch::NoReply,
+                    }
+                }
+            };
+            tokio::spawn(crate::channel_backfill::run_root_fetch_driver(
+                crate::channel_backfill::RootFetchLatch::new(),
+                request_root,
+                driver_shutdown_rx,
+                transport_epoch_rx,
+                || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0)
+                },
+            ));
+        }
+
         // ZEB-260 PR #90 round-5: `true` means "this call freshly
         // created the engine" — the atomic create flag for
         // redeem_invite_inner's rollback guards.
@@ -4407,6 +4504,14 @@ impl CommunitySyncRegistry {
             let mut engines = self.engines.lock().await;
             engines.remove(community_id)
         };
+        // ZEB-434: stop the community's root-fetch driver (if one was
+        // spawned). Strictly AFTER the engines guard dropped above —
+        // the two locks are never held together. Flip before awaiting
+        // the engine's shutdown so the driver stops issuing fetch
+        // requests while the engine drains.
+        if let Some(tx) = self.root_fetch_shutdowns.lock().await.remove(community_id) {
+            let _ = tx.send(true);
+        }
         match engine {
             Some(e) => e.shutdown().await,
             None => Ok(()),
@@ -4424,6 +4529,17 @@ impl CommunitySyncRegistry {
             let mut e = self.engines.lock().await;
             std::mem::take(&mut *e).into_values().collect()
         };
+        // ZEB-434: stop every root-fetch driver. Sequential with — never
+        // nested inside — the engines lock above; flipped before the
+        // engine shutdowns below so no driver issues fetch requests
+        // while its engine drains.
+        let shutdowns: Vec<tokio::sync::watch::Sender<bool>> = {
+            let mut g = self.root_fetch_shutdowns.lock().await;
+            std::mem::take(&mut *g).into_values().collect()
+        };
+        for tx in shutdowns {
+            let _ = tx.send(true);
+        }
         let mut last_err: Option<CommunitySyncError> = None;
         for e in engines {
             if let Err(err) = e.shutdown().await {
@@ -4912,6 +5028,19 @@ mod tests {
         }
     }
 
+    /// ZEB-434: adapter-half stand-ins for guard tests. The matching
+    /// engine/driver halves are dropped immediately — these fixtures
+    /// never spawn the zenoh adapter, and the spawn itself gets
+    /// `None, None, None` for the engine-side catch-up params.
+    fn dummy_root_serve_tx() -> mpsc::Sender<RootServeRequest> {
+        mpsc::channel(8).0
+    }
+
+    /// See [`dummy_root_serve_tx`].
+    fn dummy_fetch_request_rx() -> mpsc::Receiver<crate::event_loop::CommunityRootFetchRequest> {
+        mpsc::channel(4).1
+    }
+
     // ── ZEB-274 spawn-rollback-guard tests ─────────────────────────
 
     /// Spec §7.1 #1: spawn engine, commit guard, verify engine present
@@ -4937,6 +5066,11 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
             )
             .await
             .expect("spawn_engine_with_guard");
@@ -4984,6 +5118,11 @@ mod tests {
                     pub_rx,
                     sub_tx,
                     fix.community_adapter_tx.clone(),
+                    None,
+                    None,
+                    None,
+                    dummy_root_serve_tx(),
+                    dummy_fetch_request_rx(),
                 )
                 .await
                 .expect("spawn_engine_with_guard");
@@ -5044,6 +5183,11 @@ mod tests {
                 pub_rx_a,
                 sub_tx_a,
                 fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
             )
             .await
             .expect("spawn_engine_with_guard A");
@@ -5066,6 +5210,11 @@ mod tests {
                     pub_rx_b,
                     sub_tx_b,
                     fix.community_adapter_tx.clone(),
+                    None,
+                    None,
+                    None,
+                    dummy_root_serve_tx(),
+                    dummy_fetch_request_rx(),
                 )
                 .await
                 .expect("spawn_engine_with_guard B (idempotent)");
@@ -5101,6 +5250,11 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
             )
             .await
             .expect("spawn_engine_with_guard");
@@ -5146,6 +5300,11 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
             )
             .await
             .expect("spawn_engine_with_guard");
@@ -5218,6 +5377,11 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
             )
             .await;
 
@@ -5283,6 +5447,11 @@ mod tests {
                 pub_rx_a,
                 sub_tx_a,
                 fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
             )
             .await
             .expect("first spawn_engine_with_guard call");
@@ -5302,6 +5471,11 @@ mod tests {
                 pub_rx_b,
                 sub_tx_b,
                 fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
             )
             .await;
 
@@ -5357,6 +5531,11 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix_b.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
             )
             .await;
 
@@ -5416,6 +5595,11 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
             )
             .await;
 

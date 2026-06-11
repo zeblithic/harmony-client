@@ -136,6 +136,21 @@ pub struct CommunityAdapterRequest {
     /// community topic are forwarded here, where the engine reads
     /// them out via its paired `subscriber_rx`.
     pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// ZEB-434 D1: queryable → engine serve requests (engine holds rx).
+    /// Cost per served query: CRDT clone + CBOR encode + 2×AEAD + CAS
+    /// put_serveable + fsync(replay). The mpsc capacity at the lib.rs
+    /// call site (8) is the back-pressure bound; zenoh-facing rate
+    /// limiting beyond that is future work.
+    pub root_serve_tx: tokio::sync::mpsc::Sender<crate::community_state_sync::RootServeRequest>,
+    /// ZEB-434 D3/D4: fetch driver → adapter query requests.
+    pub fetch_request_rx: tokio::sync::mpsc::Receiver<CommunityRootFetchRequest>,
+}
+
+/// ZEB-434: one root-fetch query request from the per-community fetch
+/// driver. The adapter executes the GET and reports the reply count.
+pub struct CommunityRootFetchRequest {
+    /// Reply-count report (fire-and-forget; drop = query aborted).
+    pub report: tokio::sync::oneshot::Sender<usize>,
 }
 
 /// ZEB-298+ZEB-312 PR 1: per-community voting-log adapter request.
@@ -1550,6 +1565,8 @@ pub async fn run<R: Runtime>(
             req.id_hex,
             req.publisher_rx,
             req.subscriber_tx,
+            req.root_serve_tx,
+            req.fetch_request_rx,
             Arc::clone(&closing),
         );
     }
@@ -4946,6 +4963,8 @@ pub async fn run<R: Runtime>(
                     req.id_hex,
                     req.publisher_rx,
                     req.subscriber_tx,
+                    req.root_serve_tx,
+                    req.fetch_request_rx,
                     Arc::clone(&closing),
                 );
             }
@@ -6545,20 +6564,26 @@ fn emit_frontend_event<R: Runtime>(
 // the channel close on transport failure and trusts the engine's
 // `subscriber_channel_closed` degraded report to surface it.
 
-/// Spawn a Zenoh publisher + subscriber for one community's state-root
-/// topic (`harmony/community/{id_hex}/state-root-v1`).
+/// Spawn a Zenoh publisher + subscriber + queryable + root-fetch driver
+/// for one community's state-root topic
+/// (`harmony/community/{id_hex}/state-root-v1`).
 ///
 /// Wires:
 ///   - `publisher_rx` (engine's outbound bytes) → `session.put(key, bytes)`
 ///   - Zenoh subscriber on the same key → `subscriber_tx` (engine's inbound)
+///   - Zenoh queryable on the same key → `root_serve_tx` (engine encodes a
+///     fresh root packet per query; ZEB-434 D1/D2)
+///   - `fetch_request_rx` (per-community fetch driver) → Zenoh GET on the
+///     same key, replies piped into `subscriber_tx` (ZEB-434 D3/D4)
 ///
 /// `closing` is the event-loop-wide shutdown flag; when set, transport
 /// errors are downgraded to silence so a clean `stop_node` doesn't spam
 /// "publish failed" / "subscriber closed unexpectedly" warnings.
 ///
 /// Returns a `JoinHandle<()>` so the registry / `start_node` can await
-/// teardown if needed. Internally spawns two child tasks (publisher and
-/// subscriber) and joins them before the outer handle resolves.
+/// teardown if needed. Internally spawns four child tasks (publisher,
+/// queryable, root-fetch driver, subscriber) and joins them before the
+/// outer handle resolves.
 ///
 /// On failure to construct a `KeyExpr` from the topic string, the function
 /// logs and returns a JoinHandle that resolves immediately — both
@@ -6569,6 +6594,8 @@ pub fn spawn_community_state_zenoh_adapter(
     community_id_hex: String,
     mut publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    root_serve_tx: tokio::sync::mpsc::Sender<crate::community_state_sync::RootServeRequest>,
+    mut fetch_request_rx: tokio::sync::mpsc::Receiver<CommunityRootFetchRequest>,
     closing: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     let topic = format!("harmony/community/{}/state-root-v1", community_id_hex);
@@ -6625,6 +6652,126 @@ pub fn spawn_community_state_zenoh_adapter(
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                         if closing_pub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // ZEB-434 D1/D2: queryable on the state-root key. Each inbound
+        // query is forwarded to the engine via `root_serve_tx`; the
+        // engine's single-writer task encodes a fresh wire packet and
+        // replies through the oneshot. No selector parsing — the key
+        // carries no parameters (full-state exchange, no `since`).
+        let session_qbl = Arc::clone(&session);
+        let key_qbl = key_expr.clone();
+        let topic_qbl = topic.clone();
+        let closing_qbl = Arc::clone(&closing);
+        let root_serve_tx_qbl = root_serve_tx.clone();
+        let qbl_handle = tokio::spawn(async move {
+            let qbl = match session_qbl.declare_queryable(&key_qbl).await {
+                Ok(q) => q,
+                Err(e) => {
+                    if !closing_qbl.load(Ordering::SeqCst) {
+                        tracing::error!(topic = %topic_qbl, error = %e,
+                            "failed to declare community state-root queryable");
+                    }
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    res = qbl.recv_async() => {
+                        let Ok(query) = res else { break; };
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        if root_serve_tx_qbl.send(reply_tx).await.is_err() {
+                            // Engine gone — stop serving.
+                            break;
+                        }
+                        // Non-Ok(Ok(..)) outcomes are skipped: encode
+                        // error already logged engine-side; dropped
+                        // oneshot = engine shutdown race.
+                        if let Ok(Ok(packet)) = reply_rx.await {
+                            if let Err(e) = query.reply(query.key_expr(), packet).await {
+                                tracing::warn!(topic = %topic_qbl, error = %e,
+                                    "community state-root queryable reply failed");
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_qbl.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // ZEB-434 D3/D4: root-fetch query driver. The per-community
+        // fetch driver (registry-spawned `run_root_fetch_driver`) sends
+        // one `CommunityRootFetchRequest` per attempt; this task
+        // executes the zenoh GET, pipes every reply into the engine's
+        // normal inbound path (`subscriber_tx`), and reports the reply
+        // count. Simplified channel-log query-request driver: no
+        // paging/progress, 10s GET timeout. ConsolidationMode::None so
+        // multiple responders' roots all reach the engine (the CRDT
+        // merge dedupes).
+        let session_rf = Arc::clone(&session);
+        let key_rf = topic.clone();
+        let subscriber_tx_rf = subscriber_tx.clone();
+        let closing_rf = Arc::clone(&closing);
+        let rf_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe = fetch_request_rx.recv() => {
+                        let Some(req) = maybe else { break; };
+                        let receiver = match session_rf
+                            .get(&key_rf)
+                            .consolidation(zenoh::query::ConsolidationMode::None)
+                            .timeout(std::time::Duration::from_secs(10))
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                if !closing_rf.load(Ordering::SeqCst) {
+                                    tracing::warn!(key = %key_rf, error = %e,
+                                        "community state-root fetch query failed");
+                                }
+                                // req.report drops → driver maps to NoReply.
+                                continue;
+                            }
+                        };
+                        // Inner reply-drain loop with closing-poll arm
+                        // (mirrors the channel-log query driver): a hung
+                        // peer must not block teardown past ~500ms.
+                        let mut replies: usize = 0;
+                        let drained_clean: bool = loop {
+                            tokio::select! {
+                                biased;
+                                res = receiver.recv_async() => {
+                                    let Ok(reply) = res else { break true; };
+                                    if let Ok(sample) = reply.into_result() {
+                                        let bytes: Vec<u8> =
+                                            sample.payload().to_bytes().to_vec();
+                                        if subscriber_tx_rf.send(bytes).await.is_err() {
+                                            return; // engine teardown
+                                        }
+                                        replies = replies.saturating_add(1);
+                                    }
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                                    if closing_rf.load(Ordering::SeqCst) { break false; }
+                                }
+                            }
+                        };
+                        if drained_clean {
+                            let _ = req.report.send(replies);
+                        }
+                        // !drained_clean: report drops without a value →
+                        // fetch driver sees NoReply (its shutdown watch
+                        // ends it promptly during teardown anyway).
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_rf.load(Ordering::SeqCst) { break; }
                     }
                 }
             }
@@ -6715,6 +6862,8 @@ pub fn spawn_community_state_zenoh_adapter(
         });
 
         let _ = pub_handle.await;
+        let _ = qbl_handle.await;
+        let _ = rf_handle.await;
         let _ = sub_handle.await;
     })
 }

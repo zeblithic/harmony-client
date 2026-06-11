@@ -234,11 +234,31 @@ async fn two_members_dag_sync_full_event_log() {
     let (_a_sub_tx, a_sub_rx) = mpsc::channel(8);
 
     registry_a
-        .spawn_engine_inner_now(community_id, mk.clone(), admin, false, a_pub_tx, a_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk.clone(),
+            admin,
+            false,
+            a_pub_tx,
+            a_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn a");
     registry_b
-        .spawn_engine_inner_now(community_id, mk, admin, false, b_pub_tx, b_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk,
+            admin,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn b");
 
@@ -429,7 +449,17 @@ async fn forged_signature_event_is_rejected_on_receive() {
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
 
     registry_b
-        .spawn_engine_inner_now(community_id, mk.clone(), admin, false, b_pub_tx, b_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk.clone(),
+            admin,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn b");
 
@@ -661,11 +691,31 @@ async fn malformed_wire_packet_does_not_panic_engine() {
     let (_a_sub_tx, a_sub_rx) = mpsc::channel(8);
 
     registry_a
-        .spawn_engine_inner_now(community_id, mk.clone(), admin, false, a_pub_tx, a_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk.clone(),
+            admin,
+            false,
+            a_pub_tx,
+            a_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn a");
     registry_b
-        .spawn_engine_inner_now(community_id, mk, admin, false, b_pub_tx, b_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk,
+            admin,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn b");
 
@@ -860,11 +910,31 @@ async fn replay_of_same_root_publish_is_idempotent() {
     let (_a_sub_tx, a_sub_rx) = mpsc::channel(8);
 
     registry_a
-        .spawn_engine_inner_now(community_id, mk.clone(), admin, false, a_pub_tx, a_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk.clone(),
+            admin,
+            false,
+            a_pub_tx,
+            a_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn a");
     registry_b
-        .spawn_engine_inner_now(community_id, mk, admin, false, b_pub_tx, b_sub_rx)
+        .spawn_engine_inner_now(
+            community_id,
+            mk,
+            admin,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("spawn b");
 
@@ -1171,6 +1241,9 @@ async fn spoofed_publish_does_not_block_real_publisher() {
             false,
             a_pub_tx,
             a_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn a");
@@ -1182,6 +1255,9 @@ async fn spoofed_publish_does_not_block_real_publisher() {
             false,
             b_pub_tx,
             b_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn b");
@@ -1626,6 +1702,9 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
             false,
             a_pub_tx,
             a_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn a");
@@ -1637,6 +1716,9 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
             false,
             b_pub_tx,
             b_sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn b");

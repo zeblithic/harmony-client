@@ -122,6 +122,9 @@ async fn seeded_registry(
             /* is_invite_only */ false,
             pub_tx,
             sub_rx,
+            None,
+            None,
+            None,
         )
         .await
         .expect("spawn membership engine");
