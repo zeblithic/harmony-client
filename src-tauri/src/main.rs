@@ -25,13 +25,16 @@ enum Command {
         new_passphrase_file: PathBuf,
     },
 
-    /// Export the identity for backup.
+    /// Export an identity backup (Reticulum identity seed, or the owner
+    /// master seed via `owner-mnemonic`).
     Export {
         #[command(subcommand)]
         format: ExportFormat,
     },
 
-    /// Restore an identity from a backup.
+    /// Restore a Reticulum identity from a backup (mnemonic or recovery
+    /// file). No owner-master-seed restore path exists yet — ZEB-439
+    /// tracks re-adopting an owner identity from its exported mnemonic.
     Restore {
         #[command(subcommand)]
         format: RestoreFormat,
