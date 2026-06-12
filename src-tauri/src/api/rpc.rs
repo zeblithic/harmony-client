@@ -596,38 +596,59 @@ mod tests {
     #[tokio::test]
     async fn registry_has_exactly_the_curated_v1_surface() {
         let reg = build_registry();
-        let names = reg.command_names();
-        // Curated v1 surface: node lifecycle (start_node, stop_node) +
-        // identity (get_owner_state, mint_owner_identity) +
-        // communities (list_owner_communities,
-        // create_community, list_community_members, generate_invite,
-        // redeem_invite, join_open_community, leave_community) + channels
-        // (create_channel, list_channels, list_channel_messages,
-        // post_channel_message) + friends (list_friends, generate_friend_token,
-        // redeem_friend_token, add_friend_by_key, list_pending_friend_requests,
-        // accept_friend_request, decline_friend_request) + spaces/DMs
-        // (add_space, send_dm, read_dm_thread) + connectivity
-        // (connectivity_get_my_reachability_record,
-        // connectivity_list_peer_reachability) + network health
-        // (network_health_snapshot, network_health_run_self_test) + pairing
-        // (start_inviter_pairing, start_joiner_pairing, select_pairing_peer,
-        // confirm_pairing_sas, cancel_pairing, get_pairing_state) = 35.
-        assert_eq!(names.len(), 35, "curated v1 surface drifted: {names:?}");
-        for must in [
+        let mut names = reg.command_names();
+        names.sort_unstable();
+        // The complete curated v1 surface — any addition, rename, or
+        // removal must update this list deliberately (PR #245 round 3,
+        // CodeRabbit: a count + spot checks let a swap inside the set
+        // slip through).
+        let mut expected = vec![
+            // node lifecycle
             "start_node",
             "stop_node",
+            // identity
             "get_owner_state",
             "mint_owner_identity",
+            // communities
+            "list_owner_communities",
             "create_community",
+            "list_community_members",
+            "generate_invite",
             "redeem_invite",
+            "join_open_community",
+            "leave_community",
+            // channels
+            "create_channel",
+            "list_channels",
+            "list_channel_messages",
             "post_channel_message",
+            // friends
+            "list_friends",
+            "generate_friend_token",
+            "redeem_friend_token",
+            "add_friend_by_key",
+            "list_pending_friend_requests",
+            "accept_friend_request",
+            "decline_friend_request",
+            // spaces / DMs
+            "add_space",
             "send_dm",
             "read_dm_thread",
+            // connectivity
+            "connectivity_get_my_reachability_record",
+            "connectivity_list_peer_reachability",
+            // network health
+            "network_health_snapshot",
             "network_health_run_self_test",
+            // pairing (ZEB-446)
+            "start_inviter_pairing",
             "start_joiner_pairing",
+            "select_pairing_peer",
+            "confirm_pairing_sas",
+            "cancel_pairing",
             "get_pairing_state",
-        ] {
-            assert!(names.contains(&must), "missing command: {must}");
-        }
+        ];
+        expected.sort_unstable();
+        assert_eq!(names, expected, "curated v1 surface drifted");
     }
 }

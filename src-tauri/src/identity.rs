@@ -1984,40 +1984,54 @@ impl EncryptedFileStore {
     }
 
     /// Construct from the `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`
-    /// environment variables.
-    ///
-    /// Returns:
-    ///   - `Ok(None)` if neither env var is set
-    ///   - `Ok(Some(store))` if a non-empty passphrase resolves
-    ///   - `Err(...)` if either var is set but malformed (empty, file unreadable,
-    ///     resolves to empty)
-    ///
-    /// Precedence: `HARMONY_PASSPHRASE` (direct) wins over `HARMONY_PASSPHRASE_FILE`
-    /// when both are set; a warning is logged.
+    /// environment variables — see [`resolve_passphrase_env`] for the
+    /// resolution rules.
     pub(crate) fn from_env(path: PathBuf) -> Result<Option<Self>, String> {
-        let direct = std::env::var("HARMONY_PASSPHRASE").ok();
-        let file_path = std::env::var("HARMONY_PASSPHRASE_FILE").ok();
-
-        if direct.is_some() && file_path.is_some() {
-            tracing::warn!(
-                "both HARMONY_PASSPHRASE and HARMONY_PASSPHRASE_FILE are set; HARMONY_PASSPHRASE takes precedence"
-            );
-        }
-
-        let passphrase_str = if let Some(s) = direct {
-            if s.is_empty() {
-                return Err("HARMONY_PASSPHRASE is set to an empty string".to_string());
-            }
-            s
-        } else if let Some(file_path) = file_path {
-            parse_passphrase_file(Path::new(&file_path))
-                .map_err(|e| format!("HARMONY_PASSPHRASE_FILE={file_path} {e}"))?
-        } else {
-            return Ok(None);
-        };
-
-        Ok(Some(Self::new(path, SecretString::from(passphrase_str))))
+        Ok(resolve_passphrase_env()?.map(|passphrase| Self::new(path, passphrase)))
     }
+}
+
+/// Resolve the vault passphrase from `HARMONY_PASSPHRASE` /
+/// `HARMONY_PASSPHRASE_FILE`.
+///
+/// The single source of truth shared by [`EncryptedFileStore::from_env`]
+/// (the consumer) and [`passphrase_env_configured`] (the ZEB-446 fail-fast
+/// gate), so the gate can never pass a configuration the vault will later
+/// reject — or refuse one it would accept (PR #245 round 4, Cursor Bugbot
+/// and Greptile: the two used to diverge on whitespace-only direct values
+/// and on trimming of the file path).
+///
+/// Returns:
+///   - `Ok(None)` if neither env var is set
+///   - `Ok(Some(passphrase))` if a non-empty passphrase resolves
+///   - `Err(...)` if either var is set but malformed (empty, file unreadable,
+///     resolves to empty)
+///
+/// Precedence: `HARMONY_PASSPHRASE` (direct) wins over `HARMONY_PASSPHRASE_FILE`
+/// when both are set; a warning is logged.
+fn resolve_passphrase_env() -> Result<Option<SecretString>, String> {
+    let direct = std::env::var("HARMONY_PASSPHRASE").ok();
+    let file_path = std::env::var("HARMONY_PASSPHRASE_FILE").ok();
+
+    if direct.is_some() && file_path.is_some() {
+        tracing::warn!(
+            "both HARMONY_PASSPHRASE and HARMONY_PASSPHRASE_FILE are set; HARMONY_PASSPHRASE takes precedence"
+        );
+    }
+
+    let passphrase_str = if let Some(s) = direct {
+        if s.is_empty() {
+            return Err("HARMONY_PASSPHRASE is set to an empty string".to_string());
+        }
+        s
+    } else if let Some(file_path) = file_path {
+        parse_passphrase_file(Path::new(&file_path))
+            .map_err(|e| format!("HARMONY_PASSPHRASE_FILE={file_path} {e}"))?
+    } else {
+        return Ok(None);
+    };
+
+    Ok(Some(SecretString::from(passphrase_str)))
 }
 
 impl KeyStore for EncryptedFileStore {
@@ -2094,18 +2108,15 @@ fn identity_path_in(home: &Path, profile: Option<&str>) -> PathBuf {
 /// Named profiles are file-vault-only, so entrypoints fail fast on this
 /// instead of letting the first vault access fail later (the ZEB-450
 /// silent-degradation class).
+///
+/// Defined as "[`EncryptedFileStore::from_env`] would yield a store":
+/// the gate and the consumer share [`resolve_passphrase_env`], so they
+/// cannot drift apart (PR #245 round 4, Cursor Bugbot + Greptile). A
+/// set-but-malformed value (empty string, unreadable or blank file)
+/// counts as NOT configured — boot fails here, at the gate, rather than
+/// at the first vault access.
 pub fn passphrase_env_configured() -> bool {
-    if std::env::var("HARMONY_PASSPHRASE").is_ok_and(|v| !v.trim().is_empty()) {
-        return true;
-    }
-    // A passphrase FILE only counts when it is readable AND non-blank —
-    // catching a typo'd path or empty file here, at the fail-fast gate,
-    // beats a vault error mid-boot (PR #245 rounds 1-2, CodeAnt + Cursor).
-    std::env::var("HARMONY_PASSPHRASE_FILE")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .is_some_and(|p| std::fs::read_to_string(p).is_ok_and(|s| !s.trim().is_empty()))
+    matches!(resolve_passphrase_env(), Ok(Some(_)))
 }
 
 /// Internal resolution chain — accepts injected stores for testability.
@@ -3304,6 +3315,57 @@ mod tests {
             let path = dir.path().join("identity.enc");
             let err = EncryptedFileStore::from_env(path).unwrap_err();
             assert!(err.contains("could not be read"), "got: {err}");
+            clear_env();
+        }
+
+        /// Regression for PR #245 round 4 (Cursor Bugbot + Greptile): the
+        /// ZEB-446 fail-fast gate and the vault consumer must agree on
+        /// every env configuration. The old hand-rolled gate diverged on a
+        /// whitespace-only HARMONY_PASSPHRASE (gate fell through to the
+        /// FILE check; from_env used the whitespace as the passphrase) and
+        /// on a file path with stray whitespace (gate trimmed it; from_env
+        /// did not). Both now share resolve_passphrase_env, and this matrix
+        /// pins the equivalence.
+        #[test]
+        #[serial]
+        fn gate_agrees_with_from_env_on_every_configuration() {
+            let dir = tempfile::tempdir().unwrap();
+            let pass_file = dir.path().join("pass.txt");
+            std::fs::write(&pass_file, b"from_file\n").unwrap();
+            let good_path = pass_file.to_str().unwrap().to_string();
+            let padded_path = format!("{good_path} "); // Greptile: trailing space
+
+            let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+                ("nothing set", None, None),
+                ("direct set", Some("foo"), None),
+                ("direct empty", Some(""), None),
+                ("direct empty, file good", Some(""), Some(&good_path)),
+                // Cursor Bugbot round 4: direct whitespace must mean the
+                // SAME thing to the gate as to the vault (it is a valid,
+                // if odd, passphrase — from_env uses it verbatim).
+                ("direct whitespace, file good", Some(" "), Some(&good_path)),
+                ("file good", None, Some(&good_path)),
+                ("file path padded", None, Some(&padded_path)),
+                ("file missing", None, Some("/nonexistent/passphrase/file")),
+            ];
+
+            for (label, direct, file) in cases {
+                clear_env();
+                if let Some(v) = direct {
+                    std::env::set_var(HARMONY_PASSPHRASE, v);
+                }
+                if let Some(v) = file {
+                    std::env::set_var(HARMONY_PASSPHRASE_FILE, v);
+                }
+                let store_path = dir.path().join("identity.enc");
+                let consumer_has_store =
+                    matches!(EncryptedFileStore::from_env(store_path), Ok(Some(_)));
+                assert_eq!(
+                    passphrase_env_configured(),
+                    consumer_has_store,
+                    "gate/consumer divergence on case: {label}"
+                );
+            }
             clear_env();
         }
     }
