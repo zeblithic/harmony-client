@@ -282,6 +282,17 @@ export class CommunityService {
     await this.invoke<void>('leave_community', { communityId });
   }
 
+  /**
+   * ZEB-435: explicit "delete forever" — permanently tombstone a space and (for
+   * a community) delete its on-disk data. IRREVERSIBLE: the tombstone blocks any
+   * re-invite from resurrecting it. For a community the caller MUST have
+   * `leaveCommunity`'d first (the backend refuses otherwise, to avoid leaving a
+   * ghost member). Distinct from `leaveCommunity`, which is a reversible leave.
+   */
+  async removeSpace(spaceId: string): Promise<void> {
+    await this.invoke<void>('remove_space', { spaceId });
+  }
+
   async forkCommunity(
     communityId: string,
     opts: { name: string; silent?: boolean; alsoLeave?: boolean },
