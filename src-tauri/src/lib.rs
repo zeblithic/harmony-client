@@ -1134,19 +1134,16 @@ impl NodeState {
     }
 
     /// ZEB-445: status surface helpers for the API server.
-    #[allow(dead_code)] // ZEB-445: consumed by api module (next task)
     pub(crate) fn node_is_running(&self) -> bool {
         self.thread.is_some()
     }
 
     /// ZEB-445: status surface helpers for the API server.
-    #[allow(dead_code)] // ZEB-445: consumed by api module (next task)
     pub(crate) fn generation_for_status(&self) -> u64 {
         self.generation
     }
 
     /// ZEB-445: status surface helpers for the API server.
-    #[allow(dead_code)] // ZEB-445: consumed by api module (next task)
     pub(crate) fn owner_id_hex_for_status(&self) -> Option<String> {
         // Hex of the loaded owner identity, if any. `dm_self_owner` is the
         // canonical "owner loaded" handle (captured at start_node alongside
@@ -15403,6 +15400,151 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
     // Rotate.
     identity::rotate_passphrase(&old_store, candidate)?;
     Ok(())
+}
+
+/// ZEB-445: headless serve mode. Returns the process exit code.
+///
+/// Lifecycle (spec §Lifecycle, lock, and shutdown): tracing (stderr console,
+/// ZEB-430 stdout purity) → tokio runtime → data dir → profile lock → node
+/// auto-start → API server → wait for ctrl-c/SIGTERM or `/v1/shutdown` →
+/// stop node → best-effort removal of the discovery files.
+pub fn serve_cli(api_port: Option<u16>) -> i32 {
+    crate::app_tracing::init_serve_tracing();
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("serve: cannot build tokio runtime: {e}");
+            return 1;
+        }
+    };
+
+    rt.block_on(async move {
+        let data_dir = match crate::resolve_app_data_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("serve: {e}");
+                return 1;
+            }
+        };
+
+        // One node per profile: the OS advisory lock turns a second serve
+        // (or a GUI-with-API) on the same profile into a loud refusal
+        // instead of silent state-file races. Held until process exit.
+        let _lock = match crate::api::lock::acquire(&data_dir.join("api")) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("serve: {e}");
+                return 1;
+            }
+        };
+
+        let state = std::sync::Arc::new(Mutex::new(NodeState::default()));
+        let events = crate::api::events::ApiEventSink::new();
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(events.clone());
+
+        // serve auto-starts the node — a serve process with a stopped node
+        // is a transient state (after stop_node RPC), not the default.
+        if let Err(e) = start_node_inner(None, sink.clone(), None, &state).await {
+            eprintln!("serve: node start failed: {e}");
+            return 1;
+        }
+
+        let port = api_port
+            .or_else(|| {
+                std::env::var("HARMONY_API_PORT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(7420);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (handle, server_task) = match crate::api::start_server(
+            &data_dir,
+            port,
+            state.clone(),
+            sink,
+            events,
+            shutdown_tx.clone(),
+            shutdown_rx,
+        )
+        .await
+        {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("serve: {e}");
+                stop_inner(&state, None);
+                return 1;
+            }
+        };
+
+        tracing::info!(
+            port = handle.bound_port,
+            "harmony serve listening on 127.0.0.1"
+        );
+
+        // Two exit paths converge here:
+        //  - OS signal (ctrl-c / SIGTERM): nudge the shutdown channel, then
+        //    give the server's graceful drain a bounded window.
+        //  - `/v1/shutdown` RPC: the handler already sent on the channel;
+        //    the server task ends and the select's second arm fires (the
+        //    JoinHandle is already complete — do NOT poll it again).
+        let mut server_task = server_task;
+        let server_already_done = tokio::select! {
+            _ = wait_for_exit_signal() => {
+                let _ = shutdown_tx.send(()).await;
+                false
+            }
+            _ = &mut server_task => true,
+        };
+        if !server_already_done
+            && tokio::time::timeout(std::time::Duration::from_secs(10), &mut server_task)
+                .await
+                .is_err()
+        {
+            tracing::warn!("serve: server did not drain within 10s; continuing shutdown");
+        }
+
+        stop_inner(&state, None);
+
+        // Best-effort discovery-file cleanup: a stale port/token file is
+        // only a confusing client error, never a correctness issue (they
+        // are rewritten on every server start).
+        let _ = std::fs::remove_file(handle.api_dir.join("port"));
+        let _ = std::fs::remove_file(handle.api_dir.join("token"));
+        0
+    })
+}
+
+/// ZEB-445: resolve on ctrl-c (all platforms) or SIGTERM (unix — what
+/// systemd / `kill` send). Never resolves spuriously: if no handler can be
+/// installed, falls back to ctrl-c alone.
+async fn wait_for_exit_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "serve: cannot install SIGTERM handler; ctrl-c only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 // ── ZEB-217 community IPC types ──────────────────────────────────────────

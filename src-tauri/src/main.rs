@@ -47,6 +47,14 @@ enum Command {
         #[arg(long, global = true)]
         ignore_state: bool,
     },
+
+    /// Run a windowless node exposing the localhost HTTP+WS control surface
+    /// (ZEB-445). Token + bound port are written to <data-dir>/api/.
+    Serve {
+        /// Port for the API server (default 7420; 0 = OS-assigned).
+        #[arg(long, value_name = "PORT")]
+        api_port: Option<u16>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -187,6 +195,11 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
+            }
+            Some(Command::Serve { api_port }) => {
+                // No init_tracing() here: serve_cli installs its own
+                // subscriber (stderr console + rolling file, ZEB-445).
+                std::process::exit(harmony_app::serve_cli(api_port));
             }
             None => {
                 // Default path — launch the Tauri runtime.

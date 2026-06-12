@@ -7,3 +7,356 @@ pub mod auth;
 pub mod events;
 pub mod lock;
 pub mod rpc;
+
+use crate::node_event_sink::NodeEventSink;
+use crate::NodeState;
+use axum::{
+    extract::{Path, State, WebSocketUpgrade},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use std::sync::{Arc, Mutex};
+
+/// Shared server context, cloned into every handler via axum's `State`.
+#[derive(Clone)]
+pub struct ApiCtx {
+    pub state: Arc<Mutex<NodeState>>,
+    pub sink: Arc<dyn NodeEventSink>,
+    pub events: Arc<events::ApiEventSink>,
+    pub registry: Arc<rpc::RpcRegistry>,
+    pub token: Arc<String>,
+    pub started: std::time::Instant,
+    pub bound_port: u16,
+    pub shutdown_tx: tokio::sync::mpsc::Sender<()>,
+}
+
+/// `GET /v1/status` response. camelCase on the wire like every other DTO.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusDto {
+    running: bool,
+    generation: u64,
+    owner_id: Option<String>,
+    uptime_secs: u64,
+    port: u16,
+    version: &'static str,
+}
+
+fn authed(ctx: &ApiCtx, headers: &axum::http::HeaderMap) -> bool {
+    auth::check_bearer(
+        &ctx.token,
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
+fn unauthorized() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": "unauthorized"})),
+    )
+}
+
+/// `POST /v1/rpc/{command}` — uniform dispatch into the curated registry.
+/// Absent body (no Content-Type) → `Null` args, which the registry treats
+/// as `{}` for no-arg commands.
+async fn rpc_handler(
+    State(ctx): State<ApiCtx>,
+    Path(command): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authed(&ctx, &headers) {
+        return unauthorized();
+    }
+    let args = body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null);
+    match ctx
+        .registry
+        .dispatch(&command, ctx.state.clone(), ctx.sink.clone(), args)
+        .await
+    {
+        Ok(value) => (StatusCode::OK, Json(value)),
+        Err(rpc::RpcError::UnknownCommand) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown command"})),
+        ),
+        Err(rpc::RpcError::BadArgs(msg)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        ),
+        Err(rpc::RpcError::Command(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": msg})),
+        ),
+    }
+}
+
+/// `GET /v1/status` — node liveness + identity + server metadata.
+async fn status_handler(
+    State(ctx): State<ApiCtx>,
+    headers: axum::http::HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authed(&ctx, &headers) {
+        return unauthorized();
+    }
+    let (running, generation, owner_id) = match ctx.state.lock() {
+        Ok(guard) => (
+            guard.node_is_running(),
+            guard.generation_for_status(),
+            guard.owner_id_hex_for_status(),
+        ),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("state lock poisoned: {e}")})),
+            );
+        }
+    };
+    let dto = StatusDto {
+        running,
+        generation,
+        owner_id,
+        uptime_secs: ctx.started.elapsed().as_secs(),
+        port: ctx.bound_port,
+        version: env!("CARGO_PKG_VERSION"),
+    };
+    match serde_json::to_value(&dto) {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("serialize status: {e}")})),
+        ),
+    }
+}
+
+/// `POST /v1/shutdown` — graceful process shutdown (the headless analogue
+/// of the GUI's explicit quit). The send wakes `axum::serve`'s
+/// graceful-shutdown future; serve_cli's select observes the server task
+/// ending and runs the node teardown.
+async fn shutdown_handler(
+    State(ctx): State<ApiCtx>,
+    headers: axum::http::HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authed(&ctx, &headers) {
+        return unauthorized();
+    }
+    // Err = shutdown already requested (channel full or receiver consumed) —
+    // still report success; the process is going down either way.
+    let _ = ctx.shutdown_tx.send(()).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"shuttingDown": true})),
+    )
+}
+
+/// `GET /v1/events` — WS upgrade onto the event firehose. Auth is checked
+/// from the upgrade request's headers BEFORE upgrading.
+async fn events_handler(
+    State(ctx): State<ApiCtx>,
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    if !authed(&ctx, &headers) {
+        return unauthorized().into_response();
+    }
+    ws.on_upgrade(move |socket| events::forward_events(ctx.events.subscribe(), socket))
+        .into_response()
+}
+
+pub fn router(ctx: ApiCtx) -> Router {
+    Router::new()
+        .route("/v1/rpc/{command}", post(rpc_handler))
+        .route("/v1/status", get(status_handler))
+        .route("/v1/shutdown", post(shutdown_handler))
+        .route("/v1/events", get(events_handler))
+        .with_state(ctx)
+}
+
+/// Discovery info returned by [`start_server`]: the actually-bound port and
+/// the `<data-dir>/api` directory holding the `token` + `port` files.
+pub struct ServerHandle {
+    pub bound_port: u16,
+    pub api_dir: std::path::PathBuf,
+}
+
+/// Bind 127.0.0.1:`requested_port` (0 = OS-assigned), write the discovery
+/// files, and spawn the server task. The returned `JoinHandle` resolves when
+/// graceful shutdown (one send on the shutdown channel) completes.
+pub async fn start_server(
+    data_dir: &std::path::Path,
+    requested_port: u16,
+    state: Arc<Mutex<NodeState>>,
+    sink: Arc<dyn NodeEventSink>,
+    events: Arc<events::ApiEventSink>,
+    shutdown_tx: tokio::sync::mpsc::Sender<()>,
+    mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
+) -> Result<(ServerHandle, tokio::task::JoinHandle<()>), String> {
+    let api_dir = data_dir.join("api");
+    let token = auth::generate_token();
+    auth::write_token_file(&api_dir, &token)?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", requested_port))
+        .await
+        .map_err(|e| format!("bind 127.0.0.1:{requested_port}: {e}"))?;
+    let bound_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    std::fs::write(api_dir.join("port"), bound_port.to_string())
+        .map_err(|e| format!("write port file: {e}"))?;
+    let ctx = ApiCtx {
+        state,
+        sink,
+        events,
+        registry: Arc::new(rpc::build_registry()),
+        token: Arc::new(token),
+        started: std::time::Instant::now(),
+        bound_port,
+        shutdown_tx,
+    };
+    let app = router(ctx);
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.recv().await;
+            })
+            .await;
+    });
+    Ok((
+        ServerHandle {
+            bound_port,
+            api_dir,
+        },
+        task,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node_event_sink::FanoutSink;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Boot a real server on an ephemeral port with a default (not-running)
+    /// NodeState. Returns the handle, the server task, the token read back
+    /// from the discovery file, and the tempdir (held to keep it alive).
+    async fn boot() -> (
+        ServerHandle,
+        tokio::task::JoinHandle<()>,
+        String,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(Mutex::new(NodeState::default()));
+        let events = events::ApiEventSink::new();
+        let sink: Arc<dyn NodeEventSink> = Arc::new(FanoutSink(vec![]));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (handle, task) =
+            start_server(dir.path(), 0, state, sink, events, shutdown_tx, shutdown_rx)
+                .await
+                .expect("start_server");
+        let token = std::fs::read_to_string(handle.api_dir.join("token")).expect("read token file");
+        (handle, task, token, dir)
+    }
+
+    /// Minimal raw HTTP/1.1 client: write the request, read to EOF.
+    /// `Connection: close` in every request keeps the parsing trivial —
+    /// no new dev-deps for an HTTP client.
+    async fn raw_http(port: u16, request: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read response");
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[tokio::test]
+    async fn status_requires_auth_and_reports_not_running() {
+        let (handle, _task, token, _dir) = boot().await;
+
+        let unauthed = raw_http(
+            handle.bound_port,
+            "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            unauthed.contains("401"),
+            "status without auth must be 401, got: {unauthed}"
+        );
+        assert!(
+            unauthed.contains("unauthorized"),
+            "401 body must carry the error, got: {unauthed}"
+        );
+
+        let authed = raw_http(
+            handle.bound_port,
+            &format!(
+                "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            authed.contains("200"),
+            "authed status must be 200, got: {authed}"
+        );
+        assert!(
+            authed.contains("\"running\":false"),
+            "default NodeState must report not-running, got: {authed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_rpc_is_404() {
+        let (handle, _task, token, _dir) = boot().await;
+
+        let resp = raw_http(
+            handle.bound_port,
+            &format!(
+                "POST /v1/rpc/nope HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Authorization: Bearer {token}\r\nContent-Type: application/json\r\n\
+                 Content-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            ),
+        )
+        .await;
+        assert!(
+            resp.contains("404"),
+            "unknown command must be 404, got: {resp}"
+        );
+        assert!(
+            resp.contains("unknown command"),
+            "404 body must say unknown command, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_server() {
+        let (handle, task, token, _dir) = boot().await;
+
+        let resp = raw_http(
+            handle.bound_port,
+            &format!(
+                "POST /v1/shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            resp.contains("200"),
+            "shutdown must respond 200, got: {resp}"
+        );
+        assert!(
+            resp.contains("shuttingDown"),
+            "shutdown body must confirm, got: {resp}"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("server task must join within 5s of /v1/shutdown")
+            .expect("server task must not panic");
+    }
+}
