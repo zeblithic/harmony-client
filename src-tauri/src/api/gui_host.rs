@@ -62,9 +62,9 @@ pub fn gui_api_port_from_env() -> Option<u16> {
 /// lives as long as the app; `State::inner` returns a borrow tied to the
 /// `AppHandle` this struct owns, which satisfies `node_state`'s elided
 /// `&self` lifetime.
-struct GuiStateAccess(tauri::AppHandle);
+struct GuiStateAccess<R: tauri::Runtime>(tauri::AppHandle<R>);
 
-impl super::NodeStateAccess for GuiStateAccess {
+impl<R: tauri::Runtime> super::NodeStateAccess for GuiStateAccess<R> {
     fn node_state(&self) -> &Mutex<NodeState> {
         use tauri::Manager;
         self.0.state::<Mutex<NodeState>>().inner()
@@ -87,6 +87,23 @@ pub fn start_gui_api(app: tauri::AppHandle, port: u16) -> ApiHost {
             return ApiHost::disabled();
         }
     };
+    start_gui_api_at(app, port, data_dir)
+}
+
+/// Body of [`start_gui_api`] with the data dir injected (testable without
+/// touching the developer's real profile).
+///
+/// The bind + discovery writes run SYNCHRONOUSLY (block_on — milliseconds)
+/// so the returned `ApiHost` is truthful: the profile lock and the events
+/// sink are only retained when a server is actually listening. Retaining
+/// the lock past a failed start would block a later `harmony-app serve`
+/// on this profile for the GUI's whole lifetime (Qodo finding, PR #242
+/// round 1).
+fn start_gui_api_at<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    port: u16,
+    data_dir: std::path::PathBuf,
+) -> ApiHost {
     let lock = match super::lock::acquire(&data_dir.join("api")) {
         Ok(l) => l,
         Err(e) => {
@@ -99,40 +116,39 @@ pub fn start_gui_api(app: tauri::AppHandle, port: u16) -> ApiHost {
         }
     };
     let events = ApiEventSink::new();
-    let host = ApiHost {
-        events: Some(events.clone()),
-        _lock: Some(lock),
-    };
-
     let state: Arc<dyn super::NodeStateAccess> = Arc::new(GuiStateAccess(app.clone()));
     // The server's RPC dispatch emits through the AppHandle sink — the
     // SAME sink the Tauri wrappers use — so API-triggered events reach the
     // webview AND (via the mirror in node_event_sink.rs) the WS stream.
     // Passing `events` directly here would skip the webview.
     let sink: Arc<dyn crate::node_event_sink::NodeEventSink> = Arc::new(app.clone());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (handle, server_task) = match tauri::async_runtime::block_on(super::start_server(
+        &data_dir,
+        port,
+        state,
+        sink,
+        events.clone(),
+        shutdown_tx,
+        shutdown_rx,
+    )) {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::error!(error = %e, "ZEB-452: GUI API server failed to start; API disabled");
+            // `lock` (and `events`) drop here — the profile stays free for
+            // a later `serve`.
+            return ApiHost::disabled();
+        }
+    };
+    tracing::info!(
+        port = handle.bound_port,
+        "ZEB-452: GUI API server listening on 127.0.0.1"
+    );
+    let host = ApiHost {
+        events: Some(events),
+        _lock: Some(lock),
+    };
     tauri::async_runtime::spawn(async move {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (handle, server_task) = match super::start_server(
-            &data_dir,
-            port,
-            state,
-            sink,
-            events,
-            shutdown_tx,
-            shutdown_rx,
-        )
-        .await
-        {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::error!(error = %e, "ZEB-452: GUI API server failed to start");
-                return;
-            }
-        };
-        tracing::info!(
-            port = handle.bound_port,
-            "ZEB-452: GUI API server listening on 127.0.0.1"
-        );
         let join = server_task.await;
         // Best-effort discovery cleanup on any exit: stale files are only
         // a confusing client error (rewritten on every server start).
@@ -205,6 +221,36 @@ mod tests {
         assert_eq!(frame.event, "mirror-test");
         assert_eq!(frame.seq, 0);
         assert_eq!(frame.payload, serde_json::json!({"k": 1}));
+    }
+
+    /// Qodo PR #242 round-1 finding: a failed server start must NOT retain
+    /// the profile lock (or report an active events sink) — otherwise a
+    /// later `harmony-app serve` on this profile is blocked for the GUI's
+    /// whole lifetime while no API is actually listening.
+    #[test]
+    fn failed_server_start_releases_the_profile_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = tauri::test::mock_app();
+        // Port 1 is privileged: binding fails for a non-root test process,
+        // which is exactly the post-lock failure mode under test.
+        let host = start_gui_api_at(app.handle().clone(), 1, dir.path().to_path_buf());
+        assert!(
+            host.events.is_none(),
+            "failed start must report a disabled host"
+        );
+        assert!(
+            host._lock.is_none(),
+            "failed start must not retain the lock"
+        );
+        // The load-bearing assertion: the profile must be free for the
+        // next holder.
+        super::super::lock::acquire(&dir.path().join("api"))
+            .expect("profile lock must be free after a failed GUI API start");
+        // No orphaned discovery files: bind precedes the token write.
+        assert!(
+            !dir.path().join("api").join("token").exists(),
+            "failed bind must not leave a token file"
+        );
     }
 
     /// Without a managed ApiHost (and with a disabled one), the AppHandle
