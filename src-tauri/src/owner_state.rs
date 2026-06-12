@@ -442,41 +442,122 @@ pub fn save_owner_state_atomic(
     master_seed: Option<&[u8; 32]>,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
-    save_secret(
+    // Snapshot the prior secrets so a mid-sequence failure on an OVERWRITE
+    // (ZEB-439 forced re-adoption) can be rolled back: a fresh device key must
+    // never be left orphaned against the previous, still-on-disk
+    // owner_state.cbor (which is written LAST and so survives every pre-cbor
+    // failure). On a fresh install (mint) both read back as `None` and the
+    // rollback below is a no-op. Best-effort: an unreadable prior secret simply
+    // cannot be rolled back (the status quo before this guard).
+    let prev_device = load_secret(
         &keychain,
         VaultSlot::Device,
         KEYCHAIN_DEVICE_SK,
         identity_dir,
         "device_sk.enc",
-        &device_signing_key.to_bytes(),
-    )?;
-    if let Some(seed) = master_seed {
+    )
+    .ok()
+    .flatten();
+    let prev_seed = load_secret(
+        &keychain,
+        VaultSlot::OwnerMasterSeed,
+        KEYCHAIN_MASTER_SEED,
+        identity_dir,
+        "master_seed.enc",
+    )
+    .ok()
+    .flatten();
+
+    let write = || -> Result<(), String> {
         save_secret(
             &keychain,
-            VaultSlot::OwnerMasterSeed,
-            KEYCHAIN_MASTER_SEED,
+            VaultSlot::Device,
+            KEYCHAIN_DEVICE_SK,
             identity_dir,
-            "master_seed.enc",
-            seed,
+            "device_sk.enc",
+            &device_signing_key.to_bytes(),
         )?;
-    } else {
-        // Joiner case: cert-only model. We must NOT leave a stale master_seed
-        // from a previous identity behind; if we did, `load_owner_state` would
-        // pick it up and `canBackUp` would lie about backup eligibility.
-        clear_secret(
-            &keychain,
-            VaultSlot::OwnerMasterSeed,
-            KEYCHAIN_MASTER_SEED,
-            identity_dir,
-            "master_seed.enc",
-        )?;
+        if let Some(seed) = master_seed {
+            save_secret(
+                &keychain,
+                VaultSlot::OwnerMasterSeed,
+                KEYCHAIN_MASTER_SEED,
+                identity_dir,
+                "master_seed.enc",
+                seed,
+            )?;
+        } else {
+            // Joiner case: cert-only model. We must NOT leave a stale master_seed
+            // from a previous identity behind; if we did, `load_owner_state` would
+            // pick it up and `canBackUp` would lie about backup eligibility.
+            clear_secret(
+                &keychain,
+                VaultSlot::OwnerMasterSeed,
+                KEYCHAIN_MASTER_SEED,
+                identity_dir,
+                "master_seed.enc",
+            )?;
+        }
+        let cbor_bytes = cbor::to_canonical(state)
+            .map_err(|e| format!("CBOR encode of OwnerState failed: {e}"))?;
+        let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+        write_atomic_0600(&cbor_path, &cbor_bytes)
+            .map_err(|e| format!("failed to write {}: {e}", cbor_path.display()))?;
+        Ok(())
+    };
+
+    let result = write();
+    if result.is_err() {
+        // Roll EACH secret slot back to its prior state so the unchanged
+        // owner_state.cbor stays consistent. The inverse of a write is "restore
+        // the previous bytes if they existed, otherwise CLEAR the slot": leaving
+        // a newly-written secret whose prior state was absent (e.g. a fresh
+        // master_seed.enc over a cert-only/joiner install that had none) would
+        // make `canBackUp` lie. Best-effort; the original error is preserved.
+        match prev_device.as_deref() {
+            Some(prev) => {
+                let _ = save_secret(
+                    &keychain,
+                    VaultSlot::Device,
+                    KEYCHAIN_DEVICE_SK,
+                    identity_dir,
+                    "device_sk.enc",
+                    prev,
+                );
+            }
+            None => {
+                let _ = clear_secret(
+                    &keychain,
+                    VaultSlot::Device,
+                    KEYCHAIN_DEVICE_SK,
+                    identity_dir,
+                    "device_sk.enc",
+                );
+            }
+        }
+        match prev_seed.as_deref() {
+            Some(prev) => {
+                let _ = save_secret(
+                    &keychain,
+                    VaultSlot::OwnerMasterSeed,
+                    KEYCHAIN_MASTER_SEED,
+                    identity_dir,
+                    "master_seed.enc",
+                    prev,
+                );
+            }
+            None => {
+                let _ = clear_secret(
+                    &keychain,
+                    VaultSlot::OwnerMasterSeed,
+                    KEYCHAIN_MASTER_SEED,
+                    identity_dir,
+                    "master_seed.enc",
+                );
+            }
+        }
     }
-    let cbor_bytes =
-        cbor::to_canonical(state).map_err(|e| format!("CBOR encode of OwnerState failed: {e}"))?;
-    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
-    write_atomic_0600(&cbor_path, &cbor_bytes)
-        .map_err(|e| format!("failed to write {}: {e}", cbor_path.display()))?;
-    Ok(())
+    result
 }
 
 /// Persist only the `OwnerState` CRDT to `owner_state.cbor` (canonical CBOR,
@@ -504,6 +585,100 @@ pub fn save_owner_state_cbor_only(identity_dir: &Path, state: &OwnerState) -> Re
 pub fn device_id_from_signing_key(device_sk: &SigningKey) -> [u8; 16] {
     harmony_owner::pubkey_bundle::PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes())
         .identity_hash()
+}
+
+/// Re-adopt an existing owner identity from its 32-byte master `seed`
+/// (ZEB-439 restore). A constrained variant of
+/// [`harmony_owner::lifecycle::mint_owner`] that takes the seed as input
+/// instead of generating it: the reconstructed [`OwnerState`] keeps the SAME
+/// `owner_id` (= `RecoveryArtifact::from_seed(seed).master_pubkey_bundle()
+/// .identity_hash()` — the invariant `pairing/cert.rs::sign_enrollment_for_joiner`
+/// enforces), but a FRESH device key is minted and master-signed into a new
+/// enrollment. The old device's key is never recovered: this is re-adoption of
+/// the owner on a new/wiped device. An initial `LivenessCert` is stamped so the
+/// sole device evaluates `Full`, not `Refused(StaleTrustState)` (ZEB-342 parity).
+///
+/// Returns the reconstructed `(OwnerState, device_signing_key)`; the caller
+/// persists via [`save_owner_state_atomic`] with `Some(seed)`.
+pub fn remint_owner_from_seed(
+    seed: &[u8; 32],
+    now: u64,
+) -> Result<(OwnerState, SigningKey), String> {
+    use harmony_owner::certs::LivenessCert;
+    use harmony_owner::lifecycle::{enroll_via_master, RecoveryArtifact};
+    use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+    use harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS;
+
+    let artifact = RecoveryArtifact::from_seed(*seed);
+    let owner_id = artifact.master_pubkey_bundle().identity_hash();
+    let mut state = OwnerState::new(owner_id);
+
+    // Fresh per-device key — the old device's key is intentionally NOT
+    // recovered. The seed reconstructs the OWNER (owner_id), not the device.
+    let device_sk = SigningKey::generate(&mut rand::rngs::OsRng);
+    let device_x25519 =
+        crate::dm_signing::ed25519_pub_to_x25519(&device_sk.verifying_key().to_bytes())
+            .map_err(|e| format!("device x25519 derivation failed: {e}"))?;
+    let device_bundle = PubKeyBundle {
+        classical: ClassicalKeys {
+            ed25519_verify: device_sk.verifying_key().to_bytes(),
+            x25519_pub: device_x25519,
+        },
+        post_quantum: None,
+    };
+
+    // enroll_via_master reconstructs the master key from the artifact, enforces
+    // `master.identity_hash() == state.owner_id` (returns WrongOwner otherwise),
+    // master-signs the enrollment, and drops the master key. For a fresh restore
+    // there are no active siblings, so `auto_vouch_certs` is empty.
+    let enrolled = enroll_via_master(
+        &state,
+        &artifact,
+        &device_sk,
+        device_bundle,
+        now,
+        DEFAULT_ACTIVE_WINDOW_SECS,
+    )
+    .map_err(|e| format!("enroll device under restored owner failed: {e}"))?;
+
+    state
+        .add_enrollment(enrolled.enrollment_cert, now, DEFAULT_ACTIVE_WINDOW_SECS)
+        .map_err(|e| format!("add_enrollment failed: {e}"))?;
+    for vouch in enrolled.auto_vouch_certs {
+        state
+            .add_vouching(vouch)
+            .map_err(|e| format!("add_vouching failed: {e}"))?;
+    }
+
+    // ZEB-342 parity: stamp initial liveness so the sole device evaluates Full,
+    // not Refused(StaleTrustState).
+    let liveness = LivenessCert::sign(&device_sk, owner_id, now)
+        .map_err(|e| format!("liveness sign failed: {e}"))?;
+    state
+        .add_liveness(liveness)
+        .map_err(|e| format!("add_liveness failed: {e}"))?;
+
+    Ok((state, device_sk))
+}
+
+/// Read just the `owner_id` from a persisted `owner_state.cbor`, without
+/// touching the keychain or the device/seed secrets.
+///
+/// Returns `Ok(None)` for the natural un-minted state (no `.cbor` marker).
+/// Used by the ZEB-439 restore overwrite-guard, which must compare the
+/// mnemonic-derived owner_id against any identity already on this device
+/// *before* deciding whether `--force` is required — a check that needs the
+/// recorded owner_id but neither the device key nor the master seed.
+pub fn read_persisted_owner_id(identity_dir: &Path) -> Result<Option<[u8; 16]>, String> {
+    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    if !cbor_path.exists() {
+        return Ok(None);
+    }
+    let cbor_bytes = std::fs::read(&cbor_path)
+        .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
+    let state: OwnerState =
+        cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
+    Ok(Some(state.owner_id))
 }
 
 /// Ensure the local device (derived from `device_sk`) has a fresh `LivenessCert`
@@ -802,6 +977,173 @@ mod persistence_tests {
             device_signing_key.to_bytes()
         );
         assert_eq!(loaded.master_seed.as_deref(), Some(&master_seed));
+    }
+
+    #[test]
+    fn remint_from_seed_preserves_owner_id_with_fresh_full_trust_device() {
+        // ZEB-439: re-adopting an owner from its master seed must reproduce the
+        // SAME owner_id (so peers/communities still recognize the identity),
+        // mint a DIFFERENT device key (the old device key is not recovered),
+        // and stamp liveness so the sole device evaluates Full (ZEB-342 parity).
+        let MintResult {
+            state: original,
+            recovery_artifact,
+            device_signing_key: original_device,
+        } = mint_owner(1_700_000_000).unwrap();
+        let seed = *recovery_artifact.as_bytes();
+
+        let now = 1_700_500_000;
+        let (restored, restored_device) =
+            remint_owner_from_seed(&seed, now).expect("remint from seed");
+
+        assert_eq!(
+            restored.owner_id, original.owner_id,
+            "restored identity must keep the same owner_id"
+        );
+        assert_ne!(
+            restored_device.to_bytes(),
+            original_device.to_bytes(),
+            "restore mints a fresh device key; it must not equal the old one"
+        );
+        assert_eq!(
+            restored.enrollments.len(),
+            1,
+            "exactly one device enrolled after restore"
+        );
+
+        let device_id = device_id_from_signing_key(&restored_device);
+        assert_eq!(
+            harmony_owner::trust::evaluate_trust(
+                &restored,
+                device_id,
+                now,
+                harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
+            ),
+            harmony_owner::trust::TrustDecision::Full,
+            "the sole restored device must evaluate to Full trust"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_owner_state_atomic_rolls_back_secrets_when_cbor_write_fails() {
+        // ZEB-439 / CodeRabbit: an OVERWRITE that fails AFTER the secret writes
+        // but during the cbor write must not orphan a fresh device key against
+        // the prior owner_state.cbor. Inject a cbor-write failure (replace the
+        // marker with a non-empty directory so write_atomic_0600's rename onto
+        // it fails — the secret file writes still land) and assert the secret
+        // slots roll back to the prior identity.
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "rollback-test-pp");
+        let dir = tempdir().unwrap();
+
+        // Plant owner A.
+        let a = mint_owner(1_700_000_000).unwrap();
+        let a_seed = *a.recovery_artifact.as_bytes();
+        let a_device = a.device_signing_key.to_bytes();
+        save_owner_state_atomic(
+            dir.path(),
+            &a.state,
+            &a.device_signing_key,
+            Some(&a_seed),
+            None,
+        )
+        .expect("plant A");
+
+        // Turn owner_state.cbor into a non-empty directory so the final rename fails.
+        let cbor = dir.path().join(OWNER_STATE_FILENAME);
+        std::fs::remove_file(&cbor).unwrap();
+        std::fs::create_dir(&cbor).unwrap();
+        std::fs::write(cbor.join("blocker"), b"x").unwrap();
+
+        // Attempt to overwrite with a DIFFERENT owner B — must fail at the cbor write.
+        let b = mint_owner(1_700_000_100).unwrap();
+        let b_seed = *b.recovery_artifact.as_bytes();
+        let err = save_owner_state_atomic(
+            dir.path(),
+            &b.state,
+            &b.device_signing_key,
+            Some(&b_seed),
+            None,
+        )
+        .expect_err("cbor write onto a non-empty dir must fail");
+        assert!(
+            err.contains("owner_state.cbor"),
+            "expected a cbor write error; got: {err}"
+        );
+
+        // Restore A's cbor marker, then load: the secret slots must be A's
+        // (rolled back), NOT B's.
+        std::fs::remove_dir_all(&cbor).unwrap();
+        save_owner_state_cbor_only(dir.path(), &a.state).expect("re-plant A cbor");
+        let loaded = load_owner_state(dir.path(), None)
+            .expect("load")
+            .expect("Some");
+        assert_eq!(
+            loaded.device_signing_key.to_bytes(),
+            a_device,
+            "device key must roll back to A's after the failed overwrite"
+        );
+        assert_eq!(
+            loaded.master_seed.as_deref(),
+            Some(&a_seed),
+            "master seed must roll back to A's after the failed overwrite"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_owner_state_atomic_rollback_clears_seed_absent_in_prior_state() {
+        // Cursor: if the PRIOR state had no master seed (cert-only / joiner) and
+        // a failed overwrite wrote a fresh master_seed.enc, rollback must CLEAR
+        // it — not just skip it. Leaving the new seed would make `canBackUp` lie
+        // (seed on disk, but the unchanged owner_state.cbor never had one). The
+        // correct inverse of a write is "restore prior value OR remove if none".
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "rollback-clear-test-pp");
+        let dir = tempdir().unwrap();
+
+        // Plant a prior state with NO master seed (cert-only): save with `None`.
+        let a = mint_owner(1_700_000_000).unwrap();
+        save_owner_state_atomic(dir.path(), &a.state, &a.device_signing_key, None, None)
+            .expect("plant cert-only A");
+        assert!(
+            !dir.path().join("master_seed.enc").exists(),
+            "precondition: prior state has no master seed on disk"
+        );
+
+        // Make the cbor write fail.
+        let cbor = dir.path().join(OWNER_STATE_FILENAME);
+        std::fs::remove_file(&cbor).unwrap();
+        std::fs::create_dir(&cbor).unwrap();
+        std::fs::write(cbor.join("blocker"), b"x").unwrap();
+
+        // Attempt an overwrite that WRITES a master seed, failing at the cbor.
+        let b = mint_owner(1_700_000_100).unwrap();
+        let b_seed = *b.recovery_artifact.as_bytes();
+        let err = save_owner_state_atomic(
+            dir.path(),
+            &b.state,
+            &b.device_signing_key,
+            Some(&b_seed),
+            None,
+        )
+        .expect_err("cbor write onto a non-empty dir must fail");
+        assert!(
+            err.contains("owner_state.cbor"),
+            "expected a cbor write error; got: {err}"
+        );
+
+        // Rollback must have CLEARED the newly-written seed (prior had none).
+        std::fs::remove_dir_all(&cbor).unwrap();
+        save_owner_state_cbor_only(dir.path(), &a.state).expect("re-plant A cbor");
+        let loaded = load_owner_state(dir.path(), None)
+            .expect("load")
+            .expect("Some");
+        assert!(
+            loaded.master_seed.is_none(),
+            "a master seed written during a failed overwrite must be rolled back (cleared) \
+             when the prior state had none"
+        );
     }
 
     #[test]

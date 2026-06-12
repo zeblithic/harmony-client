@@ -191,6 +191,164 @@ fn export_owner_mnemonic_end_to_end_through_real_binary() {
     );
 }
 
+/// ZEB-439: `restore owner-mnemonic` must re-adopt the owner identity from a
+/// 24-word file end-to-end through the shipped binary — onto an EMPTY install
+/// (no `~/.harmony` yet) — and then `export owner-mnemonic` must round-trip the
+/// same words with the same owner-id. This is the DoD round-trip through the
+/// real binary (clap wiring the main.rs unit tests can't see).
+#[test]
+#[serial]
+fn restore_owner_mnemonic_end_to_end_through_real_binary() {
+    use harmony_owner::lifecycle::{mint_owner, MintResult, RecoveryArtifact};
+
+    let home = tempfile::tempdir().unwrap();
+
+    // A paper backup minted elsewhere: a known-valid owner master seed, its 24
+    // words, and its owner-id. We do NOT persist any state here — the child
+    // restores onto a blank install from the words alone.
+    let _passphrase_guard = EnvVarGuard::set("HARMONY_PASSPHRASE", CHILD_PASSPHRASE);
+    let MintResult {
+        state,
+        recovery_artifact,
+        ..
+    } = mint_owner(1_700_000_000).unwrap();
+    let master_seed = *recovery_artifact.as_bytes();
+    let owner_id = state.owner_id;
+    let words = RecoveryArtifact::from_seed(master_seed).to_mnemonic();
+    let mnemonic_path = home.path().join("owner-backup.txt");
+    std::fs::write(&mnemonic_path, words.as_str()).unwrap();
+
+    // Empty install: ~/.harmony does not exist yet (restore must create it).
+    let identity_dir = home.path().join(".harmony");
+    assert!(
+        !identity_dir.exists(),
+        "test setup: install must start empty"
+    );
+
+    let mnemonic_arg = mnemonic_path.to_str().unwrap();
+    let out = run_cli(
+        home.path(),
+        &["restore", "owner-mnemonic", "--mnemonic-file", mnemonic_arg],
+        "info",
+    );
+    assert_eq!(
+        out.code,
+        Some(0),
+        "restore must succeed; stderr: {}",
+        out.stderr
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "restore writes nothing to stdout; got: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stderr
+            .contains(&format!("restored owner-id: {}", hex::encode(owner_id))),
+        "stderr must confirm the restored owner-id; got: {}",
+        out.stderr
+    );
+
+    // DoD round-trip: export from the restored install yields the SAME words
+    // and the SAME owner-id.
+    let exported = run_cli(home.path(), &["export", "owner-mnemonic"], "info");
+    assert_eq!(exported.code, Some(0), "stderr: {}", exported.stderr);
+    assert_eq!(
+        exported.stdout,
+        format!("{}\n", words.as_str()),
+        "exported words must round-trip the restored owner seed; stderr: {}",
+        exported.stderr
+    );
+    assert!(
+        exported
+            .stderr
+            .contains(&format!("owner-id: {}", hex::encode(owner_id))),
+        "exported owner-id must match the restored identity; got: {}",
+        exported.stderr
+    );
+}
+
+/// ZEB-439: `restore owner-mnemonic` must refuse to clobber an existing owner
+/// without `--force` — end-to-end through the binary (non-zero exit, the
+/// identity left intact).
+#[test]
+#[serial]
+fn restore_owner_mnemonic_refuses_existing_owner_without_force_through_binary() {
+    use harmony_owner::lifecycle::{mint_owner, MintResult, RecoveryArtifact};
+
+    let home = tempfile::tempdir().unwrap();
+    let identity_dir = home.path().join(".harmony");
+    std::fs::create_dir_all(&identity_dir).unwrap();
+
+    // Plant an existing owner where the child will look.
+    let _passphrase_guard = EnvVarGuard::set("HARMONY_PASSPHRASE", CHILD_PASSPHRASE);
+    let MintResult {
+        state,
+        recovery_artifact,
+        device_signing_key,
+    } = mint_owner(1_700_000_050).unwrap();
+    let installed_owner_id = state.owner_id;
+    let installed_seed = *recovery_artifact.as_bytes();
+    harmony_app::owner_state::save_owner_state_atomic(
+        &identity_dir,
+        &state,
+        &device_signing_key,
+        Some(&installed_seed),
+        None,
+    )
+    .unwrap();
+
+    // Back the restore file with a DIFFERENT owner's mnemonic so a silent
+    // partial overwrite would be observable (the installed owner-id would
+    // change). (CodeRabbit round 1.)
+    let MintResult {
+        recovery_artifact: other_artifact,
+        ..
+    } = mint_owner(1_700_000_100).unwrap();
+    let other_seed = *other_artifact.as_bytes();
+    assert_ne!(
+        installed_seed, other_seed,
+        "test setup: backup must be a different owner"
+    );
+    let words = RecoveryArtifact::from_seed(other_seed).to_mnemonic();
+    let mnemonic_path = home.path().join("owner-backup.txt");
+    std::fs::write(&mnemonic_path, words.as_str()).unwrap();
+
+    let out = run_cli(
+        home.path(),
+        &[
+            "restore",
+            "owner-mnemonic",
+            "--mnemonic-file",
+            mnemonic_path.to_str().unwrap(),
+        ],
+        "info",
+    );
+    assert_eq!(
+        out.code,
+        Some(1),
+        "restore must refuse an existing owner without --force; stderr: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("--force"),
+        "stderr must point at --force; got: {}",
+        out.stderr
+    );
+
+    // The installed owner must be untouched — export still returns the ORIGINAL
+    // owner-id, proving no partial overwrite leaked through the refusal.
+    let exported = run_cli(home.path(), &["export", "owner-mnemonic"], "info");
+    assert_eq!(exported.code, Some(0), "stderr: {}", exported.stderr);
+    assert!(
+        exported
+            .stderr
+            .contains(&format!("owner-id: {}", hex::encode(installed_owner_id))),
+        "installed owner must remain intact after a refused restore; got: {}",
+        exported.stderr
+    );
+}
+
 /// Pins the discoverability half of the rename/document fix: `export --help`
 /// must list both seeds so an operator backing up "their identity" can see
 /// there are two different artifacts before picking one.
