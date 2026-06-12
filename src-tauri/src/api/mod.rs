@@ -195,12 +195,16 @@ pub async fn start_server(
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> Result<(ServerHandle, tokio::task::JoinHandle<()>), String> {
     let api_dir = data_dir.join("api");
-    let token = auth::generate_token();
-    auth::write_token_file(&api_dir, &token)?;
+    // Bind BEFORE writing discovery files: the token file's existence signals
+    // "server is live" to readers, so it must not precede the bind that
+    // decides whether that's true (a failed bind would orphan a token that
+    // authenticates to nothing).
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", requested_port))
         .await
         .map_err(|e| format!("bind 127.0.0.1:{requested_port}: {e}"))?;
     let bound_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let token = auth::generate_token();
+    auth::write_token_file(&api_dir, &token)?;
     std::fs::write(api_dir.join("port"), bound_port.to_string())
         .map_err(|e| format!("write port file: {e}"))?;
     let ctx = ApiCtx {
