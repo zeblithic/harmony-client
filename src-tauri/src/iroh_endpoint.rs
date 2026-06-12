@@ -208,17 +208,30 @@ impl IrohEndpoint {
     }
 }
 
-/// Load a persisted iroh `SecretKey` from the OS keychain, or generate
-/// and persist a fresh one on first run.
+/// Load a persisted iroh `SecretKey`, or generate and persist a fresh one on
+/// first run.
 ///
 /// Returns `(secret_key, freshly_created)` so callers can know whether a
 /// new identity was just minted (true) or an existing entry was loaded
 /// (false). The `freshly_created` flag drives the first-run welcome
 /// modal in `start_node` (ZEB-331).
 ///
-/// On keychain read failure we surface [`IrohEndpointError::Keychain`]
-/// rather than silently re-generating — losing the secret key changes
-/// our [`EndpointId`], breaking any peer that knew us by the old id.
+/// ZEB-449: the key is sourced via
+/// [`crate::identity::app_key_or_create_with_fallback`] with
+/// [`VaultSlot::Iroh`](crate::identity::VaultSlot::Iroh). It **prefers the OS
+/// keychain vault** but falls back to an encrypted file at
+/// `~/.harmony/iroh_sk.enc` (resolved via
+/// [`resolve_path`](crate::identity::resolve_path) +
+/// [`EncryptedFileStore::from_env`](crate::identity::EncryptedFileStore)) when
+/// the keychain is unavailable or unusable — so headless / kill-switched nodes
+/// still get a transport key instead of booting with transport disabled. The
+/// fallback is **lazy**: the path is resolved and the passphrase env parsed only
+/// when the keychain fails, so a malformed `HARMONY_PASSPHRASE` or a missing
+/// `HOME` never breaks a working keychain. Read/create failures (keychain *or*
+/// file) map to [`IrohEndpointError::Vault`]; only the legacy-entry construction
+/// above maps to [`IrohEndpointError::Keychain`]. We never silently re-generate:
+/// losing the secret key changes our [`EndpointId`], breaking any peer that knew
+/// us by the old id.
 ///
 /// # Freshness testing note
 ///

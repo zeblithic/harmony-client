@@ -949,6 +949,25 @@ mod vault_tests {
     }
 
     #[test]
+    fn keychain_consistency_errors_are_terminal_not_fallthrough() {
+        // Post-write/consistency failures must abort (not flap to the file),
+        // while backend-availability failures are safe to fall through. Pins the
+        // classifier the fallthrough branch keys off. (CodeRabbit.)
+        assert!(is_keychain_consistency_error(
+            "secret-vault read-back mismatch after fold; legacy item retained"
+        ));
+        assert!(is_keychain_consistency_error(
+            "secret vault disappeared immediately after write"
+        ));
+        assert!(!is_keychain_consistency_error(
+            "legacy keychain item read failed: platform error"
+        ));
+        assert!(!is_keychain_consistency_error(
+            "OS keychain disabled via HARMONY_DISABLE_KEYCHAIN (ZEB-428)"
+        ));
+    }
+
+    #[test]
     fn accessor_without_vault_item_falls_back_to_legacy() {
         // Empty mock store: load_vault() -> None (headless / no-keychain seed).
         let store = KeychainStore::new_mock();
@@ -1337,6 +1356,12 @@ where
     if let Some(store) = keychain {
         match vault_app_key_or_create_with_store(store, slot, legacy) {
             Ok(result) => return Ok(result),
+            // A post-write/consistency failure means the keychain was already
+            // mutated (the key may now live there), so falling through to the
+            // file would let THIS boot use a file key while the NEXT boot
+            // re-prefers the keychain key — flapping the EndpointId. Terminal:
+            // surface it rather than silently diverging the identity. (CodeRabbit.)
+            Err(e) if is_keychain_consistency_error(&e) => return Err(e),
             Err(e) => {
                 tracing::warn!(
                     "keychain unusable for the app-local key ({e}); trying the encrypted-file fallback"
@@ -1364,9 +1389,32 @@ where
             use rand::RngCore;
             rand::rngs::OsRng.fill_bytes(key.as_mut());
             enc.save(&key)?;
+            // The key now lives durably in the file. Best-effort drop any stale
+            // legacy keychain item so a later boot with a recovered keychain
+            // can't shadow this file key. No-ops on a broken/absent backend;
+            // mirrors owner_state::save_secret. (Cursor.)
+            if let Err(e) = legacy.delete_credential() {
+                if !matches!(e, keyring::Error::NoEntry) {
+                    tracing::warn!(
+                        "could not delete stale legacy app-local keychain item after file save: {e}"
+                    );
+                }
+            }
             Ok((key, true))
         }
     }
+}
+
+/// Post-write/consistency failures from [`vault_app_key_or_create_with_store`]:
+/// the keychain was already mutated but the verify/read-back failed, so the key
+/// may now be in the keychain. These must NOT fall through to the encrypted-file
+/// fallback — doing so would flap the iroh `EndpointId` across boots (file key
+/// this boot, keychain key the next). Only backend-availability errors are safe
+/// to fall through. Matched on the messages the accessor emits after a write
+/// (`secret-vault read-back mismatch after fold`, `secret vault disappeared
+/// immediately after write`).
+fn is_keychain_consistency_error(err: &str) -> bool {
+    err.contains("read-back mismatch") || err.contains("disappeared immediately after write")
 }
 
 /// Serializes read-modify-write sequences against the single consolidated
