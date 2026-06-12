@@ -61,6 +61,11 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
     let _g1 = common::set_env("HOME", &home_str);
     let _g2 = common::set_env("USERPROFILE", &home_str);
     let _g3 = common::set_env("HARMONY_PASSPHRASE", "api-server-test-pp");
+    // dirs::data_dir() prefers XDG_DATA_HOME (Linux) / APPDATA (Windows)
+    // over HOME-derived paths — pin both into the tempdir so a CI/dev
+    // environment that sets them can't leak the profile outside it.
+    let _g4 = common::set_env("XDG_DATA_HOME", &format!("{home_str}/xdg-data"));
+    let _g5 = common::set_env("APPDATA", &format!("{home_str}/appdata"));
 
     // Read-only safety check BEFORE any node boot writes anything: with
     // HOME tempdir'd, dirs::data_dir() follows the platform convention

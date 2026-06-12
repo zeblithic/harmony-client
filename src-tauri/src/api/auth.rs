@@ -16,13 +16,31 @@ pub fn generate_token() -> String {
 pub fn write_token_file(dir: &Path, token: &str) -> Result<std::path::PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let path = dir.join("token");
-    std::fs::write(&path, token).map_err(|e| format!("write {}: {e}", path.display()))?;
+    // Create with 0600 at open time and tighten any pre-existing file BEFORE
+    // the token bytes land — a write-then-chmod sequence would expose the
+    // token under permissive umasks for the gap between the two calls.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        // `mode(0o600)` only applies at creation; a stale token file from a
+        // previous run keeps its old bits, so tighten explicitly while the
+        // file is still empty.
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("chmod {}: {e}", path.display()))?;
     }
+    use std::io::Write;
+    f.write_all(token.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     // Windows: user-profile default ACLs already restrict to the owner.
     Ok(path)
 }

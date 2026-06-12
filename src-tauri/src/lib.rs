@@ -15495,21 +15495,43 @@ pub fn serve_cli(api_port: Option<u16>) -> i32 {
         //  - `/v1/shutdown` RPC: the handler already sent on the channel;
         //    the server task ends and the select's second arm fires (the
         //    JoinHandle is already complete — do NOT poll it again).
+        // Either way the join OUTCOME decides the exit code: a server task
+        // that ended with a serve error or panic must not exit 0, or
+        // supervisors would mistake a crash for a clean shutdown.
+        fn eval_server_join(join: Result<Result<(), String>, tokio::task::JoinError>) -> i32 {
+            match join {
+                Ok(Ok(())) => 0,
+                Ok(Err(e)) => {
+                    eprintln!("serve: api server failed: {e}");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("serve: api server task aborted: {e}");
+                    1
+                }
+            }
+        }
         let mut server_task = server_task;
-        let server_already_done = tokio::select! {
+        let exit_code = tokio::select! {
             _ = wait_for_exit_signal() => {
                 let _ = shutdown_tx.send(()).await;
-                false
-            }
-            _ = &mut server_task => true,
-        };
-        if !server_already_done
-            && tokio::time::timeout(std::time::Duration::from_secs(10), &mut server_task)
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    &mut server_task,
+                )
                 .await
-                .is_err()
-        {
-            tracing::warn!("serve: server did not drain within 10s; continuing shutdown");
-        }
+                {
+                    Ok(join) => eval_server_join(join),
+                    Err(_) => {
+                        tracing::warn!(
+                            "serve: server did not drain within 10s; continuing shutdown"
+                        );
+                        1
+                    }
+                }
+            }
+            join = &mut server_task => eval_server_join(join),
+        };
 
         stop_inner(&state, None);
 
@@ -15518,7 +15540,7 @@ pub fn serve_cli(api_port: Option<u16>) -> i32 {
         // are rewritten on every server start).
         let _ = std::fs::remove_file(handle.api_dir.join("port"));
         let _ = std::fs::remove_file(handle.api_dir.join("token"));
-        0
+        exit_code
     })
 }
 

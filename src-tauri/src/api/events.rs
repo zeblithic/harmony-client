@@ -7,7 +7,6 @@
 // connect before acting.
 
 use crate::node_event_sink::NodeEventSink;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct EventFrame {
@@ -22,7 +21,9 @@ pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 pub struct ApiEventSink {
     tx: tokio::sync::broadcast::Sender<EventFrame>,
-    seq: AtomicU64,
+    // Mutex (not AtomicU64): assignment and send must be one critical
+    // section so delivered frames are seq-ordered — see emit().
+    seq: std::sync::Mutex<u64>,
 }
 
 impl ApiEventSink {
@@ -30,7 +31,7 @@ impl ApiEventSink {
         let (tx, _) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
         std::sync::Arc::new(Self {
             tx,
-            seq: AtomicU64::new(0),
+            seq: std::sync::Mutex::new(0),
         })
     }
 
@@ -41,11 +42,21 @@ impl ApiEventSink {
 
 impl NodeEventSink for std::sync::Arc<ApiEventSink> {
     fn emit(&self, event: &str, payload: serde_json::Value) {
+        // seq assignment and the broadcast send happen under one lock:
+        // with an atomic counter alone, two concurrent emitters could send
+        // out of seq order, breaking the gap-detection contract clients rely
+        // on. `broadcast::Sender::send` is non-blocking, so holding the std
+        // mutex across it is fine.
+        let mut seq = match self.seq.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let frame = EventFrame {
-            seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            seq: *seq,
             event: event.to_string(),
             payload,
         };
+        *seq += 1;
         // No subscribers is fine (send returns Err) — fire-and-forget.
         let _ = self.tx.send(frame);
     }

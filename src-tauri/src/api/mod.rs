@@ -193,7 +193,7 @@ pub async fn start_server(
     events: Arc<events::ApiEventSink>,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-) -> Result<(ServerHandle, tokio::task::JoinHandle<()>), String> {
+) -> Result<(ServerHandle, tokio::task::JoinHandle<Result<(), String>>), String> {
     let api_dir = data_dir.join("api");
     // Bind BEFORE writing discovery files: the token file's existence signals
     // "server is live" to readers, so it must not precede the bind that
@@ -218,12 +218,16 @@ pub async fn start_server(
         shutdown_tx,
     };
     let app = router(ctx);
+    // The task returns the serve outcome so the host (serve_cli) can exit
+    // non-zero on abnormal termination instead of mistaking a server crash
+    // for a clean shutdown.
     let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
+        axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.recv().await;
             })
-            .await;
+            .await
+            .map_err(|e| format!("api server: {e}"))
     });
     Ok((
         ServerHandle {
@@ -245,7 +249,7 @@ mod tests {
     /// from the discovery file, and the tempdir (held to keep it alive).
     async fn boot() -> (
         ServerHandle,
-        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<Result<(), String>>,
         String,
         tempfile::TempDir,
     ) {
@@ -361,6 +365,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
             .expect("server task must join within 5s of /v1/shutdown")
-            .expect("server task must not panic");
+            .expect("server task must not panic")
+            .expect("graceful shutdown must end the server cleanly (Ok)");
     }
 }
