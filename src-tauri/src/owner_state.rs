@@ -508,28 +508,53 @@ pub fn save_owner_state_atomic(
 
     let result = write();
     if result.is_err() {
-        // Roll the secret slots back to the prior identity so the unchanged
-        // owner_state.cbor stays consistent with its device key. Best-effort;
-        // the original error is preserved and returned.
-        if let Some(prev) = prev_device.as_deref() {
-            let _ = save_secret(
-                &keychain,
-                VaultSlot::Device,
-                KEYCHAIN_DEVICE_SK,
-                identity_dir,
-                "device_sk.enc",
-                prev,
-            );
+        // Roll EACH secret slot back to its prior state so the unchanged
+        // owner_state.cbor stays consistent. The inverse of a write is "restore
+        // the previous bytes if they existed, otherwise CLEAR the slot": leaving
+        // a newly-written secret whose prior state was absent (e.g. a fresh
+        // master_seed.enc over a cert-only/joiner install that had none) would
+        // make `canBackUp` lie. Best-effort; the original error is preserved.
+        match prev_device.as_deref() {
+            Some(prev) => {
+                let _ = save_secret(
+                    &keychain,
+                    VaultSlot::Device,
+                    KEYCHAIN_DEVICE_SK,
+                    identity_dir,
+                    "device_sk.enc",
+                    prev,
+                );
+            }
+            None => {
+                let _ = clear_secret(
+                    &keychain,
+                    VaultSlot::Device,
+                    KEYCHAIN_DEVICE_SK,
+                    identity_dir,
+                    "device_sk.enc",
+                );
+            }
         }
-        if let Some(prev) = prev_seed.as_deref() {
-            let _ = save_secret(
-                &keychain,
-                VaultSlot::OwnerMasterSeed,
-                KEYCHAIN_MASTER_SEED,
-                identity_dir,
-                "master_seed.enc",
-                prev,
-            );
+        match prev_seed.as_deref() {
+            Some(prev) => {
+                let _ = save_secret(
+                    &keychain,
+                    VaultSlot::OwnerMasterSeed,
+                    KEYCHAIN_MASTER_SEED,
+                    identity_dir,
+                    "master_seed.enc",
+                    prev,
+                );
+            }
+            None => {
+                let _ = clear_secret(
+                    &keychain,
+                    VaultSlot::OwnerMasterSeed,
+                    KEYCHAIN_MASTER_SEED,
+                    identity_dir,
+                    "master_seed.enc",
+                );
+            }
         }
     }
     result
@@ -1063,6 +1088,61 @@ mod persistence_tests {
             loaded.master_seed.as_deref(),
             Some(&a_seed),
             "master seed must roll back to A's after the failed overwrite"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_owner_state_atomic_rollback_clears_seed_absent_in_prior_state() {
+        // Cursor: if the PRIOR state had no master seed (cert-only / joiner) and
+        // a failed overwrite wrote a fresh master_seed.enc, rollback must CLEAR
+        // it — not just skip it. Leaving the new seed would make `canBackUp` lie
+        // (seed on disk, but the unchanged owner_state.cbor never had one). The
+        // correct inverse of a write is "restore prior value OR remove if none".
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "rollback-clear-test-pp");
+        let dir = tempdir().unwrap();
+
+        // Plant a prior state with NO master seed (cert-only): save with `None`.
+        let a = mint_owner(1_700_000_000).unwrap();
+        save_owner_state_atomic(dir.path(), &a.state, &a.device_signing_key, None, None)
+            .expect("plant cert-only A");
+        assert!(
+            !dir.path().join("master_seed.enc").exists(),
+            "precondition: prior state has no master seed on disk"
+        );
+
+        // Make the cbor write fail.
+        let cbor = dir.path().join(OWNER_STATE_FILENAME);
+        std::fs::remove_file(&cbor).unwrap();
+        std::fs::create_dir(&cbor).unwrap();
+        std::fs::write(cbor.join("blocker"), b"x").unwrap();
+
+        // Attempt an overwrite that WRITES a master seed, failing at the cbor.
+        let b = mint_owner(1_700_000_100).unwrap();
+        let b_seed = *b.recovery_artifact.as_bytes();
+        let err = save_owner_state_atomic(
+            dir.path(),
+            &b.state,
+            &b.device_signing_key,
+            Some(&b_seed),
+            None,
+        )
+        .expect_err("cbor write onto a non-empty dir must fail");
+        assert!(
+            err.contains("owner_state.cbor"),
+            "expected a cbor write error; got: {err}"
+        );
+
+        // Rollback must have CLEARED the newly-written seed (prior had none).
+        std::fs::remove_dir_all(&cbor).unwrap();
+        save_owner_state_cbor_only(dir.path(), &a.state).expect("re-plant A cbor");
+        let loaded = load_owner_state(dir.path(), None)
+            .expect("load")
+            .expect("Some");
+        assert!(
+            loaded.master_seed.is_none(),
+            "a master seed written during a failed overwrite must be rolled back (cleared) \
+             when the prior state had none"
         );
     }
 
