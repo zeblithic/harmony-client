@@ -1132,6 +1132,29 @@ impl NodeState {
         self.thread.is_some()
     }
 
+    /// ZEB-445: status surface helpers for the API server.
+    #[allow(dead_code)] // ZEB-445: consumed by api module (next task)
+    pub(crate) fn node_is_running(&self) -> bool {
+        self.thread.is_some()
+    }
+
+    /// ZEB-445: status surface helpers for the API server.
+    #[allow(dead_code)] // ZEB-445: consumed by api module (next task)
+    pub(crate) fn generation_for_status(&self) -> u64 {
+        self.generation
+    }
+
+    /// ZEB-445: status surface helpers for the API server.
+    #[allow(dead_code)] // ZEB-445: consumed by api module (next task)
+    pub(crate) fn owner_id_hex_for_status(&self) -> Option<String> {
+        // Hex of the loaded owner identity, if any. `dm_self_owner` is the
+        // canonical "owner loaded" handle (captured at start_node alongside
+        // the OWNER_NOT_LOADED_MSG-guarded handles; nulled on identity
+        // restore). Encoding matches the existing convention everywhere an
+        // OwnerAddr crosses to hex (`hex::encode(owner.0)`).
+        self.dm_self_owner.map(|o| hex::encode(o.0))
+    }
+
     /// ZEB-321 Phase 1 PR #157 round 2 (CodeRabbit): abort the iroh
     /// background tasks and drop all iroh-related Arcs in one place.
     /// Called from both `stop_inner` and the identity-rebuild path
@@ -7611,14 +7634,24 @@ pub(crate) async fn start_node_inner(
 /// Stop the harmony node and clean up.
 #[tauri::command]
 fn stop_node(app: AppHandle, state: tauri::State<'_, Mutex<NodeState>>) -> Result<(), String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    stop_node_impl(state.inner(), sink)
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) fn stop_node_impl(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+) -> Result<(), String> {
     let gen = {
         let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.generation
     };
-    let stopped = stop_inner(&state, Some(gen));
+    let stopped = stop_inner(state, Some(gen));
     // Only emit disconnected if we actually stopped a running node.
     if stopped {
-        let _ = app.emit(
+        crate::node_event_sink::emit_ser(
+            sink.as_ref(),
             "zenoh-status",
             &ZenohStatus {
                 status: "disconnected".to_string(),
@@ -40967,6 +41000,13 @@ pub struct PeerReachabilityDto {
 async fn connectivity_get_my_reachability_record(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Option<ReachabilityRecordDto>, String> {
+    connectivity_get_my_reachability_record_impl(state.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn connectivity_get_my_reachability_record_impl(
+    state: &std::sync::Mutex<NodeState>,
+) -> Result<Option<ReachabilityRecordDto>, String> {
     let g = state
         .lock()
         .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -41012,6 +41052,13 @@ async fn connectivity_get_my_identity_pub_hex(
 #[tauri::command]
 async fn connectivity_list_peer_reachability(
     state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<PeerReachabilityDto>, String> {
+    connectivity_list_peer_reachability_impl(state.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn connectivity_list_peer_reachability_impl(
+    state: &std::sync::Mutex<NodeState>,
 ) -> Result<Vec<PeerReachabilityDto>, String> {
     let g = state
         .lock()
@@ -41138,6 +41185,13 @@ impl crate::network_health::PkarrSnapshot for StubEmptyPkarrSnapshot {
 async fn network_health_snapshot(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<crate::network_health::NetworkHealthSnapshot, String> {
+    network_health_snapshot_impl(state.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn network_health_snapshot_impl(
+    state: &std::sync::Mutex<NodeState>,
+) -> Result<crate::network_health::NetworkHealthSnapshot, String> {
     let (svc, settings_path, relay_client) = {
         let g = state
             .lock()
@@ -41182,6 +41236,13 @@ async fn network_health_snapshot(
 #[tauri::command]
 async fn network_health_run_self_test(
     state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<crate::network_health::SelfTestReport, String> {
+    network_health_run_self_test_impl(state.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn network_health_run_self_test_impl(
+    state: &std::sync::Mutex<NodeState>,
 ) -> Result<crate::network_health::SelfTestReport, String> {
     // Snapshot every handle we need under the lock, then drop it before awaiting.
     let (svc, iroh_endpoint, pkarr_relay_client, identity_pub_64, publisher, settings_path) = {

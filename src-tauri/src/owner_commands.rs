@@ -161,6 +161,13 @@ pub async fn get_owner_state(
     _app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<Option<OwnerStateView>, String> {
+    get_owner_state_impl(state.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn get_owner_state_impl(
+    state: &std::sync::Mutex<crate::NodeState>,
+) -> Result<Option<OwnerStateView>, String> {
     // ZEB-418 P2 D17: snapshot the fleet-net pinned device ID before entering
     // the blocking task. Reads under the NodeState lock; the Arc clone is cheap
     // and the tokio Mutex lock is async — we do it here (async context) and pass
