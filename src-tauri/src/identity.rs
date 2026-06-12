@@ -2098,14 +2098,14 @@ pub fn passphrase_env_configured() -> bool {
     if std::env::var("HARMONY_PASSPHRASE").is_ok_and(|v| !v.trim().is_empty()) {
         return true;
     }
-    // A passphrase FILE only counts when it is actually readable —
-    // catching a typo'd path here, at the fail-fast gate, beats a vault
-    // error mid-boot (PR #245 round 1, CodeAnt).
+    // A passphrase FILE only counts when it is readable AND non-blank —
+    // catching a typo'd path or empty file here, at the fail-fast gate,
+    // beats a vault error mid-boot (PR #245 rounds 1-2, CodeAnt + Cursor).
     std::env::var("HARMONY_PASSPHRASE_FILE")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .is_some_and(|p| std::fs::metadata(p).is_ok())
+        .is_some_and(|p| std::fs::read_to_string(p).is_ok_and(|s| !s.trim().is_empty()))
 }
 
 /// Internal resolution chain — accepts injected stores for testability.
