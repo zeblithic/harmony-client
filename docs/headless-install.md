@@ -427,3 +427,49 @@ mode's `500` bodies unchanged, and vice versa.
   only — no replay, no resume. A slow consumer that falls behind receives an
   explicit `{"event": "_lagged"}` marker frame and continues from the live
   edge; re-fetch state via RPC after a lag marker.
+
+### GUI-mode opt-in (`HARMONY_API_PORT`)
+
+A windowed (GUI) instance hosts the identical API when launched with
+`HARMONY_API_PORT` set (env var only in v1 — no flag):
+
+```bash
+HARMONY_API_PORT=7420 harmony-app        # fixed port
+HARMONY_API_PORT=0 harmony-app           # OS-assigned; read <data-dir>/api/port
+```
+
+Behavior notes:
+
+- Auth, discovery files, and the profile lock are identical to `serve`.
+- Every node event reaches the webview **and** the WS firehose.
+- If the profile lock is already held (e.g. a `serve` process on the same
+  profile), the GUI launches normally but the API stays **disabled** — look
+  for `ZEB-452: profile lock unavailable` in the log. The lock exists
+  because two nodes on one profile race state files; don't mix `serve` and
+  a GUI on the same profile.
+- `POST /v1/shutdown` quits the whole app gracefully (the API analogue of
+  tray → Quit). A GUI quit by any other path may leave stale
+  `<data-dir>/api/{port,token}` files behind; they are rewritten on every
+  server start and are safe to ignore or delete.
+
+### CLI client (`harmony-app api`)
+
+No new binary — two subcommand forms on the existing app, reading
+`<data-dir>/api/{port,token}`:
+
+```bash
+# One-shot RPC: result JSON on stdout, exit 0.
+harmony-app api get_owner_state
+harmony-app api create_community '{"name":"testbed","isInviteOnly":true}'
+
+# Event firehose: one {seq,event,payload} JSON frame per line until ^C.
+harmony-app api --events
+```
+
+Exit codes: `0` success · `1` server-reported error (the error JSON goes
+to stderr — same strings the GUI sees) · `2` local failure (server not
+running / discovery files missing / args not valid JSON / bad usage).
+
+Stdout carries ONLY the result JSON or event frames (PR #231 stdout-purity
+discipline); logs and errors go to stderr, so `harmony-app api ... | jq .`
+is always safe. `curl`/`websocat` remain first-class alternatives.
