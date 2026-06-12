@@ -25816,20 +25816,40 @@ async fn cleanup_community_data(
 /// best-effort/unavailable, the cleanup is deferred — the in-memory tombstone
 /// re-arms the debounce and a later `remove_space` retries.
 async fn cleanup_community_data_if_durable(
+    state: &std::sync::Mutex<NodeState>,
+    snapshot_generation: u64,
     sync_engine: &Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
     community_registry: &Option<std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>>,
     space_id: &crate::owner_state_types::SpaceId,
     id_hex: &str,
-) {
-    if fence_remove_space_flush(sync_engine, id_hex).await {
-        cleanup_community_data(community_registry, space_id, id_hex).await;
-    } else {
+) -> Result<(), String> {
+    if !fence_remove_space_flush(sync_engine, id_hex).await {
         tracing::warn!(
             space_id = %id_hex,
             "remove_space: tombstone not durably flushed — keeping the community \
              data until a later remove_space confirms durability"
         );
+        return Ok(());
     }
+    // Re-validate the node generation IMMEDIATELY before the destructive delete
+    // (Cursor): the fence + teardown are awaited after the pre-tombstone check,
+    // so a concurrent stop/start_node in that gap would leave these snapshot
+    // handles detached while the LIVE node has a fresh engine + active community
+    // for this id — deleting its dir would be data loss. Abort instead.
+    {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during remove_space (was {snapshot_generation}, \
+                 now {}); skipped on-disk cleanup — retry on the current node",
+                g.generation
+            ));
+        }
+    }
+    cleanup_community_data(community_registry, space_id, id_hex).await;
+    Ok(())
 }
 
 /// ZEB-435: best-effort filesystem delete of a community's on-disk dir
@@ -25932,16 +25952,19 @@ pub(crate) async fn remove_space_impl(
             None => {
                 if g.tombstones.contains(&space_id) {
                     drop(g);
-                    // Retry the cleanup, but through the SAME durable-flush gate
-                    // as the first removal — never delete bytes while the
-                    // tombstone is still only in memory (Cursor).
+                    // Retry the cleanup, but through the SAME durable-flush +
+                    // generation gate as the first removal — never delete bytes
+                    // while the tombstone is only in memory or the node has been
+                    // swapped out from under us (Cursor).
                     cleanup_community_data_if_durable(
+                        state,
+                        snapshot_generation,
                         &sync_engine,
                         &community_registry,
                         &space_id,
                         &id_hex,
                     )
-                    .await;
+                    .await?;
                     return Ok(());
                 }
                 return Err(format!("no space {id_hex} to remove"));
@@ -25986,16 +26009,19 @@ pub(crate) async fn remove_space_impl(
                 let mut g = crdt_state.lock().await;
                 g.tombstone_space(space_id);
             }
-            // Delete the on-disk data ONLY once the tombstone is durably flushed,
-            // so a crash can't resurrect the Space pointing at deleted bytes
-            // (Qodo). When not durable the cleanup is deferred to a later call.
+            // Delete the on-disk data ONLY once the tombstone is durably flushed
+            // (Qodo) AND the node generation still matches (Cursor) — otherwise
+            // the cleanup is deferred / aborted, never destroying bytes a crash
+            // or a restarted node would leave un-tombstoned.
             cleanup_community_data_if_durable(
+                state,
+                snapshot_generation,
                 &sync_engine,
                 &community_registry,
                 &space_id,
                 &id_hex,
             )
-            .await;
+            .await?;
         }
         SpaceKind::Dm | SpaceKind::GroupDm | SpaceKind::Channel | SpaceKind::PublicChannel => {
             check_generation()?;
