@@ -159,6 +159,13 @@ if-watch = { version = "3", features = ["tokio"] }
 # entry just makes `if_addrs::get_if_addrs()` importable.
 if-addrs = "0.15"
 tauri-plugin-fs = "2.5.1"
+# ZEB-445 API control surface: axum hosts the localhost HTTP+WS control
+# surface (already in the lock via harmony-pkarr's dev-only test-fixtures;
+# this entry promotes it to a production dep). fd-lock provides the OS
+# advisory one-node-per-profile lock (released automatically on process
+# death, so stale-lock reclaim needs no PID-liveness logic).
+axum = { version = "0.8", features = ["ws"] }
+fd-lock = "4"
 
 [dev-dependencies]
 serial_test = "3"
