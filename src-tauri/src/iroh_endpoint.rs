@@ -235,15 +235,38 @@ pub fn load_or_create_secret_key() -> Result<(SecretKey, bool), IrohEndpointErro
     // item. `vault_app_key_or_create` folds in (and deletes) any pre-existing
     // legacy item — preserving the EndpointId — and otherwise generates a fresh
     // key, all within the one item so macOS prompts for keychain access once.
-    let legacy = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| {
-        IrohEndpointError::Keychain {
-            context: format!("legacy entry creation {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
-            source: e,
-        }
-    })?;
-    let (key_bytes, freshly_created) =
-        crate::identity::vault_app_key_or_create(crate::identity::VaultSlot::Iroh, &legacy)
-            .map_err(|context| IrohEndpointError::Vault { context })?;
+    // ZEB-449: keychain preferred, with an encrypted-file fallback (`iroh.enc`
+    // next to `identity.enc`) for boxes with no keychain backend — RPi5 headless
+    // nodes, or a run with `HARMONY_DISABLE_KEYCHAIN`. Before this the iroh key
+    // was keychain-only, so a keychain-less node booted with no transport (the
+    // ZEB-450 silent failure). `KeychainStore::new()` already returns `Err` (→
+    // `None`) when the keychain is disabled/absent, so `.ok()` selects the file
+    // path automatically; a healthy desktop keeps using the keychain unchanged.
+    let keychain = crate::identity::KeychainStore::new().ok();
+    // The legacy per-item keychain entry is only consulted on the keychain path.
+    // Build it ONLY when a keychain exists: constructing a `keyring::Entry` can
+    // itself fail on a backend-less host, and that must not block the file
+    // fallback (the whole point of ZEB-449).
+    let legacy = match keychain {
+        Some(_) => Some(
+            keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| {
+                IrohEndpointError::Keychain {
+                    context: format!("legacy entry creation {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
+                    source: e,
+                }
+            })?,
+        ),
+        None => None,
+    };
+    let enc = crate::identity::iroh_key_file_store()
+        .map_err(|context| IrohEndpointError::Vault { context })?;
+    let (key_bytes, freshly_created) = crate::identity::vault_app_key_or_create_with_fallback(
+        crate::identity::VaultSlot::Iroh,
+        keychain.as_ref(),
+        legacy.as_ref(),
+        enc.as_ref(),
+    )
+    .map_err(|context| IrohEndpointError::Vault { context })?;
     Ok((SecretKey::from_bytes(&key_bytes), freshly_created))
 }
 

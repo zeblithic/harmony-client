@@ -846,6 +846,102 @@ mod vault_tests {
         assert_eq!(*key2, *key);
     }
 
+    // ── ZEB-449: encrypted-file fallback for app-local vault keys ────────────
+    // The iroh secret key (and any `vault_app_key_or_create` slot) was
+    // keychain/legacy-only: on a box with no keychain backend (RPi5 headless,
+    // or HARMONY_DISABLE_KEYCHAIN set) the key could not be created → no
+    // transport (ZEB-450). These pin the keychain-preferred → encrypted-file
+    // degrade, mirroring `owner_state::load_secret`/`save_secret` and the node
+    // seed's own keychain→identity.enc chain.
+
+    fn enc_store(dir: &std::path::Path, name: &str) -> EncryptedFileStore {
+        EncryptedFileStore::new(
+            dir.join(name),
+            secrecy::SecretString::from("zeb449-test".to_string()),
+        )
+    }
+
+    #[test]
+    fn fallback_generates_and_persists_to_encrypted_file_when_no_keychain() {
+        // keychain absent (None) + an encrypted-file store configured =>
+        // generate a fresh key, persist it to the file (fresh=true). A second
+        // boot reads the SAME key back from the file (fresh=false), so the iroh
+        // EndpointId is stable across restarts on a keychain-less node.
+        let dir = tempfile::tempdir().unwrap();
+        let enc = enc_store(dir.path(), "iroh.enc");
+        let legacy = mock_entry();
+
+        let (key, fresh) =
+            vault_app_key_or_create_with_fallback(VaultSlot::Iroh, None, Some(&legacy), Some(&enc))
+                .expect("file fallback must create the key when the keychain is absent");
+        assert!(fresh, "no keychain + empty file => freshly created");
+        assert!(
+            dir.path().join("iroh.enc").exists(),
+            "the iroh key persisted to the encrypted file"
+        );
+
+        // Re-open via a fresh store (same passphrase) to prove durability.
+        let enc2 = enc_store(dir.path(), "iroh.enc");
+        let legacy2 = mock_entry();
+        let (key2, fresh2) = vault_app_key_or_create_with_fallback(
+            VaultSlot::Iroh,
+            None,
+            Some(&legacy2),
+            Some(&enc2),
+        )
+        .expect("second boot loads from the file");
+        assert_eq!(*key2, *key, "same key reloaded from the encrypted file");
+        assert!(
+            !fresh2,
+            "a key reloaded from the file is not freshly created"
+        );
+    }
+
+    #[test]
+    fn fallback_errors_clearly_when_no_keychain_and_no_encrypted_file() {
+        // keychain absent AND no passphrase-configured file => a LOUD, specific
+        // error (the key cannot be created/persisted), not a silent
+        // transport-off. The message must name the remediation (ZEB-450).
+        let legacy = mock_entry();
+        let err = vault_app_key_or_create_with_fallback(VaultSlot::Iroh, None, Some(&legacy), None)
+            .expect_err("no store anywhere must be an explicit, hard error");
+        assert!(
+            err.contains("HARMONY_PASSPHRASE") || err.to_lowercase().contains("keychain"),
+            "error must name the remediation (keychain or passphrase): {err}"
+        );
+    }
+
+    #[test]
+    fn fallback_prefers_keychain_and_leaves_file_untouched() {
+        // With a healthy keychain present, the keychain path is authoritative:
+        // the key lands in the vault and the encrypted file is never written.
+        let store = KeychainStore::new_mock();
+        store
+            .save_vault(&SecretVault::from_seed([1u8; BLOB_LEN]))
+            .unwrap();
+        let legacy = mock_entry();
+        let dir = tempfile::tempdir().unwrap();
+        let enc = enc_store(dir.path(), "iroh.enc");
+
+        let (key, fresh) = vault_app_key_or_create_with_fallback(
+            VaultSlot::Iroh,
+            Some(&store),
+            Some(&legacy),
+            Some(&enc),
+        )
+        .unwrap();
+        assert!(fresh, "fresh generate into the keychain vault");
+        assert_eq!(
+            store.load_vault().unwrap().unwrap().iroh_secret_key,
+            Some(*key),
+            "generated key folded into the keychain vault"
+        );
+        assert!(
+            !dir.path().join("iroh.enc").exists(),
+            "the encrypted file is not written when the keychain is healthy"
+        );
+    }
+
     #[test]
     fn load_slot_returns_vault_value_and_migrates_legacy() {
         // (a) value already in the vault.
@@ -1160,6 +1256,85 @@ pub fn vault_app_key_or_create(
 ) -> Result<(Zeroizing<[u8; 32]>, bool), String> {
     let store = KeychainStore::new()?;
     vault_app_key_or_create_with_store(&store, slot, legacy)
+}
+
+/// ZEB-449: load-or-create an app-local vault key (e.g. the iroh transport
+/// secret) with an **encrypted-file fallback** when no OS keychain is available.
+///
+/// Before this, `vault_app_key_or_create` did `KeychainStore::new()?` and had no
+/// file backend: on a box with no keychain (RPi5 headless, or
+/// `HARMONY_DISABLE_KEYCHAIN` set) the key could not be created, so the iroh key
+/// failed to load and transport went silently dark (ZEB-450). This mirrors the
+/// node seed's own keychain→`identity.enc` chain and `owner_state`'s
+/// `load_secret`/`save_secret`: the device's other secrets (owner master seed,
+/// device key) already degrade to an encrypted file — the iroh key was the lone
+/// keychain-only holdout.
+///
+/// Resolution: keychain **preferred** → encrypted file → hard error.
+/// - `keychain = Some` → the existing keychain+legacy path
+///   ([`vault_app_key_or_create_with_store`]), unchanged. The keychain stays
+///   authoritative, so a healthy desktop is byte-for-byte unaffected.
+/// - `keychain = None` (disabled/unavailable) + `encrypted = Some` → read the
+///   key from the dedicated encrypted file (its `seed` slot, as `owner_state`
+///   stores `device_sk.enc`/`master_seed.enc`); generate + persist a fresh one
+///   if the file is empty. A decrypt error propagates rather than silently
+///   re-minting, since a new key changes the iroh `EndpointId` and orphans peers.
+/// - neither store → a loud, specific error naming the remediation (ZEB-450),
+///   not a silent transport-off.
+///
+/// Known edge (documented, not handled): enabling the keychain *after* a
+/// keychain-less run leaves the key in the encrypted file while the empty
+/// keychain mints a new one → `EndpointId` churn. The node seed has the same
+/// keychain-preferred property; cross-store migration is out of scope here.
+pub(crate) fn vault_app_key_or_create_with_fallback(
+    slot: VaultSlot,
+    keychain: Option<&KeychainStore>,
+    legacy: Option<&keyring::Entry>,
+    encrypted: Option<&EncryptedFileStore>,
+) -> Result<(Zeroizing<[u8; 32]>, bool), String> {
+    if let Some(store) = keychain {
+        // The legacy per-item keychain entry is only consulted on the keychain
+        // path; the caller builds it only when a keychain exists (constructing a
+        // `keyring::Entry` can itself fail on a backend-less host, which must not
+        // block the file fallback below).
+        let legacy = legacy
+            .ok_or_else(|| "internal: keychain present without a legacy entry".to_string())?;
+        return vault_app_key_or_create_with_store(store, slot, legacy);
+    }
+    // No keychain: the encrypted file is the only durable home for this key.
+    let Some(enc) = encrypted else {
+        return Err(format!(
+            "no secret store available for the {slot:?} app key: the OS keychain is \
+             unavailable and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE is not set, so \
+             the key cannot be created or persisted (ZEB-449/ZEB-450). Set \
+             HARMONY_PASSPHRASE_FILE or enable the keychain."
+        ));
+    };
+    match enc.load() {
+        Ok(Some(key)) => Ok((key, false)),
+        Ok(None) => {
+            let mut key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(key.as_mut());
+            enc.save(&key).map_err(|e| {
+                format!("persisting the {slot:?} app key to its encrypted file: {e}")
+            })?;
+            Ok((key, true))
+        }
+        Err(e) => Err(format!(
+            "reading the {slot:?} app key from its encrypted file: {e}"
+        )),
+    }
+}
+
+/// ZEB-449: the encrypted-file fallback store for the iroh transport key —
+/// `iroh.enc` alongside `identity.enc` and `owner_state`'s `device_sk.enc` /
+/// `master_seed.enc` in `~/.harmony`. `Ok(None)` when no passphrase
+/// (`HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`) is configured — then the
+/// keychain is the only backend.
+pub(crate) fn iroh_key_file_store() -> Result<Option<EncryptedFileStore>, String> {
+    let path = resolve_path(None)?.with_file_name("iroh.enc");
+    EncryptedFileStore::from_env(path)
 }
 
 /// Serializes read-modify-write sequences against the single consolidated
