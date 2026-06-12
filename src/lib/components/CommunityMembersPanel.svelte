@@ -15,6 +15,7 @@
     communityService,
     ownAddress,
     resolveCard,
+    resolveNickname,
     onOpenCard,
   }: {
     communityId: string;
@@ -27,6 +28,9 @@
      *  the channel view regardless of whether this panel is open. This panel is
      *  a pure consumer of the resolved map. */
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-432: optional local friend-nickname resolver (ZEB-419), preferred
+     *  over the profile-card name. Same pure-consumer contract as resolveCard. */
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
     /** ZEB-341: open the owner_id card popover for a clicked member. */
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
@@ -295,6 +299,7 @@
           {member}
           {viewer}
           {resolveCard}
+          {resolveNickname}
           {onOpenCard}
           onaction={(detail) => onMemberAction(detail)}
         />
@@ -313,6 +318,7 @@
               {member}
               {viewer}
               {resolveCard}
+              {resolveNickname}
               {onOpenCard}
               onaction={(detail) => onMemberAction(detail)}
             />

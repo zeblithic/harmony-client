@@ -34,6 +34,10 @@
     votingAdapter,
     /** ZEB-341: optional card resolver for author display names. */
     resolveCard,
+    /** ZEB-432: optional local friend-nickname resolver (ZEB-419). Takes
+     *  precedence over the broadcast profile-card name on message authors,
+     *  matching the members roster and the Friends panel. */
+    resolveNickname,
     /** ZEB-341: open the owner_id card popover for a message author. */
     onOpenCard,
   }: {
@@ -50,6 +54,7 @@
     forkedAtMs?: number;
     votingAdapter?: VotingAdapter;
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
     onOpenCard?: (
       payload: {
         ownerIdHex: string;
@@ -311,11 +316,23 @@
     return new Date(at.wallMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
+  // ZEB-432 label ladder (mirrors MemberRow / FriendsPanel): local friend
+  // nickname (ZEB-419) ► broadcast profile-card name (ZEB-341) ► truncated owner
+  // hex. Read through both resolvers so the reactive nickname map / card Map
+  // re-render the author label automatically.
+  function authorLabel(author: string): string {
+    return resolveNickname?.(author) ?? resolveCard?.(author)?.displayName ?? author.slice(0, 8);
+  }
+
   function handleAuthorClick(author: string, ev: MouseEvent) {
     // Resolve once — a single map lookup and a single reactive cardVersion read.
     const card = resolveCard?.(author);
     onOpenCard?.(
       {
+        // ZEB-432 (PR #240 review): the identity drill-down popover shows the
+        // SIGNED profile-card name, never the local nickname — a private label
+        // must not masquerade as the cryptographic identity (mirrors
+        // FriendsPanel). The inline author label stays nickname-first.
         ownerIdHex: author,
         displayName: card?.displayName ?? author.slice(0, 8),
         statusText: card?.statusText ?? '',
@@ -376,15 +393,15 @@
           </div>
           <div class="content-col">
             <header class="msg-meta">
-              <!-- ZEB-341 Task 1: show resolved display name when available (self-first, offline). -->
+              <!-- ZEB-341/ZEB-432: nickname ► profile-card name ► hex (authorLabel). -->
               {#if onOpenCard}
                 <button
                   type="button"
                   class="author author-btn"
                   onclick={(e) => handleAuthorClick(msg.author, e)}
-                >{resolveCard?.(msg.author)?.displayName ?? msg.author.slice(0, 8)}</button>
+                >{authorLabel(msg.author)}</button>
               {:else}
-                <span class="author">{resolveCard?.(msg.author)?.displayName ?? msg.author.slice(0, 8)}</span>
+                <span class="author">{authorLabel(msg.author)}</span>
               {/if}
               <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()}>{formatTimestamp(msg.at)}</time>
               {#if row.isPreFork}

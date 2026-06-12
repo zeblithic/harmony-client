@@ -162,3 +162,68 @@ describe('MemberRow kebab-matrix', () => {
     expect(getByRole('menuitem', { name: 'Demote to Moderator' })).toBeTruthy();
   });
 });
+
+describe('MemberRow display-name resolution (ZEB-432)', () => {
+  const ADDR = 'cc'.repeat(16);
+  const member = makeMember(0, 'joined', ADDR);
+  const viewer = { addr: VIEWER_ADDR, power: 0, isLastAdmin: false };
+
+  it('resolves the local friend nickname OVER the profile-card name and hex', () => {
+    const { getByText, queryByText } = render(MemberRow, {
+      props: {
+        member,
+        viewer,
+        resolveCard: (id: string) =>
+          id === ADDR ? { displayName: 'ZEBbot', statusText: '' } : undefined,
+        resolveNickname: (id: string) => (id === ADDR ? 'Jake-nick' : undefined),
+      },
+    });
+    expect(getByText('Jake-nick')).toBeTruthy();
+    // The card name must not win when a nickname exists.
+    expect(queryByText('ZEBbot')).toBeNull();
+  });
+
+  it('falls back to the profile-card name when there is no nickname', () => {
+    const { getByText } = render(MemberRow, {
+      props: {
+        member,
+        viewer,
+        resolveCard: (id: string) =>
+          id === ADDR ? { displayName: 'ZEBbot', statusText: '' } : undefined,
+        resolveNickname: () => undefined,
+      },
+    });
+    expect(getByText('ZEBbot')).toBeTruthy();
+  });
+
+  it('falls back to truncated hex when neither nickname nor card resolves', () => {
+    const { getByText } = render(MemberRow, {
+      props: {
+        member,
+        viewer,
+        resolveCard: () => undefined,
+        resolveNickname: () => undefined,
+      },
+    });
+    expect(getByText(ADDR.slice(0, 8))).toBeTruthy();
+  });
+
+  it('the owner-card popover carries the SIGNED card name, not the nickname (PR #240 review)', async () => {
+    const onOpenCard = vi.fn();
+    const { container } = render(MemberRow, {
+      props: {
+        member,
+        viewer,
+        resolveCard: (id: string) =>
+          id === ADDR ? { displayName: 'ZEBbot', statusText: '' } : undefined,
+        resolveNickname: (id: string) => (id === ADDR ? 'Jake-nick' : undefined),
+        onOpenCard,
+      },
+    });
+    const nameBtn = container.querySelector('.name-btn');
+    expect(nameBtn?.textContent).toContain('Jake-nick'); // inline label = nickname
+    await fireEvent.click(nameBtn!);
+    expect(onOpenCard).toHaveBeenCalled();
+    expect(onOpenCard.mock.calls[0][0].displayName).toBe('ZEBbot'); // popover = card name
+  });
+});
