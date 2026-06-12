@@ -472,4 +472,26 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
       expect(author?.textContent).toContain(AUTHOR.slice(0, 8));
     });
   });
+
+  it('the owner-card popover carries the SIGNED card name, not the nickname (PR #240 review)', async () => {
+    const onOpenCard = vi.fn();
+    const { adapter, container } = await setup({
+      onOpenCard,
+      resolveCard: (id: string) =>
+        id === AUTHOR ? { displayName: 'ZEBbot', statusText: 's' } : undefined,
+      resolveNickname: (id: string) => (id === AUTHOR ? 'Jake-nick' : undefined),
+    });
+    deliver(adapter);
+    let btn: Element | null = null;
+    await waitFor(() => {
+      btn = container.querySelector('.channel-message .author.author-btn');
+      expect(btn).toBeTruthy();
+    });
+    // Inline author label shows the nickname…
+    expect(btn!.textContent).toContain('Jake-nick');
+    await fireEvent.click(btn!);
+    // …but the identity drill-down popover gets the signed card name.
+    expect(onOpenCard).toHaveBeenCalled();
+    expect(onOpenCard.mock.calls[0][0].displayName).toBe('ZEBbot');
+  });
 });

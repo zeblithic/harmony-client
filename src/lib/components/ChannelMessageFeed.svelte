@@ -329,8 +329,12 @@
     const card = resolveCard?.(author);
     onOpenCard?.(
       {
+        // ZEB-432 (PR #240 review): the identity drill-down popover shows the
+        // SIGNED profile-card name, never the local nickname — a private label
+        // must not masquerade as the cryptographic identity (mirrors
+        // FriendsPanel). The inline author label stays nickname-first.
         ownerIdHex: author,
-        displayName: authorLabel(author),
+        displayName: card?.displayName ?? author.slice(0, 8),
         statusText: card?.statusText ?? '',
         avatarUrl: card?.avatarUrl,
         // No power known for message authors → role line omitted.

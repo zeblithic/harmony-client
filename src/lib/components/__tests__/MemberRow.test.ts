@@ -207,4 +207,23 @@ describe('MemberRow display-name resolution (ZEB-432)', () => {
     });
     expect(getByText(ADDR.slice(0, 8))).toBeTruthy();
   });
+
+  it('the owner-card popover carries the SIGNED card name, not the nickname (PR #240 review)', async () => {
+    const onOpenCard = vi.fn();
+    const { container } = render(MemberRow, {
+      props: {
+        member,
+        viewer,
+        resolveCard: (id: string) =>
+          id === ADDR ? { displayName: 'ZEBbot', statusText: '' } : undefined,
+        resolveNickname: (id: string) => (id === ADDR ? 'Jake-nick' : undefined),
+        onOpenCard,
+      },
+    });
+    const nameBtn = container.querySelector('.name-btn');
+    expect(nameBtn?.textContent).toContain('Jake-nick'); // inline label = nickname
+    await fireEvent.click(nameBtn!);
+    expect(onOpenCard).toHaveBeenCalled();
+    expect(onOpenCard.mock.calls[0][0].displayName).toBe('ZEBbot'); // popover = card name
+  });
 });

@@ -120,6 +120,16 @@
       member.displayName ??
       member.address.slice(0, 8)
   );
+  // ZEB-432 (PR #240 review): the owner-card popover is the identity drill-down,
+  // so it shows the SIGNED profile-card name — never the local nickname. A
+  // private label must not masquerade as the cryptographic identity (mirrors
+  // FriendsPanel, whose popover uses the resolved card name while its row label
+  // is nickname-first). Same card-first ladder the row used before ZEB-432.
+  let cardDisplayName = $derived(
+    resolveCard?.(member.address)?.displayName ??
+      member.displayName ??
+      member.address.slice(0, 8)
+  );
   let joinedDate = $derived(
     member.joinedAt != null
       ? new Date(member.joinedAt).toLocaleDateString()
@@ -143,7 +153,7 @@
     onOpenCard?.(
       {
         ownerIdHex: member.address,
-        displayName,
+        displayName: cardDisplayName,
         statusText: resolveCard?.(member.address)?.statusText ?? '',
         avatarUrl: resolveCard?.(member.address)?.avatarUrl,
         power: member.power,
