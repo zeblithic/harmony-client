@@ -15523,8 +15523,15 @@ pub fn communities_for_nav(state: &crate::owner_state_crdt::OwnerState) -> Vec<C
 async fn list_owner_communities(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
 ) -> Result<Vec<CommunityNavDto>, String> {
+    list_owner_communities_impl(state_lock.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn list_owner_communities_impl(
+    state: &std::sync::Mutex<NodeState>,
+) -> Result<Vec<CommunityNavDto>, String> {
     let crdt_state = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
@@ -15638,6 +15645,14 @@ async fn list_community_members(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
 ) -> Result<Vec<MemberInfoDto>, String> {
+    list_community_members_impl(state_lock.inner(), community_id).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn list_community_members_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<Vec<MemberInfoDto>, String> {
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .as_slice()
@@ -15646,7 +15661,7 @@ async fn list_community_members(
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (crdt_state, registry) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -16670,6 +16685,17 @@ async fn create_channel(
     write_power: u8,
     kind: Option<String>,
 ) -> Result<String, String> {
+    create_channel_impl(state_lock.inner(), community_id, name, write_power, kind).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn create_channel_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    name: String,
+    write_power: u8,
+    kind: Option<String>,
+) -> Result<String, String> {
     // ZEB-349: parse the channel kind at the IPC boundary. `None`/`"text"`
     // → Text, `"voice"` → Voice, anything else → Err. Done first so an
     // unknown kind surfaces fast without minting anything.
@@ -16696,7 +16722,7 @@ async fn create_channel(
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -16747,7 +16773,7 @@ async fn create_channel(
     // set_power_level; stop_node nullifies registry without bumping
     // generation, so the registry-presence check is load-bearing).
     {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
@@ -17269,6 +17295,14 @@ async fn list_channels(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
 ) -> Result<Vec<ChannelInfoDto>, String> {
+    list_channels_impl(state_lock.inner(), community_id).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn list_channels_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<Vec<ChannelInfoDto>, String> {
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .as_slice()
@@ -17277,7 +17311,7 @@ async fn list_channels(
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (crdt_state, registry) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -17381,6 +17415,17 @@ async fn post_channel_message(
     body: Vec<u8>,
     reply_to: Option<String>,
 ) -> Result<String, String> {
+    post_channel_message_impl(state_lock.inner(), community_id, channel_id, body, reply_to).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn post_channel_message_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    channel_id: String,
+    body: Vec<u8>,
+    reply_to: Option<String>,
+) -> Result<String, String> {
     if community_id.len() != 32 {
         return Err("community_id must be 16 bytes (32 hex chars)".to_string());
     }
@@ -17413,7 +17458,7 @@ async fn post_channel_message(
     };
 
     let registry = {
-        let guard = state_lock
+        let guard = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         guard
@@ -17461,6 +17506,17 @@ async fn list_channel_messages(
     since: Option<crate::community_channel_log_engine::HlcDto>,
     limit: u32,
 ) -> Result<Vec<crate::community_channel_log_engine::ChannelMessageDto>, String> {
+    list_channel_messages_impl(state_lock.inner(), community_id, channel_id, since, limit).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn list_channel_messages_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    channel_id: String,
+    since: Option<crate::community_channel_log_engine::HlcDto>,
+    limit: u32,
+) -> Result<Vec<crate::community_channel_log_engine::ChannelMessageDto>, String> {
     if limit > 1000 {
         return Err(format!("limit {limit} exceeds max 1000"));
     }
@@ -17482,7 +17538,7 @@ async fn list_channel_messages(
     let chid = crate::community_membership::ChannelId(chid_bytes);
 
     let registry = {
-        let guard = state_lock
+        let guard = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         guard
@@ -17618,6 +17674,16 @@ async fn generate_invite(
     invitee_hint: Option<String>,
     expires_at: Option<u64>,
 ) -> Result<String, String> {
+    generate_invite_impl(state_lock.inner(), community_id, invitee_hint, expires_at).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn generate_invite_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    invitee_hint: Option<String>,
+    expires_at: Option<u64>,
+) -> Result<String, String> {
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .as_slice()
@@ -17626,7 +17692,7 @@ async fn generate_invite(
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (crdt_state, community_registry, dm_outbox) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -17742,7 +17808,7 @@ async fn generate_invite(
             )
         };
         let hlc_tracker = {
-            let g = state_lock
+            let g = state
                 .lock()
                 .map_err(|e| format!("NodeState poisoned: {e}"))?;
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?
@@ -17971,7 +18037,7 @@ async fn generate_invite(
     // minting while iroh is down even for LAN-only use — acceptable, since cross-WAN
     // join is the entire point of the invite-only flow.
     {
-        let inv_pub = state_lock
+        let inv_pub = state
             .lock()
             .ok()
             .and_then(|g| g.pkarr_invite_publisher.clone());
@@ -18514,6 +18580,17 @@ async fn create_community(
     name: String,
     is_invite_only: bool,
 ) -> Result<String, String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    create_community_impl(state_lock.inner(), sink, name, is_invite_only).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn create_community_impl(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    name: String,
+    is_invite_only: bool,
+) -> Result<String, String> {
     // Snapshot NodeState handles in a single guard scope, then drop
     // the std lock BEFORE any `.await`. The signing key lives inside
     // dm_outbox under a tokio Mutex, so we acquire the dm_outbox
@@ -18532,7 +18609,7 @@ async fn create_community(
         snapshot_generation,
         sync_engine,
     ) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -18553,7 +18630,7 @@ async fn create_community(
             g.generation,
             g.sync_engine.clone(),
         )
-    }; // std `state_lock` guard dropped here.
+    }; // std `state` guard dropped here.
 
     // Now safe to `.await` — the std lock has been released.
     // ZEB-339: community-membership events sign with the enrolled device
@@ -18582,7 +18659,7 @@ async fn create_community(
         transport_epoch_rx,
         channel_log_registry,
         snapshot_generation,
-        &state_lock,
+        state,
     )
     .await?;
 
@@ -18612,7 +18689,8 @@ async fn create_community(
     // failure is non-fatal — the create already committed, and the
     // frontend's synthesis fallback (App.svelte) keeps the node visible
     // either way.
-    if let Err(e) = app.emit(
+    crate::node_event_sink::emit_ser(
+        sink.as_ref(),
         "nav-updated",
         &NavUpdatedPayload {
             action: "added",
@@ -18623,9 +18701,7 @@ async fn create_community(
             parent_id: None,
             pending: None,
         },
-    ) {
-        tracing::warn!(error = %e, "create_community: nav-updated emit failed");
-    }
+    );
 
     // ZEB-323 Phase 2b: case-C pkarr hook — register per-community publication
     // for the newly created community. We look up the engine to get the EpochKey.
@@ -18640,7 +18716,7 @@ async fn create_community(
         if let Some(id_bytes) = id_bytes {
             let space_id = crate::owner_state_types::SpaceId(id_bytes);
             let (community_pub, community_registry) = {
-                let g = state_lock.lock().ok();
+                let g = state.lock().ok();
                 match g {
                     Some(g) => (
                         g.pkarr_community_publisher.clone(),
@@ -20745,6 +20821,16 @@ async fn redeem_invite(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     url: String,
 ) -> Result<RedeemInviteResultDto, String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    redeem_invite_impl(state_lock.inner(), sink, url).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn redeem_invite_impl(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    url: String,
+) -> Result<RedeemInviteResultDto, String> {
     // Snapshot NodeState handles in a single guard scope, then drop
     // the std lock BEFORE any `.await`. Mirrors `create_community`'s
     // pattern.
@@ -20762,7 +20848,7 @@ async fn redeem_invite(
         snapshot_generation,
         sync_engine,
     ) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -20804,33 +20890,30 @@ async fn redeem_invite(
     // Fence-check closure: re-locks the std NodeState mutex and
     // compares `generation`. If the node was stopped (or stop+restart
     // raced), the closure returns Err and the inner helper rolls back.
-    // Captures `state_lock` (a clonable `tauri::State<'_, _>`) by move;
-    // `Fn` (not FnOnce) so the inner helper retains the option of
-    // re-checking on retries. The closure borrows `state_lock` through
-    // its `'r` lifetime, which the awaited inner future is bounded by.
-    let fence_check = {
-        let state_lock = state_lock.clone();
-        move || -> Result<(), String> {
-            let g = state_lock
-                .lock()
-                .map_err(|e| format!("NodeState poisoned: {e}"))?;
-            if g.generation != snapshot_generation {
-                return Err(format!(
-                    "node generation changed during redeem_invite (was {}, now {}); \
-                     redemption minted on a detached crdt_state and won't be persisted — \
-                     engine spawn suppressed",
-                    snapshot_generation, g.generation
-                ));
-            }
-            if g.community_registry.is_none() {
-                return Err(
-                    "community_registry was torn down during redeem_invite — engine spawn \
-                     suppressed"
-                        .to_string(),
-                );
-            }
-            Ok(())
+    // Captures the `&Mutex<NodeState>` reference by copy; `Fn` (not
+    // FnOnce) so the inner helper retains the option of re-checking on
+    // retries. The closure borrows `state` through this fn's lifetime,
+    // which the awaited inner future is bounded by.
+    let fence_check = move || -> Result<(), String> {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during redeem_invite (was {}, now {}); \
+                 redemption minted on a detached crdt_state and won't be persisted — \
+                 engine spawn suppressed",
+                snapshot_generation, g.generation
+            ));
         }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry was torn down during redeem_invite — engine spawn \
+                 suppressed"
+                    .to_string(),
+            );
+        }
+        Ok(())
     };
 
     let dto = redeem_invite_inner(
@@ -20875,7 +20958,8 @@ async fn redeem_invite(
     // ZEB-254 R1 (I1): carry dto.pending so listeners that subscribe AFTER
     // this emit (e.g. nav components mounted post-redeem) see the correct
     // greyed state rather than assuming non-pending.
-    if let Err(e) = app.emit(
+    crate::node_event_sink::emit_ser(
+        sink.as_ref(),
         "nav-updated",
         &NavUpdatedPayload {
             action: "added",
@@ -20886,9 +20970,7 @@ async fn redeem_invite(
             parent_id: None,
             pending: Some(dto.pending),
         },
-    ) {
-        tracing::warn!(error = %e, "redeem_invite: nav-updated emit failed");
-    }
+    );
 
     // ZEB-323 Phase 2b: case-C pkarr hook — register per-community
     // publication so the joiner starts broadcasting their membership
@@ -20903,7 +20985,7 @@ async fn redeem_invite(
         if let Some(id_bytes) = id_bytes {
             let space_id = crate::owner_state_types::SpaceId(id_bytes);
             let (community_pub, registry) = {
-                let g = state_lock.lock().ok();
+                let g = state.lock().ok();
                 match g {
                     Some(g) => (
                         g.pkarr_community_publisher.clone(),
@@ -21015,6 +21097,16 @@ async fn join_open_community(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
 ) -> Result<RedeemInviteResultDto, String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    join_open_community_impl(state_lock.inner(), sink, community_id).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn join_open_community_impl(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    community_id: String,
+) -> Result<RedeemInviteResultDto, String> {
     let (
         library_directory,
         crdt_state,
@@ -21030,7 +21122,7 @@ async fn join_open_community(
         snapshot_generation,
         sync_engine,
     ) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -21067,29 +21159,26 @@ async fn join_open_community(
         )
     };
 
-    let fence_check = {
-        let state_lock = state_lock.clone();
-        move || -> Result<(), String> {
-            let g = state_lock
-                .lock()
-                .map_err(|e| format!("NodeState poisoned: {e}"))?;
-            if g.generation != snapshot_generation {
-                return Err(format!(
-                    "node generation changed during join_open_community (was {}, now {}); \
-                     join minted on a detached crdt_state and won't be persisted — \
-                     engine spawn suppressed",
-                    snapshot_generation, g.generation
-                ));
-            }
-            if g.community_registry.is_none() {
-                return Err(
-                    "community_registry was torn down during join_open_community — engine \
-                     spawn suppressed"
-                        .to_string(),
-                );
-            }
-            Ok(())
+    let fence_check = move || -> Result<(), String> {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during join_open_community (was {}, now {}); \
+                 join minted on a detached crdt_state and won't be persisted — \
+                 engine spawn suppressed",
+                snapshot_generation, g.generation
+            ));
         }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry was torn down during join_open_community — engine \
+                 spawn suppressed"
+                    .to_string(),
+            );
+        }
+        Ok(())
     };
 
     let dto = join_open_community_inner(
@@ -21127,7 +21216,8 @@ async fn join_open_community(
         .await;
     }
 
-    if let Err(e) = app.emit(
+    crate::node_event_sink::emit_ser(
+        sink.as_ref(),
         "nav-updated",
         &NavUpdatedPayload {
             action: "added",
@@ -21138,9 +21228,7 @@ async fn join_open_community(
             parent_id: None,
             pending: None,
         },
-    ) {
-        tracing::warn!(error = %e, "join_open_community: nav-updated emit failed");
-    }
+    );
 
     Ok(dto)
 }
@@ -24743,6 +24831,16 @@ async fn leave_community(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
 ) -> Result<(), String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    leave_community_impl(state_lock.inner(), sink, community_id).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn leave_community_impl(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    community_id: String,
+) -> Result<(), String> {
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .as_slice()
@@ -24760,7 +24858,7 @@ async fn leave_community(
         sync_engine,
         snapshot_generation,
     ) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -24803,7 +24901,7 @@ async fn leave_community(
     // persisted — surface Err rather than silently writing into a
     // doomed engine.
     {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
@@ -25021,7 +25119,8 @@ async fn leave_community(
     // String: hex::decode accepts mixed case but the canonical form is
     // lowercase, so the emitted spaceId matches the lowercase ids
     // emitted from create/redeem (CodeRabbit minor — PR #92 round 1).
-    if let Err(e) = app.emit(
+    crate::node_event_sink::emit_ser(
+        sink.as_ref(),
         "nav-updated",
         &NavUpdatedPayload {
             action: "removed",
@@ -25032,14 +25131,12 @@ async fn leave_community(
             parent_id: None,
             pending: None,
         },
-    ) {
-        tracing::warn!(error = %e, "leave_community: nav-updated emit failed");
-    }
+    );
 
     // ZEB-323 Phase 2b: case-C pkarr hook — unregister per-community
     // publication on leave.
     {
-        let com_pub = state_lock
+        let com_pub = state
             .lock()
             .ok()
             .and_then(|g| g.pkarr_community_publisher.clone());
