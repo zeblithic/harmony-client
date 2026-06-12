@@ -451,7 +451,8 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
     tokio::time::timeout(Duration::from_secs(10), server_task)
         .await
         .expect("server task must join within 10s of /v1/shutdown")
-        .expect("server task must not panic");
+        .expect("server task must not panic")
+        .expect("graceful shutdown must end the server cleanly (Ok)");
     let stop_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut refused = false;
     while tokio::time::Instant::now() < stop_deadline {
