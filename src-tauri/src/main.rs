@@ -256,6 +256,17 @@ fn main() {
             ) {
                 err.exit();
             }
+            // ZEB-446: an argv set containing an explicit --profile is an
+            // operator-typed CLI invocation, not OS-injected launch argv —
+            // falling through to the GUI here could put the session on the
+            // wrong profile's data. Exit loudly instead (PR #245 round 1).
+            if std::env::args().any(|a| a == "--profile" || a.starts_with("--profile=")) {
+                eprintln!(
+                    "harmony-app: argv parsing failed ({err}); refusing GUI fall-through \
+                     because --profile was given"
+                );
+                std::process::exit(2);
+            }
             // All other parse failures: leave a stderr breadcrumb and launch
             // the GUI. The breadcrumb means a CLI typo isn't fully silent
             // (operator sees `harmony-app: argv parsing failed ...` in their

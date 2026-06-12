@@ -15431,8 +15431,9 @@ pub fn serve_cli(api_port: Option<u16>) -> i32 {
     // the first vault access.
     if crate::profile::active_profile().is_some() && !crate::identity::passphrase_env_configured() {
         eprintln!(
-            "serve: named profile requires HARMONY_PASSPHRASE or HARMONY_PASSPHRASE_FILE \
-             (named profiles use the encrypted-file vault, not the OS keychain)"
+            "serve: named profile requires HARMONY_PASSPHRASE or a readable \
+             HARMONY_PASSPHRASE_FILE (named profiles use the encrypted-file vault, \
+             not the OS keychain)"
         );
         return 1;
     }
@@ -41725,7 +41726,7 @@ pub fn run() {
     }
     if crate::profile::active_profile().is_some() && !crate::identity::passphrase_env_configured() {
         eprintln!(
-            "harmony-app: named profile requires HARMONY_PASSPHRASE or \
+            "harmony-app: named profile requires HARMONY_PASSPHRASE or a readable \
              HARMONY_PASSPHRASE_FILE (named profiles use the encrypted-file vault, \
              not the OS keychain)"
         );

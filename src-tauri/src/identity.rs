@@ -2095,8 +2095,17 @@ fn identity_path_in(home: &Path, profile: Option<&str>) -> PathBuf {
 /// instead of letting the first vault access fail later (the ZEB-450
 /// silent-degradation class).
 pub fn passphrase_env_configured() -> bool {
-    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
-    set("HARMONY_PASSPHRASE") || set("HARMONY_PASSPHRASE_FILE")
+    if std::env::var("HARMONY_PASSPHRASE").is_ok_and(|v| !v.trim().is_empty()) {
+        return true;
+    }
+    // A passphrase FILE only counts when it is actually readable —
+    // catching a typo'd path here, at the fail-fast gate, beats a vault
+    // error mid-boot (PR #245 round 1, CodeAnt).
+    std::env::var("HARMONY_PASSPHRASE_FILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .is_some_and(|p| std::fs::metadata(p).is_ok())
 }
 
 /// Internal resolution chain — accepts injected stores for testability.
@@ -2655,6 +2664,12 @@ mod tests {
         );
     }
 
+    /// Pins the ZEB-446 constructor-gate condition itself, so it must call
+    /// the real constructor — the same pattern as tests/keychain_isolation.rs
+    /// (the canonical ZEB-428 gate-pinning test). No host-keychain access is
+    /// possible: the named-profile refusal returns before keyring::Entry is
+    /// ever constructed. nextest (the supported runner, CLAUDE.md) is
+    /// process-per-test, so the OnceLock set here cannot leak.
     #[test]
     fn keychain_constructor_refuses_on_named_profile() {
         crate::profile::set_active_profile(Some("gatetest")).expect("activate");

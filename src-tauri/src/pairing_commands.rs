@@ -26,8 +26,20 @@ pub(crate) async fn start_inviter_pairing_inner(
     state: &Mutex<NodeState>,
     display_name: String,
 ) -> Result<(), String> {
+    // Production composition root: ambient keychain. The ZEB-428/ZEB-446
+    // constructor gate refuses in test builds and on named profiles (the
+    // encrypted-file vault serves the load there); tests inject through
+    // the _with_keychain seam below and never construct the real store.
+    start_inviter_pairing_with_keychain(state, display_name, KeychainStore::new().ok()).await
+}
+
+pub(crate) async fn start_inviter_pairing_with_keychain(
+    state: &Mutex<NodeState>,
+    display_name: String,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
     let identity_dir = crate::owner_commands::resolve_identity_dir()?;
-    let loaded = load_owner_state(&identity_dir, KeychainStore::new().ok())?
+    let loaded = load_owner_state(&identity_dir, keychain)?
         .ok_or_else(|| "no owner identity on this device".to_string())?;
     let master_seed = loaded
         .master_seed

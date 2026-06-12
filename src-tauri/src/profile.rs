@@ -67,6 +67,13 @@ fn desired_profile(flag: Option<&str>, env: Option<&str>) -> Result<Option<Strin
 /// would lie. Hard error on an invalid name (flag OR env): silently
 /// landing in the default profile's data is the worst outcome.
 pub fn set_active_profile(flag: Option<&str>) -> Result<(), String> {
+    // Already activated → no-op WITHOUT re-reading the env: main() may
+    // have activated from a valid --profile while HARMONY_PROFILE holds
+    // garbage, and run()'s eager re-call must not abort a launch the flag
+    // already validated (PR #245 round 1, Qodo + Cursor).
+    if ACTIVE_PROFILE.get().is_some() {
+        return Ok(());
+    }
     let desired = desired_profile(flag, std::env::var("HARMONY_PROFILE").ok().as_deref())?;
     let _ = ACTIVE_PROFILE.set(desired);
     Ok(())
@@ -137,6 +144,21 @@ mod tests {
         );
         assert!(desired_profile(Some("BAD NAME"), None).is_err());
         assert!(desired_profile(None, Some("BAD NAME")).is_err());
+    }
+
+    /// Regression for PR #245 round 1 (Qodo + Cursor): once a flag
+    /// activated the profile, a later no-op call must NOT re-read (and
+    /// fail on) a garbage HARMONY_PROFILE. nextest (the supported runner,
+    /// CLAUDE.md) is process-per-test, so mutating the process-global
+    /// OnceLock and env here cannot leak into other tests.
+    #[test]
+    fn activation_is_first_wins_and_never_revalidates_env() {
+        std::env::set_var("HARMONY_PROFILE", "BAD NAME");
+        set_active_profile(Some("flagprof")).expect("flag activation must win");
+        assert_eq!(active_profile(), Some("flagprof"));
+        set_active_profile(None).expect("post-activation call must be a no-op, not an env re-read");
+        assert_eq!(active_profile(), Some("flagprof"));
+        std::env::remove_var("HARMONY_PROFILE");
     }
 
     /// The pure join used by lib.rs's resolve_app_data_dir (defined there;
