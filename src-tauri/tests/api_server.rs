@@ -8,19 +8,18 @@
 //! ONE test fn: env vars are process-global, and a single fn avoids ordering
 //! hazards — nextest gives this binary its own process.
 //!
-//! ## Ground-truth deviation from the plan: owner mint is driven explicitly
+//! ## Owner mint is driven explicitly (designed, not discovered)
 //!
-//! The design spec says "owner mint auto-fires at first boot", but no
-//! backend code path mints: `start_node_inner` boots pre-mint when
-//! `owner_state.cbor` is absent, and in the GUI the mint fires from the
-//! WelcomeModal's "Create identity" click (`owner-gate.ts` → WelcomeModal →
-//! `mint_owner_identity` IPC). `mint_owner_identity` is also NOT in the
-//! curated 28-command RPC surface. So this test drives the production inner
-//! seam (`mint_owner_identity_inner_for_test`, keychain-hermetic per
-//! ZEB-428) with a real `start_node_inner` restart closure — exactly what
-//! the production `#[tauri::command]` wrapper does. The serve-mode
-//! fresh-profile gap (headless boot has no way to mint over the API) is
-//! reported as a follow-up concern, not papered over here.
+//! First boot is pre-mint: `start_node_inner` boots without an owner when
+//! `owner_state.cbor` is absent, and nothing in the backend auto-mints. In
+//! the GUI the mint fires from the WelcomeModal's "Create identity" click
+//! (`owner-gate.ts` → WelcomeModal → `mint_owner_identity` IPC); headless,
+//! the same `mint_owner_identity_impl` seam is the `mint_owner_identity`
+//! RPC command, and this test drives it over an authed
+//! `POST /v1/rpc/mint_owner_identity`. Keychain-hermetic per ZEB-428: the
+//! production seam calls `KeychainStore::new().ok()`, which refuses in
+//! test-fixtures builds, so the mint persists through the encrypted-file
+//! fallback (`HARMONY_PASSPHRASE`) inside the tempdir HOME.
 
 mod common;
 
@@ -192,8 +191,10 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
     // ── Phase 6e-pre: fresh profile has NO owner (ground truth) ─────────
     // get_owner_state on a fresh profile is 200 + JSON null — nothing in
     // the backend auto-mints (see module doc). Pin that behavior, then
-    // drive the mint through the production inner seam with a real
-    // start_node_inner restart closure (what the IPC wrapper does).
+    // mint over the API: `mint_owner_identity` is in the curated RPC
+    // surface (ZEB-445 DoD — headless identity bootstrap). The handler
+    // restarts the node via a real start_node_inner closure (same flow as
+    // the GUI's IPC wrapper).
     let r = rpc(
         &http,
         &base,
@@ -209,21 +210,35 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
         "fresh profile must report no owner identity; got: {pre_mint}"
     );
 
-    let restart_state = state.clone();
-    let restart_sink = sink.clone();
-    let minted = harmony_app::owner_commands::mint_owner_identity_inner_for_test(
-        &state,
-        move || async move {
-            harmony_app::start_node_inner(None, restart_sink, None, &restart_state)
-                .await
-                .map(|_| ())
-        },
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "mint_owner_identity",
+        serde_json::json!({}),
     )
-    .await
-    .expect("mint owner identity via the production inner seam");
+    .await;
+    assert_eq!(
+        r.status(),
+        200,
+        "POST /v1/rpc/mint_owner_identity must succeed on a fresh profile"
+    );
+    let minted: serde_json::Value = r.json().await.expect("mint body is JSON");
+    // MintIpcResult is { state: OwnerStateView, recovery_token } — camelCase
+    // on the wire, so the owner id lives at state.ownerId.
+    let minted_owner_id = minted["state"]["ownerId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("mint result must carry state.ownerId; got: {minted}"))
+        .to_string();
     assert!(
-        !minted.state.owner_id.is_empty(),
-        "mint must return a non-empty owner id"
+        !minted_owner_id.is_empty(),
+        "mint must return a non-empty owner id; got: {minted}"
+    );
+    assert!(
+        minted["recoveryToken"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
+        "mint result must carry a non-empty recoveryToken; got: {minted}"
     );
 
     // ── Phase 6e: get_owner_state over HTTP — owner present ─────────────
@@ -252,7 +267,7 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
     };
     assert_eq!(
         owner["ownerId"].as_str(),
-        Some(minted.state.owner_id.as_str()),
+        Some(minted_owner_id.as_str()),
         "API-visible ownerId must match the mint result; got: {owner}"
     );
 

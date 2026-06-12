@@ -193,7 +193,7 @@ struct ReadDmThreadArgs {
 
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (28 commands). Every handler calls
+/// Build the curated v1 RPC surface (29 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
@@ -213,6 +213,12 @@ pub fn build_registry() -> RpcRegistry {
     // Owner state.
     rpc!(m, "get_owner_state", EmptyArgs, |state, _sink, _a| {
         async move { crate::owner_commands::get_owner_state_impl(&state).await }
+    });
+    // ZEB-445 DoD: explicit headless identity bootstrap — first boot is
+    // pre-mint; the GUI mints via WelcomeModal. `None` wry_handle: no Tauri
+    // runtime headless.
+    rpc!(m, "mint_owner_identity", EmptyArgs, |state, sink, _a| {
+        async move { crate::owner_commands::mint_owner_identity_impl(&state, sink, None).await }
     });
 
     // Communities.
@@ -503,7 +509,8 @@ mod tests {
         let reg = build_registry();
         let names = reg.command_names();
         // Curated v1 surface: node lifecycle (start_node, stop_node) +
-        // owner state (get_owner_state) + communities (list_owner_communities,
+        // identity (get_owner_state, mint_owner_identity) +
+        // communities (list_owner_communities,
         // create_community, list_community_members, generate_invite,
         // redeem_invite, join_open_community, leave_community) + channels
         // (create_channel, list_channels, list_channel_messages,
@@ -513,12 +520,13 @@ mod tests {
         // (add_space, send_dm, read_dm_thread) + connectivity
         // (connectivity_get_my_reachability_record,
         // connectivity_list_peer_reachability) + network health
-        // (network_health_snapshot, network_health_run_self_test) = 28.
-        assert_eq!(names.len(), 28, "curated v1 surface drifted: {names:?}");
+        // (network_health_snapshot, network_health_run_self_test) = 29.
+        assert_eq!(names.len(), 29, "curated v1 surface drifted: {names:?}");
         for must in [
             "start_node",
             "stop_node",
             "get_owner_state",
+            "mint_owner_identity",
             "create_community",
             "redeem_invite",
             "post_channel_message",

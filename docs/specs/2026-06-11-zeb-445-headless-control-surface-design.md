@@ -82,7 +82,7 @@ New clap subcommand in main.rs (alongside the recovery_cli subcommands):
 harmony-app serve [--api-port PORT]
 ```
 
-Boot sequence: init tracing (existing `app_tracing`, logs to stderr/file — stdout stays pure) → acquire profile lockfile → construct `Arc<Mutex<NodeState>>` → auto-start the node via the generalized `start_node_inner` with an API-only sink → bind the server → write discovery files → run until `POST /v1/shutdown` or SIGINT/SIGTERM, both of which stop the node gracefully (the existing `stop_inner` path) before exit. Owner mint auto-fires at first boot (confirmed during AVALON bring-up) — no UI interaction needed on a fresh profile.
+Boot sequence: init tracing (existing `app_tracing`, logs to stderr/file — stdout stays pure) → acquire profile lockfile → construct `Arc<Mutex<NodeState>>` → auto-start the node via the generalized `start_node_inner` with an API-only sink → bind the server → write discovery files → run until `POST /v1/shutdown` or SIGINT/SIGTERM, both of which stop the node gracefully (the existing `stop_inner` path) before exit. First boot is pre-mint; identity is established by the explicit `mint_owner_identity` command (GUI: WelcomeModal).
 
 ### Host 2: GUI opt-in
 
@@ -106,7 +106,7 @@ Curated, scenario-driven (~35 commands). The registry exposes the **same command
 | Capability | Commands (anchors) |
 |---|---|
 | Lifecycle | `start_node`, `stop_node` (status served by `GET /v1/status`, not RPC) |
-| Identity | owner/identity status query (owner_id, device id, minted?) |
+| Identity | owner/identity status query (owner_id, device id, minted?), `mint_owner_identity` (explicit mint — first boot is pre-mint; GUI parity: WelcomeModal's create-identity action) |
 | Communities | create, list, members list, create invite, redeem invite, leave |
 | Channels | create channel, list channels (lib.rs:17237), send message (lib.rs:7911), read channel history |
 | Friends/DMs | friends list, friend request send/accept, send DM (lib.rs:8085), read DM thread |
