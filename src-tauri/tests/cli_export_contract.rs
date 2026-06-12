@@ -287,16 +287,30 @@ fn restore_owner_mnemonic_refuses_existing_owner_without_force_through_binary() 
         recovery_artifact,
         device_signing_key,
     } = mint_owner(1_700_000_050).unwrap();
-    let master_seed = *recovery_artifact.as_bytes();
+    let installed_owner_id = state.owner_id;
+    let installed_seed = *recovery_artifact.as_bytes();
     harmony_app::owner_state::save_owner_state_atomic(
         &identity_dir,
         &state,
         &device_signing_key,
-        Some(&master_seed),
+        Some(&installed_seed),
         None,
     )
     .unwrap();
-    let words = RecoveryArtifact::from_seed(master_seed).to_mnemonic();
+
+    // Back the restore file with a DIFFERENT owner's mnemonic so a silent
+    // partial overwrite would be observable (the installed owner-id would
+    // change). (CodeRabbit round 1.)
+    let MintResult {
+        recovery_artifact: other_artifact,
+        ..
+    } = mint_owner(1_700_000_100).unwrap();
+    let other_seed = *other_artifact.as_bytes();
+    assert_ne!(
+        installed_seed, other_seed,
+        "test setup: backup must be a different owner"
+    );
+    let words = RecoveryArtifact::from_seed(other_seed).to_mnemonic();
     let mnemonic_path = home.path().join("owner-backup.txt");
     std::fs::write(&mnemonic_path, words.as_str()).unwrap();
 
@@ -320,6 +334,18 @@ fn restore_owner_mnemonic_refuses_existing_owner_without_force_through_binary() 
         out.stderr.contains("--force"),
         "stderr must point at --force; got: {}",
         out.stderr
+    );
+
+    // The installed owner must be untouched — export still returns the ORIGINAL
+    // owner-id, proving no partial overwrite leaked through the refusal.
+    let exported = run_cli(home.path(), &["export", "owner-mnemonic"], "info");
+    assert_eq!(exported.code, Some(0), "stderr: {}", exported.stderr);
+    assert!(
+        exported
+            .stderr
+            .contains(&format!("owner-id: {}", hex::encode(installed_owner_id))),
+        "installed owner must remain intact after a refused restore; got: {}",
+        exported.stderr
     );
 }
 
