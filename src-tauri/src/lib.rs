@@ -195,6 +195,7 @@ pub mod pkarr_identity_publisher;
 pub mod pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
 pub mod pkarr_settings;
+pub mod profile;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;
 pub mod profile_page_doc;
@@ -271,10 +272,21 @@ impl<R: tauri::Runtime> crate::iroh_friend_acceptor::FriendEventEmit for tauri::
 /// resolve the IDENTICAL path or GUI and headless would split-brain the
 /// profile.
 /// Public for the serve path and the api_server integration test (ZEB-445).
+/// ZEB-446: profile-aware — named profiles nest under profiles/<name>.
 pub fn resolve_app_data_dir() -> Result<std::path::PathBuf, String> {
-    dirs::data_dir()
-        .map(|d| d.join("net.zeblith.harmony"))
-        .ok_or_else(|| "cannot resolve platform data dir".to_string())
+    let base = dirs::data_dir().ok_or_else(|| "cannot resolve platform data dir".to_string())?;
+    Ok(app_data_dir_in(&base, crate::profile::active_profile()))
+}
+
+/// Pure join for [`resolve_app_data_dir`] (and app_tracing's log dir):
+/// `<base>/net.zeblith.harmony[/profiles/<p>]`. ZEB-446: a named profile
+/// nests under `profiles/` so the default layout is untouched.
+pub(crate) fn app_data_dir_in(base: &std::path::Path, profile: Option<&str>) -> std::path::PathBuf {
+    let root = base.join("net.zeblith.harmony");
+    match profile {
+        Some(p) => root.join("profiles").join(p),
+        None => root,
+    }
 }
 
 /// ZEB-445: sink-trait adapter so `Arc<dyn NodeEventSink>` satisfies the

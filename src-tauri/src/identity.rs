@@ -2047,7 +2047,10 @@ impl KeyStore for EncryptedFileStore {
 
 // ── Public API (unchanged shape) ────────────────────────────────────────
 
-/// Resolve the identity file path. Uses `~/.harmony/identity.key` by default.
+/// Resolve the identity file path. `~/.harmony/identity.key` on the
+/// default profile; `~/.harmony/profiles/<p>/identity.key` on a named
+/// profile (ZEB-446 — named profiles get their own identity tree, which
+/// also scopes the ZEB-449 encrypted-file vault and `iroh_sk.enc`).
 pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(p) = override_path {
         return Ok(p.to_path_buf());
@@ -2057,7 +2060,20 @@ pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
         .map_err(|_| {
             "Cannot determine identity file path: neither $HOME nor $USERPROFILE is set".to_string()
         })?;
-    Ok(PathBuf::from(home).join(".harmony").join("identity.key"))
+    Ok(identity_path_in(
+        Path::new(&home),
+        crate::profile::active_profile(),
+    ))
+}
+
+/// Pure path join for [`resolve_path`] — unit-testable without env state.
+fn identity_path_in(home: &Path, profile: Option<&str>) -> PathBuf {
+    let root = home.join(".harmony");
+    let root = match profile {
+        Some(p) => root.join("profiles").join(p),
+        None => root,
+    };
+    root.join("identity.key")
 }
 
 /// Internal resolution chain — accepts injected stores for testability.
@@ -2601,6 +2617,20 @@ pub mod test_only {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn identity_path_in_maps_default_and_named_profiles() {
+        use std::path::Path;
+        let home = Path::new("/home/u");
+        assert_eq!(
+            identity_path_in(home, None),
+            Path::new("/home/u/.harmony/identity.key")
+        );
+        assert_eq!(
+            identity_path_in(home, Some("coord")),
+            Path::new("/home/u/.harmony/profiles/coord/identity.key")
+        );
+    }
 
     #[test]
     fn file_store_round_trip() {
