@@ -475,7 +475,6 @@ impl VoicePresenceMap {
 use crate::community_state_sync::CommunitySyncRegistry;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tauri::Emitter;
 use tokio::task::JoinHandle;
 
 /// Pure membership predicate over a resolved `MaterializedMembership`:
@@ -529,7 +528,7 @@ pub async fn beacon_signer_is_member(
 /// `session` is an owned, cheaply-cloned `zenoh::Session` (call sites pass
 /// `session.clone()`); `now_ms` is the loop's monotonic clock.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_voice_presence_subscriber<R: tauri::Runtime>(
+pub fn spawn_voice_presence_subscriber(
     session: zenoh::Session,
     topic: String,
     channel_key: Arc<ChannelKey>,
@@ -537,7 +536,7 @@ pub fn spawn_voice_presence_subscriber<R: tauri::Runtime>(
     channel: ChannelId,
     registry: Arc<CommunitySyncRegistry>,
     map: Arc<tokio::sync::Mutex<VoicePresenceMap>>,
-    app: tauri::AppHandle<R>,
+    app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     closing: Arc<AtomicBool>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> JoinHandle<()> {
@@ -580,9 +579,10 @@ pub fn spawn_voice_presence_subscriber<R: tauri::Runtime>(
                     let g = map.lock().await;
                     g.roster(&community, &channel)
                 };
-                let _ = app.emit(
+                crate::node_event_sink::emit_ser(
+                    app.as_ref(),
                     "voice-presence-changed",
-                    serde_json::json!({
+                    &serde_json::json!({
                         "community": hex::encode(community.0),
                         "channel": hex::encode(channel.0),
                         "roster": roster,
@@ -874,14 +874,14 @@ pub async fn publish_groupdm_leave_tombstone(
 /// `apply`/`roster` are shared verbatim with community voice. Mirrors
 /// [`spawn_voice_presence_subscriber`].
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_groupdm_presence_subscriber<R: tauri::Runtime>(
+pub fn spawn_groupdm_presence_subscriber(
     session: zenoh::Session,
     topic: String,
     presence_key: Arc<ChannelKey>,
     space_id: SpaceId,
     crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     map: Arc<tokio::sync::Mutex<VoicePresenceMap>>,
-    app: tauri::AppHandle<R>,
+    app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     closing: Arc<AtomicBool>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> JoinHandle<()> {
@@ -931,9 +931,10 @@ pub fn spawn_groupdm_presence_subscriber<R: tauri::Runtime>(
                     let g = map.lock().await;
                     g.roster(&space_id, &call_chan)
                 };
-                let _ = app.emit(
+                crate::node_event_sink::emit_ser(
+                    app.as_ref(),
                     "group-call-presence-changed",
-                    serde_json::json!({
+                    &serde_json::json!({
                         "spaceId": hex::encode(space_id.0),
                         "callId": hex::encode(wrapped.call_id),
                         "roster": roster,

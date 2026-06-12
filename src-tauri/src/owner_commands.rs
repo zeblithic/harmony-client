@@ -232,7 +232,11 @@ pub async fn mint_owner_identity(
     // inner fn must never construct it internally, so test drivers can't
     // reach the developer's real credential store.
     mint_owner_identity_inner(state_ref, KeychainStore::new().ok(), || async {
-        crate::start_node_inner(None, &app, state_ref)
+        // ZEB-445: wrap the AppHandle as the event sink (same shape as the
+        // `start_node` command wrapper).
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(app.clone());
+        crate::start_node_inner(None, sink, Some(app.clone()), state_ref)
             .await
             .map(|_| ())
     })

@@ -321,21 +321,21 @@ pub async fn run_dm_inbox_ingest_sweeper(
 ///   `hex::encode(cert.device_pubkeys.classical.ed25519_verify)` (the SP1
 ///   64-hex device-id form). Enrollment changes require a node restart, so
 ///   the snapshot tracks the enrolled set for the engine's lifetime.
-pub struct ProdDmInboxIngestCtx<R: tauri::Runtime> {
+pub struct ProdDmInboxIngestCtx {
     /// This device's SP1 device id (64-hex of the device ed25519 verify key).
     pub device_id: String,
     /// The runtime owner-state CRDT (`NodeState`'s `crdt_state` Arc).
     pub crdt_state: Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
     /// The shared CAS handle (`RuntimeContentStore` in production).
     pub content_store: Arc<dyn crate::content_store::ContentStore>,
-    /// AppHandle for the `dm-received` emit.
-    pub app: tauri::AppHandle<R>,
+    /// Event sink for the `dm-received` emit (ZEB-445).
+    pub sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     /// Enrolled device ids (64-hex), snapshotted at start_node.
     pub enrolled: BTreeSet<String>,
 }
 
 #[async_trait]
-impl<R: tauri::Runtime> DmInboxIngestCtx for ProdDmInboxIngestCtx<R> {
+impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
     fn self_device_id(&self) -> String {
         self.device_id.clone()
     }
@@ -430,10 +430,10 @@ impl<R: tauri::Runtime> DmInboxIngestCtx for ProdDmInboxIngestCtx<R> {
     }
 
     fn emit_dm_received(&self, msg: &ReceivedMessage) {
-        use tauri::Emitter;
-        let _ = self.app.emit(
+        crate::node_event_sink::emit_ser(
+            self.sink.as_ref(),
             crate::dm_outbox::DM_RECEIVED_EVENT,
-            crate::dm_outbox::dm_received_event_payload(msg),
+            &crate::dm_outbox::dm_received_event_payload(msg),
         );
     }
 

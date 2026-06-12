@@ -279,11 +279,12 @@ struct EngineShared {
     /// (CRITICAL 2) to flush the deletion floor to disk after an in-memory
     /// update. `None` in test constructors — tests don't persist to disk.
     sync_state_path: Option<std::path::PathBuf>,
-    /// Production passes `Some(app_handle)` so successful subscriber merges
-    /// can fire a `"mint-changed"` Tauri event. Test constructors pass `None`
-    /// — the emit is a best-effort UI notification, not a correctness
-    /// requirement, so skipping it in tests is safe.
-    app_handle: Option<tauri::AppHandle>,
+    /// Production passes `Some(sink)` so successful subscriber merges
+    /// can fire a `"mint-changed"` event (ZEB-445: via the mode-agnostic
+    /// sink). Test constructors pass `None` — the emit is a best-effort UI
+    /// notification, not a correctness requirement, so skipping it in
+    /// tests is safe.
+    app_handle: Option<std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>>,
 }
 
 /// Mint Phase 2 sync engine. Mirrors owner_state_sync's shape.
@@ -423,7 +424,7 @@ impl MintSyncEngine {
         publisher_tx: mpsc::Sender<Vec<u8>>,
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
         debounce_ms: u64,
-        app_handle: tauri::AppHandle,
+        app_handle: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     ) -> (Self, MintSyncEngineHandle) {
         let dirty = Arc::new(Notify::new());
         let (flush_tx, flush_rx) = mpsc::channel::<()>(4);
@@ -557,10 +558,9 @@ impl EngineShared {
             }
         }
         if let Some(app) = &self.app_handle {
-            use tauri::Emitter;
-            if let Err(e) = app.emit("mint-changed", ()) {
-                tracing::warn!(target: "mint_sync", "failed to emit mint-changed: {e}");
-            }
+            // Tauri serialized `()` as JSON `null` — Value::Null is
+            // wire-identical (ZEB-445).
+            app.emit("mint-changed", serde_json::Value::Null);
         }
         Ok(())
     }

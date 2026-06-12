@@ -746,7 +746,7 @@ pub struct NodeState {
     /// (which would propagate `R: Runtime` through `NodeState` itself
     /// — a larger refactor).
     channel_log_registry:
-        Option<std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>>,
+        Option<std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>>,
     /// ZEB-307 Task 7: D-FROST community-log registry. `Some` while the
     /// node is running; populated by `start_node` (Task 8) and consumed by
     /// the D-FROST IPC handlers. Mirrors `channel_log_registry` exactly —
@@ -1542,7 +1542,7 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // post-lock shutdown_all block can take it. Assigned inside the
     // lock alongside the other `take()` calls below.
     let channel_log_registry_for_shutdown: Option<
-        std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
+        std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     >;
     // ZEB-281 Sub-D Phase 4: declared in the outer scope so the
     // post-lock `shutdown().await` can drive the publisher's final-flush
@@ -2316,18 +2316,30 @@ async fn start_node(
     // ZEB-338: thin forwarder. Real logic lives in start_node_inner so the
     // self-lifecycle mint IPC (owner_commands::mint_owner_identity) can
     // restart the node after writing owner_state.cbor without duplicating
-    // ~3600 lines. `tauri::State` derefs to `&Mutex<NodeState>`.
-    start_node_inner(endpoint, &app, &state).await
+    // ~3600 lines. `tauri::State::inner()` yields `&Mutex<NodeState>`.
+    // ZEB-445: the GUI wraps its AppHandle as the event sink; serve mode
+    // will pass a WS-broadcast sink with `wry_handle: None`.
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(app.clone());
+    start_node_inner(endpoint, sink, Some(app), state.inner()).await
 }
 
-/// ZEB-338: extracted body of `start_node`. Callable from any IPC that holds
-/// an `&AppHandle` and `&Mutex<NodeState>` (the command wrapper above, and
-/// `mint_owner_identity`'s node-restart phase).
+/// ZEB-338: extracted body of `start_node`. Callable from any caller that
+/// holds a `NodeEventSink` and `&Mutex<NodeState>` (the command wrapper
+/// above, `mint_owner_identity`'s node-restart phase, and — ZEB-445 — the
+/// headless `serve` boot path). `wry_handle` is the optional typed Tauri
+/// handle for the few seams that genuinely need Tauri (managed-state
+/// lookup in the VRF beacon requester, `NodeState.app_handle_wry` for the
+/// dfrost/voting IPCs); `None` in serve mode.
 pub(crate) async fn start_node_inner(
     endpoint: Option<String>,
-    app: &AppHandle,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
     state: &Mutex<NodeState>,
 ) -> Result<StartNodeResponse, String> {
+    // ZEB-445: `app` aliases the mode-agnostic sink — the body's many
+    // emission seams clone it; Tauri-specific needs go through `wry_handle`.
+    let app = sink;
     // ── Atomic stop→identity→config→spawn→store ─────────────────────
     // Everything from stop through handle registration runs under the
     // lock (with a brief drop for the blocking thread join). This
@@ -2383,12 +2395,8 @@ pub(crate) async fn start_node_inner(
         tokio::sync::mpsc::channel::<crate::pairing::types::PairingWireMessage>(64);
 
     // Load the follow list from disk and create the shared followed set.
-    let app_data_dir = {
-        use tauri::Manager;
-        app.path()
-            .app_data_dir()
-            .map_err(|e| format!("app_data_dir: {e}"))?
-    };
+    // ZEB-445: resolved Tauri-free (identical path to `app.path().app_data_dir()`).
+    let app_data_dir = crate::resolve_app_data_dir()?;
     std::fs::create_dir_all(&app_data_dir).map_err(|e| format!("create app_data_dir: {e}"))?;
     let follow_mgr = follows::FollowManager::load(&app_data_dir);
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
@@ -2428,7 +2436,7 @@ pub(crate) async fn start_node_inner(
     // lock alongside the other `take()` calls below (see
     // `old_channel_log_registry = guard.channel_log_registry.take();`).
     let old_channel_log_registry: Option<
-        std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
+        std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     >;
     // ZEB-307 Task 8 (R1 fix — wire registry): outer-scope binding for
     // the prior identity's D-FROST registry. Taken inside the lock-1
@@ -3003,7 +3011,7 @@ pub(crate) async fn start_node_inner(
         // owner-loaded branch builds + populates it; the post-spawn
         // NodeState assignment below stashes it.
         let mut channel_log_registry_arc: Option<
-            std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
+            std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
         > = None;
         // ZEB-307 Task 8 (R1 fix — wire registry): D-FROST log registry holder.
         // The registry is the empty container; per-community engines get
@@ -3033,12 +3041,21 @@ pub(crate) async fn start_node_inner(
         // ignores the ceremony_id (fires-and-forgets the beacon request), but the
         // signature must match BeaconRequester exactly.
         let beacon_requester_for_state: crate::community_voting_log_engine::BeaconRequester = {
-            let app_for_beacon = app.clone();
+            // ZEB-445: managed-state lookup needs the real Tauri handle;
+            // in serve mode (wry_handle = None) the beacon requester is
+            // unavailable (voting/dfrost stays Tauri-bound, out of scope).
+            let wry_for_beacon = wry_handle.clone();
             std::sync::Arc::new(
                 move |space_id: crate::owner_state_types::SpaceId, seed: [u8; 32], epoch: u64| {
-                    let app = app_for_beacon.clone();
+                    let wry = wry_for_beacon.clone();
                     Box::pin(async move {
                         use tauri::Manager as _;
+                        let Some(app) = wry else {
+                            return Err(
+                                "vrf beacon unavailable: no Tauri app handle (serve mode)"
+                                    .to_string(),
+                            );
+                        };
                         let state = app.state::<Mutex<NodeState>>();
                         crate::dfrost_request_vrf_beacon_inner(&state, space_id, seed, epoch).await
                     })
@@ -3676,7 +3693,7 @@ pub(crate) async fn start_node_inner(
                             debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
                             publish_seen: true,
                             on_applied: Some(std::sync::Arc::new(move || {
-                                let _ = notes_app.emit("notes-changed", ());
+                                notes_app.emit("notes-changed", serde_json::Value::Null);
                             })),
                             sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
                                 std::collections::BTreeMap::new(),
@@ -3778,7 +3795,7 @@ pub(crate) async fn start_node_inner(
                         device_id: device_id.clone(),
                         crdt_state: std::sync::Arc::clone(&crdt_state),
                         content_store: std::sync::Arc::clone(&content_store),
-                        app: app.clone(),
+                        sink: app.clone(),
                         enrolled: dm_inbox_enrolled,
                     });
                     // The ingest sweeper: one startup sweep (entries
@@ -4152,12 +4169,12 @@ pub(crate) async fn start_node_inner(
                             // nav-updated { pending: false } when a JoinCountersign
                             // targeting a self-authored PendingJoin lands in the engine.
                             nav_emitter: Some(std::sync::Arc::new({
-                                let app_handle_for_emitter = app.clone();
+                                let sink_for_emitter = app.clone();
                                 move |community_id: crate::owner_state_types::SpaceId,
                                       space_name: String| {
-                                    use tauri::Emitter as _;
                                     let space_id_hex = hex::encode(community_id.0);
-                                    if let Err(e) = app_handle_for_emitter.emit(
+                                    crate::node_event_sink::emit_ser(
+                                        sink_for_emitter.as_ref(),
                                         "nav-updated",
                                         &NavUpdatedPayload {
                                             action: "modified",
@@ -4168,12 +4185,7 @@ pub(crate) async fn start_node_inner(
                                             parent_id: None,
                                             pending: Some(false),
                                         },
-                                    ) {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "ZEB-254 pending-clear: nav-updated emit failed"
-                                        );
-                                    }
+                                    );
                                 }
                             })),
                         };
@@ -4200,11 +4212,11 @@ pub(crate) async fn start_node_inner(
                     // the registry config — `take()` because the outer
                     // sender is moved by value once.
                     let channel_log_registry: std::sync::Arc<
-                        crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>,
+                        crate::community_channel_log_engine::ChannelLogRegistry,
                     > = crate::community_channel_log_engine::ChannelLogRegistry::new(
                         crate::community_channel_log_engine::ChannelLogRegistryConfig {
                             adapter_request_tx: channel_log_adapter_request_tx_outer.clone(),
-                            app: app.clone(),
+                            sink: app.clone(),
                             identity_dir: identity_dir.clone(),
                             self_owner,
                             self_device_id: device_id.clone(),
@@ -4266,24 +4278,21 @@ pub(crate) async fn start_node_inner(
                             move |payload| {
                                 let app = app_for_membership.clone();
                                 async move {
-                                    if let Err(e) = app.emit("community-members-changed", &payload)
-                                    {
-                                        tracing::warn!(
-                                            error = ?e,
-                                            "failed to emit community-members-changed"
-                                        );
-                                    }
+                                    crate::node_event_sink::emit_ser(
+                                        app.as_ref(),
+                                        "community-members-changed",
+                                        &payload,
+                                    );
                                 }
                             },
                             move |payload| {
                                 let app = app_for_channel_config.clone();
                                 async move {
-                                    if let Err(e) = app.emit("channel-config-updated", &payload) {
-                                        tracing::warn!(
-                                            error = ?e,
-                                            "failed to emit channel-config-updated"
-                                        );
-                                    }
+                                    crate::node_event_sink::emit_ser(
+                                        app.as_ref(),
+                                        "channel-config-updated",
+                                        &payload,
+                                    );
                                 }
                             },
                             // ZEB-270 Phase 3 Task 4.5: production
@@ -4619,17 +4628,12 @@ pub(crate) async fn start_node_inner(
                                             _ => {}
                                         }
                                         if let Some(changed_actor) = emit_changed {
-                                            if let Err(e) = app.emit(
+                                            app.emit(
                                                 "connectivity-reachability-changed",
                                                 serde_json::json!({
                                                     "actor": hex::encode(changed_actor.0),
                                                 }),
-                                            ) {
-                                                tracing::warn!(
-                                                    error = ?e,
-                                                    "failed to emit connectivity-reachability-changed"
-                                                );
-                                            }
+                                            );
                                         }
                                         apply_remote_epoch_event(
                                             cs_epoch,
@@ -4669,14 +4673,11 @@ pub(crate) async fn start_node_inner(
                             move |payload| {
                                 let app = app_for_degraded.clone();
                                 async move {
-                                    if let Err(e) =
-                                        app.emit("community-state-sync-degraded", &payload)
-                                    {
-                                        tracing::warn!(
-                                            error = ?e,
-                                            "failed to emit community-state-sync-degraded"
-                                        );
-                                    }
+                                    crate::node_event_sink::emit_ser(
+                                        app.as_ref(),
+                                        "community-state-sync-degraded",
+                                        &payload,
+                                    );
                                 }
                             },
                         ));
@@ -5053,8 +5054,8 @@ pub(crate) async fn start_node_inner(
                                     // Fire nav-updated event so the UI
                                     // ungreys this community at boot.
                                     let space_id_hex = hex::encode(space_id.0);
-                                    use tauri::Emitter as _;
-                                    if let Err(e) = app.emit(
+                                    crate::node_event_sink::emit_ser(
+                                        app.as_ref(),
                                         "nav-updated",
                                         &NavUpdatedPayload {
                                             action: "modified",
@@ -5065,12 +5066,7 @@ pub(crate) async fn start_node_inner(
                                             parent_id: None,
                                             pending: Some(false),
                                         },
-                                    ) {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "ZEB-254 R3 (C3): nav-updated emit failed during boot heal"
-                                        );
-                                    }
+                                    );
                                 }
                                 crate::owner_state_crdt::ApplyOutcome::Rejected(ref reason) => {
                                     tracing::warn!(
@@ -6084,7 +6080,7 @@ pub(crate) async fn start_node_inner(
                             dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
                         > = std::sync::Arc::new(
                             crate::iroh_invite_acceptor::IrohInviteHandshakeAcceptor::<
-                                tauri::AppHandle<tauri::Wry>,
+                                std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
                             >::with_config(
                                 std::sync::Arc::clone(&registry),
                                 std::sync::Arc::clone(&outbox),
@@ -6109,7 +6105,7 @@ pub(crate) async fn start_node_inner(
                             dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
                         > = std::sync::Arc::new(
                             crate::iroh_friend_acceptor::IrohFriendHandshakeAcceptor::<
-                                tauri::AppHandle<tauri::Wry>,
+                                std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
                             >::new(
                                 std::sync::Arc::clone(&crdt_state),
                                 std::sync::Arc::clone(&tracker),
@@ -6826,9 +6822,9 @@ pub(crate) async fn start_node_inner(
                         // ZEB-298+ZEB-312 PR 2 Task 2: capture the typed Wry
                         // AppHandle so IPC handlers (generic over R) can hand
                         // the voting engine a concrete `AppHandle<Wry>` for
-                        // Tier 3 lifecycle event emission. `app` here is
-                        // `tauri::AppHandle` (= `AppHandle<Wry>` by default).
-                        guard.app_handle_wry = Some(app.clone());
+                        // Tier 3 lifecycle event emission. ZEB-445: `None`
+                        // in serve mode (voting IPCs stay Tauri-bound).
+                        guard.app_handle_wry = wry_handle.clone();
                         // ZEB-270 Phase 3 Task 4.5: store the channel-log
                         // registry handle so stop_inner can flip every
                         // per-channel `closing` flag and run final flushes
@@ -7032,7 +7028,6 @@ pub(crate) async fn start_node_inner(
                                 // placeholders), resolving the path exactly as
                                 // get_pkarr_relays does so the two surfaces agree.
                                 let settings_path = connectivity_settings_path(
-                                    app,
                                     guard.pkarr_settings_path.clone(),
                                 )
                                 .ok();
@@ -7356,9 +7351,7 @@ pub(crate) async fn start_node_inner(
                         // change must emit so the Settings + Network Health
                         // listeners refetch, otherwise they'd show the
                         // pre-reconcile list until the next manual refresh.
-                        if let Err(e) = app.emit("connectivity-relays-changed", ()) {
-                            tracing::warn!(error = %e, "boot relay reconcile: emit failed");
-                        }
+                        app.emit("connectivity-relays-changed", serde_json::Value::Null);
                     }
                 }
             }
@@ -7414,7 +7407,11 @@ pub(crate) async fn start_node_inner(
                             break;
                         }
                         let s = prx.borrow().clone();
-                        let _ = app_clone.emit("pairing-state-changed", s);
+                        crate::node_event_sink::emit_ser(
+                            app_clone.as_ref(),
+                            "pairing-state-changed",
+                            &s,
+                        );
                     }
                 });
 
@@ -7521,13 +7518,7 @@ pub(crate) async fn start_node_inner(
                     let app_for_emit = app.clone();
                     let emit_fn: crate::community_voting_tick::EmitFn =
                         std::sync::Arc::new(move |event_name: &str, payload: serde_json::Value| {
-                            if let Err(e) = app_for_emit.emit(event_name, payload) {
-                                tracing::warn!(
-                                    event = event_name,
-                                    error = %e,
-                                    "voting tick emit failed"
-                                );
-                            }
+                            app_for_emit.emit(event_name, payload);
                         });
                     let auto_exec_fn: crate::community_voting_tick::AutoExecSetPowerFn =
                         std::sync::Arc::new(
@@ -7590,7 +7581,8 @@ pub(crate) async fn start_node_inner(
                     }
                 }
             }
-            let _ = app.emit(
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
                 "zenoh-status",
                 &ZenohStatus {
                     status: "connected".to_string(),
@@ -18174,7 +18166,7 @@ pub fn mint_community_creation(
 /// commit. See spec at `docs/specs/2026-05-09-zeb-267-...md` for the
 /// rationale behind moving the bump out of the apply critical section.
 #[allow(clippy::too_many_arguments)]
-pub async fn create_community_inner<R: tauri::Runtime>(
+pub async fn create_community_inner(
     name: String,
     is_invite_only: bool,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
@@ -18194,7 +18186,7 @@ pub async fn create_community_inner<R: tauri::Runtime>(
     // `None` (driver then parks permanently once satisfied).
     transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     channel_log_registry: std::sync::Arc<
-        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+        crate::community_channel_log_engine::ChannelLogRegistry,
     >,
     snapshot_generation: u64,
     node_state: &std::sync::Mutex<NodeState>,
@@ -18709,7 +18701,7 @@ mod create_community_inner_tests {
         enrollment_cert: harmony_owner::certs::EnrollmentCert,
         community_registry: std::sync::Arc<CommunitySyncRegistry>,
         community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
-        channel_log_registry: std::sync::Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+        channel_log_registry: std::sync::Arc<ChannelLogRegistry>,
         node_state: std::sync::Mutex<NodeState>,
         // Held alive so adapter channels don't report Closed.
         _community_adapter_rx:
@@ -19692,7 +19684,7 @@ fn orphan_dir_adoption_eligible(
 /// unchanged; the iroh-handshake redemption path (ZEB-325 Phase 2c
 /// option A) uses the explicit-overrides variant directly.
 #[allow(clippy::too_many_arguments)]
-pub async fn redeem_invite_inner<R: tauri::Runtime, F>(
+pub async fn redeem_invite_inner<F>(
     url: String,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
@@ -19713,7 +19705,7 @@ pub async fn redeem_invite_inner<R: tauri::Runtime, F>(
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<
-        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+        crate::community_channel_log_engine::ChannelLogRegistry,
     >,
     fence_check: F,
     identity_dir: Option<std::path::PathBuf>,
@@ -19751,7 +19743,7 @@ where
 /// pre-delivered `JoinCountersign` event so the oneshot await resolves
 /// without needing the Reticulum unicast or CRDT-sync round-trip.
 #[allow(clippy::too_many_arguments)]
-pub async fn redeem_invite_inner_with_overrides<R: tauri::Runtime, F>(
+pub async fn redeem_invite_inner_with_overrides<F>(
     url: String,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
@@ -19775,7 +19767,7 @@ pub async fn redeem_invite_inner_with_overrides<R: tauri::Runtime, F>(
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<
-        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+        crate::community_channel_log_engine::ChannelLogRegistry,
     >,
     fence_check: F,
     // ZEB-285: identity_dir used to write pre_fork_snapshot.bin for fork invites.
@@ -20962,7 +20954,7 @@ async fn redeem_invite(
 /// so unit tests can supply a fabricated snapshot + the standard
 /// redeem-invite test fixture without spinning up a `LibraryDirectory` actor.
 #[allow(clippy::too_many_arguments)]
-async fn join_open_community_inner<R, F>(
+async fn join_open_community_inner<F>(
     community_id_hex: String,
     snapshot: &[crate::library_directory::AggregatedEntry],
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
@@ -20984,12 +20976,11 @@ async fn join_open_community_inner<R, F>(
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<
-        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+        crate::community_channel_log_engine::ChannelLogRegistry,
     >,
     fence_check: F,
 ) -> Result<RedeemInviteResultDto, String>
 where
-    R: tauri::Runtime,
     F: Fn() -> Result<(), String>,
 {
     let invite_url = crate::library_directory::find_open_community_invite_url_in_snapshot(
@@ -21199,7 +21190,7 @@ mod redeem_invite_inner_tests {
         pub(super) unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
         pub(super) dm_outbox: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
         pub(super) channel_log_registry:
-            std::sync::Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+            std::sync::Arc<ChannelLogRegistry>,
         // ZEB-436: tempdir root (== the registry's identity_dir) so the
         // orphan-adoption tests can load `communities/{hex}/crdt.cbor`
         // directly for ground-truth assertions.
@@ -22813,7 +22804,7 @@ mod zeb436_orphan_adoption_tests {
         unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
         dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
         channel_log_registry: std::sync::Arc<
-            crate::community_channel_log_engine::ChannelLogRegistry<tauri::test::MockRuntime>,
+            crate::community_channel_log_engine::ChannelLogRegistry,
         >,
         invite_url: String,
         crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
@@ -36354,7 +36345,7 @@ async fn invite_targets_orphaned_community_dir(
 ///      resolves immediately because Step 12's countersign insert fires
 ///      the post-Inserted hook on `target_event_id == bootstrap_join.id`.
 #[allow(clippy::too_many_arguments)]
-pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime, F>(
+pub async fn connectivity_redeem_invite_iroh_inner<F>(
     invite_url: String,
     pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
     reachability_resolver: Option<crate::reachability_resolver::ReachabilityResolver>,
@@ -36380,7 +36371,7 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime, F>(
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<
-        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+        crate::community_channel_log_engine::ChannelLogRegistry,
     >,
     // ZEB-427: owner-state SyncEngine handle for the durable-on-commit
     // fence (ZEB-393 Bug A). This was the ONE join path missing the
@@ -37705,19 +37696,15 @@ async fn connectivity_get_identity_discoverable(
 /// `NodeState.pkarr_settings_path` is cleared on stop, but the relay manager
 /// must still read/write the user's persisted relays pre-start / post-stop —
 /// fall back to the app-data-dir-derived path.
-fn connectivity_settings_path<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
+fn connectivity_settings_path(
     state_path: Option<std::path::PathBuf>,
 ) -> Result<std::path::PathBuf, String> {
     if let Some(p) = state_path {
         return Ok(p);
     }
-    use tauri::Manager;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir: {e}"))?;
-    Ok(dir.join("connectivity-settings.json"))
+    // ZEB-445: Tauri-free resolution — identical path to the former
+    // `app.path().app_data_dir()` (see `resolve_app_data_dir`).
+    Ok(crate::resolve_app_data_dir()?.join("connectivity-settings.json"))
 }
 
 /// ZEB-380: build `RelayHealthWire` placeholders (all `Healthy`, no outcome) for
@@ -37774,7 +37761,7 @@ fn apply_pkarr_relays<R: tauri::Runtime>(
             guard.pkarr_relay_client.clone(),
         )
     };
-    let path = connectivity_settings_path(app, settings_path)?;
+    let path = connectivity_settings_path(settings_path)?;
     let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
     settings.relays = validated.clone();
     settings
@@ -37881,7 +37868,7 @@ async fn add_pkarr_relay<R: tauri::Runtime>(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         guard.pkarr_settings_path.clone()
     };
-    let path = connectivity_settings_path(&app, settings_path)?;
+    let path = connectivity_settings_path(settings_path)?;
     let mut relays =
         effective_pkarr_relays(pkarr_settings::PkarrSettings::load_or_default(&path).relays);
     relays.push(url);
@@ -37910,7 +37897,7 @@ async fn remove_pkarr_relay<R: tauri::Runtime>(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         guard.pkarr_settings_path.clone()
     };
-    let path = connectivity_settings_path(&app, settings_path)?;
+    let path = connectivity_settings_path(settings_path)?;
     let target = url.trim().trim_end_matches('/');
     let relays: Vec<String> =
         effective_pkarr_relays(pkarr_settings::PkarrSettings::load_or_default(&path).relays)
@@ -37927,8 +37914,7 @@ async fn remove_pkarr_relay<R: tauri::Runtime>(
 /// health; falls back to the persisted list (Healthy placeholders) pre-wiring
 /// so the Settings UI can render + edit before/without a running node.
 #[tauri::command]
-async fn get_pkarr_relays<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
+async fn get_pkarr_relays(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
     let (settings_path, relay_client) = {
@@ -37947,7 +37933,7 @@ async fn get_pkarr_relays<R: tauri::Runtime>(
     let relays = match relay_client.as_ref() {
         Some(rc) => relay_health_wires(Some(rc), None),
         None => {
-            let path = connectivity_settings_path(&app, settings_path)?;
+            let path = connectivity_settings_path(settings_path)?;
             relay_health_wires(None, Some(path.as_path()))
         }
     };
@@ -40972,8 +40958,7 @@ impl crate::network_health::PkarrSnapshot for StubEmptyPkarrSnapshot {
 /// hasn't been wired yet (boot ordering / pre-start_node) — the panel
 /// renders gracefully on the empty shape.
 #[tauri::command]
-async fn network_health_snapshot<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
+async fn network_health_snapshot(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<crate::network_health::NetworkHealthSnapshot, String> {
     let (svc, settings_path, relay_client) = {
@@ -41000,7 +40985,7 @@ async fn network_health_snapshot<R: tauri::Runtime>(
             snap.pkarr_status.relays = match relay_client.as_ref() {
                 Some(rc) => relay_health_wires(Some(rc), None),
                 None => {
-                    let path = connectivity_settings_path(&app, settings_path).ok();
+                    let path = connectivity_settings_path(settings_path).ok();
                     relay_health_wires(None, path.as_deref())
                 }
             };
@@ -47207,8 +47192,8 @@ mod zeb_321_connectivity_ipc_tests {
 ///
 /// Coverage gap: the happy-path `require_owner_loaded → Ok(handles)` test
 /// is OMITTED because `NodeState.channel_log_registry` is typed
-/// `ChannelLogRegistry<tauri::Wry>`, and there is no supported way to
-/// construct a `ChannelLogRegistry<tauri::Wry>` in tests (only
+/// `ChannelLogRegistry`, and there is no supported way to
+/// construct a `ChannelLogRegistry` in tests (only
 /// `MockRuntime` is available via `tauri::test::mock_app()`). The `NotLoaded`
 /// paths for all 8 nullable fields are covered below. The `Ok` path is
 /// exercised indirectly by integration tests that call owner-touching IPCs
@@ -47242,7 +47227,7 @@ mod owner_loaded_tests {
     /// Returns (NodeState with 7/8 owner fields as Some, receiver kept alive).
     ///
     /// `channel_log_registry` is left as `None` because
-    /// `ChannelLogRegistry<tauri::Wry>` cannot be constructed in tests.
+    /// `ChannelLogRegistry` cannot be constructed in tests.
     /// See module-level coverage-gap note above.
     fn node_state_with_seven_owner_fields() -> (
         NodeState,

@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use harmony_content::book::MemoryBookStore;
 use harmony_runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
-use tauri::{AppHandle, Emitter, Runtime};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -406,8 +405,8 @@ pub struct IrohRuntimeHandles {
 /// lists currently-enforced muted/kicked owners; flags the local node's own
 /// state. Best-effort (a failed emit is logged by Tauri, not surfaced).
 #[allow(clippy::too_many_arguments)]
-async fn emit_moderation_changed<R: Runtime>(
-    app: &AppHandle<R>,
+async fn emit_moderation_changed(
+    app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     registry: &std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     presence_map: &std::sync::Arc<tokio::sync::Mutex<crate::voice_presence::VoicePresenceMap>>,
     moderation_map: &std::sync::Arc<tokio::sync::Mutex<crate::voice_moderation::ActiveModeration>>,
@@ -451,9 +450,7 @@ async fn emit_moderation_changed<R: Runtime>(
     for o in roster_owners.iter().chain(std::iter::once(&self_owner.0)) {
         powers.insert(hex::encode(o), serde_json::json!(power_of(o)));
     }
-    let _ = app.emit(
-        "voice-moderation-changed",
-        serde_json::json!({
+    crate::node_event_sink::emit_ser(app.as_ref(), "voice-moderation-changed", &serde_json::json!({
             "community": hex::encode(community.0),
             "channel": hex::encode(channel.0),
             "mutedOwners": muted.iter().map(hex::encode).collect::<Vec<_>>(),
@@ -462,8 +459,7 @@ async fn emit_moderation_changed<R: Runtime>(
             "selfPower": power_of(&self_owner.0),
             "selfModMuted": muted.contains(&self_owner.0),
             "selfKicked": kicked.contains(&self_owner.0),
-        }),
-    );
+        }));
 }
 
 /// ZEB-418 SP2 P2: wire one [`DatasetSyncHandles`] pair to a Zenoh pub/sub
@@ -481,9 +477,9 @@ async fn emit_moderation_changed<R: Runtime>(
 /// an owned Vec — these are peer-fed topics, so an unbounded copy would be
 /// attacker-driven allocation (PR #222 round 1). Oversize samples are
 /// dropped with a warn and the loop continues as if nothing arrived.
-async fn spawn_dataset_sync_zenoh_adapter<R: Runtime>(
+async fn spawn_dataset_sync_zenoh_adapter(
     session: &zenoh::Session,
-    app: &AppHandle<R>,
+    app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     closing: &Arc<AtomicBool>,
     handles: DatasetSyncHandles,
     dataset: &'static str,
@@ -492,13 +488,10 @@ async fn spawn_dataset_sync_zenoh_adapter<R: Runtime>(
 ) {
     let topic = format!("harmony/owner/{}/ds/{}", handles.addr_hex, dataset);
     let emit_degraded = |reason: &str| {
-        let _ = app.emit(
-            degraded_event,
-            serde_json::json!({
+        crate::node_event_sink::emit_ser(app.as_ref(), degraded_event, &serde_json::json!({
                 "reason": reason,
                 "topic": &topic,
-            }),
-        );
+            }));
     };
     match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
         Ok(key_expr) => {
@@ -570,13 +563,10 @@ async fn spawn_dataset_sync_zenoh_adapter<R: Runtime>(
                                             "dataset-root subscriber closed unexpectedly; \
                                              will re-declare after backoff"
                                         );
-                                        let _ = app_late.emit(
-                                            degraded_event,
-                                            serde_json::json!({
+                                        crate::node_event_sink::emit_ser(app_late.as_ref(), degraded_event, &serde_json::json!({
                                                 "reason": "subscriber_closed",
                                                 "topic": &topic_late,
-                                            }),
-                                        );
+                                            }));
                                         break; // break inner, retry outer
                                     }
                                 }
@@ -636,10 +626,10 @@ async fn spawn_dataset_sync_zenoh_adapter<R: Runtime>(
 /// all initialized, or `Err(msg)` if any startup step fails.
 /// Returns when shutdown signal fires.
 #[allow(clippy::too_many_arguments)] // pre-existing; tracked for refactor
-pub async fn run<R: Runtime>(
+pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
-    app: AppHandle<R>,
+    app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     endpoint: Option<String>,
     ready_tx: oneshot::Sender<Result<(), String>>,
     mut shutdown: watch::Receiver<bool>,
@@ -659,7 +649,7 @@ pub async fn run<R: Runtime>(
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     vine_feed_cache: std::sync::Arc<std::sync::Mutex<crate::vine_feed_cache::VineFeedCache>>,
     mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
-    mail_sync: Option<Arc<crate::mail_sync::MailSync<R>>>,
+    mail_sync: Option<Arc<crate::mail_sync::MailSync>>,
     mut refresh_rx: mpsc::Receiver<crate::mail_sync::RefreshRequest>,
     mut pin_intent: std::collections::HashSet<[u8; 32]>,
     fetch_completion_tx: mpsc::Sender<[u8; 32]>,
@@ -964,14 +954,11 @@ pub async fn run<R: Runtime>(
             Err(e) => {
                 let e = format!("zenoh open failed: {e}");
                 let _ = ready_tx.send(Err(e.clone()));
-                let _ = app.emit(
-                    "zenoh-status",
-                    &crate::ZenohStatus {
+                crate::node_event_sink::emit_ser(app.as_ref(), "zenoh-status", &crate::ZenohStatus {
                         status: "error".to_string(),
                         endpoint: None,
                         error: Some(e),
-                    },
-                );
+                    });
                 return;
             }
         };
@@ -1036,13 +1023,10 @@ pub async fn run<R: Runtime>(
         // graceful publish-only / fully-degraded mode rather than
         // crashing the node.
         let emit_degraded = |reason: &str| {
-            let _ = app.emit(
-                "state-root-sync-degraded",
-                serde_json::json!({
+            crate::node_event_sink::emit_ser(app.as_ref(), "state-root-sync-degraded", &serde_json::json!({
                     "reason": reason,
                     "topic": &topic,
-                }),
-            );
+                }));
         };
         match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
             Ok(key_expr) => {
@@ -1098,13 +1082,10 @@ pub async fn run<R: Runtime>(
                                             tracing::warn!(
                                                 "state-root subscriber closed unexpectedly"
                                             );
-                                            let _ = app_late.emit(
-                                                "state-root-sync-degraded",
-                                                serde_json::json!({
+                                            crate::node_event_sink::emit_ser(app_late.as_ref(), "state-root-sync-degraded", &serde_json::json!({
                                                     "reason": "subscriber_closed",
                                                     "topic": &topic_late,
-                                                }),
-                                            );
+                                                }));
                                         }
                                         break;
                                     }
@@ -1146,13 +1127,10 @@ pub async fn run<R: Runtime>(
     if let Some(handles) = mint_sync_handles.take() {
         let topic = format!("harmony/owner/{}/mint-root-v1", handles.addr_hex);
         let emit_mint_degraded = |reason: &str| {
-            let _ = app.emit(
-                "mint-root-sync-degraded",
-                serde_json::json!({
+            crate::node_event_sink::emit_ser(app.as_ref(), "mint-root-sync-degraded", &serde_json::json!({
                     "reason": reason,
                     "topic": &topic,
-                }),
-            );
+                }));
         };
         match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
             Ok(key_expr) => {
@@ -1208,13 +1186,10 @@ pub async fn run<R: Runtime>(
                                                 "mint-root subscriber closed unexpectedly; \
                                                  will re-declare after backoff"
                                             );
-                                            let _ = app_late.emit(
-                                                "mint-root-sync-degraded",
-                                                serde_json::json!({
+                                            crate::node_event_sink::emit_ser(app_late.as_ref(), "mint-root-sync-degraded", &serde_json::json!({
                                                     "reason": "subscriber_closed",
                                                     "topic": &topic_late,
-                                                }),
-                                            );
+                                                }));
                                             break; // break inner, retry outer
                                         }
                                     }
@@ -1272,13 +1247,10 @@ pub async fn run<R: Runtime>(
     if let Some(handles) = notes_sync_handles.take() {
         let topic = format!("harmony/owner/{}/ds/notes-v1", handles.addr_hex);
         let emit_notes_degraded = |reason: &str| {
-            let _ = app.emit(
-                "notes-sync-degraded",
-                serde_json::json!({
+            crate::node_event_sink::emit_ser(app.as_ref(), "notes-sync-degraded", &serde_json::json!({
                     "reason": reason,
                     "topic": &topic,
-                }),
-            );
+                }));
         };
         match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
             Ok(key_expr) => {
@@ -1334,13 +1306,10 @@ pub async fn run<R: Runtime>(
                                                 "notes-root subscriber closed unexpectedly; \
                                                  will re-declare after backoff"
                                             );
-                                            let _ = app_late.emit(
-                                                "notes-sync-degraded",
-                                                serde_json::json!({
+                                            crate::node_event_sink::emit_ser(app_late.as_ref(), "notes-sync-degraded", &serde_json::json!({
                                                     "reason": "subscriber_closed",
                                                     "topic": &topic_late,
-                                                }),
-                                            );
+                                                }));
                                             break; // break inner, retry outer
                                         }
                                     }
@@ -1398,13 +1367,10 @@ pub async fn run<R: Runtime>(
     if let Some(handles) = dm_inbox_sync_handles.take() {
         let topic = format!("harmony/owner/{}/ds/dm-inbox-v1", handles.addr_hex);
         let emit_dm_inbox_degraded = |reason: &str| {
-            let _ = app.emit(
-                "dm-inbox-sync-degraded",
-                serde_json::json!({
+            crate::node_event_sink::emit_ser(app.as_ref(), "dm-inbox-sync-degraded", &serde_json::json!({
                     "reason": reason,
                     "topic": &topic,
-                }),
-            );
+                }));
         };
         match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
             Ok(key_expr) => {
@@ -1460,13 +1426,10 @@ pub async fn run<R: Runtime>(
                                                 "dm-inbox-root subscriber closed unexpectedly; \
                                                  will re-declare after backoff"
                                             );
-                                            let _ = app_late.emit(
-                                                "dm-inbox-sync-degraded",
-                                                serde_json::json!({
+                                            crate::node_event_sink::emit_ser(app_late.as_ref(), "dm-inbox-sync-degraded", &serde_json::json!({
                                                     "reason": "subscriber_closed",
                                                     "topic": &topic_late,
-                                                }),
-                                            );
+                                                }));
                                             break; // break inner, retry outer
                                         }
                                     }
@@ -1663,12 +1626,9 @@ pub async fn run<R: Runtime>(
                                                         | crate::library_directory::OnEntryOutcome::AccretedListedBy(c) => Some(*c),
                                                         crate::library_directory::OnEntryOutcome::Idempotent => None,
                                                     };
-                                                    let _ = app_for_task.emit(
-                                                        "library-directory-updated",
-                                                        serde_json::json!({
+                                                    crate::node_event_sink::emit_ser(app_for_task.as_ref(), "library-directory-updated", &serde_json::json!({
                                                             "communityId": community_id.map(|c| hex::encode(c.0)),
-                                                        }),
-                                                    );
+                                                        }));
                                                 }
                                             }
                                             Err(e) => {
@@ -1699,10 +1659,7 @@ pub async fn run<R: Runtime>(
                         }
                         let evicted = library_directory_handle.drop_library(&addr).await;
                         if !evicted.is_empty() {
-                            let _ = app_for_libdir.emit(
-                                "library-directory-updated",
-                                serde_json::json!({ "communityId": null }),
-                            );
+                            crate::node_event_sink::emit_ser(app_for_libdir.as_ref(), "library-directory-updated", &serde_json::json!({ "communityId": null }));
                         }
                     }
                 }
@@ -1779,10 +1736,7 @@ pub async fn run<R: Runtime>(
                                                 | crate::library_directory::AnnounceOutcome::Updated(_)
                                         );
                                         if changed || result.evicted.is_some() {
-                                            let _ = app_for_announce.emit(
-                                                "library-directory-updated",
-                                                serde_json::json!({ "communityId": null }),
-                                            );
+                                            crate::node_event_sink::emit_ser(app_for_announce.as_ref(), "library-directory-updated", &serde_json::json!({ "communityId": null }));
                                         }
                                     }
                                     Err(e) => {
@@ -1933,15 +1887,12 @@ pub async fn run<R: Runtime>(
                                                         // Spec §7: emit flat payload
                                                         // (subscriptionId + DiscoveredProfileInfo
                                                         // fields hoisted).
-                                                        let _ = app_for_task.emit(
-                                                            "profile-broadcast-received",
-                                                            serde_json::json!({
+                                                        crate::node_event_sink::emit_ser(app_for_task.as_ref(), "profile-broadcast-received", &serde_json::json!({
                                                                 "subscriptionId": subscription_id,
                                                                 "ownerAddr": info.owner_addr,
                                                                 "communityIds": info.community_ids,
                                                                 "sharedAt": info.shared_at,
-                                                            }),
-                                                        );
+                                                            }));
                                                     }
                                                 }
                                                 Err(e) => {
@@ -2121,9 +2072,7 @@ pub async fn run<R: Runtime>(
                                             {
                                                 // Flat payload (subscriptionId +
                                                 // DiscoveredCardInfo fields hoisted).
-                                                let _ = app_for_task.emit(
-                                                    "member-card-received",
-                                                    serde_json::json!({
+                                                crate::node_event_sink::emit_ser(app_for_task.as_ref(), "member-card-received", &serde_json::json!({
                                                         "subscriptionId": subscription_id,
                                                         "ownerIdHex": info.owner_id_hex,
                                                         "displayName": info.display_name,
@@ -2137,8 +2086,7 @@ pub async fn run<R: Runtime>(
                                                         // (Cursor). DiscoveredCardInfo
                                                         // already carries it hex-encoded.
                                                         "profilePageRoot": info.profile_page_root,
-                                                    }),
-                                                );
+                                                    }));
                                             }
                                         }
                                         Err(_) => {
@@ -3813,10 +3761,7 @@ pub async fn run<R: Runtime>(
                                             if frame.len() < 23 || frame[7..23] != dev[..16] {
                                                 continue;
                                             }
-                                            let _ = app_sub.emit(
-                                                "voice-frame-received",
-                                                serde_json::json!({ "frameBytes": frame }),
-                                            );
+                                            crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-frame-received", &serde_json::json!({ "frameBytes": frame }));
                                         }
                                         // Inner receive loop ended on a transport
                                         // error. Stop if we're shutting down.
@@ -3848,13 +3793,10 @@ pub async fn run<R: Runtime>(
                                             key = %sub_key_retry,
                                             "voice subscriber closed unexpectedly; reconnecting"
                                         );
-                                        let _ = app_sub.emit(
-                                            "voice-transport-lost",
-                                            serde_json::json!({
+                                        crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-transport-lost", &serde_json::json!({
                                                 "communityId": community_hex,
                                                 "channelId": channel_hex,
-                                            }),
-                                        );
+                                            }));
                                         if made_progress {
                                             backoff = std::time::Duration::from_secs(5);
                                         } else {
@@ -3879,13 +3821,10 @@ pub async fn run<R: Runtime>(
                                                     // made_progress logic above, not
                                                     // by mere re-subscription.
                                                     sub = s;
-                                                    let _ = app_sub.emit(
-                                                        "voice-transport-restored",
-                                                        serde_json::json!({
+                                                    crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-transport-restored", &serde_json::json!({
                                                             "communityId": community_hex,
                                                             "channelId": channel_hex,
-                                                        }),
-                                                    );
+                                                        }));
                                                     break;
                                                 }
                                                 Err(e) => {
@@ -4283,20 +4222,15 @@ pub async fn run<R: Runtime>(
                         // this, a UI listening on `voice-presence-changed`
                         // keeps showing participants for the channel we left
                         // until some unrelated update fires (final-review fix).
-                        let _ = app.emit(
-                            "voice-presence-changed",
-                            serde_json::json!({
+                        crate::node_event_sink::emit_ser(app.as_ref(), "voice-presence-changed", &serde_json::json!({
                                 "community": hex::encode(community_id.0),
                                 "channel": hex::encode(channel_id.0),
                                 "roster": Vec::<crate::voice_presence::RosterEntry>::new(),
-                            }),
-                        );
+                            }));
                         // ZEB-358: likewise clear the moderation overlay for the
                         // channel we left, so the UI never shows a stale mute/kick
                         // banner after leaving (mirrors the empty-roster emit above).
-                        let _ = app.emit(
-                            "voice-moderation-changed",
-                            serde_json::json!({
+                        crate::node_event_sink::emit_ser(app.as_ref(), "voice-moderation-changed", &serde_json::json!({
                                 "community": hex::encode(community_id.0),
                                 "channel": hex::encode(channel_id.0),
                                 "mutedOwners": Vec::<String>::new(),
@@ -4305,8 +4239,7 @@ pub async fn run<R: Runtime>(
                                 "selfPower": 0,
                                 "selfModMuted": false,
                                 "selfKicked": false,
-                            }),
-                        );
+                            }));
                     }
                     crate::voice::VoiceChannelRequest::SetMuted { community_id, channel_id, muted } => {
                         // ZEB-351 Voice V3: flip the shared mute flag the presence
@@ -4416,13 +4349,10 @@ pub async fn run<R: Runtime>(
                                                 crate::voice_crypto::VOICE_DM_PACKET_AAD,
                                                 &sealed,
                                             ) {
-                                                let _ = app_sub.emit(
-                                                    "dm-voice-frame-received",
-                                                    serde_json::json!({
+                                                crate::node_event_sink::emit_ser(app_sub.as_ref(), "dm-voice-frame-received", &serde_json::json!({
                                                         "callId": call_hex,
                                                         "frameBytes": frame,
-                                                    }),
-                                                );
+                                                    }));
                                             }
                                         }
                                         // Inner receive loop ended on a transport
@@ -4455,10 +4385,7 @@ pub async fn run<R: Runtime>(
                                             key = %sub_key_retry,
                                             "dm voice subscriber closed unexpectedly; reconnecting"
                                         );
-                                        let _ = app_sub.emit(
-                                            "voice-transport-lost",
-                                            serde_json::json!({ "callId": call_hex }),
-                                        );
+                                        crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-transport-lost", &serde_json::json!({ "callId": call_hex }));
                                         if made_progress {
                                             backoff = std::time::Duration::from_secs(5);
                                         } else {
@@ -4483,10 +4410,7 @@ pub async fn run<R: Runtime>(
                                                     // made_progress logic above, not
                                                     // by mere re-subscription.
                                                     sub = s;
-                                                    let _ = app_sub.emit(
-                                                        "voice-transport-restored",
-                                                        serde_json::json!({ "callId": call_hex }),
-                                                    );
+                                                    crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-transport-restored", &serde_json::json!({ "callId": call_hex }));
                                                     break;
                                                 }
                                                 Err(e) => {
@@ -4922,14 +4846,11 @@ pub async fn run<R: Runtime>(
                             let g = voice_presence_map.lock().await;
                             g.roster(&c, &ch)
                         };
-                        let _ = app.emit(
-                            "voice-presence-changed",
-                            serde_json::json!({
+                        crate::node_event_sink::emit_ser(app.as_ref(), "voice-presence-changed", &serde_json::json!({
                                 "community": hex::encode(c.0),
                                 "channel": hex::encode(ch.0),
                                 "roster": roster,
-                            }),
-                        );
+                            }));
                     }
                 }
                 // ── ZEB-360: group-DM presence crash-eviction ─────────────
@@ -4955,14 +4876,11 @@ pub async fn run<R: Runtime>(
                             let g = groupdm_presence_map.lock().await;
                             g.roster(&sp, &call)
                         };
-                        let _ = app.emit(
-                            "group-call-presence-changed",
-                            serde_json::json!({
+                        crate::node_event_sink::emit_ser(app.as_ref(), "group-call-presence-changed", &serde_json::json!({
                                 "spaceId": hex::encode(sp.0),
                                 "callId": hex::encode(call.0),
                                 "roster": roster,
-                            }),
-                        );
+                            }));
                     }
                 }
                 // ZEB-358: lapse moderation directives past TTL, re-emit overlay.
@@ -5205,8 +5123,8 @@ pub async fn run<R: Runtime>(
 /// event and emit it. The call state machine lives in the frontend; this
 /// only translates the transport-level signal into a Tauri event with the
 /// hex-encoded call-ID (and caller / decline reason where applicable).
-fn emit_voice_signal_event<R: Runtime>(
-    app: &AppHandle<R>,
+fn emit_voice_signal_event(
+    app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     signal: &crate::voice_signal::VoiceSignal,
     space_id_hex: Option<&str>,
 ) {
@@ -5214,17 +5132,14 @@ fn emit_voice_signal_event<R: Runtime>(
     let call_hex = hex::encode(signal.call_id);
     match signal.kind {
         VoiceSignalKind::Invite => {
-            let _ = app.emit(
-                "incoming-call",
-                serde_json::json!({
+            crate::node_event_sink::emit_ser(app.as_ref(), "incoming-call", &serde_json::json!({
                     "callId": call_hex,
                     "callerOwner": hex::encode(signal.caller.0),
                     "spaceId": space_id_hex,
-                }),
-            );
+                }));
         }
         VoiceSignalKind::Accept => {
-            let _ = app.emit("call-accepted", serde_json::json!({ "callId": call_hex }));
+            crate::node_event_sink::emit_ser(app.as_ref(), "call-accepted", &serde_json::json!({ "callId": call_hex }));
         }
         VoiceSignalKind::Decline => {
             let reason = match signal.decline_reason {
@@ -5232,16 +5147,13 @@ fn emit_voice_signal_event<R: Runtime>(
                 Some(DeclineReason::Busy) => "busy",
                 Some(DeclineReason::Timeout) => "timeout",
             };
-            let _ = app.emit(
-                "call-declined",
-                serde_json::json!({ "callId": call_hex, "reason": reason }),
-            );
+            crate::node_event_sink::emit_ser(app.as_ref(), "call-declined", &serde_json::json!({ "callId": call_hex, "reason": reason }));
         }
         VoiceSignalKind::Cancel => {
-            let _ = app.emit("call-canceled", serde_json::json!({ "callId": call_hex }));
+            crate::node_event_sink::emit_ser(app.as_ref(), "call-canceled", &serde_json::json!({ "callId": call_hex }));
         }
         VoiceSignalKind::End => {
-            let _ = app.emit("call-ended", serde_json::json!({ "callId": call_hex }));
+            crate::node_event_sink::emit_ser(app.as_ref(), "call-ended", &serde_json::json!({ "callId": call_hex }));
         }
     }
 }
@@ -5250,8 +5162,8 @@ fn emit_voice_signal_event<R: Runtime>(
 /// Only `Invite`/`Decline` carry to the UI (group calls follow a drop-in model:
 /// no Accept/Cancel/End signals are sent). `space_id_hex` names the GroupDm space
 /// so the banner/roster can scope correctly. Mirrors [`emit_voice_signal_event`].
-fn emit_group_voice_signal_event<R: Runtime>(
-    app: &AppHandle<R>,
+fn emit_group_voice_signal_event(
+    app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     signal: &crate::voice_signal::VoiceSignal,
     space_id_hex: &str,
 ) {
@@ -5259,25 +5171,19 @@ fn emit_group_voice_signal_event<R: Runtime>(
     let call_hex = hex::encode(signal.call_id);
     match signal.kind {
         VoiceSignalKind::Invite => {
-            let _ = app.emit(
-                "incoming-group-call",
-                serde_json::json!({
+            crate::node_event_sink::emit_ser(app.as_ref(), "incoming-group-call", &serde_json::json!({
                     "callId": call_hex,
                     "callerOwner": hex::encode(signal.caller.0),
                     "spaceId": space_id_hex,
-                }),
-            );
+                }));
         }
         VoiceSignalKind::Decline => {
             // `caller` on a Decline is the decliner (responder).
-            let _ = app.emit(
-                "group-call-declined",
-                serde_json::json!({
+            crate::node_event_sink::emit_ser(app.as_ref(), "group-call-declined", &serde_json::json!({
                     "callId": call_hex,
                     "spaceId": space_id_hex,
                     "owner": hex::encode(signal.caller.0),
-                }),
-            );
+                }));
         }
         // Drop-in model: no group Accept/Cancel/End signals are sent.
         _ => {}
@@ -5311,13 +5217,13 @@ fn emit_group_voice_signal_event<R: Runtime>(
 /// The fix-up is verified via type-checking of the requeue branch + the
 /// dm_outbox-side tests for the channel-pressure path.
 #[allow(clippy::too_many_arguments)]
-async fn handle_runtime_action_or_dispatch<R: Runtime>(
+async fn handle_runtime_action_or_dispatch(
     action: RuntimeAction,
     session: &zenoh::Session,
     zenoh_tx: &mpsc::Sender<ZenohEvent>,
     udp: &UdpSocket,
     broadcast_addr: &SocketAddr,
-    app: &AppHandle<R>,
+    app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     closing: &Arc<AtomicBool>,
     own_zid: &str,
     dm_outbox: Option<&std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
@@ -5426,9 +5332,7 @@ async fn handle_runtime_action_or_dispatch<R: Runtime>(
                     match result {
                         Ok(outcome) => {
                             for rm in outcome.newly_received {
-                                let _ = app.emit(
-                                    "dm-received",
-                                    serde_json::json!({
+                                crate::node_event_sink::emit_ser(app.as_ref(), "dm-received", &serde_json::json!({
                                         "spaceId": hex::encode(rm.inbox_entry.space_id.0),
                                         "messageCid": hex::encode(rm.inbox_entry.message_cid.to_bytes()),
                                         "from": hex::encode(rm.inbox_entry.from.0),
@@ -5436,27 +5340,20 @@ async fn handle_runtime_action_or_dispatch<R: Runtime>(
                                         "sentAt": rm.sent_at.wall_ms,
                                         "body": hex::encode(&rm.body),
                                         "mimeType": rm.mime_type,
-                                    }),
-                                );
+                                    }));
                             }
                             for (space_id, message_cid, recipient) in outcome.newly_delivered {
-                                let _ = app.emit(
-                                    "dm-delivered",
-                                    serde_json::json!({
+                                crate::node_event_sink::emit_ser(app.as_ref(), "dm-delivered", &serde_json::json!({
                                         "spaceId": hex::encode(space_id.0),
                                         "messageCid": hex::encode(message_cid.to_bytes()),
                                         "recipientOwnerAddr": hex::encode(recipient.0),
-                                    }),
-                                );
+                                    }));
                             }
                             for (space_id, message_cid) in outcome.newly_expired {
-                                let _ = app.emit(
-                                    "dm-expired",
-                                    serde_json::json!({
+                                crate::node_event_sink::emit_ser(app.as_ref(), "dm-expired", &serde_json::json!({
                                         "spaceId": hex::encode(space_id.0),
                                         "messageCid": hex::encode(message_cid.to_bytes()),
-                                    }),
-                                );
+                                    }));
                             }
                         }
                         Err(e) => {
@@ -5505,13 +5402,13 @@ async fn handle_runtime_action_or_dispatch<R: Runtime>(
 
 /// Dispatch a single RuntimeAction to the platform I/O layer.
 #[allow(clippy::too_many_arguments)] // pre-existing; tracked for refactor
-async fn dispatch_action<R: Runtime>(
+async fn dispatch_action(
     action: RuntimeAction,
     session: &zenoh::Session,
     zenoh_tx: &mpsc::Sender<ZenohEvent>,
     udp: &UdpSocket,
     broadcast_addr: &SocketAddr,
-    app: &AppHandle<R>,
+    app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     closing: &Arc<AtomicBool>,
     own_zid: &str,
 ) {
@@ -5799,15 +5696,12 @@ async fn query_mail_root(
 }
 
 /// Emit zenoh-status error when a Zenoh session appears to have been lost.
-fn emit_session_lost<R: Runtime>(app: &AppHandle<R>, reason: &str) {
-    let _ = app.emit(
-        "zenoh-status",
-        &crate::ZenohStatus {
+fn emit_session_lost(app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>, reason: &str) {
+    crate::node_event_sink::emit_ser(app.as_ref(), "zenoh-status", &crate::ZenohStatus {
             status: "error".to_string(),
             endpoint: None,
             error: Some(format!("session lost: {reason}")),
-        },
-    );
+        });
 }
 
 use harmony_content::book::BookStore;
@@ -6643,8 +6537,8 @@ mod content_verb_tests {
 
 /// Bridge Zenoh subscription messages to Tauri frontend events.
 #[allow(clippy::too_many_arguments)]
-fn emit_frontend_event<R: Runtime>(
-    app: &AppHandle<R>,
+fn emit_frontend_event(
+    app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     key_expr: &str,
     payload: &[u8],
     hop_distance: Option<u8>,
@@ -6653,20 +6547,20 @@ fn emit_frontend_event<R: Runtime>(
     mail_mgr: &std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
     own_mail_key: &str,
     own_root_key: &str,
-    mail_sync: Option<&Arc<crate::mail_sync::MailSync<R>>>,
+    mail_sync: Option<&Arc<crate::mail_sync::MailSync>>,
 ) {
     if key_expr.starts_with("harmony/compute/capacity/") {
         if let Some(mut update) = crate::parse_capacity(key_expr, payload) {
             update.hop_distance = hop_distance;
-            let _ = app.emit("capacity-update", &update);
+            crate::node_event_sink::emit_ser(app.as_ref(), "capacity-update", &update);
         }
     } else if key_expr.starts_with("harmony/profile/") {
         if let Ok(profile) = serde_json::from_slice::<crate::ProfilePayload>(payload) {
-            let _ = app.emit("profile-update", &profile);
+            crate::node_event_sink::emit_ser(app.as_ref(), "profile-update", &profile);
         }
     } else if key_expr.starts_with("harmony/community/") {
         if let Ok(msg) = serde_json::from_slice::<crate::ChannelMessagePayload>(payload) {
-            let _ = app.emit("message-received", &msg);
+            crate::node_event_sink::emit_ser(app.as_ref(), "message-received", &msg);
         }
     } else if key_expr.starts_with("harmony/vines/") {
         if key_expr.contains("/reactions/") {
@@ -6690,7 +6584,7 @@ fn emit_frontend_event<R: Runtime>(
             ) {
                 if let Ok(reaction) = serde_json::from_slice::<crate::VineReactionPayload>(payload)
                 {
-                    let _ = app.emit("vine-reaction-received", &reaction);
+                    crate::node_event_sink::emit_ser(app.as_ref(), "vine-reaction-received", &reaction);
                 }
             }
         } else {
@@ -6720,16 +6614,16 @@ fn emit_frontend_event<R: Runtime>(
                 }
             };
             if let Some(crate::vine_feed_cache::DescriptorOutcome::Inserted { dto }) = outcome {
-                let _ = app.emit("vine-received", &dto);
+                crate::node_event_sink::emit_ser(app.as_ref(), "vine-received", &dto);
             }
         }
     } else if key_expr.starts_with("harmony/announce/") {
         if let Some(announcement) = crate::parse_content_announcement(key_expr, payload) {
-            let _ = app.emit("content-announced", &announcement);
+            crate::node_event_sink::emit_ser(app.as_ref(), "content-announced", &announcement);
         }
     } else if key_expr.contains("/telemetry/") {
         if let Some(event) = crate::parse_telemetry(payload) {
-            let _ = app.emit("telemetry-event", &event);
+            crate::node_event_sink::emit_ser(app.as_ref(), "telemetry-event", &event);
         }
     } else if !own_root_key.is_empty() && key_expr == own_root_key {
         // Phase 2: root CID push for this node's mailbox. Forward to
@@ -6764,7 +6658,7 @@ fn emit_frontend_event<R: Runtime>(
         };
         match mgr.receive_message(payload) {
             Ok(crate::mail::ReceiveOutcome::Inserted(entry)) => {
-                let _ = app.emit("mail-received", &entry);
+                crate::node_event_sink::emit_ser(app.as_ref(), "mail-received", &entry);
             }
             Ok(crate::mail::ReceiveOutcome::Promoted(_entry)) => {
                 tracing::debug!(key_expr, "live push promoted Pending to Local (no emit)");

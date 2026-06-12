@@ -35,7 +35,7 @@ pub struct OwnerLoadedHandles {
     pub self_owner: OwnerAddr,
     pub community_registry: Arc<CommunitySyncRegistry>,
     pub community_adapter_request_tx: mpsc::Sender<CommunityAdapterRequest>,
-    pub channel_log_registry: Arc<ChannelLogRegistry<tauri::Wry>>,
+    pub channel_log_registry: Arc<ChannelLogRegistry>,
     pub dm_outbox: Arc<TokioMutex<DmOutbox>>,
     pub generation: u64,
 }
