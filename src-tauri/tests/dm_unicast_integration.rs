@@ -338,22 +338,21 @@ async fn dm_full_round_trip_through_unicast_channel() {
     //    variant (production path: event_loop pre-decodes, spawns the
     //    lifted task). The lifted handler does signature verify + cas
     //    fetch + decrypt + apply_inbox + ack fan-out into bob_unicast_tx
-    //    + emits `dm-received` via app.emit. We attach a listener on a
-    //    mock AppHandle to capture the emitted payload (since the lifted
-    //    variant returns `()` instead of DrainOutcome). ──
-    let bob_app = tauri::test::mock_app();
-    let bob_app_handle = bob_app.handle().clone();
+    //    + emits `dm-received` via the NodeEventSink (ZEB-445). We pass a
+    //    local recording sink to capture the emitted payload (since the
+    //    lifted variant returns `()` instead of DrainOutcome). ──
+    struct DmReceivedRecorder(Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+    impl harmony_app::node_event_sink::NodeEventSink for DmReceivedRecorder {
+        fn emit(&self, event: &str, payload: serde_json::Value) {
+            if event == "dm-received" {
+                self.0.lock().expect("received_payloads lock").push(payload);
+            }
+        }
+    }
     let received_payloads: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
-    let received_payloads_for_listener = Arc::clone(&received_payloads);
-    let _unlisten = tauri::Listener::listen(&bob_app_handle, "dm-received", move |event| {
-        let payload: serde_json::Value =
-            serde_json::from_str(event.payload()).expect("parse dm-received payload");
-        received_payloads_for_listener
-            .lock()
-            .expect("received_payloads lock")
-            .push(payload);
-    });
+    let bob_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(DmReceivedRecorder(Arc::clone(&received_payloads)));
     let (signed, signature, signed_bytes) =
         match harmony_app::dm_envelope::decode_packet(&alice_to_bob.packet)
             .expect("alice's outbound packet must decode")
@@ -370,7 +369,7 @@ async fn dm_full_round_trip_through_unicast_channel() {
         Arc::clone(&bob_state),
         Arc::clone(&cas),
         bob_unicast_tx.clone(),
-        bob_app_handle,
+        bob_sink,
         signed,
         signature,
         signed_bytes,
@@ -399,9 +398,10 @@ async fn dm_full_round_trip_through_unicast_channel() {
 
     // Phase 4 IPC payload assertions: dm-received emit threads body +
     // mime_type + sent_at through to the frontend. The lifted variant
-    // emits via app.emit — listener captures the payload. Tauri's
-    // listener delivery is async on a separate task; allow a short window
-    // for the event to land.
+    // emits via the NodeEventSink — the recording sink captures the
+    // payload. Sink delivery is synchronous today, but keep the short
+    // wait window so the assertion stays robust if emission ever moves
+    // onto a separate task.
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if !received_payloads.lock().unwrap().is_empty() {
@@ -730,10 +730,11 @@ async fn dm_offline_recipient_then_online_delivers() {
 
     // ZEB-241: dispatch CidNotify through the lifted variant (production
     // path: event_loop pre-decodes, spawns the lifted task). The lifted
-    // handler emits dm-received via app.emit instead of returning
-    // DrainOutcome — assert via state inspection (InboxEntry installed).
-    let bob_app = tauri::test::mock_app();
-    let bob_app_handle = bob_app.handle().clone();
+    // handler emits dm-received via the NodeEventSink instead of returning
+    // DrainOutcome — assert via state inspection (InboxEntry installed),
+    // so an empty fan-out sink is sufficient (ZEB-445).
+    let bob_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
     let (signed, signature, signed_bytes) =
         match harmony_app::dm_envelope::decode_packet(&alice_to_bob.packet)
             .expect("alice's outbound packet must decode")
@@ -751,7 +752,7 @@ async fn dm_offline_recipient_then_online_delivers() {
         Arc::clone(&bob_state),
         Arc::clone(&cas),
         bob_unicast_tx.clone(),
-        bob_app_handle,
+        bob_sink,
         signed,
         signature,
         signed_bytes,

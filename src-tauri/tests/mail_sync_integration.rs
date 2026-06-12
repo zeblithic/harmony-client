@@ -200,13 +200,13 @@ async fn end_to_end_walks_tree_and_lazy_fetches_body() {
         }
     });
 
-    // Construct MailSync with a mock AppHandle.
-    let app = tauri::test::mock_app();
+    // Construct MailSync with a don't-care event sink (ZEB-445: MailSync
+    // emits via NodeEventSink; this test asserts via MailManager state).
     let sync = Arc::new(MailSync::new(
         fetch_tx,
         _refresh_tx.clone(),
         Arc::clone(&mail_mgr),
-        app.handle().clone(),
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
     ));
 
     // Trigger the walk by directly handing MailSync a root.

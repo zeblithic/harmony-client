@@ -327,3 +327,103 @@ export formats are byte-for-byte compatible.
   RAM on most embedded targets. The harmony-openwrt repo will provide a tuned
   build with smaller KDF params (and bump the on-disk format_version).
 - **Hardware tokens (YubiKey, TPM)** — possible future, out of scope here.
+
+## API control surface (serve mode) — ZEB-445
+
+`harmony-app serve` runs a windowless node — no Tauri, no webview — and
+exposes the same control surface the GUI uses over a localhost-only HTTP+WS
+API. Agents and scripts drive it with `curl`/`websocat` or any HTTP client.
+The RPC surface is **the same command names, same camelCase JSON args, same
+DTOs, and same error strings** as the GUI's Tauri IPC — one mental model
+across both.
+
+Three moving parts, all under `<data-dir>/api/` (the platform app-data dir
+for `net.zeblith.harmony`):
+
+| File | Contents |
+|---|---|
+| `token` | Bearer token, mode `0600`. Required on every request. |
+| `port` | The actually-bound port (default 7420; `--api-port` / `HARMONY_API_PORT`; `0` = OS-assigned ephemeral). |
+| `serve.lock` | PID lockfile — single profile per machine (see caveats). |
+
+### Quickstart (macOS)
+
+```bash
+harmony-app serve &   # default port 7420; --api-port 0 for ephemeral
+API="$HOME/Library/Application Support/net.zeblith.harmony/api"
+TOKEN=$(cat "$API/token"); PORT=$(cat "$API/port")
+H="Authorization: Bearer $TOKEN"
+curl -s -H "$H" "http://127.0.0.1:$PORT/v1/status"
+# fresh profile: mint first
+curl -s -H "$H" -X POST -H 'Content-Type: application/json' -d '{}' \
+  "http://127.0.0.1:$PORT/v1/rpc/mint_owner_identity"
+curl -s -H "$H" -X POST -H 'Content-Type: application/json' \
+  -d '{"name":"test","isInviteOnly":false}' \
+  "http://127.0.0.1:$PORT/v1/rpc/create_community"
+# event stream (websocat):
+websocat -H="$H" "ws://127.0.0.1:$PORT/v1/events"
+# quit:
+curl -s -H "$H" -X POST "http://127.0.0.1:$PORT/v1/shutdown"
+```
+
+**Windows:** same flow; the api dir is `%APPDATA%\net.zeblith.harmony\api\`
+(Linux: `~/.local/share/net.zeblith.harmony/api/`).
+
+First boot is **pre-mint** — `serve` starts the node but does not create an
+identity. `GET /v1/status` reports `"ownerId": null` until you `POST
+/v1/rpc/mint_owner_identity` (once per profile; subsequent boots load it).
+
+### The v1 RPC surface (29 commands)
+
+All commands are `POST /v1/rpc/{command}` with a JSON object body
+(camelCase keys, exactly the args the GUI sends). No-arg commands accept
+`{}` or an empty body.
+
+| Capability | Commands |
+|---|---|
+| Node lifecycle (2) | `start_node`, `stop_node` (serve auto-starts the node at boot) |
+| Identity (2) | `get_owner_state`, `mint_owner_identity` |
+| Communities (7) | `list_owner_communities`, `create_community`, `list_community_members`, `generate_invite`, `redeem_invite`, `join_open_community`, `leave_community` |
+| Channels (4) | `create_channel`, `list_channels`, `list_channel_messages`, `post_channel_message` |
+| Friends (7) | `list_friends`, `generate_friend_token`, `redeem_friend_token`, `add_friend_by_key`, `list_pending_friend_requests`, `accept_friend_request`, `decline_friend_request` |
+| Spaces / DMs (3) | `add_space`, `send_dm`, `read_dm_thread` |
+| Diagnostics (4) | `connectivity_get_my_reachability_record`, `connectivity_list_peer_reachability`, `network_health_snapshot`, `network_health_run_self_test` |
+
+Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
+`POST /v1/shutdown` (graceful quit), `GET /v1/events` (WS firehose).
+
+### Error contract
+
+Every error response is JSON: `{"error": "<message>"}`.
+
+| Status | Meaning |
+|---|---|
+| `401` | Missing or wrong bearer token (body: `{"error": "unauthorized"}`). |
+| `404` | Unknown command — not in the curated v1 registry. |
+| `400` | Args failed to deserialize (the message names the offending field). |
+| `500` | The command itself failed — the message is **the same string the GUI IPC rejects with** (e.g. "owner identity not loaded"). |
+
+Parity note: a script that handles the GUI's error strings handles serve
+mode's `500` bodies unchanged, and vice versa.
+
+### Caveats
+
+- **Single profile per machine.** `serve` takes `<data-dir>/api/serve.lock`
+  (PID lockfile; stale locks from crashed processes are reclaimed). A second
+  `serve` — or a GUI launch with the API host enabled — refuses with
+  "profile already in use". This is deliberate: two nodes on one profile
+  would race identity/state files.
+- **The plain GUI does not check the lock.** Don't launch the desktop GUI
+  while `serve` holds the profile — the lock only protects against other
+  lock-aware processes.
+- **Keychain-backed vault.** serve-mode v1 stores identity in the OS
+  keychain — the same desktop backend described at the top of this file. On
+  a box with no keychain, the `HARMONY_PASSPHRASE` encrypted-file fallback
+  (see [Quickstart](#quickstart-linux-server--docker) above) applies as
+  usual; a first-class no-keychain serve mode is tracked in ZEB-449, and
+  `HARMONY_DISABLE_KEYCHAIN=1` is **not** a workaround (ZEB-450: it kills
+  iroh and blocks mint).
+- **The event stream is a firehose.** `GET /v1/events` delivers live events
+  only — no replay, no resume. A slow consumer that falls behind receives an
+  explicit `{"event": "_lagged"}` marker frame and continues from the live
+  edge; re-fetch state via RPC after a lag marker.

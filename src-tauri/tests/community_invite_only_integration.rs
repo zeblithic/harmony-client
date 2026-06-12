@@ -493,10 +493,11 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     // focus of this integration test.
     let (bob_channel_log_adapter_tx, _bob_channel_log_adapter_rx) =
         mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
-    let bob_app = tauri::test::mock_app();
+    // ZEB-445: registry takes a mode-agnostic NodeEventSink; this test never
+    // asserts on channel-log emissions, so an empty fan-out is sufficient.
     let bob_channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
         adapter_request_tx: bob_channel_log_adapter_tx,
-        app: bob_app.handle().clone(),
+        sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
         identity_dir: dir_b.path().to_path_buf(),
         self_owner: bob_addr,
         self_device_id: "bob-dev".into(),

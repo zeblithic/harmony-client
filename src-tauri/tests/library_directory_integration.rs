@@ -848,10 +848,9 @@ async fn click_to_join_redeem_invite_smoke() {
 
     let (channel_log_adapter_tx, _channel_log_adapter_rx) =
         mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
-    let app = tauri::test::mock_app();
     let channel_log_registry = Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
         adapter_request_tx: channel_log_adapter_tx,
-        app: app.handle().clone(),
+        sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
         identity_dir: tmp.path().to_path_buf(),
         self_owner: joiner_owner,
         self_device_id: "joiner-dev".into(),

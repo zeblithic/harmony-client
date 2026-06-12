@@ -57,8 +57,10 @@ async fn ingest_list_pin_burn_roundtrip() {
         [0u8; 16],
     )));
 
-    let app = tauri::test::mock_app();
-    let app_handle = app.handle().clone();
+    // ZEB-445: event_loop::run takes a mode-agnostic NodeEventSink; this
+    // test never asserts on emissions, so an empty fan-out is sufficient.
+    let event_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
 
     // Minimal NodeConfig — identity fields all zero/empty, no disk/archive/S3.
     // Config is Send so it can be moved into the thread closure.
@@ -120,7 +122,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                 harmony_app::event_loop::run(
                     runtime,
                     startup_actions,
-                    app_handle,
+                    event_sink,
                     None, // endpoint — no external Zenoh endpoint needed
                     ready_tx,
                     shutdown_rx,
@@ -363,8 +365,10 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
         [0u8; 16],
     )));
 
-    let app = tauri::test::mock_app();
-    let app_handle = app.handle().clone();
+    // ZEB-445: event_loop::run takes a mode-agnostic NodeEventSink; this
+    // test never asserts on emissions, so an empty fan-out is sufficient.
+    let event_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
 
     let config = NodeConfig {
         storage_budget: harmony_content::storage_tier::StorageBudget {
@@ -421,7 +425,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                 harmony_app::event_loop::run(
                     runtime,
                     startup_actions,
-                    app_handle,
+                    event_sink,
                     None,
                     ready_tx,
                     shutdown_rx,
@@ -768,8 +772,10 @@ async fn fetch_complete_arm_pins_root_in_intent() {
         [0u8; 16],
     )));
 
-    let app = tauri::test::mock_app();
-    let app_handle = app.handle().clone();
+    // ZEB-445: event_loop::run takes a mode-agnostic NodeEventSink; this
+    // test never asserts on emissions, so an empty fan-out is sufficient.
+    let event_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
 
     let config = NodeConfig {
         storage_budget: StorageBudget {
@@ -824,7 +830,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                 harmony_app::event_loop::run(
                     runtime,
                     startup_actions,
-                    app_handle,
+                    event_sink,
                     None,
                     ready_tx,
                     shutdown_rx,
@@ -1035,8 +1041,10 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
         [0u8; 16],
     )));
 
-    let app = tauri::test::mock_app();
-    let app_handle = app.handle().clone();
+    // ZEB-445: event_loop::run takes a mode-agnostic NodeEventSink; this
+    // test never asserts on emissions, so an empty fan-out is sufficient.
+    let event_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
 
     let config = NodeConfig {
         storage_budget: StorageBudget {
@@ -1090,7 +1098,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                 harmony_app::event_loop::run(
                     runtime,
                     startup_actions,
-                    app_handle,
+                    event_sink,
                     None,
                     ready_tx,
                     shutdown_rx,
@@ -1358,8 +1366,10 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
         [0u8; 16],
     )));
 
-    let app = tauri::test::mock_app();
-    let app_handle = app.handle().clone();
+    // ZEB-445: event_loop::run takes a mode-agnostic NodeEventSink; this
+    // test never asserts on emissions, so an empty fan-out is sufficient.
+    let event_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
 
     let config = NodeConfig {
         storage_budget: StorageBudget {
@@ -1413,7 +1423,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                 harmony_app::event_loop::run(
                     runtime,
                     startup_actions,
-                    app_handle,
+                    event_sink,
                     None,
                     ready_tx,
                     shutdown_rx,

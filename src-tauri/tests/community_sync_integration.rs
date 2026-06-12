@@ -2044,10 +2044,9 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
     // spawns occur (adapter dispatch fails first).
     let (channel_log_adapter_tx, _channel_log_adapter_rx) =
         mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
-    let app = tauri::test::mock_app();
     let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
         adapter_request_tx: channel_log_adapter_tx,
-        app: app.handle().clone(),
+        sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
         identity_dir: dir.path().to_path_buf(),
         self_owner,
         self_device_id: "test-dev".into(),
@@ -2865,10 +2864,9 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     // spawns occur (inviter is unreachable → timeout → rollback).
     let (channel_log_adapter_tx, _channel_log_adapter_rx) =
         mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
-    let app = tauri::test::mock_app();
     let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
         adapter_request_tx: channel_log_adapter_tx,
-        app: app.handle().clone(),
+        sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
         identity_dir: dir.path().to_path_buf(),
         self_owner: bob_addr,
         self_device_id: "bob-dev".into(),

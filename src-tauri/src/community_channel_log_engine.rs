@@ -1041,10 +1041,6 @@ impl ChannelLogEngine {
     pub(crate) fn notify_dirty_for_test(&self) {
         self.flush_dirty.notify_one();
     }
-
-    pub(crate) fn sink_for_test(&self) -> &Arc<dyn crate::node_event_sink::NodeEventSink> {
-        &self.sink
-    }
 }
 
 impl ChannelLogEngine {
