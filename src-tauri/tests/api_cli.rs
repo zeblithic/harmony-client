@@ -91,6 +91,7 @@ async fn cli_client_drives_rpc_and_event_stream_against_live_server() {
     let streamer = tokio::spawn(async move {
         harmony_app::api::cli::stream_events(&d2, |frame| {
             let _ = frames_tx.send(frame.to_string());
+            true
         })
         .await
     });
@@ -126,6 +127,43 @@ async fn cli_client_drives_rpc_and_event_stream_against_live_server() {
     assert!(
         v2["seq"].as_u64().expect("seq") > v1["seq"].as_u64().expect("seq"),
         "seq must be monotonic: {f1} then {f2}"
+    );
+
+    // ── Phase 5b: consumer-driven stop ends the stream cleanly ──────────
+    // CodeAnt PR #242 round-1 finding: `harmony-app api --events | head`
+    // must exit when stdout's pipe closes — `on_frame` returning false is
+    // that signal, and stream_events must return Ok promptly instead of
+    // consuming frames forever.
+    let d3 = d.clone();
+    let early_stop = tokio::spawn(async move {
+        let mut seen = 0u32;
+        harmony_app::api::cli::stream_events(&d3, |_frame| {
+            seen += 1;
+            false // consumer gone after the first frame
+        })
+        .await
+        .map(|()| seen)
+    });
+    for _ in 0..100 {
+        if events.receiver_count() > 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        events.receiver_count() > 1,
+        "second WS client must subscribe within 10s"
+    );
+    events.emit("early-stop-1", serde_json::json!({}));
+    events.emit("early-stop-2", serde_json::json!({}));
+    let early = tokio::time::timeout(std::time::Duration::from_secs(10), early_stop)
+        .await
+        .expect("early-stop streamer must end within 10s of refusing a frame")
+        .expect("early-stop streamer must not panic");
+    assert_eq!(
+        early,
+        Ok(1),
+        "consumer-driven stop must be a clean Ok after exactly one frame"
     );
 
     // ── Phase 6: graceful shutdown ───────────────────────────────────────

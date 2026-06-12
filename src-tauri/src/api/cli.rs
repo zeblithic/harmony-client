@@ -76,10 +76,14 @@ pub async fn rpc_call(
 }
 
 /// Stream `/v1/events` frames into `on_frame` until the server closes the
-/// socket (`Ok`) or the connection fails (`Err`). Interruption is the
-/// process-level ctrl-c default — no special handling needed for a
-/// read-only stream.
-pub async fn stream_events(d: &Discovery, mut on_frame: impl FnMut(&str)) -> Result<(), String> {
+/// socket (`Ok`), the consumer stops (`on_frame` returns `false` → `Ok` —
+/// e.g. stdout's pipe closed under `| head`), or the connection fails
+/// (`Err`). Interruption is the process-level ctrl-c default — no special
+/// handling needed for a read-only stream.
+pub async fn stream_events(
+    d: &Discovery,
+    mut on_frame: impl FnMut(&str) -> bool,
+) -> Result<(), String> {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut req = format!("ws://127.0.0.1:{}/v1/events", d.port)
@@ -97,7 +101,12 @@ pub async fn stream_events(d: &Discovery, mut on_frame: impl FnMut(&str)) -> Res
     let (_write, mut read) = ws.split();
     while let Some(msg) = read.next().await {
         match msg {
-            Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) => on_frame(txt.as_str()),
+            Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) => {
+                if !on_frame(txt.as_str()) {
+                    // Consumer-driven stop is a clean end, not an error.
+                    return Ok(());
+                }
+            }
             Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => return Ok(()),
             Ok(_) => {} // ping/pong/binary — not part of the frame contract
             Err(e) => return Err(format!("events stream: {e}")),
@@ -147,10 +156,13 @@ pub fn api_cli(command: Option<String>, args_json: Option<String>, events: bool)
             use std::io::Write;
             match stream_events(&d, |frame| {
                 // Explicit flush: stdout is block-buffered when piped, and
-                // agents tail this stream live.
+                // agents tail this stream live. A failed write/flush means
+                // the consumer is gone (e.g. `| head -n1` exited — Rust
+                // ignores SIGPIPE, so EPIPE surfaces here): stop streaming
+                // instead of consuming frames forever (CodeAnt, PR #242
+                // round 1).
                 let mut out = std::io::stdout();
-                let _ = writeln!(out, "{frame}");
-                let _ = out.flush();
+                writeln!(out, "{frame}").and_then(|()| out.flush()).is_ok()
             })
             .await
             {
