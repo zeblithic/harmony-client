@@ -15435,6 +15435,10 @@ pub fn serve_cli(api_port: Option<u16>) -> i32 {
              HARMONY_PASSPHRASE_FILE (named profiles use the encrypted-file vault, \
              not the OS keychain)"
         );
+        // Exit code 1 = serve's uniform startup-failure code (lock taken,
+        // data dir, node start). The GUI path exits 2 for the same
+        // condition — 2 is main.rs's pre-launch config-error code (invalid
+        // profile name, refused argv fall-through).
         return 1;
     }
 

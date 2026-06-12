@@ -38,14 +38,18 @@ pub(crate) async fn start_inviter_pairing_with_keychain(
     display_name: String,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
+    // Precondition first (PR #245 round 3, CodeRabbit): a pre-node call
+    // must fail with the pairing error — same string as every other
+    // pairing command — and must not touch persisted owner secrets on a
+    // request that cannot succeed anyway.
+    let (cmd_tx, _state_rx) = require_pairing_handle(state)?;
+
     let identity_dir = crate::owner_commands::resolve_identity_dir()?;
     let loaded = load_owner_state(&identity_dir, keychain)?
         .ok_or_else(|| "no owner identity on this device".to_string())?;
     let master_seed = loaded
         .master_seed
         .ok_or_else(|| "master seed not on this device — cannot enroll".to_string())?;
-
-    let (cmd_tx, _state_rx) = require_pairing_handle(state)?;
     cmd_tx
         .send(PairingCommand::StartInviter {
             display_name,
