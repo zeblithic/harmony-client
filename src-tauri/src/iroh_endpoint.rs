@@ -239,26 +239,44 @@ pub fn load_or_create_secret_key() -> Result<(SecretKey, bool), IrohEndpointErro
     // next to `identity.enc`) for boxes with no keychain backend — RPi5 headless
     // nodes, or a run with `HARMONY_DISABLE_KEYCHAIN`. Before this the iroh key
     // was keychain-only, so a keychain-less node booted with no transport (the
-    // ZEB-450 silent failure). `KeychainStore::new()` already returns `Err` (→
-    // `None`) when the keychain is disabled/absent, so `.ok()` selects the file
-    // path automatically; a healthy desktop keeps using the keychain unchanged.
-    let keychain = crate::identity::KeychainStore::new().ok();
+    // ZEB-450 silent failure). A healthy desktop keeps using the keychain
+    // unchanged.
+    //
+    // Capture WHY the keychain was skipped instead of dropping it with `.ok()`:
+    // an unexpected `keyring` failure must not look identical to an intentional
+    // disable, or a genuine keychain breakage gets silently masked as "no
+    // keychain" (and could switch backends → EndpointId churn) with no signal.
+    // (PR #237 review: Qodo / CodeRabbit.)
+    let keychain = match crate::identity::KeychainStore::new() {
+        Ok(kc) => Some(kc),
+        Err(e) => {
+            tracing::warn!(
+                "iroh key: OS keychain unavailable ({e}); using the encrypted-file backend"
+            );
+            None
+        }
+    };
     // The legacy per-item keychain entry is only consulted on the keychain path.
     // Build it ONLY when a keychain exists: constructing a `keyring::Entry` can
     // itself fail on a backend-less host, and that must not block the file
     // fallback (the whole point of ZEB-449).
-    let legacy = match keychain {
-        Some(_) => Some(
+    let legacy = if keychain.is_some() {
+        Some(
             keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| {
                 IrohEndpointError::Keychain {
                     context: format!("legacy entry creation {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
                     source: e,
                 }
             })?,
-        ),
-        None => None,
+        )
+    } else {
+        None
     };
-    let enc = crate::identity::iroh_key_file_store()
+    // A malformed `HARMONY_PASSPHRASE*` / `resolve_path` error is fatal ONLY when
+    // the keychain isn't the active backend — when it is, the file fallback is
+    // never used, so the error must not abort transport. (PR #237 review: Cursor
+    // / CodeRabbit; mirrors the node-seed path.)
+    let enc = crate::identity::resolve_iroh_enc_fallback(keychain.is_some())
         .map_err(|context| IrohEndpointError::Vault { context })?;
     let (key_bytes, freshly_created) = crate::identity::vault_app_key_or_create_with_fallback(
         crate::identity::VaultSlot::Iroh,

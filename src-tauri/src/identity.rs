@@ -1337,6 +1337,32 @@ pub(crate) fn iroh_key_file_store() -> Result<Option<EncryptedFileStore>, String
     EncryptedFileStore::from_env(path)
 }
 
+/// ZEB-449: choose the iroh key's encrypted-file fallback store, given whether a
+/// keychain is the active backend.
+///
+/// A passphrase / `resolve_path` error from [`iroh_key_file_store`] is **fatal
+/// only when there is no keychain**. When the keychain is available the file
+/// fallback is never consulted, so a malformed `HARMONY_PASSPHRASE` /
+/// `HARMONY_PASSPHRASE_FILE` (or a `resolve_path` failure) must NOT abort iroh
+/// transport setup. This mirrors `read_seed_from_disk_with_keychain`, which
+/// likewise ignores `from_env` errors when the keychain probe succeeded.
+/// (PR #237 review: Cursor / CodeRabbit / Qodo.)
+pub(crate) fn resolve_iroh_enc_fallback(
+    keychain_present: bool,
+) -> Result<Option<EncryptedFileStore>, String> {
+    match iroh_key_file_store() {
+        Ok(opt) => Ok(opt),
+        Err(e) if keychain_present => {
+            tracing::warn!(
+                "iroh.enc fallback unavailable ({e}); ignoring — the OS keychain is the \
+                 active backend for the iroh key"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Serializes read-modify-write sequences against the single consolidated
 /// keychain vault item.
 ///
@@ -2521,6 +2547,64 @@ pub mod test_only {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// Save/restore `HARMONY_PASSPHRASE(_FILE)` around a `#[serial]` test so a
+    /// deliberately-malformed value never leaks into another serial test that
+    /// builds an `EncryptedFileStore::from_env`.
+    struct PassphraseEnvReset {
+        pp: Option<String>,
+        pf: Option<String>,
+    }
+    impl PassphraseEnvReset {
+        fn capture() -> Self {
+            Self {
+                pp: std::env::var("HARMONY_PASSPHRASE").ok(),
+                pf: std::env::var("HARMONY_PASSPHRASE_FILE").ok(),
+            }
+        }
+    }
+    impl Drop for PassphraseEnvReset {
+        fn drop(&mut self) {
+            match &self.pp {
+                Some(v) => std::env::set_var("HARMONY_PASSPHRASE", v),
+                None => std::env::remove_var("HARMONY_PASSPHRASE"),
+            }
+            match &self.pf {
+                Some(v) => std::env::set_var("HARMONY_PASSPHRASE_FILE", v),
+                None => std::env::remove_var("HARMONY_PASSPHRASE_FILE"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn iroh_enc_fallback_ignores_bad_passphrase_when_keychain_present() {
+        // ZEB-449 (PR #237 review): a malformed HARMONY_PASSPHRASE must NOT abort
+        // the iroh key load when the keychain is the active backend — the file
+        // fallback is never used there, so the error is non-fatal (mirrors the
+        // seed path `read_seed_from_disk_with_keychain`).
+        let _reset = PassphraseEnvReset::capture();
+        std::env::set_var("HARMONY_PASSPHRASE", ""); // empty => from_env errors
+        std::env::remove_var("HARMONY_PASSPHRASE_FILE");
+        let got = resolve_iroh_enc_fallback(true)
+            .expect("keychain present => a from_env error must be non-fatal");
+        assert!(
+            got.is_none(),
+            "no fallback store is built, but transport proceeds on the keychain"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn iroh_enc_fallback_is_fatal_without_keychain() {
+        // No keychain AND a malformed passphrase => the key genuinely cannot be
+        // persisted, so this is a hard error (not a silent transport-off).
+        let _reset = PassphraseEnvReset::capture();
+        std::env::set_var("HARMONY_PASSPHRASE", "");
+        std::env::remove_var("HARMONY_PASSPHRASE_FILE");
+        resolve_iroh_enc_fallback(false)
+            .expect_err("no keychain + malformed passphrase must be fatal");
+    }
 
     #[test]
     fn file_store_round_trip() {
