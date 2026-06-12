@@ -240,9 +240,7 @@ pub fn build_registry() -> RpcRegistry {
         m,
         "list_community_members",
         CommunityIdArgs,
-        |state, _sink, a| async move {
-            crate::list_community_members_impl(state, a.community_id).await
-        }
+        |state, _sink, a| async move { crate::list_community_members_impl(state, a.community_id).await }
     );
     rpc!(
         m,
@@ -290,14 +288,8 @@ pub fn build_registry() -> RpcRegistry {
         "list_channel_messages",
         ListChannelMessagesArgs,
         |state, _sink, a| async move {
-            crate::list_channel_messages_impl(
-                state,
-                a.community_id,
-                a.channel_id,
-                a.since,
-                a.limit,
-            )
-            .await
+            crate::list_channel_messages_impl(state, a.community_id, a.channel_id, a.since, a.limit)
+                .await
         }
     );
     rpc!(

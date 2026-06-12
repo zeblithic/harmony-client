@@ -169,6 +169,12 @@ tauri-plugin-fs = "2.5.1"
 # death, so stale-lock reclaim needs no PID-liveness logic).
 axum = { version = "0.8", features = ["ws"] }
 fd-lock = "4"
+# ZEB-452 `harmony-app api` CLI client: reqwest for the one-shot RPC POST,
+# tokio-tungstenite for the events stream. TLS-free on purpose — the API
+# is loopback-only HTTP by design (spec §Auth).
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 
 [dev-dependencies]
 serial_test = "3"
@@ -185,10 +191,6 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", 
 # Activate test-fixtures feature for harmony-pkarr in dev/test builds only,
 # so MockPkarrRelay (an axum HTTP server) is excluded from release binaries.
 harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1", features = ["test-fixtures"] }
-# ZEB-445 api_server integration test client
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
-tokio-tungstenite = "0.24"
-futures-util = "0.3"
 
 # ZEB-156: harmony-runtime (pinned 04449d60 above) provides the narrow
 # `NodeRuntime::remove_content` + `StorageTier::remove` delegates this

@@ -4,6 +4,7 @@
 // GUI process (opt-in) in a follow-up. Binds 127.0.0.1 only; bearer-token
 // auth on every endpoint (see auth.rs for the trust-boundary rationale).
 pub mod auth;
+pub mod cli;
 pub mod events;
 pub mod gui_host;
 pub mod lock;
