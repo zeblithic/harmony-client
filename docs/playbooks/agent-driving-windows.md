@@ -41,8 +41,10 @@ an hour.
 ## 1. Prerequisites
 
 - Machine installed per [`install-windows.md`](../install-windows.md): Rust
-  stable (msvc), Node 20+, the app builds (`npm ci` at repo root, then a
-  `tauri dev` build succeeds).
+  stable (msvc), **Node ≥22**, the app builds (`npm ci` at repo root, then a
+  `tauri dev` build succeeds). Node 22 is required because the raw-CDP driver in
+  §4 uses the **built-in `WebSocket`** (stable since Node 22); on Node 20 the
+  driver fails before any IPC runs.
 - `cargo-nextest` installed (`cargo install cargo-nextest --locked`) if you'll
   run gates.
 - PowerShell 5.1 is the default shell. Know its hazards: it mangles non-ASCII in
@@ -56,24 +58,37 @@ an hour.
 
 ## 2. Secret storage and launch env (read before first launch)
 
-harmony-client has **two** root secrets in **two** backends:
+harmony-client keeps its secrets across the OS keychain (the ZEB-363
+consolidated `harmony`/`identity` vault item) and encrypted files. **The
+fallback story differs per secret** — and the difference is exactly what bites
+agents:
 
-| Secret | File / store | Backend |
+| Secret | Backend | File fallback? |
 |---|---|---|
-| Reticulum identity seed (`identity.enc`) | `~\.harmony\identity.enc` | **Dual:** OS keychain preferred → encrypted-file fallback via `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE` |
-| Consolidated vault (iroh + device + owner-master keys, ZEB-363) | one `harmony`/`identity` Credential Manager item | **Keychain-ONLY** — no file fallback at this rev (see [ZEB-449](https://linear.app/zeblith/issue/ZEB-449)) |
+| Reticulum identity seed (`identity.enc`) | keychain preferred → encrypted file | **Yes** — `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE` (`load_or_generate_with_stores`) |
+| Owner master seed + device secret | vault slot → encrypted file | **Yes** — same passphrase env (`owner_state.rs::load_secret`/`save_secret` → `EncryptedFileStore::from_env`) |
+| **iroh secret key** (transport) + other app-local vault keys | vault slot → *legacy keychain item* | **No** — `vault_app_key_or_create` does `KeychainStore::new()?`; on failure the error propagates and there is **no encrypted-file path** (see [ZEB-449](https://linear.app/zeblith/issue/ZEB-449)) |
+
+The asymmetry in the last row is the whole game: the owner/identity material can
+live in a file, but the **iroh transport key cannot** — it needs a working
+keychain.
 
 Consequences that bite agents:
 
 - **`HARMONY_DISABLE_KEYCHAIN=1` must NEVER be set on a real launch.** It is a
   *test-only* kill-switch (ZEB-428) for test-spawned production children. On a
-  real launch it disables iroh transport **and** blocks owner mint — the app
-  boots non-functional ([ZEB-450](https://linear.app/zeblith/issue/ZEB-450)).
+  real launch `KeychainStore::new()` returns `Err`, so the iroh key (no file
+  fallback) can't load → **transport disabled this session**. The owner *seed*
+  itself can still persist to its encrypted-file fallback if a passphrase is set,
+  but with transport down the node is non-functional, so don't set it
+  ([ZEB-450](https://linear.app/zeblith/issue/ZEB-450)).
 - **An agent-spawned process may not reach Credential Manager** in some
-  contexts. If it can't, the vault (keychain-only) fails. Whether CredMan is
-  reachable from an agent-launched process is **per-machine** — verify it with a
-  `cmdkey /list` probe from an agent-spawned shell before relying on it.
-  (On AVALON it is reachable; on Ildwyn it is not.)
+  contexts. If it can't, the **iroh/app-key path** (no file fallback) fails and
+  takes transport down with it, even though the seed-and-owner secrets would
+  survive on a passphrase. Whether CredMan is reachable from an agent-launched
+  process is **per-machine** — verify it with a `cmdkey /list` probe from an
+  agent-spawned shell before relying on it. (On AVALON it is reachable; on
+  Ildwyn it is not.)
 
 ### Passphrase file (one-time per machine)
 
@@ -83,15 +98,20 @@ lock it down — **never print its contents to the agent transcript:**
 ```powershell
 $dir = 'C:\zeblith\secrets'
 New-Item -ItemType Directory -Force $dir | Out-Null
-# 32 random bytes, base64 — written without ever being displayed
-[Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Max 256 })) |
+# 32 cryptographically-secure random bytes, base64 — written, never displayed.
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+[Convert]::ToBase64String($bytes) |
   Out-File "$dir\harmony-passphrase.txt" -NoNewline -Encoding ascii
 # Lock to the current user, read-only, no inheritance
 icacls "$dir\harmony-passphrase.txt" /inheritance:r /grant:r "$($env:USERNAME):(R)"
 ```
 
-> The snippet above uses `Get-Random` for portability. If your environment
-> provides `[System.Security.Cryptography.RandomNumberGenerator]`, prefer it.
+> Use the .NET CSPRNG (`RandomNumberGenerator`) shown above — **not**
+> `Get-Random`, which is not cryptographically strong and would weaken the key
+> protecting `identity.enc`. This matches the crypto-grade `openssl rand -base64`
+> guidance in [`headless-install.md`](../headless-install.md). Where `openssl` is
+> on PATH, `openssl rand -base64 48 > <file>` is an equivalent one-liner.
 
 ### Two launch flavors
 
@@ -181,6 +201,7 @@ async function findPageTarget() {
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`http://localhost:${PORT}/json/list`);
+      if (!res.ok) throw new Error(`/json/list HTTP ${res.status}`);
       const targets = await res.json();
       // Boot is complete when a real page target exists with a non-blank title.
       const page = targets.find(
@@ -206,26 +227,60 @@ await new Promise((resolve, reject) => {
 
 let nextId = 1;
 const pending = new Map();
+// Reject every in-flight request if the socket drops or errors — otherwise a
+// closed connection leaves `await send(...)` hanging forever.
+function rejectAllPending(reason) {
+  for (const { reject, timer } of pending.values()) {
+    clearTimeout(timer);
+    reject(new Error(reason));
+  }
+  pending.clear();
+}
+ws.onclose = () => rejectAllPending('ws closed before reply');
+ws.onerror = (e) => rejectAllPending(`ws error: ${e.message ?? e}`);
 ws.onmessage = (ev) => {
   const msg = JSON.parse(ev.data);
   if (msg.id && pending.has(msg.id)) {
-    pending.get(msg.id)(msg);
+    const { resolve, timer } = pending.get(msg.id);
+    clearTimeout(timer);
     pending.delete(msg.id);
+    resolve(msg);
   }
 };
-function send(method, params) {
+function send(method, params, timeoutMs = 30000) {
   const id = nextId++;
-  return new Promise((resolve) => {
-    pending.set(id, resolve);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    pending.set(id, { resolve, reject, timer });
     ws.send(JSON.stringify({ id, method, params }));
   });
 }
 
-const reply = await send('Runtime.evaluate', {
-  expression: expr,
-  awaitPromise: true,
-  returnByValue: true,
-});
+let reply;
+try {
+  reply = await send('Runtime.evaluate', {
+    expression: expr,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+} catch (e) {
+  // Timeout, or socket dropped before a reply arrived.
+  console.error('[cdp] SEND FAILED:', e.message);
+  console.log(JSON.stringify({ ok: false, error: e.message }));
+  try { ws.close(); } catch {}
+  process.exit(1);
+}
+
+// Protocol-level failure (bad params, target gone): `error`, no `result`.
+if (reply.error) {
+  console.error('[cdp] PROTOCOL ERROR:', reply.error.message ?? reply.error);
+  console.log(JSON.stringify({ ok: false, error: reply.error.message ?? reply.error }));
+  ws.close(); // closes OUR socket only — not Browser.close
+  process.exit(1);
+}
 
 if (reply.result?.exceptionDetails) {
   const ex = reply.result.exceptionDetails;
@@ -240,10 +295,17 @@ ws.close(); // closes OUR socket only — not Browser.close
 process.exit(0);
 ```
 
-Two rules this driver bakes in:
+What this driver bakes in:
 
 - **Never `Browser.close` / `browser.close()`.** It kills the app. The driver
   only ever closes its own WebSocket.
+- **It fails loudly, never silently.** Three distinct failure shapes each print
+  `{ ok: false, ... }` and exit 1: a CDP *protocol* error (`reply.error` — bad
+  params, target gone), a JS *exception* in the page (`exceptionDetails`), and a
+  *transport* failure (per-request 30 s timeout, or the socket dropping with
+  requests in flight — every pending `send` is rejected on `onclose`/`onerror`).
+  Without these, a failed call can otherwise print `{ ok: true, value: undefined }`
+  or hang forever — an agent would read that as success.
 - **Wrap invokes that can reject** so the reason survives `returnByValue`. A
   rejected promise's *string* reason does not survive `Runtime.evaluate` with
   `returnByValue: true` — you get a bare `Uncaught (in promise)`. Pattern:
