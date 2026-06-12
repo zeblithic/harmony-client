@@ -4,7 +4,9 @@
 // GUI process (opt-in) in a follow-up. Binds 127.0.0.1 only; bearer-token
 // auth on every endpoint (see auth.rs for the trust-boundary rationale).
 pub mod auth;
+pub mod cli;
 pub mod events;
+pub mod gui_host;
 pub mod lock;
 pub mod rpc;
 
@@ -19,10 +21,25 @@ use axum::{
 };
 use std::sync::{Arc, Mutex};
 
+/// Mode-agnostic access to the node state behind the server. serve mode
+/// owns an `Arc<Mutex<NodeState>>`; the GUI host (ZEB-452) borrows Tauri's
+/// managed state through its `AppHandle`. One method keeps it object-safe
+/// so `ApiCtx` holds `Arc<dyn NodeStateAccess>` without generics leaking
+/// into axum handler signatures.
+pub trait NodeStateAccess: Send + Sync + 'static {
+    fn node_state(&self) -> &Mutex<NodeState>;
+}
+
+impl NodeStateAccess for Mutex<NodeState> {
+    fn node_state(&self) -> &Mutex<NodeState> {
+        self
+    }
+}
+
 /// Shared server context, cloned into every handler via axum's `State`.
 #[derive(Clone)]
 pub struct ApiCtx {
-    pub state: Arc<Mutex<NodeState>>,
+    pub state: Arc<dyn NodeStateAccess>,
     pub sink: Arc<dyn NodeEventSink>,
     pub events: Arc<events::ApiEventSink>,
     pub registry: Arc<rpc::RpcRegistry>,
@@ -102,7 +119,7 @@ async fn status_handler(
     if !authed(&ctx, &headers) {
         return unauthorized();
     }
-    let (running, generation, owner_id) = match ctx.state.lock() {
+    let (running, generation, owner_id) = match ctx.state.node_state().lock() {
         Ok(guard) => (
             guard.node_is_running(),
             guard.generation_for_status(),
@@ -188,7 +205,7 @@ pub struct ServerHandle {
 pub async fn start_server(
     data_dir: &std::path::Path,
     requested_port: u16,
-    state: Arc<Mutex<NodeState>>,
+    state: Arc<dyn NodeStateAccess>,
     sink: Arc<dyn NodeEventSink>,
     events: Arc<events::ApiEventSink>,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,

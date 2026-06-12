@@ -15544,6 +15544,9 @@ pub fn serve_cli(api_port: Option<u16>) -> i32 {
     })
 }
 
+/// ZEB-452: `harmony-app api` CLI entry (thin client for the localhost API).
+pub use crate::api::cli::api_cli;
+
 /// ZEB-445: resolve on ctrl-c (all platforms) or SIGTERM (unix — what
 /// systemd / `kill` send). Never resolves spuriously: if no handler can be
 /// installed, falls back to ctrl-c alone.
@@ -41817,6 +41820,18 @@ pub fn run() {
                     );
                 }
                 app.manage(TrayActive(tray_result.is_ok()));
+            }
+
+            // ── ZEB-452: GUI-mode opt-in localhost API (HARMONY_API_PORT). ──
+            // ApiHost is managed unconditionally (events: None when off) so
+            // the AppHandle event sink can query it without a panic.
+            {
+                use tauri::Manager;
+                let host = match crate::api::gui_host::gui_api_port_from_env() {
+                    Some(port) => crate::api::gui_host::start_gui_api(app.handle().clone(), port),
+                    None => crate::api::gui_host::ApiHost::disabled(),
+                };
+                app.manage(host);
             }
 
             Ok(())

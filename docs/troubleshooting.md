@@ -124,6 +124,13 @@ Test-driver note: a hidden-to-tray instance keeps its PID and process start time
 
 `harmony-app serve` has no window and no tray — quit it via `POST /v1/shutdown` (authenticated, like every API call) or SIGTERM/Ctrl-C. A "profile already in use" error on start means another harmony-app — the GUI with the API host enabled, or another `serve` — currently holds the profile lock; quit that instance first. See the [API control surface section in `headless-install.md`](headless-install.md#api-control-surface-serve-mode--zeb-445) for the full quickstart.
 
+- **`harmony-app api` exits 2 with "is `harmony-app serve` ... running?"** —
+  no live server has written `<data-dir>/api/{port,token}`. Start `serve`
+  (or a GUI with `HARMONY_API_PORT`), then retry.
+- **GUI launched with `HARMONY_API_PORT` but no API answers** — check the
+  log for `ZEB-452: profile lock unavailable`: another process (usually a
+  `serve`) holds the profile. One node per profile in v1.
+
 ## Help + feedback
 
 ### "I want to send feedback"

@@ -55,6 +55,22 @@ enum Command {
         #[arg(long, value_name = "PORT")]
         api_port: Option<u16>,
     },
+
+    /// Drive a running node's localhost API (ZEB-445): POST one RPC
+    /// command (result JSON on stdout) or stream the event firehose with
+    /// --events. Reads <data-dir>/api/{port,token} written by `serve` or
+    /// a GUI launched with HARMONY_API_PORT.
+    Api {
+        /// RPC command name, e.g. get_owner_state (surface list:
+        /// docs/headless-install.md).
+        command: Option<String>,
+        /// JSON object with the command's camelCase args, e.g.
+        /// '{"name":"my community","isInviteOnly":true}'.
+        args: Option<String>,
+        /// Stream /v1/events as one JSON frame per line until interrupted.
+        #[arg(long)]
+        events: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -200,6 +216,14 @@ fn main() {
                 // No init_tracing() here: serve_cli installs its own
                 // subscriber (stderr console + rolling file, ZEB-445).
                 std::process::exit(harmony_app::serve_cli(api_port));
+            }
+            Some(Command::Api {
+                command,
+                args,
+                events,
+            }) => {
+                init_tracing();
+                std::process::exit(harmony_app::api_cli(command, args, events));
             }
             None => {
                 // Default path — launch the Tauri runtime.

@@ -38,6 +38,12 @@ impl ApiEventSink {
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EventFrame> {
         self.tx.subscribe()
     }
+
+    /// Live WS subscriber count — lets tests wait for a subscription
+    /// condition-style instead of sleeping a fixed interval.
+    pub fn receiver_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
 }
 
 impl NodeEventSink for std::sync::Arc<ApiEventSink> {

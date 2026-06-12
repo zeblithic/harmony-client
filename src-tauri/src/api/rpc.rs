@@ -6,11 +6,10 @@
 // rpc!() line plus its _impl seam.
 
 use crate::node_event_sink::NodeEventSink;
-use crate::NodeState;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum RpcError {
@@ -21,7 +20,7 @@ pub enum RpcError {
 
 pub type RpcFuture = Pin<Box<dyn Future<Output = Result<serde_json::Value, RpcError>> + Send>>;
 pub type RpcHandler = Box<
-    dyn Fn(Arc<Mutex<NodeState>>, Arc<dyn NodeEventSink>, serde_json::Value) -> RpcFuture
+    dyn Fn(Arc<dyn super::NodeStateAccess>, Arc<dyn NodeEventSink>, serde_json::Value) -> RpcFuture
         + Send
         + Sync,
 >;
@@ -34,7 +33,7 @@ impl RpcRegistry {
     pub async fn dispatch(
         &self,
         command: &str,
-        state: Arc<Mutex<NodeState>>,
+        state: Arc<dyn super::NodeStateAccess>,
         sink: Arc<dyn NodeEventSink>,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {
@@ -54,10 +53,11 @@ macro_rules! rpc {
         $map.insert(
             $name,
             Box::new(
-                move |$state: Arc<Mutex<NodeState>>,
+                move |__access: Arc<dyn super::NodeStateAccess>,
                       $sink: Arc<dyn NodeEventSink>,
                       raw: serde_json::Value| {
                     Box::pin(async move {
+                        let $state = __access.node_state();
                         let raw = if raw.is_null() {
                             serde_json::json!({})
                         } else {
@@ -204,21 +204,21 @@ pub fn build_registry() -> RpcRegistry {
         m,
         "start_node",
         StartNodeArgs,
-        |state, sink, a| async move { crate::start_node_inner(a.endpoint, sink, None, &state).await }
+        |state, sink, a| async move { crate::start_node_inner(a.endpoint, sink, None, state).await }
     );
     rpc!(m, "stop_node", EmptyArgs, |state, sink, _a| async move {
-        crate::stop_node_impl(&state, sink)
+        crate::stop_node_impl(state, sink)
     });
 
     // Owner state.
     rpc!(m, "get_owner_state", EmptyArgs, |state, _sink, _a| {
-        async move { crate::owner_commands::get_owner_state_impl(&state).await }
+        async move { crate::owner_commands::get_owner_state_impl(state).await }
     });
     // ZEB-445 DoD: explicit headless identity bootstrap — first boot is
     // pre-mint; the GUI mints via WelcomeModal. `None` wry_handle: no Tauri
     // runtime headless.
     rpc!(m, "mint_owner_identity", EmptyArgs, |state, sink, _a| {
-        async move { crate::owner_commands::mint_owner_identity_impl(&state, sink, None).await }
+        async move { crate::owner_commands::mint_owner_identity_impl(state, sink, None).await }
     });
 
     // Communities.
@@ -226,48 +226,46 @@ pub fn build_registry() -> RpcRegistry {
         m,
         "list_owner_communities",
         EmptyArgs,
-        |state, _sink, _a| async move { crate::list_owner_communities_impl(&state).await }
+        |state, _sink, _a| async move { crate::list_owner_communities_impl(state).await }
     );
     rpc!(
         m,
         "create_community",
         CreateCommunityArgs,
         |state, sink, a| async move {
-            crate::create_community_impl(&state, sink, a.name, a.is_invite_only).await
+            crate::create_community_impl(state, sink, a.name, a.is_invite_only).await
         }
     );
     rpc!(
         m,
         "list_community_members",
         CommunityIdArgs,
-        |state, _sink, a| async move {
-            crate::list_community_members_impl(&state, a.community_id).await
-        }
+        |state, _sink, a| async move { crate::list_community_members_impl(state, a.community_id).await }
     );
     rpc!(
         m,
         "generate_invite",
         GenerateInviteArgs,
         |state, _sink, a| async move {
-            crate::generate_invite_impl(&state, a.community_id, a.invitee_hint, a.expires_at).await
+            crate::generate_invite_impl(state, a.community_id, a.invitee_hint, a.expires_at).await
         }
     );
     rpc!(m, "redeem_invite", UrlArgs, |state, sink, a| async move {
-        crate::redeem_invite_impl(&state, sink, a.url).await
+        crate::redeem_invite_impl(state, sink, a.url).await
     });
     rpc!(
         m,
         "join_open_community",
         CommunityIdArgs,
         |state, sink, a| async move {
-            crate::join_open_community_impl(&state, sink, a.community_id).await
+            crate::join_open_community_impl(state, sink, a.community_id).await
         }
     );
     rpc!(
         m,
         "leave_community",
         CommunityIdArgs,
-        |state, sink, a| async move { crate::leave_community_impl(&state, sink, a.community_id).await }
+        |state, sink, a| async move { crate::leave_community_impl(state, sink, a.community_id).await }
     );
 
     // Channels.
@@ -276,28 +274,22 @@ pub fn build_registry() -> RpcRegistry {
         "create_channel",
         CreateChannelArgs,
         |state, _sink, a| async move {
-            crate::create_channel_impl(&state, a.community_id, a.name, a.write_power, a.kind).await
+            crate::create_channel_impl(state, a.community_id, a.name, a.write_power, a.kind).await
         }
     );
     rpc!(
         m,
         "list_channels",
         CommunityIdArgs,
-        |state, _sink, a| async move { crate::list_channels_impl(&state, a.community_id).await }
+        |state, _sink, a| async move { crate::list_channels_impl(state, a.community_id).await }
     );
     rpc!(
         m,
         "list_channel_messages",
         ListChannelMessagesArgs,
         |state, _sink, a| async move {
-            crate::list_channel_messages_impl(
-                &state,
-                a.community_id,
-                a.channel_id,
-                a.since,
-                a.limit,
-            )
-            .await
+            crate::list_channel_messages_impl(state, a.community_id, a.channel_id, a.since, a.limit)
+                .await
         }
     );
     rpc!(
@@ -306,7 +298,7 @@ pub fn build_registry() -> RpcRegistry {
         PostChannelMessageArgs,
         |state, _sink, a| async move {
             crate::post_channel_message_impl(
-                &state,
+                state,
                 a.community_id,
                 a.channel_id,
                 a.body,
@@ -318,37 +310,37 @@ pub fn build_registry() -> RpcRegistry {
 
     // Friends.
     rpc!(m, "list_friends", EmptyArgs, |state, _sink, _a| {
-        async move { crate::list_friends_impl(&state).await }
+        async move { crate::list_friends_impl(state).await }
     });
     rpc!(
         m,
         "generate_friend_token",
         GenerateFriendTokenArgs,
-        |state, _sink, a| async move { crate::generate_friend_token_impl(&state, a.expires_at).await }
+        |state, _sink, a| async move { crate::generate_friend_token_impl(state, a.expires_at).await }
     );
     rpc!(m, "redeem_friend_token", UrlArgs, |state, sink, a| {
-        async move { crate::redeem_friend_token_impl(&state, sink, a.url).await }
+        async move { crate::redeem_friend_token_impl(state, sink, a.url).await }
     });
     rpc!(
         m,
         "add_friend_by_key",
         AddFriendByKeyArgs,
         |state, sink, a| async move {
-            crate::add_friend_by_key_impl(&state, sink, a.identity_pub_hex).await
+            crate::add_friend_by_key_impl(state, sink, a.identity_pub_hex).await
         }
     );
     rpc!(
         m,
         "list_pending_friend_requests",
         EmptyArgs,
-        |state, _sink, _a| async move { crate::list_pending_friend_requests_impl(&state).await }
+        |state, _sink, _a| async move { crate::list_pending_friend_requests_impl(state).await }
     );
     rpc!(
         m,
         "accept_friend_request",
         OwnerIdHexArgs,
         |state, sink, a| async move {
-            crate::accept_friend_request_impl(&state, sink, a.owner_id_hex).await
+            crate::accept_friend_request_impl(state, sink, a.owner_id_hex).await
         }
     );
     rpc!(
@@ -356,23 +348,23 @@ pub fn build_registry() -> RpcRegistry {
         "decline_friend_request",
         OwnerIdHexArgs,
         |state, sink, a| async move {
-            crate::decline_friend_request_impl(&state, sink, a.owner_id_hex).await
+            crate::decline_friend_request_impl(state, sink, a.owner_id_hex).await
         }
     );
 
     // Spaces / DMs.
     rpc!(m, "add_space", AddSpaceArgs, |state, _sink, a| async move {
-        crate::add_space_impl(&state, a.kind, a.name, a.members).await
+        crate::add_space_impl(state, a.kind, a.name, a.members).await
     });
     rpc!(m, "send_dm", SendDmArgs, |state, _sink, a| async move {
-        crate::send_dm_impl(&state, a.space_id, a.content, a.mime_type).await
+        crate::send_dm_impl(state, a.space_id, a.content, a.mime_type).await
     });
     rpc!(
         m,
         "read_dm_thread",
         ReadDmThreadArgs,
         |state, _sink, a| async move {
-            crate::read_dm_thread_impl(&state, a.space_id, a.limit, a.before_hlc).await
+            crate::read_dm_thread_impl(state, a.space_id, a.limit, a.before_hlc).await
         }
     );
 
@@ -382,14 +374,14 @@ pub fn build_registry() -> RpcRegistry {
         "connectivity_get_my_reachability_record",
         EmptyArgs,
         |state, _sink, _a| async move {
-            crate::connectivity_get_my_reachability_record_impl(&state).await
+            crate::connectivity_get_my_reachability_record_impl(state).await
         }
     );
     rpc!(
         m,
         "connectivity_list_peer_reachability",
         EmptyArgs,
-        |state, _sink, _a| async move { crate::connectivity_list_peer_reachability_impl(&state).await }
+        |state, _sink, _a| async move { crate::connectivity_list_peer_reachability_impl(state).await }
     );
 
     // Network health.
@@ -397,13 +389,13 @@ pub fn build_registry() -> RpcRegistry {
         m,
         "network_health_snapshot",
         EmptyArgs,
-        |state, _sink, _a| async move { crate::network_health_snapshot_impl(&state).await }
+        |state, _sink, _a| async move { crate::network_health_snapshot_impl(state).await }
     );
     rpc!(
         m,
         "network_health_run_self_test",
         EmptyArgs,
-        |state, _sink, _a| async move { crate::network_health_run_self_test_impl(&state).await }
+        |state, _sink, _a| async move { crate::network_health_run_self_test_impl(state).await }
     );
 
     RpcRegistry { handlers: m }
@@ -413,6 +405,8 @@ pub fn build_registry() -> RpcRegistry {
 mod tests {
     use super::*;
     use crate::node_event_sink::FanoutSink;
+    use crate::NodeState;
+    use std::sync::Mutex;
 
     fn test_sink() -> Arc<dyn NodeEventSink> {
         Arc::new(FanoutSink(vec![]))
