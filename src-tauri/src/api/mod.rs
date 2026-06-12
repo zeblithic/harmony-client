@@ -5,6 +5,7 @@
 // auth on every endpoint (see auth.rs for the trust-boundary rationale).
 pub mod auth;
 pub mod events;
+pub mod gui_host;
 pub mod lock;
 pub mod rpc;
 

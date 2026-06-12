@@ -22,6 +22,18 @@ pub fn emit_ser<T: Serialize>(sink: &dyn NodeEventSink, event: &str, payload: &T
 
 impl<R: tauri::Runtime> NodeEventSink for tauri::AppHandle<R> {
     fn emit(&self, event: &str, payload: serde_json::Value) {
+        // ZEB-452: GUI-mode API parity. When this process also hosts the
+        // localhost API (HARMONY_API_PORT), every GUI-bound event is
+        // mirrored onto the WS broadcast here — at the sink, not per
+        // wrapper — so no emission site (current or future) can miss the
+        // stream. ApiHost is managed in both modes; `events` is None when
+        // the API is off, and try_state covers early emissions before
+        // setup manages it.
+        if let Some(host) = tauri::Manager::try_state::<crate::api::gui_host::ApiHost>(self) {
+            if let Some(events) = &host.events {
+                NodeEventSink::emit(events, event, payload.clone());
+            }
+        }
         // Fully-qualified call into tauri's Emitter trait — NOT a recursive
         // call into NodeEventSink::emit.
         if let Err(e) = tauri::Emitter::emit(self, event, payload) {
