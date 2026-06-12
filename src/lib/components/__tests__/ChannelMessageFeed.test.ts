@@ -406,3 +406,70 @@ describe('ChannelMessageFeed', () => {
     expect(textarea.value).toBe('will fail');
   });
 });
+
+describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const AUTHOR = 'ee'.repeat(20);
+
+  function deliver(adapter: { listeners: Map<string, Function> }) {
+    adapter.listeners.get('channel-message-received')!({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: AUTHOR,
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('hello')),
+        },
+      },
+    });
+  }
+
+  it('renders the local friend nickname for an author OVER the profile-card name', async () => {
+    const { adapter, container } = await setup({
+      resolveCard: (id: string) =>
+        id === AUTHOR ? { displayName: 'ZEBbot', statusText: '' } : undefined,
+      resolveNickname: (id: string) => (id === AUTHOR ? 'Jake-nick' : undefined),
+    });
+    deliver(adapter);
+    await waitFor(() => {
+      const author = container.querySelector('.channel-message .author');
+      expect(author?.textContent).toContain('Jake-nick');
+      expect(author?.textContent).not.toContain('ZEBbot');
+    });
+  });
+
+  it('falls back to the profile-card name when the author has no nickname', async () => {
+    const { adapter, container } = await setup({
+      resolveCard: (id: string) =>
+        id === AUTHOR ? { displayName: 'ZEBbot', statusText: '' } : undefined,
+      resolveNickname: () => undefined,
+    });
+    deliver(adapter);
+    await waitFor(() => {
+      const author = container.querySelector('.channel-message .author');
+      expect(author?.textContent).toContain('ZEBbot');
+    });
+  });
+
+  it('falls back to truncated hex when neither nickname nor card resolves', async () => {
+    const { adapter, container } = await setup({
+      resolveCard: () => undefined,
+      resolveNickname: () => undefined,
+    });
+    deliver(adapter);
+    await waitFor(() => {
+      const author = container.querySelector('.channel-message .author');
+      expect(author?.textContent).toContain(AUTHOR.slice(0, 8));
+    });
+  });
+});

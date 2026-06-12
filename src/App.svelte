@@ -444,6 +444,16 @@
     return memberCardService.resolve(ownerIdHex);
   }
 
+  // ZEB-432: local friend nickname for an owner_id, preferred over the broadcast
+  // profile-card name in community surfaces (members roster + message authors),
+  // matching the Friends panel ladder. Reads the reactive `friendNicknames`
+  // $state so a nickname edit (friend-list-changed → refreshDmContacts) repaints
+  // the open community view. Case-normalized: community member addresses and
+  // friend ownerIdHex are both lowercase owner_id, but normalize defensively.
+  function resolveNickname(ownerIdHex: string): string | undefined {
+    return friendNicknames.get(ownerIdHex.toLowerCase()) || undefined;
+  }
+
   // ZEB-341 Task 8: lifecycle hooks threaded down to CommunityMembersPanel,
   // which knows the visible-member set. No-ops until the adapter wires up.
   function subscribeVisibleCards(ownerIdHexes: string[]) {
@@ -1104,6 +1114,12 @@
   // Browser/mock demo mode keeps the legacy navService.profiles map.
   let dmContacts: Map<string, Profile> | null = $state(null);
   const EMPTY_DM_CONTACTS: Map<string, Profile> = new Map();
+  // ZEB-432: owner_id(hex) → local friend nickname (ZEB-419), rebuilt from the
+  // same friends list that feeds the DM picker. Consulted by community surfaces
+  // (members roster + message authors) so a nicknamed friend renders by name
+  // instead of raw hex. friend-list-changed (which fires on nickname edits too,
+  // see the listener below) keeps this fresh.
+  let friendNicknames: Map<string, string> = $state(new Map());
   let pickerContacts = $derived(
     isTauri() ? (dmContacts ?? EMPTY_DM_CONTACTS) : navService.profiles
   );
@@ -1122,6 +1138,14 @@
       if (seq <= dmContactsCommittedSeq) return; // a newer success already committed
       dmContactsCommittedSeq = seq;
       dmContacts = contactsFromFriends(friends);
+      // ZEB-432: rebuild the nickname map under the same commit guard so it
+      // stays consistent with the DM-contact map (and never regresses to an
+      // older friends snapshot).
+      friendNicknames = new Map(
+        friends
+          .filter((f) => f.nickname)
+          .map((f) => [f.ownerIdHex.toLowerCase(), f.nickname as string]),
+      );
     } catch (e) {
       // Expected pre-owner-load ("owner not loaded") and in mock mode
       // (no adapter). Keep the last known-good map rather than wiping —
@@ -2807,6 +2831,7 @@
           sharedInProfileByCommunity = next;
         }}
         {resolveCard}
+        {resolveNickname}
         {subscribeVisibleCards}
         {unsubscribeCards}
         onOpenCard={openMemberCard}

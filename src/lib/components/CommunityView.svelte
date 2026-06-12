@@ -43,6 +43,7 @@
     onSelectCommunity,
     votingAdapter,
     resolveCard,
+    resolveNickname,
     subscribeVisibleCards,
     unsubscribeCards,
     onOpenCard,
@@ -62,6 +63,9 @@
     trustService?: TrustService;
     /** ZEB-341: optional card resolver — undefined until owner identity loads. */
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-432: optional local friend-nickname resolver (ZEB-419), preferred
+     *  over the profile-card name in the roster and on message authors. */
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
     /** ZEB-341 Task 8: subscribe to cross-peer cards for the visible member set. */
     subscribeVisibleCards?: (ownerIdHexes: string[]) => void;
     /** ZEB-341 Task 8: tear down all card subscriptions when the panel unmounts. */
@@ -459,6 +463,7 @@
           originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
           forkedAtMs={preForkSnapshot?.forkedAtMs ?? 0}
           {resolveCard}
+          {resolveNickname}
           {onOpenCard}
         />
       {/if}
@@ -550,6 +555,7 @@
         {communityService}
         ownAddress={ownAddress}
         {resolveCard}
+        {resolveNickname}
         {onOpenCard}
       />
     </div>
