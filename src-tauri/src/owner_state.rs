@@ -506,6 +506,100 @@ pub fn device_id_from_signing_key(device_sk: &SigningKey) -> [u8; 16] {
         .identity_hash()
 }
 
+/// Re-adopt an existing owner identity from its 32-byte master `seed`
+/// (ZEB-439 restore). A constrained variant of
+/// [`harmony_owner::lifecycle::mint_owner`] that takes the seed as input
+/// instead of generating it: the reconstructed [`OwnerState`] keeps the SAME
+/// `owner_id` (= `RecoveryArtifact::from_seed(seed).master_pubkey_bundle()
+/// .identity_hash()` — the invariant `pairing/cert.rs::sign_enrollment_for_joiner`
+/// enforces), but a FRESH device key is minted and master-signed into a new
+/// enrollment. The old device's key is never recovered: this is re-adoption of
+/// the owner on a new/wiped device. An initial `LivenessCert` is stamped so the
+/// sole device evaluates `Full`, not `Refused(StaleTrustState)` (ZEB-342 parity).
+///
+/// Returns the reconstructed `(OwnerState, device_signing_key)`; the caller
+/// persists via [`save_owner_state_atomic`] with `Some(seed)`.
+pub fn remint_owner_from_seed(
+    seed: &[u8; 32],
+    now: u64,
+) -> Result<(OwnerState, SigningKey), String> {
+    use harmony_owner::certs::LivenessCert;
+    use harmony_owner::lifecycle::{enroll_via_master, RecoveryArtifact};
+    use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+    use harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS;
+
+    let artifact = RecoveryArtifact::from_seed(*seed);
+    let owner_id = artifact.master_pubkey_bundle().identity_hash();
+    let mut state = OwnerState::new(owner_id);
+
+    // Fresh per-device key — the old device's key is intentionally NOT
+    // recovered. The seed reconstructs the OWNER (owner_id), not the device.
+    let device_sk = SigningKey::generate(&mut rand::rngs::OsRng);
+    let device_x25519 =
+        crate::dm_signing::ed25519_pub_to_x25519(&device_sk.verifying_key().to_bytes())
+            .map_err(|e| format!("device x25519 derivation failed: {e}"))?;
+    let device_bundle = PubKeyBundle {
+        classical: ClassicalKeys {
+            ed25519_verify: device_sk.verifying_key().to_bytes(),
+            x25519_pub: device_x25519,
+        },
+        post_quantum: None,
+    };
+
+    // enroll_via_master reconstructs the master key from the artifact, enforces
+    // `master.identity_hash() == state.owner_id` (returns WrongOwner otherwise),
+    // master-signs the enrollment, and drops the master key. For a fresh restore
+    // there are no active siblings, so `auto_vouch_certs` is empty.
+    let enrolled = enroll_via_master(
+        &state,
+        &artifact,
+        &device_sk,
+        device_bundle,
+        now,
+        DEFAULT_ACTIVE_WINDOW_SECS,
+    )
+    .map_err(|e| format!("enroll device under restored owner failed: {e}"))?;
+
+    state
+        .add_enrollment(enrolled.enrollment_cert, now, DEFAULT_ACTIVE_WINDOW_SECS)
+        .map_err(|e| format!("add_enrollment failed: {e}"))?;
+    for vouch in enrolled.auto_vouch_certs {
+        state
+            .add_vouching(vouch)
+            .map_err(|e| format!("add_vouching failed: {e}"))?;
+    }
+
+    // ZEB-342 parity: stamp initial liveness so the sole device evaluates Full,
+    // not Refused(StaleTrustState).
+    let liveness = LivenessCert::sign(&device_sk, owner_id, now)
+        .map_err(|e| format!("liveness sign failed: {e}"))?;
+    state
+        .add_liveness(liveness)
+        .map_err(|e| format!("add_liveness failed: {e}"))?;
+
+    Ok((state, device_sk))
+}
+
+/// Read just the `owner_id` from a persisted `owner_state.cbor`, without
+/// touching the keychain or the device/seed secrets.
+///
+/// Returns `Ok(None)` for the natural un-minted state (no `.cbor` marker).
+/// Used by the ZEB-439 restore overwrite-guard, which must compare the
+/// mnemonic-derived owner_id against any identity already on this device
+/// *before* deciding whether `--force` is required — a check that needs the
+/// recorded owner_id but neither the device key nor the master seed.
+pub fn read_persisted_owner_id(identity_dir: &Path) -> Result<Option<[u8; 16]>, String> {
+    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    if !cbor_path.exists() {
+        return Ok(None);
+    }
+    let cbor_bytes = std::fs::read(&cbor_path)
+        .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
+    let state: OwnerState =
+        cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
+    Ok(Some(state.owner_id))
+}
+
 /// Ensure the local device (derived from `device_sk`) has a fresh `LivenessCert`
 /// in `state`. Returns `true` if it mutated `state` (caller must then persist via
 /// [`save_owner_state_cbor_only`]).
@@ -802,6 +896,52 @@ mod persistence_tests {
             device_signing_key.to_bytes()
         );
         assert_eq!(loaded.master_seed.as_deref(), Some(&master_seed));
+    }
+
+    #[test]
+    fn remint_from_seed_preserves_owner_id_with_fresh_full_trust_device() {
+        // ZEB-439: re-adopting an owner from its master seed must reproduce the
+        // SAME owner_id (so peers/communities still recognize the identity),
+        // mint a DIFFERENT device key (the old device key is not recovered),
+        // and stamp liveness so the sole device evaluates Full (ZEB-342 parity).
+        let MintResult {
+            state: original,
+            recovery_artifact,
+            device_signing_key: original_device,
+        } = mint_owner(1_700_000_000).unwrap();
+        let seed = *recovery_artifact.as_bytes();
+
+        let now = 1_700_500_000;
+        let (restored, restored_device) =
+            remint_owner_from_seed(&seed, now).expect("remint from seed");
+
+        assert_eq!(
+            restored.owner_id, original.owner_id,
+            "restored identity must keep the same owner_id"
+        );
+        assert_ne!(
+            restored_device.to_bytes(),
+            original_device.to_bytes(),
+            "restore mints a fresh device key; it must not equal the old one"
+        );
+        assert_eq!(
+            restored.enrollments.len(),
+            1,
+            "exactly one device enrolled after restore"
+        );
+
+        let device_id = device_id_from_signing_key(&restored_device);
+        assert_eq!(
+            harmony_owner::trust::evaluate_trust(
+                &restored,
+                device_id,
+                now,
+                harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
+            ),
+            harmony_owner::trust::TrustDecision::Full,
+            "the sole restored device must evaluate to Full trust"
+        );
     }
 
     #[test]
