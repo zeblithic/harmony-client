@@ -353,9 +353,7 @@ impl ChannelLogEngine {
     /// Construct + spawn receive/flush loops. Takes ownership of the
     /// subscriber receiver from `params`; the registry passes one end
     /// of an `mpsc::channel` and keeps the sender in the adapter.
-    pub async fn new(
-        params: ChannelLogEngineParams,
-    ) -> Result<Arc<Self>, ChannelLogEngineError> {
+    pub async fn new(params: ChannelLogEngineParams) -> Result<Arc<Self>, ChannelLogEngineError> {
         // Per spec §14.2 acceptance criterion + §17.4 (segments persist
         // across stop/respawn): on construction, attempt to reload any
         // on-disk log state. ChannelLog::reload returns a fresh empty
@@ -1374,10 +1372,7 @@ impl ChannelLogRegistry {
     /// `begin_transaction` overwrites the slot with a `tracing::warn!`
     /// (spec §5.5); the prior guard's commit/abort becomes a no-op due
     /// to tx_id mismatch.
-    pub fn begin_transaction(
-        self: &Arc<Self>,
-        community_id: SpaceId,
-    ) -> CommunityTransactionGuard {
+    pub fn begin_transaction(self: &Arc<Self>, community_id: SpaceId) -> CommunityTransactionGuard {
         let tx_id = self
             .next_tx_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

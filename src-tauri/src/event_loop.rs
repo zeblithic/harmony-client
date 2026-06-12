@@ -450,7 +450,10 @@ async fn emit_moderation_changed(
     for o in roster_owners.iter().chain(std::iter::once(&self_owner.0)) {
         powers.insert(hex::encode(o), serde_json::json!(power_of(o)));
     }
-    crate::node_event_sink::emit_ser(app.as_ref(), "voice-moderation-changed", &serde_json::json!({
+    crate::node_event_sink::emit_ser(
+        app.as_ref(),
+        "voice-moderation-changed",
+        &serde_json::json!({
             "community": hex::encode(community.0),
             "channel": hex::encode(channel.0),
             "mutedOwners": muted.iter().map(hex::encode).collect::<Vec<_>>(),
@@ -459,7 +462,8 @@ async fn emit_moderation_changed(
             "selfPower": power_of(&self_owner.0),
             "selfModMuted": muted.contains(&self_owner.0),
             "selfKicked": kicked.contains(&self_owner.0),
-        }));
+        }),
+    );
 }
 
 /// ZEB-418 SP2 P2: wire one [`DatasetSyncHandles`] pair to a Zenoh pub/sub
@@ -488,10 +492,14 @@ async fn spawn_dataset_sync_zenoh_adapter(
 ) {
     let topic = format!("harmony/owner/{}/ds/{}", handles.addr_hex, dataset);
     let emit_degraded = |reason: &str| {
-        crate::node_event_sink::emit_ser(app.as_ref(), degraded_event, &serde_json::json!({
+        crate::node_event_sink::emit_ser(
+            app.as_ref(),
+            degraded_event,
+            &serde_json::json!({
                 "reason": reason,
                 "topic": &topic,
-            }));
+            }),
+        );
     };
     match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
         Ok(key_expr) => {
@@ -563,10 +571,14 @@ async fn spawn_dataset_sync_zenoh_adapter(
                                             "dataset-root subscriber closed unexpectedly; \
                                              will re-declare after backoff"
                                         );
-                                        crate::node_event_sink::emit_ser(app_late.as_ref(), degraded_event, &serde_json::json!({
+                                        crate::node_event_sink::emit_ser(
+                                            app_late.as_ref(),
+                                            degraded_event,
+                                            &serde_json::json!({
                                                 "reason": "subscriber_closed",
                                                 "topic": &topic_late,
-                                            }));
+                                            }),
+                                        );
                                         break; // break inner, retry outer
                                     }
                                 }
@@ -954,11 +966,15 @@ pub async fn run(
             Err(e) => {
                 let e = format!("zenoh open failed: {e}");
                 let _ = ready_tx.send(Err(e.clone()));
-                crate::node_event_sink::emit_ser(app.as_ref(), "zenoh-status", &crate::ZenohStatus {
+                crate::node_event_sink::emit_ser(
+                    app.as_ref(),
+                    "zenoh-status",
+                    &crate::ZenohStatus {
                         status: "error".to_string(),
                         endpoint: None,
                         error: Some(e),
-                    });
+                    },
+                );
                 return;
             }
         };
@@ -1023,10 +1039,14 @@ pub async fn run(
         // graceful publish-only / fully-degraded mode rather than
         // crashing the node.
         let emit_degraded = |reason: &str| {
-            crate::node_event_sink::emit_ser(app.as_ref(), "state-root-sync-degraded", &serde_json::json!({
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                "state-root-sync-degraded",
+                &serde_json::json!({
                     "reason": reason,
                     "topic": &topic,
-                }));
+                }),
+            );
         };
         match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
             Ok(key_expr) => {
@@ -1082,10 +1102,14 @@ pub async fn run(
                                             tracing::warn!(
                                                 "state-root subscriber closed unexpectedly"
                                             );
-                                            crate::node_event_sink::emit_ser(app_late.as_ref(), "state-root-sync-degraded", &serde_json::json!({
+                                            crate::node_event_sink::emit_ser(
+                                                app_late.as_ref(),
+                                                "state-root-sync-degraded",
+                                                &serde_json::json!({
                                                     "reason": "subscriber_closed",
                                                     "topic": &topic_late,
-                                                }));
+                                                }),
+                                            );
                                         }
                                         break;
                                     }
@@ -1127,10 +1151,14 @@ pub async fn run(
     if let Some(handles) = mint_sync_handles.take() {
         let topic = format!("harmony/owner/{}/mint-root-v1", handles.addr_hex);
         let emit_mint_degraded = |reason: &str| {
-            crate::node_event_sink::emit_ser(app.as_ref(), "mint-root-sync-degraded", &serde_json::json!({
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                "mint-root-sync-degraded",
+                &serde_json::json!({
                     "reason": reason,
                     "topic": &topic,
-                }));
+                }),
+            );
         };
         match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
             Ok(key_expr) => {
@@ -1186,10 +1214,14 @@ pub async fn run(
                                                 "mint-root subscriber closed unexpectedly; \
                                                  will re-declare after backoff"
                                             );
-                                            crate::node_event_sink::emit_ser(app_late.as_ref(), "mint-root-sync-degraded", &serde_json::json!({
+                                            crate::node_event_sink::emit_ser(
+                                                app_late.as_ref(),
+                                                "mint-root-sync-degraded",
+                                                &serde_json::json!({
                                                     "reason": "subscriber_closed",
                                                     "topic": &topic_late,
-                                                }));
+                                                }),
+                                            );
                                             break; // break inner, retry outer
                                         }
                                     }
@@ -1247,10 +1279,14 @@ pub async fn run(
     if let Some(handles) = notes_sync_handles.take() {
         let topic = format!("harmony/owner/{}/ds/notes-v1", handles.addr_hex);
         let emit_notes_degraded = |reason: &str| {
-            crate::node_event_sink::emit_ser(app.as_ref(), "notes-sync-degraded", &serde_json::json!({
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                "notes-sync-degraded",
+                &serde_json::json!({
                     "reason": reason,
                     "topic": &topic,
-                }));
+                }),
+            );
         };
         match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
             Ok(key_expr) => {
@@ -1306,10 +1342,14 @@ pub async fn run(
                                                 "notes-root subscriber closed unexpectedly; \
                                                  will re-declare after backoff"
                                             );
-                                            crate::node_event_sink::emit_ser(app_late.as_ref(), "notes-sync-degraded", &serde_json::json!({
+                                            crate::node_event_sink::emit_ser(
+                                                app_late.as_ref(),
+                                                "notes-sync-degraded",
+                                                &serde_json::json!({
                                                     "reason": "subscriber_closed",
                                                     "topic": &topic_late,
-                                                }));
+                                                }),
+                                            );
                                             break; // break inner, retry outer
                                         }
                                     }
@@ -1367,10 +1407,14 @@ pub async fn run(
     if let Some(handles) = dm_inbox_sync_handles.take() {
         let topic = format!("harmony/owner/{}/ds/dm-inbox-v1", handles.addr_hex);
         let emit_dm_inbox_degraded = |reason: &str| {
-            crate::node_event_sink::emit_ser(app.as_ref(), "dm-inbox-sync-degraded", &serde_json::json!({
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                "dm-inbox-sync-degraded",
+                &serde_json::json!({
                     "reason": reason,
                     "topic": &topic,
-                }));
+                }),
+            );
         };
         match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
             Ok(key_expr) => {
@@ -1426,10 +1470,14 @@ pub async fn run(
                                                 "dm-inbox-root subscriber closed unexpectedly; \
                                                  will re-declare after backoff"
                                             );
-                                            crate::node_event_sink::emit_ser(app_late.as_ref(), "dm-inbox-sync-degraded", &serde_json::json!({
+                                            crate::node_event_sink::emit_ser(
+                                                app_late.as_ref(),
+                                                "dm-inbox-sync-degraded",
+                                                &serde_json::json!({
                                                     "reason": "subscriber_closed",
                                                     "topic": &topic_late,
-                                                }));
+                                                }),
+                                            );
                                             break; // break inner, retry outer
                                         }
                                     }
@@ -1626,9 +1674,13 @@ pub async fn run(
                                                         | crate::library_directory::OnEntryOutcome::AccretedListedBy(c) => Some(*c),
                                                         crate::library_directory::OnEntryOutcome::Idempotent => None,
                                                     };
-                                                    crate::node_event_sink::emit_ser(app_for_task.as_ref(), "library-directory-updated", &serde_json::json!({
+                                                    crate::node_event_sink::emit_ser(
+                                                        app_for_task.as_ref(),
+                                                        "library-directory-updated",
+                                                        &serde_json::json!({
                                                             "communityId": community_id.map(|c| hex::encode(c.0)),
-                                                        }));
+                                                        }),
+                                                    );
                                                 }
                                             }
                                             Err(e) => {
@@ -1659,7 +1711,11 @@ pub async fn run(
                         }
                         let evicted = library_directory_handle.drop_library(&addr).await;
                         if !evicted.is_empty() {
-                            crate::node_event_sink::emit_ser(app_for_libdir.as_ref(), "library-directory-updated", &serde_json::json!({ "communityId": null }));
+                            crate::node_event_sink::emit_ser(
+                                app_for_libdir.as_ref(),
+                                "library-directory-updated",
+                                &serde_json::json!({ "communityId": null }),
+                            );
                         }
                     }
                 }
@@ -1736,7 +1792,11 @@ pub async fn run(
                                                 | crate::library_directory::AnnounceOutcome::Updated(_)
                                         );
                                         if changed || result.evicted.is_some() {
-                                            crate::node_event_sink::emit_ser(app_for_announce.as_ref(), "library-directory-updated", &serde_json::json!({ "communityId": null }));
+                                            crate::node_event_sink::emit_ser(
+                                                app_for_announce.as_ref(),
+                                                "library-directory-updated",
+                                                &serde_json::json!({ "communityId": null }),
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -1887,12 +1947,16 @@ pub async fn run(
                                                         // Spec §7: emit flat payload
                                                         // (subscriptionId + DiscoveredProfileInfo
                                                         // fields hoisted).
-                                                        crate::node_event_sink::emit_ser(app_for_task.as_ref(), "profile-broadcast-received", &serde_json::json!({
+                                                        crate::node_event_sink::emit_ser(
+                                                            app_for_task.as_ref(),
+                                                            "profile-broadcast-received",
+                                                            &serde_json::json!({
                                                                 "subscriptionId": subscription_id,
                                                                 "ownerAddr": info.owner_addr,
                                                                 "communityIds": info.community_ids,
                                                                 "sharedAt": info.shared_at,
-                                                            }));
+                                                            }),
+                                                        );
                                                     }
                                                 }
                                                 Err(e) => {
@@ -2072,7 +2136,10 @@ pub async fn run(
                                             {
                                                 // Flat payload (subscriptionId +
                                                 // DiscoveredCardInfo fields hoisted).
-                                                crate::node_event_sink::emit_ser(app_for_task.as_ref(), "member-card-received", &serde_json::json!({
+                                                crate::node_event_sink::emit_ser(
+                                                    app_for_task.as_ref(),
+                                                    "member-card-received",
+                                                    &serde_json::json!({
                                                         "subscriptionId": subscription_id,
                                                         "ownerIdHex": info.owner_id_hex,
                                                         "displayName": info.display_name,
@@ -2086,7 +2153,8 @@ pub async fn run(
                                                         // (Cursor). DiscoveredCardInfo
                                                         // already carries it hex-encoded.
                                                         "profilePageRoot": info.profile_page_root,
-                                                    }));
+                                                    }),
+                                                );
                                             }
                                         }
                                         Err(_) => {
@@ -5132,14 +5200,22 @@ fn emit_voice_signal_event(
     let call_hex = hex::encode(signal.call_id);
     match signal.kind {
         VoiceSignalKind::Invite => {
-            crate::node_event_sink::emit_ser(app.as_ref(), "incoming-call", &serde_json::json!({
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                "incoming-call",
+                &serde_json::json!({
                     "callId": call_hex,
                     "callerOwner": hex::encode(signal.caller.0),
                     "spaceId": space_id_hex,
-                }));
+                }),
+            );
         }
         VoiceSignalKind::Accept => {
-            crate::node_event_sink::emit_ser(app.as_ref(), "call-accepted", &serde_json::json!({ "callId": call_hex }));
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                "call-accepted",
+                &serde_json::json!({ "callId": call_hex }),
+            );
         }
         VoiceSignalKind::Decline => {
             let reason = match signal.decline_reason {
@@ -5147,13 +5223,25 @@ fn emit_voice_signal_event(
                 Some(DeclineReason::Busy) => "busy",
                 Some(DeclineReason::Timeout) => "timeout",
             };
-            crate::node_event_sink::emit_ser(app.as_ref(), "call-declined", &serde_json::json!({ "callId": call_hex, "reason": reason }));
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                "call-declined",
+                &serde_json::json!({ "callId": call_hex, "reason": reason }),
+            );
         }
         VoiceSignalKind::Cancel => {
-            crate::node_event_sink::emit_ser(app.as_ref(), "call-canceled", &serde_json::json!({ "callId": call_hex }));
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                "call-canceled",
+                &serde_json::json!({ "callId": call_hex }),
+            );
         }
         VoiceSignalKind::End => {
-            crate::node_event_sink::emit_ser(app.as_ref(), "call-ended", &serde_json::json!({ "callId": call_hex }));
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                "call-ended",
+                &serde_json::json!({ "callId": call_hex }),
+            );
         }
     }
 }
@@ -5171,19 +5259,27 @@ fn emit_group_voice_signal_event(
     let call_hex = hex::encode(signal.call_id);
     match signal.kind {
         VoiceSignalKind::Invite => {
-            crate::node_event_sink::emit_ser(app.as_ref(), "incoming-group-call", &serde_json::json!({
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                "incoming-group-call",
+                &serde_json::json!({
                     "callId": call_hex,
                     "callerOwner": hex::encode(signal.caller.0),
                     "spaceId": space_id_hex,
-                }));
+                }),
+            );
         }
         VoiceSignalKind::Decline => {
             // `caller` on a Decline is the decliner (responder).
-            crate::node_event_sink::emit_ser(app.as_ref(), "group-call-declined", &serde_json::json!({
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                "group-call-declined",
+                &serde_json::json!({
                     "callId": call_hex,
                     "spaceId": space_id_hex,
                     "owner": hex::encode(signal.caller.0),
-                }));
+                }),
+            );
         }
         // Drop-in model: no group Accept/Cancel/End signals are sent.
         _ => {}
@@ -5332,7 +5428,10 @@ async fn handle_runtime_action_or_dispatch(
                     match result {
                         Ok(outcome) => {
                             for rm in outcome.newly_received {
-                                crate::node_event_sink::emit_ser(app.as_ref(), "dm-received", &serde_json::json!({
+                                crate::node_event_sink::emit_ser(
+                                    app.as_ref(),
+                                    "dm-received",
+                                    &serde_json::json!({
                                         "spaceId": hex::encode(rm.inbox_entry.space_id.0),
                                         "messageCid": hex::encode(rm.inbox_entry.message_cid.to_bytes()),
                                         "from": hex::encode(rm.inbox_entry.from.0),
@@ -5340,20 +5439,29 @@ async fn handle_runtime_action_or_dispatch(
                                         "sentAt": rm.sent_at.wall_ms,
                                         "body": hex::encode(&rm.body),
                                         "mimeType": rm.mime_type,
-                                    }));
+                                    }),
+                                );
                             }
                             for (space_id, message_cid, recipient) in outcome.newly_delivered {
-                                crate::node_event_sink::emit_ser(app.as_ref(), "dm-delivered", &serde_json::json!({
+                                crate::node_event_sink::emit_ser(
+                                    app.as_ref(),
+                                    "dm-delivered",
+                                    &serde_json::json!({
                                         "spaceId": hex::encode(space_id.0),
                                         "messageCid": hex::encode(message_cid.to_bytes()),
                                         "recipientOwnerAddr": hex::encode(recipient.0),
-                                    }));
+                                    }),
+                                );
                             }
                             for (space_id, message_cid) in outcome.newly_expired {
-                                crate::node_event_sink::emit_ser(app.as_ref(), "dm-expired", &serde_json::json!({
+                                crate::node_event_sink::emit_ser(
+                                    app.as_ref(),
+                                    "dm-expired",
+                                    &serde_json::json!({
                                         "spaceId": hex::encode(space_id.0),
                                         "messageCid": hex::encode(message_cid.to_bytes()),
-                                    }));
+                                    }),
+                                );
                             }
                         }
                         Err(e) => {
@@ -5696,12 +5804,19 @@ async fn query_mail_root(
 }
 
 /// Emit zenoh-status error when a Zenoh session appears to have been lost.
-fn emit_session_lost(app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>, reason: &str) {
-    crate::node_event_sink::emit_ser(app.as_ref(), "zenoh-status", &crate::ZenohStatus {
+fn emit_session_lost(
+    app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    reason: &str,
+) {
+    crate::node_event_sink::emit_ser(
+        app.as_ref(),
+        "zenoh-status",
+        &crate::ZenohStatus {
             status: "error".to_string(),
             endpoint: None,
             error: Some(format!("session lost: {reason}")),
-        });
+        },
+    );
 }
 
 use harmony_content::book::BookStore;
@@ -6584,7 +6699,11 @@ fn emit_frontend_event(
             ) {
                 if let Ok(reaction) = serde_json::from_slice::<crate::VineReactionPayload>(payload)
                 {
-                    crate::node_event_sink::emit_ser(app.as_ref(), "vine-reaction-received", &reaction);
+                    crate::node_event_sink::emit_ser(
+                        app.as_ref(),
+                        "vine-reaction-received",
+                        &reaction,
+                    );
                 }
             }
         } else {

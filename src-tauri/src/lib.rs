@@ -3051,10 +3051,8 @@ pub(crate) async fn start_node_inner(
                     Box::pin(async move {
                         use tauri::Manager as _;
                         let Some(app) = wry else {
-                            return Err(
-                                "vrf beacon unavailable: no Tauri app handle (serve mode)"
-                                    .to_string(),
-                            );
+                            return Err("vrf beacon unavailable: no Tauri app handle (serve mode)"
+                                .to_string());
                         };
                         let state = app.state::<Mutex<NodeState>>();
                         crate::dfrost_request_vrf_beacon_inner(&state, space_id, seed, epoch).await
@@ -7027,10 +7025,9 @@ pub(crate) async fn start_node_inner(
                                 // persisted relays Settings shows (Healthy
                                 // placeholders), resolving the path exactly as
                                 // get_pkarr_relays does so the two surfaces agree.
-                                let settings_path = connectivity_settings_path(
-                                    guard.pkarr_settings_path.clone(),
-                                )
-                                .ok();
+                                let settings_path =
+                                    connectivity_settings_path(guard.pkarr_settings_path.clone())
+                                        .ok();
                                 std::sync::Arc::new(PersistedRelaySnapshot { settings_path })
                             };
                             let mut nh = crate::network_health::NetworkHealthService::new(
@@ -18185,9 +18182,7 @@ pub async fn create_community_inner(
     // NodeState-held clone; tests that don't exercise catch-up pass
     // `None` (driver then parks permanently once satisfied).
     transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
-    channel_log_registry: std::sync::Arc<
-        crate::community_channel_log_engine::ChannelLogRegistry,
-    >,
+    channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     snapshot_generation: u64,
     node_state: &std::sync::Mutex<NodeState>,
 ) -> Result<String, String> {
@@ -18823,10 +18818,11 @@ mod create_community_inner_tests {
         // consumed, so engines_count_for_test() reflects real spawns.
         let (channel_log_adapter_tx, _channel_log_adapter_rx) =
             mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
-        let app = tauri::test::mock_app().handle().clone();
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
         let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
             adapter_request_tx: channel_log_adapter_tx,
-            app,
+            sink,
             identity_dir: tmp.path().to_path_buf(),
             self_owner,
             self_device_id: "test-dev".into(),
@@ -18942,9 +18938,7 @@ mod create_community_inner_tests {
     /// Bounded condition-wait: polls until `engines_count_for_test()`
     /// equals `expected`, or `timeout` elapses. Returns `true` on match.
     async fn wait_until_engines_count(
-        registry: &crate::community_channel_log_engine::ChannelLogRegistry<
-            tauri::test::MockRuntime,
-        >,
+        registry: &crate::community_channel_log_engine::ChannelLogRegistry,
         expected: usize,
         timeout: std::time::Duration,
     ) -> bool {
@@ -19704,9 +19698,7 @@ pub async fn redeem_invite_inner<F>(
     transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
-    channel_log_registry: std::sync::Arc<
-        crate::community_channel_log_engine::ChannelLogRegistry,
-    >,
+    channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     fence_check: F,
     identity_dir: Option<std::path::PathBuf>,
     allow_no_reticulum_destinations: bool,
@@ -19766,9 +19758,7 @@ pub async fn redeem_invite_inner_with_overrides<F>(
     transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
-    channel_log_registry: std::sync::Arc<
-        crate::community_channel_log_engine::ChannelLogRegistry,
-    >,
+    channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     fence_check: F,
     // ZEB-285: identity_dir used to write pre_fork_snapshot.bin for fork invites.
     // None suppresses the snapshot write (e.g., when resolve_identity_dir fails).
@@ -20975,9 +20965,7 @@ async fn join_open_community_inner<F>(
     transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
-    channel_log_registry: std::sync::Arc<
-        crate::community_channel_log_engine::ChannelLogRegistry,
-    >,
+    channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     fence_check: F,
 ) -> Result<RedeemInviteResultDto, String>
 where
@@ -21189,8 +21177,7 @@ mod redeem_invite_inner_tests {
             tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
         pub(super) unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
         pub(super) dm_outbox: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
-        pub(super) channel_log_registry:
-            std::sync::Arc<ChannelLogRegistry>,
+        pub(super) channel_log_registry: std::sync::Arc<ChannelLogRegistry>,
         // ZEB-436: tempdir root (== the registry's identity_dir) so the
         // orphan-adoption tests can load `communities/{hex}/crdt.cbor`
         // directly for ground-truth assertions.
@@ -21312,10 +21299,11 @@ mod redeem_invite_inner_tests {
 
         let (channel_log_adapter_tx, _channel_log_adapter_rx) =
             mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
-        let app = tauri::test::mock_app().handle().clone();
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
         let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
             adapter_request_tx: channel_log_adapter_tx,
-            app,
+            sink,
             identity_dir: tmp.path().to_path_buf(),
             self_owner,
             self_device_id: "joiner-dev".into(),
@@ -21588,11 +21576,12 @@ mod redeem_invite_inner_tests {
 
         let (channel_log_adapter_tx, _channel_log_adapter_rx) =
             mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
-        let app = tauri::test::mock_app().handle().clone();
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
         let channel_log_registry =
             std::sync::Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
                 adapter_request_tx: channel_log_adapter_tx,
-                app,
+                sink,
                 identity_dir: tmp.path().to_path_buf(),
                 self_owner: joiner_self_owner,
                 self_device_id: "joiner-dev".into(),
@@ -21885,11 +21874,12 @@ mod redeem_invite_inner_tests {
         )));
         let (channel_log_adapter_tx_b, _channel_log_adapter_rx_b) =
             mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
-        let app_b = tauri::test::mock_app().handle().clone();
+        let sink_b: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
         let channel_log_registry_b =
             std::sync::Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
                 adapter_request_tx: channel_log_adapter_tx_b,
-                app: app_b,
+                sink: sink_b,
                 identity_dir: tmp2.path().to_path_buf(),
                 self_owner: joiner_self_owner,
                 self_device_id: "joiner-dev".into(),
@@ -22803,9 +22793,8 @@ mod zeb436_orphan_adoption_tests {
         community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
         unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
         dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
-        channel_log_registry: std::sync::Arc<
-            crate::community_channel_log_engine::ChannelLogRegistry,
-        >,
+        channel_log_registry:
+            std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
         invite_url: String,
         crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
         hlc_tracker: std::sync::Arc<
@@ -22933,10 +22922,11 @@ mod zeb436_orphan_adoption_tests {
 
         let (channel_log_adapter_tx, _channel_log_adapter_rx) =
             mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
-        let app = tauri::test::mock_app().handle().clone();
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
         let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
             adapter_request_tx: channel_log_adapter_tx,
-            app,
+            sink,
             identity_dir: tmp.path().to_path_buf(),
             self_owner: joiner_self_owner,
             self_device_id: "joiner-dev".into(),
@@ -36370,9 +36360,7 @@ pub async fn connectivity_redeem_invite_iroh_inner<F>(
     transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
-    channel_log_registry: std::sync::Arc<
-        crate::community_channel_log_engine::ChannelLogRegistry,
-    >,
+    channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     // ZEB-427: owner-state SyncEngine handle for the durable-on-commit
     // fence (ZEB-393 Bug A). This was the ONE join path missing the
     // fence — `create_community`, the legacy `redeem_invite`, and
