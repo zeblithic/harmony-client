@@ -25808,6 +25808,30 @@ async fn cleanup_community_data(
     }
 }
 
+/// ZEB-435: delete a tombstoned community's on-disk data ONLY after confirming
+/// the owner-state tombstone flushed DURABLY — so the irreversible delete never
+/// outruns the durability of the tombstone that authorizes it. Used by BOTH the
+/// first community removal and the idempotent already-tombstoned retry path
+/// (Cursor: the retry must not bypass the flush gate). When the flush is
+/// best-effort/unavailable, the cleanup is deferred — the in-memory tombstone
+/// re-arms the debounce and a later `remove_space` retries.
+async fn cleanup_community_data_if_durable(
+    sync_engine: &Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
+    community_registry: &Option<std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>>,
+    space_id: &crate::owner_state_types::SpaceId,
+    id_hex: &str,
+) {
+    if fence_remove_space_flush(sync_engine, id_hex).await {
+        cleanup_community_data(community_registry, space_id, id_hex).await;
+    } else {
+        tracing::warn!(
+            space_id = %id_hex,
+            "remove_space: tombstone not durably flushed — keeping the community \
+             data until a later remove_space confirms durability"
+        );
+    }
+}
+
 /// ZEB-435: best-effort filesystem delete of a community's on-disk dir
 /// (`~/.harmony/communities/<id>/`) — the no-registry fallback for
 /// [`cleanup_community_data`]. The owner-state tombstone already blocks any
@@ -25908,7 +25932,16 @@ pub(crate) async fn remove_space_impl(
             None => {
                 if g.tombstones.contains(&space_id) {
                     drop(g);
-                    cleanup_community_data(&community_registry, &space_id, &id_hex).await;
+                    // Retry the cleanup, but through the SAME durable-flush gate
+                    // as the first removal — never delete bytes while the
+                    // tombstone is still only in memory (Cursor).
+                    cleanup_community_data_if_durable(
+                        &sync_engine,
+                        &community_registry,
+                        &space_id,
+                        &id_hex,
+                    )
+                    .await;
                     return Ok(());
                 }
                 return Err(format!("no space {id_hex} to remove"));
@@ -25955,17 +25988,14 @@ pub(crate) async fn remove_space_impl(
             }
             // Delete the on-disk data ONLY once the tombstone is durably flushed,
             // so a crash can't resurrect the Space pointing at deleted bytes
-            // (Qodo). When not durable we defer: the in-memory tombstone re-arms
-            // the debounce and a later remove_space retries the cleanup.
-            if fence_remove_space_flush(&sync_engine, &id_hex).await {
-                cleanup_community_data(&community_registry, &space_id, &id_hex).await;
-            } else {
-                tracing::warn!(
-                    space_id = %id_hex,
-                    "remove_space: tombstone not durably flushed — keeping the \
-                     community data until a later remove_space confirms durability"
-                );
-            }
+            // (Qodo). When not durable the cleanup is deferred to a later call.
+            cleanup_community_data_if_durable(
+                &sync_engine,
+                &community_registry,
+                &space_id,
+                &id_hex,
+            )
+            .await;
         }
         SpaceKind::Dm | SpaceKind::GroupDm | SpaceKind::Channel | SpaceKind::PublicChannel => {
             check_generation()?;
@@ -26091,20 +26121,34 @@ mod remove_space_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn missing_space_errs_but_already_tombstoned_is_idempotent_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
         let node = node_with(OwnerState::default());
         // Never existed → error.
         assert!(remove_space_impl(&node, hex::encode([5u8; 16]))
             .await
             .is_err());
-        // Tombstone it directly, then a remove is a no-op Ok (idempotent).
+        // Tombstone it directly + plant a dir, then a remove is a no-op Ok.
+        let id_hex = hex::encode([5u8; 16]);
+        let dir = tmp
+            .path()
+            .join(".harmony")
+            .join("communities")
+            .join(&id_hex);
+        std::fs::create_dir_all(&dir).unwrap();
         {
             let cs = node.lock().unwrap().crdt_state.clone().unwrap();
             cs.lock().await.tombstone_space(SpaceId([5; 16]));
         }
-        assert!(remove_space_impl(&node, hex::encode([5u8; 16]))
-            .await
-            .is_ok());
+        assert!(remove_space_impl(&node, id_hex).await.is_ok());
+        // Cursor: the idempotent retry must NOT delete bytes without a durable
+        // flush — with no engine here the cleanup defers, so the dir survives.
+        assert!(
+            dir.exists(),
+            "idempotent retry deferred deletion (no durable flush)"
+        );
     }
 
     #[tokio::test]
