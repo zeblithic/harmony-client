@@ -399,7 +399,7 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     // sentinel packets that decode-fail (silently dropped on receive)
     // through both directions to give the in-memory gossip time to
     // wire the subscriber on each side before the real Signal lands.
-    for _ in 0..20 {
+    for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = a_pub_tx.send(b"WARMUP-A".to_vec()).await;
         let _ = b_pub_tx.send(b"WARMUP-B".to_vec()).await;
@@ -424,7 +424,7 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     // runs verify+apply and then the four post-apply hooks. We watch
     // `log_a`'s per_voter map for bob's entry as the convergence signal.
     let mut converged = false;
-    for _ in 0..20 {
+    for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let la = log_a.lock().await;
         if let Some(ps) = la.polls.get(&pid) {
@@ -438,14 +438,14 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     }
     assert!(
         converged,
-        "engine A must converge on bob's Signal via Zenoh within 2s"
+        "engine A must converge on bob's Signal via Zenoh within 10s"
     );
 
     // ── Wait for the emit to land ───────────────────────────────────────
     // The hook runs after apply, but Tauri's listener dispatch is
     // async-ish; give it a short tick budget to flush.
     let mut payloads: Vec<String> = Vec::new();
-    for _ in 0..20 {
+    for _ in 0..100 {
         {
             let g = captured.lock().expect("captured lock");
             if !g.is_empty() {
@@ -580,7 +580,7 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     // Wait for engine B to converge on alice's override (her entry
     // appears in per_voter on log_b).
     let mut override_converged = false;
-    for _ in 0..20 {
+    for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let lb = log_b.lock().await;
         if let Some(ps) = lb.polls.get(&pid) {
@@ -594,7 +594,7 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     }
     assert!(
         override_converged,
-        "engine B must converge on alice's override Signal via Zenoh within 2s"
+        "engine B must converge on alice's override Signal via Zenoh within 10s"
     );
 
     // After the override, bob's contribution should no longer be

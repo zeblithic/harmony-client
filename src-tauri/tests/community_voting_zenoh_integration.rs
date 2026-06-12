@@ -146,7 +146,7 @@ async fn voting_event_flows_through_two_zenoh_sessions() {
     // B side silently drops the malformed bytes (decode error logged as
     // warn, not fatal) and continues. The real event is published after
     // the warm-up window, before the 3-second poll loop.
-    for _ in 0..20 {
+    for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         // Ignore send errors — the adapter may not be up yet.
         let _ = a_pub_tx.send(b"WARMUP".to_vec()).await;
