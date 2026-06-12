@@ -119,8 +119,8 @@ lands at `<profile identity dir>/identity.key` automatically because
 `identity::resolve_path()` is profile-aware.
 
 Fail-fast guard: on a named profile, if neither `HARMONY_PASSPHRASE` nor
-`HARMONY_PASSPHRASE_FILE` is set, refuse at startup with explicit guidance — `serve`
-exits non-zero; a GUI launch surfaces the error and refuses to start the node. No
+`HARMONY_PASSPHRASE_FILE` is set, refuse at startup with explicit guidance — serve
+and GUI launches alike exit non-zero at startup with the error on stderr. No
 ZEB-450-style silent transport loss.
 
 Default-profile behavior is byte-for-byte unchanged.
@@ -183,7 +183,7 @@ section) + a pointer from `docs/troubleshooting.md`:
 | Condition | Behavior |
 |---|---|
 | Invalid profile name (flag or env) | Hard error at startup with the validation rule spelled out |
-| Named profile without passphrase env | Refuse to start (serve: exit non-zero; GUI: surfaced error, node not started) |
+| Named profile without passphrase env | Refuse to start: serve and GUI launches alike exit non-zero at startup with the error on stderr |
 | Reticulum port taken / unbindable | Warn + continue without Reticulum |
 | `HARMONY_RETICULUM_PORT` unparseable | Warn + default 4242 |
 | Second serve on the SAME profile | Existing `serve.lock` refusal, now naturally per-profile |

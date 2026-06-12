@@ -130,6 +130,18 @@ Test-driver note: a hidden-to-tray instance keeps its PID and process start time
 - **GUI launched with `HARMONY_API_PORT` but no API answers** — check the
   log for `ZEB-452: profile lock unavailable`: another process (usually a
   `serve`) holds the profile. One node per profile in v1.
+- **`named profile requires HARMONY_PASSPHRASE`** at startup — named
+  profiles are file-vault-only; set `HARMONY_PASSPHRASE` or
+  `HARMONY_PASSPHRASE_FILE`. See
+  [Side-by-side coordination instance](headless-install.md#side-by-side-coordination-instance-named-profiles).
+- **`invalid profile name`** — profile names must match
+  `[a-z0-9][a-z0-9_-]{0,31}`; `default` is reserved (omit `--profile` /
+  `HARMONY_PROFILE` to use the default profile).
+- **`UDP bind failed … Reticulum LAN discovery disabled`** is a warning,
+  not an error — another local instance holds the port; the node still
+  networks via zenoh/iroh/pkarr. Set `HARMONY_RETICULUM_PORT` to rebind to
+  a different port, or `HARMONY_RETICULUM_PORT=0` to disable the bind
+  attempt entirely.
 
 ## Help + feedback
 

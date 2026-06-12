@@ -373,7 +373,7 @@ First boot is **pre-mint** — `serve` starts the node but does not create an
 identity. `GET /v1/status` reports `"ownerId": null` until you `POST
 /v1/rpc/mint_owner_identity` (once per profile; subsequent boots load it).
 
-### The v1 RPC surface (29 commands)
+### The v1 RPC surface (35 commands)
 
 All commands are `POST /v1/rpc/{command}` with a JSON object body
 (camelCase keys, exactly the args the GUI sends). No-arg commands accept
@@ -388,6 +388,7 @@ All commands are `POST /v1/rpc/{command}` with a JSON object body
 | Friends (7) | `list_friends`, `generate_friend_token`, `redeem_friend_token`, `add_friend_by_key`, `list_pending_friend_requests`, `accept_friend_request`, `decline_friend_request` |
 | Spaces / DMs (3) | `add_space`, `send_dm`, `read_dm_thread` |
 | Diagnostics (4) | `connectivity_get_my_reachability_record`, `connectivity_list_peer_reachability`, `network_health_snapshot`, `network_health_run_self_test` |
+| Pairing (6) | `start_inviter_pairing` (`{"displayName": string}`), `start_joiner_pairing` (`{"displayName": string}`), `select_pairing_peer` (`{"peerSessionId": uuid}`), `confirm_pairing_sas`, `cancel_pairing`, `get_pairing_state` → `PairingState` JSON |
 
 Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
 `POST /v1/shutdown` (graceful quit), `GET /v1/events` (WS firehose).
@@ -473,3 +474,67 @@ running / discovery files missing / args not valid JSON / bad usage).
 Stdout carries ONLY the result JSON or event frames (PR #231 stdout-purity
 discipline); logs and errors go to stderr, so `harmony-app api ... | jq .`
 is always safe. `curl`/`websocat` remain first-class alternatives.
+
+## Side-by-side coordination instance (named profiles)
+
+Run a pinned release build as an always-on headless "coordination" device
+beside your dev instance — same machine, separate enrolled device, zero
+shared state.
+
+1. **Pin a binary** (copy it OUT of the build tree so dev rebuilds can't
+   touch it):
+
+   ```bash
+   cp target/release/harmony-app ~/harmony-pinned/harmony-app
+   ```
+
+2. **Create a vault passphrase file** (named profiles never touch the OS
+   keychain — they use the encrypted-file vault):
+
+   ```bash
+   umask 077
+   echo 'a-long-random-passphrase' > ~/.harmony-coord-pass
+   ```
+
+3. **Start the coordination instance** on its own profile and API port:
+
+   ```bash
+   HARMONY_PASSPHRASE_FILE=~/.harmony-coord-pass \
+     ~/harmony-pinned/harmony-app serve --profile coord --api-port 7421
+   ```
+
+   Storage lands under `~/.harmony/profiles/coord/` and
+   `<data-dir>/net.zeblith.harmony/profiles/coord/`. If the dev instance
+   holds UDP 4242, the coordination instance logs a warning and runs
+   without Reticulum LAN discovery (zenoh/iroh/pkarr are unaffected); set
+   `HARMONY_RETICULUM_PORT=0` to silence the bind attempt entirely.
+
+4. **Verify it's up** (pre-enrollment, the owner state is `null`):
+
+   ```bash
+   ~/harmony-pinned/harmony-app api --profile coord get_owner_state
+   ```
+
+5. **Enroll it as a device in your fleet** (the inviter side runs on your
+   default-profile GUI — or its API when launched with `HARMONY_API_PORT`):
+
+   ```bash
+   # coordination instance (joiner):
+   ~/harmony-pinned/harmony-app api --profile coord start_joiner_pairing \
+     '{"displayName":"coord"}'
+   # dev GUI: start inviter pairing from the device-pairing UI (or
+   # `api start_inviter_pairing '{"displayName":"main"}'`), then on both
+   # sides select the peer and compare the short auth string:
+   ~/harmony-pinned/harmony-app api --profile coord get_pairing_state
+   ~/harmony-pinned/harmony-app api --profile coord confirm_pairing_sas
+   ```
+
+6. **Verify** both devices appear in your fleet, then kill / rebuild /
+   relaunch the dev instance freely — the coordination instance is
+   unaffected.
+
+A single GUI can also run on a named profile (onboarding tests against a
+scratch profile): launch with `HARMONY_PROFILE=<name>` plus a passphrase
+env. Two *simultaneous* GUIs remain unsupported (the single-instance
+plugin is identifier-global), and `harmony://` deep links always reach the
+default-profile GUI.
