@@ -1777,13 +1777,15 @@ impl KeychainStore {
     /// evaporated; the foreign keychain entry stayed; the next boot failed
     /// the enrollment gate and the identity was unrecoverable.
     ///
-    /// Two gates close that class:
+    /// Three gates close that class:
     /// 1. `HARMONY_DISABLE_KEYCHAIN` (non-empty, not `"0"`) → `Err` in every
     ///    build. An explicit operator kill-switch; beats all overrides.
     /// 2. In test builds (`cfg(test)` or the `test-fixtures` feature — every
     ///    integration-test compilation requires the latter) → `Err` unless
     ///    `HARMONY_ALLOW_REAL_KEYCHAIN=1`. Production builds don't compile
     ///    this branch, so the app's keychain behavior is unchanged.
+    /// 3. A named profile (ZEB-446) → `Err` in every build: keychain names are
+    ///    machine-global, so named profiles are file-vault-only.
     ///
     /// Every caller already tolerates `Err` (`.ok()` → encrypted-file
     /// fallback, or propagation) — a gated test run behaves exactly like
@@ -1791,6 +1793,18 @@ impl KeychainStore {
     pub fn new() -> Result<Self, String> {
         if std::env::var("HARMONY_DISABLE_KEYCHAIN").is_ok_and(|v| !v.is_empty() && v != "0") {
             return Err("OS keychain disabled via HARMONY_DISABLE_KEYCHAIN (ZEB-428)".to_string());
+        }
+        // ZEB-446: named profiles never touch the OS keychain — the
+        // service/account names below are machine-global, so two profiles
+        // on one machine would read/clobber EACH OTHER'S vault (the
+        // ZEB-428 class, in production). Named profiles use the
+        // encrypted-file vault under their own identity dir instead.
+        if let Some(p) = crate::profile::active_profile() {
+            return Err(format!(
+                "OS keychain refused for named profile {p:?} (ZEB-446): keychain names are \
+                 machine-global; this profile uses the encrypted-file vault — set \
+                 HARMONY_PASSPHRASE or HARMONY_PASSPHRASE_FILE"
+            ));
         }
         #[cfg(any(test, feature = "test-fixtures"))]
         {
@@ -1970,40 +1984,54 @@ impl EncryptedFileStore {
     }
 
     /// Construct from the `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`
-    /// environment variables.
-    ///
-    /// Returns:
-    ///   - `Ok(None)` if neither env var is set
-    ///   - `Ok(Some(store))` if a non-empty passphrase resolves
-    ///   - `Err(...)` if either var is set but malformed (empty, file unreadable,
-    ///     resolves to empty)
-    ///
-    /// Precedence: `HARMONY_PASSPHRASE` (direct) wins over `HARMONY_PASSPHRASE_FILE`
-    /// when both are set; a warning is logged.
+    /// environment variables — see [`resolve_passphrase_env`] for the
+    /// resolution rules.
     pub(crate) fn from_env(path: PathBuf) -> Result<Option<Self>, String> {
-        let direct = std::env::var("HARMONY_PASSPHRASE").ok();
-        let file_path = std::env::var("HARMONY_PASSPHRASE_FILE").ok();
-
-        if direct.is_some() && file_path.is_some() {
-            tracing::warn!(
-                "both HARMONY_PASSPHRASE and HARMONY_PASSPHRASE_FILE are set; HARMONY_PASSPHRASE takes precedence"
-            );
-        }
-
-        let passphrase_str = if let Some(s) = direct {
-            if s.is_empty() {
-                return Err("HARMONY_PASSPHRASE is set to an empty string".to_string());
-            }
-            s
-        } else if let Some(file_path) = file_path {
-            parse_passphrase_file(Path::new(&file_path))
-                .map_err(|e| format!("HARMONY_PASSPHRASE_FILE={file_path} {e}"))?
-        } else {
-            return Ok(None);
-        };
-
-        Ok(Some(Self::new(path, SecretString::from(passphrase_str))))
+        Ok(resolve_passphrase_env()?.map(|passphrase| Self::new(path, passphrase)))
     }
+}
+
+/// Resolve the vault passphrase from `HARMONY_PASSPHRASE` /
+/// `HARMONY_PASSPHRASE_FILE`.
+///
+/// The single source of truth shared by [`EncryptedFileStore::from_env`]
+/// (the consumer) and [`passphrase_env_configured`] (the ZEB-446 fail-fast
+/// gate), so the gate can never pass a configuration the vault will later
+/// reject — or refuse one it would accept (PR #245 round 4, Cursor Bugbot
+/// and Greptile: the two used to diverge on whitespace-only direct values
+/// and on trimming of the file path).
+///
+/// Returns:
+///   - `Ok(None)` if neither env var is set
+///   - `Ok(Some(passphrase))` if a non-empty passphrase resolves
+///   - `Err(...)` if either var is set but malformed (empty, file unreadable,
+///     resolves to empty)
+///
+/// Precedence: `HARMONY_PASSPHRASE` (direct) wins over `HARMONY_PASSPHRASE_FILE`
+/// when both are set; a warning is logged.
+fn resolve_passphrase_env() -> Result<Option<SecretString>, String> {
+    let direct = std::env::var("HARMONY_PASSPHRASE").ok();
+    let file_path = std::env::var("HARMONY_PASSPHRASE_FILE").ok();
+
+    if direct.is_some() && file_path.is_some() {
+        tracing::warn!(
+            "both HARMONY_PASSPHRASE and HARMONY_PASSPHRASE_FILE are set; HARMONY_PASSPHRASE takes precedence"
+        );
+    }
+
+    let passphrase_str = if let Some(s) = direct {
+        if s.is_empty() {
+            return Err("HARMONY_PASSPHRASE is set to an empty string".to_string());
+        }
+        s
+    } else if let Some(file_path) = file_path {
+        parse_passphrase_file(Path::new(&file_path))
+            .map_err(|e| format!("HARMONY_PASSPHRASE_FILE={file_path} {e}"))?
+    } else {
+        return Ok(None);
+    };
+
+    Ok(Some(SecretString::from(passphrase_str)))
 }
 
 impl KeyStore for EncryptedFileStore {
@@ -2047,7 +2075,10 @@ impl KeyStore for EncryptedFileStore {
 
 // ── Public API (unchanged shape) ────────────────────────────────────────
 
-/// Resolve the identity file path. Uses `~/.harmony/identity.key` by default.
+/// Resolve the identity file path. `~/.harmony/identity.key` on the
+/// default profile; `~/.harmony/profiles/<p>/identity.key` on a named
+/// profile (ZEB-446 — named profiles get their own identity tree, which
+/// also scopes the ZEB-449 encrypted-file vault and `iroh_sk.enc`).
 pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(p) = override_path {
         return Ok(p.to_path_buf());
@@ -2057,7 +2088,35 @@ pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
         .map_err(|_| {
             "Cannot determine identity file path: neither $HOME nor $USERPROFILE is set".to_string()
         })?;
-    Ok(PathBuf::from(home).join(".harmony").join("identity.key"))
+    Ok(identity_path_in(
+        Path::new(&home),
+        crate::profile::active_profile(),
+    ))
+}
+
+/// Pure path join for [`resolve_path`] — unit-testable without env state.
+fn identity_path_in(home: &Path, profile: Option<&str>) -> PathBuf {
+    let root = home.join(".harmony");
+    let root = match profile {
+        Some(p) => root.join("profiles").join(p),
+        None => root,
+    };
+    root.join("identity.key")
+}
+
+/// ZEB-446: true when the encrypted-file vault has a passphrase source.
+/// Named profiles are file-vault-only, so entrypoints fail fast on this
+/// instead of letting the first vault access fail later (the ZEB-450
+/// silent-degradation class).
+///
+/// Defined as "[`EncryptedFileStore::from_env`] would yield a store":
+/// the gate and the consumer share [`resolve_passphrase_env`], so they
+/// cannot drift apart (PR #245 round 4, Cursor Bugbot + Greptile). A
+/// set-but-malformed value (empty string, unreadable or blank file)
+/// counts as NOT configured — boot fails here, at the gate, rather than
+/// at the first vault access.
+pub fn passphrase_env_configured() -> bool {
+    matches!(resolve_passphrase_env(), Ok(Some(_)))
 }
 
 /// Internal resolution chain — accepts injected stores for testability.
@@ -2601,6 +2660,39 @@ pub mod test_only {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn identity_path_in_maps_default_and_named_profiles() {
+        use std::path::Path;
+        let home = Path::new("/home/u");
+        assert_eq!(
+            identity_path_in(home, None),
+            Path::new("/home/u/.harmony/identity.key")
+        );
+        assert_eq!(
+            identity_path_in(home, Some("coord")),
+            Path::new("/home/u/.harmony/profiles/coord/identity.key")
+        );
+    }
+
+    /// Pins the ZEB-446 constructor-gate condition itself, so it must call
+    /// the real constructor — the same pattern as tests/keychain_isolation.rs
+    /// (the canonical ZEB-428 gate-pinning test). No host-keychain access is
+    /// possible: the named-profile refusal returns before keyring::Entry is
+    /// ever constructed. nextest (the supported runner, CLAUDE.md) is
+    /// process-per-test, so the OnceLock set here cannot leak.
+    #[test]
+    fn keychain_constructor_refuses_on_named_profile() {
+        crate::profile::set_active_profile(Some("gatetest")).expect("activate");
+        let err = match KeychainStore::new() {
+            Err(e) => e,
+            Ok(_) => panic!("named profile must refuse the OS keychain"),
+        };
+        assert!(
+            err.contains("ZEB-446"),
+            "named-profile refusal must cite ZEB-446 (got the test-build gate instead?): {err}"
+        );
+    }
 
     #[test]
     fn file_store_round_trip() {
@@ -3223,6 +3315,57 @@ mod tests {
             let path = dir.path().join("identity.enc");
             let err = EncryptedFileStore::from_env(path).unwrap_err();
             assert!(err.contains("could not be read"), "got: {err}");
+            clear_env();
+        }
+
+        /// Regression for PR #245 round 4 (Cursor Bugbot + Greptile): the
+        /// ZEB-446 fail-fast gate and the vault consumer must agree on
+        /// every env configuration. The old hand-rolled gate diverged on a
+        /// whitespace-only HARMONY_PASSPHRASE (gate fell through to the
+        /// FILE check; from_env used the whitespace as the passphrase) and
+        /// on a file path with stray whitespace (gate trimmed it; from_env
+        /// did not). Both now share resolve_passphrase_env, and this matrix
+        /// pins the equivalence.
+        #[test]
+        #[serial]
+        fn gate_agrees_with_from_env_on_every_configuration() {
+            let dir = tempfile::tempdir().unwrap();
+            let pass_file = dir.path().join("pass.txt");
+            std::fs::write(&pass_file, b"from_file\n").unwrap();
+            let good_path = pass_file.to_str().unwrap().to_string();
+            let padded_path = format!("{good_path} "); // Greptile: trailing space
+
+            let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+                ("nothing set", None, None),
+                ("direct set", Some("foo"), None),
+                ("direct empty", Some(""), None),
+                ("direct empty, file good", Some(""), Some(&good_path)),
+                // Cursor Bugbot round 4: direct whitespace must mean the
+                // SAME thing to the gate as to the vault (it is a valid,
+                // if odd, passphrase — from_env uses it verbatim).
+                ("direct whitespace, file good", Some(" "), Some(&good_path)),
+                ("file good", None, Some(&good_path)),
+                ("file path padded", None, Some(&padded_path)),
+                ("file missing", None, Some("/nonexistent/passphrase/file")),
+            ];
+
+            for (label, direct, file) in cases {
+                clear_env();
+                if let Some(v) = direct {
+                    std::env::set_var(HARMONY_PASSPHRASE, v);
+                }
+                if let Some(v) = file {
+                    std::env::set_var(HARMONY_PASSPHRASE_FILE, v);
+                }
+                let store_path = dir.path().join("identity.enc");
+                let consumer_has_store =
+                    matches!(EncryptedFileStore::from_env(store_path), Ok(Some(_)));
+                assert_eq!(
+                    passphrase_env_configured(),
+                    consumer_has_store,
+                    "gate/consumer divergence on case: {label}"
+                );
+            }
             clear_env();
         }
     }

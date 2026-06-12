@@ -13,25 +13,24 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
-/// Bundle identifier from `tauri.conf.json` (`"identifier"`). Tauri v2 keys
-/// `app_data_dir()` on this, so `dirs::data_dir()/<APP_IDENTIFIER>` reproduces
-/// the same directory without a built `App` handle. Keep in sync with
-/// `tauri.conf.json`.
-const APP_IDENTIFIER: &str = "net.zeblith.harmony";
-
-/// Pure path join — `<base>/net.zeblith.harmony/logs`. Split out from `log_dir`
-/// so it can be unit-tested deterministically without depending on the host's
-/// data dir.
-fn log_dir_in(base: &Path) -> PathBuf {
-    base.join(APP_IDENTIFIER).join("logs")
+/// Pure path join — the profile-aware app-data dir + `/logs`. Split out
+/// from `log_dir` so it can be unit-tested deterministically without
+/// depending on the host's data dir. ZEB-446: delegates to the same
+/// `app_data_dir_in` join `resolve_app_data_dir` uses, so logs always
+/// live inside the active profile's app-data tree.
+fn log_dir_in(base: &Path, profile: Option<&str>) -> PathBuf {
+    crate::app_data_dir_in(base, profile).join("logs")
 }
 
 /// Directory the rolling log files live in:
-/// `dirs::data_dir()/net.zeblith.harmony/logs`, byte-identical to Tauri v2's
-/// `app_data_dir()/logs` on macOS / Windows / Linux. `None` when the platform
-/// data dir can't be resolved.
+/// `dirs::data_dir()/net.zeblith.harmony[/profiles/<p>]/logs`, byte-identical
+/// to Tauri v2's `app_data_dir()/logs` on the default profile. `None` when
+/// the platform data dir can't be resolved.
 fn log_dir() -> Option<PathBuf> {
-    Some(log_dir_in(&dirs::data_dir()?))
+    Some(log_dir_in(
+        &dirs::data_dir()?,
+        crate::profile::active_profile(),
+    ))
 }
 
 /// Install the global tracing subscriber for the desktop GUI. Idempotent: a
@@ -115,11 +114,18 @@ mod tests {
     #[test]
     fn log_dir_in_is_base_then_identifier_then_logs() {
         // Deterministic: no dependency on the host data dir. Pins the structure
-        // `<base>/net.zeblith.harmony/logs` (and the literal identifier).
+        // `<base>/net.zeblith.harmony[/profiles/<p>]/logs`.
         let base = Path::new("base");
         assert_eq!(
-            log_dir_in(base),
+            log_dir_in(base, None),
             base.join("net.zeblith.harmony").join("logs")
+        );
+        assert_eq!(
+            log_dir_in(base, Some("coord")),
+            base.join("net.zeblith.harmony")
+                .join("profiles")
+                .join("coord")
+                .join("logs")
         );
     }
 

@@ -195,6 +195,7 @@ pub mod pkarr_identity_publisher;
 pub mod pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
 pub mod pkarr_settings;
+pub mod profile;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;
 pub mod profile_page_doc;
@@ -271,10 +272,21 @@ impl<R: tauri::Runtime> crate::iroh_friend_acceptor::FriendEventEmit for tauri::
 /// resolve the IDENTICAL path or GUI and headless would split-brain the
 /// profile.
 /// Public for the serve path and the api_server integration test (ZEB-445).
+/// ZEB-446: profile-aware — named profiles nest under profiles/<name>.
 pub fn resolve_app_data_dir() -> Result<std::path::PathBuf, String> {
-    dirs::data_dir()
-        .map(|d| d.join("net.zeblith.harmony"))
-        .ok_or_else(|| "cannot resolve platform data dir".to_string())
+    let base = dirs::data_dir().ok_or_else(|| "cannot resolve platform data dir".to_string())?;
+    Ok(app_data_dir_in(&base, crate::profile::active_profile()))
+}
+
+/// Pure join for [`resolve_app_data_dir`] (and app_tracing's log dir):
+/// `<base>/net.zeblith.harmony[/profiles/<p>]`. ZEB-446: a named profile
+/// nests under `profiles/` so the default layout is untouched.
+pub(crate) fn app_data_dir_in(base: &std::path::Path, profile: Option<&str>) -> std::path::PathBuf {
+    let root = base.join("net.zeblith.harmony");
+    match profile {
+        Some(p) => root.join("profiles").join(p),
+        None => root,
+    }
 }
 
 /// ZEB-445: sink-trait adapter so `Arc<dyn NodeEventSink>` satisfies the
@@ -15422,6 +15434,23 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
 /// stop node → best-effort removal of the discovery files.
 pub fn serve_cli(api_port: Option<u16>) -> i32 {
     crate::app_tracing::init_serve_tracing();
+
+    // ZEB-446: fail fast on a named profile with no vault passphrase —
+    // named profiles are file-vault-only (OS keychain refused), so the
+    // node would otherwise boot into ZEB-450-style silent degradation at
+    // the first vault access.
+    if crate::profile::active_profile().is_some() && !crate::identity::passphrase_env_configured() {
+        eprintln!(
+            "serve: named profile requires HARMONY_PASSPHRASE or a readable \
+             HARMONY_PASSPHRASE_FILE (named profiles use the encrypted-file vault, \
+             not the OS keychain)"
+        );
+        // Exit code 1 = serve's uniform startup-failure code (lock taken,
+        // data dir, node start). The GUI path exits 2 for the same
+        // condition — 2 is main.rs's pre-launch config-error code (invalid
+        // profile name, refused argv fall-through).
+        return 1;
+    }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -42278,6 +42307,25 @@ async fn set_butler_pin(
 }
 
 pub fn run() {
+    // ZEB-446: GUI launches honor HARMONY_PROFILE (a --profile flag arrives
+    // via main.rs, which already activated — this call is then a no-op).
+    // Validate eagerly and exit loudly; and refuse a named profile with no
+    // vault passphrase, because named profiles are file-vault-only and
+    // booting on would hit the ZEB-450 silent-degradation class at the
+    // first vault access. Named-profile GUI launches are terminal-driven
+    // by definition, so stderr + exit is the honest failure surface.
+    if let Err(e) = crate::profile::set_active_profile(None) {
+        eprintln!("harmony-app: {e}");
+        std::process::exit(2);
+    }
+    if crate::profile::active_profile().is_some() && !crate::identity::passphrase_env_configured() {
+        eprintln!(
+            "harmony-app: named profile requires HARMONY_PASSPHRASE or a readable \
+             HARMONY_PASSPHRASE_FILE (named profiles use the encrypted-file vault, \
+             not the OS keychain)"
+        );
+        std::process::exit(2);
+    }
     // ZEB-379: install the tracing subscriber before anything else so RUST_LOG
     // works in the desktop app and early-boot spans land in the log file.
     app_tracing::init_app_tracing();

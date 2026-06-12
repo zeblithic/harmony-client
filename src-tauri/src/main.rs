@@ -6,6 +6,13 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "harmony-app", version)]
 struct Cli {
+    /// Named storage profile (ZEB-446): scopes ~/.harmony and the app-data
+    /// dir to profiles/<NAME> so a second instance (e.g. the pinned headless
+    /// coordination node) can run beside the default GUI. Falls back to
+    /// HARMONY_PROFILE; omit for the default profile.
+    #[arg(long, global = true, value_name = "NAME")]
+    profile: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -131,121 +138,131 @@ fn main() {
     // misbehaving desktop integration can't keep the app from starting. CLI
     // typos still print the parse error to stderr before falling through.
     match Cli::try_parse() {
-        Ok(cli) => match cli.command {
-            Some(Command::RotatePassphrase {
-                new_passphrase_file,
-            }) => {
-                init_tracing();
-                match harmony_app::rotate_passphrase_cli(&new_passphrase_file) {
-                    Ok(()) => {
-                        println!("Passphrase rotated. Update your systemd unit / Docker secret to point at the new file.");
-                        std::process::exit(0);
-                    }
-                    Err(e) => {
-                        eprintln!("Rotation failed: {e}");
-                        std::process::exit(1);
+        Ok(cli) => {
+            // ZEB-446: activate the storage profile BEFORE tracing init or
+            // any path resolution (log dirs and both storage roots depend
+            // on it). Invalid names are a hard startup error — silently
+            // landing in the default profile's data is the worst outcome.
+            if let Err(e) = harmony_app::profile::set_active_profile(cli.profile.as_deref()) {
+                eprintln!("harmony-app: {e}");
+                std::process::exit(2);
+            }
+            match cli.command {
+                Some(Command::RotatePassphrase {
+                    new_passphrase_file,
+                }) => {
+                    init_tracing();
+                    match harmony_app::rotate_passphrase_cli(&new_passphrase_file) {
+                        Ok(()) => {
+                            println!("Passphrase rotated. Update your systemd unit / Docker secret to point at the new file.");
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            eprintln!("Rotation failed: {e}");
+                            std::process::exit(1);
+                        }
                     }
                 }
-            }
-            Some(Command::Export { format }) => {
-                init_tracing();
-                let plaintext_path = match harmony_app::identity::resolve_path(None) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                };
-                let result = match format {
-                    ExportFormat::Mnemonic => {
-                        harmony_app::recovery_cli::export_mnemonic_cli(&plaintext_path)
-                    }
-                    ExportFormat::OwnerMnemonic => {
-                        harmony_app::recovery_cli::export_owner_mnemonic_cli(&plaintext_path)
-                    }
-                    ExportFormat::RecoveryFile {
-                        out,
-                        comment,
-                        no_state,
-                    } => harmony_app::recovery_cli::export_recovery_file_cli(
-                        &plaintext_path,
-                        &out,
-                        comment.as_deref(),
-                        /*include_state=*/ !no_state,
-                        /*force=*/ false,
-                    ),
-                };
-                match result {
-                    Ok(()) => std::process::exit(0),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
+                Some(Command::Export { format }) => {
+                    init_tracing();
+                    let plaintext_path = match harmony_app::identity::resolve_path(None) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let result = match format {
+                        ExportFormat::Mnemonic => {
+                            harmony_app::recovery_cli::export_mnemonic_cli(&plaintext_path)
+                        }
+                        ExportFormat::OwnerMnemonic => {
+                            harmony_app::recovery_cli::export_owner_mnemonic_cli(&plaintext_path)
+                        }
+                        ExportFormat::RecoveryFile {
+                            out,
+                            comment,
+                            no_state,
+                        } => harmony_app::recovery_cli::export_recovery_file_cli(
+                            &plaintext_path,
+                            &out,
+                            comment.as_deref(),
+                            /*include_state=*/ !no_state,
+                            /*force=*/ false,
+                        ),
+                    };
+                    match result {
+                        Ok(()) => std::process::exit(0),
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(1);
+                        }
                     }
                 }
-            }
-            Some(Command::Restore {
-                format,
-                force,
-                ignore_state,
-            }) => {
-                init_tracing();
-                let plaintext_path = match harmony_app::identity::resolve_path(None) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                };
-                let result = match format {
-                    RestoreFormat::Mnemonic { mnemonic_file } => {
-                        harmony_app::recovery_cli::restore_mnemonic_cli(
-                            &plaintext_path,
-                            &mnemonic_file,
-                            force,
-                        )
-                    }
-                    RestoreFormat::OwnerMnemonic { mnemonic_file } => {
-                        harmony_app::recovery_cli::restore_owner_mnemonic_cli(
-                            &plaintext_path,
-                            &mnemonic_file,
-                            force,
-                        )
-                    }
-                    RestoreFormat::RecoveryFile { in_path } => {
-                        harmony_app::recovery_cli::restore_recovery_file_cli(
-                            &plaintext_path,
-                            &in_path,
-                            force,
-                            ignore_state,
-                        )
-                    }
-                };
-                match result {
-                    Ok(()) => std::process::exit(0),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
+                Some(Command::Restore {
+                    format,
+                    force,
+                    ignore_state,
+                }) => {
+                    init_tracing();
+                    let plaintext_path = match harmony_app::identity::resolve_path(None) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let result = match format {
+                        RestoreFormat::Mnemonic { mnemonic_file } => {
+                            harmony_app::recovery_cli::restore_mnemonic_cli(
+                                &plaintext_path,
+                                &mnemonic_file,
+                                force,
+                            )
+                        }
+                        RestoreFormat::OwnerMnemonic { mnemonic_file } => {
+                            harmony_app::recovery_cli::restore_owner_mnemonic_cli(
+                                &plaintext_path,
+                                &mnemonic_file,
+                                force,
+                            )
+                        }
+                        RestoreFormat::RecoveryFile { in_path } => {
+                            harmony_app::recovery_cli::restore_recovery_file_cli(
+                                &plaintext_path,
+                                &in_path,
+                                force,
+                                ignore_state,
+                            )
+                        }
+                    };
+                    match result {
+                        Ok(()) => std::process::exit(0),
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(1);
+                        }
                     }
                 }
+                Some(Command::Serve { api_port }) => {
+                    // No init_tracing() here: serve_cli installs its own
+                    // subscriber (stderr console + rolling file, ZEB-445).
+                    std::process::exit(harmony_app::serve_cli(api_port));
+                }
+                Some(Command::Api {
+                    command,
+                    args,
+                    events,
+                }) => {
+                    init_tracing();
+                    std::process::exit(harmony_app::api_cli(command, args, events));
+                }
+                None => {
+                    // Default path — launch the Tauri runtime.
+                    harmony_app::run();
+                }
             }
-            Some(Command::Serve { api_port }) => {
-                // No init_tracing() here: serve_cli installs its own
-                // subscriber (stderr console + rolling file, ZEB-445).
-                std::process::exit(harmony_app::serve_cli(api_port));
-            }
-            Some(Command::Api {
-                command,
-                args,
-                events,
-            }) => {
-                init_tracing();
-                std::process::exit(harmony_app::api_cli(command, args, events));
-            }
-            None => {
-                // Default path — launch the Tauri runtime.
-                harmony_app::run();
-            }
-        },
+        }
         Err(err) => {
             use clap::error::ErrorKind;
             // --help / --version: clap-default behavior (print + exit 0).
@@ -254,6 +271,17 @@ fn main() {
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
             ) {
                 err.exit();
+            }
+            // ZEB-446: an argv set containing an explicit --profile is an
+            // operator-typed CLI invocation, not OS-injected launch argv —
+            // falling through to the GUI here could put the session on the
+            // wrong profile's data. Exit loudly instead (PR #245 round 1).
+            if std::env::args().any(|a| a == "--profile" || a.starts_with("--profile=")) {
+                eprintln!(
+                    "harmony-app: argv parsing failed ({err}); refusing GUI fall-through \
+                     because --profile was given"
+                );
+                std::process::exit(2);
             }
             // All other parse failures: leave a stderr breadcrumb and launch
             // the GUI. The breadcrumb means a CLI typo isn't fully silent

@@ -191,9 +191,21 @@ struct ReadDmThreadArgs {
     before_hlc: Option<u64>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DisplayNameArgs {
+    display_name: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerSessionIdArgs {
+    peer_session_id: String,
+}
+
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (29 commands). Every handler calls
+/// Build the curated v1 RPC surface (35 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
@@ -398,6 +410,52 @@ pub fn build_registry() -> RpcRegistry {
         |state, _sink, _a| async move { crate::network_health_run_self_test_impl(state).await }
     );
 
+    // Pairing (ZEB-446): enroll a second local instance — e.g. the pinned
+    // headless coordination node — into the owner's fleet without a GUI.
+    // SAS verification flows through get_pairing_state polling on both
+    // sides; the joiner side runs on the headless instance.
+    rpc!(
+        m,
+        "start_inviter_pairing",
+        DisplayNameArgs,
+        |state, _sink, a| async move {
+            crate::pairing_commands::start_inviter_pairing_inner(state, a.display_name).await
+        }
+    );
+    rpc!(
+        m,
+        "start_joiner_pairing",
+        DisplayNameArgs,
+        |state, _sink, a| async move {
+            crate::pairing_commands::start_joiner_pairing_inner(state, a.display_name).await
+        }
+    );
+    rpc!(
+        m,
+        "select_pairing_peer",
+        PeerSessionIdArgs,
+        |state, _sink, a| async move {
+            crate::pairing_commands::select_pairing_peer_inner(state, a.peer_session_id).await
+        }
+    );
+    rpc!(
+        m,
+        "confirm_pairing_sas",
+        EmptyArgs,
+        |state, _sink, _a| async move {
+            crate::pairing_commands::confirm_pairing_sas_inner(state).await
+        }
+    );
+    rpc!(m, "cancel_pairing", EmptyArgs, |state, _sink, _a| {
+        async move { crate::pairing_commands::cancel_pairing_inner(state).await }
+    });
+    rpc!(
+        m,
+        "get_pairing_state",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::pairing_commands::get_pairing_state_inner(state).await }
+    );
+
     RpcRegistry { handlers: m }
 }
 
@@ -499,36 +557,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pairing_commands_dispatch_with_ipc_parity_pre_node() {
+        let reg = build_registry();
+        // Pre-node, every pairing command must fail with the SAME error string
+        // the Tauri IPC layer produces — proving the seam is shared, not forked.
+        let err = reg
+            .dispatch(
+                "get_pairing_state",
+                test_state(),
+                test_sink(),
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            RpcError::Command(msg) => {
+                assert_eq!(msg, "pairing not initialized — start node first")
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+        // Args parse: camelCase displayName reaches the seam (the seam then
+        // fails pre-node, which is fine — BadArgs would mean parsing broke).
+        let err = reg
+            .dispatch(
+                "start_joiner_pairing",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "displayName": "coord-device" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::Command(_)),
+            "displayName must parse (got {err:?})"
+        );
+    }
+
+    #[tokio::test]
     async fn registry_has_exactly_the_curated_v1_surface() {
         let reg = build_registry();
-        let names = reg.command_names();
-        // Curated v1 surface: node lifecycle (start_node, stop_node) +
-        // identity (get_owner_state, mint_owner_identity) +
-        // communities (list_owner_communities,
-        // create_community, list_community_members, generate_invite,
-        // redeem_invite, join_open_community, leave_community) + channels
-        // (create_channel, list_channels, list_channel_messages,
-        // post_channel_message) + friends (list_friends, generate_friend_token,
-        // redeem_friend_token, add_friend_by_key, list_pending_friend_requests,
-        // accept_friend_request, decline_friend_request) + spaces/DMs
-        // (add_space, send_dm, read_dm_thread) + connectivity
-        // (connectivity_get_my_reachability_record,
-        // connectivity_list_peer_reachability) + network health
-        // (network_health_snapshot, network_health_run_self_test) = 29.
-        assert_eq!(names.len(), 29, "curated v1 surface drifted: {names:?}");
-        for must in [
+        let mut names = reg.command_names();
+        names.sort_unstable();
+        // The complete curated v1 surface — any addition, rename, or
+        // removal must update this list deliberately (PR #245 round 3,
+        // CodeRabbit: a count + spot checks let a swap inside the set
+        // slip through).
+        let mut expected = vec![
+            // node lifecycle
             "start_node",
             "stop_node",
+            // identity
             "get_owner_state",
             "mint_owner_identity",
+            // communities
+            "list_owner_communities",
             "create_community",
+            "list_community_members",
+            "generate_invite",
             "redeem_invite",
+            "join_open_community",
+            "leave_community",
+            // channels
+            "create_channel",
+            "list_channels",
+            "list_channel_messages",
             "post_channel_message",
+            // friends
+            "list_friends",
+            "generate_friend_token",
+            "redeem_friend_token",
+            "add_friend_by_key",
+            "list_pending_friend_requests",
+            "accept_friend_request",
+            "decline_friend_request",
+            // spaces / DMs
+            "add_space",
             "send_dm",
             "read_dm_thread",
+            // connectivity
+            "connectivity_get_my_reachability_record",
+            "connectivity_list_peer_reachability",
+            // network health
+            "network_health_snapshot",
             "network_health_run_self_test",
-        ] {
-            assert!(names.contains(&must), "missing command: {must}");
-        }
+            // pairing (ZEB-446)
+            "start_inviter_pairing",
+            "start_joiner_pairing",
+            "select_pairing_peer",
+            "confirm_pairing_sas",
+            "cancel_pairing",
+            "get_pairing_state",
+        ];
+        expected.sort_unstable();
+        assert_eq!(names, expected, "curated v1 surface drifted");
     }
 }
