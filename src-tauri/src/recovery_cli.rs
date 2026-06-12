@@ -943,43 +943,80 @@ pub fn restore_owner_mnemonic_with_keychain(
     force: bool,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
-    // Read + decode the mnemonic. Wrap in Zeroizing so neither the file text
-    // nor the normalized phrase lingers in RAM.
+    // Read + decode the mnemonic. `raw` is the only heap copy of the secret
+    // words; `words` borrows slices of it (no per-word `String` allocations to
+    // leave un-wiped), and `phrase`/`seed` are `Zeroizing`. Everything is wiped
+    // on drop.
     let raw = std::fs::read_to_string(mnemonic_file)
         .map_err(|e| format!("failed to read {}: {e}", mnemonic_file.display()))?;
     let raw = Zeroizing::new(raw);
-    let words: Vec<String> = raw.split_whitespace().map(String::from).collect();
+    let words: Vec<&str> = raw.split_whitespace().collect();
     if words.len() != 24 {
         return Err(format!("expected 24 BIP39 words, got {}", words.len()));
     }
     let phrase = Zeroizing::new(words.join(" "));
     let artifact = RecoveryArtifact::from_mnemonic(&phrase).map_err(|e| e.to_string())?;
     let derived_owner_id = artifact.master_pubkey_bundle().identity_hash();
+    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
+    drop(artifact);
 
-    // Overwrite guard (checked BEFORE any disk write). The `.cbor` owner_id is
-    // read without touching the keychain. Mirrors the export-side invariant and
-    // `pairing/cert.rs::sign_enrollment_for_joiner`: never let two backends
-    // disagree about which identity owns this device.
-    if let Some(existing) = crate::owner_state::read_persisted_owner_id(identity_dir)? {
-        if !force {
-            return Err(format!(
-                "an owner identity ({}) already exists on this device; pass --force to overwrite it",
-                hex::encode(existing)
-            ));
+    // Serialize the entire check-and-write window under the process-wide
+    // owner-state write mutex — the same lock every other owner-state writer
+    // (`mint_owner_identity`, the ZEB-342 liveness refresh, pairing-persist)
+    // holds. Without it, a concurrent writer in the same process (e.g. a future
+    // headless daemon exposing this path, ZEB-445/452) could pass the overwrite
+    // guard and then race on `owner_state.cbor` / the key slots. Recover from
+    // poisoning so a panic in one writer doesn't brick future ones (mirrors
+    // `mint_owner_identity_inner`).
+    let _owner_write_guard = crate::owner_commands::OWNER_STATE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    // Overwrite guard (under the lock, BEFORE any disk write). The `.cbor`
+    // owner_id is read without touching the keychain. Mirrors the export-side
+    // invariant and `pairing/cert.rs::sign_enrollment_for_joiner`: never let two
+    // backends disagree about which identity owns this device.
+    match crate::owner_state::read_persisted_owner_id(identity_dir) {
+        Ok(None) => { /* empty install — nothing to overwrite */ }
+        Ok(Some(existing)) => {
+            if !force {
+                return Err(format!(
+                    "an owner identity ({}) already exists on this device; pass --force to overwrite it",
+                    hex::encode(existing)
+                ));
+            }
+            if existing != derived_owner_id {
+                return Err(format!(
+                    "this mnemonic derives owner-id {} but this device already holds owner-id {} — \
+                     refusing to overwrite a different identity even with --force",
+                    hex::encode(derived_owner_id),
+                    hex::encode(existing),
+                ));
+            }
         }
-        if existing != derived_owner_id {
-            return Err(format!(
-                "this mnemonic derives owner-id {} but this device already holds owner-id {} — \
-                 refusing to overwrite a different identity even with --force",
-                hex::encode(derived_owner_id),
-                hex::encode(existing),
-            ));
+        Err(e) => {
+            // `owner_state.cbor` exists but is unreadable/corrupt — we can't
+            // compare owner-ids. Without --force, surface an actionable error
+            // rather than wedging recovery. With --force the operator has
+            // explicitly opted into a destructive overwrite, so proceed (the
+            // mismatch check is necessarily skipped — there's nothing readable
+            // to compare against). Mirrors the identity-seed restore, which
+            // does not let an unprobeable existing state block a forced restore.
+            if !force {
+                return Err(format!(
+                    "an owner_state.cbor marker exists on this device but could not be read \
+                     ({e}); pass --force to overwrite it with this mnemonic"
+                ));
+            }
+            tracing::warn!(
+                error = %e,
+                "restore owner-mnemonic --force: overwriting an unreadable owner_state.cbor \
+                 (owner-id mismatch check skipped)"
+            );
         }
     }
 
     // Re-mint from the recovered seed: same owner_id, fresh device key.
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
-    drop(artifact);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1685,6 +1722,56 @@ mod tests {
             after.device_signing_key.to_bytes(),
             old_device,
             "re-adoption mints a fresh device key"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_owner_mnemonic_corrupt_marker_blocks_without_force_then_force_overwrites() {
+        // A corrupt owner_state.cbor must not WEDGE recovery: without --force it
+        // surfaces an actionable error (not a bare parse failure); with --force
+        // the operator's explicit destructive intent overwrites it. (Qodo #1)
+        std::env::set_var("HARMONY_PASSPHRASE", "owner-restore-corrupt");
+        let dir = tempfile::tempdir().unwrap();
+
+        // A valid paper backup minted elsewhere.
+        let src = tempfile::tempdir().unwrap();
+        let (phrase, owner_id) = plant_owner_and_export_words(src.path(), 1_700_000_040);
+        let mnemonic_file = dir.path().join("owner.txt");
+        std::fs::write(&mnemonic_file, &phrase).unwrap();
+
+        // Plant a CORRUPT owner_state.cbor marker in the destination.
+        std::fs::write(dir.path().join("owner_state.cbor"), b"not-cbor-bytes").unwrap();
+
+        // Without --force: actionable error pointing at --force, no clobber.
+        let err = restore_owner_mnemonic_with_keychain(
+            dir.path(),
+            &mnemonic_file,
+            /*force=*/ false,
+            None,
+        )
+        .expect_err("a corrupt marker must block restore without --force");
+        assert!(
+            err.contains("--force") && err.contains("could not be read"),
+            "error must be actionable about the unreadable marker; got: {err}"
+        );
+
+        // With --force: overwrite the corrupt marker and adopt the mnemonic's owner.
+        restore_owner_mnemonic_with_keychain(
+            dir.path(),
+            &mnemonic_file,
+            /*force=*/ true,
+            None,
+        )
+        .expect("--force must overwrite a corrupt marker");
+        let restored = crate::owner_state::load_owner_state(dir.path(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.state.owner_id, owner_id,
+            "forced restore over a corrupt marker must adopt the mnemonic's owner"
         );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
