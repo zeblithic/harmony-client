@@ -8119,6 +8119,16 @@ async fn send_dm(
     content: Vec<u8>,
     mime_type: String,
 ) -> Result<SendDmResult, String> {
+    send_dm_impl(state_lock.inner(), space_id, content, mime_type).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn send_dm_impl(
+    state: &std::sync::Mutex<NodeState>,
+    space_id: String,
+    content: Vec<u8>,
+    mime_type: String,
+) -> Result<SendDmResult, String> {
     let space_id_hex = space_id;
     // Snapshot all handles under the sync mutex; release it before any await.
     // (Per ZEB-225 spec: NodeState sync-mutex must not be held across `.await`.)
@@ -8133,7 +8143,7 @@ async fn send_dm(
         dm_send_inflight,
         dm_send_stopping,
     ) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -8421,12 +8431,22 @@ async fn read_dm_thread(
     limit: usize,
     before_hlc: Option<u64>,
 ) -> Result<Vec<DmThreadMessage>, String> {
+    read_dm_thread_impl(state_lock.inner(), space_id, limit, before_hlc).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn read_dm_thread_impl(
+    state: &std::sync::Mutex<NodeState>,
+    space_id: String,
+    limit: usize,
+    before_hlc: Option<u64>,
+) -> Result<Vec<DmThreadMessage>, String> {
     let space_id_hex = space_id;
     // Snapshot handles under the sync mutex; release before any .await.
     // (Same pattern as send_dm — NodeState's sync mutex must not span
     // .await boundaries.)
     let (crdt_state, cas, self_owner) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -9070,6 +9090,16 @@ async fn add_space(
     name: String,
     members: Option<Vec<String>>,
 ) -> Result<String, String> {
+    add_space_impl(state_lock.inner(), kind, name, members).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn add_space_impl(
+    state: &std::sync::Mutex<NodeState>,
+    kind: String,
+    name: String,
+    members: Option<Vec<String>>,
+) -> Result<String, String> {
     use crate::owner_state_types::{OwnerAddr, SpaceKind};
 
     // Parse the kind string. Accept the same wire codes the SpaceKind
@@ -9125,7 +9155,7 @@ async fn add_space(
         identity_pub_64,
         snapshot_generation,
     ) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -9230,7 +9260,7 @@ async fn add_space(
     // alone, no flush) which is the only detach path Phase 4 UI can
     // actually trigger.
     {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
@@ -38358,6 +38388,14 @@ async fn generate_friend_token(
     state: tauri::State<'_, Mutex<NodeState>>,
     expires_at: Option<u64>,
 ) -> Result<String, String> {
+    generate_friend_token_impl(state.inner(), expires_at).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn generate_friend_token_impl(
+    state: &std::sync::Mutex<NodeState>,
+    expires_at: Option<u64>,
+) -> Result<String, String> {
     // Snapshot handles under the std lock, then drop it before any `.await`.
     let (dm_outbox, hlc_tracker, pkarr_invite_publisher) = {
         let g = state
@@ -38444,6 +38482,16 @@ async fn generate_friend_token(
 async fn redeem_friend_token(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
+    url: String,
+) -> Result<FriendLinkResultDto, String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    redeem_friend_token_impl(state.inner(), sink, url).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn redeem_friend_token_impl(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     url: String,
 ) -> Result<FriendLinkResultDto, String> {
     let (
@@ -38554,7 +38602,7 @@ async fn redeem_friend_token(
     }
 
     // Notify the UI so it re-fetches the friend list.
-    let _ = app.emit("friend-list-changed", ());
+    crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
 
     Ok(FriendLinkResultDto {
         owner_id_hex: hex::encode(outcome.friend_addr.0),
@@ -38566,6 +38614,13 @@ async fn redeem_friend_token(
 /// `FriendsPanel`. Read-only snapshot of the friend-graph sub-CRDT.
 #[tauri::command]
 async fn list_friends(state: tauri::State<'_, Mutex<NodeState>>) -> Result<Vec<FriendDto>, String> {
+    list_friends_impl(state.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn list_friends_impl(
+    state: &std::sync::Mutex<NodeState>,
+) -> Result<Vec<FriendDto>, String> {
     let (crdt_state, pkarr_settings_path) = {
         let g = state
             .lock()
@@ -39153,6 +39208,13 @@ fn decode_owner_id_16(owner_id_hex: &str) -> Result<crate::owner_state_types::Ow
 async fn list_pending_friend_requests(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<PendingFriendRequestDto>, String> {
+    list_pending_friend_requests_impl(state.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn list_pending_friend_requests_impl(
+    state: &std::sync::Mutex<NodeState>,
+) -> Result<Vec<PendingFriendRequestDto>, String> {
     let store = {
         state
             .lock()
@@ -39176,6 +39238,16 @@ async fn accept_friend_request(
     state: tauri::State<'_, Mutex<NodeState>>,
     owner_id_hex: String,
 ) -> Result<(), String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    accept_friend_request_impl(state.inner(), sink, owner_id_hex).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn accept_friend_request_impl(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    owner_id_hex: String,
+) -> Result<(), String> {
     let addr = decode_owner_id_16(&owner_id_hex)?;
     let store = {
         state
@@ -39189,7 +39261,7 @@ async fn accept_friend_request(
     };
     store.approve(addr);
     // Refresh the UI (friend list + pending inbox both re-fetch on this event).
-    let _ = app.emit("friend-list-changed", ());
+    crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
     Ok(())
 }
 
@@ -39199,6 +39271,16 @@ async fn accept_friend_request(
 async fn decline_friend_request(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
+    owner_id_hex: String,
+) -> Result<(), String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    decline_friend_request_impl(state.inner(), sink, owner_id_hex).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn decline_friend_request_impl(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     owner_id_hex: String,
 ) -> Result<(), String> {
     let addr = decode_owner_id_16(&owner_id_hex)?;
@@ -39213,7 +39295,7 @@ async fn decline_friend_request(
         return Err(OWNER_NOT_LOADED_MSG.into());
     };
     store.decline(&addr);
-    let _ = app.emit("friend-list-changed", ());
+    crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
     Ok(())
 }
 
@@ -39783,6 +39865,16 @@ async fn add_friend_by_key(
     state: tauri::State<'_, Mutex<NodeState>>,
     identity_pub_hex: String,
 ) -> Result<AddFriendOutcome, String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    add_friend_by_key_impl(state.inner(), sink, identity_pub_hex).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn add_friend_by_key_impl(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    identity_pub_hex: String,
+) -> Result<AddFriendOutcome, String> {
     let (
         pkarr_resolver,
         iroh_endpoint,
@@ -39876,7 +39968,7 @@ async fn add_friend_by_key(
             )
             .await;
         }
-        let _ = app.emit("friend-list-changed", ());
+        crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
     }
 
     Ok(outcome)
