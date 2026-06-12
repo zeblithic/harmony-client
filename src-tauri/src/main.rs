@@ -32,9 +32,9 @@ enum Command {
         format: ExportFormat,
     },
 
-    /// Restore a Reticulum identity from a backup (mnemonic or recovery
-    /// file). No owner-master-seed restore path exists yet — ZEB-439
-    /// tracks re-adopting an owner identity from its exported mnemonic.
+    /// Restore an identity from a backup: a Reticulum identity (mnemonic or
+    /// recovery file) or the owner master seed (`owner-mnemonic`, ZEB-439 —
+    /// re-adopts the owner identity from its exported mnemonic).
     Restore {
         #[command(subcommand)]
         format: RestoreFormat,
@@ -99,8 +99,17 @@ enum ExportFormat {
 
 #[derive(Subcommand, Debug)]
 enum RestoreFormat {
-    /// Read a 24-word mnemonic from a file (whitespace-tolerant, case-insensitive).
+    /// Read a 24-word RETICULUM identity mnemonic from a file
+    /// (whitespace-tolerant, case-insensitive).
     Mnemonic {
+        #[arg(long, value_name = "PATH")]
+        mnemonic_file: PathBuf,
+    },
+    /// Read a 24-word OWNER master-seed mnemonic from a file and re-adopt the
+    /// owner identity (same owner-id, fresh device key). Refuses to overwrite
+    /// an existing owner without --force (and refuses a different owner even
+    /// with --force).
+    OwnerMnemonic {
         #[arg(long, value_name = "PATH")]
         mnemonic_file: PathBuf,
     },
@@ -190,6 +199,13 @@ fn main() {
                 let result = match format {
                     RestoreFormat::Mnemonic { mnemonic_file } => {
                         harmony_app::recovery_cli::restore_mnemonic_cli(
+                            &plaintext_path,
+                            &mnemonic_file,
+                            force,
+                        )
+                    }
+                    RestoreFormat::OwnerMnemonic { mnemonic_file } => {
+                        harmony_app::recovery_cli::restore_owner_mnemonic_cli(
                             &plaintext_path,
                             &mnemonic_file,
                             force,
