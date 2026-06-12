@@ -1777,13 +1777,15 @@ impl KeychainStore {
     /// evaporated; the foreign keychain entry stayed; the next boot failed
     /// the enrollment gate and the identity was unrecoverable.
     ///
-    /// Two gates close that class:
+    /// Three gates close that class:
     /// 1. `HARMONY_DISABLE_KEYCHAIN` (non-empty, not `"0"`) → `Err` in every
     ///    build. An explicit operator kill-switch; beats all overrides.
     /// 2. In test builds (`cfg(test)` or the `test-fixtures` feature — every
     ///    integration-test compilation requires the latter) → `Err` unless
     ///    `HARMONY_ALLOW_REAL_KEYCHAIN=1`. Production builds don't compile
     ///    this branch, so the app's keychain behavior is unchanged.
+    /// 3. A named profile (ZEB-446) → `Err` in every build: keychain names are
+    ///    machine-global, so named profiles are file-vault-only.
     ///
     /// Every caller already tolerates `Err` (`.ok()` → encrypted-file
     /// fallback, or propagation) — a gated test run behaves exactly like
@@ -1791,6 +1793,18 @@ impl KeychainStore {
     pub fn new() -> Result<Self, String> {
         if std::env::var("HARMONY_DISABLE_KEYCHAIN").is_ok_and(|v| !v.is_empty() && v != "0") {
             return Err("OS keychain disabled via HARMONY_DISABLE_KEYCHAIN (ZEB-428)".to_string());
+        }
+        // ZEB-446: named profiles never touch the OS keychain — the
+        // service/account names below are machine-global, so two profiles
+        // on one machine would read/clobber EACH OTHER'S vault (the
+        // ZEB-428 class, in production). Named profiles use the
+        // encrypted-file vault under their own identity dir instead.
+        if let Some(p) = crate::profile::active_profile() {
+            return Err(format!(
+                "OS keychain refused for named profile {p:?} (ZEB-446): keychain names are \
+                 machine-global; this profile uses the encrypted-file vault — set \
+                 HARMONY_PASSPHRASE or HARMONY_PASSPHRASE_FILE"
+            ));
         }
         #[cfg(any(test, feature = "test-fixtures"))]
         {
@@ -2074,6 +2088,15 @@ fn identity_path_in(home: &Path, profile: Option<&str>) -> PathBuf {
         None => root,
     };
     root.join("identity.key")
+}
+
+/// ZEB-446: true when the encrypted-file vault has a passphrase source.
+/// Named profiles are file-vault-only, so entrypoints fail fast on this
+/// instead of letting the first vault access fail later (the ZEB-450
+/// silent-degradation class).
+pub fn passphrase_env_configured() -> bool {
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    set("HARMONY_PASSPHRASE") || set("HARMONY_PASSPHRASE_FILE")
 }
 
 /// Internal resolution chain — accepts injected stores for testability.
@@ -2629,6 +2652,19 @@ mod tests {
         assert_eq!(
             identity_path_in(home, Some("coord")),
             Path::new("/home/u/.harmony/profiles/coord/identity.key")
+        );
+    }
+
+    #[test]
+    fn keychain_constructor_refuses_on_named_profile() {
+        crate::profile::set_active_profile(Some("gatetest")).expect("activate");
+        let err = match KeychainStore::new() {
+            Err(e) => e,
+            Ok(_) => panic!("named profile must refuse the OS keychain"),
+        };
+        assert!(
+            err.contains("ZEB-446"),
+            "named-profile refusal must cite ZEB-446 (got the test-build gate instead?): {err}"
         );
     }
 

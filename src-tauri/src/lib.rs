@@ -15425,6 +15425,18 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
 pub fn serve_cli(api_port: Option<u16>) -> i32 {
     crate::app_tracing::init_serve_tracing();
 
+    // ZEB-446: fail fast on a named profile with no vault passphrase —
+    // named profiles are file-vault-only (OS keychain refused), so the
+    // node would otherwise boot into ZEB-450-style silent degradation at
+    // the first vault access.
+    if crate::profile::active_profile().is_some() && !crate::identity::passphrase_env_configured() {
+        eprintln!(
+            "serve: named profile requires HARMONY_PASSPHRASE or HARMONY_PASSPHRASE_FILE \
+             (named profiles use the encrypted-file vault, not the OS keychain)"
+        );
+        return 1;
+    }
+
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -41700,6 +41712,25 @@ async fn set_butler_pin(
 }
 
 pub fn run() {
+    // ZEB-446: GUI launches honor HARMONY_PROFILE (a --profile flag arrives
+    // via main.rs, which already activated — this call is then a no-op).
+    // Validate eagerly and exit loudly; and refuse a named profile with no
+    // vault passphrase, because named profiles are file-vault-only and
+    // booting on would hit the ZEB-450 silent-degradation class at the
+    // first vault access. Named-profile GUI launches are terminal-driven
+    // by definition, so stderr + exit is the honest failure surface.
+    if let Err(e) = crate::profile::set_active_profile(None) {
+        eprintln!("harmony-app: {e}");
+        std::process::exit(2);
+    }
+    if crate::profile::active_profile().is_some() && !crate::identity::passphrase_env_configured() {
+        eprintln!(
+            "harmony-app: named profile requires HARMONY_PASSPHRASE or \
+             HARMONY_PASSPHRASE_FILE (named profiles use the encrypted-file vault, \
+             not the OS keychain)"
+        );
+        std::process::exit(2);
+    }
     // ZEB-379: install the tracing subscriber before anything else so RUST_LOG
     // works in the desktop app and early-boot spans land in the log file.
     app_tracing::init_app_tracing();
