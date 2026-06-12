@@ -243,15 +243,18 @@ pub fn load_or_create_secret_key() -> Result<(SecretKey, bool), IrohEndpointErro
     })?;
     // ZEB-449: prefer the keychain vault, but fall back to an encrypted file
     // (`~/.harmony/iroh_sk.enc`, under HARMONY_PASSPHRASE) when no keychain is
-    // available — so headless / kill-switched nodes still get a transport key
-    // instead of booting with transport disabled.
-    let fallback_path = crate::identity::resolve_path(None)
-        .map_err(|context| IrohEndpointError::Vault { context })?
-        .with_file_name("iroh_sk.enc");
+    // available or usable — so headless / kill-switched nodes still get a
+    // transport key instead of booting with transport disabled. The fallback
+    // factory is lazy: path resolution + passphrase parsing happen ONLY when the
+    // keychain is unusable, so a keychain-healthy node never hard-fails on a
+    // missing HOME or a malformed passphrase.
     let (key_bytes, freshly_created) = crate::identity::app_key_or_create_with_fallback(
         crate::identity::VaultSlot::Iroh,
         &legacy,
-        fallback_path,
+        || {
+            let path = crate::identity::resolve_path(None)?.with_file_name("iroh_sk.enc");
+            crate::identity::EncryptedFileStore::from_env(path)
+        },
     )
     .map_err(|context| IrohEndpointError::Vault { context })?;
     Ok((SecretKey::from_bytes(&key_bytes), freshly_created))

@@ -821,6 +821,10 @@ mod vault_tests {
     }
 
     // ── ZEB-449: encrypted-file fallback for app-local (iroh) keys ──────────
+    //
+    // The fallback is supplied as a lazy factory closure: it must run ONLY when
+    // the keychain is unavailable/unusable, so these tests exercise the closure
+    // directly (no env mutation, no real keychain — per the ZEB-428 rules).
 
     #[test]
     fn app_key_file_fallback_generates_persists_and_reloads_without_keychain() {
@@ -830,27 +834,31 @@ mod vault_tests {
         // not obtain an iroh key and booted with no transport.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("iroh_sk.enc");
-        let enc = EncryptedFileStore::new(
-            path.clone(),
-            secrecy::SecretString::from("zeb449-pp".to_string()),
-        );
         let legacy = mock_entry();
 
-        let (k1, fresh1) =
-            app_key_or_create_with_stores(None, VaultSlot::Iroh, &legacy, Some(&enc)).unwrap();
+        let p1 = path.clone();
+        let (k1, fresh1) = app_key_or_create_with_stores(None, VaultSlot::Iroh, &legacy, || {
+            Ok(Some(EncryptedFileStore::new(
+                p1,
+                secrecy::SecretString::from("zeb449-pp".to_string()),
+            )))
+        })
+        .unwrap();
         assert!(
             fresh1,
             "first call with an empty file generates a fresh key"
         );
         assert!(path.exists(), "fresh key persisted to the encrypted file");
 
-        // A second store over the same file must read the SAME key, not regenerate.
-        let enc2 = EncryptedFileStore::new(
-            path.clone(),
-            secrecy::SecretString::from("zeb449-pp".to_string()),
-        );
-        let (k2, fresh2) =
-            app_key_or_create_with_stores(None, VaultSlot::Iroh, &legacy, Some(&enc2)).unwrap();
+        // A second call over the same file must read the SAME key, not regenerate.
+        let p2 = path.clone();
+        let (k2, fresh2) = app_key_or_create_with_stores(None, VaultSlot::Iroh, &legacy, || {
+            Ok(Some(EncryptedFileStore::new(
+                p2,
+                secrecy::SecretString::from("zeb449-pp".to_string()),
+            )))
+        })
+        .unwrap();
         assert!(!fresh2, "an existing file key is not freshly created");
         assert_eq!(*k1, *k2, "reloaded key matches the persisted one");
     }
@@ -861,7 +869,8 @@ mod vault_tests {
         // clear, actionable error rather than a silent transport-disable.
         // (ZEB-449 / ZEB-450.)
         let legacy = mock_entry();
-        let err = app_key_or_create_with_stores(None, VaultSlot::Iroh, &legacy, None).unwrap_err();
+        let err =
+            app_key_or_create_with_stores(None, VaultSlot::Iroh, &legacy, || Ok(None)).unwrap_err();
         assert!(
             err.contains("HARMONY_PASSPHRASE"),
             "error names the remediation env var: {err}"
@@ -873,33 +882,69 @@ mod vault_tests {
     }
 
     #[test]
-    fn app_key_prefers_keychain_and_leaves_file_untouched() {
-        // When a keychain is available the key is sourced from the vault and the
-        // encrypted-file fallback is never written (keychain-preferred).
+    fn app_key_prefers_keychain_and_skips_fallback_factory() {
+        // When the keychain is healthy the key comes from the vault and the
+        // fallback factory is NEVER invoked — so a malformed passphrase or a
+        // missing HOME cannot break a working keychain. The panicking factory
+        // proves the laziness.
         let store = KeychainStore::new_mock();
         store
             .save_vault(&SecretVault::from_seed([1u8; BLOB_LEN]))
             .unwrap();
         let legacy = mock_entry();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("iroh_sk.enc");
-        let enc = EncryptedFileStore::new(
-            path.clone(),
-            secrecy::SecretString::from("zeb449-pp".to_string()),
-        );
 
         let (key, fresh) =
-            app_key_or_create_with_stores(Some(&store), VaultSlot::Iroh, &legacy, Some(&enc))
-                .unwrap();
+            app_key_or_create_with_stores(Some(&store), VaultSlot::Iroh, &legacy, || {
+                panic!("fallback factory must not run when the keychain is healthy")
+            })
+            .unwrap();
         assert!(fresh, "fresh generate folded into the vault");
         assert_eq!(
             store.load_vault().unwrap().unwrap().iroh_secret_key,
             Some(*key),
             "key folded into the keychain vault"
         );
+    }
+
+    #[test]
+    fn app_key_runtime_failing_keychain_falls_through_to_file() {
+        // A keychain backend present but unusable at runtime (locked / no Secret
+        // Service) must fall THROUGH to the encrypted file rather than
+        // hard-failing — this is what gives keychain-installed-but-broken hosts
+        // (and headless Linux) a working transport key. Mirrors
+        // owner_state::load_secret. (CodeRabbit.)
+        let store = KeychainStore::new_load_failing_mock();
+        // A legacy entry that also errors on every op, so the vault accessor's
+        // legacy-degrade path fails too and the whole keychain attempt errors.
+        let failing_legacy = keyring::Entry::new_with_credential(Box::new(AlwaysFailOnLoad));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iroh_sk.enc");
+
+        let p = path.clone();
+        let (key, fresh) =
+            app_key_or_create_with_stores(Some(&store), VaultSlot::Iroh, &failing_legacy, || {
+                Ok(Some(EncryptedFileStore::new(
+                    p,
+                    secrecy::SecretString::from("pp".to_string()),
+                )))
+            })
+            .unwrap();
         assert!(
-            !path.exists(),
-            "encrypted-file fallback must be untouched when a keychain is present"
+            fresh,
+            "unusable keychain → fell through and generated in the file"
+        );
+        assert!(
+            path.exists(),
+            "key persisted to the encrypted-file fallback"
+        );
+
+        let reload = EncryptedFileStore::new(path, secrecy::SecretString::from("pp".to_string()))
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *key, *reload,
+            "the generated key is what landed in the file"
         );
     }
 
@@ -1224,7 +1269,7 @@ pub enum VaultSlot {
 /// Load-or-create a 32-byte app-local key (e.g. the iroh transport secret key),
 /// preferring the OS keychain vault but **falling back to an encrypted file**
 /// (`HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`) when no keychain is
-/// available.
+/// available or usable.
 ///
 /// ZEB-449: previously these keys were keychain-only — on a keychain-less box
 /// (RPi5 headless, no Secret Service) or under the `HARMONY_DISABLE_KEYCHAIN`
@@ -1232,50 +1277,85 @@ pub enum VaultSlot {
 /// transport. This mirrors the identity-seed (`load_or_generate_with_stores`)
 /// and owner-secret (`owner_state::load_secret`) fallbacks.
 ///
-/// `fallback_path` is the encrypted-file location (caller picks the filename,
-/// e.g. `~/.harmony/iroh_sk.enc`).
+/// `make_fallback` resolves the encrypted-file store **lazily** — it is invoked
+/// only when the keychain is unavailable or unusable, so a keychain-healthy node
+/// never parses the passphrase env or resolves the fallback path. A malformed
+/// `HARMONY_PASSPHRASE` (or a missing `HOME`/`USERPROFILE` during path
+/// resolution) must NOT break a working keychain.
 ///
 /// Returns `(key, freshly_created)`. `freshly_created` is `true` ONLY when a
 /// brand-new key was generated — never when an existing key was loaded (those
 /// are the *same* identity, so the iroh `EndpointId` is preserved).
-pub fn app_key_or_create_with_fallback(
+pub(crate) fn app_key_or_create_with_fallback<F>(
     slot: VaultSlot,
     legacy: &keyring::Entry,
-    fallback_path: PathBuf,
-) -> Result<(Zeroizing<[u8; 32]>, bool), String> {
-    // Keychain when available; otherwise the env-configured encrypted file.
-    let keychain = KeychainStore::new().ok();
-    let fallback = EncryptedFileStore::from_env(fallback_path)?;
-    app_key_or_create_with_stores(keychain.as_ref(), slot, legacy, fallback.as_ref())
+    make_fallback: F,
+) -> Result<(Zeroizing<[u8; 32]>, bool), String>
+where
+    F: FnOnce() -> Result<Option<EncryptedFileStore>, String>,
+{
+    // Mirrors the blessed `mint_owner_identity` production wrapper: the real
+    // keychain is acquired HERE and injected into the testable inner, which in
+    // test/test-fixtures builds receives `None` (KeychainStore::new() refuses,
+    // ZEB-428) so tests never touch the developer's real credential store.
+    app_key_or_create_with_stores(
+        KeychainStore::new().ok().as_ref(),
+        slot,
+        legacy,
+        make_fallback,
+    )
 }
 
-/// Inner resolution with injected stores, for testability (mirrors
-/// `load_or_generate_with_stores`). Keychain is preferred; the encrypted-file
-/// fallback is used only when no keychain backend is available.
+/// Inner resolution with an injected keychain + a lazy fallback factory, for
+/// testability (mirrors `load_or_generate_with_stores` / `owner_state::load_secret`).
 ///
-/// Keychain present → the consolidated-vault behaviour of
-/// [`vault_app_key_or_create_with_store`] (vault has the key → return it; vault
-/// lacks it but the `legacy` single-key item exists → fold + verify + delete the
-/// legacy item; neither → generate and fold). The encrypted file is untouched.
+/// 1. Keychain present and usable → the consolidated-vault behaviour of
+///    [`vault_app_key_or_create_with_store`] (vault has the key → return it;
+///    vault lacks it but the `legacy` single-key item exists → fold + verify +
+///    delete; neither → generate and fold). `make_fallback` is never called.
+/// 2. Keychain present but a **runtime** read/write fails (locked / no backend)
+///    → warn and fall through to the encrypted file, exactly like
+///    `owner_state::load_secret`. This is what makes a machine that *has* a
+///    keychain backend installed but unusable still get a transport key.
+/// 3. Keychain absent (kill-switch / headless) → use the encrypted file.
 ///
-/// Keychain absent → read-or-create the key in the encrypted file; a fresh key
-/// is generated with `OsRng` and persisted. With no file fallback configured
-/// either, fails loudly rather than silently disabling transport.
-fn app_key_or_create_with_stores(
+/// With no usable keychain AND no file fallback configured, surfaces the
+/// keychain error if there was one, else loud guidance — never a silent
+/// transport-disable.
+fn app_key_or_create_with_stores<F>(
     keychain: Option<&KeychainStore>,
     slot: VaultSlot,
     legacy: &keyring::Entry,
-    fallback: Option<&EncryptedFileStore>,
-) -> Result<(Zeroizing<[u8; 32]>, bool), String> {
+    make_fallback: F,
+) -> Result<(Zeroizing<[u8; 32]>, bool), String>
+where
+    F: FnOnce() -> Result<Option<EncryptedFileStore>, String>,
+{
+    // Prefer the keychain; a runtime failure is non-fatal when a file fallback
+    // is configured (the seed/owner-state probe pattern).
+    let mut keychain_err = None;
     if let Some(store) = keychain {
-        return vault_app_key_or_create_with_store(store, slot, legacy);
+        match vault_app_key_or_create_with_store(store, slot, legacy) {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                tracing::warn!(
+                    "keychain unusable for the app-local key ({e}); trying the encrypted-file fallback"
+                );
+                keychain_err = Some(e);
+            }
+        }
     }
-    let Some(enc) = fallback else {
-        return Err(
-            "no keychain available and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set \
-             — cannot persist the app-local (iroh) key; see docs/headless-install.md"
-                .to_string(),
-        );
+    // Only now resolve the passphrase env / fallback path (lazy: a healthy
+    // keychain never reaches here).
+    let enc = match make_fallback()? {
+        Some(store) => store,
+        None => {
+            return Err(keychain_err.unwrap_or_else(|| {
+                "no keychain available and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set \
+                 — cannot persist the app-local (iroh) key; see docs/headless-install.md"
+                    .to_string()
+            }));
+        }
     };
     match enc.load()? {
         Some(key) => Ok((key, false)),
