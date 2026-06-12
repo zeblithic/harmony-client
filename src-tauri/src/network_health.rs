@@ -1390,15 +1390,16 @@ impl ReachabilitySnapshot for ProdReachabilitySnapshot {
     }
 }
 
-/// Production `NotifyEmitter` wrapping `tauri::AppHandle`. The Tauri
-/// emit is fire-and-forget — errors are swallowed because the
-/// rate-limiter task cannot meaningfully react to a closed window.
-pub struct ProdNotifyEmitter(pub tauri::AppHandle);
+/// Production `NotifyEmitter` wrapping the mode-agnostic event sink
+/// (ZEB-445; formerly `tauri::AppHandle`). The emit is fire-and-forget —
+/// the rate-limiter task cannot meaningfully react to a closed window.
+/// Tauri serialized `()` as JSON `null`, so `Value::Null` is wire-identical.
+pub struct ProdNotifyEmitter(pub std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>);
 
 impl NotifyEmitter for ProdNotifyEmitter {
     fn emit_change(&self) {
-        use tauri::Emitter;
-        let _ = self.0.emit(NETWORK_HEALTH_CHANGED_EVENT, ());
+        self.0
+            .emit(NETWORK_HEALTH_CHANGED_EVENT, serde_json::Value::Null);
     }
 }
 

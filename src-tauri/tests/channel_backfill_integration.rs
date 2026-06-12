@@ -65,7 +65,7 @@ const TEST_SEAL_THRESHOLD: usize = 8;
 /// ~250ms (driver min-wait floor) instead of stalling the test 30s.
 const TEST_RETRY_BASE_MS: u64 = 200;
 
-type MockEngine = Arc<ChannelLogEngine<tauri::test::MockRuntime>>;
+type MockEngine = Arc<ChannelLogEngine>;
 
 /// Build a deterministic `(SigningKey, OwnerAddr, identity_pub_64)`
 /// triple for a single seed byte. The in-crate fixture twin
@@ -194,11 +194,10 @@ fn spawn_adapter_bridge_drainer(
 /// persists across `stop()`/re-`spawn()` within a test (the reconnect
 /// scenario depends on that).
 struct RegistryHandle {
-    registry: Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+    registry: Arc<ChannelLogRegistry>,
     owner: OwnerAddr,
     signing: Arc<SigningKey>,
     tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
-    _app: tauri::App<tauri::test::MockRuntime>,
     _dir: TempDir,
     _drainer: tokio::task::JoinHandle<()>,
 }
@@ -206,13 +205,14 @@ struct RegistryHandle {
 fn build_registry(session: &Arc<zenoh::Session>, seed: u8, device_id: &str) -> RegistryHandle {
     let (signing_raw, owner, _pub) = fixture_identity(seed);
     let signing = Arc::new(signing_raw);
-    let app = tauri::test::mock_app();
     let dir = TempDir::new().expect("tempdir");
     let (adapter_tx, adapter_rx) = mpsc::unbounded_channel();
     let drainer = spawn_adapter_bridge_drainer(Arc::clone(session), adapter_rx);
+    // ZEB-445: registry takes a mode-agnostic NodeEventSink; this test
+    // asserts convergence via engine state, not emissions — empty fan-out.
     let registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
         adapter_request_tx: adapter_tx,
-        app: app.handle().clone(),
+        sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
         identity_dir: dir.path().to_path_buf(),
         self_owner: owner,
         self_device_id: device_id.to_string(),
@@ -231,7 +231,6 @@ fn build_registry(session: &Arc<zenoh::Session>, seed: u8, device_id: &str) -> R
         owner,
         signing,
         tracker: Arc::new(Mutex::new(BTreeMap::new())),
-        _app: app,
         _dir: dir,
         _drainer: drainer,
     }

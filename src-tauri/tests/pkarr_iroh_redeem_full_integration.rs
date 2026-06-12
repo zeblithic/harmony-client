@@ -247,7 +247,7 @@ struct TwoPartySetup {
     bob_crdt_state: Arc<TokioMutex<OwnerState>>,
     bob_hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>>,
     bob_dm_outbox: Arc<TokioMutex<DmOutbox>>,
-    bob_channel_log_registry: Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+    bob_channel_log_registry: Arc<ChannelLogRegistry>,
     bob_adapter_tx: mpsc::Sender<CommunityAdapterRequest>,
     bob_unicast_tx: mpsc::Sender<UnicastSendRequest>,
     bob_unicast_count: Arc<AtomicUsize>,
@@ -267,7 +267,6 @@ struct TwoPartySetup {
     publisher_handle: tokio::task::JoinHandle<()>,
     _dir_alice: tempfile::TempDir,
     _dir_bob: tempfile::TempDir,
-    _bob_app: tauri::App<tauri::test::MockRuntime>,
 }
 
 /// Stand up the full two-party iroh-handshake harness (identities, endpoints,
@@ -593,12 +592,13 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
 
     let (bob_channel_log_adapter_tx, _bob_channel_log_adapter_rx) =
         mpsc::unbounded_channel::<ChannelLogAdapterRequest>();
-    let bob_app = tauri::test::mock_app();
     // ZEB-339: channel log registry uses community owner addr and device key.
     // `ChannelLogRegistry::new` already returns `Arc<Self>`; do not re-wrap.
+    // ZEB-445: registry takes a mode-agnostic NodeEventSink; this test never
+    // asserts on channel-log emissions, so an empty fan-out is sufficient.
     let bob_channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
         adapter_request_tx: bob_channel_log_adapter_tx,
-        app: bob_app.handle().clone(),
+        sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
         identity_dir: dir_bob.path().to_path_buf(),
         self_owner: bob_addr,
         self_device_id: "bob-dev".into(),
@@ -678,7 +678,6 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
         publisher_handle,
         _dir_alice: dir_alice,
         _dir_bob: dir_bob,
-        _bob_app: bob_app,
     }
 }
 

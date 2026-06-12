@@ -57,7 +57,10 @@ zenoh-protocol = "1"
 # leaning on the transitive copy zenoh re-exports privately. Pinned to
 # "0.11" — matches the version zenoh-link-commons 1.8 resolves to.
 flume = "0.11"
-tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
+# ZEB-445 serve mode adds: "rt-multi-thread" (serve_cli builds its own
+# multi-thread runtime), "macros" (tokio::select! in the shutdown path),
+# "signal" (ctrl-c / SIGTERM handling in wait_for_exit_signal).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
 tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-os = "2"
@@ -159,6 +162,13 @@ if-watch = { version = "3", features = ["tokio"] }
 # entry just makes `if_addrs::get_if_addrs()` importable.
 if-addrs = "0.15"
 tauri-plugin-fs = "2.5.1"
+# ZEB-445 API control surface: axum hosts the localhost HTTP+WS control
+# surface (already in the lock via harmony-pkarr's dev-only test-fixtures;
+# this entry promotes it to a production dep). fd-lock provides the OS
+# advisory one-node-per-profile lock (released automatically on process
+# death, so stale-lock reclaim needs no PID-liveness logic).
+axum = { version = "0.8", features = ["ws"] }
+fd-lock = "4"
 
 [dev-dependencies]
 serial_test = "3"
@@ -169,10 +179,16 @@ regex = "1"
 # already makes it available to tests, so a [dev-dependencies] entry would
 # be redundant and would misleadingly suggest test-only usage.
 tauri = { version = "2", features = ["test"] }
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
+# ZEB-445: "io-util" gives the api/mod.rs unit tests AsyncRead/WriteExt for
+# their raw-TcpStream HTTP client (no HTTP-client dev-dep needed).
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util", "io-util"] }
 # Activate test-fixtures feature for harmony-pkarr in dev/test builds only,
 # so MockPkarrRelay (an axum HTTP server) is excluded from release binaries.
 harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1", features = ["test-fixtures"] }
+# ZEB-445 api_server integration test client
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 
 # ZEB-156: harmony-runtime (pinned 04449d60 above) provides the narrow
 # `NodeRuntime::remove_content` + `StorageTier::remove` delegates this

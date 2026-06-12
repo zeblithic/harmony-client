@@ -161,6 +161,13 @@ pub async fn get_owner_state(
     _app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<Option<OwnerStateView>, String> {
+    get_owner_state_impl(state.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn get_owner_state_impl(
+    state: &std::sync::Mutex<crate::NodeState>,
+) -> Result<Option<OwnerStateView>, String> {
     // ZEB-418 P2 D17: snapshot the fleet-net pinned device ID before entering
     // the blocking task. Reads under the NodeState lock; the Arc clone is cheap
     // and the tokio Mutex lock is async — we do it here (async context) and pass
@@ -221,18 +228,35 @@ pub async fn mint_owner_identity(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<MintIpcResult, String> {
-    // Forward to the testable inner fn (symmetric with `start_node_inner`).
-    // The restart step is injected as a closure so the inner fn can be
-    // driven from a headless integration test (where a real `AppHandle<Wry>`
-    // — required by `start_node_inner` — cannot be constructed). Production
-    // passes the real node restart.
-    let state_ref: &Mutex<crate::NodeState> = state.inner();
-    // ZEB-428: the real keychain is acquired HERE (production wrapper) and
-    // injected, mirroring pairing/persist.rs's install_joiner_state — the
-    // inner fn must never construct it internally, so test drivers can't
-    // reach the developer's real credential store.
-    mint_owner_identity_inner(state_ref, KeychainStore::new().ok(), || async {
-        crate::start_node_inner(None, &app, state_ref)
+    // ZEB-445: wrap the AppHandle as the event sink (same shape as the
+    // `start_node` command wrapper) and delegate to the shared IPC/RPC seam.
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(app.clone());
+    mint_owner_identity_impl(state.inner(), sink, Some(app)).await
+}
+
+/// ZEB-445: shared IPC/RPC seam. `wry_handle` is Some in the GUI (keeps
+/// voting/dfrost registries alive across the restart) and None headless.
+///
+/// Forwards to the testable inner fn (symmetric with `start_node_inner`).
+/// The restart step is injected as a closure so the inner fn can be
+/// driven from a headless integration test (where a real `AppHandle<Wry>`
+/// cannot be constructed). Production (this seam) passes the real node
+/// restart.
+///
+/// ZEB-428: the real keychain is acquired HERE (production seam) and
+/// injected, mirroring pairing/persist.rs's install_joiner_state — the
+/// inner fn must never construct it internally, so test drivers can't
+/// reach the developer's real credential store. (In test-fixtures builds
+/// `KeychainStore::new()` itself refuses, so RPC-driven test mints fall
+/// back to the encrypted-file store.)
+pub(crate) async fn mint_owner_identity_impl(
+    state: &Mutex<crate::NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
+) -> Result<MintIpcResult, String> {
+    mint_owner_identity_inner(state, KeychainStore::new().ok(), || async {
+        crate::start_node_inner(None, sink.clone(), wry_handle.clone(), state)
             .await
             .map(|_| ())
     })

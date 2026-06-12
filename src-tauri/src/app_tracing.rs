@@ -41,15 +41,40 @@ pub fn init_app_tracing() {
     install_subscriber(log_dir());
 }
 
+/// ZEB-445: serve-mode subscriber. Identical layering to [`init_app_tracing`]
+/// (same EnvFilter + same rolling file layer) EXCEPT the console fmt layer
+/// writes to **stderr** — serve mode shares the CLI arms' stdout-purity
+/// discipline (ZEB-430, see `init_tracing` in main.rs): stdout stays
+/// machine-readable, log lines never interleave.
+pub fn init_serve_tracing() {
+    install_subscriber_to(log_dir(), ConsoleTarget::Stderr);
+}
+
+/// Where the console fmt layer writes. The GUI uses stdout (visible under
+/// `cargo tauri dev`); serve mode uses stderr (ZEB-430 stdout purity).
+enum ConsoleTarget {
+    Stdout,
+    Stderr,
+}
+
 /// Core installer, parameterized on the log directory so tests can pass `None`
 /// (stdout-only, zero filesystem side effects). Uses `try_init()`, discarding
 /// the error so a double init never panics.
 fn install_subscriber(log_dir: Option<PathBuf>) {
+    install_subscriber_to(log_dir, ConsoleTarget::Stdout);
+}
+
+/// Shared installer body, additionally parameterized on the console target so
+/// `init_serve_tracing` reuses the exact same EnvFilter + file-layer wiring.
+fn install_subscriber_to(log_dir: Option<PathBuf>, console: ConsoleTarget) {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Stdout always; rolling file when a usable log dir is available.
+    // Console always; rolling file when a usable log dir is available.
     let mut layers: Vec<Box<dyn Layer<_> + Send + Sync + 'static>> = Vec::new();
-    layers.push(fmt::layer().boxed());
+    layers.push(match console {
+        ConsoleTarget::Stdout => fmt::layer().boxed(),
+        ConsoleTarget::Stderr => fmt::layer().with_writer(std::io::stderr).boxed(),
+    });
 
     if let Some(dir) = log_dir {
         if let Err(e) = std::fs::create_dir_all(&dir) {

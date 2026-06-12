@@ -193,7 +193,6 @@ async fn wait_for_stable_count(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     use std::sync::Mutex as StdMutex;
-    use tauri::Listener;
 
     // ── Set up shared in-memory Zenoh router ──────────────────────────
     // Two `zenoh::open(default_config)` sessions on the same in-memory
@@ -214,9 +213,43 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     let membership_key = EpochKey::new([0x77; 32]);
     let channel_key = derive_channel_key(&membership_key, &community_id, &channel_id);
 
-    // ── Set up Tauri mock apps for each side ────────────────────────
-    let app_a = tauri::test::mock_app();
-    let app_b = tauri::test::mock_app();
+    // ── Set up event sinks for each side (ZEB-445: mode-agnostic
+    //    NodeEventSink instead of Tauri mock apps). Side A never asserts
+    //    on emissions — empty fan-out. Side B records the two event
+    //    streams the test asserts on: `channel-message-received`
+    //    (messageId per frame) and `channel-backfill-progress` (count).
+    struct SideBRecorder {
+        received: Arc<StdMutex<Vec<String>>>,
+        backfill_progress: Arc<StdMutex<u32>>,
+    }
+    impl harmony_app::node_event_sink::NodeEventSink for SideBRecorder {
+        fn emit(&self, event: &str, payload: serde_json::Value) {
+            match event {
+                "channel-message-received" => {
+                    let msg_id = payload["message"]["messageId"]
+                        .as_str()
+                        .expect("messageId")
+                        .to_string();
+                    self.received.lock().expect("received_b lock").push(msg_id);
+                }
+                "channel-backfill-progress" => {
+                    *self
+                        .backfill_progress
+                        .lock()
+                        .expect("backfill progress lock") += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    let received_b: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let backfill_progress_b: Arc<StdMutex<u32>> = Arc::new(StdMutex::new(0));
+    let sink_a: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
+    let sink_b: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = Arc::new(SideBRecorder {
+        received: Arc::clone(&received_b),
+        backfill_progress: Arc::clone(&backfill_progress_b),
+    });
 
     let dir_a = TempDir::new().expect("tmp A");
     let dir_b = TempDir::new().expect("tmp B");
@@ -251,7 +284,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     // ── Build registries ─────────────────────────────────────────────
     let registry_a = ChannelLogRegistry::new(ChannelLogRegistryConfig {
         adapter_request_tx: adapter_tx_a,
-        app: app_a.handle().clone(),
+        sink: sink_a,
         identity_dir: dir_a.path().to_path_buf(),
         self_owner: owner_a,
         self_device_id: "device-a".to_string(),
@@ -266,7 +299,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     });
     let registry_b = ChannelLogRegistry::new(ChannelLogRegistryConfig {
         adapter_request_tx: adapter_tx_b,
-        app: app_b.handle().clone(),
+        sink: sink_b,
         identity_dir: dir_b.path().to_path_buf(),
         self_owner: owner_b,
         self_device_id: "device-b".to_string(),
@@ -280,38 +313,10 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         transport_epoch_rx: None,
     });
 
-    // ── Listen for B's channel-message-received events ──────────────
-    // Listener callback is SYNC; use std::sync::Mutex (not tokio's
-    // Mutex) so the closure is non-Send-async-friendly and we avoid
-    // having to spawn an inner task per event.
-    let received_b: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
-    let received_b_for_listener = Arc::clone(&received_b);
-    let _unlisten_message = app_b
-        .handle()
-        .listen("channel-message-received", move |event| {
-            let payload: serde_json::Value =
-                serde_json::from_str(event.payload()).expect("parse payload");
-            let msg_id = payload["message"]["messageId"]
-                .as_str()
-                .expect("messageId")
-                .to_string();
-            received_b_for_listener
-                .lock()
-                .expect("received_b lock")
-                .push(msg_id);
-        });
-
-    // Listen for backfill-progress events too (spec §14.2 requires
-    // at least one fires during the backfill phase).
-    let backfill_progress_b: Arc<StdMutex<u32>> = Arc::new(StdMutex::new(0));
-    let backfill_progress_for_listener = Arc::clone(&backfill_progress_b);
-    let _unlisten_progress = app_b
-        .handle()
-        .listen("channel-backfill-progress", move |_event| {
-            *backfill_progress_for_listener
-                .lock()
-                .expect("backfill progress lock") += 1;
-        });
+    // B's `channel-message-received` + `channel-backfill-progress`
+    // emissions (spec §14.2 requires at least one progress event during
+    // the backfill phase) are captured by `SideBRecorder` above —
+    // `received_b` / `backfill_progress_b` are asserted on below.
 
     let engine_a = match Arc::clone(&registry_a)
         .spawn(

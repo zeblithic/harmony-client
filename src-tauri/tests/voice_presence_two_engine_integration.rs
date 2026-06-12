@@ -261,7 +261,10 @@ async fn run_inner() {
     let now_ms: Arc<dyn Fn() -> u64 + Send + Sync> =
         Arc::new(move || clock_for_now.load(std::sync::atomic::Ordering::SeqCst));
 
-    let app_b = tauri::test::mock_app();
+    // ZEB-445: the presence subscriber takes a mode-agnostic NodeEventSink;
+    // this test asserts via VoicePresenceMap state, not emissions.
+    let no_emit_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
     let closing = Arc::new(AtomicBool::new(false));
 
     let pres_topic = format!(
@@ -280,7 +283,7 @@ async fn run_inner() {
         channel,
         Arc::clone(&registry_b),
         Arc::clone(&map_b),
-        app_b.handle().clone(),
+        Arc::clone(&no_emit_sink),
         Arc::clone(&closing),
         Arc::clone(&now_ms),
     );
@@ -410,7 +413,7 @@ async fn run_inner() {
         channel_other,
         Arc::clone(&registry_b),
         Arc::clone(&map_other),
-        app_b.handle().clone(),
+        Arc::clone(&no_emit_sink),
         Arc::clone(&closing),
         Arc::clone(&now_ms),
     );

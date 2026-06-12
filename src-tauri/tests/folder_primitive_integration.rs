@@ -174,8 +174,10 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
         [0u8; 16],
     )));
 
-    let app = tauri::test::mock_app();
-    let app_handle = app.handle().clone();
+    // ZEB-445: event_loop::run takes a mode-agnostic NodeEventSink; this
+    // test never asserts on emissions, so an empty fan-out is sufficient.
+    let event_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
 
     let config = NodeConfig {
         storage_budget: StorageBudget {
@@ -229,7 +231,7 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                 harmony_app::event_loop::run(
                     runtime,
                     startup_actions,
-                    app_handle,
+                    event_sink,
                     None,
                     ready_tx,
                     shutdown_rx,

@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::mail::MailManager;
@@ -63,21 +62,21 @@ type InFlightMap = Arc<
     Mutex<HashMap<[u8; CID_LEN], tokio::sync::watch::Receiver<Option<Result<Vec<u8>, String>>>>>,
 >;
 
-pub struct MailSync<R: Runtime = tauri::Wry> {
+pub struct MailSync {
     state: Arc<Mutex<SyncState>>,
     fetch_tx: mpsc::Sender<FetchRequest>,
     refresh_tx: mpsc::Sender<RefreshRequest>,
     mail_mgr: Arc<Mutex<MailManager>>,
-    app: AppHandle<R>,
+    sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
     in_flight_bodies: InFlightMap,
 }
 
-impl<R: Runtime> MailSync<R> {
+impl MailSync {
     pub fn new(
         fetch_tx: mpsc::Sender<FetchRequest>,
         refresh_tx: mpsc::Sender<RefreshRequest>,
         mail_mgr: Arc<Mutex<MailManager>>,
-        app: AppHandle<R>,
+        sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(SyncState::Idle {
@@ -86,7 +85,7 @@ impl<R: Runtime> MailSync<R> {
             fetch_tx,
             refresh_tx,
             mail_mgr,
-            app,
+            sink,
             in_flight_bodies: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -634,9 +633,7 @@ impl<R: Runtime> MailSync<R> {
             // guard drops here at end of block scope.
         };
         for entry in entries_to_emit {
-            if let Err(e) = self.app.emit("mail-received", &entry) {
-                tracing::warn!(error = %e, "failed to emit mail-received");
-            }
+            crate::node_event_sink::emit_ser(&*self.sink, "mail-received", &entry);
         }
 
         if skipped_pages.is_empty() {
@@ -757,9 +754,7 @@ impl<R: Runtime> MailSync<R> {
     }
 
     fn emit_status(&self, event: SyncStatusEvent) {
-        if let Err(e) = self.app.emit("mail-sync-status", &event) {
-            tracing::warn!(error = %e, "failed to emit mail-sync-status");
-        }
+        crate::node_event_sink::emit_ser(&*self.sink, "mail-sync-status", &event);
     }
 }
 
@@ -824,20 +819,18 @@ mod tests {
         }
     }
 
-    /// Build a test MailSync with a mock Tauri AppHandle.
+    /// Build a test MailSync with a recording event sink.
     fn make_test_mail_sync(
         fetch_tx: mpsc::Sender<FetchRequest>,
         mail_mgr: Arc<Mutex<MailManager>>,
-    ) -> Arc<MailSync<tauri::test::MockRuntime>> {
-        let app = tauri::test::mock_app();
+    ) -> Arc<MailSync> {
+        // NodeEventSink is impl'd on Arc<RecordingSink>, so wrap once more
+        // to coerce into Arc<dyn NodeEventSink>.
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            Arc::new(crate::node_event_sink::RecordingSink::new());
         // Throwaway refresh channel — tests don't exercise refresh_now directly.
         let (refresh_tx, _refresh_rx) = mpsc::channel(1);
-        Arc::new(MailSync::new(
-            fetch_tx,
-            refresh_tx,
-            mail_mgr,
-            app.handle().clone(),
-        ))
+        Arc::new(MailSync::new(fetch_tx, refresh_tx, mail_mgr, sink))
     }
 
     #[tokio::test]
@@ -918,10 +911,7 @@ mod tests {
 
     /// Poll sync.state until it reaches Idle or Error (or deadline). Returns on
     /// terminal state or after the deadline (whichever comes first).
-    async fn wait_for_terminal_state<R: tauri::Runtime>(
-        sync: &MailSync<R>,
-        deadline: std::time::Duration,
-    ) {
+    async fn wait_for_terminal_state(sync: &MailSync, deadline: std::time::Duration) {
         let start = std::time::Instant::now();
         while start.elapsed() < deadline {
             let is_terminal = matches!(

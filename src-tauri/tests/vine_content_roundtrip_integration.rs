@@ -162,8 +162,10 @@ fn spawn_event_loop(
         [0u8; 16],
     )));
 
-    let app = tauri::test::mock_app();
-    let app_handle = app.handle().clone();
+    // ZEB-445: event_loop::run takes a mode-agnostic NodeEventSink; this
+    // test never asserts on emissions, so an empty fan-out is sufficient.
+    let event_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
 
     let pin_intent: HashSet<[u8; 32]> = HashSet::new();
     let cas_op_tx_clone = cas_op_tx.clone();
@@ -183,7 +185,7 @@ fn spawn_event_loop(
                 harmony_app::event_loop::run(
                     runtime,
                     startup_actions,
-                    app_handle,
+                    event_sink,
                     None, // endpoint — no external Zenoh endpoint needed
                     ready_tx,
                     shutdown_rx,

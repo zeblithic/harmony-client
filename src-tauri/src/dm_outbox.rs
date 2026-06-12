@@ -26,7 +26,6 @@ use crate::owner_state_types::{
 use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use tauri::Emitter;
 
 pub type MessageId = OutboxEntryId;
 
@@ -1559,12 +1558,12 @@ impl DmOutbox {
     /// Never panics on caller. Spawned-task panic recovery is the caller's
     /// responsibility (event_loop wraps with a top-level error log).
     #[allow(clippy::too_many_arguments)]
-    pub async fn handle_cidnotify_lifted<R: tauri::Runtime>(
+    pub async fn handle_cidnotify_lifted(
         outbox_arc: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
         state_arc: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
         cas: std::sync::Arc<dyn ContentStore>,
         unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
-        app: tauri::AppHandle<R>,
+        app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
         signed: crate::dm_envelope::DmCidNotifySigned,
         signature: [u8; 64],
         signed_bytes: Vec<u8>,
@@ -1802,7 +1801,11 @@ impl DmOutbox {
         // ingestion (ZEB-418 P1 Task 6) so the frontend cannot observe
         // which path delivered a message.
         for rm in drain_outcome.newly_received {
-            let _ = app.emit(DM_RECEIVED_EVENT, dm_received_event_payload(&rm));
+            crate::node_event_sink::emit_ser(
+                app.as_ref(),
+                DM_RECEIVED_EVENT,
+                &dm_received_event_payload(&rm),
+            );
         }
     }
 
@@ -1996,12 +1999,12 @@ impl DmOutbox {
 /// After ZEB-233: `send_dm` acquires outbox immediately during
 /// Phase B because the lock is released. Latency improvement is
 /// proportional to the slowest in-flight transport.send.
-pub async fn drain_lifted<R: tauri::Runtime>(
+pub async fn drain_lifted(
     outbox: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
     state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
     transport: &dyn DmTransport,
     wall_now_ms: u64,
-    app: tauri::AppHandle<R>,
+    app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
 ) {
     // Phase A: try_lock + collect work. If either lock is contended,
     // skip this tick. (Same deadlock-avoidance rationale as the
@@ -2133,14 +2136,14 @@ pub async fn drain_lifted<R: tauri::Runtime>(
                 "messageCid": hex::encode(message_cid.to_bytes()),
                 "recipientOwnerAddr": hex::encode(recipient.0),
             });
-            let _ = app.emit("dm-delivered", payload);
+            crate::node_event_sink::emit_ser(app.as_ref(), "dm-delivered", &payload);
         }
         for (space_id, message_cid) in outcome.newly_expired {
             let payload = serde_json::json!({
                 "spaceId": hex::encode(space_id.0),
                 "messageCid": hex::encode(message_cid.to_bytes()),
             });
-            let _ = app.emit("dm-expired", payload);
+            crate::node_event_sink::emit_ser(app.as_ref(), "dm-expired", &payload);
         }
 
         // ZEB-418 P1 Task 8 — butler deposit rung. Runs UNLOCKED (pkarr
@@ -2168,7 +2171,7 @@ pub async fn drain_lifted<R: tauri::Runtime>(
                             "messageCid": hex::encode(c.message_cid.to_bytes()),
                             "recipientOwnerAddr": hex::encode(c.recipient_owner.0),
                         });
-                        let _ = app.emit("dm-delivered", payload);
+                        crate::node_event_sink::emit_ser(app.as_ref(), "dm-delivered", &payload);
                     }
                 }
                 crate::butler_deposit::DepositRungOutcome::SkippedNoFreshButlerSet => {}
@@ -3942,7 +3945,8 @@ mod tests {
             send_count: Arc::clone(&send_count),
         };
 
-        let app = tauri::test::mock_app().handle().clone();
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
 
         super::drain_lifted(
             Arc::clone(&outbox_arc),
@@ -4089,7 +4093,8 @@ mod tests {
             triggered: AtomicBool::new(false),
         };
 
-        let app = tauri::test::mock_app().handle().clone();
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
         super::drain_lifted(
             Arc::clone(&outbox_arc),
             Arc::clone(&state_arc),
@@ -5033,11 +5038,11 @@ mod tests {
     /// freshly-built test fixture and return the post-call `(outbox, state)`
     /// for inspection. Wraps `outbox`/`state` in Arcs (the lifted handler's
     /// signature requires Arcs internally), calls the handler with a stub
-    /// `tauri::test::mock_app()` AppHandle, then unwraps the Arcs back so
+    /// `RecordingSink` event sink (ZEB-445), then unwraps the Arcs back so
     /// tests can mutate / re-assert without dealing with locks.
     ///
-    /// The lifted variant emits `dm-received` via `app.emit` (mock_app's
-    /// AppHandle accepts emits silently in tests) and returns `()` instead
+    /// The lifted variant emits `dm-received` via the sink (the recording
+    /// sink accepts emits silently in tests) and returns `()` instead
     /// of `Result<DrainOutcome, _>`. Tests that previously asserted on
     /// returned errors / outcomes now inspect post-call state directly:
     /// - `state.inbox.contains_key(...)` for InboxEntry presence
@@ -5060,7 +5065,8 @@ mod tests {
     ) -> (DmOutbox, OwnerState) {
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
-        let app = tauri::test::mock_app().handle().clone();
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
 
         DmOutbox::handle_cidnotify_lifted(
             std::sync::Arc::clone(&outbox_arc),
@@ -6703,7 +6709,8 @@ mod tests {
 
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
-        let app = tauri::test::mock_app().handle().clone();
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
 
         let handler = tokio::spawn(DmOutbox::handle_cidnotify_lifted(
             std::sync::Arc::clone(&outbox_arc),
@@ -6808,7 +6815,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
-        let app = tauri::test::mock_app().handle().clone();
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
 
         let handler = tokio::spawn(DmOutbox::handle_cidnotify_lifted(
             std::sync::Arc::clone(&outbox_arc),
@@ -6979,7 +6987,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
-        let app = tauri::test::mock_app().handle().clone();
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
 
         let handler = tokio::spawn(DmOutbox::handle_cidnotify_lifted(
             std::sync::Arc::clone(&outbox_arc),
@@ -7175,7 +7184,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
-        let app = tauri::test::mock_app().handle().clone();
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
 
         // The handler must complete without panicking and the gate
         // must short-circuit BEFORE Phase B's CAS fetch — verified

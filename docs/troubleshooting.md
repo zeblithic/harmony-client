@@ -120,6 +120,10 @@ Also intended: Harmony is single-instance. Launching it while it's already runni
 
 Test-driver note: a hidden-to-tray instance keeps its PID and process start time; only the webview page target changes on reattach. Scripted "offline" phases must verify the process actually exited rather than trusting a window close.
 
+### serve mode (headless) lifecycle
+
+`harmony-app serve` has no window and no tray — quit it via `POST /v1/shutdown` (authenticated, like every API call) or SIGTERM/Ctrl-C. A "profile already in use" error on start means another harmony-app — the GUI with the API host enabled, or another `serve` — currently holds the profile lock; quit that instance first. See the [API control surface section in `headless-install.md`](headless-install.md#api-control-surface-serve-mode--zeb-445) for the full quickstart.
+
 ## Help + feedback
 
 ### "I want to send feedback"
