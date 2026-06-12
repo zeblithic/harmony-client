@@ -270,7 +270,8 @@ impl<R: tauri::Runtime> crate::iroh_friend_acceptor::FriendEventEmit for tauri::
 /// identifier "net.zeblith.harmony" (tauri.conf.json:5). serve mode must
 /// resolve the IDENTICAL path or GUI and headless would split-brain the
 /// profile.
-pub(crate) fn resolve_app_data_dir() -> Result<std::path::PathBuf, String> {
+/// Public for the serve path and the api_server integration test (ZEB-445).
+pub fn resolve_app_data_dir() -> Result<std::path::PathBuf, String> {
     dirs::data_dir()
         .map(|d| d.join("net.zeblith.harmony"))
         .ok_or_else(|| "cannot resolve platform data dir".to_string())
@@ -2352,7 +2353,8 @@ async fn start_node(
 /// handle for the few seams that genuinely need Tauri (managed-state
 /// lookup in the VRF beacon requester, `NodeState.app_handle_wry` for the
 /// dfrost/voting IPCs); `None` in serve mode.
-pub(crate) async fn start_node_inner(
+/// Public for the serve path and the api_server integration test (ZEB-445).
+pub async fn start_node_inner(
     endpoint: Option<String>,
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
