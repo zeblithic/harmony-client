@@ -25734,35 +25734,85 @@ fn remove_space_community_guard(
     }
 }
 
-/// ZEB-435: fence the owner-state flush after a `remove_space` tombstone write,
-/// mirroring `leave_community`'s durability fence. Soft-warns (never errs) when
-/// no engine is attached — the tombstone lands at the next owner-state flush.
+/// ZEB-435: flush the owner-state tombstone and report whether it landed
+/// DURABLY. Unlike `leave_community`'s fence (best-effort, returns `()`), the
+/// caller uses this result to gate a DESTRUCTIVE delete: a community's on-disk
+/// data is removed ONLY once its tombstone is safely persisted, so a crash can
+/// never leave the Space resurrected (tombstone lost on the unflushed in-memory
+/// state) while its bytes are already gone (Qodo). Returns `false` — and re-arms
+/// the debounce — when there's no engine or the flush errors/times out; the
+/// in-memory tombstone persists at the next flush and a later `remove_space`
+/// retries the cleanup.
 async fn fence_remove_space_flush(
     sync_engine: &Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
     id_hex: &str,
-) {
-    match sync_engine {
-        Some(engine) => {
-            fence_owner_state_flush(engine, OWNER_STATE_FENCE_TIMEOUT, "remove_space", id_hex)
-                .await;
+) -> bool {
+    let Some(engine) = sync_engine else {
+        tracing::warn!(
+            space_id = %id_hex,
+            "remove_space: no SyncEngine handle — tombstone not durably flushed; \
+             deferring destructive cleanup to a later call"
+        );
+        return false;
+    };
+    match tokio::time::timeout(OWNER_STATE_FENCE_TIMEOUT, engine.flush_now()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                space_id = %id_hex, error = %e,
+                "remove_space: owner-state flush_now failed; re-arming debounce, \
+                 deferring cleanup"
+            );
+            engine.notify_dirty();
+            false
         }
-        None => {
+        Err(_elapsed) => {
             tracing::warn!(
                 space_id = %id_hex,
-                "remove_space: no SyncEngine handle — the tombstone is NOT persisted \
-                 until the next unrelated owner-state flush"
+                timeout_ms = OWNER_STATE_FENCE_TIMEOUT.as_millis() as u64,
+                "remove_space: owner-state flush_now timed out; re-arming debounce, \
+                 deferring cleanup"
             );
+            engine.notify_dirty();
+            false
         }
     }
 }
 
-/// ZEB-435: best-effort delete of a community's on-disk dir
-/// (`~/.harmony/communities/<id>/`). Jake's call (ZEB-435): `remove_space` is a
-/// true "delete forever", and the owner-state tombstone already blocks any
-/// re-invite from resurrecting the community (`apply_space` rejects tombstoned
-/// ids), so a retained dir is dead weight. Runs AFTER the tombstone is durably
-/// fenced — the tombstone is the source of truth, so a failed unlink only leaves
-/// bytes the tombstone already makes unreachable (warn, don't err).
+/// ZEB-435: stop a tombstoned community's engine and delete its on-disk data.
+/// Goes through the registry's `shutdown_engine_and_cleanup_persistence` (stop
+/// the engine FIRST, then `remove_dir_all`) so a still-running engine can't
+/// recreate the directory via its debounced `create_dir_all` persistence
+/// (Cursor). Best-effort: a failure warns — the owner-state tombstone already
+/// blocks resurrection. The no-registry fallback (owner loaded but node not
+/// started, so no live engines) is a plain filesystem delete.
+async fn cleanup_community_data(
+    community_registry: &Option<std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>>,
+    space_id: &crate::owner_state_types::SpaceId,
+    id_hex: &str,
+) {
+    match community_registry {
+        Some(registry) => {
+            if let Err(e) = registry
+                .shutdown_engine_and_cleanup_persistence(space_id)
+                .await
+            {
+                tracing::warn!(
+                    space_id = %id_hex, error = %e,
+                    "remove_space: stop-engine + cleanup-persistence failed; the \
+                     community dir may persist (the tombstone still blocks resurrection)"
+                );
+            }
+        }
+        None => delete_community_dir(id_hex),
+    }
+}
+
+/// ZEB-435: best-effort filesystem delete of a community's on-disk dir
+/// (`~/.harmony/communities/<id>/`) — the no-registry fallback for
+/// [`cleanup_community_data`]. The owner-state tombstone already blocks any
+/// re-invite (`apply_space` rejects tombstoned ids), so a failed unlink only
+/// leaves bytes the tombstone makes unreachable (warn, don't err).
 fn delete_community_dir(id_hex: &str) {
     let dir = match crate::owner_commands::resolve_identity_dir() {
         Ok(d) => d.join("communities").join(id_hex),
@@ -25794,14 +25844,17 @@ fn delete_community_dir(id_hex: &str) {
 /// - **community**: refuse unless the caller has already LEFT (membership CRDT
 ///   no longer materializes them `Joined`/`PendingJoin`, AND owner-state has
 ///   `left_at` set) — else they'd be a ghost member. Then tombstone the
-///   owner-state Space (which blocks any re-invite via `apply_space`) and DELETE
-///   the on-disk community dir.
+///   owner-state Space (which blocks any re-invite via `apply_space`); and —
+///   ONLY once that tombstone is durably flushed — stop the community engine and
+///   delete its on-disk dir (so a crash can't resurrect the Space pointing at
+///   deleted bytes).
 /// - **dm / group-dm / channel / public-channel**: tombstone the local Space
 ///   (blocks re-creation by the same SpaceId until the tombstone is cleared).
-/// - **folder**: re-parent children to top-level (`parent = None`) — never
-///   cascade-delete — then remove the folder.
+/// - **folder**: not yet supported — returns `Err` (correct cross-device child
+///   re-parenting needs HLC-bumped CRDT updates; folders aren't a live feature).
 ///
-/// Idempotent: a second call on an already-tombstoned Space returns `Ok`.
+/// Idempotent: a second call on an already-tombstoned Space returns `Ok` (and
+/// retries the best-effort on-disk cleanup).
 pub(crate) async fn remove_space_impl(
     state: &std::sync::Mutex<NodeState>,
     space_id: String,
@@ -25814,7 +25867,7 @@ pub(crate) async fn remove_space_impl(
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
     let id_hex = hex::encode(space_id.0);
 
-    let (self_owner, community_registry, crdt_state, sync_engine) = {
+    let (self_owner, community_registry, crdt_state, sync_engine, snapshot_generation) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -25823,17 +25876,40 @@ pub(crate) async fn remove_space_impl(
             g.community_registry.clone(),
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.sync_engine.clone(),
+            g.generation,
         )
     };
 
-    // Read the Space kind + leave marker. Idempotent: already-tombstoned → Ok.
+    // Re-validate the node generation hasn't changed: a concurrent
+    // stop_node/start_node swaps in a fresh `crdt_state`, so mutating our
+    // snapshot would write a tombstone into a detached owner-state the live node
+    // no longer uses (Cursor). Checked again right before the mutating write.
+    let check_generation = || -> Result<(), String> {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during remove_space (was {snapshot_generation}, \
+                 now {})",
+                g.generation
+            ));
+        }
+        Ok(())
+    };
+
+    // Read the Space kind + leave marker. Idempotent: already-tombstoned → Ok,
+    // but still retry the (best-effort) cleanup in case a prior call tombstoned
+    // without a durable-enough flush to delete the on-disk data.
     let (kind, already_left) = {
         let g = crdt_state.lock().await;
         match g.spaces.get(&space_id) {
             Some(s) => (s.kind, s.left_at.is_some()),
             None => {
                 if g.tombstones.contains(&space_id) {
-                    return Ok(()); // idempotent: already removed forever
+                    drop(g);
+                    cleanup_community_data(&community_registry, &space_id, &id_hex).await;
+                    return Ok(());
                 }
                 return Err(format!("no space {id_hex} to remove"));
             }
@@ -25855,7 +25931,7 @@ pub(crate) async fn remove_space_impl(
             // Defense-in-depth: if an engine is live, materialize self and refuse
             // if the membership CRDT still shows us active (left_at could be set
             // while the Leave hasn't actually committed).
-            let self_status = match (community_registry, self_owner) {
+            let self_status = match (&community_registry, self_owner) {
                 (Some(registry), Some(self_owner)) => match registry.engine_arc(&space_id).await {
                     Some(engine_arc) => {
                         let admin_addr = engine_arc.admin_addr();
@@ -25872,38 +25948,44 @@ pub(crate) async fn remove_space_impl(
             };
             remove_space_community_guard(self_status)?;
 
+            check_generation()?;
             {
                 let mut g = crdt_state.lock().await;
                 g.tombstone_space(space_id);
             }
-            fence_remove_space_flush(&sync_engine, &id_hex).await;
-            delete_community_dir(&id_hex);
+            // Delete the on-disk data ONLY once the tombstone is durably flushed,
+            // so a crash can't resurrect the Space pointing at deleted bytes
+            // (Qodo). When not durable we defer: the in-memory tombstone re-arms
+            // the debounce and a later remove_space retries the cleanup.
+            if fence_remove_space_flush(&sync_engine, &id_hex).await {
+                cleanup_community_data(&community_registry, &space_id, &id_hex).await;
+            } else {
+                tracing::warn!(
+                    space_id = %id_hex,
+                    "remove_space: tombstone not durably flushed — keeping the \
+                     community data until a later remove_space confirms durability"
+                );
+            }
         }
         SpaceKind::Dm | SpaceKind::GroupDm | SpaceKind::Channel | SpaceKind::PublicChannel => {
+            check_generation()?;
             {
                 let mut g = crdt_state.lock().await;
                 g.tombstone_space(space_id);
             }
-            fence_remove_space_flush(&sync_engine, &id_hex).await;
+            // No on-disk dir to delete; the tombstone flush is best-effort (same
+            // durability model as leave_community).
+            let _ = fence_remove_space_flush(&sync_engine, &id_hex).await;
         }
         SpaceKind::Folder => {
-            {
-                let mut g = crdt_state.lock().await;
-                // Re-parent children to top-level; never cascade-delete (spec).
-                let children: Vec<crate::owner_state_types::SpaceId> = g
-                    .spaces
-                    .values()
-                    .filter(|s| s.parent == Some(space_id))
-                    .map(|s| s.id)
-                    .collect();
-                for child in children {
-                    if let Some(c) = g.spaces.get_mut(&child) {
-                        c.parent = None;
-                    }
-                }
-                g.tombstone_space(space_id);
-            }
-            fence_remove_space_flush(&sync_engine, &id_hex).await;
+            // Folders are not a live, creatable feature yet, and correct removal
+            // must re-parent each child via an HLC-bumped CRDT update (an in-place
+            // `parent = None` would be dropped by LWW sync on other devices —
+            // CodeAnt). Defer rather than ship a cross-device-divergent half-fix.
+            return Err(format!(
+                "remove_space: folder removal is not yet supported (space {id_hex}); \
+                 tracked as a ZEB-435 follow-up — needs HLC-bumped child re-parenting"
+            ));
         }
     }
     Ok(())
@@ -26041,7 +26123,11 @@ mod remove_space_tests {
 
     #[tokio::test]
     #[serial]
-    async fn left_community_is_tombstoned_and_its_dir_deleted() {
+    async fn left_community_tombstoned_but_dir_deletion_deferred_without_durable_flush() {
+        // With no owner-state SyncEngine the tombstone can't be durably flushed,
+        // so the DESTRUCTIVE on-disk delete is deferred (Qodo): the Space is
+        // tombstoned (blocking resurrection) but its bytes survive until a later
+        // remove_space confirms durability.
         let tmp = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(tmp.path());
         let id = [2u8; 16];
@@ -26065,7 +26151,57 @@ mod remove_space_tests {
         let g = cs.lock().await;
         assert!(!g.spaces.contains_key(&SpaceId(id)), "space removed");
         assert!(g.tombstones.contains(&SpaceId(id)), "tombstone written");
-        assert!(!dir.exists(), "community dir deleted (delete-forever)");
+        assert!(
+            dir.exists(),
+            "dir deletion deferred until the tombstone is durably flushed"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cleanup_community_data_deletes_dir_via_fs_fallback() {
+        // The no-registry cleanup path (node not started) is a plain fs delete —
+        // this is the deletion mechanism the durable-flush path invokes.
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let id = [6u8; 16];
+        let id_hex = hex::encode(id);
+        let dir = tmp
+            .path()
+            .join(".harmony")
+            .join("communities")
+            .join(&id_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("crdt.cbor"), b"x").unwrap();
+
+        let no_registry: Option<
+            std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+        > = None;
+        cleanup_community_data(&no_registry, &SpaceId(id), &id_hex).await;
+        assert!(!dir.exists(), "community dir deleted via fs fallback");
+    }
+
+    #[tokio::test]
+    async fn folder_removal_is_not_yet_supported() {
+        let mut os = OwnerState::default();
+        os.spaces
+            .insert(SpaceId([4; 16]), space(4, SpaceKind::Folder, false));
+        let mut child = space(8, SpaceKind::Community, true);
+        child.parent = Some(SpaceId([4; 16]));
+        os.spaces.insert(SpaceId([8; 16]), child);
+        let node = node_with(os);
+        let err = remove_space_impl(&node, hex::encode([4u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("folder removal is not yet supported"), "{err}");
+        // Folder + child untouched (no half-done in-place re-parent).
+        let cs = node.lock().unwrap().crdt_state.clone().unwrap();
+        let g = cs.lock().await;
+        assert!(g.spaces.contains_key(&SpaceId([4; 16])));
+        assert_eq!(
+            g.spaces.get(&SpaceId([8; 16])).unwrap().parent,
+            Some(SpaceId([4; 16]))
+        );
     }
 
     #[tokio::test]
@@ -26081,28 +26217,6 @@ mod remove_space_tests {
         let g = cs.lock().await;
         assert!(!g.spaces.contains_key(&SpaceId([3; 16])));
         assert!(g.tombstones.contains(&SpaceId([3; 16])));
-    }
-
-    #[tokio::test]
-    async fn folder_removal_reparents_children_to_top_level() {
-        let mut os = OwnerState::default();
-        os.spaces
-            .insert(SpaceId([4; 16]), space(4, SpaceKind::Folder, false));
-        let mut child = space(8, SpaceKind::Community, true);
-        child.parent = Some(SpaceId([4; 16]));
-        os.spaces.insert(SpaceId([8; 16]), child);
-        let node = node_with(os);
-        remove_space_impl(&node, hex::encode([4u8; 16]))
-            .await
-            .unwrap();
-        let cs = node.lock().unwrap().crdt_state.clone().unwrap();
-        let g = cs.lock().await;
-        assert!(!g.spaces.contains_key(&SpaceId([4; 16])), "folder removed");
-        assert_eq!(
-            g.spaces.get(&SpaceId([8; 16])).unwrap().parent,
-            None,
-            "child re-parented to top-level, not cascade-deleted"
-        );
     }
 }
 
