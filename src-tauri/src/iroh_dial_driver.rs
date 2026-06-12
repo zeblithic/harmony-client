@@ -96,7 +96,24 @@ fn iroh_locator(node_id: &[u8; 32]) -> String {
 /// equality is what makes `connect_peer`'s post-handshake
 /// `get_transport_unicast(zid)` lookup actually find the peer.
 pub fn deterministic_zid_hex(node_id: &[u8; 32]) -> String {
-    hex::encode(&node_id[..16])
+    // ZEB-455: zenoh's `ZenohId` is a VALUE, not a fixed-width byte string — its
+    // canonical hex (what `ZenohIdProto::from_str` accepts and `session.zid()`
+    // reports) has NO leading zeros ("Leading 0s are not valid"). `hex::encode`
+    // emits fixed-width 32-char hex, so a 16-byte prefix beginning with a zero
+    // nibble (~1/16 of identities) would be REJECTED by `zenoh::open` — killing
+    // transport for that node entirely. Strip leading-zero nibbles to the
+    // canonical form. Both consumers (`config["id"]` and the dialer's
+    // `connect_peer` target) go through this one function, so they stay equal —
+    // and now also equal `session.zid()`, which zenoh always reports stripped.
+    let hex = hex::encode(&node_id[..16]);
+    let stripped = hex.trim_start_matches('0');
+    // All-zero 16-byte prefix is unreachable for a real Ed25519 key (~2^-128);
+    // keep one nibble so the id is never an empty string.
+    if stripped.is_empty() {
+        "0".to_string()
+    } else {
+        stripped.to_string()
+    }
 }
 
 /// Run the dial driver until the hint channel closes (node stop drops the resolver's
@@ -402,6 +419,53 @@ mod tests {
         assert_eq!(
             dialer_zid, config_zid,
             "config-derived zid must equal the dialer's connect_peer target"
+        );
+    }
+
+    /// ZEB-455: zenoh's `ZenohIdProto::from_str` REJECTS leading-zero hex
+    /// ("Leading 0s are not valid"), and `session.zid()` reports the stripped
+    /// canonical form. A node whose 16-byte iroh-id prefix starts with a zero
+    /// nibble (`node_id[0] < 0x10`, ~1/16 of identities) must STILL derive a zid
+    /// zenoh accepts — otherwise `config.insert_json5("id", …)` →
+    /// `zenoh::open` fails and the node has no transport at all (and its dial
+    /// target mis-parses on every peer).
+    #[test]
+    fn deterministic_zid_hex_strips_leading_zeros_for_zenoh() {
+        let mut node_id = [0x11u8; 32];
+        node_id[0] = 0x0a; // -> hex begins "0a…"
+        let hex = deterministic_zid_hex(&node_id);
+        assert!(
+            !hex.starts_with('0'),
+            "leading-zero nibble must be stripped to match zenoh's canonical id: {hex}"
+        );
+        // The load-bearing assertion: zenoh must accept it. This is what both
+        // `config["id"]` and the dialer's `connect_peer` target parse through.
+        ZenohIdProto::from_str(&hex).expect("zenoh must accept the derived zid");
+        assert_eq!(hex, deterministic_zid_hex(&node_id), "still deterministic");
+        // config-derived == dialer-derived still holds for a leading-zero id.
+        let config_zid: ZenohIdProto = zenoh::config::ZenohId::from_str(&hex)
+            .expect("config zid parses")
+            .into();
+        assert_eq!(
+            ZenohIdProto::from_str(&hex).unwrap(),
+            config_zid,
+            "config-derived zid equals the dialer target for a leading-zero node-id too"
+        );
+    }
+
+    /// ZEB-455: distinct node-ids that differ only in a leading-zero nibble must
+    /// still yield DISTINCT zids after stripping (stripping is on the value, not
+    /// a lossy truncation).
+    #[test]
+    fn leading_zero_stripping_preserves_distinctness() {
+        let mut a = [0x11u8; 32];
+        a[0] = 0x0a;
+        let mut b = [0x11u8; 32];
+        b[0] = 0xa0; // same nibbles, different byte → different value
+        assert_ne!(
+            deterministic_zid_hex(&a),
+            deterministic_zid_hex(&b),
+            "0a… and a0… must not collide after leading-zero stripping"
         );
     }
 }
