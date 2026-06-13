@@ -118,10 +118,17 @@ so the relay's siblings can also serve R's pull — same pattern, same lock
 discipline, as the butler's dm-inbox; the blobs are opaque to the relay's fleet
 too).
 
+> **Implementation amendment (2026-06-13):** the `recipient_device` field was
+> dropped during build. Each seal uses a fresh ephemeral key → a unique
+> `sealed_blob` → a unique `ContentId`, so the content id alone distinguishes
+> per-device copies; a device label is redundant in both the key and the entry.
+> Coverage GC becomes "any ack" (`pulled_by` non-empty) — only the device a blob
+> was sealed to can open + ack its content id, so a single ack means the intended
+> device received it.
+
 ```text
 RelayHoldEntry {
   recipient_owner: [u8;16],
-  recipient_device: [u8;16],   // which R device the copy is sealed to
   sender_owner: [u8;16],
   community_id: SpaceId,
   sealed_blob: Vec<u8>,        // opaque to the relay
@@ -131,9 +138,9 @@ RelayHoldEntry {
 }
 ```
 
-- **Key** = `{recipient_owner_hex}:{recipient_device_hex}:{ContentId(sealed_blob)_hex}`
+- **Key** = `{recipient_owner_hex}:{ContentId(sealed_blob)_hex}`
   (`space_id`/`message_cid` are sealed and unavailable, so the content address
-  of the sealed blob is the dedup key).
+  of the sealed blob is the dedup key — unique per seal).
 - **Caps** (enforced atomically inside the persist critical section, reusing the
   dm-inbox cap pattern): per-`(community_id, sender_owner)` cap
   (`RELAY_HOLD_PER_SENDER_CAP`, e.g. 64) + global cap
@@ -141,10 +148,10 @@ RelayHoldEntry {
   (idempotent redelivery).
 - **TTL** = 30 days (`RELAY_HOLD_TTL_MS`, reuse `INBOX_TTL_MS`).
 - **GC** (reuse the dm-inbox sweep + one-sweep deferral): each entry is sealed
-  to exactly one `recipient_device`, so an entry is **covered** once that device
-  has pulled+acked it (`recipient_device ∈ pulled_by`); remove a covered **or**
-  TTL-expired entry, with a one-sweep deferral so the `pulled_by` update
-  replicates across the relay's fleet before removal.
+  to exactly one device, so an entry is **covered** once it has been pulled+acked
+  (`pulled_by` non-empty — only the sealed-to device can open + ack it); remove a
+  covered **or** TTL-expired entry, with a one-sweep deferral so the `pulled_by`
+  update replicates across the relay's fleet before removal.
 
 ### D39 — Retrieval: PULL over a query ALPN
 
@@ -163,9 +170,12 @@ RelayPullAck    { content_ids: Vec<[u8;32]> }   // blobs successfully opened+ing
    of C, and the frame sig to verify against the requester's device key. This
    gates pull to R's own devices (defeats held-mail enumeration / traffic
    analysis by third parties; the blobs are sealed regardless).
-2. The relay returns all held entries whose `recipient_owner == R` (the
-   `recipient_device` filter is unnecessary — R opens only the copies sealed to
-   one of its devices and ignores the rest).
+2. The relay returns all held entries whose `recipient_owner == R` — R opens
+   only the copies sealed to one of its devices and ignores the rest. (The pull
+   response is intentionally recipient-scoped, not community-scoped: the
+   `community_id` on the query is the membership-liveness gate of step 1, not a
+   response filter. Confidentiality holds regardless — every blob is sealed to
+   R's device.)
 3. R opens each blob it can (`open_from_owner_with_info` with each local device
    X25519), then feeds the recovered `DepositPayload` through the **normal
    receive path** — `verify_cidnotify_admission` (cidnotify sig, device→owner
@@ -206,17 +216,21 @@ path where today there is none.
 ### D41 — Wire: new ALPNs + HKDF info + sig domains, byte-pinned
 
 - Deposit ALPN `harmony/community-relay-deposit/v1`; frame
-  `RelayDepositFrame { recipient_owner:[u8;16], recipient_device:[u8;16],
-  sender_owner:[u8;16], community_id:SpaceId, sender_enrollment_cert:Vec<u8>,
-  sig:Vec<u8>, sealed_blob:Vec<u8> }` (the P1 `DepositFrame` + `community_id` +
-  `recipient_device`). Canonical CBOR, strict decode, byte-pinned fixture.
+  `RelayDepositFrame { recipient_owner:[u8;16], sender_owner:[u8;16],
+  community_id:SpaceId, sender_enrollment_cert:Vec<u8>, sig:Vec<u8>,
+  sealed_blob:Vec<u8> }` (the P1 `DepositFrame` + `community_id`; no
+  `recipient_device` per the amendment above). Canonical CBOR, strict decode,
+  byte-pinned fixture.
 - Pull ALPN `harmony/community-relay-pull/v1`; `RelayPullQuery` /
   `RelayPullResponse` / `RelayPullAck` as in `D39`. Canonical CBOR, strict
   decode, byte-pinned fixtures.
 - HKDF info `b"harmony-zeb-458-community-relay-v1"`; deposit sig domain
-  `b"harmony-zeb-458-community-relay-deposit-v1"`; pull sig domain
-  `b"harmony-zeb-458-community-relay-pull-v1"`. All distinct from the P1 butler
-  strings (no cross-protocol confusion).
+  `b"harmony-zeb-458-community-relay-deposit-v1"`; pull-query sig domain
+  `b"harmony-zeb-458-community-relay-pull-v1"`; pull-**ack** sig domain
+  `b"harmony-zeb-458-community-relay-pull-ack-v1"` (the ack signs
+  `domain ‖ recipient_owner ‖ community_id ‖ sorted(content_ids)` so it is
+  self-authenticating + replay-distinct from the query — review hardening). All
+  distinct from the P1 butler strings (no cross-protocol confusion).
 
 ### D42 — Scope: DM + group-DM only
 
