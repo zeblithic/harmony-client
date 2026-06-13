@@ -437,15 +437,19 @@ impl ChannelLogEngine {
             let closing_notify = Arc::clone(&engine.closing_notify);
             tokio::spawn(async move {
                 loop {
-                    // ZEB-288: re-check `closing` at the top of every
-                    // iteration. `notify_waiters()` stores no permit — if
-                    // `shutdown()` lands while this loop is inside
-                    // `process_inbound_packet` (not parked in the select),
-                    // the wake is lost, and under continuous inbound flow
-                    // the biased recv arm wins every iteration, so the
-                    // notified() arm alone can never observe the flag. A
-                    // "stopped" engine would then keep processing until
-                    // the adapter drops the channel.
+                    // ZEB-288: cheap early-out — skip the decrypt/verify
+                    // work once shutdown has been signalled. This is an
+                    // OPTIMIZATION, not the durability guarantee.
+                    // `notify_waiters()` stores no permit, so a shutdown
+                    // that lands while this loop is inside
+                    // `process_inbound_packet` is not observed here until
+                    // the next iteration, and the biased recv arm can
+                    // still win one more time. The AUTHORITATIVE guard
+                    // that no event is appended after shutdown's flush
+                    // lives under the `log` lock in
+                    // `process_inbound_packet` step 3 — see the note
+                    // there. (CodeAnt: the top-of-loop check alone leaves
+                    // a post-flush-append window open.)
                     if closing.load(Ordering::SeqCst) {
                         break;
                     }
@@ -926,9 +930,27 @@ impl ChannelLogEngine {
             }
         }
 
-        // 3. Append.
+        // 3. Append. The `closing` check MUST sit under the `log` lock —
+        // the same lock `flush_now()` takes — so it is atomic w.r.t.
+        // shutdown's synchronous flush (ZEB-288, CodeAnt Critical).
+        // `shutdown()` orders `closing = true` strictly BEFORE
+        // `flush_now()`, so once we hold the lock:
+        //   * closing == false ⟹ the store-then-flush sequence has not
+        //     started, so the flush that follows will pick up this
+        //     append (it runs after we release the lock);
+        //   * closing == true  ⟹ shutdown is past the store and may have
+        //     already flushed, so we must NOT append — doing so would
+        //     strand an unflushed event and violate shutdown's "the
+        //     in-memory tail is on disk by the time it returns" contract.
+        // A dropped inbound packet is re-fetched via backfill on the next
+        // engine start; the design already tolerates that (and the
+        // replay-tracker advance at step 2c is discarded on shutdown,
+        // since the tracker is rebuilt from the on-disk log at boot).
         let appended = {
             let mut log = self.log.lock().await;
+            if self.closing.load(Ordering::SeqCst) {
+                return;
+            }
             match log.append(event.clone()) {
                 Ok(_seal_ready) => true,
                 Err(e) => {
@@ -2641,6 +2663,43 @@ mod tests {
 
         let listed = fix.engine.list_messages(None, 100).await.expect("list");
         assert_eq!(listed.len(), 1, "replay must be dropped");
+    }
+
+    #[tokio::test]
+    async fn closing_engine_drops_inbound_without_appending() {
+        // ZEB-288 durability guard (CodeAnt Critical): once `shutdown()`
+        // has set `closing` (and may already have run its synchronous
+        // `flush_now()`), an inbound packet that passes decrypt+verify
+        // must NOT be appended — appending after the flush would strand
+        // an unflushed event past shutdown's "tail is on disk on return"
+        // contract. We drive `process_inbound_packet` directly with
+        // `closing` already set so the step-3 under-lock guard is the
+        // thing under test (deterministic — no shutdown timing race).
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let hlc = Hlc {
+            wall_ms: 7_500,
+            logical: 0,
+            device_id: "remote".to_string(),
+        };
+        let event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            hlc,
+            "arrives-during-shutdown",
+            &fix.signing_key,
+        );
+        let packet = encrypt_channel_packet(&fix.channel_key, &event).expect("encrypt");
+
+        fix.engine.closing.store(true, Ordering::SeqCst);
+        fix.engine.process_inbound_packet(packet).await;
+
+        let listed = fix.engine.list_messages(None, 100).await.expect("list");
+        assert!(
+            listed.is_empty(),
+            "a closing engine must not append inbound packets (got {})",
+            listed.len()
+        );
     }
 
     // ── Sub-task 2D: flush loop ───────────────────────────────────────
