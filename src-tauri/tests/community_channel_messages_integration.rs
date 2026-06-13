@@ -368,16 +368,27 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         }
     }
 
-    // Wait for B to receive all 100.
+    // Wait for B's live deliveries. ZEB-288: this is a FLOOR, not 100.
+    // The publisher channel above is cap-64 and documented droppable
+    // under scheduler starvation; CI suite load can drop a handful of
+    // the 100 live publishes, and a dropped live event is unrecoverable
+    // until the Phase-3 re-spawn (the spawn-time backfill driver
+    // latched on an empty log before Phase 1 began). No timeout is long
+    // enough for a dropped-not-delayed event, so Phase 1 asserts the
+    // live path delivers AT VOLUME; the loss-free guarantee is Phase
+    // 3's ≥150 completeness assert, which is drop-tolerant by
+    // construction (backfill dedupes B's disk log and delivers exactly
+    // the missing remainder, landing the counter on 150 regardless).
+    const LIVE_DELIVERY_FLOOR: usize = 90;
     wait_until(
         || {
             let received_b = Arc::clone(&received_b);
-            async move { received_b.lock().expect("received_b lock").len() >= 100 }
+            async move { received_b.lock().expect("received_b lock").len() >= LIVE_DELIVERY_FLOOR }
         },
         Duration::from_secs(30),
     )
     .await
-    .expect("B should receive 100 live");
+    .expect("B should receive >= LIVE_DELIVERY_FLOOR live");
 
     // ── Phase 2: B disconnect; A posts 50 more ───────────────────────
     // Stop B's engine + adapter. The on-disk segments persist (spec
@@ -463,18 +474,17 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         .await
         .expect("backfill");
 
-    // Wait for B to receive the missing 50 events (deduped against
-    // the 100 already on disk via the rebuilt replay tracker — see
-    // ChannelLogEngine::new for the boot-time tracker rebuild).
+    // Wait for B to receive every event it is missing (deduped against
+    // what's already on disk via the rebuilt replay tracker — see
+    // ChannelLogEngine::new for the boot-time tracker rebuild). This is
+    // the loss-free completeness assert (see the ZEB-288 note in Phase
+    // 1): every live delivery was appended to B's disk log, so backfill
+    // serves exactly the missing remainder and the counter lands on
+    // precisely 150 no matter how many live publishes dropped.
     wait_until(
         || {
             let received_b = Arc::clone(&received_b);
-            async move {
-                // Live phase delivered ~100 to received_b counter; the
-                // backfill phase appends another 50 (the remaining
-                // events A posted while B was offline). Total ≈ 150.
-                received_b.lock().expect("received_b lock").len() >= 150
-            }
+            async move { received_b.lock().expect("received_b lock").len() >= 150 }
         },
         Duration::from_secs(30),
     )
