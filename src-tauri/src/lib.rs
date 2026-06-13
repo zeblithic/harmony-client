@@ -37945,6 +37945,26 @@ async fn connectivity_redeem_invite_iroh(
     state: tauri::State<'_, Mutex<NodeState>>,
     invite_url: String,
 ) -> Result<RedemptionOutcome, String> {
+    // ZEB-447: thin wrapper over the shared IPC/RPC seam. Build the
+    // NodeEventSink from the AppHandle (mirrors the `redeem_invite` IPC)
+    // and delegate. The GUI path is unchanged — the same
+    // `connectivity-invite-resolution-progress` and `nav-updated` events
+    // fan out through the AppHandle sink.
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    connectivity_redeem_invite_iroh_impl(state.inner(), sink, invite_url).await
+}
+
+/// ZEB-447: shared IPC/RPC seam for the iroh first-contact community-join
+/// verb. Takes a `NodeEventSink` instead of a `tauri::AppHandle` so the
+/// headless `serve` RPC surface can drive cross-WAN invite redemption
+/// (the GUI's REAL first-contact path: pkarr-resolve + iroh handshake +
+/// `allow_no_reticulum_destinations=true`), which the reticulum-only
+/// `redeem_invite` cannot between two never-met nodes.
+pub(crate) async fn connectivity_redeem_invite_iroh_impl(
+    state: &Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    invite_url: String,
+) -> Result<RedemptionOutcome, String> {
     // Snapshot NodeState handles in a single guard scope, then drop the
     // std lock BEFORE any `.await`. Mirrors the `redeem_invite` IPC.
     let (
@@ -38037,53 +38057,51 @@ async fn connectivity_redeem_invite_iroh(
     };
 
     // Emit staged progress events on the
-    // `connectivity-invite-resolution-progress` Tauri event so
+    // `connectivity-invite-resolution-progress` event so
     // `RedeemInviteDialog.svelte`'s `onResolutionProgress` listener can
     // surface the redemption stage to the user. ZEB-325 Phase 2c Task 4.
-    let app_for_progress_emit = app.clone();
+    // ZEB-447: forwarded through the `NodeEventSink` (GUI path delivers
+    // to the webview via the AppHandle sink; serve mode to the WS
+    // broadcast) — same event, same camelCase payload shape.
+    let progress_sink_handle = std::sync::Arc::clone(&sink);
     let progress_sink = move |payload: ResolutionProgressPayload| {
-        if let Err(e) =
-            app_for_progress_emit.emit("connectivity-invite-resolution-progress", &payload)
-        {
-            tracing::warn!(
-                error = %e,
-                stage = ?payload.stage,
-                "connectivity_redeem_invite_iroh: emit progress failed"
-            );
-        }
+        progress_sink_handle.emit(
+            "connectivity-invite-resolution-progress",
+            serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+        );
     };
 
     // ZEB-325 PR #159 R3-1 (Cursor HIGH): emit `nav-updated` after a
     // successful iroh-borne redemption so the sidebar / community list
     // refreshes without requiring the RedeemInviteDialog to drive a
     // frontend-side refresh on its own. Mirrors the Reticulum
-    // `redeem_invite` IPC's emit at lib.rs:15829, just sourced from
-    // inside the inner where we still own the dto. Tests pass a no-op
-    // closure (no AppHandle to drive).
-    let app_for_nav_emit = app.clone();
+    // `redeem_invite` IPC's emit, just sourced from inside the inner
+    // where we still own the dto. Tests pass a no-op closure (no sink
+    // events to assert). ZEB-447: forwarded through the `NodeEventSink`.
+    let nav_emit_sink_handle = std::sync::Arc::clone(&sink);
     let nav_emit_sink = move |payload: NavUpdatedPayload| {
-        if let Err(e) = app_for_nav_emit.emit("nav-updated", &payload) {
-            tracing::warn!(
-                error = %e,
-                "connectivity_redeem_invite_iroh: nav-updated emit failed"
-            );
-        }
+        nav_emit_sink_handle.emit(
+            "nav-updated",
+            serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+        );
     };
 
     // Capture the std-mutex handle + snapshot generation under a fresh
     // lock so the inner can re-check on commit (ZEB-325 PR #159 F8:
     // previously the iroh path used `|| Ok(())` and bypassed the
     // generation fence the regular `redeem_invite` IPC threads).
-    let (state_lock_for_fence, snapshot_generation_for_fence) = {
+    let snapshot_generation_for_fence = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        // `tauri::State` is `Clone`-able by value (Rust borrow-aliasing
-        // rule), so we materialize a fresh handle for the closure.
-        (state.clone(), g.generation)
+        g.generation
     };
     let fence_check = move || -> Result<(), String> {
-        let g = state_lock_for_fence
+        // ZEB-447: capture `&Mutex<NodeState>` directly (the GUI wrapper
+        // cloned the `tauri::State` smart pointer; here `state` is the
+        // borrowed mutex, valid for the whole `_impl` future which awaits
+        // the inner). Same generation + registry fence as before.
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation_for_fence {
