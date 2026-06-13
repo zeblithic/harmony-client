@@ -1030,6 +1030,12 @@ pub struct NodeState {
     /// ZEB-458 P4 Phase B: join handle for the community-relay pull driver task
     /// (populated by T11b). Held so stop_inner can abort it.
     pub community_relay_pull_driver_handle: Option<tokio::task::JoinHandle<()>>,
+    /// ZEB-458 P4 Phase B: join handle for the relay-hold GC sweep task
+    /// (populated by T11b). Held so stop_inner can abort it.
+    pub community_relay_gc_handle: Option<tokio::task::JoinHandle<()>>,
+    /// ZEB-458 P4 Phase B: join handle for the joined-communities refresher
+    /// task (populated by T11b). Held so stop_inner can abort it.
+    pub community_relay_refresher_handle: Option<tokio::task::JoinHandle<()>>,
 
     /// ZEB-418 SP2 P2: dm-outhold dataset (sender-side outbound-hold blobs,
     /// spec D12). `Some` while the node is running and an owner identity is
@@ -1454,6 +1460,8 @@ impl Default for NodeState {
             community_relay_publisher_force: None,
             community_relay_publisher_handle: None,
             community_relay_pull_driver_handle: None,
+            community_relay_gc_handle: None,
+            community_relay_refresher_handle: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles stay
             // None until start_node wires the FleetSyncEngines (mirrors
             // dm-inbox).
@@ -1960,6 +1968,12 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
             h.abort();
         }
         if let Some(h) = guard.community_relay_pull_driver_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = guard.community_relay_gc_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = guard.community_relay_refresher_handle.take() {
             h.abort();
         }
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
@@ -3146,6 +3160,8 @@ pub async fn start_node_inner(
             None;
         let mut community_relay_publisher_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut community_relay_pull_driver_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
+        let mut community_relay_gc_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
+        let mut community_relay_refresher_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut relay_sync_handles_opt: Option<crate::event_loop::RelaySyncHandles> = None;
         // ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync engines + their
         // NodeState handles. Built alongside the dm-inbox engine when an
@@ -6823,13 +6839,16 @@ pub async fn start_node_inner(
                                     );
 
                                     // Joined-communities snapshot + a refresher
-                                    // task. The driver reads it through a sync
-                                    // closure (no await), so a background task
-                                    // (re)materializes joined-ness every ~60s and
-                                    // writes the snapshot. An immediate first
-                                    // refresh runs before the loop so the startup
-                                    // pull pass has a populated set. This avoids
-                                    // any inline await into an event-loop channel.
+                                    // task. The driver reads the snapshot through
+                                    // a sync closure (no await); this spawned
+                                    // background task (re)materializes joined-ness
+                                    // on an immediate first pass then every ~60s,
+                                    // writing back the snapshot. The pull driver's
+                                    // first pass may observe an empty snapshot
+                                    // until the refresher's first pass completes
+                                    // (acceptable — the periodic pull cadence and
+                                    // the resolver wake catch up). This avoids any
+                                    // inline await into an event-loop channel.
                                     let joined_snapshot =
                                         std::sync::Arc::new(std::sync::Mutex::new(Vec::<
                                             crate::owner_state_types::SpaceId,
@@ -6842,27 +6861,29 @@ pub async fn start_node_inner(
                                         let refresher_snapshot =
                                             std::sync::Arc::clone(&joined_snapshot);
                                         let refresher_self_owner = self_owner.0;
-                                        tokio::spawn(async move {
-                                            let mut ticker = tokio::time::interval(
-                                                std::time::Duration::from_secs(60),
-                                            );
-                                            loop {
-                                                let ids = refresher_registry.known_ids().await;
-                                                let mut joined = Vec::new();
-                                                for c in ids {
-                                                    if refresher_membership
-                                                        .is_joined(&c, &refresher_self_owner)
-                                                        .await
-                                                    {
-                                                        joined.push(c);
+                                        community_relay_refresher_handle_opt =
+                                            Some(tokio::spawn(async move {
+                                                let mut ticker = tokio::time::interval(
+                                                    std::time::Duration::from_secs(60),
+                                                );
+                                                loop {
+                                                    let ids = refresher_registry.known_ids().await;
+                                                    let mut joined = Vec::new();
+                                                    for c in ids {
+                                                        if refresher_membership
+                                                            .is_joined(&c, &refresher_self_owner)
+                                                            .await
+                                                        {
+                                                            joined.push(c);
+                                                        }
                                                     }
+                                                    *refresher_snapshot
+                                                        .lock()
+                                                        .unwrap_or_else(|p| p.into_inner()) =
+                                                        joined;
+                                                    ticker.tick().await;
                                                 }
-                                                *refresher_snapshot
-                                                    .lock()
-                                                    .unwrap_or_else(|p| p.into_inner()) = joined;
-                                                ticker.tick().await;
-                                            }
-                                        });
+                                            }));
                                     }
                                     let joined_communities: crate::community_relay_pull_driver::JoinedCommunitiesFn = {
                                         let s = std::sync::Arc::clone(&joined_snapshot);
@@ -7090,12 +7111,12 @@ pub async fn start_node_inner(
                         //    sweep TTL-expired + fully-covered entries under the
                         //    doc lock; on any removal, mark dirty + durably flush
                         //    so the reclaim replicates. Installed unconditionally
-                        //    (no iroh needed — pure local CRDT GC). stop_inner's
-                        //    engine shutdown is its implicit shutdown.
+                        //    (no iroh needed — pure local CRDT GC). stop_inner
+                        //    aborts it via community_relay_gc_handle.
                         {
                             let gc_doc = std::sync::Arc::clone(&relay_hold_doc);
                             let gc_sync = std::sync::Arc::clone(&relay_hold_sync);
-                            tokio::spawn(async move {
+                            community_relay_gc_handle_opt = Some(tokio::spawn(async move {
                                 let mut ticker =
                                     tokio::time::interval(std::time::Duration::from_millis(
                                         crate::community_relay::RELAY_HOLD_GC_INTERVAL_MS,
@@ -7124,7 +7145,7 @@ pub async fn start_node_inner(
                                         }
                                     }
                                 }
-                            });
+                            }));
                         }
                     }
 
@@ -7759,6 +7780,9 @@ pub async fn start_node_inner(
                             community_relay_publisher_handle_opt.take();
                         guard.community_relay_pull_driver_handle =
                             community_relay_pull_driver_handle_opt.take();
+                        guard.community_relay_gc_handle = community_relay_gc_handle_opt.take();
+                        guard.community_relay_refresher_handle =
+                            community_relay_refresher_handle_opt.take();
                         // ZEB-418 SP2 P2: store the dm-outhold + fleet-net
                         // dataset handles (no IPC surface yet — stop_inner
                         // and the send_dm hold-write/apply-sweeper paths
@@ -47173,6 +47197,8 @@ mod start_node_race_tests {
             community_relay_publisher_force: None,
             community_relay_publisher_handle: None,
             community_relay_pull_driver_handle: None,
+            community_relay_gc_handle: None,
+            community_relay_refresher_handle: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles unused
             // in race tests.
             dm_outhold_doc: None,
