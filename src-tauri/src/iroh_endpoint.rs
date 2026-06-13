@@ -254,6 +254,26 @@ pub fn load_or_create_secret_key() -> Result<(SecretKey, bool), IrohEndpointErro
             source: e,
         }
     })?;
+    load_or_create_secret_key_inner(&legacy)
+}
+
+/// ZEB-457: [`load_or_create_secret_key`] with an injected legacy keychain
+/// entry, so integration tests can drive the REAL env-resolution wiring
+/// (`resolve_path` + `EncryptedFileStore::from_env` + the fallback
+/// orchestrator) end-to-end with a `keyring::mock` credential. The
+/// fresh-create fallback path best-effort-deletes the legacy entry — a
+/// real-keychain write that tests must never reach (ZEB-428), which rules
+/// out calling the production wrapper above from a test.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn load_or_create_secret_key_with_legacy(
+    legacy: &keyring::Entry,
+) -> Result<(SecretKey, bool), IrohEndpointError> {
+    load_or_create_secret_key_inner(legacy)
+}
+
+fn load_or_create_secret_key_inner(
+    legacy: &keyring::Entry,
+) -> Result<(SecretKey, bool), IrohEndpointError> {
     // ZEB-449: prefer the keychain vault, but fall back to an encrypted file
     // (`~/.harmony/iroh_sk.enc`, under HARMONY_PASSPHRASE) when no keychain is
     // available or usable — so headless / kill-switched nodes still get a
@@ -263,7 +283,7 @@ pub fn load_or_create_secret_key() -> Result<(SecretKey, bool), IrohEndpointErro
     // missing HOME or a malformed passphrase.
     let (key_bytes, freshly_created) = crate::identity::app_key_or_create_with_fallback(
         crate::identity::VaultSlot::Iroh,
-        &legacy,
+        legacy,
         || {
             let path = crate::identity::resolve_path(None)?.with_file_name("iroh_sk.enc");
             crate::identity::EncryptedFileStore::from_env(path)
