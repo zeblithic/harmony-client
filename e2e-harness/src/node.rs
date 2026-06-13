@@ -1,0 +1,302 @@
+//! One spawned `harmony-app serve` subprocess + an HTTP client driving it.
+
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use anyhow::Context;
+use serde_json::Value;
+use tokio::process::{Child, Command};
+
+use crate::bin_resolver::resolve_harmony_app_bin;
+
+/// Persistent config for one node. Reused across kill+relaunch so on-disk state
+/// rehydrates (the same `home` + `profile` + `passphrase`).
+#[derive(Clone)]
+pub struct NodeConfig {
+    /// Temp HOME root; the node's identity + app-data live under here.
+    pub home: PathBuf,
+    /// Named profile (lowercase `[a-z0-9][a-z0-9_-]{0,31}`); never "default".
+    pub profile: String,
+    /// File-vault passphrase (required for named profiles).
+    pub passphrase: String,
+    /// Optional dir to capture child stdout/stderr into (artifacts).
+    pub log_dir: Option<PathBuf>,
+}
+
+impl NodeConfig {
+    pub fn new(home: PathBuf, profile: &str) -> Self {
+        Self {
+            home,
+            profile: profile.to_string(),
+            passphrase: "e2e-test-passphrase".to_string(),
+            log_dir: None,
+        }
+    }
+}
+
+pub struct NodeHandle {
+    pub config: NodeConfig,
+    pub port: u16,
+    pub token: String,
+    pub base_url: String,
+    child: Option<Child>,
+    http: reqwest::Client,
+}
+
+impl NodeHandle {
+    /// Spawn `harmony-app --profile <p> serve --api-port 0` and wait until the
+    /// `api/{port,token}` discovery files appear and `/v1/status` answers.
+    pub async fn spawn(config: NodeConfig) -> anyhow::Result<Self> {
+        let bin = resolve_harmony_app_bin()?;
+        // Relaunch hygiene: a SIGKILL'd previous run (e.g. the offline step of a
+        // restart/catch-up scenario) leaves its `api/{port,token}` discovery files
+        // on disk (only a graceful shutdown removes them). Without clearing them,
+        // `wait_for_api_dir` would instantly return the DEAD process's port/token
+        // and we'd poll `/v1/status` on a dead port forever. Remove them so we
+        // wait for the freshly-spawned process to write its own.
+        remove_stale_discovery_files(&config.home);
+        let (stdout, stderr) = match &config.log_dir {
+            Some(dir) => {
+                tokio::fs::create_dir_all(dir)
+                    .await
+                    .with_context(|| format!("creating log dir {}", dir.display()))?;
+                let out =
+                    std::fs::File::create(dir.join(format!("{}.stdout.log", config.profile)))?;
+                let err =
+                    std::fs::File::create(dir.join(format!("{}.stderr.log", config.profile)))?;
+                (Stdio::from(out), Stdio::from(err))
+            }
+            None => (Stdio::null(), Stdio::null()),
+        };
+
+        let child = Command::new(&bin)
+            .arg("--profile")
+            .arg(&config.profile)
+            .arg("serve")
+            .arg("--api-port")
+            .arg("0")
+            .env("HOME", &config.home)
+            // Windows identity dir uses USERPROFILE; keep both pointed at the temp root.
+            .env("USERPROFILE", &config.home)
+            // App-data derives from XDG_DATA_HOME (Linux) / APPDATA (Windows); pin
+            // both UNDER the temp HOME so the node's `api/{port,token}` always land
+            // where `wait_for_api_dir` walks, even when the dev/CI env already sets
+            // them (CodeAnt/Qodo: data-dir not isolated). macOS uses Library under
+            // the overridden HOME and ignores XDG, so this is harmless there.
+            .env("XDG_DATA_HOME", config.home.join("xdg-data"))
+            .env("APPDATA", config.home.join("appdata"))
+            .env("HARMONY_PASSPHRASE", &config.passphrase)
+            .env("HARMONY_RETICULUM_PORT", "0")
+            .env("HARMONY_API_PORT", "0")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawning {}", bin.display()))?;
+
+        // Find the unique api/{port,token} under the temp HOME (avoids per-OS
+        // app-data path derivation). Node boot + iroh init can take ~30s.
+        let api_dir = wait_for_api_dir(&config.home, Duration::from_secs(90)).await?;
+        let port: u16 = tokio::fs::read_to_string(api_dir.join("port"))
+            .await?
+            .trim()
+            .parse()
+            .context("parsing api/port")?;
+        let token = tokio::fs::read_to_string(api_dir.join("token"))
+            .await?
+            .trim()
+            .to_string();
+        let base_url = format!("http://127.0.0.1:{port}");
+        // Per-request timeout so a wedged server surfaces as an error instead of
+        // hanging an `rpc()`/`status()` await indefinitely (Qodo: no HTTP timeout).
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("building reqwest client")?;
+
+        let handle = Self {
+            config,
+            port,
+            token,
+            base_url,
+            child: Some(child),
+            http,
+        };
+        handle
+            .wait_until_status_running(Duration::from_secs(90))
+            .await?;
+        Ok(handle)
+    }
+
+    /// `POST /v1/rpc/{cmd}` with bearer auth + a camelCase JSON body. Returns the
+    /// 200 result, or an Err carrying the server's error string (identical to the GUI's).
+    pub async fn rpc(&self, cmd: &str, args: Value) -> anyhow::Result<Value> {
+        let resp = self
+            .http
+            .post(format!("{}/v1/rpc/{cmd}", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&args)
+            .send()
+            .await
+            .with_context(|| format!("rpc {cmd}: request failed"))?;
+        let status = resp.status();
+        // `text()` can fail after a 200 (truncated/dropped body); propagate it
+        // instead of masking a transport failure as an empty body (CodeRabbit).
+        let body = resp.text().await.with_context(|| {
+            format!(
+                "rpc {cmd}: reading response body (HTTP {})",
+                status.as_u16()
+            )
+        })?;
+        if status.as_u16() == 200 {
+            // An empty 200 body is a legitimate null result (e.g. start_node);
+            // a non-empty body that fails to parse is a real error, not a silent
+            // null (Qodo: rpc hides parse errors).
+            if body.trim().is_empty() {
+                return Ok(Value::Null);
+            }
+            return serde_json::from_str(&body)
+                .with_context(|| format!("rpc {cmd}: 200 body is not valid JSON: {body}"));
+        }
+        let server_err = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str().map(str::to_string)))
+            .unwrap_or(body);
+        anyhow::bail!("rpc {cmd} -> HTTP {}: {server_err}", status.as_u16())
+    }
+
+    pub async fn status(&self) -> anyhow::Result<Value> {
+        let resp = self
+            .http
+            .get(format!("{}/v1/status", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        // Check the HTTP code (a 401/500 is a real server error, not a non-ready
+        // node) and propagate body-read failures (Cursor: status skips code check).
+        let code = resp.status();
+        let body = resp
+            .text()
+            .await
+            .with_context(|| format!("status: reading response body (HTTP {})", code.as_u16()))?;
+        if code.as_u16() != 200 {
+            anyhow::bail!("status -> HTTP {}: {body}", code.as_u16());
+        }
+        serde_json::from_str(&body)
+            .with_context(|| format!("status: body is not valid JSON: {body}"))
+    }
+
+    async fn wait_until_status_running(&self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        // Remember the last status error so a persistent server error (e.g. a 401)
+        // surfaces its message on timeout instead of a bare "never running".
+        // Connection-refused while the node is still binding is the expected early
+        // case and is simply retried.
+        let mut last_err = String::from("(status never answered)");
+        loop {
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "node {} never reported running=true within {timeout:?}; last status: {last_err}",
+                    self.config.profile
+                );
+            }
+            match self.status().await {
+                Ok(s) if s.get("running").and_then(Value::as_bool) == Some(true) => return Ok(()),
+                Ok(_) => last_err = "running=false".to_string(),
+                Err(e) => last_err = e.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    /// Hard offline: SIGKILL the child (no graceful shutdown).
+    pub async fn kill(&mut self) -> anyhow::Result<()> {
+        if let Some(mut child) = self.child.take() {
+            child.start_kill().ok();
+            let _ = child.wait().await;
+        }
+        Ok(())
+    }
+
+    /// Graceful shutdown via the API, then ensure the child is gone.
+    pub async fn shutdown(&mut self) -> anyhow::Result<()> {
+        let _ = self
+            .http
+            .post(format!("{}/v1/shutdown", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await;
+        if let Some(mut child) = self.child.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
+            child.start_kill().ok();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NodeHandle {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+/// Remove any stale `api/port` + `api/token` discovery files under `home` left
+/// by a previously-killed process, so a relaunch waits for the new process's
+/// fresh files instead of latching onto the dead one's port/token.
+fn remove_stale_discovery_files(home: &std::path::Path) {
+    for entry in walkdir::WalkDir::new(home).into_iter().flatten() {
+        let name = entry.file_name();
+        if (name == "port" || name == "token")
+            && entry
+                .path()
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|f| f == "api")
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Poll for the unique `api/` dir (containing `port` + `token`) under `home`.
+async fn wait_for_api_dir(home: &std::path::Path, timeout: Duration) -> anyhow::Result<PathBuf> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        for entry in walkdir::WalkDir::new(home).into_iter().flatten() {
+            if entry.file_name() == "port" {
+                let dir = entry.path().parent().map(PathBuf::from);
+                if let Some(dir) = dir {
+                    if dir.file_name().map(|f| f == "api").unwrap_or(false)
+                        && dir.join("token").is_file()
+                    {
+                        return Ok(dir);
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "discovery files (api/port, api/token) never appeared under {}",
+                home.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+impl NodeHandle {
+    /// Open a fresh event subscription. The caller owns the receiver + task.
+    pub async fn events(
+        &self,
+    ) -> anyhow::Result<(
+        tokio::sync::mpsc::UnboundedReceiver<crate::events::EventFrame>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        crate::events::subscribe(self.port, &self.token).await
+    }
+}

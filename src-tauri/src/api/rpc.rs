@@ -265,6 +265,18 @@ pub fn build_registry() -> RpcRegistry {
     rpc!(m, "redeem_invite", UrlArgs, |state, sink, a| async move {
         crate::redeem_invite_impl(state, sink, a.url).await
     });
+    // ZEB-447: the REAL first-contact community-join verb (pkarr-resolve +
+    // iroh handshake + allow_no_reticulum_destinations=true). The
+    // reticulum-only `redeem_invite` above cold-fails between two
+    // never-met nodes, so the two-agent E2E harness drives this instead.
+    rpc!(
+        m,
+        "connectivity_redeem_invite_iroh",
+        UrlArgs,
+        |state, sink, a| async move {
+            crate::connectivity_redeem_invite_iroh_impl(state, sink, a.url).await
+        }
+    );
     rpc!(
         m,
         "join_open_community",
@@ -637,6 +649,7 @@ mod tests {
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_list_peer_reachability",
+            "connectivity_redeem_invite_iroh",
             // network health
             "network_health_snapshot",
             "network_health_run_self_test",
