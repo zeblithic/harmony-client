@@ -1161,7 +1161,8 @@ impl DmOutbox {
                     // Rung outcomes never touch the AttemptState written
                     // above (spec §6 / P2 §4 never-worse).
                     if pre_failure_count >= crate::butler_deposit::DEPOSIT_NOACK_WINDOWS
-                        && self.butler_deposit_client.is_some()
+                        && (self.butler_deposit_client.is_some()
+                            || self.community_relay_deposit_client.is_some())
                     {
                         self.push_deposit_candidate(
                             state,
@@ -1202,7 +1203,8 @@ impl DmOutbox {
                     // delivery is never worse than today).
                     if matches!(e, TransportError::Transient(_))
                         && pre_failure_count >= 1
-                        && self.butler_deposit_client.is_some()
+                        && (self.butler_deposit_client.is_some()
+                            || self.community_relay_deposit_client.is_some())
                     {
                         self.push_deposit_candidate(
                             state,
@@ -7694,6 +7696,84 @@ mod tests {
             relay_mock.calls().is_empty(),
             "relay must NOT be called when butler acks"
         );
+    }
+
+    /// ZEB-458 P4B: when ONLY the community relay client is installed (no
+    /// butler client at all), a candidate that has reached the deposit-
+    /// candidacy threshold must still be produced and the relay rung must
+    /// fire and mark the recipient delivered.
+    ///
+    /// Before the drain_phase_c candidacy gate fix, the gate required
+    /// `butler_deposit_client.is_some()`, so no candidate was ever produced
+    /// when the butler was absent — the relay rung was never reached and the
+    /// recipient was left undelivered.  After the fix the gate accepts either
+    /// client, so the relay rung fires and delivers.
+    #[tokio::test]
+    async fn relay_rung_fires_without_butler_client() {
+        // Build the outbox manually (not via deposit_rung_fixture, which
+        // always installs a butler client).
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        let entry_id = entry.id;
+        let space_id = SpaceId([1u8; 16]);
+        let message_cid = ContentId::from_bytes([3u8; 32]);
+        install_outbox_entry(&mut state, entry);
+
+        let transport = StubTransport::new();
+        let mut o = make_outbox_synthetic("dev", alice);
+        // Intentionally do NOT call set_butler_deposit_client — butler is None.
+
+        let relay_mock = MockRelay::new(true);
+        o.set_community_relay_deposit_client(relay_mock.clone());
+
+        // Tick 1 (t=10_000): first attempt, no AttemptState yet → candidacy
+        // threshold not reached → relay must not fire.
+        let outcome1 =
+            drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+                .await;
+        assert!(outcome1.newly_delivered.is_empty());
+        assert!(
+            relay_mock.calls().is_empty(),
+            "relay must not fire before candidacy threshold"
+        );
+
+        // Tick 2 (t=15_000): AttemptState exists (failure_count ≥ 1) →
+        // candidacy gate must now be satisfied by the relay client alone →
+        // relay rung fires and acks → recipient marked delivered.
+        let outcome2 =
+            drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+                .await;
+
+        let relay_calls = relay_mock.calls();
+        assert_eq!(
+            relay_calls.len(),
+            1,
+            "relay rung must fire exactly once on tick 2"
+        );
+        assert_eq!(
+            relay_calls[0], bob,
+            "relay called for the correct recipient"
+        );
+
+        // Relay ack → delivered, surfaces in newly_delivered.
+        assert_eq!(
+            outcome2.newly_delivered,
+            vec![(space_id, message_cid, bob)],
+            "relay ack must surface in newly_delivered"
+        );
+        let stored = state.outbox.get(&entry_id).expect("entry still present");
+        assert!(
+            stored.delivered_to.contains(&bob),
+            "bob marked delivered via relay (butler-free)"
+        );
+        assert!(
+            matches!(stored.delivery_status, DeliveryStatus::Complete),
+            "sole recipient acked via relay -> Complete"
+        );
+        assert_eq!(o.backoff_len(), 0);
+        assert_eq!(o.in_flight_len(), 0);
     }
 }
 
