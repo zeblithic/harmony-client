@@ -9,3 +9,6 @@ pub use node::{NodeConfig, NodeHandle};
 
 pub mod events;
 pub use events::{await_event, EventFrame};
+
+pub mod run_dir;
+pub use run_dir::RunDir;

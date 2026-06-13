@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use e2e_harness::RunDir;
 use e2e_harness::{NodeConfig, NodeHandle};
 use serde_json::json;
 
@@ -81,4 +82,60 @@ async fn mint_emits_mint_changed_event() {
 
     drop(node);
     drop(home);
+}
+
+/// Spawn two named-profile nodes, each under its OWN temp HOME (so discovery is
+/// unambiguous), both minted, stdout/stderr captured into the run dir. Returns
+/// (run_dir, alice_home, bob_home, alice, bob). Keep both homes alive until the
+/// scenario ends.
+async fn two_minted_nodes(
+    scenario: &str,
+) -> (
+    RunDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    NodeHandle,
+    NodeHandle,
+) {
+    let run = RunDir::new(scenario).expect("run dir");
+    let alice_home = fresh_home(&format!("{scenario}-a"));
+    let bob_home = fresh_home(&format!("{scenario}-b"));
+    let mk = |home: &tempfile::TempDir, profile: &str| {
+        let mut cfg = NodeConfig::new(PathBuf::from(home.path()), profile);
+        cfg.log_dir = Some(run.log_dir());
+        cfg
+    };
+    let alice = NodeHandle::spawn(mk(&alice_home, "alice"))
+        .await
+        .expect("spawn alice");
+    let bob = NodeHandle::spawn(mk(&bob_home, "bob"))
+        .await
+        .expect("spawn bob");
+    alice
+        .rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("alice mint");
+    bob.rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("bob mint");
+    (run, alice_home, bob_home, alice, bob)
+}
+
+async fn owner_id(node: &NodeHandle) -> String {
+    let o = node
+        .rpc("get_owner_state", json!({}))
+        .await
+        .expect("get_owner_state");
+    o.get("ownerId")
+        .and_then(|v| v.as_str())
+        .expect("ownerId")
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_nodes_boot_and_mint() {
+    let (mut run, ah, bh, a, b) = two_minted_nodes("smoke").await;
+    assert_ne!(owner_id(&a).await, owner_id(&b).await, "distinct owners");
+    run.mark_success();
+    drop((a, b, ah, bh));
 }
