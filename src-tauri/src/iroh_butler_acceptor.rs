@@ -155,6 +155,12 @@ pub trait ButlerDepositCtx: Send + Sync {
     /// `OwnerState.friend_graph` under the CRDT lock.
     async fn lookup_friend(&self, sender_owner: &[u8; 16]) -> Option<([u8; 32], FriendStatus)>;
 
+    /// ZEB-424 (D27): admission fallback when `lookup_friend` is not
+    /// Active — `true` iff `sender_owner` shares a live `GroupDm` space
+    /// with this owner. Production reads `OwnerState.spaces` under the
+    /// CRDT lock via [`shares_live_group_dm_in`].
+    async fn shares_live_group_dm(&self, sender_owner: &[u8; 16]) -> bool;
+
     /// Wall-clock now in epoch-SECONDS for `EnrollmentCert` expiry checks
     /// (cert timestamps are Unix seconds — ZEB-378).
     fn now_secs(&self) -> u64;
@@ -264,6 +270,11 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
             .friends
             .get(&crate::owner_state_types::OwnerAddr(*sender_owner))
             .map(|e| (e.master_ed25519, e.status))
+    }
+
+    async fn shares_live_group_dm(&self, sender_owner: &[u8; 16]) -> bool {
+        let state = self.crdt_state.lock().await;
+        shares_live_group_dm_in(&state, &self.self_owner, sender_owner)
     }
 
     fn now_secs(&self) -> u64 {
@@ -389,9 +400,6 @@ fn decode_enrollment_cert_strict(bytes: &[u8]) -> Result<EnrollmentCert, Deposit
 /// and the sender in `members`. Spaces count is small (tens), so a linear
 /// scan needs no index (a derived index would add CRDT-merge invalidation
 /// hazards for zero measured win).
-// Wired into the deposit admission path in a later ZEB-424 task; this task
-// lands the pure predicate + its unit tests in isolation.
-#[allow(dead_code)]
 pub(crate) fn shares_live_group_dm_in(
     state: &crate::owner_state_crdt::OwnerState,
     self_owner: &[u8; 16],
@@ -850,6 +858,9 @@ mod tests {
     struct TestCtx {
         self_owner: [u8; 16],
         friends: BTreeMap<[u8; 16], ([u8; 32], FriendStatus)>,
+        /// ZEB-424: owners that share a live group-DM with self (the
+        /// `shares_live_group_dm` source). Empty by default.
+        group_co_members: std::collections::BTreeSet<[u8; 16]>,
         /// Sender DEVICE → (owner id, identity pub) — the
         /// `resolve_sender_device` source (mirrors the production
         /// `owner_device_cache` resolution).
@@ -871,6 +882,7 @@ mod tests {
             Self {
                 self_owner: BUTLER_OWNER,
                 friends,
+                group_co_members: std::collections::BTreeSet::new(),
                 device_owners,
                 butler_sk: butler_device_sk(),
                 persist_fail: false,
@@ -897,6 +909,11 @@ mod tests {
         async fn lookup_friend(&self, sender_owner: &[u8; 16]) -> Option<([u8; 32], FriendStatus)> {
             self.push_event("friend_lookup");
             self.friends.get(sender_owner).copied()
+        }
+
+        async fn shares_live_group_dm(&self, sender_owner: &[u8; 16]) -> bool {
+            self.push_event("group_lookup");
+            self.group_co_members.contains(sender_owner)
         }
 
         fn now_secs(&self) -> u64 {

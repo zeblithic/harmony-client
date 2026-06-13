@@ -270,6 +270,9 @@ struct TestButlerCtx {
     self_owner: [u8; 16],
     device_id: String,
     friends: BTreeMap<[u8; 16], ([u8; 32], FriendStatus)>,
+    /// ZEB-424: owners that share a live group-DM with self (the
+    /// `shares_live_group_dm` source). Empty by default.
+    group_co_members: std::collections::BTreeSet<[u8; 16]>,
     /// Sender DEVICE → (owner id, identity pub) — the
     /// `resolve_sender_device` source (mirrors the production
     /// `owner_device_cache` resolution).
@@ -288,6 +291,10 @@ impl ButlerDepositCtx for TestButlerCtx {
 
     async fn lookup_friend(&self, sender_owner: &[u8; 16]) -> Option<([u8; 32], FriendStatus)> {
         self.friends.get(sender_owner).copied()
+    }
+
+    async fn shares_live_group_dm(&self, sender_owner: &[u8; 16]) -> bool {
+        self.group_co_members.contains(sender_owner)
     }
 
     fn now_secs(&self) -> u64 {
@@ -590,6 +597,7 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
         self_owner: RECIPIENT_OWNER,
         device_id: a_id.clone(),
         friends: [(fx.sender.owner.0, (fx.sender_master, FriendStatus::Active))].into(),
+        group_co_members: std::collections::BTreeSet::new(),
         device_owners: [(fx.dm_device_hash, (fx.sender.owner.0, fx.identity_pub))].into(),
         butler_sk: a_sk,
         doc: Arc::clone(&a.doc),
