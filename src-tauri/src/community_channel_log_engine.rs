@@ -2728,6 +2728,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn closing_engine_publish_errors_without_appending() {
+        // ZEB-288 (CodeAnt): the LOCAL publish path must also refuse to
+        // append once shutdown has begun. Unlike the inbound path, a
+        // locally minted event has no backfill recovery, so the guard
+        // surfaces `EngineShuttingDown` rather than silently dropping —
+        // the caller must learn the post did not land.
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        fix.engine.closing.store(true, Ordering::SeqCst);
+
+        let err = Arc::clone(&fix.engine)
+            .publish(b"arrives-during-shutdown".to_vec(), None)
+            .await
+            .expect_err("publish on a closing engine must error");
+        assert!(
+            matches!(err, ChannelLogEngineError::EngineShuttingDown),
+            "expected EngineShuttingDown, got {err:?}"
+        );
+
+        let listed = fix.engine.list_messages(None, 100).await.expect("list");
+        assert!(
+            listed.is_empty(),
+            "a closing engine must not append a local publish (got {})",
+            listed.len()
+        );
+    }
+
     // ── Sub-task 2D: flush loop ───────────────────────────────────────
 
     #[tokio::test]
