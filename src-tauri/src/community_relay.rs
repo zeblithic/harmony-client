@@ -67,6 +67,19 @@ pub const RELAY_HOLD_PER_SENDER_CAP: usize = 64;
 /// Global cap on relay-held blobs (mirrors [`crate::butler_deposit::INBOX_GLOBAL_CAP`]).
 pub const RELAY_HOLD_GLOBAL_CAP: usize = 1024;
 
+/// Per-blob byte ceiling on an accepted `sealed_blob`, enforced at admission
+/// (before any crypto) so the count caps ([`RELAY_HOLD_PER_SENDER_CAP`] /
+/// [`RELAY_HOLD_GLOBAL_CAP`]) also bound the relay's byte footprint, not just
+/// the entry count. Matches the documented deposit-frame ceiling
+/// [`crate::butler_deposit::DEPOSIT_MAX_FRAME_BYTES`] (256 KiB): the sealed blob
+/// is one deposit frame's payload, so the Phase B transport frame cap already
+/// bounds it at or below this — the admission check makes the invariant
+/// explicit and independent of the transport. With the per-sender cap this
+/// bounds a single sender's hold footprint to
+/// `RELAY_HOLD_PER_SENDER_CAP * RELAY_MAX_SEALED_BLOB_BYTES` (mirroring
+/// [`crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES`]).
+pub const RELAY_MAX_SEALED_BLOB_BYTES: usize = crate::butler_deposit::DEPOSIT_MAX_FRAME_BYTES;
+
 /// TTL for un-pulled relay blobs in milliseconds (30 days, matching
 /// [`crate::butler_deposit::INBOX_TTL_MS`]).
 pub const RELAY_HOLD_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
@@ -758,6 +771,20 @@ mod tests {
         invited_state.status = MemberStatus::Invited;
         let membership =
             make_membership([(a.owner, joined_member_state(&a)), (b.owner, invited_state)]);
+        assert!(!both_joined_members(&membership, &a.owner, &b.owner));
+    }
+
+    #[test]
+    fn both_joined_members_false_when_one_pending_join() {
+        // A member whose join was minted but not yet countersigned
+        // (`JoinCountersign` pending, per ZEB-254) is `PendingJoin`, NOT
+        // `Joined` — they must not pass the relay co-membership gate.
+        let a = mint_test_owner(0x10);
+        let b = mint_test_owner(0x20);
+        let mut pending_state = joined_member_state(&b);
+        pending_state.status = MemberStatus::PendingJoin;
+        let membership =
+            make_membership([(a.owner, joined_member_state(&a)), (b.owner, pending_state)]);
         assert!(!both_joined_members(&membership, &a.owner, &b.owner));
     }
 

@@ -66,6 +66,10 @@ CRDT. On a deposit (new ALPN, before holding), the relay, in spec-§4 order:
    0 = community bind:** `frame.community_id` must name a community the relay is
    a `Joined` member of and is actively advertising relay service for. Else
    reject. (Cheapest local check first.)
+0.5. **Byte ceiling:** `frame.sealed_blob.len() <= RELAY_MAX_SEALED_BLOB_BYTES`
+   (`DEPOSIT_MAX_FRAME_BYTES`, 256 KiB), else `TooLarge`. O(1), before the
+   co-member scan and any crypto, so the count caps (`D38`) also bound byte
+   footprint. No oracle (size is sender-chosen, not membership-revealing).
 1. **Co-membership gate:** look up `frame.sender_owner` and
    `frame.recipient_owner` in C's materialized membership; **both** must be
    `Joined` (the P3b `shares_live_group_dm_in` pattern, against community
@@ -146,6 +150,14 @@ RelayHoldEntry {
   (`RELAY_HOLD_PER_SENDER_CAP`, e.g. 64) + global cap
   (`RELAY_HOLD_GLOBAL_CAP`, e.g. 1024). An occupied key bypasses caps
   (idempotent redelivery).
+- **Per-blob byte ceiling** (`RELAY_MAX_SEALED_BLOB_BYTES` =
+  `DEPOSIT_MAX_FRAME_BYTES`, 256 KiB), enforced at admission **before any
+  crypto** (step 0.5 of `D36`). Without it the count caps bound only the entry
+  count, not the byte footprint — a co-member could store max-transport-sized
+  blobs to exhaust the relay before the count cap trips. Together with the
+  per-sender count cap this bounds a single sender's footprint to
+  `RELAY_HOLD_PER_SENDER_CAP * RELAY_MAX_SEALED_BLOB_BYTES` (mirroring
+  `DM_OUTHOLD_DATASET_MAX_BYTES`). Implemented in Phase A.
 - **TTL** = 30 days (`RELAY_HOLD_TTL_MS`, reuse `INBOX_TTL_MS`).
 - **GC** (reuse the dm-inbox sweep + one-sweep deferral): each entry is sealed
   to exactly one device, so an entry is **covered** once it has been pulled+acked
@@ -185,6 +197,41 @@ RelayPullAck    { content_ids: Vec<[u8;32]> }   // blobs successfully opened+ing
 4. R sends `RelayPullAck` for the blobs it ingested; the relay records
    `pulled_by += R_device` and GCs once covered (`D38`).
 5. Anything R cannot open or that fails ingest, R simply drops (only R saw it).
+
+**Ack trust boundary (intentional, not relay-enforceable).** The relay holds
+`sealed_blob` opaque (the core confidentiality property), so it can never verify
+that an ack's signer actually *opened* the blob — `content_id =
+hash(sealed_blob)` is computable from the opaque bytes. The ack therefore proves
+only "a `Joined`-member device of `recipient_owner` received these bytes," and
+`ack ⟹ opened+ingested` is a **client-honesty contract** enforced by
+`open_and_ingest`, which acks a content id only after a successful open + decode
++ ingest. A buggy/malicious ack-without-open is bounded to R's **own** fleet (the
+ack cert anchors to `recipient_owner`; no other owner can forge one) — R can only
+harm R's own delivery. *Phase B requirement:* the background pull driver MUST ack
+a content id only **after** its ingest is durably persisted, so a crash between
+ack and persist cannot both GC the entry and lose the deposit.
+
+**GC scope is recipient-owner-scoped, not community-scoped (intentional).** The
+hold key is `(recipient_owner, content_id)` with no community component, and
+`held_for` is recipient-scoped (step 2). A recipient who is a `Joined` member of
+community A can therefore ack — and GC — a blob that was deposited via community
+B's gate, even if R has since left B. This is acceptable and correct: the ack
+means R's fleet has the bytes (R could open it because it was sealed to R's
+device at deposit time, independent of current B membership), so the relay's
+delivery job is done. The `community_id` on the pull/ack is a membership-liveness
+**spam gate** (R must be a live member of *some* community the relay serves to
+talk to it), not a per-blob authorization. The blast radius is self-harm only
+(requires R's own device key).
+
+**Wire-envelope shape (Phase B shell decision).** `RelayPullQuery` is a
+self-contained frame (embeds `recipient_owner`, `community_id`, cert, sig);
+`RelayPullAck` carries only `content_ids`, and the Phase A core
+`handle_relay_pull_ack` takes the recipient owner / community / cert / sig as
+separate parameters (it re-authenticates each ack independently rather than
+trusting pull-session state). Phase B's pull-acceptor shell decides whether to
+make `RelayPullAck` self-contained (symmetric with the query) or to thread those
+fields from the authenticated session; the core handler's signature already
+accepts them explicitly so either envelope shape wires in without a core change.
 
 Poll cadence: on coming online, on C-state sync (a new relay ad appears), and a
 periodic floor; no exponential backoff latch is needed (unlike P3a backfill —
@@ -267,9 +314,13 @@ working-fallback bar.
 
 Unit:
 - Admission: `(S,R) ∈ Joined(C)` → accept; either not `Joined` (Left/Banned/
-  Invited/absent) → reject; community the relay doesn't serve → reject;
-  cert/owner-id/master-anchor mismatch → `BadCert`; frame-sig mismatch →
+  Invited/`PendingJoin`/absent) → reject; community the relay doesn't serve →
+  reject; cert/owner-id/master-anchor mismatch → `BadCert`; frame-sig mismatch →
   `BadSig`. Reject path is pre-hold (no blob stored on reject).
+- Byte ceiling: `sealed_blob` one byte over `RELAY_MAX_SEALED_BLOB_BYTES` →
+  `TooLarge`, rejected at step 0.5 (before the co-member scan / any crypto /
+  any persist); a blob exactly at the ceiling passes the size gate (inclusive
+  boundary).
 - Seal/open round-trip: a blob sealed to an R butler device opens with that
   device's X25519 and **fails** to open with the relay's key (assert the relay
   cannot read it).

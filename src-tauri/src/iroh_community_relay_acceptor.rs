@@ -44,6 +44,7 @@ use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
 use crate::community_relay::{
     relay_deposit_sig_payload, relay_pull_ack_sig_payload, relay_pull_sig_payload, RelayDepositAck,
     RelayDepositFrame, RelayHeldBlob, RelayPullAck, RelayPullQuery, RelayPullResponse,
+    RELAY_MAX_SEALED_BLOB_BYTES,
 };
 use crate::community_relay_hold_crdt::{RelayHoldDoc, RelayHoldEntry};
 use crate::owner_state_types::{Hlc, SpaceId};
@@ -76,6 +77,12 @@ pub enum RelayDepositReject {
     /// Sender or recipient (or both) are not Joined members of the community.
     #[error("sender or recipient is not a co-member of the community")]
     NotCoMember,
+    /// `frame.sealed_blob` exceeds [`RELAY_MAX_SEALED_BLOB_BYTES`]. Rejected at
+    /// admission (before any crypto) so the count caps also bound byte
+    /// footprint — a co-member cannot store max-transport-sized blobs to
+    /// exhaust the relay before the count cap trips.
+    #[error("relay deposit sealed_blob exceeds byte ceiling")]
+    TooLarge,
     /// The embedded `EnrollmentCert` failed to decode, failed verification,
     /// is not Master-issued, has `owner_id != frame.sender_owner`, or its
     /// master key does not match the owner-id-derived anchor.
@@ -185,6 +192,16 @@ pub async fn handle_relay_deposit_core(
     // community. Cheapest local check, before any peer-state lookup or crypto.
     if !ctx.serves_community(&frame.community_id).await {
         return Err(RelayDepositReject::WrongCommunity);
+    }
+
+    // Step 0.5 — byte ceiling: reject an oversized sealed_blob BEFORE the
+    // O(members) co-member scan or any crypto. This makes the count caps
+    // (per-sender / global) also bound the relay's byte footprint, so a
+    // co-member cannot exhaust the hold with max-transport-sized blobs before
+    // the count cap trips. O(1), no oracle leak (size is sender-chosen, not
+    // membership-revealing).
+    if frame.sealed_blob.len() > RELAY_MAX_SEALED_BLOB_BYTES {
+        return Err(RelayDepositReject::TooLarge);
     }
 
     // Step 1 — co-membership admission: both the sender and the recipient
@@ -901,6 +918,63 @@ mod tests {
             "no persist on WrongCommunity: {ev:?}"
         );
         assert!(ctx.store.lock().unwrap().is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // Test 2.5: oversized sealed_blob → TooLarge, BEFORE the co-member
+    // scan / any crypto / any persist (step 0.5).
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_oversized_sealed_blob_rejected_before_co_member_scan() {
+        let f = valid_fixture();
+        let ctx = TestRelayDepositCtx::for_fixture(&f);
+
+        // Inflate sealed_blob one byte past the ceiling. The sig will no longer
+        // match, but the size check (step 0.5) fires before sig verification
+        // (step 3) — and before the co-member scan (step 1) and any persist.
+        let mut frame = f.frame.clone();
+        frame.sealed_blob = vec![0u8; RELAY_MAX_SEALED_BLOB_BYTES + 1];
+
+        let err = handle_relay_deposit_core(&frame, &ctx)
+            .await
+            .expect_err("oversized sealed_blob must be rejected");
+        assert!(matches!(err, RelayDepositReject::TooLarge), "got {err:?}");
+
+        let ev = ctx.events();
+        assert!(
+            ev.iter().any(|e| e == "serves_community"),
+            "must probe serves_community first"
+        );
+        assert!(
+            !ev.iter().any(|e| e == "both_co_members"),
+            "size check must precede the co-member scan: {ev:?}"
+        );
+        assert!(
+            !ev.iter().any(|e| e.starts_with("persist:")),
+            "no persist on TooLarge: {ev:?}"
+        );
+        assert!(ctx.store.lock().unwrap().is_empty());
+    }
+
+    // A sealed_blob exactly at the ceiling is NOT rejected by the size gate
+    // (it fails later at sig verification, proving the boundary is inclusive).
+    #[tokio::test]
+    async fn relay_sealed_blob_at_ceiling_passes_size_gate() {
+        let f = valid_fixture();
+        let ctx = TestRelayDepositCtx::for_fixture(&f);
+
+        let mut frame = f.frame.clone();
+        frame.sealed_blob = vec![0u8; RELAY_MAX_SEALED_BLOB_BYTES];
+
+        let err = handle_relay_deposit_core(&frame, &ctx)
+            .await
+            .expect_err("tampered (but ceiling-sized) blob fails later, not at the size gate");
+        // Past the size gate: rejected at sig verification, NOT TooLarge.
+        assert!(
+            matches!(err, RelayDepositReject::BadSig),
+            "ceiling-sized blob must pass the size gate and fail at sig: got {err:?}"
+        );
     }
 
     // ----------------------------------------------------------------
