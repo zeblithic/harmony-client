@@ -166,6 +166,7 @@ pub mod identity_commands;
 pub mod inbound_packet;
 pub mod invite_mint;
 pub mod iroh_butler_acceptor;
+pub mod iroh_community_relay_acceptor;
 pub mod iroh_endpoint;
 pub mod iroh_friend_acceptor;
 pub mod iroh_invite_acceptor;
