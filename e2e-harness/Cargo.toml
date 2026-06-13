@@ -1,0 +1,27 @@
+[package]
+name = "e2e-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "ZEB-447 two-agent end-to-end scenario harness for harmony-client (spawns real `serve` nodes)."
+
+[features]
+# Scenario tests spawn the real harmony-app binary + real transport; they are
+# slow and network-touching, so they are OFF by default. Run deliberately:
+#   cargo nextest run --features e2e
+e2e = []
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "net", "io-util", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+anyhow = "1"
+tempfile = "3"
+walkdir = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "net", "io-util", "fs"] }
