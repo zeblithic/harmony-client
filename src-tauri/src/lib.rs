@@ -124,6 +124,7 @@ pub mod community_membership;
 pub mod community_relay;
 pub mod community_relay_announce;
 pub mod community_relay_hold_crdt;
+pub mod community_relay_optin;
 pub mod community_relay_pull;
 pub mod community_relay_resolver;
 pub mod community_state_crdt;
