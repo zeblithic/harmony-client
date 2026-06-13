@@ -154,6 +154,23 @@ is admitted on group membership via the derived anchor — group membership
 is independent of friend status, and the stale revoked-friend master is
 deliberately not consulted.
 
+**Defense-in-depth, confirmed during implementation:** `EnrollmentCert::
+verify()` (run in step 2 *before* the master binding) already rejects
+`hash(master) != owner_id` (the `EnrollmentCertInvalid` taxonomy in
+`community_membership.rs`). Since step 2 also requires `cert.owner_id ==
+sender_owner`, any cert reaching the binding match necessarily satisfies
+the derived check — so the co-member branch (like the long-standing friend
+pin) is belt-and-suspenders, not a live rejection path for a well-formed
+cert. We keep both explicit pins anyway: they make each path's trust anchor
+self-evident and stay correct if `verify()`'s internal owner_id↔master
+binding is ever refactored away. This is also why a forged-master rejection
+is **not unit-tested** (D34) — such a cert cannot pass `verify()` via the
+real cert-minting helpers, so the test would be unreachable; the friend-pin
+regression test + integration coverage exercise the binding instead. The
+security guarantee for co-member admission rests on exactly this: a valid
+Master cert for `sender_owner` can only be minted by `sender_owner`'s own
+master.
+
 ### D30 — Churn semantics: eventual consistency, both windows accepted
 
 Membership changes propagate to the butler via normal owner-state CRDT sync
@@ -222,10 +239,11 @@ Unit (acceptor, mock ctx — extend `iroh_butler_acceptor.rs` tests):
 - co-member of a **left** group (`left_at = Some`) → rejected;
 - co-member of a `Dm`/`Channel`/`Community` space only → rejected
   (kind gate);
-- **co-member cert anchor (D29.1):** a co-member whose cert master does NOT
-  hash to `sender_owner` (`owner_id_from_master_ed25519(cert_master) !=
-  sender_owner`) → `BadCert`, even though admission passed — the derived
-  anchor is the co-member's only master pin;
+- **co-member cert anchor (D29.1):** *intentionally not unit-tested* — the
+  derived check is unreachable as a rejection because `cert.verify()` already
+  binds `hash(master) == owner_id` (see D29.1 "defense-in-depth"); a forged
+  cert can't pass `verify()` via the real minting helpers. The binding is
+  covered by the friend-pin regression + the integration path instead;
 - **friend path unchanged:** a friend-Active sender whose cert master
   mismatches the *pinned* `friend_master` → `BadCert` (regression that the
   friend branch still pins, not the derived check).

@@ -476,6 +476,17 @@ pub async fn handle_deposit_core(
     // the owner id (the owner id IS the hash of the master bundle —
     // `owner_id_from_master_ed25519`; the invariant
     // `iroh_friend_acceptor::master_ed25519_from_cert_matches_owner_id` pins it).
+    //
+    // Both branches are defense-in-depth: `cert.verify()` above already
+    // rejects `hash(master) != owner_id` (the `EnrollmentCertInvalid` taxonomy
+    // in community_membership.rs), and we already require `cert.owner_id ==
+    // sender_owner`, so any cert reaching here necessarily satisfies the
+    // derived check. We keep an EXPLICIT per-variant pin anyway — the friend
+    // branch as the long-standing trust anchor, the co-member branch to make
+    // that anchor self-evident and resilient if `verify`'s internal
+    // owner_id↔master binding ever moves. Neither is expected to be a live
+    // rejection path for a well-formed cert; that's why a forged-master unit
+    // test is intentionally omitted (such a cert can't pass `verify()`).
     match admission {
         Admission::Friend(friend_master) => {
             if cert_master != friend_master {
