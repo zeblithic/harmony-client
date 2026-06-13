@@ -439,6 +439,13 @@ pub struct DmOutbox {
     /// `set_butler_deposit_client` at start_node (only when the iroh
     /// endpoint bound); outbox tests inject a mock.
     butler_deposit_client: Option<Arc<dyn crate::butler_deposit::ButlerDepositClient>>,
+    /// ZEB-458 P4 Phase B: last-resort community-relay deposit client. `None`
+    /// (default) disables the relay rung entirely. Fires ONLY when the butler
+    /// rung did not ack for a given candidate. Production injects the real
+    /// client via `set_community_relay_deposit_client` at start_node; tests
+    /// inject a mock.
+    community_relay_deposit_client:
+        Option<Arc<dyn crate::community_relay::CommunityRelayDepositClient>>,
     /// ZEB-418 SP2 P2 Task 3: outbound-hold side-table. `None` (default)
     /// disables the hold write entirely — send_dm behaves exactly as before.
     /// Production installs both via `set_outhold` at start_node alongside the
@@ -494,6 +501,7 @@ impl DmOutbox {
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
             butler_deposit_client: None,
+            community_relay_deposit_client: None,
             outhold_doc: None,
             outhold_notify: None,
         }
@@ -528,6 +536,7 @@ impl DmOutbox {
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
             butler_deposit_client: None,
+            community_relay_deposit_client: None,
             outhold_doc: None,
             outhold_notify: None,
         }
@@ -542,6 +551,18 @@ impl DmOutbox {
         client: Arc<dyn crate::butler_deposit::ButlerDepositClient>,
     ) {
         self.butler_deposit_client = Some(client);
+    }
+
+    /// ZEB-458 P4 Phase B: install the last-resort community-relay deposit
+    /// client. Until this is called the relay rung is disabled. The relay
+    /// rung fires ONLY when the butler rung did not ack for a given
+    /// candidate — it is strictly additive, never a replacement for the
+    /// butler or direct paths.
+    pub fn set_community_relay_deposit_client(
+        &mut self,
+        client: Arc<dyn crate::community_relay::CommunityRelayDepositClient>,
+    ) {
+        self.community_relay_deposit_client = Some(client);
     }
 
     /// ZEB-418 SP2 P2 Task 3: install the outbound-hold doc + dirty-notify.
@@ -902,27 +923,59 @@ impl DmOutbox {
         // through the existing idempotent `mark_ack_delivered`; every
         // other outcome leaves the entry exactly as the transient direct
         // failure left it (spec §6).
+        //
+        // ZEB-458 P4 Phase B: clone both clients into locals before the
+        // loop so the borrow of `self` for `mark_ack_delivered` (which
+        // takes `&mut self`) inside the loop doesn't conflict with a live
+        // borrow of `self.community_relay_deposit_client`.
         if !deposit_candidates.is_empty() {
-            if let Some(client) = self.butler_deposit_client.clone() {
+            let butler_client = self.butler_deposit_client.clone();
+            let relay_client = self.community_relay_deposit_client.clone();
+            if butler_client.is_some() || relay_client.is_some() {
                 for c in deposit_candidates {
-                    match client.deposit(&c).await {
-                        crate::butler_deposit::DepositRungOutcome::Acked => {
-                            if self.mark_ack_delivered(state, c.entry_id, c.recipient_owner) {
+                    let butler_acked = if let Some(ref client) = butler_client {
+                        let butler_outcome = client.deposit(&c).await;
+                        let acked = matches!(
+                            butler_outcome,
+                            crate::butler_deposit::DepositRungOutcome::Acked
+                        );
+                        match butler_outcome {
+                            crate::butler_deposit::DepositRungOutcome::Acked => {
+                                if self.mark_ack_delivered(state, c.entry_id, c.recipient_owner) {
+                                    outcome.newly_delivered.push((
+                                        c.space_id,
+                                        c.message_cid,
+                                        c.recipient_owner,
+                                    ));
+                                }
+                            }
+                            crate::butler_deposit::DepositRungOutcome::SkippedNoFreshButlerSet => {}
+                            crate::butler_deposit::DepositRungOutcome::Failed(e) => {
+                                tracing::debug!(
+                                    entry_id = ?c.entry_id,
+                                    recipient = ?c.recipient_owner,
+                                    error = %e,
+                                    "ZEB-418: butler deposit rung failed; existing retry chain continues"
+                                );
+                            }
+                        }
+                        acked
+                    } else {
+                        false
+                    };
+                    // ZEB-458 P4: last-resort community relay rung — only if
+                    // the butler did not ack.
+                    if !butler_acked {
+                        if let Some(ref relay) = relay_client {
+                            if relay.deposit(&c).await
+                                && self.mark_ack_delivered(state, c.entry_id, c.recipient_owner)
+                            {
                                 outcome.newly_delivered.push((
                                     c.space_id,
                                     c.message_cid,
                                     c.recipient_owner,
                                 ));
                             }
-                        }
-                        crate::butler_deposit::DepositRungOutcome::SkippedNoFreshButlerSet => {}
-                        crate::butler_deposit::DepositRungOutcome::Failed(e) => {
-                            tracing::debug!(
-                                entry_id = ?c.entry_id,
-                                recipient = ?c.recipient_owner,
-                                error = %e,
-                                "ZEB-418: butler deposit rung failed; existing retry chain continues"
-                            );
                         }
                     }
                 }
@@ -2107,7 +2160,7 @@ pub async fn drain_lifted(
     // returns, the event_loop is free to pump cas_op_rx, so any holder
     // of outbox/state can release.
     tokio::spawn(async move {
-        let (outcome, deposit_candidates, deposit_client) = {
+        let (outcome, deposit_candidates, deposit_client, relay_client) = {
             let mut o_g = outbox.lock().await;
             let mut s_g = state.lock().await;
             // ZEB-233 round 1 (Qodo Correctness #1) + round 3 (CodeRabbit
@@ -2126,9 +2179,12 @@ pub async fn drain_lifted(
             let (outcome, candidates) =
                 o_g.drain_phase_c(&mut s_g, results, skipped, backoff_now_ms, wall_now_ms);
             let client = o_g.butler_deposit_client.clone();
+            // ZEB-458 P4 Phase B: also capture the relay client so the
+            // last-resort rung can fire after the butler rung per candidate.
+            let relay = o_g.community_relay_deposit_client.clone();
             // Locks drop at the end of this block — before any IPC emit
-            // and before the deposit rung's network I/O below.
-            (outcome, candidates, client)
+            // and before the deposit rungs' network I/O below.
+            (outcome, candidates, client, relay)
         };
         for (space_id, message_cid, recipient) in outcome.newly_delivered {
             let payload = serde_json::json!({
@@ -2154,34 +2210,78 @@ pub async fn drain_lifted(
         // (a raced direct ack makes it a no-op); skip/failure outcomes
         // touch NOTHING — the entry keeps the exact transient-failure
         // backoff Phase C just recorded (spec §6: never worse than today).
-        let Some(client) = deposit_client else {
+        //
+        // ZEB-458 P4 Phase B: after the butler match, if the butler did
+        // NOT ack, attempt the last-resort community-relay rung (if
+        // installed). A relay ack mirrors the butler Acked arm exactly:
+        // re-acquire locks, `mark_ack_delivered`, emit `dm-delivered`.
+        if deposit_client.is_none() && relay_client.is_none() {
             return;
-        };
+        }
         for c in deposit_candidates {
-            match client.deposit(&c).await {
-                crate::butler_deposit::DepositRungOutcome::Acked => {
-                    let newly = {
-                        let mut o_g = outbox.lock().await;
-                        let mut s_g = state.lock().await;
-                        o_g.mark_ack_delivered(&mut s_g, c.entry_id, c.recipient_owner)
-                    };
-                    if newly {
-                        let payload = serde_json::json!({
-                            "spaceId": hex::encode(c.space_id.0),
-                            "messageCid": hex::encode(c.message_cid.to_bytes()),
-                            "recipientOwnerAddr": hex::encode(c.recipient_owner.0),
-                        });
-                        crate::node_event_sink::emit_ser(app.as_ref(), "dm-delivered", &payload);
+            let butler_acked = if let Some(ref client) = deposit_client {
+                let butler_outcome = client.deposit(&c).await;
+                let acked = matches!(
+                    butler_outcome,
+                    crate::butler_deposit::DepositRungOutcome::Acked
+                );
+                match butler_outcome {
+                    crate::butler_deposit::DepositRungOutcome::Acked => {
+                        let newly = {
+                            let mut o_g = outbox.lock().await;
+                            let mut s_g = state.lock().await;
+                            o_g.mark_ack_delivered(&mut s_g, c.entry_id, c.recipient_owner)
+                        };
+                        if newly {
+                            let payload = serde_json::json!({
+                                "spaceId": hex::encode(c.space_id.0),
+                                "messageCid": hex::encode(c.message_cid.to_bytes()),
+                                "recipientOwnerAddr": hex::encode(c.recipient_owner.0),
+                            });
+                            crate::node_event_sink::emit_ser(
+                                app.as_ref(),
+                                "dm-delivered",
+                                &payload,
+                            );
+                        }
+                    }
+                    crate::butler_deposit::DepositRungOutcome::SkippedNoFreshButlerSet => {}
+                    crate::butler_deposit::DepositRungOutcome::Failed(e) => {
+                        tracing::debug!(
+                            entry_id = ?c.entry_id,
+                            recipient = ?c.recipient_owner,
+                            error = %e,
+                            "ZEB-418: butler deposit rung failed; existing retry chain continues"
+                        );
                     }
                 }
-                crate::butler_deposit::DepositRungOutcome::SkippedNoFreshButlerSet => {}
-                crate::butler_deposit::DepositRungOutcome::Failed(e) => {
-                    tracing::debug!(
-                        entry_id = ?c.entry_id,
-                        recipient = ?c.recipient_owner,
-                        error = %e,
-                        "ZEB-418: butler deposit rung failed; existing retry chain continues"
-                    );
+                acked
+            } else {
+                false
+            };
+            // ZEB-458 P4: last-resort community relay rung — only if the
+            // butler did not ack.
+            if !butler_acked {
+                if let Some(ref relay) = relay_client {
+                    if relay.deposit(&c).await {
+                        let newly = {
+                            let mut o_g = outbox.lock().await;
+                            let mut s_g = state.lock().await;
+                            o_g.mark_ack_delivered(&mut s_g, c.entry_id, c.recipient_owner)
+                        };
+                        if newly {
+                            let payload = serde_json::json!({
+                                "spaceId": hex::encode(c.space_id.0),
+                                "messageCid": hex::encode(c.message_cid.to_bytes()),
+                                "recipientOwnerAddr": hex::encode(c.recipient_owner.0),
+                            });
+                            crate::node_event_sink::emit_ser(
+                                app.as_ref(),
+                                "dm-delivered",
+                                &payload,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -7464,6 +7564,136 @@ mod tests {
             .cloned()
             .expect("tracker has entry");
         assert_eq!(stored, reserved);
+    }
+
+    // =================================================================
+    // ZEB-458 P4 Phase B: community-relay rung — last-resort after butler
+    // no-ack
+    // =================================================================
+
+    struct MockRelay {
+        acked: bool,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<OwnerAddr>>>,
+    }
+
+    impl MockRelay {
+        fn new(acked: bool) -> Arc<Self> {
+            Arc::new(Self {
+                acked,
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            })
+        }
+
+        fn calls(&self) -> Vec<OwnerAddr> {
+            self.calls.lock().expect("mock poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::community_relay::CommunityRelayDepositClient for MockRelay {
+        async fn deposit(&self, req: &ButlerDepositRequest) -> bool {
+            self.calls
+                .lock()
+                .expect("mock poisoned")
+                .push(req.recipient_owner);
+            self.acked
+        }
+    }
+
+    /// ZEB-458 P4B: when the butler rung does NOT ack (SkippedNoFreshButlerSet),
+    /// the community-relay rung fires for the same candidate; if it acks,
+    /// the recipient is marked delivered and appears in `newly_delivered`.
+    #[tokio::test]
+    async fn relay_rung_fires_and_marks_delivered_when_butler_does_not_ack() {
+        let (mut state, transport, mut o, butler_mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::SkippedNoFreshButlerSet);
+        let space_id = SpaceId([1u8; 16]);
+        let message_cid = ContentId::from_bytes([3u8; 32]);
+
+        let relay_mock = MockRelay::new(true);
+        o.set_community_relay_deposit_client(relay_mock.clone());
+
+        // Tick 1 (t=10_000): first attempt, no AttemptState yet → neither
+        // rung fires (entry not pending ≥ one backoff cycle).
+        let outcome1 =
+            drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+                .await;
+        assert!(outcome1.newly_delivered.is_empty());
+        assert!(butler_mock.calls().is_empty());
+        assert!(
+            relay_mock.calls().is_empty(),
+            "relay must not fire before candidacy"
+        );
+
+        // Tick 2 (t=15_000): AttemptState exists → both rungs fire.
+        let outcome2 =
+            drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+                .await;
+
+        // Butler was consulted (and returned SkippedNoFreshButlerSet).
+        assert_eq!(
+            butler_mock.calls().len(),
+            1,
+            "butler rung consulted on tick 2"
+        );
+
+        // Relay was consulted for the same recipient.
+        let relay_calls = relay_mock.calls();
+        assert_eq!(relay_calls.len(), 1, "relay rung must fire exactly once");
+        assert_eq!(
+            relay_calls[0], bob,
+            "relay called for the correct recipient"
+        );
+
+        // Relay ack → delivered, surfaces in newly_delivered.
+        assert_eq!(
+            outcome2.newly_delivered,
+            vec![(space_id, message_cid, bob)],
+            "relay ack must surface in newly_delivered (dm-delivered emit)"
+        );
+        let stored = state.outbox.get(&entry_id).expect("entry still present");
+        assert!(
+            stored.delivered_to.contains(&bob),
+            "bob marked delivered via relay"
+        );
+        assert!(
+            matches!(stored.delivery_status, DeliveryStatus::Complete),
+            "sole recipient acked via relay -> Complete"
+        );
+        // mark_ack_delivered must have cleared the pair's retry state.
+        assert_eq!(o.backoff_len(), 0);
+        assert_eq!(o.in_flight_len(), 0);
+    }
+
+    /// ZEB-458 P4B: when the butler rung DOES ack, the relay rung must NOT
+    /// be called — relay is strictly last-resort.
+    #[tokio::test]
+    async fn relay_rung_skipped_when_butler_acks() {
+        let (mut state, transport, mut o, butler_mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Acked);
+
+        let relay_mock = MockRelay::new(true);
+        o.set_community_relay_deposit_client(relay_mock.clone());
+
+        // Tick 1: no AttemptState → neither rung fires.
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+            .await;
+        assert!(butler_mock.calls().is_empty());
+        assert!(relay_mock.calls().is_empty());
+
+        // Tick 2: butler acks → relay must NOT be consulted.
+        let _outcome =
+            drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+                .await;
+        assert_eq!(
+            butler_mock.calls().len(),
+            1,
+            "butler rung consulted on tick 2"
+        );
+        assert!(
+            relay_mock.calls().is_empty(),
+            "relay must NOT be called when butler acks"
+        );
     }
 }
 
