@@ -4902,6 +4902,20 @@ pub async fn start_node_inner(
                                 // AppHandle clone cheaply (Arc internals).
                                 let reachability_resolver_for_hook = reachability_resolver.clone();
                                 let app_for_reachability = app.clone();
+                                // ZEB-458 P4B: feed the in-memory
+                                // CommunityRelayResolver from freshly-applied
+                                // CommunityRelayAnnounce membership events, the
+                                // relay-resolver analogue of the
+                                // ReachabilityAnnounce hook above. Captured the
+                                // same way (Arc clone) so the async block can
+                                // move a per-invocation clone. This is the live
+                                // half of the loop: publisher inserts the
+                                // CommunityRelayAnnounce event → it replicates
+                                // via community state → this arm seeds the
+                                // resolver → the pull driver + sender client
+                                // read it and dial relays.
+                                let community_relay_resolver_for_hook =
+                                    std::sync::Arc::clone(&community_relay_resolver);
                                 // ZEB-329: capture the shared
                                 // NetworkHealthService cell so the
                                 // closure can notify the rate-limiter
@@ -4970,6 +4984,11 @@ pub async fn start_node_inner(
                                     // so the async block can move them.
                                     let resolver = reachability_resolver_for_hook.clone();
                                     let app = app_for_reachability.clone();
+                                    // ZEB-458 P4B: per-invocation clone so the
+                                    // async block can move it (mirrors the
+                                    // reachability `resolver` clone above).
+                                    let community_relay_resolver =
+                                        std::sync::Arc::clone(&community_relay_resolver_for_hook);
                                     // ZEB-329: per-invocation clone of
                                     // the shared cell — the async block
                                     // takes a read lock once and uses
@@ -5013,7 +5032,34 @@ pub async fn start_node_inner(
                                                 }
                                                 emit_changed = Some(event.actor);
                                             }
+                                            crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { payload } => {
+                                                // ZEB-458 P4B: relay-resolver
+                                                // analogue of the
+                                                // ReachabilityAnnounce arm.
+                                                // The resolver applies LWW-by-
+                                                // ad_at on update + freshness
+                                                // on read, so a duplicate /
+                                                // stale ad is a no-op. No
+                                                // Network-Health notify (relay
+                                                // ads aren't a connectivity-
+                                                // panel signal) and no UI emit.
+                                                community_relay_resolver.update(
+                                                    community_id,
+                                                    event.actor,
+                                                    payload.clone(),
+                                                    event.at.clone(),
+                                                );
+                                            }
                                             crate::community_membership::MembershipEventKind::Leave => {
+                                                // ZEB-458 P4B: retract the
+                                                // leaver's relay ads promptly
+                                                // (read-time freshness would
+                                                // eventually drop them, but a
+                                                // Leave is an explicit signal —
+                                                // mirrors the reachability
+                                                // remove_owner below).
+                                                community_relay_resolver
+                                                    .remove_advertiser(&community_id, &event.actor);
                                                 let n = resolver.remove_owner(&event.actor);
                                                 if n > 0 {
                                                     // ZEB-329: see comment above.
@@ -5028,6 +5074,11 @@ pub async fn start_node_inner(
                                                 }
                                             }
                                             crate::community_membership::MembershipEventKind::Kick { target, .. } => {
+                                                // ZEB-458 P4B: retract the
+                                                // kicked member's relay ads
+                                                // (mirrors remove_owner below).
+                                                community_relay_resolver
+                                                    .remove_advertiser(&community_id, target);
                                                 let n = resolver.remove_owner(target);
                                                 if n > 0 {
                                                     // ZEB-329: see comment above.
@@ -5544,35 +5595,66 @@ pub async fn start_node_inner(
                             // the latest HLC is the correct gate (matches
                             // the spec's "current member" intent for routing
                             // — we don't want to dial Alice if she's left).
-                            let to_replay: Vec<(
+                            // ZEB-458 P4B: extend the SAME single history scan
+                            // to also seed the CommunityRelayResolver from
+                            // historical CommunityRelayAnnounce events — the
+                            // relay-resolver analogue of the reachability
+                            // bootstrap replay. A device coming online must see
+                            // already-advertised relays before any new ad
+                            // arrives, otherwise the pull driver + sender
+                            // client find no relays to dial until a peer
+                            // re-publishes. Same still-member gate (the relay
+                            // RCH5 analogue is enforced at verify time; a since-
+                            // Left/Kicked advertiser must not re-surface) and
+                            // same LWW-safe out-of-order replay (resolver
+                            // applies LWW-by-ad_at on update + freshness on
+                            // read). Collected in the same lock-held pass so
+                            // we walk `st.events` once.
+                            let mut to_replay: Vec<(
                                 crate::owner_state_types::OwnerAddr,
                                 crate::reachability_record::ReachabilityAnnouncePayload,
                                 crate::owner_state_types::Hlc,
-                            )> = {
+                            )> = Vec::new();
+                            let mut relay_to_replay: Vec<(
+                                crate::owner_state_types::OwnerAddr,
+                                crate::community_relay_announce::CommunityRelayAnnouncePayload,
+                                crate::owner_state_types::Hlc,
+                            )> = Vec::new();
+                            {
                                 let st = state_arc.lock().await;
                                 let current = st.materialized(engine.admin_addr());
-                                st.events
-                                    .values()
-                                    .filter_map(|ev| match &ev.kind {
+                                let is_joined = |actor: &crate::owner_state_types::OwnerAddr| {
+                                    current
+                                        .members
+                                        .get(actor)
+                                        .map(|s| {
+                                            s.status
+                                                == crate::community_membership::MemberStatus::Joined
+                                        })
+                                        .unwrap_or(false)
+                                };
+                                for ev in st.events.values() {
+                                    match &ev.kind {
                                         crate::community_membership::MembershipEventKind::ReachabilityAnnounce { payload } => {
-                                            let still_member = current
-                                                .members
-                                                .get(&ev.actor)
-                                                .map(|s| s.status == crate::community_membership::MemberStatus::Joined)
-                                                .unwrap_or(false);
-                                            if still_member {
-                                                Some((ev.actor, payload.clone(), ev.at.clone()))
-                                            } else {
-                                                None
+                                            if is_joined(&ev.actor) {
+                                                to_replay.push((ev.actor, payload.clone(), ev.at.clone()));
                                             }
                                         }
-                                        _ => None,
-                                    })
-                                    .collect()
-                            };
+                                        crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { payload } => {
+                                            if is_joined(&ev.actor) {
+                                                relay_to_replay.push((ev.actor, payload.clone(), ev.at.clone()));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                             for (actor, payload, hlc) in to_replay {
                                 reachability_resolver.update(actor, payload, hlc);
                                 total_replayed += 1;
+                            }
+                            for (advertiser, payload, hlc) in relay_to_replay {
+                                community_relay_resolver.update(*cid, advertiser, payload, hlc);
                             }
                         }
                         if total_replayed > 0 {
