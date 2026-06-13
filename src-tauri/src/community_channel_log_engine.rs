@@ -437,6 +437,18 @@ impl ChannelLogEngine {
             let closing_notify = Arc::clone(&engine.closing_notify);
             tokio::spawn(async move {
                 loop {
+                    // ZEB-288: re-check `closing` at the top of every
+                    // iteration. `notify_waiters()` stores no permit — if
+                    // `shutdown()` lands while this loop is inside
+                    // `process_inbound_packet` (not parked in the select),
+                    // the wake is lost, and under continuous inbound flow
+                    // the biased recv arm wins every iteration, so the
+                    // notified() arm alone can never observe the flag. A
+                    // "stopped" engine would then keep processing until
+                    // the adapter drops the channel.
+                    if closing.load(Ordering::SeqCst) {
+                        break;
+                    }
                     tokio::select! {
                         biased;
                         maybe = rx.recv() => {

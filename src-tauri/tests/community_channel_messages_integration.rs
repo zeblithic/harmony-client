@@ -399,14 +399,17 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         .await
         .expect("stop B");
 
-    // ZEB-288: the registry's `stop()` only flips the adapter's `closing`
-    // flag; the adapter's select arms poll that flag on a 1s interval,
-    // so B's adapter can keep delivering for up to ~1s after stop returns.
-    // A fixed wall-clock sleep here is the wrong shape (200ms << 1s poll;
-    // failed under load during ZEB-250 baseline). Instead, wait for B's
-    // received counter to actually stop growing — 5 quiet polls of 100ms
-    // each = 500ms of confirmed silence — which proves the adapter has
-    // drained regardless of host load or future poll-interval changes.
+    // ZEB-288: `stop()` shuts the engine down (its receive loop
+    // re-checks `closing` every iteration, so it exits within one
+    // packet even mid-flow) and flips the adapter's `closing` flag,
+    // whose select arms poll on a 1s interval — so a packet already
+    // queued between adapter and engine can still deliver briefly
+    // after stop returns. A fixed wall-clock sleep here is the wrong
+    // shape (200ms << 1s poll; failed under load during ZEB-250
+    // baseline). Instead, wait for B's received counter to actually
+    // stop growing — 5 quiet polls of 100ms each = 500ms of confirmed
+    // silence — which proves the pipeline has drained regardless of
+    // host load or future poll-interval changes.
     let received_at_offline_start = wait_for_stable_count(&received_b, 5, Duration::from_secs(5))
         .await
         .unwrap_or_else(|count| {
