@@ -513,6 +513,27 @@ pub async fn handle_relay_pull_query(
 /// 4. Translate `ack.content_ids` → storage keys and call
 ///    `mark_pulled(keys, requester_device_id)`. An ack for a content id not
 ///    currently held is a no-op (mark_pulled tolerates missing keys).
+///
+/// ## Trust boundary: ack authenticity vs. proof-of-open
+///
+/// The ack proves only that *some* enrolled device of `recipient_owner` (a
+/// joined member of `community_id`) signed this content_id list — NOT that the
+/// signing device actually opened the sealed blob. The relay holds the blob
+/// fully opaque (the core P4 confidentiality property), so it **cannot** verify
+/// an open: `content_id` is `hash(sealed_blob)`, computable by any device that
+/// pulled the opaque bytes without decrypting them. A proof-of-open to the
+/// relay is architecturally impossible without breaking opacity.
+///
+/// Coverage GC's `ack ⟹ opened+ingested` invariant is therefore a
+/// *client-honesty* contract enforced by the honest pull client
+/// [`crate::community_relay_pull::open_and_ingest`], which returns a content_id
+/// in its ack list ONLY after a successful open + decode + `ingest_recovered`.
+/// The blast radius of a buggy/malicious ack-without-open is bounded to
+/// `recipient_owner`'s OWN fleet — the cert anchor binds the signer to
+/// `recipient_owner`, so no other owner can forge an ack, i.e. R can only harm
+/// R's own delivery. The Phase B background pull driver MUST ack a content_id
+/// only after its ingest is durably persisted, so a crash between ack and
+/// persist cannot both GC the entry and lose the deposit.
 pub async fn handle_relay_pull_ack(
     recipient_owner: &[u8; 16],
     community_id: &SpaceId,
