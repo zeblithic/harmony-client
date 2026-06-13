@@ -368,27 +368,31 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         }
     }
 
-    // Wait for B's live deliveries. ZEB-288: this is a FLOOR, not 100.
-    // The publisher channel above is cap-64 and documented droppable
-    // under scheduler starvation; CI suite load can drop a handful of
-    // the 100 live publishes, and a dropped live event is unrecoverable
-    // until the Phase-3 re-spawn (the spawn-time backfill driver
-    // latched on an empty log before Phase 1 began). No timeout is long
-    // enough for a dropped-not-delayed event, so Phase 1 asserts the
-    // live path delivers AT VOLUME; the loss-free guarantee is Phase
-    // 3's ≥150 completeness assert, which is drop-tolerant by
-    // construction (backfill dedupes B's disk log and delivers exactly
-    // the missing remainder, landing the counter on 150 regardless).
-    const LIVE_DELIVERY_FLOOR: usize = 90;
+    // Wait for the live broadcast path to prove itself: B receives at
+    // least one of A's live posts. ZEB-288: this is deliberately NOT a
+    // high fixed floor. The engine→adapter publisher channel is cap-64
+    // and uses `try_send` (drop-on-full), so under scheduler starvation
+    // an UNBOUNDED number of the 100 live publishes can legitimately
+    // drop (Qodo + CodeAnt: a fixed floor of 90 still times out when
+    // >10 drop, which is exactly how this test flaked in CI). A dropped
+    // live event is unrecoverable until the Phase-3 re-spawn, so no
+    // timeout length can rescue a fixed floor. We therefore assert only
+    // that the live wire is *alive* (≥1 delivered, deterministic within
+    // 30s) here; the loss-free guarantee is Phase 3's ≥150 completeness
+    // assert plus the final exact-150/no-dupes check — both drop-tolerant
+    // by construction (backfill dedupes B's disk log and delivers exactly
+    // the missing remainder, landing the counter on 150 regardless of how
+    // many live publishes dropped). Phase 2 then captures whatever volume
+    // actually landed via `wait_for_stable_count` before B goes offline.
     wait_until(
         || {
             let received_b = Arc::clone(&received_b);
-            async move { received_b.lock().expect("received_b lock").len() >= LIVE_DELIVERY_FLOOR }
+            async move { !received_b.lock().expect("received_b lock").is_empty() }
         },
         Duration::from_secs(30),
     )
     .await
-    .expect("B should receive >= LIVE_DELIVERY_FLOOR live");
+    .expect("B should receive at least one live broadcast (live wire is dead, not merely lossy)");
 
     // ── Phase 2: B disconnect; A posts 50 more ───────────────────────
     // Stop B's engine + adapter. The on-disk segments persist (spec
