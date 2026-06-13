@@ -10,7 +10,7 @@
 //!   persist-with-caps over [`RelayHoldDoc`] (mirrors
 //!   [`crate::iroh_butler_acceptor::ProdButlerDepositCtx::persist_entry`]).
 //! - [`ProdRelayPullCtx`] — serve/membership gates + recipient-scoped
-//!   `held_for` + ack→pulled_by→GC.
+//!   `held_for` + ack→pulled_by→flush (GC is a separate periodic sweep).
 //!
 //! Both ctxs answer community-membership questions through a
 //! [`CommunityMembershipLookup`] seam rather than reaching into the community
@@ -56,14 +56,6 @@ fn now_epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-/// Wall-clock epoch MILLISECONDS (for relay-hold GC).
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 // =====================================================================
@@ -221,9 +213,10 @@ impl RelayDepositCtx for ProdRelayDepositCtx {
 
 /// Production [`RelayPullCtx`]: serve/membership gates via the opt-in doc +
 /// the membership seam, a recipient-scoped `held_for`, and an ack handler that
-/// unions `pulled_by`, GCs (the doc's built-in one-sweep deferral keeps a
-/// just-acked entry one extra sweep so `pulled_by` replicates first), and
-/// durably flushes.
+/// unions `pulled_by` into the present keys and durably flushes. GC is a
+/// SEPARATE periodic sweep — NOT run inline here — so `pulled_by` replicates
+/// to the relay's fleet before any replica removes the entry. See
+/// `mark_pulled` for the full rationale.
 pub struct ProdRelayPullCtx {
     /// This relay owner's address bytes, checked in `serves_community`.
     pub self_owner: [u8; 16],
@@ -274,12 +267,15 @@ impl RelayPullCtx for ProdRelayPullCtx {
 
     async fn mark_pulled(&self, keys: &[String], requester_device: String) -> Result<(), String> {
         // Union the requester into pulled_by for every key present (missing
-        // keys = no-op, so an ack for an already-GC'd blob never errors), then
-        // run GC under the same lock. The doc's gc() snapshots covered_at_start
-        // BEFORE mutating, so an entry that becomes covered DURING this sweep
-        // survives one extra gc() call — giving pulled_by time to replicate to
-        // sibling relays before any replica destroys the entry (one-sweep
-        // deferral, built into RelayHoldDoc::gc).
+        // keys = no-op, so an ack for an already-GC'd blob never errors).
+        //
+        // GC is a SEPARATE periodic sweep (not inline) so `pulled_by` replicates
+        // to the relay's fleet before any replica removes the entry.
+        // `RelayHoldDoc::merge_from` is a grow-only union: an early local delete
+        // would be resurrected by a sibling relay that has not yet seen the pull
+        // (spec D38). The periodic sweep runs AFTER `pulled_by` has propagated;
+        // any transient resurrection carries `pulled_by` and is re-removed on the
+        // next sweep.
         {
             let mut doc = self.relay_hold_doc.lock().await;
             for k in keys {
@@ -287,10 +283,9 @@ impl RelayPullCtx for ProdRelayPullCtx {
                     e.pulled_by.insert(requester_device.clone());
                 }
             }
-            let now_ms = now_epoch_ms();
-            doc.gc(now_ms);
         }
-        // Durable persist + publish of the pulled_by union (+ any GC removal).
+        // Durable persist + publish of the pulled_by union so covered state
+        // replicates to siblings before the periodic sweep reclaims storage.
         // notify_dirty BEFORE flush_now (publish-retry latch, as in deposit).
         self.flush.notify_dirty();
         self.flush.flush_now().await?;
@@ -801,14 +796,12 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[tokio::test]
-    async fn mark_pulled_sets_pulled_by_and_gc_removes_covered_entry() {
-        // mark_pulled sets pulled_by then immediately calls gc().
-        // gc() snapshots covered_at_start BEFORE its retain loop. Because
-        // mark_pulled sets pulled_by BEFORE calling gc(), the entry IS in
-        // covered_at_start at gc time and is removed in the same call.
-        // (The one-sweep deferral protects a REMOTE replica's gc run that
-        // fires BEFORE seeing our pulled_by update — not the local gc that
-        // runs AFTER the local union in the same mark_pulled body.)
+    async fn mark_pulled_sets_pulled_by_and_does_not_remove_inline() {
+        // mark_pulled must union pulled_by but MUST NOT call gc() inline.
+        // `RelayHoldDoc::merge_from` is a grow-only union: an early local delete
+        // would be resurrected by a sibling relay that has not yet seen the pull
+        // (spec D38). The periodic sweep (separate from mark_pulled) is what
+        // reclaims storage.
         let c = space(0xCC);
         let recipient = [0xAA; 16];
         let sender = [0x22; 16];
@@ -825,54 +818,21 @@ mod tests {
             fake(&[(c, [0x01; 16])]),
         );
 
-        ctx.mark_pulled(&[key.clone()], "devX".into())
+        ctx.mark_pulled(&[key.clone()], "Rdev".into())
             .await
             .unwrap();
 
-        // The entry is covered at gc()-start (pulled_by was set just above)
-        // so gc() removes it immediately — the doc is empty after mark_pulled.
+        // The entry must STILL BE PRESENT — mark_pulled does NOT remove it.
+        let locked = doc_arc.lock().await;
         assert!(
-            doc_arc.lock().await.entries.is_empty(),
-            "entry covered at gc-start is removed immediately by the local gc sweep"
+            locked.entries.contains_key(&key),
+            "mark_pulled must not remove the entry inline (grow-only union resurrects early deletes)"
         );
-    }
-
-    #[tokio::test]
-    async fn mark_pulled_one_sweep_deferral_for_already_covered_entry() {
-        // An entry that was ALREADY covered (pulled_by non-empty) when a
-        // SECOND mark_pulled call's gc() runs would be in covered_at_start and
-        // removed. This test seeds an entry that already has pulled_by = {"devY"}
-        // before the ctx is constructed (simulating a remote replica update),
-        // then calls mark_pulled to add "devX". The gc() inside this call sees
-        // the entry as covered-at-start (it was already covered before mark_pulled
-        // ran) and removes it. This verifies the gc path is exercised correctly.
-        let c = space(0xCC);
-        let recipient = [0xAA; 16];
-        let sender = [0x22; 16];
-        let key = RelayHoldDoc::key(&recipient, &[0x01; 32]);
-
-        let mut entry = hold_entry(recipient, sender, c, vec![1, 2, 3]);
-        // Pre-seed pulled_by — entry is already covered before mark_pulled runs.
-        entry.pulled_by.insert("devY".into());
-
-        let mut doc = RelayHoldDoc::default();
-        doc.entries.insert(key.clone(), entry);
-        let doc_arc = Arc::new(tokio::sync::Mutex::new(doc));
-        let ctx = pull_ctx(
-            [0x01; 16],
-            doc_arc.clone(),
-            optin_doc(c, true),
-            fake(&[(c, [0x01; 16])]),
-        );
-
-        // mark_pulled adds "devX" to pulled_by, then gc() sees the entry is
-        // covered-at-start (was already non-empty) and removes it.
-        ctx.mark_pulled(&[key.clone()], "devX".into())
-            .await
-            .unwrap();
+        // pulled_by must now contain "Rdev".
+        let pb = &locked.entries[&key].pulled_by;
         assert!(
-            doc_arc.lock().await.entries.is_empty(),
-            "entry that was already covered before mark_pulled is removed by gc"
+            pb.contains("Rdev"),
+            "pulled_by must contain the requester device after mark_pulled"
         );
     }
 
@@ -892,6 +852,52 @@ mod tests {
             .await
             .unwrap();
         assert!(doc_arc.lock().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn separate_gc_sweep_removes_covered_entry() {
+        // After mark_pulled has set pulled_by (covered state), a direct call to
+        // `doc.gc(now_ms_large)` — simulating the periodic sweep — removes the
+        // entry. This confirms that the SWEEP (not mark_pulled inline) is what
+        // reclaims storage. The now_ms used here is large enough not to TTL-expire
+        // the entry on its own (we use a held_at.wall_ms that is well within TTL
+        // at any test-time clock); the removal is by coverage, not TTL.
+        let c = space(0xCC);
+        let recipient = [0xAA; 16];
+        let sender = [0x22; 16];
+        let key = RelayHoldDoc::key(&recipient, &[0x01; 32]);
+
+        let mut doc = RelayHoldDoc::default();
+        doc.entries
+            .insert(key.clone(), hold_entry(recipient, sender, c, vec![1, 2, 3]));
+        let doc_arc = Arc::new(tokio::sync::Mutex::new(doc));
+        let ctx = pull_ctx(
+            [0x01; 16],
+            doc_arc.clone(),
+            optin_doc(c, true),
+            fake(&[(c, [0x01; 16])]),
+        );
+
+        // Step 1: mark_pulled sets pulled_by but does NOT remove the entry.
+        ctx.mark_pulled(&[key.clone()], "Rdev".into())
+            .await
+            .unwrap();
+        assert!(
+            doc_arc.lock().await.entries.contains_key(&key),
+            "entry must still be present after mark_pulled (no inline GC)"
+        );
+
+        // Step 2: the periodic sweep (gc) now sees the entry as covered-at-start
+        // (pulled_by is non-empty) and removes it. Use a now_ms that is WITHIN
+        // TTL for the held_at.wall_ms=1_000 entry (held_at + TTL ≥ 1_000 +
+        // RELAY_HOLD_TTL_MS >> 2_000_000) — the removal is by coverage, not TTL.
+        let now_ms: u64 = 2_000_000;
+        let removed = doc_arc.lock().await.gc(now_ms);
+        assert!(removed, "gc sweep must remove the covered entry");
+        assert!(
+            doc_arc.lock().await.entries.is_empty(),
+            "doc must be empty after the periodic gc sweep"
+        );
     }
 
     // A compile-time anchor: the prod ctx structs implement the Phase A

@@ -370,10 +370,15 @@ pub trait RelayPullCtx: Send + Sync {
     /// device can open any of the returned blobs.
     async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)>;
 
-    /// Record that `requester_device` pulled + acked the blobs at `keys`, then
-    /// run GC. Implementations should treat missing keys as a no-op so an ack
-    /// for an already-GC'd blob does not return an error. Returns `Err(String)`
-    /// only for genuine storage failures.
+    /// Record that `requester_device` pulled + acked the blobs at `keys` by
+    /// unioning `requester_device` into each present entry's `pulled_by` set,
+    /// then DURABLY FLUSH so the covered state replicates to the relay's fleet
+    /// before any replica removes the entry. GC is a SEPARATE periodic sweep
+    /// (`RelayHoldDoc::gc`), NOT run inline: `RelayHoldDoc::merge_from` is a
+    /// grow-only union, so an early local delete would be resurrected by a
+    /// sibling relay that has not yet seen the pull (spec D38). Missing keys are
+    /// a no-op so an ack for an already-GC'd blob does not return an error.
+    /// Returns `Err(String)` only for genuine storage failures.
     async fn mark_pulled(&self, keys: &[String], requester_device: String) -> Result<(), String>;
 }
 
