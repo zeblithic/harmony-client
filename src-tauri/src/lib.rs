@@ -126,6 +126,7 @@ pub mod community_relay_announce;
 pub mod community_relay_hold_crdt;
 pub mod community_relay_optin;
 pub mod community_relay_prod;
+pub mod community_relay_publisher;
 pub mod community_relay_pull;
 pub mod community_relay_pull_driver;
 pub mod community_relay_resolver;
