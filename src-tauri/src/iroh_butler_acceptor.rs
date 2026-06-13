@@ -382,6 +382,32 @@ fn decode_enrollment_cert_strict(bytes: &[u8]) -> Result<EnrollmentCert, Deposit
     Ok(cert)
 }
 
+/// ZEB-424 (D27): does the butler share a LIVE group-DM space with
+/// `sender_owner`? Pure scan over the replicated `OwnerState.spaces` — the
+/// same state step-1 admission already reads the friend graph from. A match
+/// requires a `GroupDm` space that has not been left, with BOTH this owner
+/// and the sender in `members`. Spaces count is small (tens), so a linear
+/// scan needs no index (a derived index would add CRDT-merge invalidation
+/// hazards for zero measured win).
+// Wired into the deposit admission path in a later ZEB-424 task; this task
+// lands the pure predicate + its unit tests in isolation.
+#[allow(dead_code)]
+pub(crate) fn shares_live_group_dm_in(
+    state: &crate::owner_state_crdt::OwnerState,
+    self_owner: &[u8; 16],
+    sender_owner: &[u8; 16],
+) -> bool {
+    use crate::owner_state_types::{OwnerAddr, SpaceKind};
+    let self_addr = OwnerAddr(*self_owner);
+    let sender_addr = OwnerAddr(*sender_owner);
+    state.spaces.values().any(|s| {
+        s.kind == SpaceKind::GroupDm
+            && s.left_at.is_none()
+            && s.members.contains(&self_addr)
+            && s.members.contains(&sender_addr)
+    })
+}
+
 /// The Tauri-free deposit pipeline (spec §4 order — see the module docs).
 /// Returns the ack to write on success; any reject means the shell closes
 /// the stream without detail.
@@ -1406,5 +1432,80 @@ mod tests {
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
         assert_eq!(err, DepositReject::BadPayload);
         assert!(ctx.store.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shares_live_group_dm_in_matches_only_live_group_with_both_members() {
+        use crate::owner_state_crdt::OwnerState;
+        use crate::owner_state_types::{Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+        let me = [0x11u8; 16];
+        let peer = [0x22u8; 16];
+        let stranger = [0x33u8; 16];
+
+        let hlc = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        let mk_space = |id: u8, kind: SpaceKind, members: Vec<[u8; 16]>, left: Option<Hlc>| Space {
+            id: SpaceId([id; 16]),
+            kind,
+            parent: None,
+            community_id: None,
+            name: "g".into(),
+            transport: None,
+            members: members.into_iter().map(OwnerAddr).collect(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: left,
+            created_at: hlc.clone(),
+            updated_at: hlc.clone(),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+
+        let mut state = OwnerState::default();
+        let s_live = mk_space(0x01, SpaceKind::GroupDm, vec![me, peer], None);
+        state.spaces.insert(s_live.id, s_live);
+        assert!(
+            shares_live_group_dm_in(&state, &me, &peer),
+            "live group, both members"
+        );
+        assert!(
+            !shares_live_group_dm_in(&state, &me, &stranger),
+            "stranger not a member"
+        );
+
+        let mut state_left = OwnerState::default();
+        let s_left = mk_space(0x02, SpaceKind::GroupDm, vec![me, peer], Some(hlc.clone()));
+        state_left.spaces.insert(s_left.id, s_left);
+        assert!(
+            !shares_live_group_dm_in(&state_left, &me, &peer),
+            "left group does not match"
+        );
+
+        let mut state_dm = OwnerState::default();
+        let s_dm = mk_space(0x03, SpaceKind::Dm, vec![me, peer], None);
+        state_dm.spaces.insert(s_dm.id, s_dm);
+        assert!(
+            !shares_live_group_dm_in(&state_dm, &me, &peer),
+            "Dm kind does not match"
+        );
+
+        let mut state_noself = OwnerState::default();
+        let s_noself = mk_space(0x04, SpaceKind::GroupDm, vec![peer, stranger], None);
+        state_noself.spaces.insert(s_noself.id, s_noself);
+        assert!(
+            !shares_live_group_dm_in(&state_noself, &me, &peer),
+            "self must be a member too"
+        );
     }
 }
