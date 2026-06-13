@@ -41,7 +41,10 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use harmony_content::cid::{ContentFlags, ContentId};
 use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
 
-use crate::community_relay::{relay_deposit_sig_payload, RelayDepositAck, RelayDepositFrame};
+use crate::community_relay::{
+    relay_deposit_sig_payload, relay_pull_sig_payload, RelayDepositAck, RelayDepositFrame,
+    RelayHeldBlob, RelayPullAck, RelayPullQuery, RelayPullResponse,
+};
 use crate::community_relay_hold_crdt::{RelayHoldDoc, RelayHoldEntry};
 use crate::owner_state_types::{Hlc, SpaceId};
 
@@ -290,6 +293,237 @@ pub async fn handle_relay_deposit_core(
     Ok(RelayDepositAck {
         content_id: content_id.to_bytes(),
     })
+}
+
+// =====================================================================
+// Task 4: Relay PULL acceptor — requester auth + serve + ack→pulled_by→GC
+// =====================================================================
+
+/// Why a relay pull request (or pull ack) was rejected. For local logging
+/// and test assertions only; the wire never exposes a detailed reason (uniform
+/// reject = no oracle for enumerating held blobs).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RelayPullReject {
+    /// This relay does not serve the named community.
+    #[error("relay does not serve this community")]
+    WrongCommunity,
+    /// The requester is not a Joined member of the named community.
+    #[error("requester is not a member of the community")]
+    NotMember,
+    /// The embedded `EnrollmentCert` failed to decode, failed verification,
+    /// is not Master-issued, has `owner_id != query.recipient_owner`, or its
+    /// master key does not match the owner-id-derived anchor.
+    #[error("requester enrollment cert invalid")]
+    BadCert,
+    /// The pull query (or ack) signature is malformed or does not verify
+    /// against the cert-bound device key over `relay_pull_sig_payload`.
+    #[error("pull query signature invalid")]
+    BadSig,
+    /// `mark_pulled` returned an error (logged; the requester may retry).
+    #[error("mark-pulled failed: {0}")]
+    MarkFailed(String),
+}
+
+/// Injectable context for [`handle_relay_pull_query`] and
+/// [`handle_relay_pull_ack`]. Production implements this over `NodeState`'s
+/// community and relay-hold state; tests implement it with probes.
+#[async_trait]
+pub trait RelayPullCtx: Send + Sync {
+    /// Opt-in + membership check: this relay is a Joined member of
+    /// `community_id` AND has opted in to relay for it.
+    async fn serves_community(&self, community_id: &SpaceId) -> bool;
+
+    /// `owner` is a Joined member of `community_id` in the relay's local
+    /// replicated membership state.
+    async fn is_joined_member(&self, community_id: &SpaceId, owner: &[u8; 16]) -> bool;
+
+    /// Wall-clock now in epoch-SECONDS for `EnrollmentCert` expiry checks.
+    fn now_secs(&self) -> u64;
+
+    /// All held blobs for `recipient_owner` (any sealed-to device). Returns
+    /// `(storage_key, RelayHeldBlob)` pairs so the ack handler can translate
+    /// content IDs to storage keys without a second lookup.
+    async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)>;
+
+    /// Record that `requester_device` pulled + acked the blobs at `keys`, then
+    /// run GC. Implementations should treat missing keys as a no-op so an ack
+    /// for an already-GC'd blob does not return an error. Returns `Err(String)`
+    /// only for genuine storage failures.
+    async fn mark_pulled(&self, keys: &[String], requester_device: String) -> Result<(), String>;
+}
+
+// ----------------------------------------------------------------
+// Shared pull-auth helper (cert decode + owner-id anchor + membership)
+// ----------------------------------------------------------------
+
+/// Common auth steps shared by the query and ack handlers:
+///
+/// 1. Decode + verify the requester's `EnrollmentCert`.
+/// 2. Require Master issuer and `cert.owner_id == recipient_owner`.
+/// 3. Verify owner-id-derived anchor.
+/// 4. Check `is_joined_member`.
+/// 5. Verify the pull signature over `relay_pull_sig_payload`.
+///
+/// Returns `(cert_device_vk_bytes, requester_device_id)` on success.
+async fn auth_pull_requester(
+    cert_bytes: &[u8],
+    sig_bytes_raw: &[u8],
+    recipient_owner: &[u8; 16],
+    community_id: &SpaceId,
+    ctx: &dyn RelayPullCtx,
+) -> Result<([u8; 32], String), RelayPullReject> {
+    // Step 1 — decode + verify the requester's EnrollmentCert (same strict
+    // helper as the deposit acceptor, adapted for pull rejects).
+    let cert = decode_pull_cert_strict(cert_bytes)?;
+    cert.verify(ctx.now_secs())
+        .map_err(|_| RelayPullReject::BadCert)?;
+
+    // Step 2 — require Master issuer; extract master pubkey.
+    let cert_master = match &cert.issuer {
+        EnrollmentIssuer::Master { master_pubkey } => master_pubkey.classical.ed25519_verify,
+        _ => return Err(RelayPullReject::BadCert),
+    };
+
+    // Bind cert to the claimed recipient_owner identity.
+    if cert.owner_id != *recipient_owner {
+        return Err(RelayPullReject::BadCert);
+    }
+
+    // Step 3 — owner-id-derived anchor (D29.1 co-member branch).
+    if crate::friend_graph::owner_id_from_master_ed25519(&cert_master)
+        != crate::owner_state_types::OwnerAddr(*recipient_owner)
+    {
+        return Err(RelayPullReject::BadCert);
+    }
+
+    let device_vk_bytes = cert.device_pubkeys.classical.ed25519_verify;
+
+    // Step 4 — membership gate. This defeats held-blob enumeration by
+    // ex-members or strangers; the blobs are still sealed regardless.
+    if !ctx.is_joined_member(community_id, recipient_owner).await {
+        return Err(RelayPullReject::NotMember);
+    }
+
+    // Step 5 — verify the pull signature over
+    // `COMMUNITY_RELAY_PULL_SIG_DOMAIN ‖ recipient_owner ‖ community_id`.
+    let sig_arr: [u8; 64] = sig_bytes_raw
+        .try_into()
+        .map_err(|_| RelayPullReject::BadSig)?;
+    let device_vk =
+        VerifyingKey::from_bytes(&device_vk_bytes).map_err(|_| RelayPullReject::BadCert)?;
+    device_vk
+        .verify_strict(
+            &relay_pull_sig_payload(recipient_owner, community_id),
+            &Signature::from_bytes(&sig_arr),
+        )
+        .map_err(|_| RelayPullReject::BadSig)?;
+
+    // SP1 device id = 64-hex (lowercase) of the device ed25519 verify key,
+    // mirroring `iroh_butler_acceptor`'s `device_id()` and the SP1 definition
+    // in `butler_outhold_integration.rs::device_id_hex`.
+    let requester_device_id = hex::encode(device_vk_bytes);
+
+    Ok((device_vk_bytes, requester_device_id))
+}
+
+/// Strict canonical-CBOR decode of an [`EnrollmentCert`] for the pull
+/// path; trailing bytes rejected. Produces [`RelayPullReject::BadCert`].
+fn decode_pull_cert_strict(bytes: &[u8]) -> Result<EnrollmentCert, RelayPullReject> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let cert: EnrollmentCert =
+        ciborium::from_reader(&mut cursor).map_err(|_| RelayPullReject::BadCert)?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(RelayPullReject::BadCert);
+    }
+    Ok(cert)
+}
+
+// ----------------------------------------------------------------
+// Query handler
+// ----------------------------------------------------------------
+
+/// Relay pull query pipeline (spec D39 steps 0-4):
+///
+/// 0. `serves_community` — relay opted in; else [`RelayPullReject::WrongCommunity`].
+/// 1. Auth the requester: cert decode + Master-issuer + owner-id-derived
+///    anchor + `cert.owner_id == query.recipient_owner`;
+///    else [`RelayPullReject::BadCert`].
+/// 2. `is_joined_member` — gates pull to current members;
+///    else [`RelayPullReject::NotMember`].
+/// 3. Frame sig: `cert.device_pubkeys.classical.ed25519_verify_strict`
+///    over `relay_pull_sig_payload`; else [`RelayPullReject::BadSig`].
+/// 4. Return `RelayPullResponse { entries: held_for(recipient_owner) }`.
+pub async fn handle_relay_pull_query(
+    query: &RelayPullQuery,
+    ctx: &dyn RelayPullCtx,
+) -> Result<RelayPullResponse, RelayPullReject> {
+    // Step 0 — community gate.
+    if !ctx.serves_community(&query.community_id).await {
+        return Err(RelayPullReject::WrongCommunity);
+    }
+
+    // Steps 1-5 — shared auth (cert + anchor + membership + sig).
+    let (_device_vk_bytes, _requester_device_id) = auth_pull_requester(
+        &query.requester_enrollment_cert,
+        &query.sig,
+        &query.recipient_owner,
+        &query.community_id,
+        ctx,
+    )
+    .await?;
+
+    // Step 4 — serve held blobs for this recipient (opaque).
+    let held = ctx.held_for(&query.recipient_owner).await;
+    let entries = held.into_iter().map(|(_, blob)| blob).collect();
+    Ok(RelayPullResponse { entries })
+}
+
+// ----------------------------------------------------------------
+// Ack handler
+// ----------------------------------------------------------------
+
+/// Relay pull ack pipeline:
+///
+/// 1. Run the SAME auth (cert + `is_joined_member` + sig) on
+///    `requester_cert_bytes` / `ack_sig`.
+/// 2. Translate `ack.content_ids` → storage keys via
+///    `RelayHoldDoc::key(recipient_owner, content_id)`.
+/// 3. Call `mark_pulled(keys, requester_device_id)`. An ack for a content id
+///    not currently held is a no-op (mark_pulled tolerates missing keys).
+pub async fn handle_relay_pull_ack(
+    recipient_owner: &[u8; 16],
+    community_id: &SpaceId,
+    ack: &RelayPullAck,
+    requester_cert_bytes: &[u8],
+    ack_sig: &[u8],
+    ctx: &dyn RelayPullCtx,
+) -> Result<(), RelayPullReject> {
+    // Community gate first (cheapest check).
+    if !ctx.serves_community(community_id).await {
+        return Err(RelayPullReject::WrongCommunity);
+    }
+
+    // Shared auth — cert + anchor + membership + sig.
+    let (_device_vk_bytes, requester_device_id) = auth_pull_requester(
+        requester_cert_bytes,
+        ack_sig,
+        recipient_owner,
+        community_id,
+        ctx,
+    )
+    .await?;
+
+    // Translate content IDs to storage keys.
+    let keys: Vec<String> = ack
+        .content_ids
+        .iter()
+        .map(|cid| RelayHoldDoc::key(recipient_owner, cid))
+        .collect();
+
+    // Mark pulled + run GC. Missing keys are no-ops inside mark_pulled.
+    ctx.mark_pulled(&keys, requester_device_id)
+        .await
+        .map_err(RelayPullReject::MarkFailed)
 }
 
 // =====================================================================
@@ -897,5 +1131,518 @@ mod tests {
         let store = ctx.store.lock().unwrap();
         let entry = store.get(&key).expect("entry persisted");
         assert_eq!(entry.sealed_blob, f.frame.sealed_blob);
+    }
+
+    // ================================================================
+    // Task 4 pull tests
+    // ================================================================
+
+    use crate::community_relay::{relay_pull_sig_payload, RelayPullQuery};
+    use ed25519_dalek::Signer;
+
+    // ----------------------------------------------------------------
+    // TestRelayPullCtx — RelayHoldDoc-backed store + events probe
+    // ----------------------------------------------------------------
+
+    /// Build a valid `RelayPullQuery` signed by the recipient's device key.
+    fn build_pull_query(recipient: &TestOwner, community_id: SpaceId) -> RelayPullQuery {
+        let cert_bytes = harmony_owner::cbor::to_canonical(&recipient.cert).expect("encode cert");
+        let sig = recipient
+            .device_key
+            .sign(&relay_pull_sig_payload(&recipient.owner.0, &community_id))
+            .to_bytes()
+            .to_vec();
+        RelayPullQuery {
+            recipient_owner: recipient.owner.0,
+            community_id,
+            requester_enrollment_cert: cert_bytes,
+            sig,
+        }
+    }
+
+    struct TestRelayPullCtx {
+        /// Communities this relay serves.
+        served_communities: std::collections::BTreeSet<SpaceId>,
+        /// (community_id, owner) pairs that pass `is_joined_member`.
+        members: std::collections::BTreeSet<([u8; 16], [u8; 16])>,
+        /// Backing store (RelayHoldDoc).
+        doc: StdMutex<RelayHoldDoc>,
+        /// Wall-clock now in seconds (for cert expiry).
+        now_secs: u64,
+        /// Wall-clock now in milliseconds (for gc).
+        now_ms: u64,
+        /// Ordered event log for call-order assertions.
+        events: StdMutex<Vec<String>>,
+    }
+
+    impl TestRelayPullCtx {
+        fn new(now_secs: u64, now_ms: u64) -> Self {
+            Self {
+                served_communities: Default::default(),
+                members: Default::default(),
+                doc: StdMutex::new(RelayHoldDoc::default()),
+                now_secs,
+                now_ms,
+                events: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn serve(&mut self, community_id: SpaceId) {
+            self.served_communities.insert(community_id);
+        }
+
+        fn admit(&mut self, community_id: SpaceId, owner: [u8; 16]) {
+            self.members.insert((community_id.0, owner));
+        }
+
+        /// Pre-load an entry into the doc store (simulates a prior deposit).
+        fn preload_entry(&self, key: String, entry: RelayHoldEntry) {
+            self.doc.lock().unwrap().entries.insert(key, entry);
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+
+        fn push_event(&self, e: impl Into<String>) {
+            self.events.lock().unwrap().push(e.into());
+        }
+
+        /// Snapshot the current pulled_by set for a key.
+        fn pulled_by_for(&self, key: &str) -> BTreeSet<String> {
+            self.doc
+                .lock()
+                .unwrap()
+                .entries
+                .get(key)
+                .map(|e| e.pulled_by.clone())
+                .unwrap_or_default()
+        }
+
+        /// True iff the entry key still exists in the doc.
+        fn entry_exists(&self, key: &str) -> bool {
+            self.doc.lock().unwrap().entries.contains_key(key)
+        }
+
+        /// Drive one GC sweep (for test assertions about the one-sweep
+        /// deferral — separate from `mark_pulled` so tests control sweep
+        /// timing explicitly). Returns true iff the doc changed.
+        fn gc_sweep(&self) -> bool {
+            self.doc.lock().unwrap().gc(self.now_ms)
+        }
+    }
+
+    #[async_trait]
+    impl RelayPullCtx for TestRelayPullCtx {
+        async fn serves_community(&self, community_id: &SpaceId) -> bool {
+            self.push_event("serves_community");
+            self.served_communities.contains(community_id)
+        }
+
+        async fn is_joined_member(&self, community_id: &SpaceId, owner: &[u8; 16]) -> bool {
+            self.push_event("is_joined_member");
+            self.members.contains(&(community_id.0, *owner))
+        }
+
+        fn now_secs(&self) -> u64 {
+            self.now_secs
+        }
+
+        async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)> {
+            self.push_event("held_for");
+            self.doc
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|(_, e)| &e.recipient_owner == recipient_owner)
+                .map(|(k, e)| {
+                    (
+                        k.clone(),
+                        RelayHeldBlob {
+                            sender_owner: e.sender_owner,
+                            sealed_blob: e.sealed_blob.clone(),
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        /// Set `pulled_by` for matched keys (silently skip missing keys).
+        /// Does NOT run GC — the test drives gc_sweep() manually to verify
+        /// the one-sweep deferral invariant.
+        async fn mark_pulled(
+            &self,
+            keys: &[String],
+            requester_device: String,
+        ) -> Result<(), String> {
+            self.push_event(format!("mark_pulled:{}", keys.len()));
+            let mut doc = self.doc.lock().unwrap();
+            for k in keys {
+                if let Some(e) = doc.entries.get_mut(k) {
+                    e.pulled_by.insert(requester_device.clone());
+                }
+                // Missing keys are silently ignored (no-op).
+            }
+            Ok(())
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Helper: build a RelayHoldEntry for a given recipient+sender
+    // ----------------------------------------------------------------
+
+    fn pull_test_entry(
+        recipient: &TestOwner,
+        sender: &TestOwner,
+        community_id: SpaceId,
+        blob: Vec<u8>,
+        held_at_ms: u64,
+    ) -> (String, RelayHoldEntry) {
+        let content_id = ContentId::for_book(
+            &blob,
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("content_id");
+        let key = RelayHoldDoc::key(&recipient.owner.0, &content_id.to_bytes());
+        let entry = RelayHoldEntry {
+            recipient_owner: recipient.owner.0,
+            sender_owner: sender.owner.0,
+            community_id,
+            sealed_blob: blob,
+            held_at: Hlc {
+                wall_ms: held_at_ms,
+                logical: 0,
+                device_id: "relay-device".into(),
+            },
+            held_by: "relay-device".into(),
+            pulled_by: BTreeSet::new(),
+        };
+        (key, entry)
+    }
+
+    // ----------------------------------------------------------------
+    // Test 1: authed recipient pull returns exactly their blobs
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_pull_authed_recipient_returns_their_blobs_only() {
+        let recipient = mint_test_owner(0x42);
+        let other_recipient = mint_test_owner(0x43);
+        let sender = mint_test_owner(0x51);
+        let cid = community_id();
+
+        // now_secs=1_700_000_100 (cert minted at 1_700_000_000 with no expiry)
+        let now_secs = 1_700_000_100u64;
+        let now_ms = 1_700_000_100_000u64;
+
+        let mut ctx = TestRelayPullCtx::new(now_secs, now_ms);
+        ctx.serve(cid);
+        ctx.admit(cid, recipient.owner.0);
+
+        // One blob for our recipient.
+        let blob1 = b"blob-for-recipient".to_vec();
+        let (key1, entry1) =
+            pull_test_entry(&recipient, &sender, cid, blob1.clone(), now_ms - 1_000);
+        ctx.preload_entry(key1.clone(), entry1);
+
+        // One blob for another recipient — must NOT appear in the response.
+        let blob2 = b"blob-for-other".to_vec();
+        let (key2, entry2) = pull_test_entry(
+            &other_recipient,
+            &sender,
+            cid,
+            blob2.clone(),
+            now_ms - 1_000,
+        );
+        ctx.preload_entry(key2.clone(), entry2);
+
+        let query = build_pull_query(&recipient, cid);
+        let resp = handle_relay_pull_query(&query, &ctx)
+            .await
+            .expect("valid pull query must succeed");
+
+        assert_eq!(resp.entries.len(), 1, "exactly one blob for this recipient");
+        assert_eq!(
+            resp.entries[0].sealed_blob, blob1,
+            "sealed_blob is byte-identical to deposited blob"
+        );
+        assert_eq!(resp.entries[0].sender_owner, sender.owner.0);
+
+        // Call-order probe: serves_community → (auth → held_for).
+        let ev = ctx.events();
+        assert!(ev.iter().any(|e| e == "serves_community"));
+        assert!(ev.iter().any(|e| e == "is_joined_member"));
+        assert!(ev.iter().any(|e| e == "held_for"));
+    }
+
+    // ----------------------------------------------------------------
+    // Test 2: wrong-owner cert → BadCert
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_pull_wrong_owner_cert_bad_cert() {
+        let recipient = mint_test_owner(0x42);
+        let other = mint_test_owner(0x55); // different owner
+        let cid = community_id();
+
+        let now_secs = 1_700_000_100u64;
+        let now_ms = 1_700_000_100_000u64;
+
+        let mut ctx = TestRelayPullCtx::new(now_secs, now_ms);
+        ctx.serve(cid);
+        ctx.admit(cid, recipient.owner.0);
+
+        // Build a query where the cert belongs to `other` but recipient_owner
+        // is `recipient` — cert.owner_id != query.recipient_owner.
+        let other_cert_bytes = harmony_owner::cbor::to_canonical(&other.cert).expect("encode cert");
+        // Sign with the OTHER's device key (so the sig is valid for the other's cert,
+        // but the cert.owner_id != recipient.owner.0).
+        let sig = other
+            .device_key
+            .sign(&relay_pull_sig_payload(&recipient.owner.0, &cid))
+            .to_bytes()
+            .to_vec();
+        let query = RelayPullQuery {
+            recipient_owner: recipient.owner.0,
+            community_id: cid,
+            requester_enrollment_cert: other_cert_bytes,
+            sig,
+        };
+
+        let err = handle_relay_pull_query(&query, &ctx)
+            .await
+            .expect_err("wrong-owner cert must be rejected");
+        assert!(
+            matches!(err, RelayPullReject::BadCert),
+            "expected BadCert, got {err:?}"
+        );
+
+        // No held_for call (rejected before serve step).
+        assert!(
+            !ctx.events().iter().any(|e| e == "held_for"),
+            "held_for must not be called on BadCert"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Test 3: non-served community → WrongCommunity
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_pull_wrong_community_rejected() {
+        let recipient = mint_test_owner(0x42);
+        let cid = community_id();
+        let other_cid = SpaceId([0xFF; 16]);
+
+        let now_secs = 1_700_000_100u64;
+        let now_ms = 1_700_000_100_000u64;
+
+        let mut ctx = TestRelayPullCtx::new(now_secs, now_ms);
+        ctx.serve(cid); // serves cid, NOT other_cid
+
+        let query = build_pull_query(&recipient, other_cid);
+        let err = handle_relay_pull_query(&query, &ctx)
+            .await
+            .expect_err("non-served community must be rejected");
+        assert!(
+            matches!(err, RelayPullReject::WrongCommunity),
+            "expected WrongCommunity, got {err:?}"
+        );
+
+        let ev = ctx.events();
+        assert!(
+            ev.iter().any(|e| e == "serves_community"),
+            "must probe serves_community"
+        );
+        assert!(
+            !ev.iter().any(|e| e == "held_for"),
+            "held_for must not be called on WrongCommunity"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Test 4: non-member recipient → NotMember
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_pull_not_member_rejected() {
+        let recipient = mint_test_owner(0x42);
+        let cid = community_id();
+
+        let now_secs = 1_700_000_100u64;
+        let now_ms = 1_700_000_100_000u64;
+
+        let mut ctx = TestRelayPullCtx::new(now_secs, now_ms);
+        ctx.serve(cid);
+        // Do NOT admit the recipient → is_joined_member returns false.
+
+        let query = build_pull_query(&recipient, cid);
+        let err = handle_relay_pull_query(&query, &ctx)
+            .await
+            .expect_err("non-member must be rejected");
+        assert!(
+            matches!(err, RelayPullReject::NotMember),
+            "expected NotMember, got {err:?}"
+        );
+
+        assert!(
+            !ctx.events().iter().any(|e| e == "held_for"),
+            "held_for must not be called on NotMember"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Test 5: tampered sig → BadSig
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_pull_bad_sig_rejected() {
+        let recipient = mint_test_owner(0x42);
+        let cid = community_id();
+
+        let now_secs = 1_700_000_100u64;
+        let now_ms = 1_700_000_100_000u64;
+
+        let mut ctx = TestRelayPullCtx::new(now_secs, now_ms);
+        ctx.serve(cid);
+        ctx.admit(cid, recipient.owner.0);
+
+        let mut query = build_pull_query(&recipient, cid);
+        query.sig[10] ^= 0xFF; // tamper a byte
+
+        let err = handle_relay_pull_query(&query, &ctx)
+            .await
+            .expect_err("tampered sig must be rejected");
+        assert!(
+            matches!(err, RelayPullReject::BadSig),
+            "expected BadSig, got {err:?}"
+        );
+
+        assert!(
+            !ctx.events().iter().any(|e| e == "held_for"),
+            "held_for must not be called on BadSig"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Test 6: ack marks pulled_by + GC removes covered entry
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_pull_ack_marks_pulled_and_gc_removes_on_next_sweep() {
+        let recipient = mint_test_owner(0x42);
+        let sender = mint_test_owner(0x51);
+        let cid = community_id();
+
+        // Use a well-past now_ms so TTL isn't a factor.
+        let now_secs = 1_700_000_100u64;
+        let now_ms = 1_700_000_100_000u64;
+
+        let mut ctx = TestRelayPullCtx::new(now_secs, now_ms);
+        ctx.serve(cid);
+        ctx.admit(cid, recipient.owner.0);
+
+        // Deposit one blob.
+        let blob = b"ack-me-blob".to_vec();
+        let (key, entry) = pull_test_entry(&recipient, &sender, cid, blob.clone(), now_ms - 1_000);
+        ctx.preload_entry(key.clone(), entry);
+
+        // Compute the content_id for the ack.
+        let content_id = ContentId::for_book(
+            &blob,
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("content_id");
+
+        let cert_bytes = harmony_owner::cbor::to_canonical(&recipient.cert).expect("encode cert");
+        let ack_sig = recipient
+            .device_key
+            .sign(&relay_pull_sig_payload(&recipient.owner.0, &cid))
+            .to_bytes()
+            .to_vec();
+        let ack = RelayPullAck {
+            content_ids: vec![content_id.to_bytes()],
+        };
+
+        // Ack: mark_pulled records the requester device in pulled_by for
+        // the acked content IDs (does NOT call gc in the test mock).
+        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &ack_sig, &ctx)
+            .await
+            .expect("ack must succeed");
+
+        // After mark_pulled: pulled_by is set.
+        let pb = ctx.pulled_by_for(&key);
+        let recipient_device_id =
+            hex::encode(recipient.cert.device_pubkeys.classical.ed25519_verify);
+        assert!(
+            pb.contains(&recipient_device_id),
+            "pulled_by must contain the requester device id after ack"
+        );
+
+        // One-sweep deferral (spec + RelayHoldDoc::gc() comment): the FIRST gc
+        // sweep after the ack defers removal because covered_at_start is
+        // snapshotted at the TOP of gc() — the entry IS in covered_at_start
+        // (pulled_by was set before this call), so it IS removed immediately.
+        // Wait — the deferral only protects entries that become covered DURING
+        // a gc call; entries that were already covered AT gc() entry are removed
+        // on that very call. So: first gc_sweep removes the entry.
+        let changed = ctx.gc_sweep();
+        assert!(
+            changed,
+            "first gc sweep after ack must remove the covered entry"
+        );
+        assert!(
+            !ctx.entry_exists(&key),
+            "entry must be removed by the first gc sweep after ack"
+        );
+
+        // Ack for an already-GC'd key is a no-op (not an error).
+        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &ack_sig, &ctx)
+            .await
+            .expect("second ack for already-removed key must be a no-op");
+    }
+
+    // ----------------------------------------------------------------
+    // Test 6b: ack for unknown content_id is a no-op
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_pull_ack_unknown_content_id_is_noop() {
+        let recipient = mint_test_owner(0x42);
+        let cid = community_id();
+
+        let now_secs = 1_700_000_100u64;
+        let now_ms = 1_700_000_100_000u64;
+
+        let mut ctx = TestRelayPullCtx::new(now_secs, now_ms);
+        ctx.serve(cid);
+        ctx.admit(cid, recipient.owner.0);
+        // Store is empty — no held blobs.
+
+        let cert_bytes = harmony_owner::cbor::to_canonical(&recipient.cert).expect("encode cert");
+        let ack_sig = recipient
+            .device_key
+            .sign(&relay_pull_sig_payload(&recipient.owner.0, &cid))
+            .to_bytes()
+            .to_vec();
+        let unknown_content_id = [0xAB; 32];
+        let ack = RelayPullAck {
+            content_ids: vec![unknown_content_id],
+        };
+
+        // Must succeed — unknown content IDs are silently ignored.
+        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &ack_sig, &ctx)
+            .await
+            .expect("ack for unknown content_id must be a no-op, not an error");
+
+        // Nothing was inserted or removed.
+        assert!(ctx.doc.lock().unwrap().entries.is_empty());
     }
 }
