@@ -10313,21 +10313,15 @@ mod zeb_458_community_relay_announce_verify_tests {
         let member = mint_test_owner(0xa2);
         let prior = joined_prior(community_id, &member);
 
-        let event = make_relay_announce_event(
-            community_id,
-            &member,
-            member.owner,
-            1_000_000,
-            1_000_000,
-        );
+        let event =
+            make_relay_announce_event(community_id, &member, member.owner, 1_000_000, 1_000_000);
 
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr: member.owner,
             is_invite_only: false,
         };
-        verify_event(&event, &prior, &ctx)
-            .expect("valid CommunityRelayAnnounce must verify");
+        verify_event(&event, &prior, &ctx).expect("valid CommunityRelayAnnounce must verify");
     }
 
     /// RCH2 analogue: tampering the inner identity_signature bytes causes
@@ -10338,13 +10332,8 @@ mod zeb_458_community_relay_announce_verify_tests {
         let member = mint_test_owner(0xa2);
         let prior = joined_prior(community_id, &member);
 
-        let mut event = make_relay_announce_event(
-            community_id,
-            &member,
-            member.owner,
-            1_000_000,
-            1_000_000,
-        );
+        let mut event =
+            make_relay_announce_event(community_id, &member, member.owner, 1_000_000, 1_000_000);
 
         // Flip a bit in the inner signature; re-sign the outer envelope so
         // SignatureInvalid doesn't fire before the inner-sig check.
@@ -10360,8 +10349,7 @@ mod zeb_458_community_relay_announce_verify_tests {
             actor: event.actor,
             at: event.at.clone(),
         };
-        let resigned =
-            sign_event(&resigned_payload, &member.device_key).expect("re-sign envelope");
+        let resigned = sign_event(&resigned_payload, &member.device_key).expect("re-sign envelope");
 
         let ctx = VerifyContext {
             expected_community_id: community_id,
@@ -10386,8 +10374,7 @@ mod zeb_458_community_relay_announce_verify_tests {
         let wall_ms: u64 = 1_000_000_000;
         // 30-min bound is shared with reachability (REACHABILITY_TIMESTAMP_SKEW_MAX_MS).
         let ad_at = wall_ms + REACHABILITY_TIMESTAMP_SKEW_MAX_MS + 60 * 1_000;
-        let event =
-            make_relay_announce_event(community_id, &member, member.owner, ad_at, wall_ms);
+        let event = make_relay_announce_event(community_id, &member, member.owner, ad_at, wall_ms);
 
         let ctx = VerifyContext {
             expected_community_id: community_id,
@@ -10412,8 +10399,7 @@ mod zeb_458_community_relay_announce_verify_tests {
         let bob = mint_test_owner(0xbb);
         let prior = joined_prior(community_id, &admin);
 
-        let event =
-            make_relay_announce_event(community_id, &bob, bob.owner, 1_000_000, 1_000_000);
+        let event = make_relay_announce_event(community_id, &bob, bob.owner, 1_000_000, 1_000_000);
 
         let ctx = VerifyContext {
             expected_community_id: community_id,
