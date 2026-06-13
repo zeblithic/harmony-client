@@ -58,7 +58,7 @@ use harmony_app::fleet_sync::{
 };
 use harmony_app::friend_graph::FriendStatus;
 use harmony_app::iroh_butler_acceptor::{
-    handle_deposit_core, ButlerDepositCtx, DepositPersistVerdict,
+    handle_deposit_core, ButlerDepositCtx, DepositPersistVerdict, DepositReject,
 };
 use harmony_app::owner_state_crypto::KeyTree;
 use harmony_app::owner_state_types::{
@@ -800,4 +800,276 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
     let _ = a.engine.shutdown().await;
     let _ = b.engine.shutdown().await;
     forwarder.abort();
+}
+
+/// ZEB-424: a deposit from a sender who is NOT an Active friend but DOES
+/// share a live group-DM with the recipient is admitted through the
+/// co-member branch and runs the full receive path — admitted, persisted
+/// (persist-before-ack), acked, fanned out, and ingested. This mirrors
+/// `butler_deposit_fans_out_ingests_acks_and_gcs` with exactly two deltas
+/// before the deposit: the sender is REMOVED from `friends` (so the friend
+/// branch misses) and ADDED to `group_co_members` (so the co-member branch
+/// admits). Every success outcome the friend happy-path asserts must hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
+    let fx = fixture();
+    let a_sk = device_a_sk();
+    let b_sk = device_b_sk();
+    let a_id = device_id(&a_sk);
+    let b_id = device_id(&b_sk);
+    let enrolled: BTreeSet<String> = [a_id.clone(), b_id.clone()].into();
+    let key = DmInboxDoc::key(&fx.space_id.0, &fx.message_cid.to_bytes());
+
+    let kt = Arc::new(KeyTree::derive(&[0x42u8; 32]).expect("kt"));
+    let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+
+    let chronology: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let a_dir = tempfile::tempdir().expect("tempdir A");
+    let b_dir = tempfile::tempdir().expect("tempdir B");
+    let mut a = build_engine(
+        &a_id,
+        Arc::clone(&kt),
+        Arc::clone(&cas),
+        Arc::new(RecordingPersist {
+            inner: DmInboxPersist {
+                doc_path: a_dir.path().join("dm_inbox.cbor"),
+                replay_path: a_dir.path().join("dm_inbox_replay.cbor"),
+            },
+            expected_key: key.clone(),
+            chronology: Arc::clone(&chronology),
+        }),
+    );
+    let mut b = build_engine(
+        &b_id,
+        Arc::clone(&kt),
+        Arc::clone(&cas),
+        Arc::new(DmInboxPersist {
+            doc_path: b_dir.path().join("dm_inbox.cbor"),
+            replay_path: b_dir.path().join("dm_inbox_replay.cbor"),
+        }),
+    );
+
+    let a_in = a.in_tx.clone();
+    let b_in = b.in_tx.clone();
+    let mut a_out = std::mem::replace(&mut a.out_rx, mpsc::channel(1).1);
+    let mut b_out = std::mem::replace(&mut b.out_rx, mpsc::channel(1).1);
+    let forwarder = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(frame) = a_out.recv() => { let _ = b_in.send(frame).await; }
+                Some(frame) = b_out.recv() => { let _ = a_in.send(frame).await; }
+                else => break,
+            }
+        }
+    });
+
+    // ----- (1) Sender builds the real sealed frame; A accepts it ---------
+    let cert_bytes = harmony_owner::cbor::to_canonical(&fx.sender.cert).expect("encode cert");
+    let frame = build_deposit_frame(
+        &RECIPIENT_OWNER,
+        &fx.sender.owner.0,
+        &cert_bytes,
+        &fx.sender.device_key,
+        &a_sk.verifying_key().to_bytes(),
+        &DepositPayload {
+            cidnotify_packet: fx.cidnotify_packet.clone(),
+            storage_blob: fx.storage_blob.clone(),
+        },
+    )
+    .expect("sender-side frame build");
+
+    // The ONLY deltas vs the friend happy-path: the sender is NOT a friend
+    // (empty `friends`), but IS a live group-DM co-member (the sender owner
+    // is in `group_co_members`). Admission must take the co-member branch;
+    // its cert-anchor check is derived from the owner id, which the minted
+    // sender cert satisfies automatically.
+    let a_butler_ctx = TestButlerCtx {
+        self_owner: RECIPIENT_OWNER,
+        device_id: a_id.clone(),
+        friends: BTreeMap::new(),
+        group_co_members: [fx.sender.owner.0].into(),
+        device_owners: [(fx.dm_device_hash, (fx.sender.owner.0, fx.identity_pub))].into(),
+        butler_sk: a_sk,
+        doc: Arc::clone(&a.doc),
+        tracker: Arc::clone(&a.tracker),
+        engine: Arc::clone(&a.engine),
+    };
+
+    let ack = handle_deposit_core(&frame, &a_butler_ctx)
+        .await
+        .expect("valid deposit from a live group-DM co-member must be accepted");
+    chronology.lock().unwrap().push("ack".to_string());
+
+    assert_eq!(ack.space_id, fx.space_id.0);
+    assert_eq!(ack.message_cid, fx.message_cid.to_bytes().to_vec());
+
+    // Persist-before-ack (D7): same chronology guarantee as the friend path.
+    {
+        let log = chronology.lock().unwrap().clone();
+        let first_persist_with_entry = log.iter().position(|e| e == "persist:with-entry");
+        let ack_pos = log.iter().position(|e| e == "ack").expect("ack stamped");
+        assert!(
+            first_persist_with_entry.is_some_and(|p| p < ack_pos),
+            "entry must be durably persisted on A BEFORE the ack exists; chronology: {log:?}"
+        );
+    }
+
+    // A's doc holds the entry at ack time, exactly as deposited.
+    {
+        let doc = a.doc.lock().await;
+        let entry = doc.entries.get(&key).expect("entry in A's doc at ack");
+        assert_eq!(entry.sender_owner, fx.sender.owner.0);
+        assert_eq!(entry.cidnotify_packet, fx.cidnotify_packet);
+        assert_eq!(entry.storage_blob, fx.storage_blob);
+        assert_eq!(entry.deposited_by, a_id);
+        assert!(entry.ingested_by.is_empty());
+    }
+
+    // ----- (2) Fan-out: A's persist_entry flush → bridge → B applies -----
+    let b_doc_handle = Arc::clone(&b.doc);
+    let converged = wait_until(
+        || {
+            let b_doc = Arc::clone(&b_doc_handle);
+            let key = key.clone();
+            async move { b_doc.lock().await.entries.contains_key(&key) }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        converged,
+        "B did not receive the co-member entry via fan-out within 5s"
+    );
+    let deposited_at = {
+        let doc = b.doc.lock().await;
+        let entry = &doc.entries[&key];
+        assert_eq!(entry.sender_owner, fx.sender.owner.0);
+        assert_eq!(entry.cidnotify_packet, fx.cidnotify_packet);
+        assert_eq!(entry.storage_blob, fx.storage_blob);
+        assert_eq!(entry.deposited_by, a_id);
+        entry.deposited_at.clone()
+    };
+
+    // ----- (3) B's ingestion sweep: the normal DM receive path ----------
+    let b_ingest_ctx = ProbeIngestCtx::new(
+        b_id.clone(),
+        [(fx.dm_device_hash, fx.identity_pub)].into(),
+        enrolled.clone(),
+    );
+    let changed = sweep(&b.doc, &b_ingest_ctx, &b.engine).await;
+    assert!(changed, "B's ingestion must mutate the doc (ig growth)");
+
+    assert_eq!(
+        *b_ingest_ctx.cas_blobs.lock().unwrap(),
+        vec![fx.storage_blob.clone()],
+        "B must CAS-put the deposited storage blob"
+    );
+    let expected_inbox = InboxEntry {
+        space_id: fx.space_id,
+        message_cid: fx.message_cid,
+        from: OwnerAddr(fx.sender.owner.0),
+        received_at: deposited_at,
+    };
+    assert_eq!(b_ingest_ctx.applied(), vec![expected_inbox.clone()]);
+    let emitted = b_ingest_ctx.emitted();
+    assert_eq!(emitted.len(), 1, "exactly one dm-received emit on B");
+    assert_eq!(emitted[0].inbox_entry, expected_inbox);
+    assert_eq!(emitted[0].body, TEST_BODY.to_vec());
+    assert_eq!(emitted[0].mime_type, "text/plain");
+    {
+        let doc = b.doc.lock().await;
+        let entry = doc.entries.get(&key).expect("entry retained on B");
+        assert!(entry.ingested_by.contains(&b_id));
+        assert!(!entry.ingested_by.contains(&a_id));
+    }
+
+    let _ = a.engine.shutdown().await;
+    let _ = b.engine.shutdown().await;
+    forwarder.abort();
+}
+
+/// ZEB-424: a deposit from a sender who is NEITHER an Active friend NOR a
+/// live group-DM co-member is rejected with `NotAuthorized`, and nothing is
+/// persisted into A's dm-inbox store. Same construction as the happy-path,
+/// but BOTH `friends` and `group_co_members` are empty for this sender, so
+/// both admission branches miss at step 1 — before any decrypt/persist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_member_non_friend_deposit_is_rejected_and_not_persisted() {
+    let fx = fixture();
+    let a_sk = device_a_sk();
+    let a_id = device_id(&a_sk);
+    let key = DmInboxDoc::key(&fx.space_id.0, &fx.message_cid.to_bytes());
+
+    let kt = Arc::new(KeyTree::derive(&[0x42u8; 32]).expect("kt"));
+    let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+
+    let chronology: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let a_dir = tempfile::tempdir().expect("tempdir A");
+    let a = build_engine(
+        &a_id,
+        Arc::clone(&kt),
+        Arc::clone(&cas),
+        Arc::new(RecordingPersist {
+            inner: DmInboxPersist {
+                doc_path: a_dir.path().join("dm_inbox.cbor"),
+                replay_path: a_dir.path().join("dm_inbox_replay.cbor"),
+            },
+            expected_key: key.clone(),
+            chronology: Arc::clone(&chronology),
+        }),
+    );
+
+    let cert_bytes = harmony_owner::cbor::to_canonical(&fx.sender.cert).expect("encode cert");
+    let frame = build_deposit_frame(
+        &RECIPIENT_OWNER,
+        &fx.sender.owner.0,
+        &cert_bytes,
+        &fx.sender.device_key,
+        &a_sk.verifying_key().to_bytes(),
+        &DepositPayload {
+            cidnotify_packet: fx.cidnotify_packet.clone(),
+            storage_blob: fx.storage_blob.clone(),
+        },
+    )
+    .expect("sender-side frame build");
+
+    // BOTH admission sources empty for this sender: not a friend, not a
+    // co-member → step 1 returns NotAuthorized before any persist.
+    let a_butler_ctx = TestButlerCtx {
+        self_owner: RECIPIENT_OWNER,
+        device_id: a_id.clone(),
+        friends: BTreeMap::new(),
+        group_co_members: BTreeSet::new(),
+        device_owners: [(fx.dm_device_hash, (fx.sender.owner.0, fx.identity_pub))].into(),
+        butler_sk: a_sk,
+        doc: Arc::clone(&a.doc),
+        tracker: Arc::clone(&a.tracker),
+        engine: Arc::clone(&a.engine),
+    };
+
+    let err = handle_deposit_core(&frame, &a_butler_ctx)
+        .await
+        .expect_err("deposit from a non-friend non-co-member must be rejected");
+    assert_eq!(err, DepositReject::NotAuthorized);
+
+    // Nothing was persisted: A's dm-inbox doc is untouched (no entry under
+    // the deposit key, and the store is empty overall).
+    {
+        let doc = a.doc.lock().await;
+        assert!(
+            !doc.entries.contains_key(&key),
+            "rejected deposit must not persist its entry"
+        );
+        assert!(
+            doc.entries.is_empty(),
+            "A's dm-inbox store must be empty after a rejected deposit"
+        );
+    }
+    // The persist sink was never invoked with the entry (no persist stamp).
+    assert!(
+        chronology.lock().unwrap().is_empty(),
+        "no persist should occur for a rejected deposit"
+    );
+
+    let _ = a.engine.shutdown().await;
 }
