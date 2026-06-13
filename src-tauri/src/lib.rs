@@ -122,6 +122,7 @@ pub mod community_fork;
 pub mod community_invite;
 pub mod community_membership;
 pub mod community_relay;
+pub mod community_relay_hold_crdt;
 pub mod community_state_crdt;
 pub mod community_state_persist;
 pub mod community_state_sync;
