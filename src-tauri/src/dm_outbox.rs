@@ -3875,6 +3875,178 @@ mod tests {
         assert!(stored.delivered_to.is_empty());
     }
 
+    // =================================================================
+    // ZEB-424 D31: per-recipient mixed-state deposit candidacy on a
+    // single fan-out OutboxEntry (CHARACTERIZATION — confirm, don't
+    // change). Group-DM butler fans one logical message to N recipients
+    // (one OutboxEntry, shared message_cid). D31 asserts the EXISTING
+    // per-recipient candidacy already does the right thing when one
+    // fan-out entry has recipients in MIXED delivery states. This test
+    // pins that behavior; it must NOT drive any production change.
+    // =================================================================
+
+    /// One fan-out `OutboxEntry` with three recipients in mixed states:
+    ///   - `alice_rcpt` (A): already acked (in `delivered_to`) — terminal.
+    ///   - `bob` (B): sat sent-but-never-acked for `DEPOSIT_NOACK_WINDOWS`
+    ///     full backoff windows (`failure_count == DEPOSIT_NOACK_WINDOWS`)
+    ///     — a deposit candidate this tick.
+    ///   - `carol` (C): fresh / below the no-ack threshold (no prior
+    ///     `AttemptState`) — pending, NOT a candidate.
+    ///
+    /// One Phase C pass (the synchronous candidacy-producing phase, with
+    /// Ok send results for the two OUTSTANDING recipients B and C — A is
+    /// already delivered so no real drain tick would produce a send
+    /// result for it) must:
+    ///   1. produce a butler deposit candidate for B ONLY (not A, not C);
+    ///   2. leave the entry's overall `DeliveryStatus` as `Partial` (a
+    ///      deposit is a relay, not a direct ack — `drain_phase_c` only
+    ///      returns candidates; it does NOT run them, so nothing flips to
+    ///      Complete here);
+    ///   3. not mutate A's per-recipient state as a side effect of B's
+    ///      candidacy (A stays in `delivered_to`, never gets an
+    ///      `AttemptState`), and leave C's `AttemptState` reflecting ONLY
+    ///      C's own Ok-send bump (failure_count 0 -> 1) — B's deposit rung
+    ///      never touches A's or C's backoff (spec §6 never-worse:
+    ///      rung outcomes don't mutate AttemptState).
+    #[test]
+    fn drain_phase_c_mixed_state_fanout_deposits_only_for_noack_recipient() {
+        // DEPOSIT_NOACK_WINDOWS is the candidacy threshold for the Ok
+        // (sent-but-never-acked) arm; seed B exactly at it.
+        let threshold = crate::butler_deposit::DEPOSIT_NOACK_WINDOWS;
+
+        let mut state = OwnerState::default();
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let alice_rcpt = OwnerAddr([0xa1; 16]); // A — acked (terminal)
+        let bob = OwnerAddr([0xbb; 16]); // B — deposit candidate
+        let carol = OwnerAddr([0xcc; 16]); // C — fresh / pending
+
+        // One fan-out entry: all three recipients, A already acked.
+        let mut entry = entry_with_age(7, vec![alice_rcpt, bob, carol], 1_000);
+        entry.delivered_to.insert(alice_rcpt);
+        entry.delivery_status = DeliveryStatus::Partial; // A acked, B+C outstanding
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = make_outbox_synthetic("dev", self_owner);
+        // Butler client installed so the deposit rung is enabled at all.
+        // Outcome is irrelevant — drain_phase_c only COLLECTS candidates;
+        // it does not run them — but a Failed outcome documents that even
+        // a non-acking butler can't flip the entry to Complete here.
+        let mock = MockDepositClient::returning(DepositRungOutcome::Failed("unused".into()));
+        o.set_butler_deposit_client(mock.clone());
+
+        // Seed B at the no-ack threshold (it has sat unacked for
+        // DEPOSIT_NOACK_WINDOWS full backoff windows). C gets NO prior
+        // AttemptState — it is fresh / below threshold.
+        o.backoff.insert(
+            (entry_id, bob),
+            AttemptState {
+                last_attempt_wall_ms: 1_000,
+                failure_count: threshold,
+            },
+        );
+
+        // Phase B would have sent to the two OUTSTANDING recipients this
+        // tick (A is delivered → no work unit / send result for it). Both
+        // come back Ok (the cached-but-offline primary scenario: enqueued
+        // but never acked).
+        o.in_flight.insert((entry_id, bob));
+        o.in_flight.insert((entry_id, carol));
+        let results = vec![
+            DrainSendResult {
+                entry_id,
+                recipient: bob,
+                result: Ok(()),
+            },
+            DrainSendResult {
+                entry_id,
+                recipient: carol,
+                result: Ok(()),
+            },
+        ];
+
+        let (outcome, candidates) = o.drain_phase_c(&mut state, results, Vec::new(), 2_000, 2_000);
+
+        // ---- Assertion 1: deposit candidate for B ONLY. ----
+        let candidate_recipients: BTreeSet<OwnerAddr> =
+            candidates.iter().map(|c| c.recipient_owner).collect();
+        assert_eq!(
+            candidate_recipients,
+            BTreeSet::from([bob]),
+            "exactly one deposit candidate, for B (the no-ack recipient); \
+             A is acked-terminal and C is below DEPOSIT_NOACK_WINDOWS"
+        );
+        // Every candidate carries the shared fan-out identity.
+        for c in &candidates {
+            assert_eq!(c.entry_id, entry_id, "candidate bound to the fan-out entry");
+            assert_eq!(c.message_cid, ContentId::from_bytes([3u8; 32]));
+        }
+
+        // ---- Assertion 2: entry stays Partial. ----
+        let stored = state.outbox.get(&entry_id).expect("entry still present");
+        assert!(
+            matches!(stored.delivery_status, DeliveryStatus::Partial),
+            "a butler deposit candidate is a relay, not a direct ack; \
+             drain_phase_c returns candidates without running them, so the \
+             entry must remain Partial (got {:?})",
+            stored.delivery_status
+        );
+        assert!(
+            outcome.newly_delivered.is_empty(),
+            "no recipient was acked this pass — newly_delivered must be empty"
+        );
+        assert!(outcome.newly_expired.is_empty(), "entry is not expired");
+
+        // ---- Assertion 3: B's candidacy doesn't perturb A or C. ----
+        // A: still acked, never acquired per-recipient backoff state.
+        assert!(
+            stored.delivered_to.contains(&alice_rcpt),
+            "A stays delivered; B's candidacy must not touch A"
+        );
+        assert!(
+            !o.backoff.contains_key(&(entry_id, alice_rcpt)),
+            "A (acked-terminal) must never acquire an AttemptState"
+        );
+        // C: AttemptState reflects ONLY its own Ok-send bump (0 -> 1) —
+        // B's deposit rung adds nothing to C's backoff.
+        let carol_state = o
+            .backoff
+            .get(&(entry_id, carol))
+            .copied()
+            .expect("C got its own Ok-send AttemptState this tick");
+        assert_eq!(
+            carol_state.failure_count, 1,
+            "C's failure_count is exactly its own one-window Ok-send bump; \
+             B's candidacy must not inflate it"
+        );
+        assert_eq!(
+            carol_state.last_attempt_wall_ms, 2_000,
+            "C's clock anchored by its own Ok-send only"
+        );
+        // B: its own Ok-arm bump (threshold -> threshold + 1); the rung
+        // (candidacy) itself never mutates the AttemptState (spec §6).
+        let bob_state = o
+            .backoff
+            .get(&(entry_id, bob))
+            .copied()
+            .expect("B's AttemptState retained while unacked");
+        assert_eq!(
+            bob_state.failure_count,
+            threshold + 1,
+            "B's failure_count is exactly the Ok-arm's own bump; the deposit \
+             rung adds nothing"
+        );
+
+        // The mock was never INVOKED — drain_phase_c collects candidates
+        // for the caller (drain_lifted) to run unlocked; it does not call
+        // .deposit() itself. This pins that the status/AttemptState
+        // observations above hold independent of any butler outcome.
+        assert!(
+            mock.calls().is_empty(),
+            "drain_phase_c must only COLLECT candidates, never run the deposit"
+        );
+    }
+
     #[tokio::test]
     async fn drain_lifted_releases_outbox_lock_during_transport_send() {
         // ZEB-233 regression test: drain_lifted MUST release the outbox
