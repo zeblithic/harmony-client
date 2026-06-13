@@ -6,3 +6,6 @@ pub use bin_resolver::resolve_harmony_app_bin;
 
 pub mod node;
 pub use node::{NodeConfig, NodeHandle};
+
+pub mod events;
+pub use events::{await_event, EventFrame};

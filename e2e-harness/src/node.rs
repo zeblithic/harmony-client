@@ -215,3 +215,15 @@ async fn wait_for_api_dir(home: &std::path::Path, timeout: Duration) -> anyhow::
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
+
+impl NodeHandle {
+    /// Open a fresh event subscription. The caller owns the receiver + task.
+    pub async fn events(
+        &self,
+    ) -> anyhow::Result<(
+        tokio::sync::mpsc::UnboundedReceiver<crate::events::EventFrame>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        crate::events::subscribe(self.port, &self.token).await
+    }
+}
