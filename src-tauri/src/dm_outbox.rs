@@ -3968,6 +3968,14 @@ mod tests {
         let (outcome, candidates) = o.drain_phase_c(&mut state, results, Vec::new(), 2_000, 2_000);
 
         // ---- Assertion 1: deposit candidate for B ONLY. ----
+        // Bound the COUNT before the set conversion: a BTreeSet would silently
+        // dedupe a duplicate-fanout regression (two candidates for B) and let
+        // the value check below still pass.
+        assert_eq!(
+            candidates.len(),
+            1,
+            "exactly one deposit candidate expected (no duplicate fan-out)"
+        );
         let candidate_recipients: BTreeSet<OwnerAddr> =
             candidates.iter().map(|c| c.recipient_owner).collect();
         assert_eq!(

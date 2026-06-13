@@ -46,7 +46,7 @@ the owner's replicated owner-state CRDT (`ProdButlerDepositCtx.crdt_state`,
 the same state step 1 reads `friend_graph` from). Group-DM admission is a
 second arm of step 1, read from that local state under the same lock:
 
-```
+```text
 step 1 (admission), extended:
   1a. friend_graph[sender_owner] == Active            → admit  (today's path)
   1b. else if ∃ space ∈ owner_state.spaces:

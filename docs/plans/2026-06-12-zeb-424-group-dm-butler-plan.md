@@ -11,13 +11,15 @@
 **Spec:** `docs/specs/2026-06-12-zeb-424-group-dm-butler-design.md` (D27–D34, esp. **D29.1** cert anchor). **Branch:** `zeb-424-group-dm-butler` (off main `fa6672c5`, spec already committed).
 
 **House rules (every task):** no worktrees; `set -o pipefail`; commit BEFORE running gates; 10-minute wall-clock kill switch on any cargo command (use the Bash tool `timeout` param — macOS has no `timeout` binary); `--locked` always. Per-task gates unless a task says otherwise:
+
 ```bash
 cd src-tauri
 cargo fmt --all -- --check
 cargo clippy --locked -p harmony-app --lib --features test-fixtures --no-deps -- -D warnings
 cargo nextest run --locked -p harmony-app --lib --features test-fixtures
 ```
-Reserve `--all-targets` for the final sweep (Task 6) — it relinks ~97 integration binaries (~25min compile / ~27min clippy).
+
+Reserve `--all-targets` for the final sweep (Task 6) — it relinks ~97 integration binaries (~25min compile / ~27min clippy). (Per-task gates are intentionally `--lib`-scoped to avoid that relink on every task; the final sweep and CI's own `--all-targets` run catch integration-target compile breakage before merge.)
 
 ---
 
