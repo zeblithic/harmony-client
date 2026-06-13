@@ -142,7 +142,14 @@ impl NodeHandle {
             .await
             .with_context(|| format!("rpc {cmd}: request failed"))?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        // `text()` can fail after a 200 (truncated/dropped body); propagate it
+        // instead of masking a transport failure as an empty body (CodeRabbit).
+        let body = resp.text().await.with_context(|| {
+            format!(
+                "rpc {cmd}: reading response body (HTTP {})",
+                status.as_u16()
+            )
+        })?;
         if status.as_u16() == 200 {
             // An empty 200 body is a legitimate null result (e.g. start_node);
             // a non-empty body that fails to parse is a real error, not a silent
@@ -167,19 +174,38 @@ impl NodeHandle {
             .bearer_auth(&self.token)
             .send()
             .await?;
-        Ok(resp.json::<Value>().await?)
+        // Check the HTTP code (a 401/500 is a real server error, not a non-ready
+        // node) and propagate body-read failures (Cursor: status skips code check).
+        let code = resp.status();
+        let body = resp
+            .text()
+            .await
+            .with_context(|| format!("status: reading response body (HTTP {})", code.as_u16()))?;
+        if code.as_u16() != 200 {
+            anyhow::bail!("status -> HTTP {}: {body}", code.as_u16());
+        }
+        serde_json::from_str(&body)
+            .with_context(|| format!("status: body is not valid JSON: {body}"))
     }
 
     async fn wait_until_status_running(&self, timeout: Duration) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
+        // Remember the last status error so a persistent server error (e.g. a 401)
+        // surfaces its message on timeout instead of a bare "never running".
+        // Connection-refused while the node is still binding is the expected early
+        // case and is simply retried.
+        let mut last_err = String::from("(status never answered)");
         loop {
-            if let Ok(s) = self.status().await {
-                if s.get("running").and_then(Value::as_bool) == Some(true) {
-                    return Ok(());
-                }
-            }
             if Instant::now() >= deadline {
-                anyhow::bail!("node {} never reported running=true", self.config.profile);
+                anyhow::bail!(
+                    "node {} never reported running=true within {timeout:?}; last status: {last_err}",
+                    self.config.profile
+                );
+            }
+            match self.status().await {
+                Ok(s) if s.get("running").and_then(Value::as_bool) == Some(true) => return Ok(()),
+                Ok(_) => last_err = "running=false".to_string(),
+                Err(e) => last_err = e.to_string(),
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
