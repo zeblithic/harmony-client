@@ -3,3 +3,6 @@
 pub mod bin_resolver;
 
 pub use bin_resolver::resolve_harmony_app_bin;
+
+pub mod node;
+pub use node::{NodeConfig, NodeHandle};
