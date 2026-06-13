@@ -73,6 +73,12 @@ fn iroh_key_persists_to_encrypted_file_without_keychain_and_is_stable_across_boo
     std::fs::create_dir_all(harmony_dir(&home)).unwrap();
     let _g_home = EnvVarGuard::set("HOME", home.path().to_str().unwrap());
     let _g_up = EnvVarGuard::set("USERPROFILE", home.path().to_str().unwrap());
+    // ZEB-457 (Qodo): pin the default profile. Production path resolution
+    // (`identity::resolve_path` → `profile::active_profile`) honors
+    // HARMONY_PROFILE, so a profile set in the ambient env would relocate
+    // the key under `…/profiles/<name>/iroh_sk.enc` and break the
+    // hardcoded `~/.harmony/iroh_sk.enc` assertions below.
+    let _g_prof = EnvVarGuard::unset("HARMONY_PROFILE");
     let _g_kc = EnvVarGuard::set("HARMONY_DISABLE_KEYCHAIN", "1");
     let _g_pp = EnvVarGuard::set("HARMONY_PASSPHRASE", "zeb449-iroh-fallback-pp");
     let _g_pf = EnvVarGuard::unset("HARMONY_PASSPHRASE_FILE");
@@ -116,6 +122,8 @@ fn no_keychain_and_no_passphrase_is_a_loud_error_not_silent_transport_off() {
     std::fs::create_dir_all(harmony_dir(&home)).unwrap();
     let _g_home = EnvVarGuard::set("HOME", home.path().to_str().unwrap());
     let _g_up = EnvVarGuard::set("USERPROFILE", home.path().to_str().unwrap());
+    // ZEB-457 (Qodo): pin the default profile — see the companion test.
+    let _g_prof = EnvVarGuard::unset("HARMONY_PROFILE");
     let _g_kc = EnvVarGuard::set("HARMONY_DISABLE_KEYCHAIN", "1");
     // No passphrase anywhere => no encrypted-file backend either.
     let _g_pp = EnvVarGuard::unset("HARMONY_PASSPHRASE");
