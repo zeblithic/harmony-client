@@ -80,6 +80,21 @@ pub const RELAY_HOLD_GLOBAL_CAP: usize = 1024;
 /// [`crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES`]).
 pub const RELAY_MAX_SEALED_BLOB_BYTES: usize = crate::butler_deposit::DEPOSIT_MAX_FRAME_BYTES;
 
+/// ZEB-458 P4 Phase B: inbound size cap for one `relay-hold-v1` fleet-sync
+/// sample (a whole CBOR-encoded `RelayHoldDoc`), enforced in the zenoh bridge
+/// before the owned copy. The doc holds at most [`RELAY_HOLD_GLOBAL_CAP`]
+/// entries, each bounded by [`RELAY_MAX_SEALED_BLOB_BYTES`]; this product is
+/// the byte footprint of the held blobs, so it is the natural ceiling for the
+/// whole-doc sample (mirroring [`crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES`]).
+pub const RELAY_HOLD_DATASET_MAX_BYTES: usize = RELAY_HOLD_GLOBAL_CAP * RELAY_MAX_SEALED_BLOB_BYTES;
+
+/// ZEB-458 P4 Phase B: inbound size cap for one `relay-optin-v1` fleet-sync
+/// sample (a whole CBOR-encoded `RelayOptInDoc`). The doc carries only a
+/// boolean + HLC stamp per community, so a generous fixed ceiling (mirroring
+/// [`crate::fleet_net::FLEET_NET_DATASET_MAX_BYTES`]) bounds peer-driven
+/// allocation without constraining a realistic opt-in set.
+pub const RELAY_OPTIN_DATASET_MAX_BYTES: usize = 256 * 1024;
+
 /// TTL for un-pulled relay blobs in milliseconds (30 days, matching
 /// [`crate::butler_deposit::INBOX_TTL_MS`]).
 pub const RELAY_HOLD_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;

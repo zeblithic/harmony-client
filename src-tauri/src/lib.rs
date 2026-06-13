@@ -131,6 +131,7 @@ pub mod community_relay_pull;
 pub mod community_relay_pull_driver;
 pub mod community_relay_resolver;
 pub mod community_state_crdt;
+// ZEB-458 P4 Phase B: on-disk persistence for the two relay fleet datasets.
 pub mod community_state_persist;
 pub mod community_state_sync;
 pub mod community_voting_approval;
@@ -210,6 +211,8 @@ pub mod profile_broadcast;
 pub mod profile_card_broadcast;
 pub mod profile_page_doc;
 pub mod referral_catalog;
+pub mod relay_hold_persist;
+pub mod relay_optin_persist;
 // ZEB-321 Phase 1 Task 7: debounced background task that re-emits this
 // device's ReachabilityAnnounce on startup / network change / idle tick /
 // manual force-notify. Wired into the event loop by Task 8.
@@ -969,6 +972,65 @@ pub struct NodeState {
     >,
     pub dm_inbox_device_id: Option<String>,
 
+    /// ZEB-458 P4 Phase B: relay-hold dataset (`relay-hold-v1`, D38) — the
+    /// relay's held opaque blobs, replicated across the relay's OWN fleet so
+    /// every device of a volunteering owner can serve a recipient pull. `Some`
+    /// while the node is running and an owner identity is loaded; `None` before
+    /// the FleetSyncEngine is wired at startup or after stop_node. No IPC
+    /// surface in this task — the resolver-feed + GC sweep + acceptors are the
+    /// later active-machinery task (T11b); held here so stop_inner can shut the
+    /// engine down and a restart re-loads from disk. Mirrors the dm_inbox
+    /// handles above field-for-field.
+    pub relay_hold_doc:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::community_relay_hold_crdt::RelayHoldDoc>>>,
+    pub relay_hold_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+    >,
+    pub relay_hold_sync: Option<
+        std::sync::Arc<
+            crate::fleet_sync::FleetSyncEngine<crate::community_relay_hold_crdt::RelayHoldDoc>,
+        >,
+    >,
+
+    /// ZEB-458 P4 Phase B: relay-optin dataset (`relay-optin-v1`, D43) — the
+    /// per-community opt-in flag set, replicated across the volunteer's fleet so
+    /// every online device advertises + serves for an opted-in community.
+    /// `Some` while the node is running and an owner identity is loaded; `None`
+    /// otherwise. Toggled by the `set_community_relay_opt_in` IPC; read by
+    /// `get_community_relay_status`. Mirrors the dm_inbox handle shapes.
+    pub relay_optin_doc:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::community_relay_optin::RelayOptInDoc>>>,
+    pub relay_optin_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+    >,
+    pub relay_optin_sync: Option<
+        std::sync::Arc<
+            crate::fleet_sync::FleetSyncEngine<crate::community_relay_optin::RelayOptInDoc>,
+        >,
+    >,
+
+    /// ZEB-458 P4 Phase B: shared community-relay resolver — maps a community
+    /// id to the relay endpoints currently advertising for it. Constructed at
+    /// start_node; fed by the announce/pull machinery in T11b. Declared now so
+    /// T11b only assigns into it.
+    pub community_relay_resolver:
+        Option<std::sync::Arc<crate::community_relay_resolver::CommunityRelayResolver>>,
+    /// ZEB-458 P4 Phase B: force-publish trigger for the community-relay
+    /// announce publisher (T11b spawns the publisher; the opt-in IPC wakes it).
+    /// Declared now + defaulted None so the IPC can `notify_one()` it harmlessly
+    /// before T11b populates it.
+    pub community_relay_publisher_force: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// ZEB-458 P4 Phase B: join handle for the community-relay announce
+    /// publisher task (populated by T11b). Held so stop_inner can abort it.
+    pub community_relay_publisher_handle: Option<tokio::task::JoinHandle<()>>,
+    /// ZEB-458 P4 Phase B: join handle for the community-relay pull driver task
+    /// (populated by T11b). Held so stop_inner can abort it.
+    pub community_relay_pull_driver_handle: Option<tokio::task::JoinHandle<()>>,
+
     /// ZEB-418 SP2 P2: dm-outhold dataset (sender-side outbound-hold blobs,
     /// spec D12). `Some` while the node is running and an owner identity is
     /// loaded; `None` before the FleetSyncEngine is wired at startup or
@@ -1379,6 +1441,19 @@ impl Default for NodeState {
             dm_inbox_tracker: None,
             dm_inbox_sync: None,
             dm_inbox_device_id: None,
+            // ZEB-458 P4 Phase B: relay-hold + relay-optin dataset handles +
+            // the resolver/publisher/driver slots stay None until start_node
+            // wires the FleetSyncEngines (and T11b spawns the active tasks).
+            relay_hold_doc: None,
+            relay_hold_tracker: None,
+            relay_hold_sync: None,
+            relay_optin_doc: None,
+            relay_optin_tracker: None,
+            relay_optin_sync: None,
+            community_relay_resolver: None,
+            community_relay_publisher_force: None,
+            community_relay_publisher_handle: None,
+            community_relay_pull_driver_handle: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles stay
             // None until start_node wires the FleetSyncEngines (mirrors
             // dm-inbox).
@@ -1637,6 +1712,18 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let fleet_net_sync_for_shutdown: Option<
         std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::fleet_net::FleetNetDoc>>,
     >;
+    // ZEB-458 P4 Phase B: relay-hold + relay-optin fleet-sync engines, taken
+    // outside the lock for the same ephemeral-runtime shutdown pattern.
+    let relay_hold_sync_for_shutdown: Option<
+        std::sync::Arc<
+            crate::fleet_sync::FleetSyncEngine<crate::community_relay_hold_crdt::RelayHoldDoc>,
+        >,
+    >;
+    let relay_optin_sync_for_shutdown: Option<
+        std::sync::Arc<
+            crate::fleet_sync::FleetSyncEngine<crate::community_relay_optin::RelayOptInDoc>,
+        >,
+    >;
     let (
         shutdown_tx,
         thread,
@@ -1854,6 +1941,27 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // fleet-net handles — it captures the pkarr publishers and the
         // fleet-net engine, all of which die with this stop.
         guard.routing_republish = None;
+        // ZEB-458 P4 Phase B: take the relay-hold + relay-optin engines for
+        // shutdown and clear the remaining handles (mirrors fleet-net). Neither
+        // has a sweeper — `on_applied` is None for both — so the engine
+        // shutdown is the whole teardown. Also abort the T11b publisher /
+        // pull-driver tasks (None until T11b populates them, so the take +
+        // abort-if-Some is a correct no-op here) and drop the resolver +
+        // force-notify so a restart rebuilds fresh ones.
+        relay_hold_sync_for_shutdown = guard.relay_hold_sync.take();
+        guard.relay_hold_doc = None;
+        guard.relay_hold_tracker = None;
+        relay_optin_sync_for_shutdown = guard.relay_optin_sync.take();
+        guard.relay_optin_doc = None;
+        guard.relay_optin_tracker = None;
+        guard.community_relay_resolver = None;
+        guard.community_relay_publisher_force = None;
+        if let Some(h) = guard.community_relay_publisher_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = guard.community_relay_pull_driver_handle.take() {
+            h.abort();
+        }
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -2281,6 +2389,61 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                         tracing::error!(
                             error = %e,
                             "could not build ephemeral tokio runtime for fleet-net \
+                             FleetSyncEngine shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-458 P4 Phase B: shut down the relay-hold + relay-optin fleet-sync
+    // engines so their final debounced publish + persist pass runs before the
+    // event-loop thread is joined. Same ephemeral-runtime pattern as fleet-net.
+    if let Some(relay_hold_engine) = relay_hold_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(relay_hold_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "relay-hold FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for relay-hold \
+                             FleetSyncEngine shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    if let Some(relay_optin_engine) = relay_optin_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(relay_optin_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "relay-optin FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for relay-optin \
                              FleetSyncEngine shutdown — final flush skipped"
                         );
                     }
@@ -2934,6 +3097,47 @@ pub async fn start_node_inner(
         > = None;
         let mut dm_inbox_device_id_opt: Option<String> = None;
         let mut dm_inbox_sync_handles_opt: Option<crate::event_loop::DmInboxSyncHandles> = None;
+        // ZEB-458 P4 Phase B: relay-hold + relay-optin fleet datasets. Lifted
+        // to outer scope so the NodeState assignment (relay_hold_*/relay_optin_*
+        // + resolver) and the event_loop::run call site can reach them. Built
+        // alongside the dm-inbox engine when an owner identity loads. Mirror the
+        // dm_inbox opts above field-for-field; `on_applied` is None for BOTH
+        // (no local ingest sweeper on the relay side — the resolver-feed + GC
+        // sweep are the later active-machinery task, T11b).
+        let mut relay_hold_doc_opt: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::community_relay_hold_crdt::RelayHoldDoc>>,
+        > = None;
+        let mut relay_hold_tracker_opt: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<
+                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                >,
+            >,
+        > = None;
+        let mut relay_hold_sync_engine_opt: Option<
+            std::sync::Arc<
+                crate::fleet_sync::FleetSyncEngine<crate::community_relay_hold_crdt::RelayHoldDoc>,
+            >,
+        > = None;
+        let mut relay_optin_doc_opt: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::community_relay_optin::RelayOptInDoc>>,
+        > = None;
+        let mut relay_optin_tracker_opt: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<
+                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                >,
+            >,
+        > = None;
+        let mut relay_optin_sync_engine_opt: Option<
+            std::sync::Arc<
+                crate::fleet_sync::FleetSyncEngine<crate::community_relay_optin::RelayOptInDoc>,
+            >,
+        > = None;
+        let mut community_relay_resolver_opt: Option<
+            std::sync::Arc<crate::community_relay_resolver::CommunityRelayResolver>,
+        > = None;
+        let mut relay_sync_handles_opt: Option<crate::event_loop::RelaySyncHandles> = None;
         // ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync engines + their
         // NodeState handles. Built alongside the dm-inbox engine when an
         // owner identity loads; lifted to outer scope so the NodeState
@@ -3879,6 +4083,140 @@ pub async fn start_node_inner(
                     });
 
                     tracing::info!("BOOT-PROBE 05: dm-inbox engine constructed");
+                    // ── ZEB-458 P4 Phase B: relay-hold + relay-optin datasets ─
+                    //
+                    // Two new fleet-replicated datasets, each wired exactly
+                    // like the dm-inbox engine above:
+                    //   * `relay-hold-v1` (D38): the relay's held opaque blobs,
+                    //     replicated across the relay's OWN fleet so any device
+                    //     of a volunteering owner can serve a recipient pull.
+                    //   * `relay-optin-v1` (D43): the per-community opt-in flags,
+                    //     replicated across the volunteer's fleet so every online
+                    //     device advertises + serves for an opted-in community.
+                    //
+                    // Both use `owner_addr_hex` as their fleet scope (siblings on
+                    // the same owner replicate), `publish_seen: true` (LWW datasets
+                    // — the merged whole-doc is the unit of replication), and
+                    // `on_applied: None` (no local ingest sweeper on the relay
+                    // side; the resolver-feed + GC sweep + acceptors are the later
+                    // active-machinery task, T11b). The publisher/pull-driver
+                    // tasks + the resolver-feed are NOT spawned here.
+                    let relay_hold_path =
+                        identity_dir.join(crate::relay_hold_persist::RELAY_HOLD_FILENAME);
+                    let relay_hold_replay_path =
+                        identity_dir.join(crate::relay_hold_persist::RELAY_HOLD_REPLAY_FILENAME);
+                    let relay_hold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::relay_hold_persist::load_doc_or_recover(&relay_hold_path),
+                    ));
+                    let relay_hold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::relay_hold_persist::load_replay_or_recover(&relay_hold_replay_path),
+                    ));
+                    let (relay_hold_out_tx, relay_hold_out_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let (relay_hold_in_tx, relay_hold_in_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let relay_hold_merger: crate::fleet_sync::Merger<
+                        crate::community_relay_hold_crdt::RelayHoldDoc,
+                    > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                    let relay_hold_sync =
+                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                            crate::fleet_sync::FleetSyncConfig {
+                                kt: std::sync::Arc::clone(&kt),
+                                device_id: device_id.clone(),
+                                state: std::sync::Arc::clone(&relay_hold_doc),
+                                merger: relay_hold_merger,
+                                replay_tracker: std::sync::Arc::clone(&relay_hold_tracker),
+                                content_store: std::sync::Arc::clone(&content_store),
+                                publisher_tx: relay_hold_out_tx,
+                                subscriber_rx: relay_hold_in_rx,
+                                persist: std::sync::Arc::new(
+                                    crate::relay_hold_persist::RelayHoldPersist {
+                                        doc_path: relay_hold_path,
+                                        replay_path: relay_hold_replay_path,
+                                    },
+                                ),
+                                lookup_key_tag: b"relay-hold-v1",
+                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                publish_seen: true,
+                                on_applied: None,
+                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                    std::collections::BTreeMap::new(),
+                                )),
+                            },
+                        ));
+                    let relay_optin_path =
+                        identity_dir.join(crate::relay_optin_persist::RELAY_OPTIN_FILENAME);
+                    let relay_optin_replay_path =
+                        identity_dir.join(crate::relay_optin_persist::RELAY_OPTIN_REPLAY_FILENAME);
+                    let relay_optin_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::relay_optin_persist::load_doc_or_recover(&relay_optin_path),
+                    ));
+                    let relay_optin_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::relay_optin_persist::load_replay_or_recover(
+                            &relay_optin_replay_path,
+                        ),
+                    ));
+                    let (relay_optin_out_tx, relay_optin_out_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let (relay_optin_in_tx, relay_optin_in_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let relay_optin_merger: crate::fleet_sync::Merger<
+                        crate::community_relay_optin::RelayOptInDoc,
+                    > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                    let relay_optin_sync =
+                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                            crate::fleet_sync::FleetSyncConfig {
+                                kt: std::sync::Arc::clone(&kt),
+                                device_id: device_id.clone(),
+                                state: std::sync::Arc::clone(&relay_optin_doc),
+                                merger: relay_optin_merger,
+                                replay_tracker: std::sync::Arc::clone(&relay_optin_tracker),
+                                content_store: std::sync::Arc::clone(&content_store),
+                                publisher_tx: relay_optin_out_tx,
+                                subscriber_rx: relay_optin_in_rx,
+                                persist: std::sync::Arc::new(
+                                    crate::relay_optin_persist::RelayOptInPersist {
+                                        doc_path: relay_optin_path,
+                                        replay_path: relay_optin_replay_path,
+                                    },
+                                ),
+                                lookup_key_tag: b"relay-optin-v1",
+                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                publish_seen: true,
+                                on_applied: None,
+                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                    std::collections::BTreeMap::new(),
+                                )),
+                            },
+                        ));
+                    // Shared resolver Arc (community id → advertising relay
+                    // endpoints). Built here so the NodeState assignment can stash
+                    // it; T11b's announce/pull machinery feeds + reads it.
+                    let community_relay_resolver = std::sync::Arc::new(
+                        crate::community_relay_resolver::CommunityRelayResolver::new(),
+                    );
+                    relay_hold_doc_opt = Some(std::sync::Arc::clone(&relay_hold_doc));
+                    relay_hold_tracker_opt = Some(std::sync::Arc::clone(&relay_hold_tracker));
+                    relay_hold_sync_engine_opt = Some(std::sync::Arc::clone(&relay_hold_sync));
+                    relay_optin_doc_opt = Some(std::sync::Arc::clone(&relay_optin_doc));
+                    relay_optin_tracker_opt = Some(std::sync::Arc::clone(&relay_optin_tracker));
+                    relay_optin_sync_engine_opt = Some(std::sync::Arc::clone(&relay_optin_sync));
+                    community_relay_resolver_opt =
+                        Some(std::sync::Arc::clone(&community_relay_resolver));
+                    relay_sync_handles_opt = Some(crate::event_loop::RelaySyncHandles {
+                        hold: crate::event_loop::DatasetSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: relay_hold_out_rx,
+                            inbound_tx: relay_hold_in_tx,
+                        },
+                        optin: crate::event_loop::DatasetSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: relay_optin_out_rx,
+                            inbound_tx: relay_optin_in_tx,
+                        },
+                    });
+
+                    tracing::info!("BOOT-PROBE 05b: relay-hold + relay-optin engines constructed");
                     // ── ZEB-418 SP2 P2 Task 6: dm-outhold fleet-sync engine ─
                     //
                     // Sender-side outbound-hold dataset (spec D12):
@@ -6636,6 +6974,9 @@ pub async fn start_node_inner(
                 // ZEB-418 SP2 P2: thread the dm-outhold + fleet-net adapter
                 // handle bundle into event_loop::run (mirrors dm-inbox).
                 let p2_sync_handles_for_loop = p2_sync_handles_opt;
+                // ZEB-458 P4 Phase B: thread the relay-hold + relay-optin
+                // adapter handle bundle into event_loop::run (mirrors p2).
+                let relay_sync_handles_for_loop = relay_sync_handles_opt;
                 // ZEB-321 Phase 1 Task 8: shadow the outer-scope binding into
                 // a move-capturable local so the thread closure can take
                 // ownership without disturbing the iroh_endpoint_arc /
@@ -6763,6 +7104,7 @@ pub async fn start_node_inner(
                                 notes_sync_handles_for_loop,
                                 dm_inbox_sync_handles_for_loop,
                                 p2_sync_handles_for_loop,
+                                relay_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                                 dial_telemetry_into_loop,
                                 serve_allowlist_for_loop,
@@ -6947,6 +7289,19 @@ pub async fn start_node_inner(
                         guard.dm_inbox_tracker = dm_inbox_tracker_opt.clone();
                         guard.dm_inbox_sync = dm_inbox_sync_engine_opt.clone();
                         guard.dm_inbox_device_id = dm_inbox_device_id_opt.clone();
+                        // ZEB-458 P4 Phase B: store the relay-hold + relay-optin
+                        // dataset handles + the shared resolver. The opt-in IPC
+                        // (set_community_relay_opt_in / get_community_relay_status)
+                        // reads relay_optin_doc/sync; stop_inner shuts the engines
+                        // down. The publisher/pull-driver join handles + the
+                        // force-notify stay None here — T11b assigns them.
+                        guard.relay_hold_doc = relay_hold_doc_opt.clone();
+                        guard.relay_hold_tracker = relay_hold_tracker_opt.clone();
+                        guard.relay_hold_sync = relay_hold_sync_engine_opt.clone();
+                        guard.relay_optin_doc = relay_optin_doc_opt.clone();
+                        guard.relay_optin_tracker = relay_optin_tracker_opt.clone();
+                        guard.relay_optin_sync = relay_optin_sync_engine_opt.clone();
+                        guard.community_relay_resolver = community_relay_resolver_opt.clone();
                         // ZEB-418 SP2 P2: store the dm-outhold + fleet-net
                         // dataset handles (no IPC surface yet — stop_inner
                         // and the send_dm hold-write/apply-sweeper paths
@@ -7178,6 +7533,14 @@ pub async fn start_node_inner(
             // sweeper by dropping the engine task's nudge sender).
             dm_outhold_sync_engine_opt,
             fleet_net_sync_engine_opt,
+            // ZEB-458 P4 Phase B: carry the relay-hold + relay-optin
+            // FleetSyncEngines out so the failure-cleanup path can shut them
+            // down (construction may have succeeded before a later step aborted
+            // the install). The success path above stashed `.clone()`s into
+            // NodeState, so moving the originals out here is safe (mirrors
+            // dm-inbox).
+            relay_hold_sync_engine_opt,
+            relay_optin_sync_engine_opt,
             node_addr_for_response,
             freshly_created,
             has_owner_identity,
@@ -7199,6 +7562,8 @@ pub async fn start_node_inner(
         dm_inbox_engine_for_cleanup,
         dm_outhold_engine_for_cleanup,
         fleet_net_engine_for_cleanup,
+        relay_hold_engine_for_cleanup,
+        relay_optin_engine_for_cleanup,
         node_addr_for_response,
         freshly_created,
         has_owner_identity,
@@ -7329,6 +7694,26 @@ pub async fn start_node_inner(
                 tracing::error!(
                     error = %e,
                     "fleet-net FleetSyncEngine cleanup after start_node failure"
+                );
+            }
+        }
+        // ZEB-458 P4 Phase B: same carry-out shutdown for the relay-hold +
+        // relay-optin FleetSyncEngines (construction may have succeeded before a
+        // later step aborted the install). Neither has a sweeper to stop —
+        // `on_applied` is None for both.
+        if let Some(relay_hold_engine) = relay_hold_engine_for_cleanup {
+            if let Err(e) = relay_hold_engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "relay-hold FleetSyncEngine cleanup after start_node failure"
+                );
+            }
+        }
+        if let Some(relay_optin_engine) = relay_optin_engine_for_cleanup {
+            if let Err(e) = relay_optin_engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "relay-optin FleetSyncEngine cleanup after start_node failure"
                 );
             }
         }
@@ -42320,6 +42705,113 @@ async fn set_butler_pin(
     Ok(())
 }
 
+/// ZEB-458 P4 Phase B (D43): unit-testable core of `set_community_relay_opt_in`.
+/// Mints an HLC strictly-newer than the community's current opt-in stamp
+/// (reusing the same `dm_outbox::next_hlc` source as `set_butler_pin_inner`)
+/// and LWW-writes `opted_in` into the relay-optin doc. Re-stamping against the
+/// per-community prior stamp keeps the write monotonic even when the wall clock
+/// is stuck or runs backwards, so a later opt-out always supersedes an earlier
+/// opt-in on this device.
+pub(crate) async fn set_community_relay_opt_in_inner(
+    doc: &tokio::sync::Mutex<crate::community_relay_optin::RelayOptInDoc>,
+    community_id: crate::owner_state_types::SpaceId,
+    opted_in: bool,
+    now_ms: u64,
+    self_device_id: &str,
+) -> Result<(), String> {
+    let mut guard = doc.lock().await;
+    let prev = guard
+        .communities
+        .get(&community_id)
+        .map(|s| s.stamp.clone());
+    let new_stamp = crate::dm_outbox::next_hlc(prev.as_ref(), now_ms, self_device_id);
+    guard.set(community_id, opted_in, new_stamp);
+    Ok(())
+}
+
+/// ZEB-458 P4 Phase B (D43): IPC to opt this owner's fleet in (or out) of
+/// volunteering as a community relay for `community_id_hex`. Writes through the
+/// relay-optin fleet-sync doc (LWW-correct stamp), notifies + flushes the
+/// engine so siblings learn the change, and wakes the community-relay announce
+/// publisher (a harmless no-op until T11b spawns it). Flush errors are
+/// log-warn only — the dirty latch retries on the next cycle.
+#[tauri::command]
+async fn set_community_relay_opt_in(
+    community_id_hex: String,
+    opted_in: bool,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    // Snapshot the handles needed from NodeState, then drop the lock before the
+    // async doc-lock acquisition (mirrors set_butler_pin).
+    let (relay_optin_doc_arc, relay_optin_sync_arc, self_device_id, publisher_force) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let doc = g.relay_optin_doc.clone().ok_or_else(|| {
+            "set_community_relay_opt_in: relay-optin not running (node not started)".to_string()
+        })?;
+        let sync = g.relay_optin_sync.clone().ok_or_else(|| {
+            "set_community_relay_opt_in: relay-optin engine not running".to_string()
+        })?;
+        // The relay-optin stamp's device id: prefer the dm-inbox device id (the
+        // 64-hex SP1 id used by the sibling fleet datasets); fall back to empty.
+        let self_device_id = g.dm_inbox_device_id.clone().unwrap_or_default();
+        let publisher_force = g.community_relay_publisher_force.clone();
+        (doc, sync, self_device_id, publisher_force)
+    };
+
+    let community_id = crate::owner_state_types::SpaceId(parse_space_id_16(&community_id_hex)?);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    set_community_relay_opt_in_inner(
+        &relay_optin_doc_arc,
+        community_id,
+        opted_in,
+        now_ms,
+        &self_device_id,
+    )
+    .await?;
+
+    relay_optin_sync_arc.notify_dirty();
+    if let Err(e) = relay_optin_sync_arc.flush_now().await {
+        tracing::warn!(
+            error = %e,
+            "set_community_relay_opt_in: relay-optin flush failed; dirty latch will retry on next cycle"
+        );
+    }
+
+    // Wake the community-relay announce publisher so the new opt-in is
+    // advertised immediately. Harmless no-op until T11b spawns it.
+    if let Some(force) = publisher_force {
+        force.notify_one();
+    }
+    Ok(())
+}
+
+/// ZEB-458 P4 Phase B (D43): read-only IPC reporting whether this owner's fleet
+/// is currently opted in to relaying for `community_id_hex`.
+#[tauri::command]
+async fn get_community_relay_status(
+    community_id_hex: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let community_id = crate::owner_state_types::SpaceId(parse_space_id_16(&community_id_hex)?);
+    let doc = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.relay_optin_doc.clone().ok_or_else(|| {
+            "get_community_relay_status: relay-optin not running (node not started)".to_string()
+        })?
+    };
+    let opted_in = doc.lock().await.is_opted_in(&community_id);
+    Ok(opted_in)
+}
+
 pub fn run() {
     // ZEB-446: GUI launches honor HARMONY_PROFILE (a --profile flag arrives
     // via main.rs, which already activated — this call is then a no-op).
@@ -42748,6 +43240,9 @@ pub fn run() {
             notes_commands::notes_delete,
             // ZEB-418 P2 D17: pin-a-butler IPC.
             set_butler_pin,
+            // ZEB-458 P4 Phase B D43: community-relay opt-in IPCs.
+            set_community_relay_opt_in,
+            get_community_relay_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -46209,6 +46704,18 @@ mod start_node_race_tests {
             dm_inbox_tracker: None,
             dm_inbox_sync: None,
             dm_inbox_device_id: None,
+            // ZEB-458 P4 Phase B: relay-hold + relay-optin handles + the
+            // resolver/publisher/driver slots unused in race tests.
+            relay_hold_doc: None,
+            relay_hold_tracker: None,
+            relay_hold_sync: None,
+            relay_optin_doc: None,
+            relay_optin_tracker: None,
+            relay_optin_sync: None,
+            community_relay_resolver: None,
+            community_relay_publisher_force: None,
+            community_relay_publisher_handle: None,
+            community_relay_pull_driver_handle: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles unused
             // in race tests.
             dm_outhold_doc: None,
@@ -48674,5 +49181,110 @@ mod butler_pin_tests {
                 "stamp after clear must be strictly newer"
             );
         }
+    }
+}
+
+// ── ZEB-458 P4 Phase B D43: set_community_relay_opt_in_inner unit tests ───────
+
+#[cfg(test)]
+mod relay_opt_in_tests {
+    use super::set_community_relay_opt_in_inner;
+    use crate::community_relay_optin::RelayOptInDoc;
+    use crate::owner_state_types::SpaceId;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// Toggle opt-in ON, then OFF with a strictly-later wall stamp: the LWW
+    /// doc must reflect each write (true → false). The opt-out, carrying a
+    /// newer stamp, must supersede the opt-in.
+    #[tokio::test]
+    async fn opt_in_then_out_is_lww() {
+        let community = SpaceId([7u8; 16]);
+        let doc = Arc::new(Mutex::new(RelayOptInDoc::default()));
+
+        // Default: not opted in.
+        assert!(
+            !doc.lock().await.is_opted_in(&community),
+            "default is opted-out"
+        );
+
+        // ── opt IN ──
+        set_community_relay_opt_in_inner(&doc, community, true, 1000, "self-dev")
+            .await
+            .expect("opt-in should succeed");
+        assert!(
+            doc.lock().await.is_opted_in(&community),
+            "is_opted_in true after opt-in"
+        );
+        let stamp_after_in = doc
+            .lock()
+            .await
+            .communities
+            .get(&community)
+            .expect("entry present")
+            .stamp
+            .clone();
+
+        // ── opt OUT with a strictly-later wall clock ──
+        set_community_relay_opt_in_inner(&doc, community, false, 2000, "self-dev")
+            .await
+            .expect("opt-out should succeed");
+        assert!(
+            !doc.lock().await.is_opted_in(&community),
+            "is_opted_in false after opt-out (LWW newer stamp wins)"
+        );
+        let stamp_after_out = doc
+            .lock()
+            .await
+            .communities
+            .get(&community)
+            .expect("entry present")
+            .stamp
+            .clone();
+        assert!(
+            stamp_after_out.is_strictly_newer_than(&stamp_after_in),
+            "opt-out stamp must be strictly newer than opt-in stamp"
+        );
+    }
+
+    /// Even with a stuck/backwards wall clock (same now_ms on both writes), the
+    /// per-community re-stamp keeps the second write strictly newer, so a later
+    /// opt-out still supersedes an earlier opt-in on the same device.
+    #[tokio::test]
+    async fn opt_out_supersedes_with_stuck_wall_clock() {
+        let community = SpaceId([3u8; 16]);
+        let doc = Arc::new(Mutex::new(RelayOptInDoc::default()));
+
+        set_community_relay_opt_in_inner(&doc, community, true, 5000, "self-dev")
+            .await
+            .expect("opt-in should succeed");
+        assert!(doc.lock().await.is_opted_in(&community));
+
+        // Same wall stamp — next_hlc must bump the logical counter so the write
+        // is still strictly newer and the LWW set takes it.
+        set_community_relay_opt_in_inner(&doc, community, false, 5000, "self-dev")
+            .await
+            .expect("opt-out should succeed");
+        assert!(
+            !doc.lock().await.is_opted_in(&community),
+            "opt-out wins even when the wall clock did not advance"
+        );
+    }
+
+    /// Independent communities don't interfere: opting into one leaves another
+    /// opted-out.
+    #[tokio::test]
+    async fn per_community_isolation() {
+        let a = SpaceId([1u8; 16]);
+        let b = SpaceId([2u8; 16]);
+        let doc = Arc::new(Mutex::new(RelayOptInDoc::default()));
+
+        set_community_relay_opt_in_inner(&doc, a, true, 1000, "self-dev")
+            .await
+            .expect("opt-in a should succeed");
+
+        let g = doc.lock().await;
+        assert!(g.is_opted_in(&a), "a opted in");
+        assert!(!g.is_opted_in(&b), "b still opted out");
     }
 }
