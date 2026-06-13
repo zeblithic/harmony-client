@@ -273,6 +273,10 @@ struct TestButlerCtx {
     /// ZEB-424: owners that share a live group-DM with self (the
     /// `shares_live_group_dm` source). Empty by default.
     group_co_members: std::collections::BTreeSet<[u8; 16]>,
+    /// ZEB-424 (D28.1): `(space_id, sender_owner)` pairs the
+    /// `space_live_group_dm_co_member` post-decrypt bind treats as a live
+    /// `GroupDm` with both members. Empty by default.
+    group_co_member_spaces: std::collections::BTreeSet<([u8; 16], [u8; 16])>,
     /// Sender DEVICE → (owner id, identity pub) — the
     /// `resolve_sender_device` source (mirrors the production
     /// `owner_device_cache` resolution).
@@ -295,6 +299,15 @@ impl ButlerDepositCtx for TestButlerCtx {
 
     async fn shares_live_group_dm(&self, sender_owner: &[u8; 16]) -> bool {
         self.group_co_members.contains(sender_owner)
+    }
+
+    async fn space_live_group_dm_co_member(
+        &self,
+        space_id: &[u8; 16],
+        sender_owner: &[u8; 16],
+    ) -> bool {
+        self.group_co_member_spaces
+            .contains(&(*space_id, *sender_owner))
     }
 
     fn now_secs(&self) -> u64 {
@@ -598,6 +611,7 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
         device_id: a_id.clone(),
         friends: [(fx.sender.owner.0, (fx.sender_master, FriendStatus::Active))].into(),
         group_co_members: std::collections::BTreeSet::new(),
+        group_co_member_spaces: std::collections::BTreeSet::new(),
         device_owners: [(fx.dm_device_hash, (fx.sender.owner.0, fx.identity_pub))].into(),
         butler_sk: a_sk,
         doc: Arc::clone(&a.doc),
@@ -888,6 +902,8 @@ async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
         device_id: a_id.clone(),
         friends: BTreeMap::new(),
         group_co_members: [fx.sender.owner.0].into(),
+        // D28.1: the deposit's own space is a live GroupDm with both members.
+        group_co_member_spaces: [(fx.space_id.0, fx.sender.owner.0)].into(),
         device_owners: [(fx.dm_device_hash, (fx.sender.owner.0, fx.identity_pub))].into(),
         butler_sk: a_sk,
         doc: Arc::clone(&a.doc),
@@ -1040,6 +1056,7 @@ async fn non_member_non_friend_deposit_is_rejected_and_not_persisted() {
         device_id: a_id.clone(),
         friends: BTreeMap::new(),
         group_co_members: BTreeSet::new(),
+        group_co_member_spaces: BTreeSet::new(),
         device_owners: [(fx.dm_device_hash, (fx.sender.owner.0, fx.identity_pub))].into(),
         butler_sk: a_sk,
         doc: Arc::clone(&a.doc),
@@ -1069,6 +1086,98 @@ async fn non_member_non_friend_deposit_is_rejected_and_not_persisted() {
     assert!(
         chronology.lock().unwrap().is_empty(),
         "no persist should occur for a rejected deposit"
+    );
+
+    let _ = a.engine.shutdown().await;
+}
+
+/// ZEB-424 D28.1 security follow-up: a sender who shares SOME live group DM
+/// with the recipient (so step-1 admission passes) but deposits a packet whose
+/// inner `space_id` names a space they are NOT a live member of is rejected
+/// `NotAuthorized` and nothing is persisted. This is the integration-level
+/// proof that co-member admission is bound to the DEPOSITED space, not merely
+/// to "shares any group" — closing the un-ingestible-entry inbox-slot-pinning
+/// vector. Same construction as the co-member happy-path, with one delta:
+/// `group_co_member_spaces` is EMPTY, so the post-decrypt bind rejects the
+/// fixture's own `space_id`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn co_member_deposit_for_unrelated_space_is_rejected_and_not_persisted() {
+    let fx = fixture();
+    let a_sk = device_a_sk();
+    let a_id = device_id(&a_sk);
+    let key = DmInboxDoc::key(&fx.space_id.0, &fx.message_cid.to_bytes());
+
+    let kt = Arc::new(KeyTree::derive(&[0x42u8; 32]).expect("kt"));
+    let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+
+    let chronology: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let a_dir = tempfile::tempdir().expect("tempdir A");
+    let a = build_engine(
+        &a_id,
+        Arc::clone(&kt),
+        Arc::clone(&cas),
+        Arc::new(RecordingPersist {
+            inner: DmInboxPersist {
+                doc_path: a_dir.path().join("dm_inbox.cbor"),
+                replay_path: a_dir.path().join("dm_inbox_replay.cbor"),
+            },
+            expected_key: key.clone(),
+            chronology: Arc::clone(&chronology),
+        }),
+    );
+
+    let cert_bytes = harmony_owner::cbor::to_canonical(&fx.sender.cert).expect("encode cert");
+    let frame = build_deposit_frame(
+        &RECIPIENT_OWNER,
+        &fx.sender.owner.0,
+        &cert_bytes,
+        &fx.sender.device_key,
+        &a_sk.verifying_key().to_bytes(),
+        &DepositPayload {
+            cidnotify_packet: fx.cidnotify_packet.clone(),
+            storage_blob: fx.storage_blob.clone(),
+        },
+    )
+    .expect("sender-side frame build");
+
+    // The sender shares SOME live group DM (step 1 admits via the co-member
+    // branch), but `group_co_member_spaces` is EMPTY, so the deposit's own
+    // space (fx.space_id) is NOT a live GroupDm with both members → the
+    // post-decrypt bind (step 5.5) rejects before any persist/ack.
+    let a_butler_ctx = TestButlerCtx {
+        self_owner: RECIPIENT_OWNER,
+        device_id: a_id.clone(),
+        friends: BTreeMap::new(),
+        group_co_members: [fx.sender.owner.0].into(),
+        group_co_member_spaces: BTreeSet::new(),
+        device_owners: [(fx.dm_device_hash, (fx.sender.owner.0, fx.identity_pub))].into(),
+        butler_sk: a_sk,
+        doc: Arc::clone(&a.doc),
+        tracker: Arc::clone(&a.tracker),
+        engine: Arc::clone(&a.engine),
+    };
+
+    let err = handle_deposit_core(&frame, &a_butler_ctx)
+        .await
+        .expect_err("co-member depositing into a non-member space must be rejected");
+    assert_eq!(err, DepositReject::NotAuthorized);
+
+    // Nothing was persisted, even though step-1 admission passed: the reject
+    // landed at the post-decrypt space bind, before persist/ack.
+    {
+        let doc = a.doc.lock().await;
+        assert!(
+            !doc.entries.contains_key(&key),
+            "a space-bind reject must not persist its entry"
+        );
+        assert!(
+            doc.entries.is_empty(),
+            "A's dm-inbox store must be empty after a space-bind reject"
+        );
+    }
+    assert!(
+        chronology.lock().unwrap().is_empty(),
+        "no persist should occur for a space-bind reject"
     );
 
     let _ = a.engine.shutdown().await;

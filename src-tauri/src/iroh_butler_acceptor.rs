@@ -88,8 +88,12 @@ pub enum DepositReject {
     #[error("sender is not authorized to deposit (not an active friend or co-member)")]
     NotAuthorized,
     /// The embedded `EnrollmentCert` failed to decode, failed verification,
-    /// is not Master-issued, or does not bind to the friend-graph identity
-    /// (owner id / pinned master key mismatch).
+    /// is not Master-issued, has `owner_id != frame.sender_owner`, or its
+    /// issuing master fails the admission-path master binding: the friend
+    /// path pins the cert master byte-for-byte against the friend-graph's
+    /// stored master; the co-member path (ZEB-424 D29.1) requires the
+    /// owner-id-derived anchor `owner_id_from_master_ed25519(master) ==
+    /// sender_owner`.
     #[error("sender enrollment cert invalid")]
     BadCert,
     /// `frame.sig` is malformed or does not verify over
@@ -162,6 +166,23 @@ pub trait ButlerDepositCtx: Send + Sync {
     /// with this owner. Production reads `OwnerState.spaces` under the
     /// CRDT lock via [`shares_live_group_dm_in`].
     async fn shares_live_group_dm(&self, sender_owner: &[u8; 16]) -> bool;
+
+    /// ZEB-424 (D28.1, security follow-up): post-decrypt authoritative bind
+    /// for the co-member admission path — `true` iff `space_id` is a live
+    /// `GroupDm` in `OwnerState.spaces` whose members contain BOTH this owner
+    /// and `sender_owner`. Step 1's [`shares_live_group_dm`] can only prove
+    /// the sender shares SOME live group DM (the deposit's `space_id` is
+    /// sealed until decrypt), so the co-member path binds the deposit's
+    /// ACTUAL space here, before persist/ack — a co-member of one group must
+    /// not get a deposit for an unrelated space persisted+acked (it would be
+    /// un-ingestible and pin an inbox slot until TTL). Production reads
+    /// `OwnerState.spaces` under the CRDT lock via
+    /// [`space_is_live_group_dm_co_member_in`].
+    async fn space_live_group_dm_co_member(
+        &self,
+        space_id: &[u8; 16],
+        sender_owner: &[u8; 16],
+    ) -> bool;
 
     /// Wall-clock now in epoch-SECONDS for `EnrollmentCert` expiry checks
     /// (cert timestamps are Unix seconds — ZEB-378).
@@ -277,6 +298,15 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
     async fn shares_live_group_dm(&self, sender_owner: &[u8; 16]) -> bool {
         let state = self.crdt_state.lock().await;
         shares_live_group_dm_in(&state, &self.self_owner, sender_owner)
+    }
+
+    async fn space_live_group_dm_co_member(
+        &self,
+        space_id: &[u8; 16],
+        sender_owner: &[u8; 16],
+    ) -> bool {
+        let state = self.crdt_state.lock().await;
+        space_is_live_group_dm_co_member_in(&state, &self.self_owner, sender_owner, space_id)
     }
 
     fn now_secs(&self) -> u64 {
@@ -418,6 +448,32 @@ pub(crate) fn shares_live_group_dm_in(
     })
 }
 
+/// ZEB-424 (D28.1, security follow-up): is the SPECIFIC space `space_id` a
+/// LIVE `GroupDm` whose `members` contain BOTH `self_owner` and
+/// `sender_owner`? The post-decrypt counterpart to [`shares_live_group_dm_in`]:
+/// pre-decrypt admission only proves the sender shares SOME live group DM (the
+/// deposit's `space_id` is sealed until decrypt), so the co-member path binds
+/// the deposit's own `space_id` to membership here, before persist/ack. This
+/// matches the receive-path / ingestion check
+/// (`dm_outbox::verify_cidnotify_admission`), so a co-member can never get a
+/// deposit for a space they are not a live member of persisted+acked.
+pub(crate) fn space_is_live_group_dm_co_member_in(
+    state: &crate::owner_state_crdt::OwnerState,
+    self_owner: &[u8; 16],
+    sender_owner: &[u8; 16],
+    space_id: &[u8; 16],
+) -> bool {
+    use crate::owner_state_types::{OwnerAddr, SpaceId, SpaceKind};
+    let self_addr = OwnerAddr(*self_owner);
+    let sender_addr = OwnerAddr(*sender_owner);
+    state.spaces.get(&SpaceId(*space_id)).is_some_and(|s| {
+        s.kind == SpaceKind::GroupDm
+            && s.left_at.is_none()
+            && s.members.contains(&self_addr)
+            && s.members.contains(&sender_addr)
+    })
+}
+
 /// The Tauri-free deposit pipeline (spec §4 order — see the module docs).
 /// Returns the ack to write on success; any reject means the shell closes
 /// the stream without detail.
@@ -436,10 +492,12 @@ pub async fn handle_deposit_core(
     // group-DM co-member (owner-id-derived trust). Friend status is checked
     // first; a non-Active result (Pending/Revoked/None) falls through to the
     // co-membership check — group membership is independent of friend status.
+    #[derive(Clone, Copy)]
     enum Admission {
         /// Active friend: step 2 pins the cert master against this stored key.
         Friend([u8; 32]),
-        /// Live group-DM co-member: step 2 derives the anchor from the owner id.
+        /// Live group-DM co-member: step 2 derives the anchor from the owner id,
+        /// and step 5.5 binds the deposit's own space to membership.
         CoMember,
     }
     let admission = match ctx.lookup_friend(&frame.sender_owner).await {
@@ -454,9 +512,12 @@ pub async fn handle_deposit_core(
     };
 
     // Step 2 — decode + verify the sender device's EnrollmentCert and bind
-    // it to the friend-graph identity: internally valid, Master-issued,
-    // owner id == frame.sender_owner, and the issuing master key == the
-    // friend graph's pinned master (the actual trust anchor).
+    // its issuing master to the admitted identity: internally valid,
+    // Master-issued, owner id == frame.sender_owner, and the issuing master
+    // satisfies the admission-path binding below (friend path → byte-for-byte
+    // pin against the friend graph's stored master; co-member path → the
+    // owner-id-derived anchor, D29.1 — both are the trust anchor for their
+    // path).
     let cert = decode_enrollment_cert_strict(&frame.sender_enrollment_cert)?;
     cert.verify(ctx.now_secs())
         .map_err(|_| DepositReject::BadCert)?;
@@ -574,6 +635,27 @@ pub async fn handle_deposit_core(
     .map_err(|_| DepositReject::BadPayload)?;
     if computed_cid != signed.message_cid {
         return Err(DepositReject::InnerVerifyFailed);
+    }
+
+    // Step 5.5 (ZEB-424 D28.1, security follow-up) — bind co-member admission
+    // to the DEPOSITED space. Step 1 only proved the sender shares SOME live
+    // group DM (the `space_id` was still sealed); now that the inner packet is
+    // open and its signing device is bound to `frame.sender_owner`, require
+    // that the deposit's own `signed.space_id` is a live `GroupDm` containing
+    // BOTH this owner and the sender. Without it, a co-member of group A could
+    // get a deposit for an unrelated space B (which they are NOT in)
+    // persisted+acked, only for ingestion (which re-checks space membership)
+    // to reject it until TTL — an inbox-slot-pinning DoS plus a lying ack. The
+    // friend path is intentionally NOT space-bound here: friendship is the
+    // authorization for 1:1 DM deposits and is unchanged by ZEB-424. The
+    // pre-decrypt "shares any" gate stays as the cheap stranger-filter in
+    // front of decrypt; this is the authoritative bind.
+    if matches!(admission, Admission::CoMember)
+        && !ctx
+            .space_live_group_dm_co_member(&signed.space_id.0, &frame.sender_owner)
+            .await
+    {
+        return Err(DepositReject::NotAuthorized);
     }
 
     // Step 6 — atomic persist-with-caps + durable flush BEFORE the ack
@@ -903,6 +985,10 @@ mod tests {
         /// ZEB-424: owners that share a live group-DM with self (the
         /// `shares_live_group_dm` source). Empty by default.
         group_co_members: std::collections::BTreeSet<[u8; 16]>,
+        /// ZEB-424 (D28.1): `(space_id, sender_owner)` pairs the
+        /// `space_live_group_dm_co_member` post-decrypt bind treats as a live
+        /// `GroupDm` with both members. Empty by default.
+        group_co_member_spaces: std::collections::BTreeSet<([u8; 16], [u8; 16])>,
         /// Sender DEVICE → (owner id, identity pub) — the
         /// `resolve_sender_device` source (mirrors the production
         /// `owner_device_cache` resolution).
@@ -925,6 +1011,7 @@ mod tests {
                 self_owner: BUTLER_OWNER,
                 friends,
                 group_co_members: std::collections::BTreeSet::new(),
+                group_co_member_spaces: std::collections::BTreeSet::new(),
                 device_owners,
                 butler_sk: butler_device_sk(),
                 persist_fail: false,
@@ -956,6 +1043,16 @@ mod tests {
         async fn shares_live_group_dm(&self, sender_owner: &[u8; 16]) -> bool {
             self.push_event("group_lookup");
             self.group_co_members.contains(sender_owner)
+        }
+
+        async fn space_live_group_dm_co_member(
+            &self,
+            space_id: &[u8; 16],
+            sender_owner: &[u8; 16],
+        ) -> bool {
+            self.push_event("group_space_lookup");
+            self.group_co_member_spaces
+                .contains(&(*space_id, *sender_owner))
         }
 
         fn now_secs(&self) -> u64 {
@@ -1099,23 +1196,68 @@ mod tests {
         assert!(failing.store.lock().unwrap().is_empty());
     }
 
-    /// ZEB-424 (D27/D29.1): a sender who is NOT a friend at all but shares a
-    /// live group-DM with the butler is admitted via the co-member fallback,
-    /// and the friend lookup is consulted BEFORE the group lookup (friend
-    /// status is the primary, cheaper trust anchor).
+    /// ZEB-424 (D27/D29.1/D28.1): a sender who is NOT a friend at all but
+    /// shares a live group-DM with the butler AND deposits into that very
+    /// space is admitted via the co-member fallback. The friend lookup is
+    /// consulted BEFORE the (pre-decrypt) group lookup (friend status is the
+    /// primary, cheaper trust anchor), and the post-decrypt space bind runs
+    /// AFTER decrypt (the deposit's space_id is sealed until then).
     #[tokio::test]
     async fn deposit_from_non_friend_group_co_member_is_accepted() {
         let f = valid_fixture();
         let mut ctx = TestCtx::for_fixture(&f);
         ctx.friends.clear();
         ctx.group_co_members.insert(f.sender_owner);
+        // The deposit's own space (f.space_id) is a live GroupDm with both
+        // members → the D28.1 post-decrypt bind passes.
+        ctx.group_co_member_spaces
+            .insert((f.space_id.0, f.sender_owner));
         handle_deposit_core(&f.frame, &ctx)
             .await
             .expect("co-member admitted");
         let ev = ctx.events();
         let fp = ev.iter().position(|e| e == "friend_lookup").unwrap();
         let gp = ev.iter().position(|e| e == "group_lookup").unwrap();
+        let dp = ev.iter().position(|e| e == "decrypt").unwrap();
+        let sp = ev.iter().position(|e| e == "group_space_lookup").unwrap();
         assert!(fp < gp, "friend lookup precedes group lookup: {ev:?}");
+        assert!(
+            gp < dp && dp < sp,
+            "pre-decrypt group gate, then decrypt, then post-decrypt space bind: {ev:?}"
+        );
+    }
+
+    /// ZEB-424 D28.1 security follow-up: a sender who shares SOME live group
+    /// DM (so step-1 admission passes) but whose deposit names a space they
+    /// are NOT a live member of is rejected `NotAuthorized` AFTER decrypt but
+    /// BEFORE persist/ack — closing the "deposit for an unrelated space"
+    /// inbox-slot-pinning / lying-ack vector. The bind is on the inner
+    /// packet's own space_id, not merely "shares any group".
+    #[tokio::test]
+    async fn co_member_deposit_for_non_member_space_rejected_before_persist() {
+        let f = valid_fixture();
+        let mut ctx = TestCtx::for_fixture(&f);
+        ctx.friends.clear();
+        // Shares SOME live group → step 1 admits…
+        ctx.group_co_members.insert(f.sender_owner);
+        // …but the deposit's own space (f.space_id) is NOT registered as a
+        // live GroupDm with both members → the post-decrypt bind rejects.
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("co-member depositing into a non-member space is rejected");
+        assert!(matches!(err, DepositReject::NotAuthorized), "got {err:?}");
+        let ev = ctx.events();
+        // The reject is POST-decrypt (the space_id is sealed until then)…
+        assert!(
+            ev.iter().any(|e| e == "decrypt") && ev.iter().any(|e| e == "group_space_lookup"),
+            "space bind runs post-decrypt: {ev:?}"
+        );
+        // …and crucially nothing was persisted or acked.
+        assert!(
+            !ev.iter().any(|e| e.starts_with("persist:")),
+            "no persist on a space-bind reject: {ev:?}"
+        );
+        assert!(ctx.store.lock().unwrap().is_empty());
     }
 
     /// ZEB-424: the friend path is untouched — an Active friend with NO group
@@ -1645,5 +1787,96 @@ mod tests {
             !shares_live_group_dm_in(&state_noself, &me, &peer),
             "self must be a member too"
         );
+    }
+
+    /// ZEB-424 D28.1: the post-decrypt bind matches ONLY the named space when
+    /// it is a live `GroupDm` with both owners — and, crucially, rejects a
+    /// DIFFERENT space even when the sender DOES share some other live group
+    /// DM (the exact-space property the "shares any" pre-decrypt gate lacks).
+    #[test]
+    fn space_is_live_group_dm_co_member_in_binds_the_named_space_only() {
+        use crate::owner_state_crdt::OwnerState;
+        use crate::owner_state_types::{Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+        let me = [0x11u8; 16];
+        let peer = [0x22u8; 16];
+        let stranger = [0x33u8; 16];
+        let hlc = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        let mk_space = |id: u8, kind: SpaceKind, members: Vec<[u8; 16]>, left: Option<Hlc>| Space {
+            id: SpaceId([id; 16]),
+            kind,
+            parent: None,
+            community_id: None,
+            name: "g".into(),
+            transport: None,
+            members: members.into_iter().map(OwnerAddr).collect(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: left,
+            created_at: hlc.clone(),
+            updated_at: hlc.clone(),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+
+        // A live shared GroupDm (id 0x01) AND a second live GroupDm the sender
+        // is NOT in (id 0x05) — proving "shares any" is insufficient.
+        let mut state = OwnerState::default();
+        for s in [
+            mk_space(0x01, SpaceKind::GroupDm, vec![me, peer], None),
+            mk_space(0x05, SpaceKind::GroupDm, vec![me, stranger], None),
+            mk_space(0x02, SpaceKind::GroupDm, vec![me, peer], Some(hlc.clone())), // left
+            mk_space(0x03, SpaceKind::Dm, vec![me, peer], None),                   // Dm kind
+        ] {
+            state.spaces.insert(s.id, s);
+        }
+
+        // Named live GroupDm with both members → admitted.
+        assert!(space_is_live_group_dm_co_member_in(
+            &state,
+            &me,
+            &peer,
+            &[0x01; 16]
+        ));
+        // The sender shares 0x01, but the deposit names 0x05 (sender absent) →
+        // rejected. This is the exact-space bind the DoS fix turns on.
+        assert!(!space_is_live_group_dm_co_member_in(
+            &state,
+            &me,
+            &peer,
+            &[0x05; 16]
+        ));
+        // Left group → rejected.
+        assert!(!space_is_live_group_dm_co_member_in(
+            &state,
+            &me,
+            &peer,
+            &[0x02; 16]
+        ));
+        // Dm kind → rejected.
+        assert!(!space_is_live_group_dm_co_member_in(
+            &state,
+            &me,
+            &peer,
+            &[0x03; 16]
+        ));
+        // Unknown space id → rejected.
+        assert!(!space_is_live_group_dm_co_member_in(
+            &state,
+            &me,
+            &peer,
+            &[0xAB; 16]
+        ));
     }
 }

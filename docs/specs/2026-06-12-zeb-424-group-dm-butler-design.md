@@ -94,10 +94,48 @@ what step 1 is for — an anti-spam/anti-DoS storage gate in front of decrypt:
   (`INBOX_PER_SENDER_CAP = 64`, `INBOX_GLOBAL_CAP = 1024`,
   `DEPOSIT_MAX_FRAME_BYTES = 256 KiB`).
 
-The exact-space binding buys nothing those layers don't already provide, and
-costs a wire-format migration. If P4's presented-proof work later wants
-space-scoped frames, it versions the ALPN (`harmony/butler-deposit/v2`)
-there.
+A **frame-level** (pre-decrypt) exact-space check buys nothing those layers
+don't already provide, and costs a wire-format migration. If P4's
+presented-proof work later wants space-scoped *frames*, it versions the ALPN
+(`harmony/butler-deposit/v2`) there.
+
+> **D28.1 amendment (security follow-up, post-review):** the paragraph above
+> is right that a *pre-decrypt, frame-level* exact-space check would cost a
+> wire migration — but it conflated that with exact-space binding in general.
+> The `space_id` is available **post-decrypt** (it travels inside the sealed
+> payload), so an exact-space bind for the co-member path is achievable with
+> **zero wire change**. The "shares any" gate alone lets an admitted co-member
+> of group A deposit a packet whose inner `space_id` names an unrelated space
+> B (which they are not in): inner-verify still passes (they legitimately
+> signed it), so it is **persisted + acked**, then ingestion — which re-checks
+> space membership — rejects it forever, leaving an un-ingestible entry that
+> pins an inbox slot for the full `INBOX_TTL_MS` (30 days). The per-sender cap
+> bounds one sender, but "anyone you share any group with" is a far wider
+> trust set than friends, and the un-ingestible entries are *stickier* than
+> legitimate traffic (never GC'd on ingest). So the co-member path now adds a
+> **post-decrypt** bind (see D28.1 below) — the originally-approved sketch's
+> exact-space intent, for free. See D28.1.
+
+### D28.1 — Post-decrypt co-member space bind (no wire change)
+
+After the inner CidNotify is decrypted and verified (its signing device bound
+to `frame.sender_owner`), and **before** persist/ack, the **co-member** path
+requires that the deposit's own `signed.space_id` is a live `GroupDm` in the
+butler's replicated `OwnerState.spaces` whose members contain BOTH this owner
+and the sender — the same check ingestion (`verify_cidnotify_admission`)
+applies, moved earlier so the un-ingestible entry is never written.
+
+- New ctx method `space_live_group_dm_co_member(space_id, sender_owner) ->
+  bool`, prod-implemented via `space_is_live_group_dm_co_member_in` (the
+  exact-space sibling of `shares_live_group_dm_in`, same single lock).
+- The pre-decrypt "shares any" gate stays as the cheap stranger-filter in
+  front of decrypt; the post-decrypt bind is the authoritative one. A failing
+  bind rejects `NotAuthorized` (the same uniform, no-oracle close).
+- **The friend path is intentionally NOT space-bound here.** Friendship is the
+  authorization for 1:1 DM deposits and is unchanged by ZEB-424; a latent
+  "malicious friend deposits for an unrelated space" parity question exists but
+  is pre-existing, out of this PR's blast radius, and left for a follow-up if
+  desired (friends are a small curated trusted set).
 
 ### D29 — Acceptor surface: one new ctx method, one new (local-only) reject variant
 
@@ -239,6 +277,12 @@ Unit (acceptor, mock ctx — extend `iroh_butler_acceptor.rs` tests):
 - co-member of a **left** group (`left_at = Some`) → rejected;
 - co-member of a `Dm`/`Channel`/`Community` space only → rejected
   (kind gate);
+- **post-decrypt space bind (D28.1):** co-member shares SOME live group DM
+  (step 1 admits) but the deposit's own `signed.space_id` is NOT a live
+  GroupDm with both members → `NotAuthorized` **after** decrypt, **before**
+  persist/ack (call-order probe: `decrypt` ran, no `persist:` event); plus a
+  direct `space_is_live_group_dm_co_member_in` helper test that the bind
+  matches ONLY the named space (rejects a different space the sender shares);
 - **co-member cert anchor (D29.1):** *intentionally not unit-tested* — the
   derived check is unreachable as a rejection because `cert.verify()` already
   binds `hash(master) == owner_id` (see D29.1 "defense-in-depth"); a forged
@@ -257,7 +301,11 @@ Integration (extend `tests/butler_deposit_integration.rs`):
 - end-to-end group-DM deposit: non-friend co-member sender → butler admits,
   persists, acks; recipient ingest delivers (reuses the existing two-engine
   harness with a GroupDm space seeded in the butler's owner-state);
-- non-member sender → stream closes, nothing persisted.
+- non-member sender → stream closes, nothing persisted;
+- **co-member into an unrelated space (D28.1):** co-member of some group
+  deposits a packet whose inner `space_id` is one they are not a member of →
+  `NotAuthorized`, nothing persisted (the post-decrypt bind closes the
+  un-ingestible-entry inbox-slot-pinning vector).
 
 Wire pin: `deposit_frame_wire_fixture_pinned` must pass **unchanged** — the
 no-wire-change property of D28 is itself an assert.
