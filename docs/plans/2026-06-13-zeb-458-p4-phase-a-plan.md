@@ -240,41 +240,28 @@ pub async fn open_and_ingest(blobs: &[RelayHeldBlob], ctx: &dyn RelayIngestCtx) 
 
 ---
 
-### Task 6: Prod ctx impls, iroh shells, start_node install, opt-in toggle
+### Task 6: Direct-connect integration test (engine-backed) + wire fixtures + final `--all-targets` sweep
 
-**Files:**
-- Modify: `src-tauri/src/iroh_community_relay_acceptor.rs` (`ProdRelayDepositCtx`, `ProdRelayPullCtx`, iroh shells `IrohCommunityRelayDepositAcceptor` / `IrohCommunityRelayPullAcceptor` mirroring `IrohButlerDepositAcceptor` L659+)
-- Modify: `src-tauri/src/community_relay_pull.rs` (`ProdRelayIngestCtx`)
-- Modify: `src-tauri/src/zenoh_iroh_transport.rs` (+ `iroh_endpoint.rs`): register the two new ALPNs + `install_community_relay_*_acceptor` (mirror `install_butler_deposit_acceptor` L173–213, each behind its own `OnceLock`)
-- Modify: `src-tauri/src/lib.rs`: build the Prod ctxs + install the acceptors (mirror L6255–6289); add the relay `RelayHoldDoc` `FleetSyncEngine` (`lookup_key_tag: b"relay-hold-v1"`, merger `|l,r| l.merge_from(r)`, mirror dm-inbox engine wiring) + handles on `NodeState`; per-community opt-in flag storage + `set_community_relay_optin` IPC command (mirror `set_butler_pin` L42189–42290) + register in the handler list (L42503–42737)
-- Test: a focused `#[cfg(test)]` for the opt-in core (`set_community_relay_optin_inner`) — toggling persists + flips `serves_community`
-
-Opt-in storage: a per-community `BTreeSet<SpaceId>` of opted-in communities, persisted in the relay node's own state (simplest: a small dedicated CBOR settings doc on disk + an in-memory `Arc<Mutex<BTreeSet<SpaceId>>>` on `NodeState`, loaded at start_node, mutated by the IPC). `serves_community(C)` = `opted_in.contains(C) && self is a Joined member of C` (read C-membership from `crdt_state`/community state). Default empty (opt-out). `persist_hold`/`held_for`/`mark_pulled` wrap the `RelayHoldDoc` + its engine with the atomic-cap critical section (mirror `ProdButlerDepositCtx::persist_entry` caps logic). `ProdRelayIngestCtx::ingest_recovered` delegates to the existing dm-inbox ingest primitives.
-
-- [ ] **Step 1: Failing test** — `set_community_relay_optin_inner(community_id, true)` then `serves_community` true for that C (member) + persists across reload; `false` reverts. (Keychain-hermetic; inject via `*_inner` seams per CLAUDE.md.)
-- [ ] **Step 2: Run — FAIL.** [ ] **Step 3: Implement Prod ctxs + shells + ALPN install + start_node wiring + opt-in IPC.**
-- [ ] **Step 4: Gates** (lib clippy may surface integration wiring — keep lib-scoped here).
-- [ ] **Step 5: Commit** `feat(zeb-458): prod relay ctxs + iroh shells + start_node install + opt-in toggle`.
-
----
-
-### Task 7: Direct-connect integration test + final `--all-targets` sweep
+**Phasing note:** ALL production wiring — `ProdRelayDepositCtx`/`ProdRelayPullCtx`/`ProdRelayIngestCtx`, the iroh shells + ALPN registration, the start_node install, the `set_community_relay_optin` IPC + disk persistence, the `CommunityRelayAnnounce` discovery, the sender rung, and the background pull driver — is **Phase B** (next PR). Phase A proves the *mechanism* end-to-end via engine-backed test ctxs (the P1 pattern: `butler_deposit_integration::TestButlerCtx` + `ProbeIngestCtx` are engine-backed test ctxs, not start_node). **No start_node changes in Phase A** (zero boot-deadlock risk).
 
 **Files:**
 - Create: `src-tauri/tests/community_relay_integration.rs`
 - Create: `src-tauri/tests/wire_format_community_relay_fixtures.rs` (byte-pin `RelayDepositFrame` + `RelayPullQuery`/`Response` canonical CBOR)
 
-E2E with three engines (relay + recipient fleet; a test sender builds the frame). Mirror the `butler_deposit_integration.rs` harness. Scenarios:
+Build engine-backed test ctxs in the integration file (mirror `butler_deposit_integration.rs` `TestButlerCtx`):
+- A **relay** test ctx implementing `RelayDepositCtx` + `RelayPullCtx`, backed by a real `FleetSyncEngine<RelayHoldDoc>` (build it the way `butler_deposit_integration` builds the dm-inbox engine — `FleetSyncConfig` merger `|l,r| l.merge_from(r)`, `lookup_key_tag: b"relay-hold-v1"`). `persist_hold` runs the atomic-cap critical section over the engine's doc (occupied→Duplicate; vacant→`count_for_sender < RELAY_HOLD_PER_SENDER_CAP` && `live_count < RELAY_HOLD_GLOBAL_CAP` → insert else CapExceeded) + `notify_dirty` + `flush_now`. `serves_community`/`both_co_members`/`is_joined_member` read an injected `MaterializedMembership` + an injected opted-in set. `mark_pulled` unions `pulled_by` + `flush_now` and does NOT gc inline; the test calls `RelayHoldDoc::gc` as a SEPARATE step (the one-sweep coverage deferral requires `pulled_by` to replicate before removal — see Task 4 note).
+- A **recipient** test ctx implementing `RelayIngestCtx`, backed by the real receive path: `device_x25519_privs` = R's enrolled device privs; `ingest_recovered` calls the SAME dm-inbox ingest primitives the butler path uses (`dm_outbox::verify_cidnotify_admission` + `decrypt_and_bind_dm_blob` + `apply_inbox` + emit — reuse `ProbeIngestCtx`-style wiring from `butler_deposit_integration`). NOT a forked verify.
 
-1. **Happy path (deposit → hold opaque → pull → open → ingest → ack → GC):** test sender `build_relay_deposit_frame` sealing the `DepositPayload` to R's device vk → `handle_relay_deposit_core` admits + holds (assert the held `sealed_blob` is byte-identical to the frame's and the relay never decrypted) → R issues `RelayPullQuery` (authed) → `handle_relay_pull_query` returns the opaque blob → `open_and_ingest` opens it (R's device priv) + ingests via the real receive path (assert the `dm-received` inbox entry matches the original message) → `RelayPullAck` → `mark_pulled` GCs the entry (assert the hold doc is empty).
-2. **Non-member sender rejected, nothing held** (sender not `Joined` in C).
-3. **Wrong-owner pull rejected** (a cert for a different owner gets nothing).
-4. **Restart durability:** a held blob survives recreating the relay engine from its persisted doc and is still pullable.
-5. **Relay opacity:** assert the relay holds only `sealed_blob` and never reconstructs the `DepositPayload` (no decrypt path exists on the relay ctxs).
+Scenarios:
+1. **Happy path (deposit → hold opaque → pull → open → ingest → ack → GC):** test sender `build_relay_deposit_frame` seals the `DepositPayload` to R's device vk → `handle_relay_deposit_core` admits + holds (assert the held `sealed_blob` is byte-identical to the frame's; assert the relay ctx exposes no way to reconstruct the payload) → R issues an authed `RelayPullQuery` → `handle_relay_pull_query` returns the opaque blob → `open_and_ingest` opens it with R's device priv + ingests via the real receive path (assert the `dm-received` inbox entry matches the original message) → `handle_relay_pull_ack` → `mark_pulled` sets `pulled_by` → a follow-up `gc` sweep empties the hold doc.
+2. **Non-member sender rejected, nothing held** (sender not `Joined` in C → `NotCoMember`, hold doc untouched).
+3. **Wrong-owner pull rejected** (a cert for a different owner → `BadCert`, returns nothing).
+4. **Restart durability:** a held blob survives recreating the relay engine from its persisted doc/path and is still pullable.
+5. **Relay opacity (structural):** the relay-side ctxs hold only `sealed_blob` and never call `open_from_owner*`/`decrypt*` — assert by construction (the hold entry stores the blob verbatim; no decrypt seam on `RelayDepositCtx`/`RelayPullCtx`).
 
 Wire fixtures: pin `RelayDepositFrame` + `RelayPullQuery` + `RelayPullResponse` canonical bytes (deterministic helpers behind `test-fixtures`).
 
-- [ ] **Step 1: Write the integration + fixture tests.**
+- [ ] **Step 1: Write the integration + fixture tests (engine-backed test ctxs).**
 - [ ] **Step 2: Run** `cargo nextest run --locked -p harmony-app --features test-fixtures --test community_relay_integration --test wire_format_community_relay_fixtures` — PASS.
 - [ ] **Step 3: Final sweep** `set -o pipefail && cargo fmt --all -- --check && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings && cargo nextest run --locked --all-targets --features test-fixtures` (the load-bearing full gate; budget ~50 min; known-unrelated api_server contention flake `serve_core_drives_full_flow_over_http_and_ws` = ZEB-374, re-run if it's the only failure).
 - [ ] **Step 4: Commit** `test(zeb-458): community-relay E2E + wire fixtures (Phase A)`.
@@ -282,6 +269,6 @@ Wire fixtures: pin `RelayDepositFrame` + `RelayPullQuery` + `RelayPullResponse` 
 ---
 
 ## Self-review checklist (run before execution)
-- **Spec coverage:** D35 seal target (Task 1 build_relay_deposit_frame to R device vk ✓); D36 admission (Task 3 ✓); D38 store/caps/TTL/GC (Task 2 + Task 6 persist ✓); D39 pull + open+ingest via receive path (Task 4 + Task 5 ✓); D41 wire + fixtures (Task 1 + Task 7 ✓); D42 DM-scope (DepositPayload reuse ✓); D43 opt-in (Task 6 ✓). **Deferred to Phase B:** D37 discovery/advertisement, D40 sender rung, the background pull driver — explicitly out of Phase A.
+- **Spec coverage (Phase A):** D35 seal target (Task 1 build_relay_deposit_frame to R device vk ✓); D36 admission (Task 3 ✓); D38 store/caps/TTL/GC (Task 2 + the engine-backed persist in Task 6 ✓); D39 pull + open+ingest via receive path (Task 4 + Task 5 ✓); D41 wire + fixtures (Task 1 + Task 6 ✓); D42 DM-scope (DepositPayload reuse ✓). **Deferred to Phase B:** D37 discovery/advertisement, D40 sender rung, D43 opt-in IPC + disk persistence, the Prod ctxs, the iroh shells + ALPN registration, the start_node install, and the background pull driver — explicitly out of Phase A (Phase A has NO start_node changes).
 - **Type consistency:** `DepositPayload` + `encode/decode_deposit_payload` reused from `butler_deposit.rs` (not redefined); `RelayHoldDoc::merge_from` returns the same `MergeOutcome` the FleetSync merger bound needs; ContentId flags `{encrypted:true}` match between build (Task 1), persist key (Task 3), and open (Task 5).
 - **No placeholders:** every task names exact files + the mirror anchor + the new signatures + the test assertions.
