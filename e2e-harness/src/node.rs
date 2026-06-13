@@ -49,6 +49,13 @@ impl NodeHandle {
     /// `api/{port,token}` discovery files appear and `/v1/status` answers.
     pub async fn spawn(config: NodeConfig) -> anyhow::Result<Self> {
         let bin = resolve_harmony_app_bin()?;
+        // Relaunch hygiene: a SIGKILL'd previous run (e.g. the offline step of a
+        // restart/catch-up scenario) leaves its `api/{port,token}` discovery files
+        // on disk (only a graceful shutdown removes them). Without clearing them,
+        // `wait_for_api_dir` would instantly return the DEAD process's port/token
+        // and we'd poll `/v1/status` on a dead port forever. Remove them so we
+        // wait for the freshly-spawned process to write its own.
+        remove_stale_discovery_files(&config.home);
         let (stdout, stderr) = match &config.log_dir {
             Some(dir) => {
                 tokio::fs::create_dir_all(dir).await.ok();
@@ -186,6 +193,25 @@ impl Drop for NodeHandle {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
+        }
+    }
+}
+
+/// Remove any stale `api/port` + `api/token` discovery files under `home` left
+/// by a previously-killed process, so a relaunch waits for the new process's
+/// fresh files instead of latching onto the dead one's port/token.
+fn remove_stale_discovery_files(home: &std::path::Path) {
+    for entry in walkdir::WalkDir::new(home).into_iter().flatten() {
+        let name = entry.file_name();
+        if (name == "port" || name == "token")
+            && entry
+                .path()
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|f| f == "api")
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }

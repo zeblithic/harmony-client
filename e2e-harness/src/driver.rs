@@ -70,6 +70,42 @@ pub async fn redeem_invite_iroh(node: &NodeHandle, url: &str) -> anyhow::Result<
         .await
 }
 
+/// Poll the iroh first-contact community join until the recipient reports
+/// `"joined"`, returning the joined RedemptionOutcome (with `communityId`).
+///
+/// Retries on BOTH (a) transient RPC errors — most importantly
+/// `pkarr resolve: no relays available (all on cooldown or unreachable)`, which
+/// happens when the external pkarr relays rate-limit a node under repeated runs
+/// — and (b) the `inviter_unreachable` outcome (pkarr/iroh not yet converged).
+/// Fails fast only on a terminal non-join status (e.g. `join_failed`), and times
+/// out after `timeout`. This is what makes the suite robust to the inherently
+/// racy + relay-dependent first-contact path; see ZEB-447 / ZEB-461.
+pub async fn poll_join_iroh(
+    node: &NodeHandle,
+    url: &str,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    poll_until(timeout, || async {
+        match redeem_invite_iroh(node, url).await {
+            Ok(outcome) => match outcome.get("status").and_then(|v| v.as_str()) {
+                Some("joined") => Ok(Some(outcome)),
+                // pkarr/iroh not yet converged — keep polling.
+                Some("inviter_unreachable") => Ok(None),
+                other => {
+                    anyhow::bail!("iroh redeem terminal non-join status: {other:?} ({outcome})")
+                }
+            },
+            // Transient RPC error (pkarr relay cooldown, transport hiccup): the
+            // relay pool recovers and pkarr propagates — retry, don't fail.
+            Err(e) => {
+                eprintln!("poll_join_iroh transient error (retrying): {e}");
+                Ok(None)
+            }
+        }
+    })
+    .await
+}
+
 pub async fn list_community_members(
     node: &NodeHandle,
     community_id: &str,

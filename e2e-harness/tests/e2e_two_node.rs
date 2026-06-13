@@ -172,21 +172,13 @@ async fn s1_invite_join_roster_convergence() {
         .await
         .expect("generate invite");
 
-    // Bob joins via iroh first-contact. Poll until `status == "joined"`: keep
-    // retrying on `inviter_unreachable` (pkarr/iroh not yet converged), fail on
-    // any other terminal status with the status surfaced.
-    let joined = poll_until(Duration::from_secs(120), || async {
-        let outcome = redeem_invite_iroh(&bob, &invite)
-            .await
-            .expect("redeem_invite_iroh rpc");
-        match outcome.get("status").and_then(|v| v.as_str()) {
-            Some("joined") => Ok(Some(outcome)),
-            Some("inviter_unreachable") => Ok(None), // retryable: pkarr/iroh not yet converged
-            other => panic!("iroh redeem returned terminal non-join status: {other:?} ({outcome})"),
-        }
-    })
-    .await
-    .expect("bob joins alice's community via iroh first-contact");
+    // Bob joins via iroh first-contact. `poll_join_iroh` polls until "joined",
+    // retrying on `inviter_unreachable` (pkarr/iroh not yet converged) AND on
+    // transient RPC errors (pkarr relay cooldown under repeated runs), failing
+    // only on a terminal non-join status or timeout.
+    let joined = poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins alice's community via iroh first-contact");
 
     let joined_id = joined
         .get("communityId")
@@ -393,4 +385,151 @@ async fn s2_friend_dm_exchange() {
     // DM byte-delivery is characterized above but not gated on (documented gap).
     run.mark_success();
     drop((alice, bob, ah, bh));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S3: channel reconnect catch-up (ZEB-434) — #[ignore]'d, blocked by ZEB-462.
+//
+// The single-machine harness CANNOT validate community channel propagation:
+// ongoing community-state sync does not establish between two co-located headless
+// nodes (see the FINDING block below — reproduced WITHOUT any restart). Only
+// first-contact + join/handshake-time state delivery works co-located (that is
+// what S1 roster + S2 friendship exercise). Channel propagation — live OR
+// offline-catch-up — needs ongoing zenoh/iroh community sync, which only
+// establishes across real machines (ZEB-330). So the canonical ZEB-434
+// offline→restart→catch-up test below is #[ignore]'d and is validated via the
+// cross-machine playbook + the ZEB-462 fix.
+// ─────────────────────────────────────────────────────────────────────────────
+// FINDING (ZEB-462): community channel catch-up does NOT complete between two
+// co-located headless nodes. The ROOT cause is (A) ongoing community-state sync
+// never establishes co-located: BOTH nodes log "startup root query: no responder"
+// persistently — reproduced even WITHOUT a restart (a channel Alice creates while
+// Bob is online + joined never reaches Bob). Only first-contact + join/handshake-
+// time state delivery works co-located (S1 roster, S2 friendship). On the restart
+// path there is additionally (B) Bob's rehydrated membership showing the admin
+// Alice as `Left` (left_at: None) → he rejects her publishes. (A) is most likely
+// a co-located transport-peering limitation (ongoing sync is proven across REAL
+// machines, ZEB-330); (B) is a possible membership-rehydration bug. Both tracked
+// in ZEB-462. This test encodes the correct ZEB-434 expectation and is the
+// natural cross-machine-playbook scenario; ignored here until ZEB-462.
+// Run explicitly: `cargo test --features e2e -- --ignored s3_offline`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "blocked by ZEB-462: restart breaks community reconnect + catch-up (no-responder re-peering + admin rehydrated as Left)"]
+async fn s3_offline_channel_reconnect_catchup() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let (mut run, ah, bh, alice, mut bob) = two_minted_nodes("s3-offline").await;
+    let bob_owner = owner_id(&bob).await;
+
+    let community = create_community(&alice, "s3-community", true)
+        .await
+        .expect("create community");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    let joined = poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins alice's community via iroh first-contact");
+    assert_eq!(
+        joined.get("communityId").and_then(|v| v.as_str()),
+        Some(community.as_str()),
+        "bob joined alice's community"
+    );
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("alice sees bob joined (both online before bob goes offline)");
+
+    // Bob goes HARD offline (SIGKILL); snapshot config for relaunch.
+    let bob_cfg = bob.config.clone();
+    bob.kill().await.expect("bob hard offline (SIGKILL)");
+    drop(bob);
+
+    // Alice creates a channel while Bob is provably offline.
+    let channel = create_channel(&alice, &community, "created-while-offline", 0)
+        .await
+        .expect("alice creates channel while bob is offline");
+    eprintln!("S3-offline channel id={channel}");
+
+    // Bob relaunches against the persisted profile/home.
+    let bob = NodeHandle::spawn(bob_cfg)
+        .await
+        .expect("bob relaunches against persisted profile/home");
+
+    // ZEB-434 expectation (currently blocked by ZEB-462): Bob catches up the
+    // offline-created channel after reconnect.
+    poll_until(Duration::from_secs(120), || async {
+        Ok(channels_contains(&bob, &community, &channel)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("bob catches up the offline-created channel after reconnect (ZEB-434)");
+
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S4: single-node restart durability (ZEB-393) — #[ignore]'d, blocked by ZEB-462
+// finding (B). Mint → create community → restart → the community must rehydrate
+// and appear in `list_owner_communities`.
+//
+// FINDING (ZEB-462 B): this FAILS, single-node, even with a GRACEFUL shutdown
+// (so it is NOT a crash-before-flush / debounce edge). After restart the node
+// rehydrates the community (`registered case-C pkarr publications … count=1`) but
+// materializes the OWNER's own membership as `Left` (left_at: None) — it then
+// drops its own community publishes ("publisher … not joined … status: Left") and
+// `list_owner_communities` returns empty. So a clean restart can make a node's
+// OWN communities disappear from the list. This is a real membership-rehydration
+// durability bug (ZEB-462 B, confirmed single-node), NOT a harness bug — ignored
+// until fixed. Run explicitly: `cargo test --features e2e -- --ignored s4_restart`.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "blocked by ZEB-462 (B): single-node restart rehydrates the owner's own membership as Left → community drops out of list_owner_communities (fails even on graceful shutdown)"]
+async fn s4_restart_durability() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let mut run = RunDir::new("s4").expect("run dir");
+    let home = fresh_home("s4");
+    let mut cfg = NodeConfig::new(PathBuf::from(home.path()), "alice");
+    cfg.log_dir = Some(run.log_dir());
+
+    let mut alice = NodeHandle::spawn(cfg.clone()).await.expect("spawn");
+    mint(&alice).await.expect("mint");
+    let community = create_community(&alice, "s4-durable", true)
+        .await
+        .expect("create community");
+
+    // GRACEFUL shutdown (flushes owner-state on exit) — the robust durability
+    // question: does a community survive a CLEAN restart? (A hard SIGKILL-before-
+    // debounce is the separate ZEB-393 Bug-A edge.)
+    alice.shutdown().await.expect("graceful shutdown");
+    drop(alice);
+
+    // Relaunch against the same profile/home; the community must rehydrate.
+    let alice = NodeHandle::spawn(cfg).await.expect("relaunch");
+    poll_until(Duration::from_secs(120), || async {
+        let comms = alice
+            .rpc("list_owner_communities", serde_json::json!({}))
+            .await?;
+        let found = comms
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .any(|c| c.get("id").and_then(|v| v.as_str()) == Some(community.as_str()))
+            })
+            .unwrap_or(false);
+        Ok(found.then_some(()))
+    })
+    .await
+    .expect("community rehydrated after restart (ZEB-393)");
+
+    run.mark_success();
+    drop((alice, home));
 }
