@@ -1313,7 +1313,7 @@ mod tests {
             fake(&[(c, [0x01; 16])]),
         );
 
-        ctx.mark_pulled(&[key.clone()], "Rdev".into())
+        ctx.mark_pulled(std::slice::from_ref(&key), "Rdev".into())
             .await
             .unwrap();
 
@@ -1374,7 +1374,7 @@ mod tests {
         );
 
         // Step 1: mark_pulled sets pulled_by but does NOT remove the entry.
-        ctx.mark_pulled(&[key.clone()], "Rdev".into())
+        ctx.mark_pulled(std::slice::from_ref(&key), "Rdev".into())
             .await
             .unwrap();
         assert!(

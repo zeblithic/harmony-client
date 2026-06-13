@@ -626,7 +626,7 @@ mod tests {
         let handle = driver.spawn();
 
         // Startup pass fires with no wake.
-        wait_until(|| transport.calls().len() >= 1).await;
+        wait_until(|| !transport.calls().is_empty()).await;
 
         // A wake triggers a second pass.
         wake.notify_one();
