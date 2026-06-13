@@ -464,6 +464,294 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
     }
 }
 
+// =====================================================================
+// ProdCommunityRelayDepositClient (sender side — D40 relay rung)
+// =====================================================================
+
+/// Resolves the RECIPIENT owner's freshest advertised butler set (the SEAL
+/// TARGETS — each is one of R's enrolled device ed25519 verify keys). Factored
+/// behind a seam so the decision logic of
+/// [`ProdCommunityRelayDepositClient::deposit`] (no butler set → false, etc.)
+/// is unit-testable without a real `ReachabilityResolver`/pkarr. Production
+/// wires [`ReachabilityButlerSetResolve`] over the live resolver.
+#[async_trait]
+pub trait ButlerSetResolve: Send + Sync {
+    async fn resolve_targets(
+        &self,
+        recipient_owner: &crate::owner_state_types::OwnerAddr,
+        now_ms: u64,
+    ) -> Vec<crate::reachability_record::ButlerSetEntry>;
+}
+
+/// Production butler-set resolution over the live [`ReachabilityResolver`]
+/// (in-memory CRDT cache first, pkarr fallback on miss) + `freshest_butler_set`
+/// — identical to the butler client's resolution step.
+pub struct ReachabilityButlerSetResolve(pub crate::reachability_resolver::ReachabilityResolver);
+
+#[async_trait]
+impl ButlerSetResolve for ReachabilityButlerSetResolve {
+    async fn resolve_targets(
+        &self,
+        recipient_owner: &crate::owner_state_types::OwnerAddr,
+        now_ms: u64,
+    ) -> Vec<crate::reachability_record::ButlerSetEntry> {
+        let blobs = self.0.resolve_async(recipient_owner).await;
+        crate::butler_deposit::freshest_butler_set(&blobs, now_ms)
+    }
+}
+
+/// Dials ONE community relay and deposits ONE sealed [`RelayDepositFrame`],
+/// returning `Ok(())` iff the relay acked (a valid [`RelayDepositAck`] decoded).
+/// Factored behind a seam so the deposit DECISION loop (first acking relay
+/// wins; none ack → false) is unit-testable without iroh. Production wires
+/// [`IrohRelayDepositDial`].
+#[async_trait]
+pub trait RelayDepositDial: Send + Sync {
+    async fn dial_deposit(
+        &self,
+        relay: &crate::community_relay_announce::CommunityRelayEntry,
+        frame: &crate::community_relay::RelayDepositFrame,
+    ) -> Result<(), String>;
+}
+
+/// Production [`RelayDepositDial`] over iroh — mirrors
+/// [`crate::butler_deposit::IrohButlerDepositClient::deposit_to_entry`]: dial
+/// the relay's endpoint on [`HARMONY_COMMUNITY_RELAY_DEPOSIT_V1`], `open_bi`,
+/// write the length-prefixed frame, `finish`, read + decode the length-prefixed
+/// ack, close — all bounded by `io_deadline`. A decoded [`RelayDepositAck`] is
+/// the success signal; its `content_id` is informational (the relay derives it
+/// over the sealed_blob), so it is not cross-checked.
+pub struct IrohRelayDepositDial {
+    pub endpoint: Arc<crate::iroh_endpoint::IrohEndpoint>,
+    pub io_deadline: std::time::Duration,
+}
+
+#[async_trait]
+impl RelayDepositDial for IrohRelayDepositDial {
+    async fn dial_deposit(
+        &self,
+        relay: &crate::community_relay_announce::CommunityRelayEntry,
+        frame: &crate::community_relay::RelayDepositFrame,
+    ) -> Result<(), String> {
+        let exchange = async {
+            let ep_id = iroh::EndpointId::from_bytes(&relay.iroh_endpoint_id)
+                .map_err(|e| format!("relay endpoint id: {e}"))?;
+            let mut addr = iroh::EndpointAddr::new(ep_id);
+            if !relay.home_relay.is_empty() {
+                match relay.home_relay.parse::<iroh::RelayUrl>() {
+                    Ok(url) => addr = addr.with_relay_url(url),
+                    Err(e) => tracing::trace!(
+                        relay = %relay.home_relay,
+                        "ZEB-458: skip malformed relay home_relay: {e}"
+                    ),
+                }
+            }
+            let conn = self
+                .endpoint
+                .inner()
+                .connect(
+                    addr,
+                    crate::iroh_endpoint::alpn::HARMONY_COMMUNITY_RELAY_DEPOSIT_V1,
+                )
+                .await
+                .map_err(|e| format!("connect: {e}"))?;
+            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+            let frame_bytes = crate::community_relay::encode_relay_deposit_frame(frame)
+                .map_err(|e| format!("encode frame: {e}"))?;
+            crate::butler_deposit::write_length_prefixed(&mut send, &frame_bytes)
+                .await
+                .map_err(|e| format!("write frame: {e}"))?;
+            send.finish().map_err(|e| format!("finish: {e}"))?;
+            let ack_bytes = crate::butler_deposit::read_length_prefixed(&mut recv)
+                .await
+                .map_err(|e| format!("read ack: {e}"))?;
+            // A decoded ack is the success signal; a reject closes the stream
+            // without an ack (the read above fails). The content_id is derived
+            // by the relay over the sealed_blob — informational, not checked.
+            crate::community_relay::decode_relay_deposit_ack(&ack_bytes)
+                .map_err(|e| format!("decode ack: {e}"))?;
+            // Dialer-driven close (the acceptor waits on `conn.closed()` after
+            // writing the ack).
+            conn.close(0u32.into(), b"");
+            Ok(())
+        };
+        tokio::time::timeout(self.io_deadline, exchange)
+            .await
+            .map_err(|_| "relay deposit IO timeout".to_string())?
+    }
+}
+
+/// Production [`CommunityRelayDepositClient`] (ZEB-458 P4 Phase B, D40): the
+/// sender's last-resort relay rung. Seals the SAME [`DepositPayload`] the butler
+/// rung uses to the RECIPIENT's advertised butler-set device key(s), and
+/// deposits to a relay in a community both parties have Joined. Returns `true`
+/// iff at least one relay acked ≥1 sealed copy.
+///
+/// Mirrors [`crate::butler_deposit::IrohButlerDepositClient`] for the
+/// resolve-butler-set + fetch-blob + seal-per-target steps; adds the
+/// shared-community computation (D40 gate) and the per-community relay fan-out.
+/// The two iroh-touching steps (butler-set resolution + the per-relay dial) are
+/// behind seams ([`ButlerSetResolve`], [`RelayDepositDial`]) so the decision
+/// logic is unit-testable; T12 covers the live iroh path end-to-end.
+pub struct ProdCommunityRelayDepositClient {
+    /// Resolves the recipient's butler-set seal targets (R's device keys).
+    pub butler_resolver: Arc<dyn ButlerSetResolve>,
+    /// Resolves the fresh relay advertisers for a given community.
+    pub relay_resolver: Arc<crate::community_relay_resolver::CommunityRelayResolver>,
+    /// Dials + deposits one frame to one relay (iroh in production).
+    pub dial: Arc<dyn RelayDepositDial>,
+    /// CAS holding the message storage blob (written by `send_dm` step 5).
+    pub cas: Arc<dyn crate::content_store::ContentStore>,
+    /// This (sender) owner's address bytes.
+    pub sender_owner: [u8; 16],
+    /// Canonical CBOR of this device's own `EnrollmentCert` (the relay
+    /// strict-decodes + verifies it against the sender owner's master key).
+    pub enrollment_cert_bytes: Vec<u8>,
+    /// The cert-bound enrolled device signing key — signs the deposit frame.
+    pub device_signing_key: Arc<ed25519_dalek::SigningKey>,
+    /// Runtime owner-state CRDT — read to enumerate the sender's community
+    /// spaces (the candidate gating communities) + their kinds.
+    pub crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    /// Community-membership lookup seam (used for BOTH self+recipient
+    /// joined-ness in the shared-community computation).
+    pub membership: Arc<dyn CommunityMembershipLookup>,
+}
+
+impl ProdCommunityRelayDepositClient {
+    /// Communities where BOTH the sender and the recipient are Joined members
+    /// (D40 gate). `CommunityMembershipLookup::is_joined` is async, but
+    /// [`crate::community_relay::find_shared_communities`] takes a SYNC closure,
+    /// so the joined-ness is MATERIALIZED into a set first: read the sender's
+    /// community space ids + kinds from the owner-state CRDT under one lock, then
+    /// probe membership for each Community-kind space (self + recipient) and feed
+    /// the pure predicate. Returns the communities in `space_ids` order.
+    async fn shared_communities(
+        &self,
+        recipient_owner: &crate::owner_state_types::OwnerAddr,
+    ) -> Vec<crate::owner_state_types::SpaceId> {
+        use crate::owner_state_types::{OwnerAddr, SpaceId, SpaceKind};
+
+        // 1. Snapshot (space_id, kind) for every space under one lock, then drop
+        //    it before any await on the membership seam.
+        let spaces: Vec<(SpaceId, SpaceKind)> = {
+            let state = self.crdt_state.lock().await;
+            state
+                .spaces
+                .iter()
+                .map(|(id, space)| (*id, space.kind))
+                .collect()
+        };
+
+        let kind_map: BTreeMap<SpaceId, SpaceKind> = spaces.iter().copied().collect();
+        let space_ids: Vec<SpaceId> = spaces.iter().map(|(id, _)| *id).collect();
+        let self_addr = OwnerAddr(self.sender_owner);
+
+        // 2. Materialize joined-ness for the Community-kind spaces only — the
+        //    pure predicate filters to Community kind anyway, so probing the
+        //    others would be wasted RPCs.
+        let mut joined: std::collections::HashSet<(SpaceId, [u8; 16])> =
+            std::collections::HashSet::new();
+        for (id, kind) in &spaces {
+            if *kind != SpaceKind::Community {
+                continue;
+            }
+            if self.membership.is_joined(id, &self.sender_owner).await {
+                joined.insert((*id, self.sender_owner));
+            }
+            if self.membership.is_joined(id, &recipient_owner.0).await {
+                joined.insert((*id, recipient_owner.0));
+            }
+        }
+
+        crate::community_relay::find_shared_communities(
+            &space_ids,
+            &self_addr,
+            recipient_owner,
+            |c| kind_map.get(c).copied().unwrap_or(SpaceKind::Folder),
+            |c, o| joined.contains(&(*c, o.0)),
+        )
+    }
+}
+
+#[async_trait]
+impl crate::community_relay::CommunityRelayDepositClient for ProdCommunityRelayDepositClient {
+    async fn deposit(&self, req: &crate::butler_deposit::ButlerDepositRequest) -> bool {
+        // 1. Resolve R's fresh butler set — the SEAL TARGETS (R's device keys,
+        //    NOT any relay's). Empty → no device to seal to (accepted gap, D35).
+        let targets = self
+            .butler_resolver
+            .resolve_targets(&req.recipient_owner, req.now_ms)
+            .await;
+        if targets.is_empty() {
+            return false;
+        }
+
+        // 2. Communities both parties have Joined (D40 gate). None → no relay
+        //    rung is permitted.
+        let communities = self.shared_communities(&req.recipient_owner).await;
+        if communities.is_empty() {
+            return false;
+        }
+
+        // 3. Fetch the storage blob (only after a target + a shared community
+        //    are confirmed — no CAS work for a no-op rung). Miss/err → false.
+        let storage_blob = match self.cas.get(&req.message_cid).await {
+            Ok(Some(blob)) => blob,
+            Ok(None) | Err(_) => return false,
+        };
+        let payload = DepositPayload {
+            cidnotify_packet: req.cidnotify_packet.clone(),
+            storage_blob,
+        };
+
+        // 4. Fan out: the FIRST relay that acks ≥1 sealed copy wins. For each
+        //    community (in `find_shared_communities` order), for each fresh
+        //    relay advertiser, deposit every butler-set device-target copy to
+        //    that relay; if it acks any, return true. Depositing all (≤2) device
+        //    copies to the one reachable relay means whichever R device returns
+        //    can pull its copy.
+        for community in &communities {
+            let relays = self
+                .relay_resolver
+                .relays_for_community(community, req.now_ms);
+            for relay in &relays {
+                let mut relay_acked = false;
+                for target in &targets {
+                    let frame = match crate::community_relay::build_relay_deposit_frame(
+                        req.recipient_owner.0,
+                        &target.device_ed25519_verify,
+                        self.sender_owner,
+                        *community,
+                        self.enrollment_cert_bytes.clone(),
+                        &self.device_signing_key,
+                        &payload,
+                    ) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "ZEB-458: relay frame build failed; skip target");
+                            continue;
+                        }
+                    };
+                    match self.dial.dial_deposit(relay, &frame).await {
+                        Ok(()) => relay_acked = true,
+                        Err(e) => {
+                            tracing::debug!(
+                                relay_device = %hex::encode(relay.relay_device_id),
+                                error = %e,
+                                "ZEB-458: relay deposit copy failed"
+                            );
+                        }
+                    }
+                }
+                if relay_acked {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 /// Wall-clock now in epoch-MS for `received_at` (the inbox entry's receive
 /// stamp). Separate from [`now_epoch_secs`] (cert expiry uses seconds).
 fn now_epoch_ms() -> u64 {
@@ -1088,5 +1376,528 @@ mod tests {
         fn is_pull_ctx<T: RelayPullCtx>() {}
         is_deposit_ctx::<ProdRelayDepositCtx>();
         is_pull_ctx::<ProdRelayPullCtx>();
+    }
+
+    // =================================================================
+    // ProdCommunityRelayDepositClient (sender side) — decision logic via
+    // the ButlerSetResolve + RelayDepositDial seams (iroh-free).
+    // =================================================================
+
+    use crate::butler_deposit::ButlerDepositRequest;
+    use crate::community_relay::{CommunityRelayDepositClient, RelayDepositFrame};
+    use crate::community_relay_announce::{CommunityRelayAnnouncePayload, CommunityRelayEntry};
+    use crate::community_relay_resolver::CommunityRelayResolver;
+    use crate::content_store::InMemoryStub;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{ContentId, OutboxEntryId, OwnerAddr, Space, SpaceKind};
+    use crate::reachability_record::ButlerSetEntry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Butler-set resolution seam returning a fixed target list (the SEAL
+    /// TARGETS — R's device keys).
+    struct FakeButlerSetResolve {
+        targets: Vec<ButlerSetEntry>,
+    }
+
+    #[async_trait]
+    impl ButlerSetResolve for FakeButlerSetResolve {
+        async fn resolve_targets(&self, _r: &OwnerAddr, _now_ms: u64) -> Vec<ButlerSetEntry> {
+            self.targets.clone()
+        }
+    }
+
+    /// One butler-set device target keyed by its device verify key.
+    fn target(vk_seed: u8) -> ButlerSetEntry {
+        ButlerSetEntry {
+            device_id: [vk_seed; 16],
+            iroh_endpoint_id: [vk_seed; 32],
+            device_ed25519_verify: [vk_seed; 32],
+            home_relay: String::new(),
+            pinned: false,
+        }
+    }
+
+    /// Relay-dial seam mock: a relay (keyed by `relay_device_id`) acks iff it is
+    /// in `acking`. Records the (relay_device_id) of every dialed copy.
+    struct MockDial {
+        acking: HashSet<[u8; 16]>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RelayDepositDial for MockDial {
+        async fn dial_deposit(
+            &self,
+            relay: &CommunityRelayEntry,
+            _frame: &RelayDepositFrame,
+        ) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.acking.contains(&relay.relay_device_id) {
+                Ok(())
+            } else {
+                Err("unreachable".into())
+            }
+        }
+    }
+
+    /// A minimal `Space` of the given kind (all non-essential fields empty).
+    fn space_of_kind(id: u8, kind: SpaceKind) -> Space {
+        Space {
+            id: SpaceId([id; 16]),
+            kind,
+            parent: None,
+            community_id: None,
+            name: "S".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    /// Owner-state with the given (space_id_byte, kind) spaces inserted.
+    fn crdt_with_spaces(spaces: &[(u8, SpaceKind)]) -> Arc<tokio::sync::Mutex<OwnerState>> {
+        let mut st = OwnerState::default();
+        for (id, kind) in spaces {
+            st.spaces
+                .insert(SpaceId([*id; 16]), space_of_kind(*id, *kind));
+        }
+        Arc::new(tokio::sync::Mutex::new(st))
+    }
+
+    /// A relay resolver pre-populated with one relay advertiser per
+    /// (community_byte, relay_device_id_seed) at `now`.
+    fn relay_resolver_with(entries: &[(u8, u8)], now: u64) -> Arc<CommunityRelayResolver> {
+        let r = CommunityRelayResolver::new();
+        for (community_byte, relay_seed) in entries {
+            let payload = CommunityRelayAnnouncePayload {
+                relay: CommunityRelayEntry {
+                    relay_device_id: [*relay_seed; 16],
+                    iroh_endpoint_id: [*relay_seed; 32],
+                    relay_device_ed25519_verify: [*relay_seed; 32],
+                    home_relay: String::new(),
+                },
+                ad_at: now,
+                identity_signature: [0; 64],
+            };
+            r.update(
+                SpaceId([*community_byte; 16]),
+                OwnerAddr([*relay_seed; 16]),
+                payload,
+                Hlc {
+                    wall_ms: now,
+                    logical: 0,
+                    device_id: "r".into(),
+                },
+            );
+        }
+        Arc::new(r)
+    }
+
+    const TEST_NOW: u64 = 1_700_000_000_000;
+
+    /// CAS pre-seeded so the message_cid resolves to a stored blob.
+    async fn cas_with_blob(
+        cid: &ContentId,
+        blob: Vec<u8>,
+    ) -> Arc<dyn crate::content_store::ContentStore> {
+        use crate::content_store::ContentStore as _;
+        let cas = InMemoryStub::default();
+        cas.put(*cid, blob).await.unwrap();
+        Arc::new(cas)
+    }
+
+    fn req(recipient: [u8; 16], cid: ContentId) -> ButlerDepositRequest {
+        ButlerDepositRequest {
+            entry_id: OutboxEntryId([0x77; 16]),
+            recipient_owner: OwnerAddr(recipient),
+            space_id: SpaceId([0xDD; 16]),
+            message_cid: cid,
+            cidnotify_packet: vec![0x01, 0x02, 0x03],
+            now_ms: TEST_NOW,
+        }
+    }
+
+    /// Build a client wired with the given seams. `device_signing_key` is a
+    /// throwaway (build_relay_deposit_frame only needs a valid signer).
+    fn deposit_client(
+        butler_resolver: Arc<dyn ButlerSetResolve>,
+        relay_resolver: Arc<CommunityRelayResolver>,
+        dial: Arc<dyn RelayDepositDial>,
+        cas: Arc<dyn crate::content_store::ContentStore>,
+        sender_owner: [u8; 16],
+        crdt_state: Arc<tokio::sync::Mutex<OwnerState>>,
+        membership: Arc<dyn CommunityMembershipLookup>,
+    ) -> ProdCommunityRelayDepositClient {
+        ProdCommunityRelayDepositClient {
+            butler_resolver,
+            relay_resolver,
+            dial,
+            cas,
+            sender_owner,
+            enrollment_cert_bytes: vec![0xCE, 0x12],
+            device_signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+            crdt_state,
+            membership,
+        }
+    }
+
+    #[tokio::test]
+    async fn deposit_false_when_no_fresh_butler_set() {
+        // No seal target → no device to seal to → false (D35 accepted gap),
+        // and NO relay dialed.
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve { targets: vec![] }), // EMPTY butler set
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(MockDial {
+                acking: HashSet::new(),
+                calls: calls.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_with_spaces(&[(community, SpaceKind::Community)]),
+            fake(&[
+                (SpaceId([community; 16]), sender),
+                (SpaceId([community; 16]), recipient),
+            ]),
+        );
+
+        assert!(!client.deposit(&req(recipient, cid)).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no relay should be dialed");
+    }
+
+    #[tokio::test]
+    async fn deposit_false_when_no_shared_community() {
+        // A fresh butler set exists, but the only shared-kind space is one the
+        // recipient has NOT joined → no shared community → false, no dial.
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve {
+                targets: vec![target(0xAA)],
+            }),
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(MockDial {
+                acking: HashSet::from([[0x01; 16]]), // would ack if reached
+                calls: calls.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_with_spaces(&[(community, SpaceKind::Community)]),
+            // Only the SENDER is joined — recipient is not.
+            fake(&[(SpaceId([community; 16]), sender)]),
+        );
+
+        assert!(!client.deposit(&req(recipient, cid)).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no relay should be dialed");
+    }
+
+    #[tokio::test]
+    async fn deposit_false_when_dm_only_no_community_kind_space() {
+        // A DM space the recipient is in is NOT a Community kind → excluded by
+        // find_shared_communities → no shared community → false.
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let dm = 0xD0;
+        let cid = ContentId::from_bytes([0x33; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve {
+                targets: vec![target(0xAA)],
+            }),
+            relay_resolver_with(&[(dm, 0x01)], TEST_NOW),
+            Arc::new(MockDial {
+                acking: HashSet::from([[0x01; 16]]),
+                calls: calls.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_with_spaces(&[(dm, SpaceKind::Dm)]),
+            fake(&[(SpaceId([dm; 16]), sender), (SpaceId([dm; 16]), recipient)]),
+        );
+
+        assert!(!client.deposit(&req(recipient, cid)).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn deposit_false_when_cas_miss() {
+        // Butler set + shared community both present, but the storage blob is
+        // missing from CAS → false.
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve {
+                targets: vec![target(0xAA)],
+            }),
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(MockDial {
+                acking: HashSet::from([[0x01; 16]]),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(InMemoryStub::default()), // EMPTY CAS — get returns None
+            sender,
+            crdt_with_spaces(&[(community, SpaceKind::Community)]),
+            fake(&[
+                (SpaceId([community; 16]), sender),
+                (SpaceId([community; 16]), recipient),
+            ]),
+        );
+
+        assert!(!client.deposit(&req(recipient, cid)).await);
+    }
+
+    #[tokio::test]
+    async fn deposit_true_when_first_relay_acks() {
+        // The single relay acks → true.
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve {
+                targets: vec![target(0xAA)],
+            }),
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(MockDial {
+                acking: HashSet::from([[0x01; 16]]),
+                calls: calls.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_with_spaces(&[(community, SpaceKind::Community)]),
+            fake(&[
+                (SpaceId([community; 16]), sender),
+                (SpaceId([community; 16]), recipient),
+            ]),
+        );
+
+        assert!(client.deposit(&req(recipient, cid)).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one target → one dial");
+    }
+
+    #[tokio::test]
+    async fn deposit_true_first_acking_relay_wins_no_later_relay_dialed() {
+        // Two relays in the community: the FIRST (freshest) acks. With one
+        // butler target, exactly one dial happens and the second relay is never
+        // tried.
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // relay 0x0A advertised LATER (fresher) so it sorts first; both ack.
+        let resolver = CommunityRelayResolver::new();
+        for (seed, ad_at) in [(0x0Au8, TEST_NOW + 10), (0x0Bu8, TEST_NOW)] {
+            resolver.update(
+                SpaceId([community; 16]),
+                OwnerAddr([seed; 16]),
+                CommunityRelayAnnouncePayload {
+                    relay: CommunityRelayEntry {
+                        relay_device_id: [seed; 16],
+                        iroh_endpoint_id: [seed; 32],
+                        relay_device_ed25519_verify: [seed; 32],
+                        home_relay: String::new(),
+                    },
+                    ad_at,
+                    identity_signature: [0; 64],
+                },
+                Hlc {
+                    wall_ms: ad_at,
+                    logical: 0,
+                    device_id: "r".into(),
+                },
+            );
+        }
+
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve {
+                targets: vec![target(0xAA)],
+            }),
+            Arc::new(resolver),
+            Arc::new(MockDial {
+                acking: HashSet::from([[0x0A; 16], [0x0B; 16]]),
+                calls: calls.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_with_spaces(&[(community, SpaceKind::Community)]),
+            fake(&[
+                (SpaceId([community; 16]), sender),
+                (SpaceId([community; 16]), recipient),
+            ]),
+        );
+
+        assert!(client.deposit(&req(recipient, cid)).await);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "first acking relay wins; the second relay is not dialed"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_falls_through_to_second_relay_when_first_unreachable() {
+        // First relay (fresher) is unreachable; second acks → true. Two dials.
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let resolver = CommunityRelayResolver::new();
+        for (seed, ad_at) in [(0x0Au8, TEST_NOW + 10), (0x0Bu8, TEST_NOW)] {
+            resolver.update(
+                SpaceId([community; 16]),
+                OwnerAddr([seed; 16]),
+                CommunityRelayAnnouncePayload {
+                    relay: CommunityRelayEntry {
+                        relay_device_id: [seed; 16],
+                        iroh_endpoint_id: [seed; 32],
+                        relay_device_ed25519_verify: [seed; 32],
+                        home_relay: String::new(),
+                    },
+                    ad_at,
+                    identity_signature: [0; 64],
+                },
+                Hlc {
+                    wall_ms: ad_at,
+                    logical: 0,
+                    device_id: "r".into(),
+                },
+            );
+        }
+
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve {
+                targets: vec![target(0xAA)],
+            }),
+            Arc::new(resolver),
+            Arc::new(MockDial {
+                // Only the SECOND relay (0x0B) acks.
+                acking: HashSet::from([[0x0B; 16]]),
+                calls: calls.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_with_spaces(&[(community, SpaceKind::Community)]),
+            fake(&[
+                (SpaceId([community; 16]), sender),
+                (SpaceId([community; 16]), recipient),
+            ]),
+        );
+
+        assert!(client.deposit(&req(recipient, cid)).await);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "first relay unreachable, second acks → two dials"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_false_when_no_relay_acks() {
+        // Shared community + butler set + blob all present, but the relay never
+        // acks → false (every copy/relay tried).
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve {
+                targets: vec![target(0xAA), target(0xBB)], // two device targets
+            }),
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(MockDial {
+                acking: HashSet::new(), // nothing acks
+                calls: calls.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_with_spaces(&[(community, SpaceKind::Community)]),
+            fake(&[
+                (SpaceId([community; 16]), sender),
+                (SpaceId([community; 16]), recipient),
+            ]),
+        );
+
+        assert!(!client.deposit(&req(recipient, cid)).await);
+        // Both device-target copies attempted against the one relay.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn deposit_true_deposits_all_device_copies_to_first_acking_relay() {
+        // Two butler-set device targets, one relay that acks: ALL copies are
+        // deposited to that first acking relay (2 dials), then true.
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve {
+                targets: vec![target(0xAA), target(0xBB)],
+            }),
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(MockDial {
+                acking: HashSet::from([[0x01; 16]]),
+                calls: calls.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_with_spaces(&[(community, SpaceKind::Community)]),
+            fake(&[
+                (SpaceId([community; 16]), sender),
+                (SpaceId([community; 16]), recipient),
+            ]),
+        );
+
+        assert!(client.deposit(&req(recipient, cid)).await);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both device-target copies deposited to the first acking relay"
+        );
     }
 }
