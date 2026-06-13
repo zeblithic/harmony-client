@@ -66,6 +66,14 @@ pub enum ChannelLogEngineError {
 
     #[error("invariant violation: {0}")]
     InvariantViolation(String),
+
+    /// ZEB-288 (CodeAnt): a local `publish` raced engine `shutdown()` and
+    /// found `closing` set under the `log` lock. Appending would strand an
+    /// unflushed event past shutdown's flush; unlike an inbound packet a
+    /// local publish has no backfill recovery, so the caller is told the
+    /// post did not land rather than silently losing it.
+    #[error("channel engine is shutting down; publish not persisted")]
+    EngineShuttingDown,
 }
 
 // ── Transaction primitives (ZEB-271) ─────────────────────────────────────────
@@ -677,6 +685,24 @@ impl ChannelLogEngine {
         }
         {
             let mut log = self.log.lock().await;
+            // ZEB-288 (CodeAnt): the same durability guard as the inbound
+            // path (`process_inbound_packet` step 3), under the same `log`
+            // lock so it is atomic w.r.t. shutdown's `flush_now()`.
+            // `shutdown()` orders `closing = true` strictly before
+            // `flush_now()`, so once we hold the lock: closing == false ⟹
+            // the flush hasn't started and will pick up this append;
+            // closing == true ⟹ shutdown is past the store and may have
+            // already flushed, so appending now would strand an unflushed
+            // event past the "tail is on disk on return" contract. Unlike
+            // an inbound packet (re-fetched via backfill), a locally minted
+            // event has NO recovery path, so we surface an error instead of
+            // silently dropping — the caller must learn the post did not
+            // land. (The replay-tracker `record` above is discarded on
+            // shutdown, since the tracker is rebuilt from the on-disk log
+            // at boot.)
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(ChannelLogEngineError::EngineShuttingDown);
+            }
             log.append(event.clone())
                 .map_err(ChannelLogEngineError::Persist)?;
         }
