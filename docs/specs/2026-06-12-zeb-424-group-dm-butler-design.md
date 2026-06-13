@@ -111,10 +111,48 @@ there.
 - `DepositReject` gains `NotAuthorized` (collapsing "not a friend AND not a
   co-member"). The enum never crosses the wire (rejects close the stream
   uniformly; it exists for counters/tests), so this is not a format change.
-  `NotFriend` remains for... it does not: `NotFriend` is **renamed/absorbed**
-  into `NotAuthorized` since the gate is now "friend OR co-member" — a
-  deposit that fails both is rejected for the compound reason. Counter
-  continuity note goes in the changelog comment.
+  `NotFriend` is **renamed/absorbed** into `NotAuthorized` since the gate is
+  now "friend OR co-member" — a deposit that fails both is rejected for the
+  compound reason. Counter continuity note goes in the changelog comment.
+
+### D29.1 — Cert trust anchor for co-members: derive the master from the owner id (load-bearing; not in the approved sketch)
+
+Grounding the plan surfaced a gap the sketch glossed: step 2 (the
+`EnrollmentCert` master-pin) currently binds the cert's issuing master to
+the **friend-graph-pinned master** (`cert_master == friend_master`). A
+non-friend co-member has no pinned master, so that check can't run for
+them — yet the cert must still be anchored to *something*, or admission
+would persist a blob behind a cert with an attacker-chosen master.
+
+The anchor already exists and needs no new state: **the owner id is the
+hash of the master key bundle**.
+`friend_graph::owner_id_from_master_ed25519(master) -> OwnerAddr` is the
+derivation, and `iroh_friend_acceptor`'s own test
+(`master_ed25519_from_cert_matches_owner_id`) pins the invariant
+`owner_id_from_master_ed25519(cert_master) == cert.owner_id`. So a
+Master-issued cert for `sender_owner` is cryptographically valid for that
+owner iff `owner_id_from_master_ed25519(cert_master) == sender_owner` —
+collision-resistance of the identity hash makes a forged-master cert for a
+victim's owner id infeasible.
+
+Decision: keep the **friend path byte-for-byte unchanged** (it still pins
+`cert_master == friend_master`, which — because the pinned master was
+itself validated by this same derivation at friend-time — is equivalent to
+but stricter-by-defense-in-depth than the derived check). Add a **parallel
+co-member branch** that does the derived check
+`owner_id_from_master_ed25519(cert_master) == frame.sender_owner`. The
+admission step therefore yields a small two-variant verdict —
+`Friend(friend_master)` vs `CoMember` — that step 2 consumes to pick the
+master-binding rule. Everything downstream (frame sig, decrypt, inner
+CidNotify verify against `owner_device_cache`, atomic persist) is identical
+for both. This keeps the security-critical friend path untouched (no
+re-review needed there) and makes the co-member path purely additive.
+
+A non-Active **friend** who is *also* a live co-member (e.g. a revoked
+friend still in a shared group) falls through to the co-member branch and
+is admitted on group membership via the derived anchor — group membership
+is independent of friend status, and the stale revoked-friend master is
+deliberately not consulted.
 
 ### D30 — Churn semantics: eventual consistency, both windows accepted
 
@@ -183,7 +221,14 @@ Unit (acceptor, mock ctx — extend `iroh_butler_acceptor.rs` tests):
   reached on reject);
 - co-member of a **left** group (`left_at = Some`) → rejected;
 - co-member of a `Dm`/`Channel`/`Community` space only → rejected
-  (kind gate).
+  (kind gate);
+- **co-member cert anchor (D29.1):** a co-member whose cert master does NOT
+  hash to `sender_owner` (`owner_id_from_master_ed25519(cert_master) !=
+  sender_owner`) → `BadCert`, even though admission passed — the derived
+  anchor is the co-member's only master pin;
+- **friend path unchanged:** a friend-Active sender whose cert master
+  mismatches the *pinned* `friend_master` → `BadCert` (regression that the
+  friend branch still pins, not the derived check).
 
 Unit (outbox, `dm_outbox.rs` tests):
 - N-recipient entry, mixed states: A acked, B deposit-candidate, C pending
