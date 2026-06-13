@@ -52,6 +52,15 @@ pub const COMMUNITY_RELAY_DEPOSIT_SIG_DOMAIN: &[u8] = b"harmony-zeb-458-communit
 /// (see [`relay_pull_sig_payload`]).
 pub const COMMUNITY_RELAY_PULL_SIG_DOMAIN: &[u8] = b"harmony-zeb-458-community-relay-pull-v1";
 
+/// Domain-separation prefix for the pull ack signature. The requester's
+/// cert-bound device ed25519 signs
+/// `domain ‖ recipient_owner ‖ community_id ‖ (content_ids SORTED + concatenated)`
+/// (see [`relay_pull_ack_sig_payload`]).
+///
+/// The distinct domain ensures an ack cannot be replayed as a query and vice versa.
+pub const COMMUNITY_RELAY_PULL_ACK_SIG_DOMAIN: &[u8] =
+    b"harmony-zeb-458-community-relay-pull-ack-v1";
+
 /// Per-sender cap on relay-held blobs (mirrors [`crate::butler_deposit::INBOX_PER_SENDER_CAP`]).
 pub const RELAY_HOLD_PER_SENDER_CAP: usize = 64;
 
@@ -265,6 +274,37 @@ pub fn relay_pull_sig_payload(recipient_owner: &[u8; 16], community_id: &SpaceId
     out.extend_from_slice(COMMUNITY_RELAY_PULL_SIG_DOMAIN);
     out.extend_from_slice(recipient_owner);
     out.extend_from_slice(&community_id.0);
+    out
+}
+
+/// Signed bytes for a pull ack:
+/// `COMMUNITY_RELAY_PULL_ACK_SIG_DOMAIN ‖ recipient_owner ‖ community_id.0 ‖ (content_ids SORTED + concatenated)`.
+///
+/// content_ids MUST be sorted ascending before concatenation so the binding is
+/// order-independent: the relay and the recipient may enumerate content IDs in
+/// different orders, and the canonical form must be identical for both sides.
+///
+/// Both the requester (signer) and the relay (verifier) MUST build the signed
+/// bytes through this function — never inline the concatenation.
+pub fn relay_pull_ack_sig_payload(
+    recipient_owner: &[u8; 16],
+    community_id: &SpaceId,
+    content_ids: &[[u8; 32]],
+) -> Vec<u8> {
+    let mut sorted = content_ids.to_vec();
+    sorted.sort_unstable();
+    let mut out = Vec::with_capacity(
+        COMMUNITY_RELAY_PULL_ACK_SIG_DOMAIN.len()
+            + recipient_owner.len()
+            + community_id.0.len()
+            + sorted.len() * 32,
+    );
+    out.extend_from_slice(COMMUNITY_RELAY_PULL_ACK_SIG_DOMAIN);
+    out.extend_from_slice(recipient_owner);
+    out.extend_from_slice(&community_id.0);
+    for cid in &sorted {
+        out.extend_from_slice(cid);
+    }
     out
 }
 

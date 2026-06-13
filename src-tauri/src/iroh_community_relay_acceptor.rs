@@ -42,8 +42,8 @@ use harmony_content::cid::{ContentFlags, ContentId};
 use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
 
 use crate::community_relay::{
-    relay_deposit_sig_payload, relay_pull_sig_payload, RelayDepositAck, RelayDepositFrame,
-    RelayHeldBlob, RelayPullAck, RelayPullQuery, RelayPullResponse,
+    relay_deposit_sig_payload, relay_pull_ack_sig_payload, relay_pull_sig_payload, RelayDepositAck,
+    RelayDepositFrame, RelayHeldBlob, RelayPullAck, RelayPullQuery, RelayPullResponse,
 };
 use crate::community_relay_hold_crdt::{RelayHoldDoc, RelayHoldEntry};
 use crate::owner_state_types::{Hlc, SpaceId};
@@ -343,6 +343,14 @@ pub trait RelayPullCtx: Send + Sync {
     /// All held blobs for `recipient_owner` (any sealed-to device). Returns
     /// `(storage_key, RelayHeldBlob)` pairs so the ack handler can translate
     /// content IDs to storage keys without a second lookup.
+    ///
+    /// This method is intentionally RECIPIENT-scoped: it returns ALL of R's
+    /// held blobs across the relay's served communities. The `community_id` on
+    /// the pull query is a membership-LIVENESS gate (proving the requester is a
+    /// current member of a community the relay serves, to prevent non-member
+    /// enumeration) — NOT a response filter. Confidentiality holds regardless
+    /// because every blob is sealed to R's device key; no party other than R's
+    /// device can open any of the returned blobs.
     async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)>;
 
     /// Record that `requester_device` pulled + acked the blobs at `keys`, then
@@ -356,22 +364,22 @@ pub trait RelayPullCtx: Send + Sync {
 // Shared pull-auth helper (cert decode + owner-id anchor + membership)
 // ----------------------------------------------------------------
 
-/// Common auth steps shared by the query and ack handlers:
+/// Shared cert + membership checks for both the query and ack handlers:
 ///
 /// 1. Decode + verify the requester's `EnrollmentCert`.
 /// 2. Require Master issuer and `cert.owner_id == recipient_owner`.
 /// 3. Verify owner-id-derived anchor.
 /// 4. Check `is_joined_member`.
-/// 5. Verify the pull signature over `relay_pull_sig_payload`.
 ///
-/// Returns `(cert_device_vk_bytes, requester_device_id)` on success.
-async fn auth_pull_requester(
+/// Returns `(cert_device_vk, requester_device_id)` on success. The caller is
+/// responsible for verifying the signature over the correct payload for its
+/// operation (query vs. ack payloads differ).
+async fn auth_pull_cert_and_membership(
     cert_bytes: &[u8],
-    sig_bytes_raw: &[u8],
     recipient_owner: &[u8; 16],
     community_id: &SpaceId,
     ctx: &dyn RelayPullCtx,
-) -> Result<([u8; 32], String), RelayPullReject> {
+) -> Result<(VerifyingKey, String), RelayPullReject> {
     // Step 1 — decode + verify the requester's EnrollmentCert (same strict
     // helper as the deposit acceptor, adapted for pull rejects).
     let cert = decode_pull_cert_strict(cert_bytes)?;
@@ -404,26 +412,29 @@ async fn auth_pull_requester(
         return Err(RelayPullReject::NotMember);
     }
 
-    // Step 5 — verify the pull signature over
-    // `COMMUNITY_RELAY_PULL_SIG_DOMAIN ‖ recipient_owner ‖ community_id`.
-    let sig_arr: [u8; 64] = sig_bytes_raw
-        .try_into()
-        .map_err(|_| RelayPullReject::BadSig)?;
-    let device_vk =
-        VerifyingKey::from_bytes(&device_vk_bytes).map_err(|_| RelayPullReject::BadCert)?;
-    device_vk
-        .verify_strict(
-            &relay_pull_sig_payload(recipient_owner, community_id),
-            &Signature::from_bytes(&sig_arr),
-        )
-        .map_err(|_| RelayPullReject::BadSig)?;
-
     // SP1 device id = 64-hex (lowercase) of the device ed25519 verify key,
     // mirroring `iroh_butler_acceptor`'s `device_id()` and the SP1 definition
     // in `butler_outhold_integration.rs::device_id_hex`.
+    let device_vk =
+        VerifyingKey::from_bytes(&device_vk_bytes).map_err(|_| RelayPullReject::BadCert)?;
     let requester_device_id = hex::encode(device_vk_bytes);
 
-    Ok((device_vk_bytes, requester_device_id))
+    Ok((device_vk, requester_device_id))
+}
+
+/// Verify an ed25519 signature `sig_bytes_raw` (64 raw bytes) over `payload`
+/// using `device_vk`. Returns [`RelayPullReject::BadSig`] on any failure.
+fn verify_pull_sig(
+    device_vk: &VerifyingKey,
+    payload: &[u8],
+    sig_bytes_raw: &[u8],
+) -> Result<(), RelayPullReject> {
+    let sig_arr: [u8; 64] = sig_bytes_raw
+        .try_into()
+        .map_err(|_| RelayPullReject::BadSig)?;
+    device_vk
+        .verify_strict(payload, &Signature::from_bytes(&sig_arr))
+        .map_err(|_| RelayPullReject::BadSig)
 }
 
 /// Strict canonical-CBOR decode of an [`EnrollmentCert`] for the pull
@@ -462,17 +473,24 @@ pub async fn handle_relay_pull_query(
         return Err(RelayPullReject::WrongCommunity);
     }
 
-    // Steps 1-5 — shared auth (cert + anchor + membership + sig).
-    let (_device_vk_bytes, _requester_device_id) = auth_pull_requester(
+    // Steps 1-4 — cert decode + Master-issuer + owner-id-derived anchor + membership.
+    let (device_vk, _requester_device_id) = auth_pull_cert_and_membership(
         &query.requester_enrollment_cert,
-        &query.sig,
         &query.recipient_owner,
         &query.community_id,
         ctx,
     )
     .await?;
 
-    // Step 4 — serve held blobs for this recipient (opaque).
+    // Step 5 — verify the pull query signature over
+    // `COMMUNITY_RELAY_PULL_SIG_DOMAIN ‖ recipient_owner ‖ community_id`.
+    verify_pull_sig(
+        &device_vk,
+        &relay_pull_sig_payload(&query.recipient_owner, &query.community_id),
+        &query.sig,
+    )?;
+
+    // Step 6 — serve held blobs for this recipient (opaque).
     let held = ctx.held_for(&query.recipient_owner).await;
     let entries = held.into_iter().map(|(_, blob)| blob).collect();
     Ok(RelayPullResponse { entries })
@@ -484,12 +502,17 @@ pub async fn handle_relay_pull_query(
 
 /// Relay pull ack pipeline:
 ///
-/// 1. Run the SAME auth (cert + `is_joined_member` + sig) on
-///    `requester_cert_bytes` / `ack_sig`.
-/// 2. Translate `ack.content_ids` → storage keys via
-///    `RelayHoldDoc::key(recipient_owner, content_id)`.
-/// 3. Call `mark_pulled(keys, requester_device_id)`. An ack for a content id
-///    not currently held is a no-op (mark_pulled tolerates missing keys).
+/// 1. Community gate first (cheapest check).
+/// 2. Cert decode + Master-issuer + owner-id-derived anchor + membership.
+/// 3. Verify the ack signature over
+///    `relay_pull_ack_sig_payload(recipient_owner, community_id, &ack.content_ids)`.
+///    This is DISTINCT from the query payload — the ack payload additionally
+///    binds the sorted content_id list, making the ack self-authenticating
+///    (cannot be replayed as a query and cannot be forged for a different set
+///    of content IDs).
+/// 4. Translate `ack.content_ids` → storage keys and call
+///    `mark_pulled(keys, requester_device_id)`. An ack for a content id not
+///    currently held is a no-op (mark_pulled tolerates missing keys).
 pub async fn handle_relay_pull_ack(
     recipient_owner: &[u8; 16],
     community_id: &SpaceId,
@@ -503,15 +526,20 @@ pub async fn handle_relay_pull_ack(
         return Err(RelayPullReject::WrongCommunity);
     }
 
-    // Shared auth — cert + anchor + membership + sig.
-    let (_device_vk_bytes, requester_device_id) = auth_pull_requester(
-        requester_cert_bytes,
+    // Cert + anchor + membership.
+    let (device_vk, requester_device_id) =
+        auth_pull_cert_and_membership(requester_cert_bytes, recipient_owner, community_id, ctx)
+            .await?;
+
+    // Verify the ack-specific signature over
+    // `COMMUNITY_RELAY_PULL_ACK_SIG_DOMAIN ‖ recipient_owner ‖ community_id ‖ sorted(content_ids)`.
+    // This binds the acked content_id list so the ack cannot be replayed as a
+    // query or forged for a different set of content IDs.
+    verify_pull_sig(
+        &device_vk,
+        &relay_pull_ack_sig_payload(recipient_owner, community_id, &ack.content_ids),
         ack_sig,
-        recipient_owner,
-        community_id,
-        ctx,
-    )
-    .await?;
+    )?;
 
     // Translate content IDs to storage keys.
     let keys: Vec<String> = ack
@@ -1137,7 +1165,9 @@ mod tests {
     // Task 4 pull tests
     // ================================================================
 
-    use crate::community_relay::{relay_pull_sig_payload, RelayPullQuery};
+    use crate::community_relay::{
+        relay_pull_ack_sig_payload, relay_pull_sig_payload, RelayPullQuery,
+    };
     use ed25519_dalek::Signer;
 
     // ----------------------------------------------------------------
@@ -1562,13 +1592,18 @@ mod tests {
         .expect("content_id");
 
         let cert_bytes = harmony_owner::cbor::to_canonical(&recipient.cert).expect("encode cert");
+        let content_ids = vec![content_id.to_bytes()];
         let ack_sig = recipient
             .device_key
-            .sign(&relay_pull_sig_payload(&recipient.owner.0, &cid))
+            .sign(&relay_pull_ack_sig_payload(
+                &recipient.owner.0,
+                &cid,
+                &content_ids,
+            ))
             .to_bytes()
             .to_vec();
         let ack = RelayPullAck {
-            content_ids: vec![content_id.to_bytes()],
+            content_ids: content_ids.clone(),
         };
 
         // Ack: mark_pulled records the requester device in pulled_by for
@@ -1627,14 +1662,19 @@ mod tests {
         // Store is empty — no held blobs.
 
         let cert_bytes = harmony_owner::cbor::to_canonical(&recipient.cert).expect("encode cert");
+        let unknown_content_id = [0xAB; 32];
+        let content_ids = vec![unknown_content_id];
         let ack_sig = recipient
             .device_key
-            .sign(&relay_pull_sig_payload(&recipient.owner.0, &cid))
+            .sign(&relay_pull_ack_sig_payload(
+                &recipient.owner.0,
+                &cid,
+                &content_ids,
+            ))
             .to_bytes()
             .to_vec();
-        let unknown_content_id = [0xAB; 32];
         let ack = RelayPullAck {
-            content_ids: vec![unknown_content_id],
+            content_ids: content_ids.clone(),
         };
 
         // Must succeed — unknown content IDs are silently ignored.
@@ -1644,5 +1684,176 @@ mod tests {
 
         // Nothing was inserted or removed.
         assert!(ctx.doc.lock().unwrap().entries.is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // Test 7: ack signed with correct ack payload succeeds; ack signed
+    // with pull-query payload (old domain, no content_ids) is rejected.
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_pull_ack_sig_domain_separation() {
+        let recipient = mint_test_owner(0x42);
+        let sender = mint_test_owner(0x51);
+        let cid = community_id();
+
+        let now_secs = 1_700_000_100u64;
+        let now_ms = 1_700_000_100_000u64;
+
+        let mut ctx = TestRelayPullCtx::new(now_secs, now_ms);
+        ctx.serve(cid);
+        ctx.admit(cid, recipient.owner.0);
+
+        // Preload one blob so the ack has a real content_id to reference.
+        let blob = b"ack-domain-sep-blob".to_vec();
+        let (key, entry) = pull_test_entry(&recipient, &sender, cid, blob.clone(), now_ms - 1_000);
+        ctx.preload_entry(key.clone(), entry);
+
+        let content_id = ContentId::for_book(
+            &blob,
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("content_id");
+        let cert_bytes = harmony_owner::cbor::to_canonical(&recipient.cert).expect("encode cert");
+        let content_ids = vec![content_id.to_bytes()];
+
+        // (a) Correctly-signed ack over relay_pull_ack_sig_payload must succeed.
+        let correct_ack_sig = recipient
+            .device_key
+            .sign(&relay_pull_ack_sig_payload(
+                &recipient.owner.0,
+                &cid,
+                &content_ids,
+            ))
+            .to_bytes()
+            .to_vec();
+        let ack = RelayPullAck {
+            content_ids: content_ids.clone(),
+        };
+        handle_relay_pull_ack(
+            &recipient.owner.0,
+            &cid,
+            &ack,
+            &cert_bytes,
+            &correct_ack_sig,
+            &ctx,
+        )
+        .await
+        .expect("correctly-signed ack must succeed");
+
+        // Reset pulled_by for the next sub-case.
+        ctx.doc.lock().unwrap().entries.get_mut(&key).map(|e| {
+            e.pulled_by.clear();
+            e
+        });
+
+        // (b) Ack signed with the OLD pull-query payload (missing content_ids) must be rejected.
+        let old_query_sig = recipient
+            .device_key
+            .sign(&relay_pull_sig_payload(&recipient.owner.0, &cid))
+            .to_bytes()
+            .to_vec();
+        let err = handle_relay_pull_ack(
+            &recipient.owner.0,
+            &cid,
+            &ack,
+            &cert_bytes,
+            &old_query_sig,
+            &ctx,
+        )
+        .await
+        .expect_err("ack signed with pull-query domain must be rejected");
+        assert!(
+            matches!(err, RelayPullReject::BadSig),
+            "expected BadSig for old-domain ack sig, got {err:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Test 8: tampered content_ids in the ack → BadSig
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_pull_ack_tampered_content_ids_bad_sig() {
+        let recipient = mint_test_owner(0x42);
+        let sender = mint_test_owner(0x51);
+        let cid = community_id();
+
+        let now_secs = 1_700_000_100u64;
+        let now_ms = 1_700_000_100_000u64;
+
+        let mut ctx = TestRelayPullCtx::new(now_secs, now_ms);
+        ctx.serve(cid);
+        ctx.admit(cid, recipient.owner.0);
+
+        let blob = b"tamper-test-blob".to_vec();
+        let (key, entry) = pull_test_entry(&recipient, &sender, cid, blob.clone(), now_ms - 1_000);
+        ctx.preload_entry(key, entry);
+
+        let content_id = ContentId::for_book(
+            &blob,
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("content_id");
+        let cert_bytes = harmony_owner::cbor::to_canonical(&recipient.cert).expect("encode cert");
+        let original_content_ids = vec![content_id.to_bytes()];
+
+        // Sign over the correct content_ids.
+        let ack_sig = recipient
+            .device_key
+            .sign(&relay_pull_ack_sig_payload(
+                &recipient.owner.0,
+                &cid,
+                &original_content_ids,
+            ))
+            .to_bytes()
+            .to_vec();
+
+        // Now tamper with the content_id in the ack before sending — the sig no longer covers it.
+        let mut tampered_id = content_id.to_bytes();
+        tampered_id[0] ^= 0xFF;
+        let tampered_ack = RelayPullAck {
+            content_ids: vec![tampered_id],
+        };
+
+        let err = handle_relay_pull_ack(
+            &recipient.owner.0,
+            &cid,
+            &tampered_ack,
+            &cert_bytes,
+            &ack_sig,
+            &ctx,
+        )
+        .await
+        .expect_err("ack with tampered content_ids must be rejected");
+        assert!(
+            matches!(err, RelayPullReject::BadSig),
+            "expected BadSig for tampered content_ids, got {err:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Test 9: relay_pull_ack_sig_payload is order-independent (sort canonicalizes)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn relay_pull_ack_sig_payload_order_independent() {
+        let ro = [0x11u8; 16];
+        let cid = SpaceId([0xCC; 16]);
+        let id_a = [0xAAu8; 32];
+        let id_b = [0xBBu8; 32];
+
+        let p1 = relay_pull_ack_sig_payload(&ro, &cid, &[id_a, id_b]);
+        let p2 = relay_pull_ack_sig_payload(&ro, &cid, &[id_b, id_a]);
+        assert_eq!(
+            p1, p2,
+            "ack payload must be identical regardless of content_id order"
+        );
     }
 }

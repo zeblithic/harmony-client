@@ -28,8 +28,9 @@ use ed25519_dalek::Signer;
 use harmony_app::butler_deposit::DepositPayload;
 use harmony_app::community_membership::{mint_test_owner, TestOwner};
 use harmony_app::community_relay::{
-    build_relay_deposit_frame, relay_pull_sig_payload, RelayHeldBlob, RelayPullAck, RelayPullQuery,
-    COMMUNITY_RELAY_SEAL_INFO, RELAY_HOLD_GLOBAL_CAP, RELAY_HOLD_PER_SENDER_CAP,
+    build_relay_deposit_frame, relay_pull_ack_sig_payload, relay_pull_sig_payload, RelayHeldBlob,
+    RelayPullAck, RelayPullQuery, COMMUNITY_RELAY_SEAL_INFO, RELAY_HOLD_GLOBAL_CAP,
+    RELAY_HOLD_PER_SENDER_CAP,
 };
 use harmony_app::community_relay_hold_crdt::{RelayHoldDoc, RelayHoldEntry};
 use harmony_app::community_relay_pull::{open_and_ingest, RelayIngestCtx};
@@ -641,15 +642,27 @@ async fn relay_happy_path_full_round_trip() {
     assert!(!plaintext.is_empty(), "plaintext is non-empty after open");
 
     // ----- (4) Recipient sends pull ack -----
+    // The ack must be signed over relay_pull_ack_sig_payload (distinct from the
+    // query sig — binds the content_id list so the ack is self-authenticating).
     let ack_msg = RelayPullAck {
         content_ids: acked_content_ids.clone(),
     };
+    let pull_ack_sig = fx
+        .recipient
+        .device_key
+        .sign(&relay_pull_ack_sig_payload(
+            &fx.recipient.owner.0,
+            &community_id(),
+            &acked_content_ids,
+        ))
+        .to_bytes()
+        .to_vec();
     handle_relay_pull_ack(
         &fx.recipient.owner.0,
         &community_id(),
         &ack_msg,
         &cert_bytes,
-        &pull_sig,
+        &pull_ack_sig,
         &relay_ctx,
     )
     .await
