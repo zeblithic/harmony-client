@@ -1745,10 +1745,9 @@ mod tests {
         .expect("correctly-signed ack must succeed");
 
         // Reset pulled_by for the next sub-case.
-        ctx.doc.lock().unwrap().entries.get_mut(&key).map(|e| {
+        if let Some(e) = ctx.doc.lock().unwrap().entries.get_mut(&key) {
             e.pulled_by.clear();
-            e
-        });
+        }
 
         // (b) Ack signed with the OLD pull-query payload (missing content_ids) must be rejected.
         let old_query_sig = recipient
