@@ -261,7 +261,7 @@ async fn s1_invite_join_roster_convergence() {
 // real DM-space creation with the verified id semantics.
 // ─────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn s2_friend_dm_exchange() {
+async fn s2_friend_graph_and_dm_send() {
     use e2e_harness::driver::*;
     use std::time::Duration;
 
@@ -273,16 +273,22 @@ async fn s2_friend_dm_exchange() {
     // token; Bob redeems it. Poll the redeem until it returns Ok — every Err is
     // the pkarr/iroh-not-yet-converged race (retryable for ~120s, mirroring S1).
     let token = generate_friend_token(&alice).await.expect("friend token");
-    poll_until(Duration::from_secs(120), || async {
-        match redeem_friend_token(&bob, &token).await {
-            Ok(_) => Ok(Some(())),
-            // inviter_unreachable / connect|open_bi|read timeouts: first-contact
-            // hasn't converged yet. Keep retrying (do NOT surface as fatal).
-            Err(_e) => Ok(None),
+    // Friend redeem IS the cross-node first-contact and is racy: it can Err while
+    // pkarr/iroh converge (~75-90s). Retry until Ok, but CAPTURE the last error so
+    // a genuine hard failure surfaces it instead of a bare 120s timeout with the
+    // real server error discarded (CodeRabbit).
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut last_err = String::from("(no redeem attempt completed before the deadline)");
+    loop {
+        if std::time::Instant::now() >= deadline {
+            panic!("bob never redeemed alice's friend token within 120s; last error: {last_err}");
         }
-    })
-    .await
-    .expect("bob redeems alice's friend token via iroh first-contact");
+        match redeem_friend_token(&bob, &token).await {
+            Ok(_) => break,
+            Err(e) => last_err = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 
     // Token redemption auto-accepts on both sides (TokenPath consent). The accept
     // loop is belt-and-braces (no-ops without a pending row); the real check is

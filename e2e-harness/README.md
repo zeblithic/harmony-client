@@ -38,7 +38,7 @@ machine** (two co-located nodes):
 | Scenario | What it proves | Status |
 |---|---|---|
 | `s1_invite_join_roster_convergence` | invite → iroh first-contact join → roster converges both ways | ✅ pass |
-| `s2_friend_dm_exchange` | friend-token iroh handshake → friendship `active` both ways (ZEB-431 DM-picker graph) + `send_dm` accepted | ✅ pass |
+| `s2_friend_graph_and_dm_send` | friend-token iroh handshake → friendship `active` both ways (ZEB-431 DM-picker graph) + `send_dm` accepted. (1:1 DM byte-**delivery** is characterized, not asserted — co-located gap ZEB-461.) | ✅ pass |
 | `s3_offline_channel_reconnect_catchup` | channel created while peer offline → reconnect catch-up (ZEB-434) | ⏸ `#[ignore]` — ZEB-462 |
 | `s4_restart_durability` | single-node community survives a restart (ZEB-393) | ⏸ `#[ignore]` — ZEB-462 (B) |
 

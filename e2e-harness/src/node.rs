@@ -58,7 +58,9 @@ impl NodeHandle {
         remove_stale_discovery_files(&config.home);
         let (stdout, stderr) = match &config.log_dir {
             Some(dir) => {
-                tokio::fs::create_dir_all(dir).await.ok();
+                tokio::fs::create_dir_all(dir)
+                    .await
+                    .with_context(|| format!("creating log dir {}", dir.display()))?;
                 let out =
                     std::fs::File::create(dir.join(format!("{}.stdout.log", config.profile)))?;
                 let err =
@@ -77,6 +79,13 @@ impl NodeHandle {
             .env("HOME", &config.home)
             // Windows identity dir uses USERPROFILE; keep both pointed at the temp root.
             .env("USERPROFILE", &config.home)
+            // App-data derives from XDG_DATA_HOME (Linux) / APPDATA (Windows); pin
+            // both UNDER the temp HOME so the node's `api/{port,token}` always land
+            // where `wait_for_api_dir` walks, even when the dev/CI env already sets
+            // them (CodeAnt/Qodo: data-dir not isolated). macOS uses Library under
+            // the overridden HOME and ignores XDG, so this is harmless there.
+            .env("XDG_DATA_HOME", config.home.join("xdg-data"))
+            .env("APPDATA", config.home.join("appdata"))
             .env("HARMONY_PASSPHRASE", &config.passphrase)
             .env("HARMONY_RETICULUM_PORT", "0")
             .env("HARMONY_API_PORT", "0")
@@ -100,7 +109,12 @@ impl NodeHandle {
             .trim()
             .to_string();
         let base_url = format!("http://127.0.0.1:{port}");
-        let http = reqwest::Client::new();
+        // Per-request timeout so a wedged server surfaces as an error instead of
+        // hanging an `rpc()`/`status()` await indefinitely (Qodo: no HTTP timeout).
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("building reqwest client")?;
 
         let handle = Self {
             config,
@@ -130,7 +144,14 @@ impl NodeHandle {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if status.as_u16() == 200 {
-            return Ok(serde_json::from_str(&body).unwrap_or(Value::Null));
+            // An empty 200 body is a legitimate null result (e.g. start_node);
+            // a non-empty body that fails to parse is a real error, not a silent
+            // null (Qodo: rpc hides parse errors).
+            if body.trim().is_empty() {
+                return Ok(Value::Null);
+            }
+            return serde_json::from_str(&body)
+                .with_context(|| format!("rpc {cmd}: 200 body is not valid JSON: {body}"));
         }
         let server_err = serde_json::from_str::<Value>(&body)
             .ok()

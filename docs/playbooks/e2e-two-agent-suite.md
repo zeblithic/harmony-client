@@ -4,7 +4,7 @@ A protocol two Claude Code agents (one per machine, e.g. Ildwyn + AVALON) follow
 
 ## When to use this vs the single-machine harness
 
-- **`e2e-harness/` (single machine, automated):** the day-to-day dev substrate. `cd e2e-harness && cargo nextest run --features e2e`. Spawns two real `serve` nodes on one box. It reliably validates **first-contact + join/handshake-time state** — `s1_invite_join_roster_convergence` and `s2_friend_dm_exchange` pass. It does **not** validate ongoing community-state sync, 1:1 DM byte-delivery, or restart catch-up — those need two real machines (see "Known co-located limitations" below).
+- **`e2e-harness/` (single machine, automated):** the day-to-day dev substrate. `cd e2e-harness && cargo nextest run --features e2e`. Spawns two real `serve` nodes on one box. It reliably validates **first-contact + join/handshake-time state** — `s1_invite_join_roster_convergence` and `s2_friend_graph_and_dm_send` pass. It does **not** validate ongoing community-state sync, 1:1 DM byte-delivery, or restart catch-up — those need two real machines (see "Known co-located limitations" below).
 - **This playbook (two machines, agent-driven):** the cross-WAN proof. Run it when AVALON is up (ZEB-444) to validate the scenarios the single-machine harness can't, and to satisfy the ZEB-447 DoD ("≥3 scenarios proven in a live Ildwyn↔AVALON run with artifacts").
 
 ## Roles

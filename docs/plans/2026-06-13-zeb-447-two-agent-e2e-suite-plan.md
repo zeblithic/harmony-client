@@ -22,12 +22,12 @@
 | `generate_invite` | `{ "communityId": String }` | invite URL `String` |
 | `redeem_invite` | `{ "url": String }` | `{ "ownerIdHex": String /*=joined community id*/, "display": String? }` |
 | `list_owner_communities` | `{}` | `[ { "id": String, "name": String, ... } ]` |
-| `list_community_members` | `{ "communityId": String }` | `[ { "addr": String, "displayName": String?, "status": "Joined"|"Left"|"Invited"|"Banned"|"PendingJoin", "power": u8, "joinedAt": Hlc } ]` |
+| `list_community_members` | `{ "communityId": String }` | `[ { "addr": String, "displayName": String?, "status": "Joined"\|"Left"\|"Invited"\|"Banned"\|"PendingJoin", "power": u8, "joinedAt": Hlc } ]` |
 | `generate_friend_token` | `{}` | friend token URL `String` |
 | `redeem_friend_token` | `{ "url": String }` | `{ "ownerIdHex": String, "display": String? }` |
 | `list_pending_friend_requests` | `{}` | `[ { "ownerIdHex": String, "display": String?, "receivedAtMs": u64 } ]` |
 | `accept_friend_request` | `{ "ownerIdHex": String }` | friend owner id `String` |
-| `list_friends` | `{}` | `[ { "ownerIdHex": String, "display": String?, "nickname": String?, "status": "pending"|"active"|"revoked", ... } ]` |
+| `list_friends` | `{}` | `[ { "ownerIdHex": String, "display": String?, "nickname": String?, "status": "pending"\|"active"\|"revoked", ... } ]` |
 | `add_space` | `{ "kind": "dm", "name": String, "members": [String] }` | space id `String` (hex) |
 | `send_dm` | `{ "spaceId": String, "content": [u8], "mimeType": String }` | `{ "messageId": String, "messageCid": String }` |
 | `read_dm_thread` | `{ "spaceId": String, "limit": usize, "beforeHlc": u64? }` | `[ { "from": String, "body": String /*HEX plaintext*/, "mimeType": String, "isSelfOutbound": bool, "sentAt": u64, "receivedAt": u64, "messageCid": String } ]` |

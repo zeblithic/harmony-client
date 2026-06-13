@@ -38065,9 +38065,10 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
     // broadcast) — same event, same camelCase payload shape.
     let progress_sink_handle = std::sync::Arc::clone(&sink);
     let progress_sink = move |payload: ResolutionProgressPayload| {
-        progress_sink_handle.emit(
+        crate::node_event_sink::emit_ser(
+            progress_sink_handle.as_ref(),
             "connectivity-invite-resolution-progress",
-            serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+            &payload,
         );
     };
 
@@ -38080,10 +38081,7 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
     // events to assert). ZEB-447: forwarded through the `NodeEventSink`.
     let nav_emit_sink_handle = std::sync::Arc::clone(&sink);
     let nav_emit_sink = move |payload: NavUpdatedPayload| {
-        nav_emit_sink_handle.emit(
-            "nav-updated",
-            serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
-        );
+        crate::node_event_sink::emit_ser(nav_emit_sink_handle.as_ref(), "nav-updated", &payload);
     };
 
     // Capture the std-mutex handle + snapshot generation under a fresh
