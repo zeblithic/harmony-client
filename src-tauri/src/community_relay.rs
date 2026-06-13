@@ -187,6 +187,37 @@ pub struct RelayPullAck {
     pub content_ids: Vec<[u8; 32]>,
 }
 
+/// Self-contained pull-ack wire frame (recipient → relay, second message of
+/// the pull bi-stream). Unlike [`RelayPullAck`] — which carries only the bare
+/// content-id list and relies on the surrounding pull session for the
+/// requester's identity, cert, and signature — this frame bundles everything
+/// the relay's [`crate::iroh_community_relay_acceptor::handle_relay_pull_ack`]
+/// needs to authenticate the ack on its own: the recipient owner, community,
+/// the requester's `EnrollmentCert`, the acked content ids, and the ack
+/// signature over [`relay_pull_ack_sig_payload`]. The Phase B pull transport
+/// writes this frame on the SAME stream after receiving the pull response, so
+/// the relay can mark the listed content ids pulled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayPullAckFrame {
+    /// Recipient OwnerAddr bytes (who is acking their pulled blobs).
+    #[serde(rename = "ro")]
+    pub recipient_owner: [u8; 16],
+    /// Community SpaceId — the membership-liveness gate (same role as on the
+    /// pull query).
+    #[serde(rename = "ci")]
+    pub community_id: SpaceId,
+    /// Canonical CBOR of the requester device's `EnrollmentCert` (re-supplied
+    /// so the ack is self-authenticating on a fresh stream read).
+    #[serde(rename = "ec", with = "serde_bytes")]
+    pub requester_enrollment_cert: Vec<u8>,
+    /// Content IDs of successfully ingested blobs (relay may GC these).
+    #[serde(rename = "cd")]
+    pub content_ids: Vec<[u8; 32]>,
+    /// 64-byte device ed25519 signature over [`relay_pull_ack_sig_payload`].
+    #[serde(rename = "sg", with = "serde_bytes")]
+    pub sig: Vec<u8>,
+}
+
 // Manual CanonicalPayload registrations (mirrors butler_deposit.rs).
 impl CanonicalPayloadSealed for RelayDepositFrame {}
 impl CanonicalPayload for RelayDepositFrame {}
@@ -200,6 +231,8 @@ impl CanonicalPayloadSealed for RelayPullResponse {}
 impl CanonicalPayload for RelayPullResponse {}
 impl CanonicalPayloadSealed for RelayPullAck {}
 impl CanonicalPayload for RelayPullAck {}
+impl CanonicalPayloadSealed for RelayPullAckFrame {}
+impl CanonicalPayload for RelayPullAckFrame {}
 
 // =====================================================================
 // Encode / decode helpers (one pair per wire type, trailing bytes rejected)
@@ -252,6 +285,16 @@ pub fn encode_relay_pull_ack(ack: &RelayPullAck) -> Result<Vec<u8>, DepositWireE
 
 /// Decode a [`RelayPullAck`] from canonical CBOR (trailing bytes rejected).
 pub fn decode_relay_pull_ack(bytes: &[u8]) -> Result<RelayPullAck, DepositWireError> {
+    canonical_cbor_decode(bytes).map_err(|e| DepositWireError::Decode(format!("{e}")))
+}
+
+/// Encode a [`RelayPullAckFrame`] to canonical CBOR.
+pub fn encode_relay_pull_ack_frame(frame: &RelayPullAckFrame) -> Result<Vec<u8>, DepositWireError> {
+    canonical_cbor_encode(frame).map_err(|e| DepositWireError::Encode(format!("{e}")))
+}
+
+/// Decode a [`RelayPullAckFrame`] from canonical CBOR (trailing bytes rejected).
+pub fn decode_relay_pull_ack_frame(bytes: &[u8]) -> Result<RelayPullAckFrame, DepositWireError> {
     canonical_cbor_decode(bytes).map_err(|e| DepositWireError::Decode(format!("{e}")))
 }
 
@@ -507,6 +550,16 @@ mod tests {
         }
     }
 
+    fn fixture_pull_ack_frame() -> RelayPullAckFrame {
+        RelayPullAckFrame {
+            recipient_owner: [0x11; 16],
+            community_id: fixture_space_id(),
+            requester_enrollment_cert: vec![0xA1, 0xA2, 0xA3],
+            content_ids: vec![[0xAA; 32], [0xBB; 32]],
+            sig: vec![0x07; 64],
+        }
+    }
+
     fn fixture_payload() -> DepositPayload {
         DepositPayload {
             cidnotify_packet: vec![0x01, 0x02, 0x03, 0x04],
@@ -620,6 +673,25 @@ mod tests {
         bytes.push(0x42);
         assert!(matches!(
             decode_relay_pull_ack(&bytes),
+            Err(DepositWireError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn relay_pull_ack_frame_round_trips() {
+        let frame = fixture_pull_ack_frame();
+        let bytes = encode_relay_pull_ack_frame(&frame).expect("encode");
+        let back = decode_relay_pull_ack_frame(&bytes).expect("decode");
+        assert_eq!(back, frame);
+    }
+
+    #[test]
+    fn relay_pull_ack_frame_rejects_trailing_bytes() {
+        let frame = fixture_pull_ack_frame();
+        let mut bytes = encode_relay_pull_ack_frame(&frame).expect("encode");
+        bytes.push(0x13);
+        assert!(matches!(
+            decode_relay_pull_ack_frame(&bytes),
             Err(DepositWireError::Decode(_))
         ));
     }

@@ -24,7 +24,7 @@
 //! `tests/wire_format_*_fixtures.rs` guard-rail to keep out of production.
 
 use harmony_app::community_relay::{
-    RelayDepositFrame, RelayHeldBlob, RelayPullQuery, RelayPullResponse,
+    RelayDepositFrame, RelayHeldBlob, RelayPullAckFrame, RelayPullQuery, RelayPullResponse,
 };
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
 use harmony_app::owner_state_types::SpaceId;
@@ -84,6 +84,22 @@ fn fixture_relay_pull_response() -> RelayPullResponse {
                 sealed_blob: vec![0x04, 0x05],
             },
         ],
+    }
+}
+
+/// A deterministic `RelayPullAckFrame` with fixed byte fields.
+/// - `recipient_owner`: all-0x11 (16 bytes)
+/// - `community_id`: all-0xCC (16 bytes)
+/// - `requester_enrollment_cert`: 3-byte sentinel `[0xA1, 0xA2, 0xA3]`
+/// - `content_ids`: two entries, all-0xAA and all-0xBB (32 bytes each)
+/// - `sig`: all-0x07 (64 bytes)
+fn fixture_relay_pull_ack_frame() -> RelayPullAckFrame {
+    RelayPullAckFrame {
+        recipient_owner: [0x11; 16],
+        community_id: fixture_community_id(),
+        requester_enrollment_cert: vec![0xA1, 0xA2, 0xA3],
+        content_ids: vec![[0xAA; 32], [0xBB; 32]],
+        sig: vec![0x07; 64],
     }
 }
 
@@ -148,6 +164,20 @@ fn relay_pull_response_wire_bytes_pinned() {
     );
 }
 
+/// Pin the canonical CBOR of `RelayPullAckFrame`.
+#[test]
+fn relay_pull_ack_frame_wire_bytes_pinned() {
+    let frame = fixture_relay_pull_ack_frame();
+    let bytes = canonical_cbor_encode(&frame).expect("encode");
+    let hex = hex::encode(&bytes);
+    eprintln!("relay_pull_ack_frame hex: {hex}");
+    assert_eq!(
+        hex,
+        "a562726f901111111111111111111111111111111162636950cccccccccccccccccccccccccccccccc62656343a1a2a362636482982018aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa982018bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb627367584007070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707",
+        "RelayPullAckFrame wire format changed — re-pin deliberately"
+    );
+}
+
 // =====================================================================
 // Round-trip sanity (separate from the pins — confirms encode+decode
 // is byte-stable, not just that the types serialize at all)
@@ -178,4 +208,13 @@ fn relay_pull_response_encode_decode_round_trips() {
     let bytes = encode_relay_pull_response(&resp).expect("encode");
     let back = decode_relay_pull_response(&bytes).expect("decode");
     assert_eq!(back, resp);
+}
+
+#[test]
+fn relay_pull_ack_frame_encode_decode_round_trips() {
+    use harmony_app::community_relay::{decode_relay_pull_ack_frame, encode_relay_pull_ack_frame};
+    let frame = fixture_relay_pull_ack_frame();
+    let bytes = encode_relay_pull_ack_frame(&frame).expect("encode");
+    let back = decode_relay_pull_ack_frame(&bytes).expect("decode");
+    assert_eq!(back, frame);
 }
