@@ -141,46 +141,20 @@ async fn two_nodes_boot_and_mint() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// S1: invite → cross-node join → roster convergence.
+// S1: invite → cross-node iroh first-contact join → roster convergence.
 //
-// FINDING (2026-06-13, this run): S1 cannot currently pass against the headless
-// RPC surface. Root cause is a *contract gap*, NOT a transport / first-contact
-// failure — both nodes boot, get distinct stable iroh ids (alice 3d5818be…,
-// bob 7d862e11…), and reach the iroh relay. The blocker is which join RPC the
-// headless surface exposes:
+// Bob joins Alice's invite-only community over the REAL first-contact path the
+// GUI uses for two-never-met nodes: `connectivity_redeem_invite_iroh`. That verb
+// pkarr-window-resolves Alice's routing record, opens an iroh bi-stream on the
+// handshake ALPN, and runs the inner join. It is now exposed on the headless v1
+// RPC surface (the binary under test was rebuilt with it).
 //
-//   * The only invite-join verb in `src-tauri/src/api/rpc.rs` is `redeem_invite`
-//     → `redeem_invite_impl`, which calls `redeem_invite_inner(.., allow_no_
-//     reticulum_destinations = FALSE)` (lib.rs:22266). That path requires the
-//     joiner to ALREADY hold a Reticulum device-route for the inviter in
-//     `owner_device_cache` (resolve_destinations_for_owner, lib.rs:22100). The
-//     harness sets HARMONY_RETICULUM_PORT=0 (to dodge the fixed-4242 two-local-
-//     node collision) and the two owners have never met, so that cache is cold.
-//     → server returns HTTP 500 "no known device for inviter <hex> — invite
-//        cannot route" (lib.rs:21745) within ~1s of redeem.
-//
-//   * The REAL first-contact path the GUI uses for two-never-met nodes is
-//     `connectivity_redeem_invite_iroh` (lib.rs:37943): it pkarr-window-resolves
-//     the inviter's routing record, opens an iroh bi-stream on the handshake
-//     ALPN, and runs the inner with `allow_no_reticulum_destinations = TRUE`
-//     (lib.rs:38346). That verb is a `#[tauri::command]` but is **NOT** in the
-//     curated headless v1 RPC surface (api/rpc.rs:605-650) — so the harness has
-//     no way to drive real first contact.
-//
-// Controller decision needed (out of this task's "add the S1 test" scope, which
-// must not rebuild harmony-app): EITHER (a) expose `connectivity_redeem_invite_
-// iroh` in api/rpc.rs (its handles already come straight off NodeState — a
-// one-entry registration mirroring `redeem_invite`, then rebuild), OR (b) let
-// the harness re-enable Reticulum on a per-node unique port so LAN discovery
-// seeds the device cache before redeem.
-//
-// The assertions below are kept MEANINGFUL (real joined-roster convergence, both
-// directions) and are NOT weakened. The test is `#[ignore]`d so the suite stays
-// green while documenting the exact expected behavior; remove the ignore once
-// the first-contact join verb is reachable headlessly. Run it explicitly with:
-//   cargo test --features e2e s1_invite_join_roster_convergence -- --ignored --nocapture
+// First contact is racy: Alice's pkarr record may not be resolvable the instant
+// after she boots + invites, so the redeem is polled — `inviter_unreachable`
+// means pkarr/iroh hasn't converged yet (retryable), `joined` is success, and
+// anything else (e.g. `join_failed`) is a hard failure surfaced with its status.
+// Assertions are MEANINGFUL (real joined-roster convergence, both directions).
 // ─────────────────────────────────────────────────────────────────────────────
-#[ignore = "blocked: headless surface lacks a first-contact join RPC (connectivity_redeem_invite_iroh); see FINDING above"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s1_invite_join_roster_convergence() {
     use e2e_harness::driver::*;
@@ -198,22 +172,30 @@ async fn s1_invite_join_roster_convergence() {
         .await
         .expect("generate invite");
 
-    // Bob redeems → joins the same community.
-    //
-    // NOTE: this drives `redeem_invite` (the Reticulum-required path). For two
-    // fresh, never-met nodes with Reticulum disabled this fast-fails with
-    // "no known device for inviter … — invite cannot route" (see FINDING). The
-    // real first-contact verb is `connectivity_redeem_invite_iroh`, which is not
-    // yet exposed on the headless RPC surface.
-    let redeemed = redeem_invite(&bob, &invite).await.expect("redeem invite");
-    let joined_id = redeemed
-        .get("ownerIdHex")
+    // Bob joins via iroh first-contact. Poll until `status == "joined"`: keep
+    // retrying on `inviter_unreachable` (pkarr/iroh not yet converged), fail on
+    // any other terminal status with the status surfaced.
+    let joined = poll_until(Duration::from_secs(120), || async {
+        let outcome = redeem_invite_iroh(&bob, &invite)
+            .await
+            .expect("redeem_invite_iroh rpc");
+        match outcome.get("status").and_then(|v| v.as_str()) {
+            Some("joined") => Ok(Some(outcome)),
+            Some("inviter_unreachable") => Ok(None), // retryable: pkarr/iroh not yet converged
+            other => panic!("iroh redeem returned terminal non-join status: {other:?} ({outcome})"),
+        }
+    })
+    .await
+    .expect("bob joins alice's community via iroh first-contact");
+
+    let joined_id = joined
+        .get("communityId")
         .and_then(|v| v.as_str())
         .expect("joined community id");
     assert_eq!(joined_id, community, "bob joined alice's community");
 
     // Roster converges both directions (poll — no assumed event).
-    poll_until(Duration::from_secs(60), || async {
+    poll_until(Duration::from_secs(120), || async {
         Ok(roster_has_joined(&alice, &community, &bob_owner)
             .await?
             .then_some(()))
@@ -221,7 +203,7 @@ async fn s1_invite_join_roster_convergence() {
     .await
     .expect("alice sees bob joined");
 
-    poll_until(Duration::from_secs(60), || async {
+    poll_until(Duration::from_secs(120), || async {
         Ok(roster_has_joined(&bob, &community, &alice_owner)
             .await?
             .then_some(()))

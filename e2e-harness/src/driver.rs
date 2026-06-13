@@ -63,6 +63,13 @@ pub async fn redeem_invite(node: &NodeHandle, url: &str) -> anyhow::Result<Value
     node.rpc("redeem_invite", json!({ "url": url })).await
 }
 
+/// Iroh first-contact community join (the real cross-node path). Returns the
+/// RedemptionOutcome value: { status, communityId }.
+pub async fn redeem_invite_iroh(node: &NodeHandle, url: &str) -> anyhow::Result<Value> {
+    node.rpc("connectivity_redeem_invite_iroh", json!({ "url": url }))
+        .await
+}
+
 pub async fn list_community_members(
     node: &NodeHandle,
     community_id: &str,
@@ -76,7 +83,10 @@ pub async fn list_community_members(
     Ok(v.as_array().cloned().unwrap_or_default())
 }
 
-/// True once `member_owner` appears in `community_id`'s roster with status "Joined".
+/// True once `member_owner` appears in `community_id`'s roster with a joined
+/// status. The headless `list_community_members` surface serializes the status
+/// lowercase (`"joined"`); compare case-insensitively so the check is robust to
+/// either casing.
 pub async fn roster_has_joined(
     node: &NodeHandle,
     community_id: &str,
@@ -85,7 +95,9 @@ pub async fn roster_has_joined(
     let members = list_community_members(node, community_id).await?;
     Ok(members.iter().any(|m| {
         m.get("addr").and_then(Value::as_str) == Some(member_owner)
-            && m.get("status").and_then(Value::as_str) == Some("Joined")
+            && m.get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.eq_ignore_ascii_case("joined"))
     }))
 }
 
