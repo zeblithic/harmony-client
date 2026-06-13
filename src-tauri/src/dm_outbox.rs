@@ -7775,6 +7775,197 @@ mod tests {
         assert_eq!(o.backoff_len(), 0);
         assert_eq!(o.in_flight_len(), 0);
     }
+
+    /// ZEB-458 P4B (review fix): the relay-rung regression above only drives
+    /// the LOCK-HELD `drain`. Production runs the separately-copied ladder in
+    /// `drain_lifted`'s spawned Phase C (lock-reacquire + `dm-delivered`
+    /// emit). This test exercises THAT path end-to-end: butler is absent, the
+    /// relay client acks, and after the spawned Phase C settles the recipient
+    /// is marked delivered, the relay was called for the right recipient, and
+    /// a `dm-delivered` IPC frame was emitted via the NodeEventSink — the
+    /// emit that only the spawned path performs.
+    // Multi-thread runtime: `drain_lifted` spawns Phase C detached, and this
+    // test observes its effects by polling shared Arcs from the test task. On
+    // a current-thread runtime the detached task and the poller can starve
+    // each other across `try_lock`/`.await` boundaries; a 2-worker runtime
+    // lets Phase C make progress independently (and matches production, where
+    // Phase C runs on the multi-thread node runtime).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_lifted_relay_rung_marks_delivered_and_emits_via_spawned_path() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let space_id = SpaceId([1u8; 16]);
+        let message_cid = ContentId::from_bytes([3u8; 32]);
+
+        // IMPORTANT timing note: unlike the lock-held `drain` (which stamps
+        // `last_attempt_wall_ms` from the caller-supplied `wall_now_ms`),
+        // `drain_lifted`'s spawned Phase C stamps it from the REAL wall clock
+        // (`SystemTime::now()`). The next tick's `is_due` then compares the
+        // caller-supplied `wall_now_ms` against that real-clock stamp. So the
+        // two ticks must use realistic, real-clock-anchored timestamps: tick 1
+        // ≈ now, tick 2 ≈ now + (one backoff window). We anchor on
+        // `SystemTime::now()` and advance tick 2 by 6s (> the 5s base window)
+        // so the entry becomes due again with an AttemptState present.
+        let base_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let tick1_ms = base_now_ms;
+        let tick2_ms = base_now_ms + 6_000;
+
+        // Entry created just before tick 1 so it is well within the 30-day
+        // expiration window at both ticks.
+        let entry = entry_with_age(7, vec![bob], base_now_ms.saturating_sub(1_000));
+        let entry_id = entry.id;
+
+        let mut state = OwnerState::default();
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = make_outbox_synthetic("dev", alice);
+        // No butler client — the relay rung must still fire (the drain_phase_c
+        // candidacy gate accepts the relay client alone).
+        let relay_mock = MockRelay::new(true);
+        o.set_community_relay_deposit_client(relay_mock.clone());
+
+        let outbox_arc = Arc::new(Mutex::new(o));
+        let state_arc = Arc::new(Mutex::new(state));
+
+        // A transport that always fails transiently, so each drain records a
+        // direct-send failure → builds candidacy across two ticks.
+        let transport = StubTransport::new();
+        transport.set_outcome(
+            entry_id,
+            bob,
+            Err(TransportError::Transient("recipient unreachable".into())),
+        );
+
+        let sink = crate::node_event_sink::RecordingSink::new();
+        let app: Arc<dyn crate::node_event_sink::NodeEventSink> = Arc::new(sink.clone());
+
+        // `drain_lifted` spawns Phase C detached; it settles shortly after the
+        // call returns. Poll a predicate with a bounded budget so the test is
+        // not racy. (The spawned task re-acquires outbox/state via
+        // `.lock().await`, so we can observe its effects via the shared Arcs /
+        // the mock / the sink once it completes.)
+        async fn wait_until<F: Fn() -> bool>(pred: F) {
+            for _ in 0..400 {
+                if pred() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("predicate did not become true within budget");
+        }
+
+        // Tick 1 (≈ now): first attempt, no prior AttemptState → candidacy
+        // threshold not reached → relay must not fire. Wait for the spawned
+        // Phase C to record the transient-failure backoff.
+        super::drain_lifted(
+            Arc::clone(&outbox_arc),
+            Arc::clone(&state_arc),
+            &transport,
+            tick1_ms,
+            Arc::clone(&app),
+        )
+        .await;
+        // After Phase C settles, an AttemptState exists for (entry, bob).
+        wait_until(|| match outbox_arc.try_lock() {
+            Ok(g) => g.backoff_len() == 1,
+            Err(_) => false,
+        })
+        .await;
+        assert!(
+            relay_mock.calls().is_empty(),
+            "relay must not fire before candidacy threshold (tick 1)"
+        );
+
+        // The StubTransport CONSUMES a configured outcome on each `send`
+        // (returns it once, then defaults to Ok). Re-arm the transient failure
+        // so tick 2's Phase B also fails directly → the Err-path candidacy
+        // gate (pre_failure_count >= 1) produces a relay candidate. (The
+        // lock-held `drain` tests do the same via `drain_with_transient_failure`,
+        // which re-sets the outcome before every tick.)
+        transport.set_outcome(
+            entry_id,
+            bob,
+            Err(TransportError::Transient("recipient unreachable".into())),
+        );
+
+        // Tick 2 (≈ now + 6s, one base backoff window elapsed): AttemptState
+        // exists and the entry is due again → candidate produced → relay rung
+        // fires in the spawned Phase C.
+        super::drain_lifted(
+            Arc::clone(&outbox_arc),
+            Arc::clone(&state_arc),
+            &transport,
+            tick2_ms,
+            Arc::clone(&app),
+        )
+        .await;
+
+        // Wait until the spawned Phase C has marked bob delivered.
+        wait_until(|| {
+            let s = state_arc.try_lock();
+            matches!(s, Ok(g) if g.outbox.get(&entry_id).is_some_and(|e| e.delivered_to.contains(&bob)))
+        })
+        .await;
+
+        // Relay was consulted exactly once, for bob.
+        let relay_calls = relay_mock.calls();
+        assert_eq!(
+            relay_calls.len(),
+            1,
+            "relay rung must fire exactly once via the spawned Phase C"
+        );
+        assert_eq!(
+            relay_calls[0], bob,
+            "relay called for the correct recipient"
+        );
+
+        // The recipient is marked delivered (sole recipient → Complete).
+        {
+            let s = state_arc.lock().await;
+            let stored = s.outbox.get(&entry_id).expect("entry still present");
+            assert!(
+                stored.delivered_to.contains(&bob),
+                "bob marked delivered via the relay rung (spawned path)"
+            );
+            assert!(
+                matches!(stored.delivery_status, DeliveryStatus::Complete),
+                "sole recipient acked via relay -> Complete"
+            );
+        }
+
+        // The spawned path emitted a `dm-delivered` IPC frame for bob — the
+        // emit the lock-held `drain` rung does NOT perform (its caller emits).
+        let frames = sink.frames();
+        let delivered: Vec<_> = frames
+            .iter()
+            .filter(|(ev, _)| ev == "dm-delivered")
+            .collect();
+        assert_eq!(
+            delivered.len(),
+            1,
+            "exactly one dm-delivered frame must be emitted via the spawned Phase C; got {frames:?}"
+        );
+        let (_, payload) = delivered[0];
+        assert_eq!(
+            payload.get("recipientOwnerAddr").and_then(|v| v.as_str()),
+            Some(hex::encode(bob.0).as_str()),
+            "dm-delivered frame must name bob as the recipient"
+        );
+        assert_eq!(
+            payload.get("spaceId").and_then(|v| v.as_str()),
+            Some(hex::encode(space_id.0).as_str()),
+        );
+        assert_eq!(
+            payload.get("messageCid").and_then(|v| v.as_str()),
+            Some(hex::encode(message_cid.to_bytes()).as_str()),
+        );
+    }
 }
 
 #[cfg(test)]

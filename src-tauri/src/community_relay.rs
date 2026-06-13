@@ -92,13 +92,33 @@ pub const RELAY_HOLD_GLOBAL_CAP: usize = 1024;
 /// [`crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES`]).
 pub const RELAY_MAX_SEALED_BLOB_BYTES: usize = crate::butler_deposit::DEPOSIT_MAX_FRAME_BYTES;
 
+/// ZEB-458 P4 Phase B: generous per-entry CBOR-metadata overhead allowance,
+/// added on top of [`RELAY_MAX_SEALED_BLOB_BYTES`] when sizing the whole-doc
+/// dataset cap below. A replicated `RelayHoldDoc` is not just the blob bytes —
+/// each held entry serializes as a CBOR map keyed by `"{recipient_hex}:
+/// {content_id_hex}"` (≈ 81 bytes of key text) plus the entry's metadata:
+/// `recipient_owner` + `sender_owner` (OwnerAddr, 16 bytes each), `community_id`
+/// (SpaceId, 16 bytes), `held_at` (an HLC: wall_ms + logical + device_id
+/// string), a 64-hex `held_by` relay-device string, the `content_id`, and a
+/// `pulled_by` set — all wrapped in CBOR map/key/length headers. 512 bytes is
+/// deliberately over-budget (the measured per-entry overhead is well under this
+/// — see the unit test) so the dataset cap never under-counts the doc and the
+/// zenoh dataset adapter cannot silently DROP a full-capacity sample.
+pub const RELAY_HOLD_ENTRY_OVERHEAD_BYTES: usize = 512;
+
 /// ZEB-458 P4 Phase B: inbound size cap for one `relay-hold-v1` fleet-sync
 /// sample (a whole CBOR-encoded `RelayHoldDoc`), enforced in the zenoh bridge
 /// before the owned copy. The doc holds at most [`RELAY_HOLD_GLOBAL_CAP`]
-/// entries, each bounded by [`RELAY_MAX_SEALED_BLOB_BYTES`]; this product is
-/// the byte footprint of the held blobs, so it is the natural ceiling for the
-/// whole-doc sample (mirroring [`crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES`]).
-pub const RELAY_HOLD_DATASET_MAX_BYTES: usize = RELAY_HOLD_GLOBAL_CAP * RELAY_MAX_SEALED_BLOB_BYTES;
+/// entries, each bounded by [`RELAY_MAX_SEALED_BLOB_BYTES`] for the blob plus
+/// [`RELAY_HOLD_ENTRY_OVERHEAD_BYTES`] for the per-entry CBOR map key + metadata
+/// (the replicated sample is the WHOLE doc, not just the raw blobs — a
+/// blob-bytes-only product under-counts the doc and, at full capacity, the
+/// zenoh dataset adapter would DROP the over-cap sample so sibling relays never
+/// converge). A fixed 64 KiB envelope margin covers the doc-level CBOR framing
+/// (outer map header, version tag, etc.) independent of entry count.
+pub const RELAY_HOLD_DATASET_MAX_BYTES: usize = RELAY_HOLD_GLOBAL_CAP
+    * (RELAY_MAX_SEALED_BLOB_BYTES + RELAY_HOLD_ENTRY_OVERHEAD_BYTES)
+    + 64 * 1024;
 
 /// ZEB-458 P4 Phase B: inbound size cap for one `relay-optin-v1` fleet-sync
 /// sample (a whole CBOR-encoded `RelayOptInDoc`). The doc carries only a

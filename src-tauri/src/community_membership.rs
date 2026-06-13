@@ -10306,22 +10306,61 @@ mod zeb_458_community_relay_announce_verify_tests {
         materialize(std::slice::from_ref(&join_ev), owner.owner)
     }
 
-    /// Positive: Joined actor + valid inner sig + in-window `ad_at` → Ok(()).
+    /// Build a `prior_state` where BOTH `admin` and `member` are Joined with
+    /// their enrolled device keys materialized. `admin` is the bootstrap admin
+    /// (`VerifyContext::admin_addr`); `member` is a regular (non-admin) Joined
+    /// member. Used so the positive CommunityRelayAnnounce test advertises from
+    /// a NON-admin member — if `CommunityRelayAnnounce` ever picked up an
+    /// admin-only gate, the test would catch it (an admin-as-advertiser test
+    /// would falsely keep passing).
+    fn joined_prior_two_members(admin: &TestOwner, member: &TestOwner) -> MaterializedMembership {
+        let joined_with_enrolled = |owner: &TestOwner| {
+            let mut keys = std::collections::BTreeSet::new();
+            keys.insert(owner.cert.device_pubkeys.classical.ed25519_verify);
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: keys,
+            }
+        };
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(admin.owner, joined_with_enrolled(admin));
+        mat.members
+            .insert(member.owner, joined_with_enrolled(member));
+        // Admin carries invite power; the regular member carries none — so the
+        // advertiser is unambiguously a non-admin Joined member.
+        mat.power_levels
+            .insert(admin.owner, POWER_THRESHOLDS.invite);
+        mat
+    }
+
+    /// Positive: a NON-admin Joined actor + valid inner sig + in-window
+    /// `ad_at` → Ok(()). The advertiser is a regular member, NOT the bootstrap
+    /// admin, so this would fail if CommunityRelayAnnounce ever gained an
+    /// admin-only gate.
     #[test]
     fn community_relay_announce_verifies_when_actor_joined_and_inner_sig_valid() {
         let community_id = SpaceId([0xd0; 16]);
+        let admin = mint_test_owner(0xa1);
         let member = mint_test_owner(0xa2);
-        let prior = joined_prior(community_id, &member);
+        let prior = joined_prior_two_members(&admin, &member);
 
+        // Advertise from the regular (non-admin) `member`.
         let event =
             make_relay_announce_event(community_id, &member, member.owner, 1_000_000, 1_000_000);
 
         let ctx = VerifyContext {
             expected_community_id: community_id,
-            admin_addr: member.owner,
+            admin_addr: admin.owner,
             is_invite_only: false,
         };
-        verify_event(&event, &prior, &ctx).expect("valid CommunityRelayAnnounce must verify");
+        verify_event(&event, &prior, &ctx)
+            .expect("valid CommunityRelayAnnounce from a non-admin Joined member must verify");
     }
 
     /// RCH2 analogue: tampering the inner identity_signature bytes causes

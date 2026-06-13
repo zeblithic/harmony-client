@@ -5043,12 +5043,58 @@ pub async fn start_node_inner(
                                                 // Network-Health notify (relay
                                                 // ads aren't a connectivity-
                                                 // panel signal) and no UI emit.
-                                                community_relay_resolver.update(
-                                                    community_id,
-                                                    event.actor,
-                                                    payload.clone(),
-                                                    event.at.clone(),
-                                                );
+                                                //
+                                                // CURRENT-membership gate
+                                                // (mirrors the boot-replay
+                                                // `is_joined` filter): a stale /
+                                                // older CommunityRelayAnnounce
+                                                // applied AFTER a later
+                                                // Leave/Kick (out-of-order
+                                                // delivery or replay) must NOT
+                                                // resurrect the departed
+                                                // advertiser — `update()` is an
+                                                // add and `remove_advertiser` is
+                                                // only a delete, so without this
+                                                // re-check the resolver would
+                                                // re-add a non-member. Read the
+                                                // advertiser's CURRENT status
+                                                // from the community's
+                                                // materialized membership and
+                                                // SKIP if not Joined.
+                                                let advertiser_is_joined = if let Some(engine) =
+                                                    registry.engine_arc(&community_id).await
+                                                {
+                                                    // Bind the Arc<Mutex<_>> to a
+                                                    // local first — `engine.state()`
+                                                    // returns by value, so locking
+                                                    // it inline would drop the
+                                                    // temporary while `st` borrows
+                                                    // it (E0716).
+                                                    let state_arc = engine.state();
+                                                    let st = state_arc.lock().await;
+                                                    st.materialized(engine.admin_addr())
+                                                        .members
+                                                        .get(&event.actor)
+                                                        .map(|m| {
+                                                            m.status
+                                                                == crate::community_membership::MemberStatus::Joined
+                                                        })
+                                                        .unwrap_or(false)
+                                                } else {
+                                                    // No engine for this
+                                                    // community (not joined /
+                                                    // torn down) → not a current
+                                                    // member; do not resurrect.
+                                                    false
+                                                };
+                                                if advertiser_is_joined {
+                                                    community_relay_resolver.update(
+                                                        community_id,
+                                                        event.actor,
+                                                        payload.clone(),
+                                                        event.at.clone(),
+                                                    );
+                                                }
                                             }
                                             crate::community_membership::MembershipEventKind::Leave => {
                                                 // ZEB-458 P4B: retract the
@@ -6948,6 +6994,16 @@ pub async fn start_node_inner(
                                                 let mut ticker = tokio::time::interval(
                                                     std::time::Duration::from_secs(60),
                                                 );
+                                                // After a slow refresh pass
+                                                // (many communities), Tokio's
+                                                // default `Burst` behavior would
+                                                // fire every missed tick
+                                                // back-to-back. `Skip` collapses
+                                                // the backlog to a single tick on
+                                                // the next period boundary.
+                                                ticker.set_missed_tick_behavior(
+                                                    tokio::time::MissedTickBehavior::Skip,
+                                                );
                                                 loop {
                                                     let ids = refresher_registry.known_ids().await;
                                                     let mut joined = Vec::new();
@@ -7203,6 +7259,15 @@ pub async fn start_node_inner(
                                     tokio::time::interval(std::time::Duration::from_millis(
                                         crate::community_relay::RELAY_HOLD_GC_INTERVAL_MS,
                                     ));
+                                // After a slow GC pass (large doc + flush_now),
+                                // Tokio's default `Burst` behavior would fire
+                                // every missed tick back-to-back, triggering a
+                                // flurry of immediate re-sweeps. `Skip` collapses
+                                // the backlog to a single tick on the next
+                                // period boundary.
+                                ticker.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Skip,
+                                );
                                 // Consume the immediate first tick — nothing to GC
                                 // at boot (the doc was just loaded).
                                 ticker.tick().await;
@@ -8104,6 +8169,17 @@ pub async fn start_node_inner(
             // dm-inbox).
             relay_hold_sync_engine_opt,
             relay_optin_sync_engine_opt,
+            // ZEB-458 P4 Phase B (review fix): carry the four relay background
+            // task handles out so the failure-cleanup path can `.abort()` any
+            // that were spawned. The success / supersede path already `.take()`s
+            // them into `guard.*` above (leaving these carriers None), so on
+            // those paths the abort below is a no-op; only a lock-poison
+            // rollback (which skips the guard block) leaves them Some — without
+            // aborting them they would leak (run forever holding Arc clones).
+            community_relay_publisher_handle_opt,
+            community_relay_pull_driver_handle_opt,
+            community_relay_gc_handle_opt,
+            community_relay_refresher_handle_opt,
             node_addr_for_response,
             freshly_created,
             has_owner_identity,
@@ -8127,6 +8203,10 @@ pub async fn start_node_inner(
         fleet_net_engine_for_cleanup,
         relay_hold_engine_for_cleanup,
         relay_optin_engine_for_cleanup,
+        mut community_relay_publisher_handle_for_cleanup,
+        mut community_relay_pull_driver_handle_for_cleanup,
+        mut community_relay_gc_handle_for_cleanup,
+        mut community_relay_refresher_handle_for_cleanup,
         node_addr_for_response,
         freshly_created,
         has_owner_identity,
@@ -8279,6 +8359,27 @@ pub async fn start_node_inner(
                     "relay-optin FleetSyncEngine cleanup after start_node failure"
                 );
             }
+        }
+        // ZEB-458 P4 Phase B (review fix): abort the four relay background
+        // tasks (publisher, pull driver, GC sweep, joined-communities
+        // refresher) if they were spawned before this attempt failed. On the
+        // success / supersede path the guard block already `.take()`d these
+        // handles into NodeState, leaving the carriers None (these are
+        // no-ops); only a lock-poison rollback that skipped the guard block
+        // leaves them Some — without aborting them they leak (run forever
+        // holding Arc clones, separate from the FleetSyncEngine shutdowns
+        // above which only stop the sync engines).
+        if let Some(h) = community_relay_publisher_handle_for_cleanup.take() {
+            h.abort();
+        }
+        if let Some(h) = community_relay_pull_driver_handle_for_cleanup.take() {
+            h.abort();
+        }
+        if let Some(h) = community_relay_gc_handle_for_cleanup.take() {
+            h.abort();
+        }
+        if let Some(h) = community_relay_refresher_handle_for_cleanup.take() {
+            h.abort();
         }
         return Err(msg);
     }

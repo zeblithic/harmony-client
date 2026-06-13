@@ -328,6 +328,11 @@ impl CommunityRelayPullDriver {
         tokio::spawn(async move {
             self.run_one_pass(now_ms()).await;
             let mut ticker = tokio::time::interval(self.interval);
+            // After a slow pull pass, Tokio's default `Burst` behavior would
+            // fire every missed tick back-to-back, triggering a flurry of
+            // immediate re-pulls. `Skip` collapses the backlog to a single
+            // tick on the next period boundary.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // `interval` fires the first tick immediately; we just ran the
             // startup pass, so consume it.
             ticker.tick().await;

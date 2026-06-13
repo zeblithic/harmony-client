@@ -58,6 +58,11 @@ impl CommunityRelayPublisher {
         tokio::spawn(async move {
             (self.publish)().await; // startup publish
             let mut tick = interval(self.refresh);
+            // After a slow publish (e.g. a stalled relay round), Tokio's default
+            // `Burst` behavior would fire every missed tick back-to-back,
+            // triggering a flurry of immediate re-publishes. `Skip` collapses
+            // the backlog to a single tick on the next period boundary.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             tick.tick().await; // consume the immediate first tick (already published)
             loop {
                 tokio::select! {
