@@ -1,0 +1,983 @@
+//! ZEB-458 Phase A Task 6: community relay E2E integration test.
+//!
+//! Two test ctx types back the relay + recipient pipelines with real
+//! `FleetSyncEngine<RelayHoldDoc>` instances and real crypto. No Tauri, no
+//! `start_node`, no iroh shells — exactly the `butler_deposit_integration`
+//! harness pattern applied to the relay modules.
+//!
+//! Scenarios:
+//! 1. **Happy path** — full round-trip: deposit → pull → open_and_ingest →
+//!    pull_ack → mark_pulled → gc empty.
+//! 2. **Non-member sender** — deposit rejects with `NotCoMember`; hold doc
+//!    untouched.
+//! 3. **Wrong-owner pull** — pull query with a cert for a different owner
+//!    rejects with `BadCert`.
+//! 4. **Restart durability** — drop + recreate engine from persisted state;
+//!    blob still present and pullable.
+//! 5. **Opacity (structural)** — `RelayDepositCtx` has no decrypt hook;
+//!    relay ctx event log never records "decrypt".
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use ed25519_dalek::Signer;
+use harmony_app::butler_deposit::DepositPayload;
+use harmony_app::community_membership::{mint_test_owner, TestOwner};
+use harmony_app::community_relay::{
+    build_relay_deposit_frame, relay_pull_ack_sig_payload, relay_pull_sig_payload, RelayHeldBlob,
+    RelayPullAck, RelayPullQuery, COMMUNITY_RELAY_SEAL_INFO, RELAY_HOLD_GLOBAL_CAP,
+    RELAY_HOLD_PER_SENDER_CAP,
+};
+use harmony_app::community_relay_hold_crdt::{RelayHoldDoc, RelayHoldEntry};
+use harmony_app::community_relay_pull::{open_and_ingest, RelayIngestCtx};
+use harmony_app::dm_signing::{ed25519_priv_to_x25519, open_from_owner_with_info};
+use harmony_app::fleet_sync::{
+    mint_next_hlc, FleetPersist, FleetSyncConfig, FleetSyncEngine, Merger, SyncError,
+};
+use harmony_app::iroh_community_relay_acceptor::{
+    handle_relay_deposit_core, handle_relay_pull_ack, handle_relay_pull_query, RelayDepositCtx,
+    RelayDepositReject, RelayPersistVerdict, RelayPullCtx, RelayPullReject,
+};
+use harmony_app::owner_state_crypto::KeyTree;
+use harmony_app::owner_state_types::{Hlc, SpaceId};
+use harmony_content::cid::{ContentFlags, ContentId};
+use tokio::sync::{mpsc, Mutex};
+use zeroize::Zeroizing;
+
+// =====================================================================
+// Deterministic test identities and community setup
+// =====================================================================
+
+/// Relay device — accepts deposits and serves pull queries.
+fn relay_owner() -> TestOwner {
+    mint_test_owner(0x01)
+}
+
+/// Sender — deposits sealed blobs.
+fn sender_owner() -> TestOwner {
+    mint_test_owner(0x10)
+}
+
+/// Recipient — pulls + opens blobs.
+fn recipient_owner() -> TestOwner {
+    mint_test_owner(0x20)
+}
+
+/// The community all three parties share.
+fn community_id() -> SpaceId {
+    SpaceId([0xCC; 16])
+}
+
+// =====================================================================
+// Relay-hold on-disk persist (mirrors DmInboxPersist exactly, just for
+// RelayHoldDoc — used by the restart-durability scenario).
+// =====================================================================
+
+/// Trivial CBOR persist for `RelayHoldDoc` (one-byte version prefix, same
+/// pattern as `DmInboxPersist` and `NotesPersist`). Used ONLY in the durability
+/// scenario; the other scenarios use `NoopRelayPersist` to avoid FS I/O.
+struct RelayHoldPersist {
+    doc_path: PathBuf,
+    replay_path: PathBuf,
+}
+
+impl FleetPersist<RelayHoldDoc> for RelayHoldPersist {
+    fn persist(
+        &self,
+        state: &RelayHoldDoc,
+        tracker: &BTreeMap<String, Hlc>,
+    ) -> Result<(), SyncError> {
+        // Write doc
+        if let Some(p) = self.doc_path.parent() {
+            std::fs::create_dir_all(p)
+                .map_err(|e| SyncError::Persist(format!("create_dir: {e}")))?;
+        }
+        let mut doc_bytes = vec![1u8]; // schema v1
+        ciborium::into_writer(state, &mut doc_bytes)
+            .map_err(|e| SyncError::CborEncode(format!("encode relay_hold: {e}")))?;
+        std::fs::write(&self.doc_path, &doc_bytes)
+            .map_err(|e| SyncError::Persist(format!("write relay_hold: {e}")))?;
+
+        // Write replay tracker
+        let mut rep_bytes = vec![1u8];
+        ciborium::into_writer(tracker, &mut rep_bytes)
+            .map_err(|e| SyncError::CborEncode(format!("encode replay: {e}")))?;
+        std::fs::write(&self.replay_path, &rep_bytes)
+            .map_err(|e| SyncError::Persist(format!("write replay: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Load a `RelayHoldDoc` from the persisted file (version-prefixed CBOR).
+/// Returns `RelayHoldDoc::default()` if the file doesn't exist.
+fn load_relay_hold_doc(path: &PathBuf) -> RelayHoldDoc {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RelayHoldDoc::default(),
+        Err(e) => panic!("read relay_hold doc: {e}"),
+    };
+    // Validate the schema-version prefix BEFORE decoding, so this durability
+    // test fails at the version boundary it is meant to exercise rather than
+    // silently decoding an incompatible future format.
+    let (&version, payload) = bytes.split_first().expect("relay_hold doc file is empty");
+    assert_eq!(
+        version, 1u8,
+        "unexpected relay_hold schema version byte: {version}"
+    );
+    let mut cursor = std::io::Cursor::new(payload);
+    let doc: RelayHoldDoc =
+        ciborium::from_reader(&mut cursor).expect("decode relay_hold doc from disk");
+    // Reject trailing bytes — a partial/garbage tail must fail loudly, not be
+    // silently ignored.
+    assert_eq!(
+        cursor.position() as usize,
+        payload.len(),
+        "trailing bytes after relay_hold doc CBOR ({} of {} consumed)",
+        cursor.position(),
+        payload.len()
+    );
+    doc
+}
+
+// =====================================================================
+// No-op persist (all other scenarios)
+// =====================================================================
+
+struct NoopRelayPersist;
+
+impl FleetPersist<RelayHoldDoc> for NoopRelayPersist {
+    fn persist(
+        &self,
+        _state: &RelayHoldDoc,
+        _tracker: &BTreeMap<String, Hlc>,
+    ) -> Result<(), SyncError> {
+        Ok(())
+    }
+}
+
+// =====================================================================
+// Engine builder (mirrors butler_deposit_integration::build_engine)
+// =====================================================================
+
+struct Built {
+    engine: Arc<FleetSyncEngine<RelayHoldDoc>>,
+    doc: Arc<Mutex<RelayHoldDoc>>,
+    tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    /// Keep the outbound receiver alive so the `publisher_tx` channel
+    /// remains open — dropping it would close the publish channel and cause
+    /// `flush_now` to return `TransportClosed`.
+    _out_rx: mpsc::Receiver<Vec<u8>>,
+}
+
+fn build_relay_engine(device_id: &str, persist: Arc<dyn FleetPersist<RelayHoldDoc>>) -> Built {
+    let (out_tx, out_rx) = mpsc::channel(64);
+    let (_in_tx, in_rx) = mpsc::channel(64);
+    let doc = Arc::new(Mutex::new(RelayHoldDoc::default()));
+    let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+    let kt = Arc::new(KeyTree::derive(&[0xAA; 32]).expect("kt"));
+    let merger: Merger<RelayHoldDoc> = Arc::new(|l: &mut RelayHoldDoc, r| l.merge_from(r));
+    let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
+        kt,
+        device_id: device_id.to_string(),
+        state: Arc::clone(&doc),
+        merger,
+        replay_tracker: Arc::clone(&tracker),
+        content_store: Arc::new(harmony_app::content_store::InMemoryStub::default()),
+        publisher_tx: out_tx,
+        subscriber_rx: in_rx,
+        persist,
+        lookup_key_tag: b"relay-hold-v1",
+        debounce_ms: 50,
+        publish_seen: false,
+        on_applied: None,
+        sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+    }));
+    Built {
+        engine,
+        doc,
+        tracker,
+        _out_rx: out_rx,
+    }
+}
+
+/// Build from a pre-loaded doc (durability scenario: inject previously
+/// persisted state without replaying the full engine).
+fn build_relay_engine_from_doc(
+    device_id: &str,
+    persisted_doc: RelayHoldDoc,
+    persist: Arc<dyn FleetPersist<RelayHoldDoc>>,
+) -> Built {
+    let (out_tx, out_rx) = mpsc::channel(64);
+    let (_in_tx, in_rx) = mpsc::channel(64);
+    let doc = Arc::new(Mutex::new(persisted_doc));
+    let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+    let kt = Arc::new(KeyTree::derive(&[0xAA; 32]).expect("kt"));
+    let merger: Merger<RelayHoldDoc> = Arc::new(|l: &mut RelayHoldDoc, r| l.merge_from(r));
+    let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
+        kt,
+        device_id: device_id.to_string(),
+        state: Arc::clone(&doc),
+        merger,
+        replay_tracker: Arc::clone(&tracker),
+        content_store: Arc::new(harmony_app::content_store::InMemoryStub::default()),
+        publisher_tx: out_tx,
+        subscriber_rx: in_rx,
+        persist,
+        lookup_key_tag: b"relay-hold-v1",
+        debounce_ms: 50,
+        publish_seen: false,
+        on_applied: None,
+        sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+    }));
+    Built {
+        engine,
+        doc,
+        tracker,
+        _out_rx: out_rx,
+    }
+}
+
+// =====================================================================
+// Relay test ctx: implements BOTH RelayDepositCtx and RelayPullCtx,
+// backed by a real FleetSyncEngine<RelayHoldDoc>.
+//
+// `serves_community` / `both_co_members` / `is_joined_member` read from
+// injected BTreeSets.  `persist_hold` does the atomic caps-enforcing
+// persist under the doc lock + flush_now(), mirroring ProdButlerDepositCtx.
+// `held_for` scans the doc under lock.
+// `mark_pulled` unions pulled_by under the doc lock + flush_now().
+// =====================================================================
+
+struct TestRelayCtx {
+    /// The relay's device id (64-hex of its device ed25519 vk).
+    relay_device_id: String,
+    /// Set of community_ids this relay serves.
+    served_communities: BTreeSet<SpaceId>,
+    /// (community_id, sender_owner, recipient_owner) triples that pass
+    /// `both_co_members`.
+    co_members: BTreeSet<([u8; 16], [u8; 16], [u8; 16])>,
+    /// (community_id, owner) pairs that pass `is_joined_member`.
+    members: BTreeSet<([u8; 16], [u8; 16])>,
+    /// Wall-clock now in epoch-seconds (for cert expiry).
+    now_secs: u64,
+    /// Ordered event log for opacity / call-order assertions.
+    events: StdMutex<Vec<String>>,
+    /// The relay's hold doc (under engine lock).
+    doc: Arc<Mutex<RelayHoldDoc>>,
+    /// HLC tracker.
+    tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    /// Engine handle for notify_dirty + flush_now.
+    engine: Arc<FleetSyncEngine<RelayHoldDoc>>,
+}
+
+impl TestRelayCtx {
+    fn push_event(&self, e: impl Into<String>) {
+        self.events.lock().unwrap().push(e.into());
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl RelayDepositCtx for TestRelayCtx {
+    fn relay_device_id(&self) -> String {
+        self.relay_device_id.clone()
+    }
+
+    async fn serves_community(&self, community_id: &SpaceId) -> bool {
+        self.push_event("serves_community");
+        self.served_communities.contains(community_id)
+    }
+
+    async fn both_co_members(
+        &self,
+        community_id: &SpaceId,
+        sender_owner: &[u8; 16],
+        recipient_owner: &[u8; 16],
+    ) -> bool {
+        self.push_event("both_co_members");
+        self.co_members
+            .contains(&(community_id.0, *sender_owner, *recipient_owner))
+    }
+
+    fn now_secs(&self) -> u64 {
+        self.now_secs
+    }
+
+    async fn mint_hlc(&self) -> Hlc {
+        mint_next_hlc(&self.tracker, &self.relay_device_id).await
+    }
+
+    /// Atomic persist-with-caps under the doc lock (mirrors
+    /// `TestButlerCtx::persist_entry` exactly, adapted to relay types).
+    async fn persist_hold(
+        &self,
+        key: String,
+        entry: RelayHoldEntry,
+    ) -> Result<RelayPersistVerdict, String> {
+        self.push_event(format!("persist:{}", &key[..16])); // abbreviated key for assertions
+        let verdict = {
+            let mut doc = self.doc.lock().await;
+            if doc.entries.contains_key(&key) {
+                RelayPersistVerdict::Duplicate
+            } else {
+                let sender_count = doc.count_for_sender(&entry.community_id, &entry.sender_owner);
+                if sender_count >= RELAY_HOLD_PER_SENDER_CAP
+                    || doc.live_count() >= RELAY_HOLD_GLOBAL_CAP
+                {
+                    return Ok(RelayPersistVerdict::CapExceeded);
+                }
+                doc.entries.insert(key, entry);
+                RelayPersistVerdict::Inserted
+            }
+        };
+        self.engine.notify_dirty();
+        self.engine
+            .flush_now()
+            .await
+            .map_err(|e| format!("flush_now: {e}"))?;
+        Ok(verdict)
+    }
+}
+
+#[async_trait]
+impl RelayPullCtx for TestRelayCtx {
+    async fn serves_community(&self, community_id: &SpaceId) -> bool {
+        self.push_event("serves_community");
+        self.served_communities.contains(community_id)
+    }
+
+    async fn is_joined_member(&self, community_id: &SpaceId, owner: &[u8; 16]) -> bool {
+        self.push_event("is_joined_member");
+        self.members.contains(&(community_id.0, *owner))
+    }
+
+    fn now_secs(&self) -> u64 {
+        self.now_secs
+    }
+
+    async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)> {
+        self.push_event("held_for");
+        let doc = self.doc.lock().await;
+        doc.entries
+            .iter()
+            .filter(|(_, e)| &e.recipient_owner == recipient_owner)
+            .map(|(k, e)| {
+                (
+                    k.clone(),
+                    RelayHeldBlob {
+                        sender_owner: e.sender_owner,
+                        sealed_blob: e.sealed_blob.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Union pulled_by for the given keys under the doc lock, then flush.
+    /// Missing keys are silently ignored (no-op, as per trait contract).
+    async fn mark_pulled(&self, keys: &[String], requester_device: String) -> Result<(), String> {
+        self.push_event(format!("mark_pulled:{}", keys.len()));
+        {
+            let mut doc = self.doc.lock().await;
+            for k in keys {
+                if let Some(e) = doc.entries.get_mut(k) {
+                    e.pulled_by.insert(requester_device.clone());
+                }
+            }
+        }
+        self.engine.notify_dirty();
+        self.engine
+            .flush_now()
+            .await
+            .map_err(|e| format!("flush_now mark_pulled: {e}"))?;
+        Ok(())
+    }
+}
+
+// =====================================================================
+// Recipient ingest ctx: implements RelayIngestCtx backed by the device's
+// X25519 private keys.  `ingest_recovered` records the DepositPayload.
+// (In a full production ctx this would call verify_cidnotify_admission,
+// decrypt_and_bind_dm_blob, apply_inbox, emit_dm_received — Phase B wires
+// those. Here we verify the open-and-ingest seam by recording the payload.)
+// =====================================================================
+
+struct TestRecipientIngestCtx {
+    /// X25519 privs for all the recipient's enrolled devices.
+    device_privs: Vec<Zeroizing<[u8; 32]>>,
+    /// Recorded payloads from successful ingest calls.
+    ingested: StdMutex<Vec<DepositPayload>>,
+}
+
+impl TestRecipientIngestCtx {
+    fn new(device_privs: Vec<Zeroizing<[u8; 32]>>) -> Self {
+        Self {
+            device_privs,
+            ingested: StdMutex::new(Vec::new()),
+        }
+    }
+
+    fn ingested(&self) -> Vec<DepositPayload> {
+        self.ingested.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl RelayIngestCtx for TestRecipientIngestCtx {
+    fn device_x25519_privs(&self) -> Vec<Zeroizing<[u8; 32]>> {
+        self.device_privs.clone()
+    }
+
+    async fn ingest_recovered(&self, payload: DepositPayload) -> Result<(), String> {
+        self.ingested.lock().unwrap().push(payload);
+        Ok(())
+    }
+}
+
+// =====================================================================
+// Helper: bounded condition-polling (mirrors butler_deposit_integration)
+// =====================================================================
+
+async fn wait_until<F, Fut>(mut cond: F, timeout: Duration) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if cond().await {
+            return true;
+        }
+        if tokio::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
+// =====================================================================
+// Fixture builder: build a valid RelayDepositFrame sealed to the recipient
+// =====================================================================
+
+struct RelayFixture {
+    frame: harmony_app::community_relay::RelayDepositFrame,
+    payload: DepositPayload,
+    recipient: TestOwner,
+    sender: TestOwner,
+    /// `ContentId::for_book(&frame.sealed_blob, encrypted=true).to_bytes()`
+    sealed_content_id: [u8; 32],
+}
+
+fn build_fixture() -> RelayFixture {
+    let sender = sender_owner();
+    let recipient = recipient_owner();
+    let cid = community_id();
+    let payload = DepositPayload {
+        cidnotify_packet: vec![0x01, 0x02, 0x03, 0x04],
+        storage_blob: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+    };
+    let cert_bytes = harmony_owner::cbor::to_canonical(&sender.cert).expect("encode cert");
+    let frame = build_relay_deposit_frame(
+        recipient.owner.0,
+        &recipient.cert.device_pubkeys.classical.ed25519_verify,
+        sender.owner.0,
+        cid,
+        cert_bytes,
+        &sender.device_key,
+        &payload,
+    )
+    .expect("build_relay_deposit_frame");
+    let sealed_content_id = ContentId::for_book(
+        &frame.sealed_blob,
+        ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        },
+    )
+    .expect("content_id for sealed blob")
+    .to_bytes();
+    RelayFixture {
+        frame,
+        payload,
+        recipient,
+        sender,
+        sealed_content_id,
+    }
+}
+
+/// Build the `TestRelayCtx` wired for the happy-path (relay serves the
+/// community; sender and recipient are both co-members; all three are
+/// `is_joined_member` for pull).
+fn build_relay_ctx(built: &Built, relay_device_id: String) -> TestRelayCtx {
+    let sender = sender_owner();
+    let recipient = recipient_owner();
+    let relay = relay_owner();
+    let cid = community_id();
+
+    let mut served = BTreeSet::new();
+    served.insert(cid);
+
+    let mut co_members = BTreeSet::new();
+    co_members.insert((cid.0, sender.owner.0, recipient.owner.0));
+
+    let mut members = BTreeSet::new();
+    members.insert((cid.0, relay.owner.0));
+    members.insert((cid.0, sender.owner.0));
+    members.insert((cid.0, recipient.owner.0));
+
+    TestRelayCtx {
+        relay_device_id,
+        served_communities: served,
+        co_members,
+        members,
+        now_secs: 1_700_000_100,
+        events: StdMutex::new(Vec::new()),
+        doc: Arc::clone(&built.doc),
+        tracker: Arc::clone(&built.tracker),
+        engine: Arc::clone(&built.engine),
+    }
+}
+
+/// Build the relay device id string (64-hex of the relay's device ed25519 vk).
+fn relay_device_id() -> String {
+    hex::encode(relay_owner().cert.device_pubkeys.classical.ed25519_verify)
+}
+
+// =====================================================================
+// Test 1: Happy path — full relay round-trip
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_happy_path_full_round_trip() {
+    let fx = build_fixture();
+    let relay_dev_id = relay_device_id();
+
+    let built = build_relay_engine(&relay_dev_id, Arc::new(NoopRelayPersist));
+    let relay_ctx = build_relay_ctx(&built, relay_dev_id.clone());
+
+    // ----- (1) Sender deposits -----
+    let ack = handle_relay_deposit_core(&fx.frame, &relay_ctx)
+        .await
+        .expect("valid co-member deposit must be accepted");
+
+    // Ack content_id matches ContentId::for_book(sealed_blob).
+    assert_eq!(ack.content_id, fx.sealed_content_id);
+
+    // The hold doc has the entry, sealed_blob byte-identical to frame.
+    {
+        let doc = built.doc.lock().await;
+        let key = RelayHoldDoc::key(&fx.recipient.owner.0, &ack.content_id);
+        let entry = doc.entries.get(&key).expect("entry in hold doc");
+        assert_eq!(
+            entry.sealed_blob, fx.frame.sealed_blob,
+            "relay holds sealed_blob verbatim (no decrypt)"
+        );
+        assert_eq!(entry.recipient_owner, fx.recipient.owner.0);
+        assert_eq!(entry.sender_owner, fx.sender.owner.0);
+        assert_eq!(entry.community_id, community_id());
+        assert!(entry.pulled_by.is_empty(), "fresh hold has no pulls");
+    }
+
+    // Call-order: serves_community → both_co_members → persist (no "decrypt").
+    let ev = relay_ctx.events();
+    let sc = ev.iter().position(|e| e == "serves_community").unwrap();
+    let bc = ev.iter().position(|e| e == "both_co_members").unwrap();
+    let ps = ev
+        .iter()
+        .position(|e| e.starts_with("persist:"))
+        .expect("persist event");
+    assert!(sc < bc, "serves_community before both_co_members");
+    assert!(bc < ps, "both_co_members before persist");
+    assert!(
+        !ev.iter().any(|e| e == "decrypt"),
+        "relay ctx must NEVER record decrypt"
+    );
+
+    // ----- (2) Recipient builds authed pull query -----
+    let cert_bytes = harmony_owner::cbor::to_canonical(&fx.recipient.cert).expect("encode cert");
+    let pull_sig = fx
+        .recipient
+        .device_key
+        .sign(&relay_pull_sig_payload(
+            &fx.recipient.owner.0,
+            &community_id(),
+        ))
+        .to_bytes()
+        .to_vec();
+    let query = RelayPullQuery {
+        recipient_owner: fx.recipient.owner.0,
+        community_id: community_id(),
+        requester_enrollment_cert: cert_bytes.clone(),
+        sig: pull_sig.clone(),
+    };
+
+    let resp = handle_relay_pull_query(&query, &relay_ctx)
+        .await
+        .expect("authed pull query must succeed");
+
+    assert_eq!(resp.entries.len(), 1, "one held blob for this recipient");
+    let held_blob = &resp.entries[0];
+    assert_eq!(
+        held_blob.sealed_blob, fx.frame.sealed_blob,
+        "pull response delivers the verbatim sealed blob"
+    );
+    assert_eq!(held_blob.sender_owner, fx.sender.owner.0);
+
+    // ----- (3) Recipient opens + ingests via open_and_ingest -----
+    let recipient_x25519 = ed25519_priv_to_x25519(&fx.recipient.device_key);
+    let ingest_ctx = TestRecipientIngestCtx::new(vec![recipient_x25519]);
+    let acked_content_ids = open_and_ingest(&resp.entries, &ingest_ctx).await;
+
+    // One blob acked = the sealed_content_id.
+    assert_eq!(acked_content_ids.len(), 1);
+    assert_eq!(acked_content_ids[0], fx.sealed_content_id);
+
+    // ingest_recovered received the exact DepositPayload.
+    let ingested = ingest_ctx.ingested();
+    assert_eq!(ingested.len(), 1);
+    assert_eq!(
+        ingested[0], fx.payload,
+        "recovered payload matches original"
+    );
+
+    // Verify: the X25519 priv opens the sealed_blob independently.
+    let plaintext = open_from_owner_with_info(
+        &ed25519_priv_to_x25519(&fx.recipient.device_key),
+        &fx.frame.sealed_blob,
+        COMMUNITY_RELAY_SEAL_INFO,
+    )
+    .expect("recipient device key must open sealed blob");
+    assert!(!plaintext.is_empty(), "plaintext is non-empty after open");
+
+    // ----- (4) Recipient sends pull ack -----
+    // The ack must be signed over relay_pull_ack_sig_payload (distinct from the
+    // query sig — binds the content_id list so the ack is self-authenticating).
+    let ack_msg = RelayPullAck {
+        content_ids: acked_content_ids.clone(),
+    };
+    let pull_ack_sig = fx
+        .recipient
+        .device_key
+        .sign(&relay_pull_ack_sig_payload(
+            &fx.recipient.owner.0,
+            &community_id(),
+            &acked_content_ids,
+        ))
+        .to_bytes()
+        .to_vec();
+    handle_relay_pull_ack(
+        &fx.recipient.owner.0,
+        &community_id(),
+        &ack_msg,
+        &cert_bytes,
+        &pull_ack_sig,
+        &relay_ctx,
+    )
+    .await
+    .expect("pull ack must succeed");
+
+    // mark_pulled was called and pulled_by is set.
+    let key = RelayHoldDoc::key(&fx.recipient.owner.0, &fx.sealed_content_id);
+    {
+        let doc = built.doc.lock().await;
+        let entry = doc.entries.get(&key).expect("entry still in doc before gc");
+        let recipient_device_id =
+            hex::encode(fx.recipient.cert.device_pubkeys.classical.ed25519_verify);
+        assert!(
+            entry.pulled_by.contains(&recipient_device_id),
+            "pulled_by must contain the recipient device id"
+        );
+    }
+
+    // ----- (5) GC sweep removes the covered entry -----
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let changed = built.doc.lock().await.gc(now_ms);
+    assert!(changed, "gc must remove the covered (acked) entry");
+    assert!(
+        built.doc.lock().await.entries.is_empty(),
+        "hold doc must be empty after gc removes the covered entry"
+    );
+
+    let _ = built.engine.shutdown().await;
+}
+
+// =====================================================================
+// Test 2: Non-member sender — deposit rejected, hold doc untouched
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_non_member_sender_deposit_rejected_doc_empty() {
+    let fx = build_fixture();
+    let relay_dev_id = relay_device_id();
+
+    let built = build_relay_engine(&relay_dev_id, Arc::new(NoopRelayPersist));
+
+    // Build a relay ctx with an EMPTY co_members set (sender not a co-member).
+    let relay_ctx = TestRelayCtx {
+        relay_device_id: relay_dev_id.clone(),
+        served_communities: [community_id()].into(),
+        co_members: BTreeSet::new(), // ← sender NOT admitted
+        members: BTreeSet::new(),
+        now_secs: 1_700_000_100,
+        events: StdMutex::new(Vec::new()),
+        doc: Arc::clone(&built.doc),
+        tracker: Arc::clone(&built.tracker),
+        engine: Arc::clone(&built.engine),
+    };
+
+    let err = handle_relay_deposit_core(&fx.frame, &relay_ctx)
+        .await
+        .expect_err("non-co-member sender must be rejected");
+
+    assert!(
+        matches!(err, RelayDepositReject::NotCoMember),
+        "expected NotCoMember, got {err:?}"
+    );
+
+    // Hold doc untouched.
+    {
+        let doc = built.doc.lock().await;
+        assert!(
+            doc.entries.is_empty(),
+            "hold doc must be empty after reject"
+        );
+    }
+
+    // No persist event (rejected before step 4 — before any persist call).
+    assert!(
+        !relay_ctx.events().iter().any(|e| e.starts_with("persist:")),
+        "no persist event on NotCoMember reject"
+    );
+
+    let _ = built.engine.shutdown().await;
+}
+
+// =====================================================================
+// Test 3: Wrong-owner pull — pull query cert for different owner → BadCert
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_wrong_owner_pull_cert_rejected() {
+    let fx = build_fixture();
+    let relay_dev_id = relay_device_id();
+
+    let built = build_relay_engine(&relay_dev_id, Arc::new(NoopRelayPersist));
+    let relay_ctx = build_relay_ctx(&built, relay_dev_id.clone());
+
+    // Pre-deposit a blob so there is something to pull.
+    handle_relay_deposit_core(&fx.frame, &relay_ctx)
+        .await
+        .expect("deposit");
+
+    // Build a pull query where the cert belongs to a DIFFERENT owner than
+    // `recipient_owner` names.
+    let other = mint_test_owner(0x77);
+    let other_cert_bytes = harmony_owner::cbor::to_canonical(&other.cert).expect("encode cert");
+    // Sign over the RECIPIENT's owner bytes (so the sig would pass for other's cert)
+    // but cert.owner_id != fx.recipient.owner.0 → BadCert.
+    let bad_sig = other
+        .device_key
+        .sign(&relay_pull_sig_payload(
+            &fx.recipient.owner.0,
+            &community_id(),
+        ))
+        .to_bytes()
+        .to_vec();
+    let bad_query = RelayPullQuery {
+        recipient_owner: fx.recipient.owner.0,
+        community_id: community_id(),
+        requester_enrollment_cert: other_cert_bytes,
+        sig: bad_sig,
+    };
+
+    let err = handle_relay_pull_query(&bad_query, &relay_ctx)
+        .await
+        .expect_err("wrong-owner cert must be rejected");
+
+    assert!(
+        matches!(err, RelayPullReject::BadCert),
+        "expected BadCert, got {err:?}"
+    );
+
+    // held_for must NOT have been called (reject is before blob serving).
+    assert!(
+        !relay_ctx.events().iter().any(|e| e == "held_for"),
+        "held_for must not be called on BadCert"
+    );
+
+    // Verify the blob is still in the hold doc (pull was rejected).
+    {
+        let doc = built.doc.lock().await;
+        assert_eq!(doc.entries.len(), 1, "hold doc entry must still be present");
+    }
+
+    let _ = built.engine.shutdown().await;
+}
+
+// =====================================================================
+// Test 4: Restart durability — drop + recreate engine from persisted state
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_restart_durability_blob_survives_engine_drop() {
+    let fx = build_fixture();
+    let relay_dev_id = relay_device_id();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let doc_path = dir.path().join("relay_hold.cbor");
+    let replay_path = dir.path().join("relay_hold_replay.cbor");
+
+    // ----- Phase 1: deposit + flush -----
+    let built = build_relay_engine(
+        &relay_dev_id,
+        Arc::new(RelayHoldPersist {
+            doc_path: doc_path.clone(),
+            replay_path: replay_path.clone(),
+        }),
+    );
+    let relay_ctx = build_relay_ctx(&built, relay_dev_id.clone());
+
+    let ack = handle_relay_deposit_core(&fx.frame, &relay_ctx)
+        .await
+        .expect("deposit succeeds");
+
+    // Flush is already done inside persist_hold. Wait briefly for background work.
+    let key = RelayHoldDoc::key(&fx.recipient.owner.0, &ack.content_id);
+    let doc_has_entry = wait_until(
+        || {
+            let doc = Arc::clone(&built.doc);
+            let key = key.clone();
+            async move { doc.lock().await.entries.contains_key(&key) }
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(doc_has_entry, "entry must be in the doc after deposit");
+
+    // Confirm file was written.
+    assert!(doc_path.exists(), "relay_hold.cbor must exist after flush");
+
+    // ----- Phase 2: drop the engine (simulated restart) -----
+    let _ = built.engine.shutdown().await;
+    drop(built);
+    drop(relay_ctx);
+
+    // ----- Phase 3: reload from disk -----
+    let reloaded_doc = load_relay_hold_doc(&doc_path);
+    assert!(
+        reloaded_doc.entries.contains_key(&key),
+        "entry must survive across the engine drop+reload (durability)"
+    );
+    assert_eq!(
+        reloaded_doc.entries[&key].sealed_blob, fx.frame.sealed_blob,
+        "reloaded sealed_blob is byte-identical to the deposited blob"
+    );
+
+    // ----- Phase 4: the reloaded engine can serve a pull query -----
+    let built2 = build_relay_engine_from_doc(
+        &relay_dev_id,
+        reloaded_doc,
+        Arc::new(NoopRelayPersist), // no further writes needed for this assertion
+    );
+    let relay_ctx2 = build_relay_ctx(&built2, relay_dev_id.clone());
+
+    let cert_bytes = harmony_owner::cbor::to_canonical(&fx.recipient.cert).expect("encode cert");
+    let pull_sig = fx
+        .recipient
+        .device_key
+        .sign(&relay_pull_sig_payload(
+            &fx.recipient.owner.0,
+            &community_id(),
+        ))
+        .to_bytes()
+        .to_vec();
+    let query = RelayPullQuery {
+        recipient_owner: fx.recipient.owner.0,
+        community_id: community_id(),
+        requester_enrollment_cert: cert_bytes,
+        sig: pull_sig,
+    };
+
+    let resp = handle_relay_pull_query(&query, &relay_ctx2)
+        .await
+        .expect("reloaded relay must serve pull query");
+
+    assert_eq!(resp.entries.len(), 1, "one held blob after reload");
+    assert_eq!(
+        resp.entries[0].sealed_blob, fx.frame.sealed_blob,
+        "sealed blob is byte-identical after reload"
+    );
+
+    let _ = built2.engine.shutdown().await;
+}
+
+// =====================================================================
+// Test 5: Opacity (structural) — relay ctx has no decrypt hook;
+//         relay NEVER opens the sealed blob.
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_opacity_no_decrypt_on_relay_side() {
+    // STRUCTURAL ASSERTION: `RelayDepositCtx` has no `decrypt` method.
+    // The relay receives `sealed_blob` and stores it verbatim. The blob is
+    // sealed to the RECIPIENT's device key; without the recipient's X25519
+    // private key the relay cannot open it. This test confirms:
+    //   (a) the event log never records "decrypt" after a deposit,
+    //   (b) attempting to open the stored blob with the RELAY's device key fails,
+    //   (c) the stored bytes are byte-identical to the frame's sealed_blob.
+
+    let fx = build_fixture();
+    let relay_dev_id = relay_device_id();
+
+    let built = build_relay_engine(&relay_dev_id, Arc::new(NoopRelayPersist));
+    let relay_ctx = build_relay_ctx(&built, relay_dev_id.clone());
+
+    handle_relay_deposit_core(&fx.frame, &relay_ctx)
+        .await
+        .expect("deposit");
+
+    // (a) No "decrypt" event.
+    let ev = relay_ctx.events();
+    assert!(
+        !ev.iter().any(|e| e == "decrypt"),
+        "relay ctx must NEVER record a decrypt event: {ev:?}"
+    );
+
+    // (b) The relay's own device key CANNOT open the blob (it's sealed to the
+    //     recipient's key, not the relay's). This is the cryptographic opacity proof.
+    let relay_x25519 = ed25519_priv_to_x25519(&relay_owner().device_key);
+    let open_result = open_from_owner_with_info(
+        &relay_x25519,
+        &fx.frame.sealed_blob,
+        COMMUNITY_RELAY_SEAL_INFO,
+    );
+    assert!(
+        open_result.is_err(),
+        "relay's device key must NOT be able to open the sealed blob"
+    );
+
+    // (c) Stored blob byte-identical to the frame's sealed_blob.
+    let key = RelayHoldDoc::key(&fx.recipient.owner.0, &fx.sealed_content_id);
+    {
+        // Scope the lock guard so it is dropped before shutdown, preventing a
+        // deadlock: shutdown calls persist_now which also locks the doc.
+        let doc = built.doc.lock().await;
+        let entry = doc.entries.get(&key).expect("entry in hold doc");
+        assert_eq!(
+            entry.sealed_blob, fx.frame.sealed_blob,
+            "relay stores sealed_blob verbatim — never transforms or decrypts it"
+        );
+    }
+
+    let _ = built.engine.shutdown().await;
+}
