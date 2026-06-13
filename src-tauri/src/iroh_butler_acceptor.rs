@@ -81,10 +81,12 @@ pub enum DepositReject {
     /// `frame.recipient_owner` is not this device's owner.
     #[error("deposit addressed to a different recipient owner")]
     WrongRecipient,
-    /// `frame.sender_owner` is not an `Active` friend (unknown, `Pending`,
-    /// or `Revoked` — all collapse to the same reject).
-    #[error("sender is not an active friend")]
-    NotFriend,
+    /// `frame.sender_owner` is neither an `Active` friend nor a live
+    /// group-DM co-member (ZEB-424). All non-authorized senders collapse
+    /// here — the wire close is uniform, so this distinction is only for
+    /// counters/tests. (Formerly `NotFriend`.)
+    #[error("sender is not authorized to deposit (not an active friend or co-member)")]
+    NotAuthorized,
     /// The embedded `EnrollmentCert` failed to decode, failed verification,
     /// is not Master-issued, or does not bind to the friend-graph identity
     /// (owner id / pinned master key mismatch).
@@ -429,17 +431,27 @@ pub async fn handle_deposit_core(
         return Err(DepositReject::WrongRecipient);
     }
 
-    // Step 1 — admission (spec §4 D5): sender must be an Active friend. This
-    // runs FIRST among the identity checks because the cert in step 2 can
-    // only be trusted against the friend graph's pinned master key. No
-    // crypto has touched attacker-controlled bytes yet.
-    let (friend_master, status) = ctx
-        .lookup_friend(&frame.sender_owner)
-        .await
-        .ok_or(DepositReject::NotFriend)?;
-    if status != FriendStatus::Active {
-        return Err(DepositReject::NotFriend);
+    // Step 1 — admission (spec §4 D5 as amended by ZEB-424 D27/D29.1): the
+    // sender must be either an Active friend (pinned-master trust) OR a live
+    // group-DM co-member (owner-id-derived trust). Friend status is checked
+    // first; a non-Active result (Pending/Revoked/None) falls through to the
+    // co-membership check — group membership is independent of friend status.
+    enum Admission {
+        /// Active friend: step 2 pins the cert master against this stored key.
+        Friend([u8; 32]),
+        /// Live group-DM co-member: step 2 derives the anchor from the owner id.
+        CoMember,
     }
+    let admission = match ctx.lookup_friend(&frame.sender_owner).await {
+        Some((friend_master, FriendStatus::Active)) => Admission::Friend(friend_master),
+        _ => {
+            if ctx.shares_live_group_dm(&frame.sender_owner).await {
+                Admission::CoMember
+            } else {
+                return Err(DepositReject::NotAuthorized);
+            }
+        }
+    };
 
     // Step 2 — decode + verify the sender device's EnrollmentCert and bind
     // it to the friend-graph identity: internally valid, Master-issued,
@@ -456,8 +468,27 @@ pub async fn handle_deposit_core(
         // `iroh_friend_acceptor::verify_enrolled_device`.
         _ => return Err(DepositReject::BadCert),
     };
-    if cert.owner_id != frame.sender_owner || cert_master != friend_master {
+    if cert.owner_id != frame.sender_owner {
         return Err(DepositReject::BadCert);
+    }
+    // Master binding (D29.1): the friend path keeps its byte-for-byte pin
+    // against the stored master; the co-member path derives the anchor from
+    // the owner id (the owner id IS the hash of the master bundle —
+    // `owner_id_from_master_ed25519`; the invariant
+    // `iroh_friend_acceptor::master_ed25519_from_cert_matches_owner_id` pins it).
+    match admission {
+        Admission::Friend(friend_master) => {
+            if cert_master != friend_master {
+                return Err(DepositReject::BadCert);
+            }
+        }
+        Admission::CoMember => {
+            if crate::friend_graph::owner_id_from_master_ed25519(&cert_master)
+                != crate::owner_state_types::OwnerAddr(frame.sender_owner)
+            {
+                return Err(DepositReject::BadCert);
+            }
+        }
     }
     let device_vk_bytes = cert.device_pubkeys.classical.ed25519_verify;
 
@@ -1057,6 +1088,78 @@ mod tests {
         assert!(failing.store.lock().unwrap().is_empty());
     }
 
+    /// ZEB-424 (D27/D29.1): a sender who is NOT a friend at all but shares a
+    /// live group-DM with the butler is admitted via the co-member fallback,
+    /// and the friend lookup is consulted BEFORE the group lookup (friend
+    /// status is the primary, cheaper trust anchor).
+    #[tokio::test]
+    async fn deposit_from_non_friend_group_co_member_is_accepted() {
+        let f = valid_fixture();
+        let mut ctx = TestCtx::for_fixture(&f);
+        ctx.friends.clear();
+        ctx.group_co_members.insert(f.sender_owner);
+        handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect("co-member admitted");
+        let ev = ctx.events();
+        let fp = ev.iter().position(|e| e == "friend_lookup").unwrap();
+        let gp = ev.iter().position(|e| e == "group_lookup").unwrap();
+        assert!(fp < gp, "friend lookup precedes group lookup: {ev:?}");
+    }
+
+    /// ZEB-424: the friend path is untouched — an Active friend with NO group
+    /// co-membership is still admitted exactly as before (the group fallback
+    /// is never even consulted for an Active friend).
+    #[tokio::test]
+    async fn deposit_from_active_friend_still_accepted_without_group() {
+        let f = valid_fixture();
+        let ctx = TestCtx::for_fixture(&f); // friend-Active, no group
+        handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect("friend still admitted");
+        assert!(
+            !ctx.events().iter().any(|e| e == "group_lookup"),
+            "an Active friend must not trigger the group fallback: {:?}",
+            ctx.events()
+        );
+    }
+
+    /// ZEB-424: a sender who is neither an Active friend nor a live group-DM
+    /// co-member is rejected with `NotAuthorized` BEFORE any decryption.
+    #[tokio::test]
+    async fn deposit_from_neither_friend_nor_co_member_rejected_before_decrypt() {
+        let f = valid_fixture();
+        let mut ctx = TestCtx::for_fixture(&f);
+        ctx.friends.clear(); // group_co_members already empty → neither
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("rejected");
+        assert!(matches!(err, DepositReject::NotAuthorized));
+        assert!(
+            !ctx.events().iter().any(|e| e == "decrypt"),
+            "no decrypt on reject: {:?}",
+            ctx.events()
+        );
+    }
+
+    /// ZEB-424 D29.1 regression guard: the friend path STILL pins the cert
+    /// master byte-for-byte against the friend-graph's stored master. An
+    /// Active friend whose pinned master differs from the cert master is
+    /// rejected `BadCert` via the UNCHANGED friend branch — the co-member
+    /// derived-anchor relaxation must not leak into the friend path.
+    #[tokio::test]
+    async fn friend_path_still_pins_master_mismatch_rejected() {
+        let f = valid_fixture();
+        let mut ctx = TestCtx::for_fixture(&f);
+        // Wrong pinned master for an otherwise-Active friend.
+        ctx.friends
+            .insert(f.sender_owner, ([0xAAu8; 32], FriendStatus::Active));
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("pinned mismatch rejected");
+        assert!(matches!(err, DepositReject::BadCert));
+    }
+
     /// ZEB-418 P1 Task 8 cross-check: a frame produced by the SENDER-side
     /// `butler_deposit::build_deposit_frame` (the exact construction
     /// `IrohButlerDepositClient` ships) passes the FULL acceptor pipeline —
@@ -1106,8 +1209,10 @@ mod tests {
     async fn deposit_from_non_friend_rejected_before_any_crypto() {
         let f = valid_fixture();
 
-        // Unknown sender: rejected at the friend lookup — the decrypt probe
-        // (and everything after it) is never reached.
+        // Unknown sender with NO group co-membership: the friend lookup
+        // misses, the group fallback (ZEB-424) is consulted and also misses,
+        // then the deposit is rejected — the decrypt probe (and everything
+        // after it) is never reached.
         let ctx = TestCtx {
             friends: BTreeMap::new(),
             ..TestCtx::for_fixture(&f)
@@ -1115,15 +1220,17 @@ mod tests {
         let err = handle_deposit_core(&f.frame, &ctx)
             .await
             .expect_err("non-friend deposit must be rejected");
-        assert_eq!(err, DepositReject::NotFriend);
+        assert_eq!(err, DepositReject::NotAuthorized);
         assert_eq!(
             ctx.events(),
-            vec!["friend_lookup".to_string()],
-            "no crypto step (decrypt) and no persist may run for a non-friend"
+            vec!["friend_lookup".to_string(), "group_lookup".to_string()],
+            "no crypto step (decrypt) and no persist may run for a non-authorized sender"
         );
         assert!(ctx.store.lock().unwrap().is_empty());
 
-        // Pending / Revoked friends are NOT admitted either (must be Active).
+        // Pending / Revoked friends are NOT admitted by the friend path
+        // (must be Active); with no group co-membership they fall through the
+        // group fallback and reject.
         for status in [FriendStatus::Pending, FriendStatus::Revoked] {
             let mut friends = BTreeMap::new();
             friends.insert(f.sender_owner, (f.sender_master, status));
@@ -1134,8 +1241,11 @@ mod tests {
             let err = handle_deposit_core(&f.frame, &ctx)
                 .await
                 .expect_err("non-Active friend must be rejected");
-            assert_eq!(err, DepositReject::NotFriend);
-            assert_eq!(ctx.events(), vec!["friend_lookup".to_string()]);
+            assert_eq!(err, DepositReject::NotAuthorized);
+            assert_eq!(
+                ctx.events(),
+                vec!["friend_lookup".to_string(), "group_lookup".to_string()]
+            );
         }
 
         // Wrong recipient: rejected before even the friend lookup (cheapest
