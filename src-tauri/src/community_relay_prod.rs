@@ -27,13 +27,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use zeroize::Zeroizing;
 
+use crate::butler_deposit::DepositPayload;
 use crate::community_relay::{RelayHeldBlob, RELAY_HOLD_GLOBAL_CAP, RELAY_HOLD_PER_SENDER_CAP};
 use crate::community_relay_hold_crdt::{RelayHoldDoc, RelayHoldEntry};
 use crate::community_relay_optin::RelayOptInDoc;
+use crate::community_relay_pull::RelayIngestCtx;
 use crate::fleet_sync::FleetSyncEngine;
 use crate::iroh_community_relay_acceptor::{RelayDepositCtx, RelayPersistVerdict, RelayPullCtx};
-use crate::owner_state_types::{Hlc, SpaceId};
+use crate::owner_state_types::{Hlc, InboxEntry, ReceivedMessage, SpaceId};
 
 // =====================================================================
 // Membership seam
@@ -291,6 +294,183 @@ impl RelayPullCtx for ProdRelayPullCtx {
         self.flush.flush_now().await?;
         Ok(())
     }
+}
+
+// =====================================================================
+// ProdRelayIngestCtx
+// =====================================================================
+
+/// Production [`RelayIngestCtx`] (ZEB-458 P4 Phase B): the recipient-side ingest
+/// for blobs pulled off a community relay. After
+/// [`crate::community_relay_pull::open_and_ingest`] opens a sealed blob to one
+/// of this owner's device keys and decodes the [`DepositPayload`], this ctx runs
+/// it through the SAME normal DM receive path a direct arrival takes — so a
+/// relayed message and a directly-delivered one are indistinguishable to the UI
+/// and to persistence.
+///
+/// `ingest_recovered` mirrors [`crate::dm_inbox_ingest::ProdDmInboxIngestCtx`]'s
+/// `cas_put` → `verify` → `apply_inbox` → emit sequence, reusing the SAME
+/// `pub(crate)` receive-path helpers extracted from `handle_cidnotify_lifted`
+/// (`dm_outbox::verify_cidnotify_admission`,
+/// `dm_outbox::decrypt_and_bind_dm_blob`) under the owner-state lock, and the
+/// SAME `dm-received` event. There is NO separate `sender_owner` field on a
+/// `DepositPayload` (unlike the butler's `DmInboxEntry`), so the sender is
+/// derived from the signed CidNotify packet itself by
+/// `verify_cidnotify_admission` (`resolved_owner`), exactly as the direct path
+/// resolves it — no out-of-band sender claim to cross-check.
+///
+/// `Err(reason)` from any step leaves the blob unacked (the relay keeps holding
+/// it; a later pull retries), so the relay's coverage-GC `ack ⟹ ingested`
+/// invariant holds.
+pub struct ProdRelayIngestCtx {
+    /// This device's SP1 device id (64-hex of the device ed25519 verify key),
+    /// stamped as `received_at.device_id` on the inbox entry (mirrors the
+    /// normal path's `outbox_g.device_id`).
+    pub device_id: String,
+    /// X25519 private keys for each enrolled device this node holds (one per
+    /// device). `open_and_ingest` tries each against the sealed blob; in
+    /// practice a single device holds one key.
+    pub device_x25519_privs: Vec<Zeroizing<[u8; 32]>>,
+    /// The runtime owner-state CRDT (`NodeState`'s `crdt_state` Arc) — admission
+    /// (`verify_cidnotify_admission`) + `apply_inbox` happen under this lock.
+    pub crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    /// The shared CAS handle (`RuntimeContentStore` in production) — the storage
+    /// blob is put here so the message body is fetchable like a direct arrival.
+    pub content_store: Arc<dyn crate::content_store::ContentStore>,
+    /// Event sink for the `dm-received` emit (ZEB-445).
+    pub sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
+}
+
+#[async_trait]
+impl RelayIngestCtx for ProdRelayIngestCtx {
+    fn device_x25519_privs(&self) -> Vec<Zeroizing<[u8; 32]>> {
+        self.device_x25519_privs.clone()
+    }
+
+    async fn ingest_recovered(&self, payload: DepositPayload) -> Result<(), String> {
+        // 1. Decode the recovered packet — must be a signed CidNotify.
+        let packet = crate::dm_envelope::decode_packet(&payload.cidnotify_packet)
+            .map_err(|e| format!("decode_packet: {e}"))?;
+        let crate::dm_envelope::DmPacket::CidNotify {
+            signed,
+            signature,
+            signed_bytes,
+        } = packet
+        else {
+            return Err("recovered packet is not a CidNotify".into());
+        };
+
+        // 2. CAS-put the storage blob FIRST so the body is fetchable at the
+        //    packet's message_cid before anything references the CID — exactly
+        //    as the dm-inbox sweeper does (idempotent on content address).
+        let computed_cid = harmony_content::cid::ContentId::for_book(
+            &payload.storage_blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("for_book: {e:?}"))?;
+        self.content_store
+            .put(computed_cid, payload.storage_blob.clone())
+            .await
+            .map_err(|e| format!("cas put: {e}"))?;
+
+        // 3. Normal receive-path admission under the owner-state lock
+        //    (signature, owner resolution, Space lookup, SpaceKind gate,
+        //    membership). The sender identity (`resolved_owner`) is derived
+        //    here from the packet — there is no separate sender claim to bind.
+        //    `apply_inbox` runs under the SAME lock acquisition so admission and
+        //    the durable insert are atomic, matching the direct path.
+        let (resolved_owner, payload_msg, newly_inserted, received_at, space_id, message_cid) = {
+            let mut state = self.crdt_state.lock().await;
+            let (space, resolved_owner, _identity_pub) =
+                crate::dm_outbox::verify_cidnotify_admission(
+                    &state,
+                    &signed,
+                    &signature,
+                    &signed_bytes,
+                )
+                .map_err(|e| format!("verify_cidnotify_admission: {e:?}"))?;
+
+            // 4. Blob ↔ packet binding: the recovered storage blob must hash to
+            //    the packet's message_cid under the DM send path's flags.
+            if computed_cid != signed.message_cid {
+                return Err("storage blob CID does not match packet message_cid".into());
+            }
+
+            // 5. Decrypt + sender binding — the normal path's Phase C.
+            let payload_msg = crate::dm_outbox::decrypt_and_bind_dm_blob(
+                &space,
+                &payload.storage_blob,
+                resolved_owner,
+            )
+            .map_err(|e| format!("decrypt_and_bind_dm_blob: {e:?}"))?;
+
+            // 6. apply_inbox — idempotent on (space_id, message_cid). `from` =
+            //    the resolved sender, `received_at` = now (this device's id),
+            //    mirroring the direct path's `inbox_entry`. A message that ALSO
+            //    arrived direct dedupes here (Merged → no re-emit).
+            let received_at = Hlc {
+                wall_ms: now_epoch_ms(),
+                logical: 0,
+                device_id: self.device_id.clone(),
+            };
+            let inbox_entry = InboxEntry {
+                space_id: signed.space_id,
+                message_cid: signed.message_cid,
+                from: resolved_owner,
+                received_at: received_at.clone(),
+            };
+            let newly_inserted = match state.apply_inbox(inbox_entry) {
+                crate::owner_state_crdt::ApplyOutcome::Inserted => true,
+                crate::owner_state_crdt::ApplyOutcome::Merged { .. } => false,
+                crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+                    return Err(format!("apply_inbox rejected: {reason:?}"));
+                }
+            };
+            (
+                resolved_owner,
+                payload_msg,
+                newly_inserted,
+                received_at,
+                signed.space_id,
+                signed.message_cid,
+            )
+        };
+
+        // 7. Emit the SAME dm-received event the normal path emits, gated on
+        //    Inserted (a duplicate — direct arrival or an earlier ingest — never
+        //    re-emits). Done AFTER the lock is released.
+        if newly_inserted {
+            let rm = ReceivedMessage {
+                inbox_entry: InboxEntry {
+                    space_id,
+                    message_cid,
+                    from: resolved_owner,
+                    received_at,
+                },
+                body: payload_msg.body,
+                mime_type: payload_msg.mime_type,
+                sent_at: payload_msg.sent_at,
+            };
+            crate::node_event_sink::emit_ser(
+                self.sink.as_ref(),
+                crate::dm_outbox::DM_RECEIVED_EVENT,
+                &crate::dm_outbox::dm_received_event_payload(&rm),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Wall-clock now in epoch-MS for `received_at` (the inbox entry's receive
+/// stamp). Separate from [`now_epoch_secs`] (cert expiry uses seconds).
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
