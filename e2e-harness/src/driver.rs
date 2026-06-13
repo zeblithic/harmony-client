@@ -85,25 +85,36 @@ pub async fn poll_join_iroh(
     url: &str,
     timeout: Duration,
 ) -> anyhow::Result<Value> {
-    poll_until(timeout, || async {
+    let deadline = std::time::Instant::now() + timeout;
+    // Capture the last error/outcome so a hard failure surfaces its real message
+    // on timeout instead of a bare generic timeout (Cursor: poll retries permanent
+    // RPC errors). A terminal non-join status still fails fast immediately.
+    let mut last_err = String::from("(no redeem attempt completed before the deadline)");
+    loop {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("poll_join_iroh timed out after {timeout:?}; last error: {last_err}");
+        }
         match redeem_invite_iroh(node, url).await {
             Ok(outcome) => match outcome.get("status").and_then(|v| v.as_str()) {
-                Some("joined") => Ok(Some(outcome)),
+                Some("joined") => return Ok(outcome),
                 // pkarr/iroh not yet converged — keep polling.
-                Some("inviter_unreachable") => Ok(None),
+                Some("inviter_unreachable") => {
+                    last_err = format!("inviter_unreachable ({outcome})")
+                }
+                // A terminal non-join status (e.g. join_failed) is NOT retryable.
                 other => {
                     anyhow::bail!("iroh redeem terminal non-join status: {other:?} ({outcome})")
                 }
             },
-            // Transient RPC error (pkarr relay cooldown, transport hiccup): the
-            // relay pool recovers and pkarr propagates — retry, don't fail.
+            // RPC error (pkarr relay cooldown, transport hiccup, etc.): retry, but
+            // remember it so a persistent/permanent failure is reported on timeout.
             Err(e) => {
                 eprintln!("poll_join_iroh transient error (retrying): {e}");
-                Ok(None)
+                last_err = e.to_string();
             }
         }
-    })
-    .await
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 pub async fn list_community_members(
