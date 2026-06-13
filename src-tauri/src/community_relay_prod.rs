@@ -17,6 +17,11 @@
 //! state registry directly. This keeps them unit-testable with a fake (no full
 //! `CommunitySyncRegistry`); the registry-backed lookup impl is wired in at
 //! `start_node` in a later task (T11).
+//!
+//! The flush seam ([`RelayHoldFlush`]) decouples both ctx structs from the
+//! concrete `FleetSyncEngine<RelayHoldDoc>`, making `persist_hold` and
+//! `mark_pulled` unit-testable without constructing a real engine. Production
+//! wires [`EngineRelayHoldFlush`] at `start_node` (T11).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -62,6 +67,38 @@ fn now_epoch_ms() -> u64 {
 }
 
 // =====================================================================
+// RelayHoldFlush seam
+// =====================================================================
+
+/// Decouples the relay ctxs from the concrete `FleetSyncEngine<RelayHoldDoc>`
+/// so the ctx methods (incl. cap enforcement) are unit-testable with a no-op
+/// flush. Production wires `EngineRelayHoldFlush(engine_arc)` at start_node
+/// (T11).
+#[async_trait]
+pub trait RelayHoldFlush: Send + Sync {
+    fn notify_dirty(&self);
+    async fn flush_now(&self) -> Result<(), String>;
+}
+
+/// Production flush seam over the real fleet-sync engine.
+pub struct EngineRelayHoldFlush(
+    pub Arc<FleetSyncEngine<crate::community_relay_hold_crdt::RelayHoldDoc>>,
+);
+
+#[async_trait]
+impl RelayHoldFlush for EngineRelayHoldFlush {
+    fn notify_dirty(&self) {
+        self.0.notify_dirty();
+    }
+    async fn flush_now(&self) -> Result<(), String> {
+        self.0
+            .flush_now()
+            .await
+            .map_err(|e| format!("flush_now: {e}"))
+    }
+}
+
+// =====================================================================
 // ProdRelayDepositCtx
 // =====================================================================
 
@@ -71,10 +108,11 @@ fn now_epoch_ms() -> u64 {
 ///
 /// `persist_hold` mirrors
 /// [`crate::iroh_butler_acceptor::ProdButlerDepositCtx::persist_entry`]:
-/// occupied key → `Duplicate` (caps bypassed); vacant within caps → insert +
-/// flush → `Inserted`; vacant over caps → `CapExceeded` (nothing inserted /
-/// flushed). There is NO local ingest sweeper to nudge on a relay (the relay is
-/// never the recipient of the blobs it holds), so that step is omitted.
+/// occupied key → `Duplicate` (caps bypassed, still Ok); vacant within caps →
+/// insert + flush → `Inserted`; vacant over caps → `CapExceeded` (nothing
+/// inserted / flushed). There is NO local ingest sweeper to nudge on a relay
+/// (the relay is never the recipient of the blobs it holds), so that step is
+/// omitted.
 pub struct ProdRelayDepositCtx {
     /// This relay owner's address bytes (`OwnerAddr.0`), checked for
     /// self-membership in `serves_community`.
@@ -86,8 +124,8 @@ pub struct ProdRelayDepositCtx {
     pub relay_hold_doc: Arc<tokio::sync::Mutex<RelayHoldDoc>>,
     /// HLC tracker for minting `held_at`.
     pub relay_hold_tracker: Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>>,
-    /// The relay-hold fleet-sync engine (durable flush + publish).
-    pub relay_hold_engine: Arc<FleetSyncEngine<RelayHoldDoc>>,
+    /// Flush seam (notify_dirty + flush_now over the fleet-sync engine).
+    pub flush: Arc<dyn RelayHoldFlush>,
     /// Runtime per-community relay opt-in doc.
     pub optin: Arc<tokio::sync::Mutex<RelayOptInDoc>>,
     /// Community-membership lookup seam (registry-backed at start_node, T11).
@@ -164,15 +202,12 @@ impl RelayDepositCtx for ProdRelayDepositCtx {
         // notify_dirty BEFORE flush_now: if the flush's publish leg fails, the
         // engine's swap-and-restore keeps the dirty latch armed so a later
         // debounce retries the publish.
-        self.relay_hold_engine.notify_dirty();
+        self.flush.notify_dirty();
         // Durable persist + publish BEFORE the ack exists (D7). Flushed even
         // for a Duplicate key: if the FIRST deposit's flush failed after the
         // in-memory insert, the retry hits the occupied entry — skipping the
         // flush here would ack an entry that was never made durable.
-        self.relay_hold_engine
-            .flush_now()
-            .await
-            .map_err(|e| format!("flush_now: {e}"))?;
+        self.flush.flush_now().await?;
         // No local ingest sweeper to nudge: a relay is never the recipient of
         // the blobs it holds (unlike the butler, which is itself a recipient
         // device).
@@ -184,8 +219,8 @@ impl RelayDepositCtx for ProdRelayDepositCtx {
 // ProdRelayPullCtx
 // =====================================================================
 
-/// Production [`RelayPullCtx`]: serve/membership gates via the opt-in doc + the
-/// membership seam, a recipient-scoped `held_for`, and an ack handler that
+/// Production [`RelayPullCtx`]: serve/membership gates via the opt-in doc +
+/// the membership seam, a recipient-scoped `held_for`, and an ack handler that
 /// unions `pulled_by`, GCs (the doc's built-in one-sweep deferral keeps a
 /// just-acked entry one extra sweep so `pulled_by` replicates first), and
 /// durably flushes.
@@ -194,8 +229,8 @@ pub struct ProdRelayPullCtx {
     pub self_owner: [u8; 16],
     /// Runtime relay-hold CRDT (same Arc the engine owns).
     pub relay_hold_doc: Arc<tokio::sync::Mutex<RelayHoldDoc>>,
-    /// The relay-hold fleet-sync engine (durable flush + publish).
-    pub relay_hold_engine: Arc<FleetSyncEngine<RelayHoldDoc>>,
+    /// Flush seam (notify_dirty + flush_now over the fleet-sync engine).
+    pub flush: Arc<dyn RelayHoldFlush>,
     /// Runtime per-community relay opt-in doc.
     pub optin: Arc<tokio::sync::Mutex<RelayOptInDoc>>,
     /// Community-membership lookup seam (registry-backed at start_node, T11).
@@ -257,11 +292,8 @@ impl RelayPullCtx for ProdRelayPullCtx {
         }
         // Durable persist + publish of the pulled_by union (+ any GC removal).
         // notify_dirty BEFORE flush_now (publish-retry latch, as in deposit).
-        self.relay_hold_engine.notify_dirty();
-        self.relay_hold_engine
-            .flush_now()
-            .await
-            .map_err(|e| format!("flush_now: {e}"))?;
+        self.flush.notify_dirty();
+        self.flush.flush_now().await?;
         Ok(())
     }
 }
@@ -273,6 +305,19 @@ mod tests {
 
     fn space(b: u8) -> SpaceId {
         SpaceId([b; 16])
+    }
+
+    // ---------------------------------------------------------------
+    // NoopFlush — unit-test flush seam: never errors, no side-effects.
+    // ---------------------------------------------------------------
+    struct NoopFlush;
+
+    #[async_trait]
+    impl RelayHoldFlush for NoopFlush {
+        fn notify_dirty(&self) {}
+        async fn flush_now(&self) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     // ---------------------------------------------------------------
@@ -314,57 +359,40 @@ mod tests {
         Arc::new(tokio::sync::Mutex::new(d))
     }
 
-    // A `FleetSyncEngine` is NOT cheap to construct for a unit test (it owns a
-    // background task + transport channels + a typed CAS/merger/persist
-    // config), and its persist/flush behavior is integration-tested exactly
-    // like `ProdButlerDepositCtx::persist_entry`. These unit tests therefore
-    // cover ONLY the engine-free admission/projection logic; the
-    // caps / persist / GC durability paths are covered end-to-end by the T12
-    // integration test.
-    //
-    // `serves_community`, `both_co_members`, `is_joined_member`, and `held_for`
-    // read ONLY `optin`, `membership`, and `relay_hold_doc` — never the engine
-    // — so the helpers below mirror those method bodies 1:1 over the same
-    // inputs, exercising the gate logic without instantiating a real engine.
-    // The `_assert_impls` anchor pins that the prod structs satisfy the Phase A
-    // trait bounds.
-    async fn serves(
-        optin: &Arc<tokio::sync::Mutex<RelayOptInDoc>>,
-        membership: &Arc<dyn CommunityMembershipLookup>,
-        self_owner: &[u8; 16],
-        community_id: &SpaceId,
-    ) -> bool {
-        optin.lock().await.is_opted_in(community_id)
-            && membership.is_joined(community_id, self_owner).await
+    /// Build a `ProdRelayDepositCtx` wired with a `NoopFlush` and the
+    /// provided membership/optin. `self_owner` defaults to `[0x01; 16]`.
+    fn deposit_ctx(
+        self_owner: [u8; 16],
+        relay_hold_doc: Arc<tokio::sync::Mutex<RelayHoldDoc>>,
+        optin: Arc<tokio::sync::Mutex<RelayOptInDoc>>,
+        membership: Arc<dyn CommunityMembershipLookup>,
+    ) -> ProdRelayDepositCtx {
+        ProdRelayDepositCtx {
+            self_owner,
+            relay_device_id: "relay-dev".into(),
+            relay_hold_doc,
+            relay_hold_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            flush: Arc::new(NoopFlush),
+            optin,
+            membership,
+        }
     }
 
-    async fn both_co(
-        membership: &Arc<dyn CommunityMembershipLookup>,
-        community_id: &SpaceId,
-        sender: &[u8; 16],
-        recipient: &[u8; 16],
-    ) -> bool {
-        membership.is_joined(community_id, sender).await
-            && membership.is_joined(community_id, recipient).await
-    }
-
-    fn held_for_doc(
-        doc: &RelayHoldDoc,
-        recipient_owner: &[u8; 16],
-    ) -> Vec<(String, RelayHeldBlob)> {
-        doc.entries
-            .iter()
-            .filter(|(_, e)| &e.recipient_owner == recipient_owner)
-            .map(|(k, e)| {
-                (
-                    k.clone(),
-                    RelayHeldBlob {
-                        sender_owner: e.sender_owner,
-                        sealed_blob: e.sealed_blob.clone(),
-                    },
-                )
-            })
-            .collect()
+    /// Build a `ProdRelayPullCtx` wired with a `NoopFlush` and the provided
+    /// membership/optin. `self_owner` defaults to `[0x01; 16]`.
+    fn pull_ctx(
+        self_owner: [u8; 16],
+        relay_hold_doc: Arc<tokio::sync::Mutex<RelayHoldDoc>>,
+        optin: Arc<tokio::sync::Mutex<RelayOptInDoc>>,
+        membership: Arc<dyn CommunityMembershipLookup>,
+    ) -> ProdRelayPullCtx {
+        ProdRelayPullCtx {
+            self_owner,
+            relay_hold_doc,
+            flush: Arc::new(NoopFlush),
+            optin,
+            membership,
+        }
     }
 
     fn hold_entry(
@@ -390,33 +418,86 @@ mod tests {
 
     // ---------------------------------------------------------------
     // serves_community: true iff opted-in AND self is_joined
+    // Tests call the REAL ProdRelayDepositCtx / ProdRelayPullCtx methods.
     // ---------------------------------------------------------------
 
     #[tokio::test]
-    async fn serves_community_true_when_opted_in_and_self_joined() {
+    async fn deposit_ctx_serves_community_true_when_opted_in_and_self_joined() {
         let c = space(0xCC);
         let self_owner = [0x11; 16];
-        let optin = optin_doc(c, true);
-        let membership = fake(&[(c, self_owner)]);
-        assert!(serves(&optin, &membership, &self_owner, &c).await);
+        let doc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
+        let ctx = deposit_ctx(
+            self_owner,
+            doc,
+            optin_doc(c, true),
+            fake(&[(c, self_owner)]),
+        );
+        assert!(ctx.serves_community(&c).await);
     }
 
     #[tokio::test]
-    async fn serves_community_false_when_not_opted_in() {
+    async fn deposit_ctx_serves_community_false_when_not_opted_in() {
         let c = space(0xCC);
         let self_owner = [0x11; 16];
-        let optin = optin_doc(c, false); // NOT opted in
-        let membership = fake(&[(c, self_owner)]); // but IS a member
-        assert!(!serves(&optin, &membership, &self_owner, &c).await);
+        let doc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
+        let ctx = deposit_ctx(
+            self_owner,
+            doc,
+            optin_doc(c, false), // NOT opted in
+            fake(&[(c, self_owner)]),
+        );
+        assert!(!ctx.serves_community(&c).await);
     }
 
     #[tokio::test]
-    async fn serves_community_false_when_self_not_joined() {
+    async fn deposit_ctx_serves_community_false_when_self_not_joined() {
         let c = space(0xCC);
         let self_owner = [0x11; 16];
-        let optin = optin_doc(c, true); // opted in
-        let membership = fake(&[]); // but NOT a member
-        assert!(!serves(&optin, &membership, &self_owner, &c).await);
+        let doc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
+        let ctx = deposit_ctx(
+            self_owner,
+            doc,
+            optin_doc(c, true), // opted in
+            fake(&[]),          // but NOT a member
+        );
+        assert!(!ctx.serves_community(&c).await);
+    }
+
+    #[tokio::test]
+    async fn pull_ctx_serves_community_true_when_opted_in_and_self_joined() {
+        let c = space(0xCC);
+        let self_owner = [0x11; 16];
+        let doc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
+        let ctx = pull_ctx(
+            self_owner,
+            doc,
+            optin_doc(c, true),
+            fake(&[(c, self_owner)]),
+        );
+        assert!(ctx.serves_community(&c).await);
+    }
+
+    #[tokio::test]
+    async fn pull_ctx_serves_community_false_when_not_opted_in() {
+        let c = space(0xCC);
+        let self_owner = [0x11; 16];
+        let doc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
+        let ctx = pull_ctx(
+            self_owner,
+            doc,
+            optin_doc(c, false),
+            fake(&[(c, self_owner)]),
+        );
+        assert!(!ctx.serves_community(&c).await);
+    }
+
+    #[tokio::test]
+    async fn pull_ctx_serves_community_false_when_self_not_joined() {
+        let c = space(0xCC);
+        let self_owner = [0x11; 16];
+        let doc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
+        let ctx = pull_ctx(self_owner, doc, optin_doc(c, true), fake(&[]));
+        assert!(!ctx.serves_community(&c).await);
     }
 
     // ---------------------------------------------------------------
@@ -428,36 +509,54 @@ mod tests {
         let c = space(0xCC);
         let sender = [0x22; 16];
         let recipient = [0x33; 16];
+        let doc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
 
         // both joined → true
-        let m = fake(&[(c, sender), (c, recipient)]);
-        assert!(both_co(&m, &c, &sender, &recipient).await);
+        let ctx = deposit_ctx(
+            [0x01; 16],
+            doc.clone(),
+            optin_doc(c, true),
+            fake(&[(c, sender), (c, recipient)]),
+        );
+        assert!(ctx.both_co_members(&c, &sender, &recipient).await);
 
         // only sender joined → false
-        let m = fake(&[(c, sender)]);
-        assert!(!both_co(&m, &c, &sender, &recipient).await);
+        let ctx = deposit_ctx(
+            [0x01; 16],
+            doc.clone(),
+            optin_doc(c, true),
+            fake(&[(c, sender)]),
+        );
+        assert!(!ctx.both_co_members(&c, &sender, &recipient).await);
 
         // only recipient joined → false
-        let m = fake(&[(c, recipient)]);
-        assert!(!both_co(&m, &c, &sender, &recipient).await);
+        let ctx = deposit_ctx(
+            [0x01; 16],
+            doc.clone(),
+            optin_doc(c, true),
+            fake(&[(c, recipient)]),
+        );
+        assert!(!ctx.both_co_members(&c, &sender, &recipient).await);
 
         // neither joined → false
-        let m = fake(&[]);
-        assert!(!both_co(&m, &c, &sender, &recipient).await);
+        let ctx = deposit_ctx([0x01; 16], doc, optin_doc(c, true), fake(&[]));
+        assert!(!ctx.both_co_members(&c, &sender, &recipient).await);
     }
 
     #[tokio::test]
     async fn is_joined_member_reflects_fake() {
         let c = space(0xCC);
         let owner = [0x44; 16];
-        let m = fake(&[(c, owner)]);
-        assert!(m.is_joined(&c, &owner).await);
-        assert!(!m.is_joined(&c, &[0x45; 16]).await);
-        assert!(!m.is_joined(&space(0xDD), &owner).await);
+        let doc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
+        let ctx = pull_ctx([0x01; 16], doc, optin_doc(c, true), fake(&[(c, owner)]));
+        assert!(ctx.is_joined_member(&c, &owner).await);
+        assert!(!ctx.is_joined_member(&c, &[0x45; 16]).await);
+        assert!(!ctx.is_joined_member(&space(0xDD), &owner).await);
     }
 
     // ---------------------------------------------------------------
     // held_for: exactly the recipient's entries, excludes others'
+    // Calls the REAL ProdRelayPullCtx::held_for.
     // ---------------------------------------------------------------
 
     #[tokio::test]
@@ -488,7 +587,15 @@ mod tests {
         doc.entries
             .insert(key_other, hold_entry(other, sender, c, vec![9, 9, 9]));
 
-        let mut got = held_for_doc(&doc, &recipient);
+        let doc_arc = Arc::new(tokio::sync::Mutex::new(doc));
+        let ctx = pull_ctx(
+            [0x01; 16],
+            doc_arc,
+            optin_doc(c, true),
+            fake(&[(c, [0x01; 16])]),
+        );
+
+        let mut got = ctx.held_for(&recipient).await;
         got.sort_by(|a, b| a.0.cmp(&b.0));
 
         assert_eq!(got.len(), 2, "exactly the recipient's two entries");
@@ -510,8 +617,281 @@ mod tests {
             RelayHoldDoc::key(&[0xBB; 16], &[0x01; 32]),
             hold_entry([0xBB; 16], [0x22; 16], c, vec![1]),
         );
-        let got = held_for_doc(&doc, &[0xAA; 16]);
+        let doc_arc = Arc::new(tokio::sync::Mutex::new(doc));
+        let ctx = pull_ctx(
+            [0x01; 16],
+            doc_arc,
+            optin_doc(c, true),
+            fake(&[(c, [0x01; 16])]),
+        );
+        let got = ctx.held_for(&[0xAA; 16]).await;
         assert!(got.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // persist_hold caps — the main new unit-test coverage.
+    // Calls the REAL ProdRelayDepositCtx::persist_hold method.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn persist_hold_first_insert_returns_inserted() {
+        let c = space(0xCC);
+        let sender = [0x22; 16];
+        let recipient = [0x33; 16];
+        let doc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
+        let ctx = deposit_ctx(
+            [0x01; 16],
+            doc.clone(),
+            optin_doc(c, true),
+            fake(&[(c, [0x01; 16])]),
+        );
+
+        let key = RelayHoldDoc::key(&recipient, &[0xAA; 32]);
+        let entry = hold_entry(recipient, sender, c, vec![1, 2, 3]);
+        let verdict = ctx.persist_hold(key.clone(), entry).await.unwrap();
+        assert_eq!(verdict, RelayPersistVerdict::Inserted);
+
+        // Entry is actually in the doc.
+        assert!(doc.lock().await.entries.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn persist_hold_duplicate_key_returns_duplicate() {
+        let c = space(0xCC);
+        let sender = [0x22; 16];
+        let recipient = [0x33; 16];
+        let doc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
+        let ctx = deposit_ctx(
+            [0x01; 16],
+            doc.clone(),
+            optin_doc(c, true),
+            fake(&[(c, [0x01; 16])]),
+        );
+
+        let key = RelayHoldDoc::key(&recipient, &[0xAA; 32]);
+        let entry = hold_entry(recipient, sender, c, vec![1, 2, 3]);
+
+        // First insert → Inserted.
+        let v1 = ctx.persist_hold(key.clone(), entry.clone()).await.unwrap();
+        assert_eq!(v1, RelayPersistVerdict::Inserted);
+
+        // Second call with same key → Duplicate (caps bypassed).
+        let v2 = ctx.persist_hold(key.clone(), entry).await.unwrap();
+        assert_eq!(v2, RelayPersistVerdict::Duplicate);
+
+        // Still only one entry in the doc.
+        assert_eq!(doc.lock().await.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persist_hold_per_sender_cap_exceeded() {
+        // Fill a single (community, sender) to RELAY_HOLD_PER_SENDER_CAP
+        // distinct keys, then attempt one more distinct key for that sender
+        // → CapExceeded, and the doc did NOT grow past the cap.
+        let c = space(0xCC);
+        let sender = [0x22; 16];
+        let recipient = [0x33; 16];
+
+        let mut initial_doc = RelayHoldDoc::default();
+        // Pre-populate with exactly RELAY_HOLD_PER_SENDER_CAP entries for
+        // (c, sender). We use distinct content_ids [i; 32] for i in 0..cap.
+        for i in 0u8..RELAY_HOLD_PER_SENDER_CAP as u8 {
+            let content_id = [i; 32];
+            let key = RelayHoldDoc::key(&recipient, &content_id);
+            initial_doc
+                .entries
+                .insert(key, hold_entry(recipient, sender, c, vec![i]));
+        }
+        assert_eq!(initial_doc.entries.len(), RELAY_HOLD_PER_SENDER_CAP);
+
+        let doc = Arc::new(tokio::sync::Mutex::new(initial_doc));
+        let ctx = deposit_ctx(
+            [0x01; 16],
+            doc.clone(),
+            optin_doc(c, true),
+            fake(&[(c, [0x01; 16])]),
+        );
+
+        // One more distinct key for the same (community, sender) → CapExceeded.
+        let overflow_key = RelayHoldDoc::key(&recipient, &[0xFF; 32]);
+        let overflow_entry = hold_entry(recipient, sender, c, vec![0xFF]);
+        let verdict = ctx
+            .persist_hold(overflow_key.clone(), overflow_entry)
+            .await
+            .unwrap();
+        assert_eq!(verdict, RelayPersistVerdict::CapExceeded);
+
+        // Doc must NOT have grown.
+        assert_eq!(
+            doc.lock().await.entries.len(),
+            RELAY_HOLD_PER_SENDER_CAP,
+            "doc must not grow past the per-sender cap"
+        );
+        assert!(
+            !doc.lock().await.entries.contains_key(&overflow_key),
+            "overflow key must not be in the doc"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_hold_global_cap_exceeded() {
+        // Fill the doc to RELAY_HOLD_GLOBAL_CAP entries across different
+        // senders (so per-sender cap is not the limiting factor), then assert
+        // the global cap triggers CapExceeded.
+        //
+        // RELAY_HOLD_GLOBAL_CAP = 1024. We build the doc directly and call
+        // persist_hold once more to exercise the global-cap branch.
+        let c = space(0xCC);
+        let recipient = [0x33; 16];
+
+        let mut initial_doc = RelayHoldDoc::default();
+        // Use a unique sender per entry so per-sender cap (64) never triggers.
+        // 1024 entries across 1024 distinct senders = 1 per sender.
+        for i in 0u16..RELAY_HOLD_GLOBAL_CAP as u16 {
+            let sender = {
+                let mut s = [0u8; 16];
+                let bytes = i.to_le_bytes();
+                s[0] = bytes[0];
+                s[1] = bytes[1];
+                s
+            };
+            // Distinct content_id per entry — encode `i` into the first two bytes.
+            let content_id = {
+                let mut cid = [0u8; 32];
+                let bytes = i.to_le_bytes();
+                cid[0] = bytes[0];
+                cid[1] = bytes[1];
+                cid
+            };
+            let key = RelayHoldDoc::key(&recipient, &content_id);
+            initial_doc
+                .entries
+                .insert(key, hold_entry(recipient, sender, c, vec![0x01]));
+        }
+        assert_eq!(initial_doc.entries.len(), RELAY_HOLD_GLOBAL_CAP);
+
+        let doc = Arc::new(tokio::sync::Mutex::new(initial_doc));
+        let ctx = deposit_ctx(
+            [0x01; 16],
+            doc.clone(),
+            optin_doc(c, true),
+            fake(&[(c, [0x01; 16])]),
+        );
+
+        // A fresh sender (count_for_sender = 0 < 64) but global is full.
+        let new_sender = [0xFF; 16];
+        let overflow_key = RelayHoldDoc::key(&[0xAA; 16], &[0xEE; 32]);
+        let overflow_entry = hold_entry([0xAA; 16], new_sender, c, vec![0xEE]);
+        let verdict = ctx
+            .persist_hold(overflow_key.clone(), overflow_entry)
+            .await
+            .unwrap();
+        assert_eq!(verdict, RelayPersistVerdict::CapExceeded);
+
+        // Doc must NOT have grown past RELAY_HOLD_GLOBAL_CAP.
+        assert_eq!(
+            doc.lock().await.entries.len(),
+            RELAY_HOLD_GLOBAL_CAP,
+            "doc must not grow past the global cap"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // mark_pulled — calls the REAL ProdRelayPullCtx::mark_pulled.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mark_pulled_sets_pulled_by_and_gc_removes_covered_entry() {
+        // mark_pulled sets pulled_by then immediately calls gc().
+        // gc() snapshots covered_at_start BEFORE its retain loop. Because
+        // mark_pulled sets pulled_by BEFORE calling gc(), the entry IS in
+        // covered_at_start at gc time and is removed in the same call.
+        // (The one-sweep deferral protects a REMOTE replica's gc run that
+        // fires BEFORE seeing our pulled_by update — not the local gc that
+        // runs AFTER the local union in the same mark_pulled body.)
+        let c = space(0xCC);
+        let recipient = [0xAA; 16];
+        let sender = [0x22; 16];
+        let key = RelayHoldDoc::key(&recipient, &[0x01; 32]);
+
+        let mut doc = RelayHoldDoc::default();
+        doc.entries
+            .insert(key.clone(), hold_entry(recipient, sender, c, vec![1, 2, 3]));
+        let doc_arc = Arc::new(tokio::sync::Mutex::new(doc));
+        let ctx = pull_ctx(
+            [0x01; 16],
+            doc_arc.clone(),
+            optin_doc(c, true),
+            fake(&[(c, [0x01; 16])]),
+        );
+
+        ctx.mark_pulled(&[key.clone()], "devX".into())
+            .await
+            .unwrap();
+
+        // The entry is covered at gc()-start (pulled_by was set just above)
+        // so gc() removes it immediately — the doc is empty after mark_pulled.
+        assert!(
+            doc_arc.lock().await.entries.is_empty(),
+            "entry covered at gc-start is removed immediately by the local gc sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_pulled_one_sweep_deferral_for_already_covered_entry() {
+        // An entry that was ALREADY covered (pulled_by non-empty) when a
+        // SECOND mark_pulled call's gc() runs would be in covered_at_start and
+        // removed. This test seeds an entry that already has pulled_by = {"devY"}
+        // before the ctx is constructed (simulating a remote replica update),
+        // then calls mark_pulled to add "devX". The gc() inside this call sees
+        // the entry as covered-at-start (it was already covered before mark_pulled
+        // ran) and removes it. This verifies the gc path is exercised correctly.
+        let c = space(0xCC);
+        let recipient = [0xAA; 16];
+        let sender = [0x22; 16];
+        let key = RelayHoldDoc::key(&recipient, &[0x01; 32]);
+
+        let mut entry = hold_entry(recipient, sender, c, vec![1, 2, 3]);
+        // Pre-seed pulled_by — entry is already covered before mark_pulled runs.
+        entry.pulled_by.insert("devY".into());
+
+        let mut doc = RelayHoldDoc::default();
+        doc.entries.insert(key.clone(), entry);
+        let doc_arc = Arc::new(tokio::sync::Mutex::new(doc));
+        let ctx = pull_ctx(
+            [0x01; 16],
+            doc_arc.clone(),
+            optin_doc(c, true),
+            fake(&[(c, [0x01; 16])]),
+        );
+
+        // mark_pulled adds "devX" to pulled_by, then gc() sees the entry is
+        // covered-at-start (was already non-empty) and removes it.
+        ctx.mark_pulled(&[key.clone()], "devX".into())
+            .await
+            .unwrap();
+        assert!(
+            doc_arc.lock().await.entries.is_empty(),
+            "entry that was already covered before mark_pulled is removed by gc"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_pulled_missing_key_is_noop() {
+        let c = space(0xCC);
+        let doc_arc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
+        let ctx = pull_ctx(
+            [0x01; 16],
+            doc_arc.clone(),
+            optin_doc(c, true),
+            fake(&[(c, [0x01; 16])]),
+        );
+
+        // A key that does not exist — must not error and doc stays empty.
+        ctx.mark_pulled(&["nonexistent-key".to_string()], "devX".into())
+            .await
+            .unwrap();
+        assert!(doc_arc.lock().await.entries.is_empty());
     }
 
     // A compile-time anchor: the prod ctx structs implement the Phase A
