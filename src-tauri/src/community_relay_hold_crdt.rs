@@ -70,12 +70,15 @@ impl RelayHoldDoc {
     /// `DmInboxDoc::merge_from` exactly in shape.
     ///
     /// - New entries insert unconditionally → `Changed`.
-    /// - Existing entries: `pulled_by` merges by union (grow-only); immutable
-    ///   metadata (`held_at`, `held_by`, `sealed_blob`) is first-writer-wins
-    ///   by `held_at` (only a remote with an EARLIER `held_at` replaces the
-    ///   local metadata, exactly mirroring the `deposited_at` rule in
-    ///   `DmInboxDoc`). `Changed` is set ONLY on new entry or `pulled_by`
-    ///   growth — not on metadata-only updates.
+    /// - Existing entries: `pulled_by` merges by union (grow-only); the
+    ///   immutable metadata (`held_at`, `held_by`, `sender_owner`,
+    ///   `community_id`, `sealed_blob`) is first-writer-wins by `held_at` and
+    ///   replaced WHOLESALE (only a remote with an EARLIER `held_at` replaces
+    ///   the local metadata, and when it does it brings ALL of its metadata so
+    ///   the result is never a field-wise hybrid). Mirrors the `deposited_at`
+    ///   rule in `DmInboxDoc`. `Changed` is set ONLY on new entry or `pulled_by`
+    ///   growth — not on metadata-only updates (persistence is unconditional in
+    ///   the fleet-sync engine; `changed` only drives the `on_applied` wakeup).
     pub fn merge_from(&mut self, remote: RelayHoldDoc) -> MergeOutcome {
         let mut changed = false;
         for (k, r) in remote.entries {
@@ -87,11 +90,31 @@ impl RelayHoldDoc {
                 Some(l) => {
                     let before = l.pulled_by.len();
                     l.pulled_by.extend(r.pulled_by);
-                    // First-writer-wins on held_at: keep the earliest deposit.
+                    // First-writer-wins on held_at: when the remote deposit is
+                    // strictly earlier, adopt its immutable metadata WHOLESALE
+                    // (held_at, held_by, sender_owner, community_id, sealed_blob)
+                    // rather than field-wise, so the merged entry always equals a
+                    // state that existed on some replica — never a hybrid.
+                    // `sealed_blob` is content-addressed by the key so it is
+                    // already byte-identical; `sender_owner`/`community_id` are
+                    // NOT part of the content id, so if the same sealed bytes were
+                    // ever deposited via a different frame they must travel
+                    // together with the winning `held_at` rather than being left
+                    // behind from the losing writer.
                     if l.held_at.is_strictly_newer_than(&r.held_at) {
                         l.held_at = r.held_at;
                         l.held_by = r.held_by;
+                        l.sender_owner = r.sender_owner;
+                        l.community_id = r.community_id;
+                        l.sealed_blob = r.sealed_blob;
                     }
+                    // `changed` deliberately flags ONLY new entries / `pulled_by`
+                    // growth, never this metadata churn — it drives the
+                    // `on_applied` wakeup (mirroring `DmInboxDoc`). Persistence is
+                    // unconditional in the fleet-sync engine (`persist_now` runs on
+                    // every `Applied` outcome regardless of `changed`, see
+                    // `fleet_sync.rs`), so the earliest `held_at` is durably kept
+                    // across restarts without flagging `changed`.
                     changed |= l.pulled_by.len() != before;
                 }
             }
@@ -325,6 +348,49 @@ mod tests {
         // But the metadata WAS updated (first-writer-wins → earlier wins).
         assert_eq!(local.entries[&key_rr(1, 2)].held_by, "relay-b");
         assert_eq!(local.entries[&key_rr(1, 2)].held_at, hlc(100, "B"));
+    }
+
+    #[test]
+    fn merge_first_writer_wins_replaces_metadata_wholesale_no_hybrid() {
+        // Same key (content-addressed), but the two writers disagree on the
+        // non-key metadata sender_owner / community_id (reachable only via a
+        // byte-replay of the same sealed blob through a different frame). When
+        // the earlier writer wins, ALL of its metadata must travel together —
+        // the merged entry must equal a state that existed on some replica, not
+        // a hybrid of the earlier held_at with the later sender/community.
+        let mut local = RelayHoldDoc::default();
+        local.entries.insert(
+            key_rr(1, 2),
+            entry([1; 16], [2; 16], space(0xCC), hlc(500, "A"), "relay-a", &[]),
+        );
+        let mut remote = RelayHoldDoc::default();
+        remote.entries.insert(
+            key_rr(1, 2),
+            // EARLIER held_at, DIFFERENT sender_owner + community_id.
+            entry(
+                [1; 16],
+                [0x33; 16],
+                space(0xEE),
+                hlc(100, "B"),
+                "relay-b",
+                &[],
+            ),
+        );
+        let out = local.merge_from(remote);
+        assert!(!out.changed, "metadata-only churn must not flag Changed");
+        let merged = &local.entries[&key_rr(1, 2)];
+        // The earlier writer (remote) wins — its metadata is adopted WHOLESALE.
+        assert_eq!(merged.held_at, hlc(100, "B"));
+        assert_eq!(merged.held_by, "relay-b");
+        assert_eq!(
+            merged.sender_owner, [0x33; 16],
+            "sender_owner must follow the winning held_at, not stay hybrid"
+        );
+        assert_eq!(
+            merged.community_id,
+            space(0xEE),
+            "community_id must follow the winning held_at, not stay hybrid"
+        );
     }
 
     #[test]

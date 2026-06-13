@@ -10,9 +10,18 @@
 //! `wire_format_channel_log_fixtures.rs`: deterministic struct fields,
 //! `canonical_cbor_encode`, hex assertion.
 //!
-//! All three structs use fixed seed bytes so the output is deterministic
-//! across platforms and Rust versions. No random-nonce crypto is needed
-//! here — these are pure CBOR wire types.
+//! All structs use fixed literal byte fields so the output is deterministic
+//! across platforms and Rust versions.
+//!
+//! **No `test-fixtures` gate is needed here (deliberate).** Unlike
+//! `wire_format_channel_log_fixtures.rs` — which gates the specific items that
+//! import/call the deterministic-nonce helper `encrypt_channel_packet_with_nonce`
+//! on `#[cfg(feature = "test-fixtures")]` — this suite calls NO deterministic-nonce
+//! crypto. It constructs the wire types from fixed byte literals and runs
+//! `canonical_cbor_encode` only. The target compiles and runs identically with or
+//! without `--features test-fixtures` (verified by building the test target with
+//! the feature off), so there is no deterministic-nonce variant for the
+//! `tests/wire_format_*_fixtures.rs` guard-rail to keep out of production.
 
 use harmony_app::community_relay::{
     RelayDepositFrame, RelayHeldBlob, RelayPullQuery, RelayPullResponse,

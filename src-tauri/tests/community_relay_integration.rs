@@ -120,11 +120,26 @@ fn load_relay_hold_doc(path: &PathBuf) -> RelayHoldDoc {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RelayHoldDoc::default(),
         Err(e) => panic!("read relay_hold doc: {e}"),
     };
-    assert!(!bytes.is_empty(), "relay_hold doc file is empty");
-    let payload = &bytes[1..]; // skip version byte
+    // Validate the schema-version prefix BEFORE decoding, so this durability
+    // test fails at the version boundary it is meant to exercise rather than
+    // silently decoding an incompatible future format.
+    let (&version, payload) = bytes.split_first().expect("relay_hold doc file is empty");
+    assert_eq!(
+        version, 1u8,
+        "unexpected relay_hold schema version byte: {version}"
+    );
     let mut cursor = std::io::Cursor::new(payload);
     let doc: RelayHoldDoc =
         ciborium::from_reader(&mut cursor).expect("decode relay_hold doc from disk");
+    // Reject trailing bytes — a partial/garbage tail must fail loudly, not be
+    // silently ignored.
+    assert_eq!(
+        cursor.position() as usize,
+        payload.len(),
+        "trailing bytes after relay_hold doc CBOR ({} of {} consumed)",
+        cursor.position(),
+        payload.len()
+    );
     doc
 }
 

@@ -58,12 +58,16 @@ pub const RELAY_HOLD_PER_SENDER_CAP: usize = 64;
 pub const RELAY_HOLD_GLOBAL_CAP: usize = 1024;
 pub const RELAY_HOLD_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
-// Deposit frame: P1 DepositFrame + community_id + recipient_device. The
-// sealed_blob is a DepositPayload sealed to birational(recipient_device_vk).
+// Deposit frame: P1 DepositFrame + community_id. The sealed_blob is a
+// DepositPayload sealed to birational(recipient_device_vk). NOTE (amended): the
+// `recipient_device` field was DROPPED — each seal uses a fresh ephemeral key →
+// unique sealed_blob → unique ContentId, so the content id alone keys per-device
+// copies and a device label on the wire is redundant. `build_relay_deposit_frame`
+// still takes the recipient device's ed25519 verify key as the SEAL TARGET; it
+// just isn't carried as a frame field.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RelayDepositFrame {
     pub recipient_owner: [u8; 16],
-    pub recipient_device: [u8; 16],     // which R device the blob is sealed to
     pub sender_owner: [u8; 16],
     pub community_id: SpaceId,
     #[serde(with = "serde_bytes")] pub sender_enrollment_cert: Vec<u8>,
@@ -190,7 +194,10 @@ Admission order (spec D36):
     fn now_secs(&self) -> u64;
     /// all held blobs for recipient_owner (any device) — returns (key, RelayHeldBlob)
     async fn held_for(&self, recipient_owner: &[u8;16]) -> Vec<(String, RelayHeldBlob)>;
-    /// record that requester_device pulled+acked these keys; runs GC
+    /// record that requester_device pulled+acked these keys (union pulled_by +
+    /// flush). Does NOT run GC inline — GC is a SEPARATE sweep, because the
+    /// one-sweep coverage deferral requires the freshly-set pulled_by to
+    /// replicate across the relay's fleet before any replica removes the entry.
     async fn mark_pulled(&self, keys: &[String], requester_device: String) -> Result<(), String>;
     /// resolve the requester device id from the validated cert (for pulled_by)
     fn requester_device_id_from_cert(&self, cert: &EnrollmentCert) -> Option<String>;
@@ -199,7 +206,7 @@ pub async fn handle_relay_pull_query(query: &RelayPullQuery, ctx: &dyn RelayPull
 pub async fn handle_relay_pull_ack(recipient_owner: &[u8;16], ack: &RelayPullAck, requester_device: String, ctx: &dyn RelayPullCtx) -> Result<(), RelayPullReject>;
 ```
 
-Query flow (spec D39 step 1–2): `serves_community` else reject; decode+verify requester cert (strict, owner-id == `query.recipient_owner`, Master-issued, owner-id-derived anchor); `is_joined_member(community_id, recipient_owner)` else reject; verify `query.sig` over `relay_pull_sig_payload(recipient_owner, community_id)` against the cert device key; then return `held_for(recipient_owner)` as `RelayPullResponse`. Ack flow: validate the same auth, then `mark_pulled(content_id→keys, requester_device)` (translate acked content_ids to stored keys for this recipient), which unions `pulled_by` + runs `gc`.
+Query flow (spec D39 step 1–2): `serves_community` else reject; decode+verify requester cert (strict, owner-id == `query.recipient_owner`, Master-issued, owner-id-derived anchor); `is_joined_member(community_id, recipient_owner)` else reject; verify `query.sig` over `relay_pull_sig_payload(recipient_owner, community_id)` against the cert device key; then return `held_for(recipient_owner)` as `RelayPullResponse`. Ack flow: validate the same auth, then `mark_pulled(content_id→keys, requester_device)` (translate acked content_ids to stored keys for this recipient), which unions `pulled_by` + flushes but does NOT run `gc` inline — GC runs as a separate sweep so the freshly-set `pulled_by` replicates across the relay's fleet first (one-sweep coverage deferral; see Task 2 + the Task 6 ctx note at the bottom of this plan).
 
 `ProdRelayPullCtx` (Task 6) + `#[cfg(test)] TestRelayPullCtx`.
 

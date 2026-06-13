@@ -140,8 +140,12 @@ pub struct RelayPullQuery {
     /// Recipient OwnerAddr bytes (who is pulling their held blobs).
     #[serde(rename = "ro")]
     pub recipient_owner: [u8; 16],
-    /// Community SpaceId — restricts the pull to blobs deposited under this
-    /// community's co-membership gate.
+    /// Community SpaceId. This is the membership-LIVENESS gate: the relay
+    /// requires the requester to be a `Joined` member of this community before
+    /// serving anything. It is NOT a per-blob response filter — the response is
+    /// recipient-scoped (all of R's held blobs, regardless of which community
+    /// each was deposited under); see [`RelayPullResponse`] and the acceptor's
+    /// `held_for`.
     #[serde(rename = "ci")]
     pub community_id: SpaceId,
     /// Canonical CBOR of the requester device's `EnrollmentCert`.
@@ -167,7 +171,10 @@ pub struct RelayHeldBlob {
 /// Relay → recipient pull response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayPullResponse {
-    /// Held blobs for this recipient in this community.
+    /// All held blobs for the authenticated recipient — recipient-scoped, NOT
+    /// filtered by the query's `community_id` (that is only the membership-
+    /// liveness gate). The recipient opens the copies sealed to one of its own
+    /// device keys and ignores any it cannot open.
     #[serde(rename = "en")]
     pub entries: Vec<RelayHeldBlob>,
 }
