@@ -818,12 +818,20 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
 
 /// ZEB-424: a deposit from a sender who is NOT an Active friend but DOES
 /// share a live group-DM with the recipient is admitted through the
-/// co-member branch and runs the full receive path — admitted, persisted
-/// (persist-before-ack), acked, fanned out, and ingested. This mirrors
-/// `butler_deposit_fans_out_ingests_acks_and_gcs` with exactly two deltas
-/// before the deposit: the sender is REMOVED from `friends` (so the friend
-/// branch misses) and ADDED to `group_co_members` (so the co-member branch
-/// admits). Every success outcome the friend happy-path asserts must hold.
+/// co-member branch and runs the receive path through ingestion — admitted,
+/// persisted (persist-before-ack), acked, fanned out to B, and ingested by B.
+/// This mirrors `butler_deposit_fans_out_ingests_acks_and_gcs` *through B's
+/// ingestion* (its phases 1–3), with exactly two deltas before the deposit:
+/// the sender is REMOVED from `friends` (so the friend branch misses) and
+/// ADDED to `group_co_members` (so the co-member branch admits).
+///
+/// It intentionally stops at ingestion and does NOT re-assert that test's
+/// phases 4–5 (ig-ack propagation back to A + coverage-GC convergence): those
+/// run on the shared post-admission machinery, which is byte-for-byte
+/// identical regardless of admission flavor — admission is the ONLY divergence
+/// and is complete by step 1, long before persist. The ig-ack + GC tail is
+/// fully covered by the friend gold-standard test; duplicating its ~90 lines
+/// here would add no distinct-code-path coverage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
     let fx = fixture();
