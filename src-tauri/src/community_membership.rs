@@ -306,6 +306,19 @@ pub enum MembershipEventKind {
         #[serde(rename = "pl")]
         payload: crate::reachability_record::ReachabilityAnnouncePayload,
     },
+
+    /// ZEB-458 P4: a joined member volunteers their device as a sealed
+    /// relay for the community. Publishes a signed `CommunityRelayAnnouncePayload`
+    /// into the community-state CRDT. No membership-state effect —
+    /// consumed by `CommunityRelayResolver` for the fresh advertiser set.
+    ///
+    /// Variant tag "b" (1-char value, unused before this). Inner field
+    /// key "pl" mirrors `ReachabilityAnnounce` (same-length-keys invariant).
+    #[serde(rename = "b")]
+    CommunityRelayAnnounce {
+        #[serde(rename = "pl")]
+        payload: crate::community_relay_announce::CommunityRelayAnnouncePayload,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -832,6 +845,27 @@ pub enum VerifyError {
     /// ZEB-339: counter-signer's signing key is not in the counter-signer's
     /// materialized `enrolled_device_keys`.
     CounterSignerNotEnrolled,
+
+    // ── ZEB-458 P4B CommunityRelayAnnounce verify rules ───────────────────────
+    //
+    // RCH1 analogue (outer signature) is enforced by the existing
+    // `verify_signature()` call at the top of verify_event —
+    // reuses `VerifyError::SignatureInvalid`. No dedicated discriminant.
+    /// ZEB-458 RCH2 analogue: inner device identity signature on a
+    /// `CommunityRelayAnnounce` payload failed to verify. Binds the relay
+    /// advertisement to the announcing device; rejecting prevents a malicious
+    /// community member from claiming another device's relay coordinates.
+    CommunityRelayInnerSigInvalid,
+
+    /// ZEB-458 RCH4 analogue: the payload's `ad_at` differs from the event's
+    /// HLC `wall_ms` by more than ±30 minutes. The 30-min bound is shared
+    /// with `REACHABILITY_TIMESTAMP_SKEW_MAX_MS`.
+    CommunityRelayTimestampSkew,
+
+    /// ZEB-458 RCH5 analogue: the actor is not a current Joined community
+    /// member at the event's HLC. Relay advertisements from non-members are
+    /// meaningless and must be rejected.
+    CommunityRelayActorNotMember,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -1016,6 +1050,15 @@ impl std::fmt::Display for VerifyError {
                     f,
                     "ZEB-339: counter-signer's device key is not enrolled for their identity"
                 )
+            }
+            VerifyError::CommunityRelayInnerSigInvalid => {
+                write!(f, "ZEB-458 RCH2 inner CommunityRelayAnnounce signature invalid")
+            }
+            VerifyError::CommunityRelayTimestampSkew => {
+                write!(f, "ZEB-458 RCH4 CommunityRelayAnnounce timestamp skew > 30min")
+            }
+            VerifyError::CommunityRelayActorNotMember => {
+                write!(f, "ZEB-458 RCH5 CommunityRelayAnnounce actor is not a community member")
             }
         }
     }
@@ -2462,6 +2505,10 @@ pub fn materialize_with_now(
                 // ZEB-321: no membership-state effect; handled by
                 // ReachabilityResolver hook in event_loop.
             }
+            MembershipEventKind::CommunityRelayAnnounce { .. } => {
+                // ZEB-458: no membership-state effect; consumed by
+                // CommunityRelayResolver for the fresh advertiser set.
+            }
         }
     }
 
@@ -2948,6 +2995,11 @@ pub fn verify_event(
             // Fork) but we keep all RCH2-RCH5 enforcement contiguous in
             // the per-kind block for readability.
         }
+        MembershipEventKind::CommunityRelayAnnounce { .. } => {
+            // ZEB-458: membership status (RCH5 analogue) is enforced in
+            // the per-kind power-rules block below, alongside the inner-sig
+            // and timestamp-skew checks. Same pattern as ReachabilityAnnounce.
+        }
     }
 
     // 5. Per-kind power rules.
@@ -3287,6 +3339,48 @@ pub fn verify_event(
             // event per the function's contract.
             if !is_joined_member(prior_state, &event.actor) {
                 return Err(VerifyError::ReachabilityActorNotMember);
+            }
+        }
+        MembershipEventKind::CommunityRelayAnnounce { payload } => {
+            // ZEB-458 P4B: RCH1-RCH5 analogue for CommunityRelayAnnounce.
+            //
+            // RCH1 (outer signature) already verified by `verify_signature()`
+            // above — surfaces as VerifyError::SignatureInvalid. No work here.
+
+            // ZEB-339: derive the signer's Ed25519 verifying key from the
+            // resolved enrolled device key (same origin as ReachabilityAnnounce).
+            let signer_vk = ed25519_dalek::VerifyingKey::from_bytes(&signer.device_ed25519)
+                .map_err(|_| VerifyError::SignatureInvalid)?;
+
+            // RCH2 analogue: inner identity signature must verify over canonical
+            // CBOR of (relay fields + ad_at + actor + hlc) using the signer's
+            // enrolled device Ed25519 verifying key.
+            crate::community_relay_announce::verify_inner_signature(
+                payload,
+                &event.actor,
+                &event.at,
+                &signer_vk,
+            )
+            .map_err(|e| match e {
+                crate::reachability_record::InnerSigError::Encode => {
+                    VerifyError::EncodeError("inner community relay sig encode".to_string())
+                }
+                crate::reachability_record::InnerSigError::Invalid => {
+                    VerifyError::CommunityRelayInnerSigInvalid
+                }
+            })?;
+
+            // RCH4 analogue: ad_at vs hlc.wall_ms within ±30 min.
+            // The 30-min bound is shared with REACHABILITY_TIMESTAMP_SKEW_MAX_MS.
+            let skew = payload.ad_at.abs_diff(event.at.wall_ms);
+            if skew > REACHABILITY_TIMESTAMP_SKEW_MAX_MS {
+                return Err(VerifyError::CommunityRelayTimestampSkew);
+            }
+
+            // RCH5 analogue: actor must be Joined at hlc (any joined member,
+            // no power gate — same shape as ReachabilityAnnounce).
+            if !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::CommunityRelayActorNotMember);
             }
         }
     }
@@ -10134,6 +10228,202 @@ mod zeb_321_reachability_verify_tests {
         assert!(
             matches!(result, Err(VerifyError::ReachabilityInnerSigInvalid)),
             "all-zero inner sig must produce ReachabilityInnerSigInvalid; got {result:?}"
+        );
+    }
+}
+
+// ── ZEB-458 P4B CommunityRelayAnnounce verify_event tests ─────────────────────
+
+#[cfg(test)]
+mod zeb_458_community_relay_announce_verify_tests {
+    use super::*;
+    use crate::community_relay_announce::{
+        build_signed_community_relay_announce, CommunityRelayEntry,
+    };
+
+    /// Build a `CommunityRelayEntry` fixture.
+    fn fixture_relay_entry() -> CommunityRelayEntry {
+        CommunityRelayEntry {
+            relay_device_id: [0x11; 16],
+            iroh_endpoint_id: [0x22; 32],
+            relay_device_ed25519_verify: [0x33; 32],
+            home_relay: "https://relay.example/".into(),
+        }
+    }
+
+    /// Build a signed `CommunityRelayAnnounce` event for `owner` at
+    /// `ad_at` (inner timestamp) and `wall_ms` (outer HLC wall).
+    fn make_relay_announce_event(
+        community_id: SpaceId,
+        owner: &TestOwner,
+        actor: OwnerAddr,
+        ad_at: u64,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let hlc = Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        let payload = build_signed_community_relay_announce(
+            fixture_relay_entry(),
+            ad_at,
+            &actor,
+            &hlc,
+            &owner.device_key,
+        )
+        .expect("build relay announce payload");
+        let event_payload = EventPayload {
+            id: [0x43; 16],
+            community_id,
+            kind: MembershipEventKind::CommunityRelayAnnounce { payload },
+            actor,
+            at: hlc,
+        };
+        sign_event(&event_payload, &owner.device_key).expect("sign relay announce envelope")
+    }
+
+    /// Build a `prior_state` where `owner` is Joined with their enrolled
+    /// device key materialized (mirrors `joined_prior` from the reachability
+    /// test module).
+    fn joined_prior(community_id: SpaceId, owner: &TestOwner) -> MaterializedMembership {
+        let join_payload = EventPayload {
+            id: [0x01; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let join_ev = sign_event(&join_payload, &owner.device_key).expect("sign join");
+        let join_ev = SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..join_ev
+        };
+        materialize(std::slice::from_ref(&join_ev), owner.owner)
+    }
+
+    /// Positive: Joined actor + valid inner sig + in-window `ad_at` → Ok(()).
+    #[test]
+    fn community_relay_announce_verifies_when_actor_joined_and_inner_sig_valid() {
+        let community_id = SpaceId([0xd0; 16]);
+        let member = mint_test_owner(0xa2);
+        let prior = joined_prior(community_id, &member);
+
+        let event = make_relay_announce_event(
+            community_id,
+            &member,
+            member.owner,
+            1_000_000,
+            1_000_000,
+        );
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: member.owner,
+            is_invite_only: false,
+        };
+        verify_event(&event, &prior, &ctx)
+            .expect("valid CommunityRelayAnnounce must verify");
+    }
+
+    /// RCH2 analogue: tampering the inner identity_signature bytes causes
+    /// `CommunityRelayInnerSigInvalid`.
+    #[test]
+    fn community_relay_announce_rejects_inner_sig_tampering() {
+        let community_id = SpaceId([0xd0; 16]);
+        let member = mint_test_owner(0xa2);
+        let prior = joined_prior(community_id, &member);
+
+        let mut event = make_relay_announce_event(
+            community_id,
+            &member,
+            member.owner,
+            1_000_000,
+            1_000_000,
+        );
+
+        // Flip a bit in the inner signature; re-sign the outer envelope so
+        // SignatureInvalid doesn't fire before the inner-sig check.
+        if let MembershipEventKind::CommunityRelayAnnounce { ref mut payload } = event.kind {
+            payload.identity_signature[0] ^= 0xFF;
+        } else {
+            panic!("expected CommunityRelayAnnounce");
+        }
+        let resigned_payload = EventPayload {
+            id: event.id,
+            community_id: event.community_id,
+            kind: event.kind.clone(),
+            actor: event.actor,
+            at: event.at.clone(),
+        };
+        let resigned =
+            sign_event(&resigned_payload, &member.device_key).expect("re-sign envelope");
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: member.owner,
+            is_invite_only: false,
+        };
+        let result = verify_event(&resigned, &prior, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::CommunityRelayInnerSigInvalid)),
+            "tampered inner sig must produce CommunityRelayInnerSigInvalid; got {result:?}"
+        );
+    }
+
+    /// RCH4 analogue: `ad_at` outside ±30 min of HLC wall_ms →
+    /// `CommunityRelayTimestampSkew`.
+    #[test]
+    fn community_relay_announce_rejects_timestamp_skew() {
+        let community_id = SpaceId([0xd0; 16]);
+        let member = mint_test_owner(0xa2);
+        let prior = joined_prior(community_id, &member);
+
+        let wall_ms: u64 = 1_000_000_000;
+        // 30-min bound is shared with reachability (REACHABILITY_TIMESTAMP_SKEW_MAX_MS).
+        let ad_at = wall_ms + REACHABILITY_TIMESTAMP_SKEW_MAX_MS + 60 * 1_000;
+        let event =
+            make_relay_announce_event(community_id, &member, member.owner, ad_at, wall_ms);
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: member.owner,
+            is_invite_only: false,
+        };
+        let result = verify_event(&event, &prior, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::CommunityRelayTimestampSkew)),
+            "skewed ad_at must produce CommunityRelayTimestampSkew; got {result:?}"
+        );
+    }
+
+    /// RCH5 analogue: actor is not a Joined member →
+    /// `SignerNotEnrolledForActor` (signer resolution fails before the
+    /// membership gate, mirroring the reachability non-member test).
+    #[test]
+    fn community_relay_announce_rejects_non_member() {
+        let community_id = SpaceId([0xd0; 16]);
+        let admin = mint_test_owner(0xa2);
+        // Bob has never joined.
+        let bob = mint_test_owner(0xbb);
+        let prior = joined_prior(community_id, &admin);
+
+        let event =
+            make_relay_announce_event(community_id, &bob, bob.owner, 1_000_000, 1_000_000);
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: admin.owner,
+            is_invite_only: false,
+        };
+        let result = verify_event(&event, &prior, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::SignerNotEnrolledForActor)),
+            "non-member's CommunityRelayAnnounce must produce SignerNotEnrolledForActor; got {result:?}"
         );
     }
 }

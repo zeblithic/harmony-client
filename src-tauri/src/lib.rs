@@ -28728,7 +28728,11 @@ pub fn delta_to_change(
         // ZEB-321: ReachabilityAnnounce is connectivity-state, not
         // membership-state; no MembershipChange is projected. Handled
         // by the ReachabilityResolver hook in event_loop.
-        | crate::community_membership::MembershipEventKind::ReachabilityAnnounce { .. } => return None,
+        | crate::community_membership::MembershipEventKind::ReachabilityAnnounce { .. }
+        // ZEB-458: CommunityRelayAnnounce is relay-state, not
+        // membership-state; no MembershipChange is projected. Consumed
+        // by CommunityRelayResolver.
+        | crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { .. } => return None,
     };
     Some((cid_hex, change))
 }
