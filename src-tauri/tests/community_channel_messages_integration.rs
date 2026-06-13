@@ -353,9 +353,18 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // ── Phase 1: A posts 100 messages live ───────────────────────────
-    // The publisher channel between engine and adapter has capacity 64,
-    // so a tight burst can drop on the wire (only locally appended).
-    // Yield + small sleep every batch so the publisher task drains.
+    // ZEB-288: publish in small DRAIN-SYNCED batches so the engine→adapter
+    // publisher channel (cap-64, `try_send` drop-on-full) never fills.
+    // `try_send` only drops on a *full* channel, so by waiting for B to
+    // catch up to each checkpoint before bursting the next batch we keep
+    // the in-flight count at ≤ BATCH (< 64) — which makes live delivery
+    // LOSSLESS and the Phase-1 assertion deterministic. This resolves the
+    // tension the earlier attempts hit: a fixed floor of 90 flaked when CI
+    // starvation let the publisher outrun the adapter and drop > 10
+    // (Qodo + CodeAnt), while a ≥ 1 floor was too weak to catch a genuine
+    // live-path regression (Qodo). Bounding the burst gives us BOTH: all
+    // 100 must arrive live, and no scheduling can cause a spurious drop.
+    const BATCH: usize = 10;
     let mut posted_ids = Vec::new();
     for i in 0..100 {
         let id = Arc::clone(&engine_a)
@@ -363,32 +372,38 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             .await
             .expect("publish");
         posted_ids.push(id);
-        if (i + 1) % 16 == 0 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        if (i + 1) % BATCH == 0 {
+            // Drain checkpoint: B must catch up to everything posted so
+            // far before we burst more, keeping publisher_tx well under
+            // its 64 cap (≤ BATCH in flight at any instant → no drop).
+            let target = i + 1;
+            wait_until(
+                || {
+                    let received_b = Arc::clone(&received_b);
+                    async move { received_b.lock().expect("received_b lock").len() >= target }
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap_or_else(|()| {
+                panic!("B should receive the first {target} live messages (live wire stalled)")
+            });
         }
     }
 
-    // Wait for B's live deliveries. ZEB-288: this is a FLOOR, not 100.
-    // The publisher channel above is cap-64 and documented droppable
-    // under scheduler starvation; CI suite load can drop a handful of
-    // the 100 live publishes, and a dropped live event is unrecoverable
-    // until the Phase-3 re-spawn (the spawn-time backfill driver
-    // latched on an empty log before Phase 1 began). No timeout is long
-    // enough for a dropped-not-delayed event, so Phase 1 asserts the
-    // live path delivers AT VOLUME; the loss-free guarantee is Phase
-    // 3's ≥150 completeness assert, which is drop-tolerant by
-    // construction (backfill dedupes B's disk log and delivers exactly
-    // the missing remainder, landing the counter on 150 regardless).
-    const LIVE_DELIVERY_FLOOR: usize = 90;
-    wait_until(
-        || {
-            let received_b = Arc::clone(&received_b);
-            async move { received_b.lock().expect("received_b lock").len() >= LIVE_DELIVERY_FLOOR }
-        },
-        Duration::from_secs(30),
-    )
-    .await
-    .expect("B should receive >= LIVE_DELIVERY_FLOOR live");
+    // All 100 delivered live and losslessly. The final checkpoint
+    // (i + 1 == 100) already waited for this; assert explicitly so the
+    // Phase-1 contract — strong (full volume) AND deterministic — is
+    // unmistakable. The loss-free guarantee for the *offline* gap is
+    // Phase 3's ≥ 150 completeness assert + the final exact-150/no-dupes
+    // check.
+    {
+        let got = received_b.lock().expect("received_b lock").len();
+        assert!(
+            got >= 100,
+            "Phase 1 should deliver all 100 messages live (got {got})"
+        );
+    }
 
     // ── Phase 2: B disconnect; A posts 50 more ───────────────────────
     // Stop B's engine + adapter. The on-disk segments persist (spec
