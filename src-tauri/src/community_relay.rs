@@ -99,6 +99,12 @@ pub const RELAY_OPTIN_DATASET_MAX_BYTES: usize = 256 * 1024;
 /// [`crate::butler_deposit::INBOX_TTL_MS`]).
 pub const RELAY_HOLD_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
+/// Sweep interval (ms) for the relay-hold GC task — the ONLY storage-reclaim
+/// path (TTL-expired + fully-covered entries). 10 minutes: frequent enough to
+/// bound storage shortly after coverage propagates, infrequent enough to be
+/// negligible overhead. Wired at start_node (T11b).
+pub const RELAY_HOLD_GC_INTERVAL_MS: u64 = 10 * 60 * 1_000;
+
 // =====================================================================
 // Wire types — Deposit direction (sender → relay)
 // =====================================================================

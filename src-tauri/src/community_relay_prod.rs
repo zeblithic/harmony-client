@@ -52,6 +52,33 @@ pub trait CommunityMembershipLookup: Send + Sync {
     async fn is_joined(&self, community_id: &SpaceId, owner: &[u8; 16]) -> bool;
 }
 
+/// Production [`CommunityMembershipLookup`] backed by the live
+/// [`CommunitySyncRegistry`]. Wired at start_node (T11b). Resolves a community's
+/// engine, materializes its membership against the engine's configured admin
+/// addr, and answers `is_joined` by the member's `Joined` status. A community
+/// with no spawned engine (never joined / left + GC'd) answers `false`.
+pub struct ProdCommunityMembershipLookup {
+    pub registry: Arc<crate::community_state_sync::CommunitySyncRegistry>,
+}
+
+#[async_trait]
+impl CommunityMembershipLookup for ProdCommunityMembershipLookup {
+    async fn is_joined(&self, community_id: &SpaceId, owner: &[u8; 16]) -> bool {
+        let Some(engine) = self.registry.engine_arc(community_id).await else {
+            return false;
+        };
+        let admin = engine.admin_addr();
+        let state = engine.state();
+        let guard = state.lock().await;
+        guard
+            .materialized(admin)
+            .members
+            .get(&crate::owner_state_types::OwnerAddr(*owner))
+            .map(|m| m.status == crate::community_membership::MemberStatus::Joined)
+            .unwrap_or(false)
+    }
+}
+
 /// Wall-clock epoch SECONDS (for `EnrollmentCert` expiry checks). Mirrors
 /// [`crate::iroh_butler_acceptor::ProdButlerDepositCtx::now_secs`].
 fn now_epoch_secs() -> u64 {

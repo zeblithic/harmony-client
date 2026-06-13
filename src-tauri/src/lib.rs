@@ -3137,6 +3137,15 @@ pub async fn start_node_inner(
         let mut community_relay_resolver_opt: Option<
             std::sync::Arc<crate::community_relay_resolver::CommunityRelayResolver>,
         > = None;
+        // ZEB-458 P4 Phase B (T11b): carriers for the active-machinery handles
+        // built in the install block (deeper scope) so the NodeState lock-2
+        // block below can stash them. force = the publisher's wake handle (opt-in
+        // IPC / republish-poke pokes it); the two JoinHandles are aborted by
+        // stop_inner.
+        let mut community_relay_publisher_force_opt: Option<std::sync::Arc<tokio::sync::Notify>> =
+            None;
+        let mut community_relay_publisher_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
+        let mut community_relay_pull_driver_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut relay_sync_handles_opt: Option<crate::event_loop::RelaySyncHandles> = None;
         // ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync engines + their
         // NodeState handles. Built alongside the dm-inbox engine when an
@@ -6681,6 +6690,442 @@ pub async fn start_node_inner(
                                 ),
                             }
                         }
+
+                        // ── ZEB-458 P4 Phase B (T11b): install the relay
+                        //    deposit+pull acceptors, spawn the pull driver +
+                        //    publisher + GC sweep, and inject the sender relay
+                        //    deposit client. The replication substrate
+                        //    (relay-hold/optin engines + resolver) was built by
+                        //    T11a above; this block installs the ACTIVE
+                        //    machinery on top of it.
+                        //
+                        //    The three CONNECTING HOOKS — resolver-feed on
+                        //    applied CommunityRelayAnnounce, bootstrap replay of
+                        //    historical announces into the resolver, and the
+                        //    republish-timer poke — are T11c. Until T11c lands
+                        //    the resolver stays empty, so the pull driver +
+                        //    sender client find no relays to dial (they are
+                        //    correctly wired, just unfed). The deposit/pull
+                        //    ACCEPTORS, the publisher (advertises THIS node), and
+                        //    the GC sweep are fully live now.
+
+                        // One shared registry-backed membership lookup, reused by
+                        // every relay ctx/client built below.
+                        let relay_membership: std::sync::Arc<
+                            dyn crate::community_relay_prod::CommunityMembershipLookup,
+                        > = std::sync::Arc::new(
+                            crate::community_relay_prod::ProdCommunityMembershipLookup {
+                                registry: std::sync::Arc::clone(&registry),
+                            },
+                        );
+
+                        // B. Deposit + pull acceptors over the relay-hold/optin
+                        //    runtime Arcs (the SAME in-scope Arcs the T11a engines
+                        //    were built from). `device_id` IS the 64-hex of this
+                        //    device's ed25519 verify key (same form butler uses),
+                        //    stamped as `held_by`.
+                        let relay_deposit_ctx: std::sync::Arc<
+                            dyn crate::iroh_community_relay_acceptor::RelayDepositCtx,
+                        > = std::sync::Arc::new(crate::community_relay_prod::ProdRelayDepositCtx {
+                            self_owner: self_owner.0,
+                            relay_device_id: device_id.clone(),
+                            relay_hold_doc: std::sync::Arc::clone(&relay_hold_doc),
+                            relay_hold_tracker: std::sync::Arc::clone(&relay_hold_tracker),
+                            flush: std::sync::Arc::new(
+                                crate::community_relay_prod::EngineRelayHoldFlush(
+                                    std::sync::Arc::clone(&relay_hold_sync),
+                                ),
+                            ),
+                            optin: std::sync::Arc::clone(&relay_optin_doc),
+                            membership: std::sync::Arc::clone(&relay_membership),
+                        });
+                        let relay_pull_ctx: std::sync::Arc<
+                            dyn crate::iroh_community_relay_acceptor::RelayPullCtx,
+                        > = std::sync::Arc::new(crate::community_relay_prod::ProdRelayPullCtx {
+                            self_owner: self_owner.0,
+                            relay_hold_doc: std::sync::Arc::clone(&relay_hold_doc),
+                            flush: std::sync::Arc::new(
+                                crate::community_relay_prod::EngineRelayHoldFlush(
+                                    std::sync::Arc::clone(&relay_hold_sync),
+                                ),
+                            ),
+                            optin: std::sync::Arc::clone(&relay_optin_doc),
+                            membership: std::sync::Arc::clone(&relay_membership),
+                        });
+                        if link_mgr
+                            .install_community_relay_deposit_acceptor(std::sync::Arc::new(
+                                crate::iroh_community_relay_acceptor::IrohCommunityRelayDepositAcceptor::new(
+                                    relay_deposit_ctx,
+                                ),
+                            ))
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "ZEB-458: community-relay deposit acceptor already \
+                                 installed on iroh link manager — keeping the prior \
+                                 instance"
+                            );
+                        }
+                        if link_mgr
+                            .install_community_relay_pull_acceptor(std::sync::Arc::new(
+                                crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor::new(
+                                    relay_pull_ctx,
+                                ),
+                            ))
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "ZEB-458: community-relay pull acceptor already \
+                                 installed on iroh link manager — keeping the prior \
+                                 instance"
+                            );
+                        }
+
+                        // C/D/E. The pull driver, sender deposit client, and
+                        //    publisher all need the iroh endpoint (dial/announce
+                        //    coordinates). Gate the whole rung on a bound
+                        //    endpoint + a canonicalizable own cert — without
+                        //    either there is no relay transport, exactly like the
+                        //    butler rung above.
+                        if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
+                            match harmony_owner::cbor::to_canonical(&own_enrollment_cert_for_friend)
+                            {
+                                Ok(relay_cert_bytes) => {
+                                    // C. Recipient pull path: ingest ctx +
+                                    //    transport + background pull driver. The
+                                    //    ingest ctx runs pulled blobs through the
+                                    //    SAME normal DM receive path (sink =
+                                    //    `app`, identical to ProdDmInboxIngestCtx).
+                                    let relay_ingest_ctx: std::sync::Arc<
+                                        dyn crate::community_relay_pull::RelayIngestCtx,
+                                    > = std::sync::Arc::new(
+                                        crate::community_relay_prod::ProdRelayIngestCtx {
+                                            device_id: device_id.clone(),
+                                            device_x25519_privs: vec![
+                                                crate::dm_signing::ed25519_priv_to_x25519(
+                                                    &community_signing_key_arc,
+                                                ),
+                                            ],
+                                            crdt_state: std::sync::Arc::clone(&crdt_state),
+                                            content_store: std::sync::Arc::clone(&content_store),
+                                            sink: app.clone(),
+                                        },
+                                    );
+                                    let relay_pull_transport: std::sync::Arc<
+                                        dyn crate::community_relay_pull_driver::RelayPullTransport,
+                                    > = std::sync::Arc::new(
+                                        crate::community_relay_pull_driver::IrohRelayPullTransport {
+                                            endpoint: std::sync::Arc::clone(ep_arc),
+                                            io_deadline: std::time::Duration::from_millis(
+                                                crate::iroh_butler_acceptor::DEFAULT_BUTLER_IO_DEADLINE_MS,
+                                            ),
+                                        },
+                                    );
+
+                                    // Joined-communities snapshot + a refresher
+                                    // task. The driver reads it through a sync
+                                    // closure (no await), so a background task
+                                    // (re)materializes joined-ness every ~60s and
+                                    // writes the snapshot. An immediate first
+                                    // refresh runs before the loop so the startup
+                                    // pull pass has a populated set. This avoids
+                                    // any inline await into an event-loop channel.
+                                    let joined_snapshot =
+                                        std::sync::Arc::new(std::sync::Mutex::new(Vec::<
+                                            crate::owner_state_types::SpaceId,
+                                        >::new(
+                                        )));
+                                    {
+                                        let refresher_registry = std::sync::Arc::clone(&registry);
+                                        let refresher_membership =
+                                            std::sync::Arc::clone(&relay_membership);
+                                        let refresher_snapshot =
+                                            std::sync::Arc::clone(&joined_snapshot);
+                                        let refresher_self_owner = self_owner.0;
+                                        tokio::spawn(async move {
+                                            let mut ticker = tokio::time::interval(
+                                                std::time::Duration::from_secs(60),
+                                            );
+                                            loop {
+                                                let ids = refresher_registry.known_ids().await;
+                                                let mut joined = Vec::new();
+                                                for c in ids {
+                                                    if refresher_membership
+                                                        .is_joined(&c, &refresher_self_owner)
+                                                        .await
+                                                    {
+                                                        joined.push(c);
+                                                    }
+                                                }
+                                                *refresher_snapshot
+                                                    .lock()
+                                                    .unwrap_or_else(|p| p.into_inner()) = joined;
+                                                ticker.tick().await;
+                                            }
+                                        });
+                                    }
+                                    let joined_communities: crate::community_relay_pull_driver::JoinedCommunitiesFn = {
+                                        let s = std::sync::Arc::clone(&joined_snapshot);
+                                        std::sync::Arc::new(move || {
+                                            s.lock().unwrap_or_else(|p| p.into_inner()).clone()
+                                        })
+                                    };
+                                    let pull_driver = std::sync::Arc::new(
+                                        crate::community_relay_pull_driver::CommunityRelayPullDriver::new(
+                                            self_owner.0,
+                                            relay_cert_bytes.clone(),
+                                            std::sync::Arc::clone(&community_signing_key_arc),
+                                            std::sync::Arc::clone(&community_relay_resolver),
+                                            relay_pull_transport,
+                                            relay_ingest_ctx,
+                                            joined_communities,
+                                        ),
+                                    );
+                                    community_relay_pull_driver_handle_opt =
+                                        Some(pull_driver.spawn());
+
+                                    // D. Sender relay deposit client → inject into
+                                    //    the DmOutbox (the drain's last-resort
+                                    //    relay rung). Same identity material as
+                                    //    the butler client; adds the relay
+                                    //    resolver + the shared-community
+                                    //    membership gate.
+                                    let relay_deposit_client: std::sync::Arc<
+                                        dyn crate::community_relay::CommunityRelayDepositClient,
+                                    > = std::sync::Arc::new(
+                                        crate::community_relay_prod::ProdCommunityRelayDepositClient {
+                                            butler_resolver: std::sync::Arc::new(
+                                                crate::community_relay_prod::ReachabilityButlerSetResolve(
+                                                    reachability_resolver.clone(),
+                                                ),
+                                            ),
+                                            relay_resolver: std::sync::Arc::clone(
+                                                &community_relay_resolver,
+                                            ),
+                                            dial: std::sync::Arc::new(
+                                                crate::community_relay_prod::IrohRelayDepositDial {
+                                                    endpoint: std::sync::Arc::clone(ep_arc),
+                                                    io_deadline:
+                                                        std::time::Duration::from_millis(
+                                                            crate::iroh_butler_acceptor::DEFAULT_BUTLER_IO_DEADLINE_MS,
+                                                        ),
+                                                },
+                                            ),
+                                            cas: std::sync::Arc::clone(&content_store),
+                                            sender_owner: self_owner.0,
+                                            enrollment_cert_bytes: relay_cert_bytes.clone(),
+                                            device_signing_key: std::sync::Arc::clone(
+                                                &community_signing_key_arc,
+                                            ),
+                                            crdt_state: std::sync::Arc::clone(&crdt_state),
+                                            membership: std::sync::Arc::clone(&relay_membership),
+                                        },
+                                    );
+                                    outbox
+                                        .lock()
+                                        .await
+                                        .set_community_relay_deposit_client(relay_deposit_client);
+
+                                    // E. Relay publish-fn + publisher. Mirrors the
+                                    //    reachability publish-fn: for each opted-in
+                                    //    community this node is ALSO a Joined
+                                    //    member of, mint an HLC, build the signed
+                                    //    CommunityRelayAnnounce (inner sig HLC ==
+                                    //    outer EventPayload.at), and insert it via
+                                    //    that community's engine.
+                                    let relay_publish_fn: crate::community_relay_publisher::RelayPublishFn = {
+                                        let registry = std::sync::Arc::clone(&registry);
+                                        let signing_key =
+                                            std::sync::Arc::clone(&community_signing_key_arc);
+                                        let actor = self_owner;
+                                        let hlc_tracker = std::sync::Arc::clone(&tracker);
+                                        let device_id = device_id.clone();
+                                        let optin = std::sync::Arc::clone(&relay_optin_doc);
+                                        let membership = std::sync::Arc::clone(&relay_membership);
+                                        // THIS node's relay coordinates (stable for
+                                        // the endpoint's lifetime; home_relay is
+                                        // snapshotted at publish time below).
+                                        let relay_device_id = this_device_id_hash;
+                                        let iroh_endpoint_id: [u8; 32] =
+                                            *ep_arc.node_id().as_bytes();
+                                        let relay_device_ed25519_verify =
+                                            community_signing_key_arc.verifying_key().to_bytes();
+                                        let ep_for_relay = std::sync::Arc::clone(ep_arc);
+                                        std::sync::Arc::new(move || {
+                                            let registry = std::sync::Arc::clone(&registry);
+                                            let signing_key = std::sync::Arc::clone(&signing_key);
+                                            let hlc_tracker = std::sync::Arc::clone(&hlc_tracker);
+                                            let device_id = device_id.clone();
+                                            let optin = std::sync::Arc::clone(&optin);
+                                            let membership = std::sync::Arc::clone(&membership);
+                                            let ep = std::sync::Arc::clone(&ep_for_relay);
+                                            Box::pin(async move {
+                                                let now_ms = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_millis()
+                                                    as u64;
+                                                let home_relay = ep
+                                                    .home_relay()
+                                                    .map(|r| r.to_string())
+                                                    .unwrap_or_default();
+                                                let entry =
+                                                    crate::community_relay_announce::CommunityRelayEntry {
+                                                        relay_device_id,
+                                                        iroh_endpoint_id,
+                                                        relay_device_ed25519_verify,
+                                                        home_relay,
+                                                    };
+                                                let opted = {
+                                                    optin.lock().await.opted_in_communities()
+                                                };
+                                                for c in opted {
+                                                    if !membership.is_joined(&c, &actor.0).await {
+                                                        continue;
+                                                    }
+                                                    let hlc =
+                                                        crate::dm_outbox::reserve_next_hlc_for_device(
+                                                            &hlc_tracker,
+                                                            &device_id,
+                                                            now_ms,
+                                                        )
+                                                        .await;
+                                                    let payload = match crate::community_relay_announce::build_signed_community_relay_announce(
+                                                        entry.clone(),
+                                                        now_ms,
+                                                        &actor,
+                                                        &hlc,
+                                                        signing_key.as_ref(),
+                                                    ) {
+                                                        Ok(p) => p,
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                community_id = ?c,
+                                                                error = %e,
+                                                                "ZEB-458: CommunityRelayAnnounce \
+                                                                 build_signed failed; skipping \
+                                                                 this community"
+                                                            );
+                                                            continue;
+                                                        }
+                                                    };
+                                                    let event_id: [u8; 16] = {
+                                                        use rand::RngCore;
+                                                        let mut buf = [0u8; 16];
+                                                        rand::thread_rng().fill_bytes(&mut buf);
+                                                        buf
+                                                    };
+                                                    let envelope =
+                                                        crate::community_membership::EventPayload {
+                                                            id: event_id,
+                                                            community_id: c,
+                                                            kind: crate::community_membership::MembershipEventKind::CommunityRelayAnnounce {
+                                                                payload,
+                                                            },
+                                                            actor,
+                                                            at: hlc,
+                                                        };
+                                                    let signed = match crate::community_membership::sign_event(
+                                                        &envelope,
+                                                        signing_key.as_ref(),
+                                                    ) {
+                                                        Ok(s) => s,
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                community_id = ?c,
+                                                                error = %e,
+                                                                "ZEB-458: CommunityRelayAnnounce \
+                                                                 sign_event failed; skipping this \
+                                                                 community"
+                                                            );
+                                                            continue;
+                                                        }
+                                                    };
+                                                    let Some(engine) =
+                                                        registry.engine_arc(&c).await
+                                                    else {
+                                                        tracing::warn!(
+                                                            community_id = ?c,
+                                                            "ZEB-458: no engine for community \
+                                                             during CommunityRelayAnnounce publish; \
+                                                             skipping"
+                                                        );
+                                                        continue;
+                                                    };
+                                                    if let Err(e) =
+                                                        engine.insert_local_event(signed).await
+                                                    {
+                                                        tracing::warn!(
+                                                            community_id = ?c,
+                                                            error = %e,
+                                                            "ZEB-458: CommunityRelayAnnounce \
+                                                             insert_local_event failed; continuing"
+                                                        );
+                                                    }
+                                                }
+                                            })
+                                                as futures::future::BoxFuture<'static, ()>
+                                        })
+                                    };
+                                    let relay_publisher = std::sync::Arc::new(
+                                        crate::community_relay_publisher::CommunityRelayPublisher::new(
+                                            relay_publish_fn,
+                                        ),
+                                    );
+                                    community_relay_publisher_force_opt =
+                                        Some(relay_publisher.force_handle());
+                                    community_relay_publisher_handle_opt =
+                                        Some(std::sync::Arc::clone(&relay_publisher).spawn());
+                                }
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "ZEB-458: cannot canonicalize own enrollment \
+                                     cert; relay pull/deposit/publish rung disabled"
+                                ),
+                            }
+                        }
+
+                        // F. Relay-hold GC sweep — the ONLY storage-reclaim path.
+                        //    Standalone task, every RELAY_HOLD_GC_INTERVAL_MS:
+                        //    sweep TTL-expired + fully-covered entries under the
+                        //    doc lock; on any removal, mark dirty + durably flush
+                        //    so the reclaim replicates. Installed unconditionally
+                        //    (no iroh needed — pure local CRDT GC). stop_inner's
+                        //    engine shutdown is its implicit shutdown.
+                        {
+                            let gc_doc = std::sync::Arc::clone(&relay_hold_doc);
+                            let gc_sync = std::sync::Arc::clone(&relay_hold_sync);
+                            tokio::spawn(async move {
+                                let mut ticker =
+                                    tokio::time::interval(std::time::Duration::from_millis(
+                                        crate::community_relay::RELAY_HOLD_GC_INTERVAL_MS,
+                                    ));
+                                // Consume the immediate first tick — nothing to GC
+                                // at boot (the doc was just loaded).
+                                ticker.tick().await;
+                                loop {
+                                    ticker.tick().await;
+                                    let now_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        as u64;
+                                    let changed = {
+                                        let mut d = gc_doc.lock().await;
+                                        d.gc(now_ms)
+                                    };
+                                    if changed {
+                                        gc_sync.notify_dirty();
+                                        if let Err(e) = gc_sync.flush_now().await {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "ZEB-458: relay-hold GC flush_now failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        }
                     }
 
                     // ZEB-418 SP2 P2 Task 6: install the outbound-hold
@@ -7302,6 +7747,18 @@ pub async fn start_node_inner(
                         guard.relay_optin_tracker = relay_optin_tracker_opt.clone();
                         guard.relay_optin_sync = relay_optin_sync_engine_opt.clone();
                         guard.community_relay_resolver = community_relay_resolver_opt.clone();
+                        // ZEB-458 P4 Phase B (T11b): stash the active-machinery
+                        // handles. force = the publisher wake handle (opt-in IPC /
+                        // republish-poke); the two JoinHandles are aborted by
+                        // stop_inner. `.take()` moves the (non-Clone) JoinHandles
+                        // out of the carriers — this lock-2 block runs exactly
+                        // once per start.
+                        guard.community_relay_publisher_force =
+                            community_relay_publisher_force_opt.clone();
+                        guard.community_relay_publisher_handle =
+                            community_relay_publisher_handle_opt.take();
+                        guard.community_relay_pull_driver_handle =
+                            community_relay_pull_driver_handle_opt.take();
                         // ZEB-418 SP2 P2: store the dm-outhold + fleet-net
                         // dataset handles (no IPC surface yet — stop_inner
                         // and the send_dm hold-write/apply-sweeper paths
