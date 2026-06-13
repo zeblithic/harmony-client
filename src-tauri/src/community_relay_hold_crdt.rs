@@ -707,4 +707,85 @@ mod tests {
         let doc = RelayHoldDoc::default();
         assert_eq!(doc.count_for_sender(&space(0x01), &[0x01; 16]), 0);
     }
+
+    // ----------------------------------------------------------------
+    // 6. Dataset-cap CBOR overhead accounting (ZEB-458 P4B review fix)
+    //
+    // RELAY_HOLD_DATASET_MAX_BYTES must account for the per-entry CBOR
+    // map key + metadata, NOT just the blob bytes. Build a SMALL
+    // representative doc with realistic max-length keys + metadata + a
+    // tiny blob, encode it with the SAME canonical-CBOR encoder the
+    // fleet-sync dataset root uses, and assert the measured per-entry
+    // overhead (encoded size minus the blob bytes, divided by the entry
+    // count) stays within RELAY_HOLD_ENTRY_OVERHEAD_BYTES. We do NOT
+    // build a full-capacity 256 MiB doc — we extrapolate from this
+    // small sample, since the per-entry overhead is constant in the
+    // number of entries.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn dataset_cap_per_entry_overhead_within_allowance() {
+        use crate::community_relay::RELAY_HOLD_ENTRY_OVERHEAD_BYTES;
+        use crate::owner_state_crypto::canonical_cbor_encode;
+
+        const ENTRY_COUNT: usize = 8;
+        // Small per-entry blob so the measured overhead is dominated by
+        // the key + metadata (the thing the const is meant to cover).
+        const BLOB_LEN: usize = 16;
+
+        // A realistic max-length 64-hex relay-device `held_by` string.
+        let held_by_64hex = "ab".repeat(32);
+        assert_eq!(held_by_64hex.len(), 64);
+        // A realistic HLC with a non-trivial device_id string.
+        let held_at = hlc(1_700_000_000_000, "relay-device-id");
+
+        let mut doc = RelayHoldDoc::default();
+        let mut total_blob_bytes = 0usize;
+        for i in 0..ENTRY_COUNT {
+            // Distinct recipient + content per entry → distinct realistic
+            // max-length keys (`{recipient_hex}:{content_id_hex}` ≈ 81 chars).
+            let recipient = [i as u8; 16];
+            let content = [(0x80 + i) as u8; 32];
+            let key = RelayHoldDoc::key(&recipient, &content);
+            assert_eq!(
+                key.len(),
+                16 * 2 + 1 + 32 * 2,
+                "key is recipient:content hex"
+            );
+            let e = RelayHoldEntry {
+                recipient_owner: recipient,
+                sender_owner: [(0x40 + i) as u8; 16],
+                community_id: space(0x55),
+                sealed_blob: vec![0xAB; BLOB_LEN],
+                held_at: held_at.clone(),
+                held_by: held_by_64hex.clone(),
+                // A couple of pulled-by device strings (grow-only set).
+                pulled_by: ["pull-dev-aaaa", "pull-dev-bbbb"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            };
+            total_blob_bytes += e.sealed_blob.len();
+            doc.entries.insert(key, e);
+        }
+        assert_eq!(doc.entries.len(), ENTRY_COUNT);
+
+        let encoded = canonical_cbor_encode(&doc).expect("canonical-CBOR encode RelayHoldDoc");
+        // Per-entry overhead = (whole-doc encoded size − Σ blob bytes) / entries.
+        // This generously attributes the doc-level CBOR framing to the
+        // per-entry budget too, so the assertion is conservative.
+        let overhead_total = encoded
+            .len()
+            .checked_sub(total_blob_bytes)
+            .expect("encoded doc must be at least its blob bytes");
+        let per_entry_overhead = overhead_total / ENTRY_COUNT;
+
+        assert!(
+            per_entry_overhead <= RELAY_HOLD_ENTRY_OVERHEAD_BYTES,
+            "measured per-entry CBOR overhead {per_entry_overhead} B exceeds the \
+             RELAY_HOLD_ENTRY_OVERHEAD_BYTES allowance ({RELAY_HOLD_ENTRY_OVERHEAD_BYTES} B); \
+             the dataset cap would under-count a full doc and the zenoh adapter \
+             could DROP the sample"
+        );
+    }
 }

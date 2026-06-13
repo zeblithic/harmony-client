@@ -65,6 +65,22 @@ pub mod alpn {
     /// connections arriving before install are closed — the sender's
     /// fallback chain treats that as a rung-2 failure and retries.
     pub const HARMONY_BUTLER_DEPOSIT_V1: &[u8] = b"harmony/butler-deposit/v1";
+    /// ZEB-458 (SP2 P4): community sealed-relay deposit protocol
+    /// (`RelayDepositFrame` / `RelayDepositAck`, see `community_relay` +
+    /// `iroh_community_relay_acceptor`). Routed by the accept loop to the
+    /// late-installed `IrohCommunityRelayDepositAcceptor` (see
+    /// `IrohZenohLinkManager::install_community_relay_deposit_acceptor`);
+    /// connections arriving before install are closed (sender retries — a
+    /// failed relay rung never makes delivery worse). Re-exported from
+    /// `community_relay` so the wire ALPN string lives in exactly one place.
+    pub const HARMONY_COMMUNITY_RELAY_DEPOSIT_V1: &[u8] =
+        crate::community_relay::COMMUNITY_RELAY_DEPOSIT_ALPN;
+    /// ZEB-458 (SP2 P4): community sealed-relay pull protocol (`RelayPullQuery`
+    /// → `RelayPullResponse` → optional `RelayPullAckFrame`, see
+    /// `community_relay` + `iroh_community_relay_acceptor`). Routed to the
+    /// late-installed `IrohCommunityRelayPullAcceptor`.
+    pub const HARMONY_COMMUNITY_RELAY_PULL_V1: &[u8] =
+        crate::community_relay::COMMUNITY_RELAY_PULL_ALPN;
 }
 
 /// OS keychain coordinates for the persistent iroh `SecretKey`.
@@ -110,6 +126,8 @@ impl IrohEndpoint {
                 alpn::HARMONY_FRIEND_V1.to_vec(),
                 alpn::HARMONY_FRIEND_PEX_V1.to_vec(),
                 alpn::HARMONY_BUTLER_DEPOSIT_V1.to_vec(),
+                alpn::HARMONY_COMMUNITY_RELAY_DEPOSIT_V1.to_vec(),
+                alpn::HARMONY_COMMUNITY_RELAY_PULL_V1.to_vec(),
             ])
             .bind()
             .await
@@ -361,6 +379,8 @@ mod tests {
                 alpn::HARMONY_FRIEND_V1.to_vec(),
                 alpn::HARMONY_FRIEND_PEX_V1.to_vec(),
                 alpn::HARMONY_BUTLER_DEPOSIT_V1.to_vec(),
+                alpn::HARMONY_COMMUNITY_RELAY_DEPOSIT_V1.to_vec(),
+                alpn::HARMONY_COMMUNITY_RELAY_PULL_V1.to_vec(),
             ])
             .relay_mode(RelayMode::Disabled)
             .bind()

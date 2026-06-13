@@ -180,6 +180,19 @@ pub struct IrohZenohLinkManager {
     /// the existing DmOutbox loop, so dropping is graceful by design.
     butler_deposit_acceptor:
         std::sync::OnceLock<Arc<crate::iroh_butler_acceptor::IrohButlerDepositAcceptor>>,
+    /// ZEB-458 P4: late-installed acceptor for inbound
+    /// `harmony/community-relay-deposit/v1` connections. Same lifecycle as
+    /// `butler_deposit_acceptor` — no boot-window queue; a deposit arriving
+    /// before install is closed and the sender's fallback chain retries.
+    community_relay_deposit_acceptor: std::sync::OnceLock<
+        Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayDepositAcceptor>,
+    >,
+    /// ZEB-458 P4: late-installed acceptor for inbound
+    /// `harmony/community-relay-pull/v1` connections. Same lifecycle as the
+    /// deposit acceptor.
+    community_relay_pull_acceptor: std::sync::OnceLock<
+        Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>,
+    >,
 }
 
 impl IrohZenohLinkManager {
@@ -197,6 +210,8 @@ impl IrohZenohLinkManager {
                 HANDSHAKE_PENDING_QUEUE_CAP,
             )),
             butler_deposit_acceptor: std::sync::OnceLock::new(),
+            community_relay_deposit_acceptor: std::sync::OnceLock::new(),
+            community_relay_pull_acceptor: std::sync::OnceLock::new(),
         }
     }
 
@@ -210,6 +225,30 @@ impl IrohZenohLinkManager {
         acceptor: Arc<crate::iroh_butler_acceptor::IrohButlerDepositAcceptor>,
     ) -> Result<(), Arc<crate::iroh_butler_acceptor::IrohButlerDepositAcceptor>> {
         self.butler_deposit_acceptor.set(acceptor)
+    }
+
+    /// ZEB-458 P4: install the community-relay deposit acceptor used by the
+    /// accept loop to route inbound `harmony/community-relay-deposit/v1`
+    /// connections. Install-once (mirrors the butler-deposit acceptor); a
+    /// second install returns the supplied acceptor back as `Err`. No pending
+    /// queue — dropping pre-install is graceful (the sender's relay rung is a
+    /// last-resort retry that can never make delivery worse).
+    pub fn install_community_relay_deposit_acceptor(
+        &self,
+        acceptor: Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayDepositAcceptor>,
+    ) -> Result<(), Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayDepositAcceptor>>
+    {
+        self.community_relay_deposit_acceptor.set(acceptor)
+    }
+
+    /// ZEB-458 P4: install the community-relay pull acceptor used by the
+    /// accept loop to route inbound `harmony/community-relay-pull/v1`
+    /// connections. Same install-once lifecycle as the deposit acceptor.
+    pub fn install_community_relay_pull_acceptor(
+        &self,
+        acceptor: Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>,
+    ) -> Result<(), Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>> {
+        self.community_relay_pull_acceptor.set(acceptor)
     }
 
     /// ZEB-368: expose the resolver so the event loop can enumerate known peers
@@ -419,6 +458,35 @@ impl IrohZenohLinkManager {
                         } else {
                             tracing::debug!(
                                 "ZEB-418: butler deposit before acceptor installed; closing"
+                            );
+                            conn.close(0u32.into(), b"");
+                        }
+                    } else if alpn_used == alpn::HARMONY_COMMUNITY_RELAY_DEPOSIT_V1 {
+                        // ZEB-458 P4: community-relay deposit. Spawn so a
+                        // slow/hung depositor can't block the accept loop. No
+                        // boot-window queue: pre-install deposits are closed
+                        // and the sender's fallback chain retries.
+                        if let Some(acceptor) = mgr.community_relay_deposit_acceptor.get().cloned()
+                        {
+                            tokio::spawn(async move {
+                                acceptor.handle_connection(conn).await;
+                            });
+                        } else {
+                            tracing::debug!(
+                                "ZEB-458: community relay deposit before acceptor installed; closing"
+                            );
+                            conn.close(0u32.into(), b"");
+                        }
+                    } else if alpn_used == alpn::HARMONY_COMMUNITY_RELAY_PULL_V1 {
+                        // ZEB-458 P4: community-relay pull. Spawn so a slow/hung
+                        // requester can't block the accept loop.
+                        if let Some(acceptor) = mgr.community_relay_pull_acceptor.get().cloned() {
+                            tokio::spawn(async move {
+                                acceptor.handle_connection(conn).await;
+                            });
+                        } else {
+                            tracing::debug!(
+                                "ZEB-458: community relay pull before acceptor installed; closing"
                             );
                             conn.close(0u32.into(), b"");
                         }

@@ -226,13 +226,27 @@ pub async fn write_length_prefixed<W: AsyncWrite + Unpin>(
     writer: &mut W,
     body: &[u8],
 ) -> Result<(), DepositWireError> {
-    if body.is_empty() || body.len() > DEPOSIT_MAX_FRAME_BYTES {
+    write_length_prefixed_with_max(writer, body, DEPOSIT_MAX_FRAME_BYTES).await
+}
+
+/// Like [`write_length_prefixed`] but with a caller-supplied frame cap. Used by
+/// the relay pull RESPONSE path, whose frame batches many held blobs and so
+/// needs the larger [`crate::community_relay::RELAY_PULL_MAX_FRAME_BYTES`] cap
+/// rather than the per-blob [`DEPOSIT_MAX_FRAME_BYTES`]. Rejects bodies
+/// exceeding `max` (or empty) before writing anything.
+pub async fn write_length_prefixed_with_max<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    body: &[u8],
+    max: usize,
+) -> Result<(), DepositWireError> {
+    if body.is_empty() || body.len() > max {
         return Err(DepositWireError::FrameOutOfBounds {
             len: body.len(),
-            max: DEPOSIT_MAX_FRAME_BYTES,
+            max,
         });
     }
-    // Cast is lossless: body.len() <= DEPOSIT_MAX_FRAME_BYTES << u32::MAX.
+    // Cast is lossless: body.len() <= max <= u32::MAX (callers pass caps far
+    // below u32::MAX).
     writer.write_all(&(body.len() as u32).to_le_bytes()).await?;
     writer.write_all(body).await?;
     Ok(())
@@ -245,14 +259,23 @@ pub async fn write_length_prefixed<W: AsyncWrite + Unpin>(
 pub async fn read_length_prefixed<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Vec<u8>, DepositWireError> {
+    read_length_prefixed_with_max(reader, DEPOSIT_MAX_FRAME_BYTES).await
+}
+
+/// Like [`read_length_prefixed`] but with a caller-supplied frame cap. Used by
+/// the relay pull RESPONSE path (see
+/// [`crate::community_relay::RELAY_PULL_MAX_FRAME_BYTES`]). A prefix of zero or
+/// exceeding `max` is rejected BEFORE the body is read or allocated — an
+/// attacker-supplied prefix never drives an allocation past `max`.
+pub async fn read_length_prefixed_with_max<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> Result<Vec<u8>, DepositWireError> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 || len > DEPOSIT_MAX_FRAME_BYTES {
-        return Err(DepositWireError::FrameOutOfBounds {
-            len,
-            max: DEPOSIT_MAX_FRAME_BYTES,
-        });
+    if len == 0 || len > max {
+        return Err(DepositWireError::FrameOutOfBounds { len, max });
     }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
@@ -802,5 +825,49 @@ mod tests {
             wire.is_empty(),
             "nothing may be written for a rejected frame"
         );
+    }
+
+    /// The `_with_max` helpers honour a caller-supplied cap distinct from
+    /// `DEPOSIT_MAX_FRAME_BYTES`: a body BETWEEN the default and the larger cap
+    /// is rejected by the default helper but round-trips under the larger cap,
+    /// and an over-the-larger-cap body is still rejected (before any write /
+    /// before the body read).
+    #[tokio::test]
+    async fn with_max_helpers_honour_a_larger_cap() {
+        let larger = DEPOSIT_MAX_FRAME_BYTES * 4;
+        // A body bigger than the default cap but within the larger cap.
+        let body = vec![0x5Au8; DEPOSIT_MAX_FRAME_BYTES + 1];
+
+        // Default helper rejects it (regression guard for the existing callers).
+        let mut wire: Vec<u8> = Vec::new();
+        assert!(matches!(
+            write_length_prefixed(&mut wire, &body).await,
+            Err(DepositWireError::FrameOutOfBounds { .. })
+        ));
+        assert!(wire.is_empty());
+
+        // Under the larger cap it round-trips intact.
+        let mut wire: Vec<u8> = Vec::new();
+        write_length_prefixed_with_max(&mut wire, &body, larger)
+            .await
+            .expect("body within larger cap must write");
+        let mut reader = wire.as_slice();
+        let got = read_length_prefixed_with_max(&mut reader, larger)
+            .await
+            .expect("body within larger cap must read back");
+        assert_eq!(got, body, "round-trips byte-identical under the larger cap");
+
+        // A prefix exceeding the larger cap is rejected before the body read.
+        let oversize = (larger as u32) + 1;
+        let prefix_bytes = oversize.to_le_bytes();
+        let mut prefix_only = prefix_bytes.as_slice();
+        let err = read_length_prefixed_with_max(&mut prefix_only, larger)
+            .await
+            .expect_err("over-larger-cap prefix must be rejected before body read");
+        assert!(matches!(
+            err,
+            DepositWireError::FrameOutOfBounds { len, max }
+                if len == oversize as usize && max == larger
+        ));
     }
 }

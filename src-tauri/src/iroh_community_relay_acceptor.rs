@@ -35,16 +35,25 @@
 //! is no friend-graph on a relay; any sender must be a co-member.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ed25519_dalek::{Signature, VerifyingKey};
 use harmony_content::cid::{ContentFlags, ContentId};
 use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
+use iroh::endpoint::Connection;
 
+use crate::butler_deposit::{
+    read_length_prefixed, write_length_prefixed, write_length_prefixed_with_max,
+};
 use crate::community_relay::{
-    relay_deposit_sig_payload, relay_pull_ack_sig_payload, relay_pull_sig_payload, RelayDepositAck,
-    RelayDepositFrame, RelayHeldBlob, RelayPullAck, RelayPullQuery, RelayPullResponse,
-    RELAY_MAX_SEALED_BLOB_BYTES,
+    decode_relay_deposit_frame, decode_relay_pull_ack_frame, decode_relay_pull_query,
+    encode_relay_deposit_ack, encode_relay_pull_response, relay_deposit_sig_payload,
+    relay_pull_ack_sig_payload, relay_pull_sig_payload, RelayDepositAck, RelayDepositFrame,
+    RelayHeldBlob, RelayPullAck, RelayPullQuery, RelayPullResponse, RELAY_MAX_SEALED_BLOB_BYTES,
+    RELAY_PULL_MAX_FRAME_BYTES,
 };
 use crate::community_relay_hold_crdt::{RelayHoldDoc, RelayHoldEntry};
 use crate::owner_state_types::{Hlc, SpaceId};
@@ -357,23 +366,42 @@ pub trait RelayPullCtx: Send + Sync {
     /// Wall-clock now in epoch-SECONDS for `EnrollmentCert` expiry checks.
     fn now_secs(&self) -> u64;
 
-    /// All held blobs for `recipient_owner` (any sealed-to device). Returns
-    /// `(storage_key, RelayHeldBlob)` pairs so the ack handler can translate
-    /// content IDs to storage keys without a second lookup.
+    /// Held blobs for `recipient_owner` that `requester_device` has NOT yet
+    /// pulled+acked (i.e. entries whose `pulled_by` set does NOT contain
+    /// `requester_device`). Returns `(storage_key, RelayHeldBlob)` pairs so the
+    /// ack handler can translate content IDs to storage keys without a second
+    /// lookup.
     ///
-    /// This method is intentionally RECIPIENT-scoped: it returns ALL of R's
-    /// held blobs across the relay's served communities. The `community_id` on
-    /// the pull query is a membership-LIVENESS gate (proving the requester is a
-    /// current member of a community the relay serves, to prevent non-member
+    /// This method is intentionally RECIPIENT-scoped: it returns R's held blobs
+    /// across the relay's served communities. The `community_id` on the pull
+    /// query is a membership-LIVENESS gate (proving the requester is a current
+    /// member of a community the relay serves, to prevent non-member
     /// enumeration) — NOT a response filter. Confidentiality holds regardless
     /// because every blob is sealed to R's device key; no party other than R's
     /// device can open any of the returned blobs.
-    async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)>;
+    ///
+    /// The per-device `pulled_by` exclusion lets a recipient DRAIN a backlog
+    /// over repeated pulls: once a device acks a blob, that device's subsequent
+    /// pulls no longer re-serve it (GC is a separate, later sweep — see
+    /// `mark_pulled` — so already-acked entries linger until then and must be
+    /// filtered here to avoid re-serving them every pass). The caller
+    /// (`handle_relay_pull_query`) then size-batches the returned set to one
+    /// [`crate::community_relay::RELAY_PULL_MAX_FRAME_BYTES`] frame.
+    async fn held_for(
+        &self,
+        recipient_owner: &[u8; 16],
+        requester_device: &str,
+    ) -> Vec<(String, RelayHeldBlob)>;
 
-    /// Record that `requester_device` pulled + acked the blobs at `keys`, then
-    /// run GC. Implementations should treat missing keys as a no-op so an ack
-    /// for an already-GC'd blob does not return an error. Returns `Err(String)`
-    /// only for genuine storage failures.
+    /// Record that `requester_device` pulled + acked the blobs at `keys` by
+    /// unioning `requester_device` into each present entry's `pulled_by` set,
+    /// then DURABLY FLUSH so the covered state replicates to the relay's fleet
+    /// before any replica removes the entry. GC is a SEPARATE periodic sweep
+    /// (`RelayHoldDoc::gc`), NOT run inline: `RelayHoldDoc::merge_from` is a
+    /// grow-only union, so an early local delete would be resurrected by a
+    /// sibling relay that has not yet seen the pull (spec D38). Missing keys are
+    /// a no-op so an ack for an already-GC'd blob does not return an error.
+    /// Returns `Err(String)` only for genuine storage failures.
     async fn mark_pulled(&self, keys: &[String], requester_device: String) -> Result<(), String>;
 }
 
@@ -491,7 +519,11 @@ pub async fn handle_relay_pull_query(
     }
 
     // Steps 1-4 — cert decode + Master-issuer + owner-id-derived anchor + membership.
-    let (device_vk, _requester_device_id) = auth_pull_cert_and_membership(
+    // `requester_device_id` is the lowercase 64-hex of the cert's enrolled
+    // device ed25519 verify key — the SAME id the ack path unions into
+    // `pulled_by` via `mark_pulled`, so excluding already-pulled entries by it
+    // here drains exactly what that device has acked.
+    let (device_vk, requester_device_id) = auth_pull_cert_and_membership(
         &query.requester_enrollment_cert,
         &query.recipient_owner,
         &query.community_id,
@@ -507,10 +539,42 @@ pub async fn handle_relay_pull_query(
         &query.sig,
     )?;
 
-    // Step 6 — serve held blobs for this recipient (opaque).
-    let held = ctx.held_for(&query.recipient_owner).await;
-    let entries = held.into_iter().map(|(_, blob)| blob).collect();
+    // Step 6 — serve held blobs not yet pulled by this device (opaque), size-
+    // batched to fit one RELAY_PULL_MAX_FRAME_BYTES response frame. Un-included
+    // entries stay held for the requester's next pull (backlog drain).
+    let held = ctx
+        .held_for(&query.recipient_owner, &requester_device_id)
+        .await;
+    let entries = batch_held_to_frame(held);
     Ok(RelayPullResponse { entries })
+}
+
+/// Conservative per-entry CBOR overhead added on top of `sealed_blob.len()`
+/// when size-batching held blobs into one response frame: the map keys
+/// (`"so"`, `"sb"`), the byte-string length headers, and the 16-byte
+/// `sender_owner`. A small fixed value is deliberately over-generous so the
+/// accumulated estimate never undershoots the real encoded size.
+const PER_ENTRY_OVERHEAD: usize = 64;
+
+/// Greedily accumulate held blobs (in `held_for` order) into one response
+/// frame, stopping before the running estimate would exceed
+/// [`RELAY_PULL_MAX_FRAME_BYTES`]. ALWAYS includes at least the first entry
+/// even if it alone is near the cap — a single ≤256 KiB sealed blob always
+/// fits, so the drain never wedges. Un-included entries are dropped here and
+/// re-served on the requester's next pull.
+fn batch_held_to_frame(held: Vec<(String, RelayHeldBlob)>) -> Vec<RelayHeldBlob> {
+    let mut entries: Vec<RelayHeldBlob> = Vec::new();
+    let mut running: usize = 0;
+    for (_, blob) in held {
+        let cost = blob.sealed_blob.len().saturating_add(PER_ENTRY_OVERHEAD);
+        // Always include the first entry; otherwise stop once it would overflow.
+        if !entries.is_empty() && running.saturating_add(cost) > RELAY_PULL_MAX_FRAME_BYTES {
+            break;
+        }
+        running = running.saturating_add(cost);
+        entries.push(blob);
+    }
+    entries
 }
 
 // ----------------------------------------------------------------
@@ -590,6 +654,345 @@ pub async fn handle_relay_pull_ack(
     ctx.mark_pulled(&keys, requester_device_id)
         .await
         .map_err(RelayPullReject::MarkFailed)
+}
+
+// =====================================================================
+// Phase B (Task 11): thin iroh shells driving the core handlers.
+//
+// Both shells mirror `iroh_butler_acceptor::IrohButlerDepositAcceptor`: a
+// length-prefixed frame in, the core pipeline, a length-prefixed response out,
+// and a uniform no-detail close on ANY failure (uniform reject = no oracle).
+// Behavioral coverage is the Task 12 end-to-end integration test (two real
+// iroh endpoints, the prod ctxs from Task 7); these shells carry only the
+// IO/decode/timeout plumbing.
+// =====================================================================
+
+/// Default per-await IO deadline for the relay deposit + pull exchanges.
+/// Mirrors [`crate::iroh_butler_acceptor::DEFAULT_BUTLER_IO_DEADLINE_MS`].
+pub const DEFAULT_RELAY_IO_DEADLINE_MS: u64 = 30_000;
+
+/// Default deadline for the post-response ack read on the pull stream. Shorter
+/// than the main IO deadline: a recipient that ingested nothing (or crashed
+/// mid-ingest) simply never writes the ack frame, and the relay must not block
+/// a stream slot for the full IO deadline waiting on an ack that will never
+/// arrive. The entries stay held (TTL / next pull reclaims), so a short wait
+/// here is a pure latency/occupancy tradeoff, never a correctness one.
+pub const DEFAULT_RELAY_ACK_READ_DEADLINE_MS: u64 = 5_000;
+
+/// Tunable timeouts for the relay shells. Tests construct this directly with
+/// sub-second values; production uses [`Self::default`].
+#[derive(Debug, Clone, Copy)]
+pub struct RelayAcceptorConfig {
+    /// Per-await IO timeout bounding `accept_bi`, the query/frame read, the
+    /// response write, and the post-success `conn.closed()` wait.
+    pub io_deadline: Duration,
+    /// Separate (shorter) deadline for the optional ack read that follows the
+    /// pull response. An ack-read timeout/EOF is a NORMAL termination, not an
+    /// error. Unused by the deposit shell.
+    pub ack_read_deadline: Duration,
+}
+
+impl Default for RelayAcceptorConfig {
+    fn default() -> Self {
+        Self {
+            io_deadline: Duration::from_millis(DEFAULT_RELAY_IO_DEADLINE_MS),
+            ack_read_deadline: Duration::from_millis(DEFAULT_RELAY_ACK_READ_DEADLINE_MS),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Deposit shell
+// ---------------------------------------------------------------------
+
+/// Errors that short-circuit one inbound relay-deposit connection. Internal to
+/// the shell — NOTHING here reaches the sender (uniform reject = no oracle for
+/// probing membership). Mirrors
+/// [`crate::iroh_butler_acceptor::DepositConnError`].
+#[derive(Debug, thiserror::Error)]
+enum RelayDepositConnError {
+    #[error("accept_bi: {0}")]
+    AcceptBi(String),
+    #[error("read frame: {0}")]
+    Read(String),
+    #[error("decode frame: {0}")]
+    Decode(String),
+    #[error("rejected: {0}")]
+    Reject(RelayDepositReject),
+    #[error("encode ack: {0}")]
+    EncodeAck(String),
+    #[error("write ack: {0}")]
+    Write(String),
+    #[error("send.finish: {0}")]
+    Finish(String),
+    #[error("IO timeout in {step}")]
+    IoTimeout { step: &'static str },
+}
+
+/// Inbound handler for the `harmony/community-relay-deposit/v1` ALPN.
+/// Installed on the iroh accept loop via
+/// `IrohZenohLinkManager::install_community_relay_deposit_acceptor`.
+/// Mirrors [`crate::iroh_butler_acceptor::IrohButlerDepositAcceptor`] exactly:
+/// length-prefixed [`RelayDepositFrame`] in → [`handle_relay_deposit_core`] →
+/// length-prefixed [`RelayDepositAck`] out → finish.
+pub struct IrohCommunityRelayDepositAcceptor {
+    ctx: Arc<dyn RelayDepositCtx>,
+    config: RelayAcceptorConfig,
+    /// Rejected deposits since construction (the wire never carries a detailed
+    /// reason; this is the "unlogged beyond a counter" sink, mirroring the
+    /// butler acceptor's `rejected_deposits`).
+    rejected_deposits: AtomicU64,
+}
+
+impl IrohCommunityRelayDepositAcceptor {
+    pub fn new(ctx: Arc<dyn RelayDepositCtx>) -> Self {
+        Self::with_config(ctx, RelayAcceptorConfig::default())
+    }
+
+    pub fn with_config(ctx: Arc<dyn RelayDepositCtx>, config: RelayAcceptorConfig) -> Self {
+        Self {
+            ctx,
+            config,
+            rejected_deposits: AtomicU64::new(0),
+        }
+    }
+
+    /// Total rejected deposits since construction.
+    pub fn rejected_deposit_count(&self) -> u64 {
+        self.rejected_deposits.load(Ordering::Relaxed)
+    }
+
+    /// Handle one inbound relay-deposit connection. On ANY failure the stream
+    /// is closed uniformly with no detail.
+    pub async fn handle_connection(&self, conn: Connection) {
+        match self.handle_deposit_inbound(&conn).await {
+            Ok(()) => {
+                tracing::info!(
+                    remote_id = ?conn.remote_id(),
+                    "ZEB-458: community relay deposit accepted (ack delivered)"
+                );
+                // Wait for the dialer to drive the close so the ack bytes flush
+                // before `conn` drops (same race-avoidance as the butler shell).
+                let _ = tokio::time::timeout(self.config.io_deadline, conn.closed()).await;
+            }
+            Err(RelayDepositConnError::Reject(reject)) => {
+                self.rejected_deposits.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    reject = %reject,
+                    remote_id = ?conn.remote_id(),
+                    "ZEB-458: community relay deposit rejected (closing without detail)"
+                );
+                conn.close(0u32.into(), b"");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    remote_id = ?conn.remote_id(),
+                    "ZEB-458: community relay deposit connection failed"
+                );
+                conn.close(0u32.into(), b"");
+            }
+        }
+    }
+
+    async fn handle_deposit_inbound(&self, conn: &Connection) -> Result<(), RelayDepositConnError> {
+        let (mut send, mut recv) = tokio::time::timeout(self.config.io_deadline, conn.accept_bi())
+            .await
+            .map_err(|_| RelayDepositConnError::IoTimeout { step: "accept_bi" })?
+            .map_err(|e| RelayDepositConnError::AcceptBi(e.to_string()))?;
+
+        let body = tokio::time::timeout(self.config.io_deadline, read_length_prefixed(&mut recv))
+            .await
+            .map_err(|_| RelayDepositConnError::IoTimeout { step: "read frame" })?
+            .map_err(|e| RelayDepositConnError::Read(e.to_string()))?;
+        let frame = decode_relay_deposit_frame(&body)
+            .map_err(|e| RelayDepositConnError::Decode(e.to_string()))?;
+
+        let ack = handle_relay_deposit_core(&frame, self.ctx.as_ref())
+            .await
+            .map_err(RelayDepositConnError::Reject)?;
+
+        let ack_bytes = encode_relay_deposit_ack(&ack)
+            .map_err(|e| RelayDepositConnError::EncodeAck(e.to_string()))?;
+        tokio::time::timeout(
+            self.config.io_deadline,
+            write_length_prefixed(&mut send, &ack_bytes),
+        )
+        .await
+        .map_err(|_| RelayDepositConnError::IoTimeout { step: "write ack" })?
+        .map_err(|e| RelayDepositConnError::Write(e.to_string()))?;
+        send.finish()
+            .map_err(|e| RelayDepositConnError::Finish(e.to_string()))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------
+// Pull shell
+// ---------------------------------------------------------------------
+
+/// Errors that short-circuit one inbound relay-pull connection. Internal to
+/// the shell — NOTHING here reaches the requester. The ack-absent case is NOT
+/// represented here: a missing/timed-out ack is a normal termination handled
+/// inline, never an error.
+#[derive(Debug, thiserror::Error)]
+enum RelayPullConnError {
+    #[error("accept_bi: {0}")]
+    AcceptBi(String),
+    #[error("read query: {0}")]
+    ReadQuery(String),
+    #[error("decode query: {0}")]
+    DecodeQuery(String),
+    #[error("query rejected: {0}")]
+    QueryReject(RelayPullReject),
+    #[error("encode response: {0}")]
+    EncodeResponse(String),
+    #[error("write response: {0}")]
+    WriteResponse(String),
+    #[error("decode ack frame: {0}")]
+    DecodeAck(String),
+    #[error("ack rejected: {0}")]
+    AckReject(RelayPullReject),
+    #[error("send.finish: {0}")]
+    Finish(String),
+    #[error("IO timeout in {step}")]
+    IoTimeout { step: &'static str },
+}
+
+/// Inbound handler for the `harmony/community-relay-pull/v1` ALPN. Installed
+/// via `IrohZenohLinkManager::install_community_relay_pull_acceptor`.
+///
+/// The pull protocol is a single bi-stream carrying up to three messages:
+///
+/// 1. **query** (requester → relay): a length-prefixed [`RelayPullQuery`].
+/// 2. **response** (relay → requester): a length-prefixed [`RelayPullResponse`]
+///    with the recipient's held blobs.
+/// 3. **ack** (requester → relay, OPTIONAL): a length-prefixed
+///    [`crate::community_relay::RelayPullAckFrame`]. The recipient ingests its
+///    blobs and then sends an ack listing the content ids it durably persisted.
+///    If no ack arrives — the recipient ingested nothing, crashed, or closed —
+///    the stream finishes gracefully and the entries stay held (TTL / next pull
+///    reclaims). An ack-read timeout or EOF is therefore a NORMAL termination,
+///    never an error.
+pub struct IrohCommunityRelayPullAcceptor {
+    ctx: Arc<dyn RelayPullCtx>,
+    config: RelayAcceptorConfig,
+}
+
+impl IrohCommunityRelayPullAcceptor {
+    pub fn new(ctx: Arc<dyn RelayPullCtx>) -> Self {
+        Self::with_config(ctx, RelayAcceptorConfig::default())
+    }
+
+    pub fn with_config(ctx: Arc<dyn RelayPullCtx>, config: RelayAcceptorConfig) -> Self {
+        Self { ctx, config }
+    }
+
+    /// Handle one inbound relay-pull connection. On ANY failure the stream is
+    /// closed uniformly with no detail. A missing ack is success, not failure.
+    pub async fn handle_connection(&self, conn: Connection) {
+        match self.handle_pull_inbound(&conn).await {
+            Ok(()) => {
+                tracing::info!(
+                    remote_id = ?conn.remote_id(),
+                    "ZEB-458: community relay pull served"
+                );
+                let _ = tokio::time::timeout(self.config.io_deadline, conn.closed()).await;
+            }
+            Err(RelayPullConnError::QueryReject(reject))
+            | Err(RelayPullConnError::AckReject(reject)) => {
+                tracing::debug!(
+                    reject = %reject,
+                    remote_id = ?conn.remote_id(),
+                    "ZEB-458: community relay pull rejected (closing without detail)"
+                );
+                conn.close(0u32.into(), b"");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    remote_id = ?conn.remote_id(),
+                    "ZEB-458: community relay pull connection failed"
+                );
+                conn.close(0u32.into(), b"");
+            }
+        }
+    }
+
+    async fn handle_pull_inbound(&self, conn: &Connection) -> Result<(), RelayPullConnError> {
+        let (mut send, mut recv) = tokio::time::timeout(self.config.io_deadline, conn.accept_bi())
+            .await
+            .map_err(|_| RelayPullConnError::IoTimeout { step: "accept_bi" })?
+            .map_err(|e| RelayPullConnError::AcceptBi(e.to_string()))?;
+
+        // Message 1 — pull query.
+        let query_body =
+            tokio::time::timeout(self.config.io_deadline, read_length_prefixed(&mut recv))
+                .await
+                .map_err(|_| RelayPullConnError::IoTimeout { step: "read query" })?
+                .map_err(|e| RelayPullConnError::ReadQuery(e.to_string()))?;
+        let query = decode_relay_pull_query(&query_body)
+            .map_err(|e| RelayPullConnError::DecodeQuery(e.to_string()))?;
+
+        let resp = handle_relay_pull_query(&query, self.ctx.as_ref())
+            .await
+            .map_err(RelayPullConnError::QueryReject)?;
+
+        // Message 2 — pull response. This frame batches many held blobs, so it
+        // uses the larger RELAY_PULL_MAX_FRAME_BYTES cap (the query/ack frames
+        // above/below stay on the default 256 KiB deposit cap).
+        let resp_bytes = encode_relay_pull_response(&resp)
+            .map_err(|e| RelayPullConnError::EncodeResponse(e.to_string()))?;
+        tokio::time::timeout(
+            self.config.io_deadline,
+            write_length_prefixed_with_max(&mut send, &resp_bytes, RELAY_PULL_MAX_FRAME_BYTES),
+        )
+        .await
+        .map_err(|_| RelayPullConnError::IoTimeout {
+            step: "write response",
+        })?
+        .map_err(|e| RelayPullConnError::WriteResponse(e.to_string()))?;
+
+        // Message 3 — OPTIONAL ack. Read on the SAME recv stream with the
+        // SHORTER ack deadline. A timeout, EOF, or any read error here means
+        // "no ack" — finish gracefully; the entries stay held.
+        match tokio::time::timeout(
+            self.config.ack_read_deadline,
+            read_length_prefixed(&mut recv),
+        )
+        .await
+        {
+            Ok(Ok(ack_body)) => {
+                let frame = decode_relay_pull_ack_frame(&ack_body)
+                    .map_err(|e| RelayPullConnError::DecodeAck(e.to_string()))?;
+                let ack = RelayPullAck {
+                    content_ids: frame.content_ids.clone(),
+                };
+                handle_relay_pull_ack(
+                    &frame.recipient_owner,
+                    &frame.community_id,
+                    &ack,
+                    &frame.requester_enrollment_cert,
+                    &frame.sig,
+                    self.ctx.as_ref(),
+                )
+                .await
+                .map_err(RelayPullConnError::AckReject)?;
+            }
+            // Timeout (outer Err) or read error/EOF (inner Err): the recipient
+            // never acked. This is a normal, non-error termination.
+            Ok(Err(_)) | Err(_) => {
+                tracing::debug!(
+                    remote_id = ?conn.remote_id(),
+                    "ZEB-458: community relay pull finished with no ack (entries stay held)"
+                );
+            }
+        }
+
+        send.finish()
+            .map_err(|e| RelayPullConnError::Finish(e.to_string()))?;
+        Ok(())
+    }
 }
 
 // =====================================================================
@@ -1373,14 +1776,20 @@ mod tests {
             self.now_secs
         }
 
-        async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)> {
+        async fn held_for(
+            &self,
+            recipient_owner: &[u8; 16],
+            requester_device: &str,
+        ) -> Vec<(String, RelayHeldBlob)> {
             self.push_event("held_for");
             self.doc
                 .lock()
                 .unwrap()
                 .entries
                 .iter()
-                .filter(|(_, e)| &e.recipient_owner == recipient_owner)
+                .filter(|(_, e)| {
+                    &e.recipient_owner == recipient_owner && !e.pulled_by.contains(requester_device)
+                })
                 .map(|(k, e)| {
                     (
                         k.clone(),
@@ -1502,6 +1911,91 @@ mod tests {
         assert!(ev.iter().any(|e| e == "serves_community"));
         assert!(ev.iter().any(|e| e == "is_joined_member"));
         assert!(ev.iter().any(|e| e == "held_for"));
+    }
+
+    // ----------------------------------------------------------------
+    // Test 1b: query response is size-batched to one frame AND excludes
+    // entries this requesting device already pulled+acked.
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_pull_query_size_batches_and_excludes_already_pulled() {
+        let recipient = mint_test_owner(0x42);
+        let sender = mint_test_owner(0x51);
+        let cid = community_id();
+        let now_secs = 1_700_000_100u64;
+        let now_ms = 1_700_000_100_000u64;
+
+        // The requester device id is the lowercase 64-hex of the cert's enrolled
+        // device ed25519 verify key — exactly what the query handler derives.
+        let requester_device = hex::encode(recipient.cert.device_pubkeys.classical.ed25519_verify);
+
+        let mut ctx = TestRelayPullCtx::new(now_secs, now_ms);
+        ctx.serve(cid);
+        ctx.admit(cid, recipient.owner.0);
+
+        // Build a hold entry with an arbitrary unique key + sealed_blob, bypassing
+        // ContentId::for_book (whose own ~1 MiB cap is unrelated to the frame cap
+        // under test). `pulled` seeds the per-device exclusion.
+        let build = |seed: u8, blob: Vec<u8>, pulled: &[&str]| -> (String, RelayHoldEntry) {
+            let key = RelayHoldDoc::key(&recipient.owner.0, &[seed; 32]);
+            let entry = RelayHoldEntry {
+                recipient_owner: recipient.owner.0,
+                sender_owner: sender.owner.0,
+                community_id: cid,
+                sealed_blob: blob,
+                held_at: Hlc {
+                    wall_ms: now_ms - 1_000,
+                    logical: 0,
+                    device_id: "relay-device".into(),
+                },
+                held_by: "relay-device".into(),
+                pulled_by: pulled.iter().map(|s| s.to_string()).collect(),
+            };
+            (key, entry)
+        };
+
+        // Two large blobs (~10 MiB each) — together they exceed one 16 MiB
+        // response frame, so the batch must serve a subset.
+        let big = |fill: u8| vec![fill; 10 * 1024 * 1024];
+        let (key_a, entry_a) = build(0xA1, big(0xA1), &[]);
+        let (key_b, entry_b) = build(0xB2, big(0xB2), &[]);
+
+        // A third entry that this device has ALREADY pulled+acked — must be
+        // excluded entirely (it lingers pre-GC but is never re-served).
+        let (key_acked, entry_acked) = build(
+            0xC3,
+            b"already-delivered".to_vec(),
+            &[requester_device.as_str()],
+        );
+
+        ctx.preload_entry(key_a.clone(), entry_a);
+        ctx.preload_entry(key_b.clone(), entry_b);
+        ctx.preload_entry(key_acked.clone(), entry_acked);
+
+        let query = build_pull_query(&recipient, cid);
+        let resp = handle_relay_pull_query(&query, &ctx)
+            .await
+            .expect("valid pull query must succeed");
+
+        // The already-acked entry is never in the response.
+        assert!(
+            resp.entries
+                .iter()
+                .all(|b| b.sealed_blob != b"already-delivered".to_vec()),
+            "an entry already pulled by this device must be excluded"
+        );
+
+        // Two 10 MiB blobs would be ~20 MiB > 16 MiB cap, so only ONE of the
+        // big blobs fits this frame; the encoded response stays under the cap.
+        assert_eq!(resp.entries.len(), 1, "size-batched to a single big blob");
+        let encoded = encode_relay_pull_response(&resp).expect("encode response");
+        assert!(
+            encoded.len() <= RELAY_PULL_MAX_FRAME_BYTES,
+            "encoded response ({}) must fit the frame cap ({})",
+            encoded.len(),
+            RELAY_PULL_MAX_FRAME_BYTES
+        );
     }
 
     // ----------------------------------------------------------------

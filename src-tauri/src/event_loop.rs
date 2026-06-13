@@ -129,6 +129,20 @@ pub struct P2SyncHandles {
     pub fleet_net: DatasetSyncHandles,
 }
 
+/// ZEB-458 P4 Phase B: the two relay dataset adapter handle pairs, bundled so
+/// `run(...)` grows ONE parameter instead of two (same rationale as
+/// [`P2SyncHandles`]). Both datasets are fleet-scoped on the OWNER address —
+/// `relay-hold-v1` replicates the relay's held blobs across the relay's own
+/// fleet (D38); `relay-optin-v1` replicates the per-community opt-in across the
+/// volunteer's fleet (D43). `None` when no owner identity is loaded (and in
+/// test callers that bypass `start_node`).
+pub struct RelaySyncHandles {
+    /// relay-hold-v1 — the relay's held opaque blobs (D38).
+    pub hold: DatasetSyncHandles,
+    /// relay-optin-v1 — per-community relay opt-in flags (D43).
+    pub optin: DatasetSyncHandles,
+}
+
 /// One per-community adapter request handed from `start_node` (lib.rs)
 /// into the event loop's Zenoh-session scope.
 ///
@@ -813,6 +827,11 @@ pub async fn run(
     // `harmony/owner/{addr_hex}/ds/{dataset}`. `None` when no owner
     // identity is loaded (and in test callers that bypass `start_node`).
     mut p2_sync_handles: Option<P2SyncHandles>,
+    // ZEB-458 P4 Phase B: the two relay dataset channel pairs (relay-hold-v1 +
+    // relay-optin-v1), bridged to Zenoh on
+    // `harmony/owner/{addr_hex}/ds/{dataset}`. `None` when no owner identity is
+    // loaded (and in test callers that bypass `start_node`).
+    mut relay_sync_handles: Option<RelaySyncHandles>,
     // ZEB-321 Phase 1 Task 8: bundle of iroh-transport resources built in
     // `start_node`. When `Some`, the event loop spawns the link-manager
     // accept loop + publisher driver as background tasks; when `None`
@@ -1624,6 +1643,38 @@ pub async fn run(
             "fleet-net-v1",
             "fleet-net-sync-degraded",
             crate::fleet_net::FLEET_NET_DATASET_MAX_BYTES,
+        )
+        .await;
+    }
+
+    // ── ZEB-458 P4 Phase B: relay-hold + relay-optin fleet-sync adapters ─
+    // Same plumbing as the P2 datasets above — `relay-hold-v1` replicates the
+    // relay's held opaque blobs across the relay's own fleet (D38);
+    // `relay-optin-v1` replicates the per-community opt-in across the
+    // volunteer's fleet (D43). Both are keyed off the OWNER address hex
+    // (`handles.addr_hex`, set to `owner_addr_hex` at the start_node call site)
+    // and the per-dataset lookup tag, forming
+    // `harmony/owner/{addr_hex}/ds/{dataset}`. `None` when no owner identity is
+    // loaded.
+    if let Some(relay) = relay_sync_handles.take() {
+        spawn_dataset_sync_zenoh_adapter(
+            &session,
+            &app,
+            &closing,
+            relay.hold,
+            "relay-hold-v1",
+            "relay-hold-sync-degraded",
+            crate::community_relay::RELAY_HOLD_DATASET_MAX_BYTES,
+        )
+        .await;
+        spawn_dataset_sync_zenoh_adapter(
+            &session,
+            &app,
+            &closing,
+            relay.optin,
+            "relay-optin-v1",
+            "relay-optin-sync-degraded",
+            crate::community_relay::RELAY_OPTIN_DATASET_MAX_BYTES,
         )
         .await;
     }

@@ -34,6 +34,18 @@ pub const COMMUNITY_RELAY_DEPOSIT_ALPN: &[u8] = b"harmony/community-relay-deposi
 /// ALPN for the pull direction: recipient → relay pulls held blobs.
 pub const COMMUNITY_RELAY_PULL_ALPN: &[u8] = b"harmony/community-relay-pull/v1";
 
+/// Cap on a single pull-RESPONSE frame body ([`RelayPullResponse`], a
+/// `Vec<RelayHeldBlob>`). This is DISTINCT from
+/// [`crate::butler_deposit::DEPOSIT_MAX_FRAME_BYTES`] (256 KiB), which bounds
+/// one *per-blob* deposit frame: a pull response batches many held blobs into a
+/// single frame, so it needs a larger cap. 16 MiB is generous — it must be
+/// ≥ one maximum sealed blob (≤ 256 KiB) plus its CBOR envelope so that at
+/// least one held blob always fits in a response (the query handler size-batches
+/// to this cap, but a single oversize entry must never wedge the drain). The
+/// query / ack frames stay on the small 256 KiB cap; only the response frame
+/// uses this.
+pub const RELAY_PULL_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// HKDF info string for the relay sealed envelope. Distinct from both the
 /// butler-deposit and epoch-key-seal info strings (key-derivation domain
 /// separation ensures a ciphertext sealed for one context can never be
@@ -80,9 +92,50 @@ pub const RELAY_HOLD_GLOBAL_CAP: usize = 1024;
 /// [`crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES`]).
 pub const RELAY_MAX_SEALED_BLOB_BYTES: usize = crate::butler_deposit::DEPOSIT_MAX_FRAME_BYTES;
 
+/// ZEB-458 P4 Phase B: generous per-entry CBOR-metadata overhead allowance,
+/// added on top of [`RELAY_MAX_SEALED_BLOB_BYTES`] when sizing the whole-doc
+/// dataset cap below. A replicated `RelayHoldDoc` is not just the blob bytes —
+/// each held entry serializes as a CBOR map keyed by `"{recipient_hex}:
+/// {content_id_hex}"` (≈ 81 bytes of key text) plus the entry's metadata:
+/// `recipient_owner` + `sender_owner` (OwnerAddr, 16 bytes each), `community_id`
+/// (SpaceId, 16 bytes), `held_at` (an HLC: wall_ms + logical + device_id
+/// string), a 64-hex `held_by` relay-device string, the `content_id`, and a
+/// `pulled_by` set — all wrapped in CBOR map/key/length headers. 512 bytes is
+/// deliberately over-budget (the measured per-entry overhead is well under this
+/// — see the unit test) so the dataset cap never under-counts the doc and the
+/// zenoh dataset adapter cannot silently DROP a full-capacity sample.
+pub const RELAY_HOLD_ENTRY_OVERHEAD_BYTES: usize = 512;
+
+/// ZEB-458 P4 Phase B: inbound size cap for one `relay-hold-v1` fleet-sync
+/// sample (a whole CBOR-encoded `RelayHoldDoc`), enforced in the zenoh bridge
+/// before the owned copy. The doc holds at most [`RELAY_HOLD_GLOBAL_CAP`]
+/// entries, each bounded by [`RELAY_MAX_SEALED_BLOB_BYTES`] for the blob plus
+/// [`RELAY_HOLD_ENTRY_OVERHEAD_BYTES`] for the per-entry CBOR map key + metadata
+/// (the replicated sample is the WHOLE doc, not just the raw blobs — a
+/// blob-bytes-only product under-counts the doc and, at full capacity, the
+/// zenoh dataset adapter would DROP the over-cap sample so sibling relays never
+/// converge). A fixed 64 KiB envelope margin covers the doc-level CBOR framing
+/// (outer map header, version tag, etc.) independent of entry count.
+pub const RELAY_HOLD_DATASET_MAX_BYTES: usize = RELAY_HOLD_GLOBAL_CAP
+    * (RELAY_MAX_SEALED_BLOB_BYTES + RELAY_HOLD_ENTRY_OVERHEAD_BYTES)
+    + 64 * 1024;
+
+/// ZEB-458 P4 Phase B: inbound size cap for one `relay-optin-v1` fleet-sync
+/// sample (a whole CBOR-encoded `RelayOptInDoc`). The doc carries only a
+/// boolean + HLC stamp per community, so a generous fixed ceiling (mirroring
+/// [`crate::fleet_net::FLEET_NET_DATASET_MAX_BYTES`]) bounds peer-driven
+/// allocation without constraining a realistic opt-in set.
+pub const RELAY_OPTIN_DATASET_MAX_BYTES: usize = 256 * 1024;
+
 /// TTL for un-pulled relay blobs in milliseconds (30 days, matching
 /// [`crate::butler_deposit::INBOX_TTL_MS`]).
 pub const RELAY_HOLD_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+
+/// Sweep interval (ms) for the relay-hold GC task — the ONLY storage-reclaim
+/// path (TTL-expired + fully-covered entries). 10 minutes: frequent enough to
+/// bound storage shortly after coverage propagates, infrequent enough to be
+/// negligible overhead. Wired at start_node (T11b).
+pub const RELAY_HOLD_GC_INTERVAL_MS: u64 = 10 * 60 * 1_000;
 
 // =====================================================================
 // Wire types — Deposit direction (sender → relay)
@@ -187,6 +240,37 @@ pub struct RelayPullAck {
     pub content_ids: Vec<[u8; 32]>,
 }
 
+/// Self-contained pull-ack wire frame (recipient → relay, second message of
+/// the pull bi-stream). Unlike [`RelayPullAck`] — which carries only the bare
+/// content-id list and relies on the surrounding pull session for the
+/// requester's identity, cert, and signature — this frame bundles everything
+/// the relay's [`crate::iroh_community_relay_acceptor::handle_relay_pull_ack`]
+/// needs to authenticate the ack on its own: the recipient owner, community,
+/// the requester's `EnrollmentCert`, the acked content ids, and the ack
+/// signature over [`relay_pull_ack_sig_payload`]. The Phase B pull transport
+/// writes this frame on the SAME stream after receiving the pull response, so
+/// the relay can mark the listed content ids pulled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayPullAckFrame {
+    /// Recipient OwnerAddr bytes (who is acking their pulled blobs).
+    #[serde(rename = "ro")]
+    pub recipient_owner: [u8; 16],
+    /// Community SpaceId — the membership-liveness gate (same role as on the
+    /// pull query).
+    #[serde(rename = "ci")]
+    pub community_id: SpaceId,
+    /// Canonical CBOR of the requester device's `EnrollmentCert` (re-supplied
+    /// so the ack is self-authenticating on a fresh stream read).
+    #[serde(rename = "ec", with = "serde_bytes")]
+    pub requester_enrollment_cert: Vec<u8>,
+    /// Content IDs of successfully ingested blobs (relay may GC these).
+    #[serde(rename = "cd")]
+    pub content_ids: Vec<[u8; 32]>,
+    /// 64-byte device ed25519 signature over [`relay_pull_ack_sig_payload`].
+    #[serde(rename = "sg", with = "serde_bytes")]
+    pub sig: Vec<u8>,
+}
+
 // Manual CanonicalPayload registrations (mirrors butler_deposit.rs).
 impl CanonicalPayloadSealed for RelayDepositFrame {}
 impl CanonicalPayload for RelayDepositFrame {}
@@ -200,6 +284,8 @@ impl CanonicalPayloadSealed for RelayPullResponse {}
 impl CanonicalPayload for RelayPullResponse {}
 impl CanonicalPayloadSealed for RelayPullAck {}
 impl CanonicalPayload for RelayPullAck {}
+impl CanonicalPayloadSealed for RelayPullAckFrame {}
+impl CanonicalPayload for RelayPullAckFrame {}
 
 // =====================================================================
 // Encode / decode helpers (one pair per wire type, trailing bytes rejected)
@@ -252,6 +338,16 @@ pub fn encode_relay_pull_ack(ack: &RelayPullAck) -> Result<Vec<u8>, DepositWireE
 
 /// Decode a [`RelayPullAck`] from canonical CBOR (trailing bytes rejected).
 pub fn decode_relay_pull_ack(bytes: &[u8]) -> Result<RelayPullAck, DepositWireError> {
+    canonical_cbor_decode(bytes).map_err(|e| DepositWireError::Decode(format!("{e}")))
+}
+
+/// Encode a [`RelayPullAckFrame`] to canonical CBOR.
+pub fn encode_relay_pull_ack_frame(frame: &RelayPullAckFrame) -> Result<Vec<u8>, DepositWireError> {
+    canonical_cbor_encode(frame).map_err(|e| DepositWireError::Encode(format!("{e}")))
+}
+
+/// Decode a [`RelayPullAckFrame`] from canonical CBOR (trailing bytes rejected).
+pub fn decode_relay_pull_ack_frame(bytes: &[u8]) -> Result<RelayPullAckFrame, DepositWireError> {
     canonical_cbor_decode(bytes).map_err(|e| DepositWireError::Decode(format!("{e}")))
 }
 
@@ -411,6 +507,41 @@ pub fn both_joined_members(
 }
 
 // =====================================================================
+// D40 sender-side helpers
+// =====================================================================
+
+use crate::owner_state_types::SpaceKind;
+
+/// Communities where BOTH `self_owner` and `recipient` are Joined members
+/// (D40 gate). Pure: `kind_of` and `is_joined` abstract the community-state
+/// registry so this is unit-testable. The caller passes the sender's own
+/// space-id list (`OwnerState.spaces` keys).
+pub fn find_shared_communities(
+    space_ids: &[SpaceId],
+    self_owner: &OwnerAddr,
+    recipient: &OwnerAddr,
+    kind_of: impl Fn(&SpaceId) -> SpaceKind,
+    is_joined: impl Fn(&SpaceId, &OwnerAddr) -> bool,
+) -> Vec<SpaceId> {
+    space_ids
+        .iter()
+        .filter(|s| kind_of(s) == SpaceKind::Community)
+        .filter(|s| is_joined(s, self_owner) && is_joined(s, recipient))
+        .copied()
+        .collect()
+}
+
+/// Sender-side last-resort rung (D40). Mirrors the butler deposit client: given
+/// the same outbox candidate the butler rung uses, seal the DepositPayload to
+/// R's advertised butler-set device(s) and deposit to a relay in a shared
+/// community. Returns true iff at least one relay acked. Never touches
+/// AttemptState (the caller treats an acked candidate as delivered-pending-pull).
+#[async_trait::async_trait]
+pub trait CommunityRelayDepositClient: Send + Sync {
+    async fn deposit(&self, req: &crate::butler_deposit::ButlerDepositRequest) -> bool;
+}
+
+// =====================================================================
 // Tests
 // =====================================================================
 
@@ -469,6 +600,16 @@ mod tests {
     fn fixture_pull_ack() -> RelayPullAck {
         RelayPullAck {
             content_ids: vec![[0xAA; 32], [0xBB; 32]],
+        }
+    }
+
+    fn fixture_pull_ack_frame() -> RelayPullAckFrame {
+        RelayPullAckFrame {
+            recipient_owner: [0x11; 16],
+            community_id: fixture_space_id(),
+            requester_enrollment_cert: vec![0xA1, 0xA2, 0xA3],
+            content_ids: vec![[0xAA; 32], [0xBB; 32]],
+            sig: vec![0x07; 64],
         }
     }
 
@@ -585,6 +726,25 @@ mod tests {
         bytes.push(0x42);
         assert!(matches!(
             decode_relay_pull_ack(&bytes),
+            Err(DepositWireError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn relay_pull_ack_frame_round_trips() {
+        let frame = fixture_pull_ack_frame();
+        let bytes = encode_relay_pull_ack_frame(&frame).expect("encode");
+        let back = decode_relay_pull_ack_frame(&bytes).expect("decode");
+        assert_eq!(back, frame);
+    }
+
+    #[test]
+    fn relay_pull_ack_frame_rejects_trailing_bytes() {
+        let frame = fixture_pull_ack_frame();
+        let mut bytes = encode_relay_pull_ack_frame(&frame).expect("encode");
+        bytes.push(0x13);
+        assert!(matches!(
+            decode_relay_pull_ack_frame(&bytes),
             Err(DepositWireError::Decode(_))
         ));
     }
@@ -801,5 +961,35 @@ mod tests {
         let b = mint_test_owner(0x20);
         let membership = make_membership([]);
         assert!(!both_joined_members(&membership, &a.owner, &b.owner));
+    }
+
+    #[test]
+    fn find_shared_communities_includes_only_mutually_joined_community_spaces() {
+        use crate::owner_state_types::{OwnerAddr, SpaceId, SpaceKind};
+        let self_o = OwnerAddr([0x01; 16]);
+        let r = OwnerAddr([0x02; 16]);
+        let c_both = SpaceId([0xC1; 16]); // both joined -> included
+        let c_self_only = SpaceId([0xC2; 16]); // only self joined -> excluded
+        let dm = SpaceId([0xD0; 16]); // not a community -> excluded
+
+        let kinds = |s: &SpaceId| -> SpaceKind {
+            if *s == dm {
+                SpaceKind::Dm
+            } else {
+                SpaceKind::Community
+            }
+        };
+        let joined = |s: &SpaceId, who: &OwnerAddr| -> bool {
+            if *s == c_both {
+                true
+            } else if *s == c_self_only {
+                *who == self_o
+            } else {
+                false
+            }
+        };
+        let space_ids = vec![c_both, c_self_only, dm];
+        let got = find_shared_communities(&space_ids, &self_o, &r, kinds, joined);
+        assert_eq!(got, vec![c_both]);
     }
 }

@@ -33,6 +33,10 @@ use harmony_app::community_relay::{
     RELAY_HOLD_PER_SENDER_CAP,
 };
 use harmony_app::community_relay_hold_crdt::{RelayHoldDoc, RelayHoldEntry};
+use harmony_app::community_relay_optin::RelayOptInDoc;
+use harmony_app::community_relay_prod::{
+    CommunityMembershipLookup, EngineRelayHoldFlush, ProdRelayDepositCtx, ProdRelayPullCtx,
+};
 use harmony_app::community_relay_pull::{open_and_ingest, RelayIngestCtx};
 use harmony_app::dm_signing::{ed25519_priv_to_x25519, open_from_owner_with_info};
 use harmony_app::fleet_sync::{
@@ -362,12 +366,18 @@ impl RelayPullCtx for TestRelayCtx {
         self.now_secs
     }
 
-    async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)> {
+    async fn held_for(
+        &self,
+        recipient_owner: &[u8; 16],
+        requester_device: &str,
+    ) -> Vec<(String, RelayHeldBlob)> {
         self.push_event("held_for");
         let doc = self.doc.lock().await;
         doc.entries
             .iter()
-            .filter(|(_, e)| &e.recipient_owner == recipient_owner)
+            .filter(|(_, e)| {
+                &e.recipient_owner == recipient_owner && !e.pulled_by.contains(requester_device)
+            })
             .map(|(k, e)| {
                 (
                     k.clone(),
@@ -978,6 +988,534 @@ async fn relay_opacity_no_decrypt_on_relay_side() {
             "relay stores sealed_blob verbatim — never transforms or decrypts it"
         );
     }
+
+    let _ = built.engine.shutdown().await;
+}
+
+// =====================================================================
+// PRODUCTION-ctx integration (ZEB-458 P4 Phase B, D45)
+//
+// The scenarios below exercise the SAME core handlers
+// (`handle_relay_deposit_core` / `handle_relay_pull_query` /
+// `handle_relay_pull_ack`) against the REAL production context impls
+// (`ProdRelayDepositCtx` / `ProdRelayPullCtx`) instead of the in-file
+// `TestRelayCtx`. The core handlers take `&dyn RelayDepositCtx` /
+// `&dyn RelayPullCtx`, so this is a pure ctx swap that additionally proves:
+//   - prod admission: opt-in gate (`RelayOptInDoc`) + co-membership gate
+//     (`CommunityMembershipLookup`) + the enrollment-cert/sig crypto;
+//   - prod persist/flush over the real `FleetSyncEngine<RelayHoldDoc>` via
+//     `EngineRelayHoldFlush` (durable flush BEFORE the ack, caps enforced);
+//   - prod `held_for` / `mark_pulled` (pulled_by union, no inline GC).
+//
+// The membership + flush seams are recreated here (the production module's
+// `FakeMembership` / `NoopFlush` are `#[cfg(test)]`-private, so an integration
+// binary — which compiles against the public API — cannot see them).
+//
+// The recipient-side ingest keeps the in-file `TestRecipientIngestCtx`: the
+// production `ProdRelayIngestCtx::ingest_recovered` runs the full receive path
+// (verify_cidnotify_admission → apply_inbox → emit) which needs a fully set-up
+// recipient `OwnerState`; its correctness is unit-reviewed in T9a, and the
+// open-and-ingest seam is what this test exercises.
+// =====================================================================
+
+/// Integration-local membership seam: a fixed set of `(community, owner)`
+/// Joined pairs. Mirrors the production module's `#[cfg(test)]` `FakeMembership`.
+struct FakeMembership {
+    joined: BTreeSet<([u8; 16], [u8; 16])>,
+}
+
+#[async_trait]
+impl CommunityMembershipLookup for FakeMembership {
+    async fn is_joined(&self, c: &SpaceId, o: &[u8; 16]) -> bool {
+        self.joined.contains(&(c.0, *o))
+    }
+}
+
+/// An opt-in doc that has opted in to `community`.
+fn opted_in_doc(community: SpaceId) -> Arc<Mutex<RelayOptInDoc>> {
+    let mut d = RelayOptInDoc::default();
+    d.set(
+        community,
+        true,
+        Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "relay".into(),
+        },
+    );
+    Arc::new(Mutex::new(d))
+}
+
+/// Build the PRODUCTION deposit + pull ctxs over the SAME real engine in
+/// `built` (so a deposit's flush + the pull's `held_for` see one shared doc).
+/// `members` is the set of `(community.0, owner.0)` pairs the `FakeMembership`
+/// treats as Joined; `opted_in` controls whether the opt-in doc has the
+/// community opted in (false → `serves_community` is false → WrongCommunity).
+fn build_prod_ctxs(
+    built: &Built,
+    opted_in: bool,
+    members: BTreeSet<([u8; 16], [u8; 16])>,
+) -> (ProdRelayDepositCtx, ProdRelayPullCtx) {
+    let relay = relay_owner();
+    let cid = community_id();
+    let relay_dev_id = relay_device_id();
+
+    let membership: Arc<dyn CommunityMembershipLookup> =
+        Arc::new(FakeMembership { joined: members });
+
+    let optin = if opted_in {
+        opted_in_doc(cid)
+    } else {
+        Arc::new(Mutex::new(RelayOptInDoc::default()))
+    };
+
+    // BOTH ctxs flush through the SAME engine (EngineRelayHoldFlush) and share
+    // the engine's doc + tracker Arcs, exactly as start_node wires them.
+    let deposit = ProdRelayDepositCtx {
+        self_owner: relay.owner.0,
+        relay_device_id: relay_dev_id,
+        relay_hold_doc: Arc::clone(&built.doc),
+        relay_hold_tracker: Arc::clone(&built.tracker),
+        flush: Arc::new(EngineRelayHoldFlush(Arc::clone(&built.engine))),
+        optin: Arc::clone(&optin),
+        membership: Arc::clone(&membership),
+    };
+    let pull = ProdRelayPullCtx {
+        self_owner: relay.owner.0,
+        relay_hold_doc: Arc::clone(&built.doc),
+        flush: Arc::new(EngineRelayHoldFlush(Arc::clone(&built.engine))),
+        optin,
+        membership,
+    };
+    (deposit, pull)
+}
+
+/// The `(community, owner)` membership set for the happy path: relay, sender,
+/// and recipient are ALL Joined members of the community.
+fn all_joined_members() -> BTreeSet<([u8; 16], [u8; 16])> {
+    let cid = community_id();
+    let mut m = BTreeSet::new();
+    m.insert((cid.0, relay_owner().owner.0));
+    m.insert((cid.0, sender_owner().owner.0));
+    m.insert((cid.0, recipient_owner().owner.0));
+    m
+}
+
+// =====================================================================
+// Prod-ctx Test 1: Happy path over the PRODUCTION ctxs — admission (opt-in +
+// co-membership + cert/sig) → durable persist/flush → pull → open_and_ingest
+// → ack → pulled_by → gc. Opacity (verbatim sealed_blob) re-asserted.
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_prod_ctx_happy_path_full_round_trip() {
+    let fx = build_fixture();
+    let relay_dev_id = relay_device_id();
+
+    let built = build_relay_engine(&relay_dev_id, Arc::new(NoopRelayPersist));
+    let (deposit_ctx, pull_ctx) = build_prod_ctxs(&built, true, all_joined_members());
+
+    // ----- (1) Sender deposits through the PROD deposit ctx -----
+    // serves_community (opt-in + relay self-joined) → both_co_members (sender +
+    // recipient joined) → cert/sig verify → atomic persist-with-caps + flush.
+    let ack = handle_relay_deposit_core(&fx.frame, &deposit_ctx)
+        .await
+        .expect("valid co-member deposit must be accepted by the prod ctx");
+    assert_eq!(ack.content_id, fx.sealed_content_id);
+
+    // Hold doc has the entry, sealed_blob verbatim (relay never decrypts).
+    let key = RelayHoldDoc::key(&fx.recipient.owner.0, &ack.content_id);
+    {
+        let doc = built.doc.lock().await;
+        let entry = doc.entries.get(&key).expect("entry in hold doc");
+        assert_eq!(
+            entry.sealed_blob, fx.frame.sealed_blob,
+            "prod relay holds sealed_blob verbatim (no decrypt)"
+        );
+        assert_eq!(entry.recipient_owner, fx.recipient.owner.0);
+        assert_eq!(entry.sender_owner, fx.sender.owner.0);
+        assert_eq!(entry.community_id, community_id());
+        assert_eq!(
+            entry.held_by, relay_dev_id,
+            "held_by stamped with the prod relay device id"
+        );
+        assert!(entry.pulled_by.is_empty(), "fresh hold has no pulls");
+    }
+
+    // ----- (2) Recipient builds + sends an authed pull query (PROD pull ctx) -----
+    let cert_bytes = harmony_owner::cbor::to_canonical(&fx.recipient.cert).expect("encode cert");
+    let pull_sig = fx
+        .recipient
+        .device_key
+        .sign(&relay_pull_sig_payload(
+            &fx.recipient.owner.0,
+            &community_id(),
+        ))
+        .to_bytes()
+        .to_vec();
+    let query = RelayPullQuery {
+        recipient_owner: fx.recipient.owner.0,
+        community_id: community_id(),
+        requester_enrollment_cert: cert_bytes.clone(),
+        sig: pull_sig,
+    };
+    let resp = handle_relay_pull_query(&query, &pull_ctx)
+        .await
+        .expect("authed pull query must succeed against the prod ctx");
+    assert_eq!(resp.entries.len(), 1, "one held blob for this recipient");
+    assert_eq!(
+        resp.entries[0].sealed_blob, fx.frame.sealed_blob,
+        "prod pull delivers the verbatim sealed blob"
+    );
+    assert_eq!(resp.entries[0].sender_owner, fx.sender.owner.0);
+
+    // ----- (3) Recipient opens + ingests via open_and_ingest -----
+    let recipient_x25519 = ed25519_priv_to_x25519(&fx.recipient.device_key);
+    let ingest_ctx = TestRecipientIngestCtx::new(vec![recipient_x25519]);
+    let acked_content_ids = open_and_ingest(&resp.entries, &ingest_ctx).await;
+    assert_eq!(acked_content_ids.len(), 1);
+    assert_eq!(acked_content_ids[0], fx.sealed_content_id);
+    let ingested = ingest_ctx.ingested();
+    assert_eq!(ingested.len(), 1);
+    assert_eq!(
+        ingested[0], fx.payload,
+        "recovered payload matches original"
+    );
+
+    // ----- (4) Recipient sends pull ack through the PROD pull ctx -----
+    let ack_msg = RelayPullAck {
+        content_ids: acked_content_ids.clone(),
+    };
+    let pull_ack_sig = fx
+        .recipient
+        .device_key
+        .sign(&relay_pull_ack_sig_payload(
+            &fx.recipient.owner.0,
+            &community_id(),
+            &acked_content_ids,
+        ))
+        .to_bytes()
+        .to_vec();
+    handle_relay_pull_ack(
+        &fx.recipient.owner.0,
+        &community_id(),
+        &ack_msg,
+        &cert_bytes,
+        &pull_ack_sig,
+        &pull_ctx,
+    )
+    .await
+    .expect("pull ack must succeed against the prod ctx");
+
+    // mark_pulled unioned pulled_by under the prod ctx (no inline GC).
+    {
+        let doc = built.doc.lock().await;
+        let entry = doc
+            .entries
+            .get(&key)
+            .expect("entry still present before gc");
+        let recipient_device_id =
+            hex::encode(fx.recipient.cert.device_pubkeys.classical.ed25519_verify);
+        assert!(
+            entry.pulled_by.contains(&recipient_device_id),
+            "prod mark_pulled must record the recipient device in pulled_by"
+        );
+    }
+
+    // ----- (5) The SEPARATE periodic GC sweep removes the covered entry -----
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let changed = built.doc.lock().await.gc(now_ms);
+    assert!(changed, "gc must remove the covered (acked) entry");
+    assert!(
+        built.doc.lock().await.entries.is_empty(),
+        "hold doc empty after gc reclaims the covered entry"
+    );
+
+    let _ = built.engine.shutdown().await;
+}
+
+// =====================================================================
+// Prod-ctx Test 2: Non-member sender — the PROD deposit ctx's co-membership
+// gate (FakeMembership WITHOUT the sender) rejects with NotCoMember, and the
+// hold doc stays EMPTY (nothing is held pre-decrypt).
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_prod_ctx_non_member_sender_rejected_doc_empty() {
+    let fx = build_fixture();
+    let relay_dev_id = relay_device_id();
+
+    let built = build_relay_engine(&relay_dev_id, Arc::new(NoopRelayPersist));
+
+    // Membership has the relay + recipient joined, but NOT the sender — so
+    // both_co_members is false → NotCoMember (and we never reach persist).
+    let cid = community_id();
+    let mut members = BTreeSet::new();
+    members.insert((cid.0, relay_owner().owner.0));
+    members.insert((cid.0, recipient_owner().owner.0));
+    // (sender_owner deliberately omitted)
+    let (deposit_ctx, _pull_ctx) = build_prod_ctxs(&built, true, members);
+
+    let err = handle_relay_deposit_core(&fx.frame, &deposit_ctx)
+        .await
+        .expect_err("non-co-member sender must be rejected by the prod ctx");
+    assert!(
+        matches!(err, RelayDepositReject::NotCoMember),
+        "expected NotCoMember, got {err:?}"
+    );
+
+    // The hold doc must be EMPTY — nothing is held before admission passes.
+    {
+        let doc = built.doc.lock().await;
+        assert!(
+            doc.entries.is_empty(),
+            "hold doc must be EMPTY after a non-member reject (nothing held pre-decrypt)"
+        );
+    }
+
+    let _ = built.engine.shutdown().await;
+}
+
+// =====================================================================
+// Prod-ctx Test 3: Restart survival through the PROD pull ctx — deposit via the
+// prod deposit ctx, drop + reload the relay engine from the persisted
+// RelayHoldDoc, then serve a pull query off the reloaded engine through the
+// PROD pull ctx.
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_prod_ctx_restart_durability_pull_via_prod_ctx() {
+    let fx = build_fixture();
+    let relay_dev_id = relay_device_id();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let doc_path = dir.path().join("relay_hold.cbor");
+    let replay_path = dir.path().join("relay_hold_replay.cbor");
+
+    // ----- Phase 1: deposit + durable flush through the PROD deposit ctx -----
+    let built = build_relay_engine(
+        &relay_dev_id,
+        Arc::new(RelayHoldPersist {
+            doc_path: doc_path.clone(),
+            replay_path: replay_path.clone(),
+        }),
+    );
+    let (deposit_ctx, _pull_ctx) = build_prod_ctxs(&built, true, all_joined_members());
+
+    let ack = handle_relay_deposit_core(&fx.frame, &deposit_ctx)
+        .await
+        .expect("deposit through the prod ctx succeeds");
+    let key = RelayHoldDoc::key(&fx.recipient.owner.0, &ack.content_id);
+
+    // The prod persist_hold flushes synchronously BEFORE returning the ack, so
+    // the file is already written; assert it before the drop.
+    assert!(
+        built.doc.lock().await.entries.contains_key(&key),
+        "entry must be in the doc after the prod deposit"
+    );
+    assert!(doc_path.exists(), "relay_hold.cbor must exist after flush");
+
+    // ----- Phase 2: drop the engine + ctxs (simulated restart) -----
+    let _ = built.engine.shutdown().await;
+    drop(deposit_ctx);
+    drop(built);
+
+    // ----- Phase 3: reload the doc from disk -----
+    let reloaded_doc = load_relay_hold_doc(&doc_path);
+    assert!(
+        reloaded_doc.entries.contains_key(&key),
+        "entry must survive the engine drop+reload (durability)"
+    );
+    assert_eq!(
+        reloaded_doc.entries[&key].sealed_blob, fx.frame.sealed_blob,
+        "reloaded sealed_blob is byte-identical to the deposited blob"
+    );
+
+    // ----- Phase 4: the reloaded engine serves a pull query via the PROD ctx -----
+    let built2 =
+        build_relay_engine_from_doc(&relay_dev_id, reloaded_doc, Arc::new(NoopRelayPersist));
+    let (_deposit2, pull_ctx2) = build_prod_ctxs(&built2, true, all_joined_members());
+
+    let cert_bytes = harmony_owner::cbor::to_canonical(&fx.recipient.cert).expect("encode cert");
+    let pull_sig = fx
+        .recipient
+        .device_key
+        .sign(&relay_pull_sig_payload(
+            &fx.recipient.owner.0,
+            &community_id(),
+        ))
+        .to_bytes()
+        .to_vec();
+    let query = RelayPullQuery {
+        recipient_owner: fx.recipient.owner.0,
+        community_id: community_id(),
+        requester_enrollment_cert: cert_bytes,
+        sig: pull_sig,
+    };
+
+    let resp = handle_relay_pull_query(&query, &pull_ctx2)
+        .await
+        .expect("reloaded relay must serve a pull query through the prod ctx");
+    assert_eq!(resp.entries.len(), 1, "one held blob after reload");
+    assert_eq!(
+        resp.entries[0].sealed_blob, fx.frame.sealed_blob,
+        "sealed blob is byte-identical after reload + prod-ctx pull"
+    );
+
+    let _ = built2.engine.shutdown().await;
+}
+
+// =====================================================================
+// Prod-ctx Test 4: multi-blob backlog DRAIN — the per-device `held_for`
+// exclusion means a recipient device that pulls + acks its held blobs sees an
+// EMPTY response on its next pull (no re-serve of acked-but-not-yet-GC'd
+// entries), proving the bounded/drain contract end-to-end over the prod ctxs.
+// =====================================================================
+
+/// Build a deposit frame for the standard sender/recipient/community with a
+/// custom `storage_blob` (distinct content → distinct sealed content id →
+/// distinct hold-doc key). Returns `(frame, sealed_content_id)`.
+fn build_deposit_frame_with_blob(
+    sender: &TestOwner,
+    recipient: &TestOwner,
+    storage_blob: Vec<u8>,
+) -> (harmony_app::community_relay::RelayDepositFrame, [u8; 32]) {
+    let cid = community_id();
+    let payload = DepositPayload {
+        cidnotify_packet: vec![0x01, 0x02, 0x03, 0x04],
+        storage_blob,
+    };
+    let cert_bytes = harmony_owner::cbor::to_canonical(&sender.cert).expect("encode cert");
+    let frame = build_relay_deposit_frame(
+        recipient.owner.0,
+        &recipient.cert.device_pubkeys.classical.ed25519_verify,
+        sender.owner.0,
+        cid,
+        cert_bytes,
+        &sender.device_key,
+        &payload,
+    )
+    .expect("build_relay_deposit_frame");
+    let sealed_content_id = ContentId::for_book(
+        &frame.sealed_blob,
+        ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        },
+    )
+    .expect("content_id for sealed blob")
+    .to_bytes();
+    (frame, sealed_content_id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_prod_ctx_multi_blob_drain_no_reserve_after_ack() {
+    let sender = sender_owner();
+    let recipient = recipient_owner();
+    let relay_dev_id = relay_device_id();
+
+    let built = build_relay_engine(&relay_dev_id, Arc::new(NoopRelayPersist));
+    let (deposit_ctx, pull_ctx) = build_prod_ctxs(&built, true, all_joined_members());
+
+    // ----- (1) Deposit THREE distinct blobs for the recipient -----
+    let frames: Vec<_> = [
+        b"blob-one".to_vec(),
+        b"blob-two".to_vec(),
+        b"blob-three".to_vec(),
+    ]
+    .into_iter()
+    .map(|b| build_deposit_frame_with_blob(&sender, &recipient, b))
+    .collect();
+    for (frame, _cid) in &frames {
+        handle_relay_deposit_core(frame, &deposit_ctx)
+            .await
+            .expect("co-member deposit must be accepted");
+    }
+    assert_eq!(
+        built.doc.lock().await.entries.len(),
+        3,
+        "three held blobs after three deposits"
+    );
+
+    // ----- (2) First pull returns the full un-delivered set -----
+    let cert_bytes = harmony_owner::cbor::to_canonical(&recipient.cert).expect("encode cert");
+    let pull_sig = recipient
+        .device_key
+        .sign(&relay_pull_sig_payload(&recipient.owner.0, &community_id()))
+        .to_bytes()
+        .to_vec();
+    let query = RelayPullQuery {
+        recipient_owner: recipient.owner.0,
+        community_id: community_id(),
+        requester_enrollment_cert: cert_bytes.clone(),
+        sig: pull_sig.clone(),
+    };
+    let resp1 = handle_relay_pull_query(&query, &pull_ctx)
+        .await
+        .expect("first pull must succeed");
+    assert_eq!(
+        resp1.entries.len(),
+        3,
+        "first pull serves all three un-delivered blobs"
+    );
+
+    // ----- (3) Ack ALL three content ids (as the honest client would after
+    // a successful open+ingest) -----
+    let acked: Vec<[u8; 32]> = frames.iter().map(|(_, cid)| *cid).collect();
+    let ack_msg = RelayPullAck {
+        content_ids: acked.clone(),
+    };
+    let ack_sig = recipient
+        .device_key
+        .sign(&relay_pull_ack_sig_payload(
+            &recipient.owner.0,
+            &community_id(),
+            &acked,
+        ))
+        .to_bytes()
+        .to_vec();
+    handle_relay_pull_ack(
+        &recipient.owner.0,
+        &community_id(),
+        &ack_msg,
+        &cert_bytes,
+        &ack_sig,
+        &pull_ctx,
+    )
+    .await
+    .expect("pull ack must succeed");
+
+    // The entries linger (GC is a separate sweep), each now carrying this
+    // device in pulled_by.
+    let recipient_device_id = hex::encode(recipient.cert.device_pubkeys.classical.ed25519_verify);
+    {
+        let doc = built.doc.lock().await;
+        assert_eq!(doc.entries.len(), 3, "entries still present pre-GC");
+        assert!(
+            doc.entries
+                .values()
+                .all(|e| e.pulled_by.contains(&recipient_device_id)),
+            "every entry now carries this device in pulled_by"
+        );
+    }
+
+    // ----- (4) Second pull (SAME device) returns EMPTY — none re-served -----
+    let query2 = RelayPullQuery {
+        recipient_owner: recipient.owner.0,
+        community_id: community_id(),
+        requester_enrollment_cert: cert_bytes,
+        sig: pull_sig,
+    };
+    let resp2 = handle_relay_pull_query(&query2, &pull_ctx)
+        .await
+        .expect("second pull must succeed");
+    assert!(
+        resp2.entries.is_empty(),
+        "second pull re-serves nothing — all blobs already delivered+acked to this device"
+    );
 
     let _ = built.engine.shutdown().await;
 }

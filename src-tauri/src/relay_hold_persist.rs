@@ -1,0 +1,386 @@
+//! On-disk persistence for RelayHoldDoc and its replay tracker (ZEB-458 P4 B).
+//! Mirrors `dm_inbox_persist` exactly: atomic-rename + file fsync + parent-dir
+//! fsync via `owner_state_persist::save_atomically`, a 1-byte schema-version
+//! prefix (plaintext CBOR), strict trailing-byte rejection, and a quarantine-
+//! on-corruption recovery path so a bad load never silently overwrites the
+//! relay's held blobs on the next persist.
+//!
+//! `RelayHoldDoc` is not encrypted at rest (the held `sealed_blob`s inside are
+//! already sealed to the recipient device — the relay holds them opaque).
+
+use crate::community_relay_hold_crdt::RelayHoldDoc;
+use crate::fleet_sync::SyncError;
+use crate::owner_state_types::Hlc;
+use ciborium::{from_reader, into_writer};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io::Cursor;
+use std::path::Path;
+
+/// File name for the persisted RelayHoldDoc. Lives at
+/// `<identity_dir>/relay_hold.cbor`.
+pub const RELAY_HOLD_FILENAME: &str = "relay_hold.cbor";
+
+/// File name for the persisted replay tracker. Lives alongside
+/// `relay_hold.cbor`.
+pub const RELAY_HOLD_REPLAY_FILENAME: &str = "relay_hold_replay.cbor";
+
+const RELAY_HOLD_SCHEMA_V1: u8 = 1;
+const RELAY_HOLD_REPLAY_SCHEMA_V1: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct RelayHoldFileV1(RelayHoldDoc);
+
+#[derive(Serialize, Deserialize)]
+struct RelayHoldReplayFileV1(BTreeMap<String, Hlc>);
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Atomic write with parent-directory fsync (crash-durable rename). Routes
+/// through `owner_state_persist::save_atomically`, which fsyncs both the
+/// tempfile and (on Unix) the parent directory entry.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), SyncError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| SyncError::Persist(format!("create_dir_all {}: {e}", path.display())))?;
+    }
+    crate::owner_state_persist::save_atomically(path, bytes)
+        .map_err(|e| SyncError::Persist(e.to_string()))
+}
+
+// ── RelayHoldDoc ───────────────────────────────────────────────────────────────
+
+/// Load `RelayHoldDoc` from `path`. Returns `Ok(RelayHoldDoc::default())` if
+/// the file does not exist yet.
+pub fn load(path: &Path) -> Result<RelayHoldDoc, SyncError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RelayHoldDoc::default()),
+        Err(e) => return Err(SyncError::Persist(format!("read {}: {e}", path.display()))),
+    };
+    if bytes.is_empty() {
+        return Err(SyncError::CborDecode(format!(
+            "relay-hold file is empty: {}",
+            path.display()
+        )));
+    }
+    let version = bytes[0];
+    let payload = &bytes[1..];
+    match version {
+        RELAY_HOLD_SCHEMA_V1 => {
+            let mut cursor = Cursor::new(payload);
+            let file: RelayHoldFileV1 = from_reader(&mut cursor)
+                .map_err(|e| SyncError::CborDecode(format!("load {}: {e}", path.display())))?;
+            // Reject trailing bytes after the CBOR value (mirrors
+            // owner_state_crypto::canonical_cbor_decode): a corrupt file that is
+            // valid-prefix + garbage must NOT decode as "valid".
+            let pos = cursor.position() as usize;
+            if pos != payload.len() {
+                return Err(SyncError::CborDecode(format!(
+                    "trailing bytes after relay-hold value: consumed {} of {}",
+                    pos,
+                    payload.len()
+                )));
+            }
+            Ok(file.0)
+        }
+        v => Err(SyncError::CborDecode(format!(
+            "unknown relay-hold schema version {v:#x} in {}",
+            path.display()
+        ))),
+    }
+}
+
+/// Load the relay-hold doc, or — on a corruption/IO error (NOT NotFound) — log
+/// loudly, quarantine the bad file (renamed aside, never overwritten), and
+/// start fresh. Prevents the silent-data-loss path where a load error becomes
+/// an empty doc that the next persist writes over held blobs.
+pub fn load_doc_or_recover(path: &Path) -> RelayHoldDoc {
+    match load(path) {
+        Ok(doc) => doc,
+        Err(e) => {
+            quarantine(path, &e);
+            RelayHoldDoc::default()
+        }
+    }
+}
+
+/// Same recovery contract as [`load_doc_or_recover`], but for the replay
+/// tracker: on a corruption/IO error (NOT NotFound) the bad file is
+/// quarantined and an empty tracker returned, never silently overwritten.
+pub fn load_replay_or_recover(path: &Path) -> BTreeMap<String, Hlc> {
+    match load_replay(path) {
+        Ok(t) => t,
+        Err(e) => {
+            quarantine(path, &e);
+            BTreeMap::new()
+        }
+    }
+}
+
+fn quarantine(path: &Path, err: &SyncError) {
+    // Append a timestamped `.corrupt-<ms>` suffix so we never clobber a prior
+    // quarantine or the live file; preserves the bytes for manual recovery.
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut corrupt = path.as_os_str().to_os_string();
+    corrupt.push(format!(".corrupt-{ms}"));
+    tracing::error!(path = %path.display(), error = %err,
+        "relay-hold persistence load failed; quarantining corrupt file and starting fresh (bytes preserved)");
+    if let Err(re) = std::fs::rename(path, &corrupt) {
+        tracing::warn!(path = %path.display(), error = %re, "failed to quarantine corrupt relay-hold file");
+    }
+}
+
+/// Save `RelayHoldDoc` to `path` atomically (tempfile + fsync + parent-dir
+/// fsync + rename). Creates parent directories if needed.
+pub fn save(path: &Path, doc: &RelayHoldDoc) -> Result<(), SyncError> {
+    let mut bytes = vec![RELAY_HOLD_SCHEMA_V1];
+    into_writer(&RelayHoldFileV1(doc.clone()), &mut bytes)
+        .map_err(|e| SyncError::CborEncode(format!("encode {}: {e}", path.display())))?;
+    atomic_write(path, &bytes)
+}
+
+// ── Replay tracker ────────────────────────────────────────────────────────────
+
+/// Load the replay tracker from `path`. Returns `Ok(BTreeMap::new())` if the
+/// file does not exist yet.
+pub fn load_replay(path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(SyncError::Persist(format!("read {}: {e}", path.display()))),
+    };
+    if bytes.is_empty() {
+        return Err(SyncError::CborDecode(format!(
+            "relay-hold replay file is empty: {}",
+            path.display()
+        )));
+    }
+    let version = bytes[0];
+    let payload = &bytes[1..];
+    match version {
+        RELAY_HOLD_REPLAY_SCHEMA_V1 => {
+            let mut cursor = Cursor::new(payload);
+            let file: RelayHoldReplayFileV1 = from_reader(&mut cursor).map_err(|e| {
+                SyncError::CborDecode(format!("load_replay {}: {e}", path.display()))
+            })?;
+            // Reject trailing bytes after the CBOR value (mirrors
+            // owner_state_crypto::canonical_cbor_decode).
+            let pos = cursor.position() as usize;
+            if pos != payload.len() {
+                return Err(SyncError::CborDecode(format!(
+                    "trailing bytes after relay-hold replay value: consumed {} of {}",
+                    pos,
+                    payload.len()
+                )));
+            }
+            Ok(file.0)
+        }
+        v => Err(SyncError::CborDecode(format!(
+            "unknown relay-hold replay schema version {v:#x} in {}",
+            path.display()
+        ))),
+    }
+}
+
+/// Save the replay tracker to `path` atomically.
+pub fn save_replay(path: &Path, tracker: &BTreeMap<String, Hlc>) -> Result<(), SyncError> {
+    let mut bytes = vec![RELAY_HOLD_REPLAY_SCHEMA_V1];
+    into_writer(&RelayHoldReplayFileV1(tracker.clone()), &mut bytes)
+        .map_err(|e| SyncError::CborEncode(format!("encode replay {}: {e}", path.display())))?;
+    atomic_write(path, &bytes)
+}
+
+// ── FleetPersist impl ─────────────────────────────────────────────────────────
+
+/// Durability sink for the relay-hold fleet-sync engine. Holds the absolute
+/// paths for both the doc and replay-tracker files. The engine calls
+/// `persist` inside a `spawn_blocking` (fleet_sync.rs), so this impl stays
+/// synchronous like `DmInboxPersist`.
+pub struct RelayHoldPersist {
+    pub doc_path: std::path::PathBuf,
+    pub replay_path: std::path::PathBuf,
+}
+
+impl crate::fleet_sync::FleetPersist<RelayHoldDoc> for RelayHoldPersist {
+    fn persist(
+        &self,
+        state: &RelayHoldDoc,
+        tracker: &BTreeMap<String, Hlc>,
+    ) -> Result<(), SyncError> {
+        save(&self.doc_path, state)?;
+        save_replay(&self.replay_path, tracker)?;
+        Ok(())
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::community_relay_hold_crdt::{RelayHoldDoc, RelayHoldEntry};
+    use crate::fleet_sync::SyncError;
+    use crate::owner_state_types::{Hlc, SpaceId};
+
+    fn sample_entry() -> RelayHoldEntry {
+        RelayHoldEntry {
+            recipient_owner: [9u8; 16],
+            sender_owner: [7u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            sealed_blob: vec![4, 5, 6],
+            held_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "A".into(),
+            },
+            held_by: "relay-dev".into(),
+            pulled_by: ["dev-1".to_string()].into_iter().collect(),
+        }
+    }
+
+    fn sample_doc() -> RelayHoldDoc {
+        let mut doc = RelayHoldDoc::default();
+        doc.entries
+            .insert(RelayHoldDoc::key(&[9u8; 16], &[2u8; 32]), sample_entry());
+        doc
+    }
+
+    #[test]
+    fn doc_round_trips_and_missing_file_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_hold.cbor");
+        assert_eq!(load(&path).unwrap(), RelayHoldDoc::default());
+        let doc = sample_doc();
+        save(&path, &doc).unwrap();
+        assert_eq!(load(&path).unwrap(), doc);
+    }
+
+    #[test]
+    fn load_rejects_trailing_bytes_after_valid_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_hold.cbor");
+        let doc = sample_doc();
+        save(&path, &doc).unwrap();
+        assert_eq!(load(&path).unwrap(), doc);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0xFF);
+        std::fs::write(&path, &bytes).unwrap();
+        let err = load(&path).unwrap_err();
+        assert!(
+            matches!(err, SyncError::CborDecode(_)),
+            "trailing bytes must surface CborDecode, got {err:?}"
+        );
+        let recovered = load_doc_or_recover(&path);
+        assert_eq!(recovered, RelayHoldDoc::default());
+        assert!(!path.exists(), "corrupt file was quarantined");
+    }
+
+    #[test]
+    fn replay_round_trips_and_missing_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_hold_replay.cbor");
+        assert!(load_replay(&path).unwrap().is_empty());
+        let mut t = std::collections::BTreeMap::new();
+        t.insert(
+            "A".to_string(),
+            Hlc {
+                wall_ms: 9,
+                logical: 1,
+                device_id: "A".into(),
+            },
+        );
+        save_replay(&path, &t).unwrap();
+        assert_eq!(load_replay(&path).unwrap(), t);
+    }
+
+    #[test]
+    fn load_doc_or_recover_quarantines_corrupt_and_starts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_hold.cbor");
+        std::fs::write(&path, [0xFF_u8, 0x01, 0x02]).unwrap();
+        let doc = load_doc_or_recover(&path);
+        assert_eq!(
+            doc,
+            RelayHoldDoc::default(),
+            "recovers to a fresh empty doc"
+        );
+        assert!(
+            !path.exists(),
+            "the corrupt file is moved aside, not left in place"
+        );
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("relay_hold.cbor.corrupt-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine file");
+        assert_eq!(
+            std::fs::read(quarantined[0].path()).unwrap(),
+            vec![0xFF_u8, 0x01, 0x02],
+            "quarantined bytes are preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn load_doc_or_recover_missing_is_default_no_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_hold.cbor");
+        assert_eq!(load_doc_or_recover(&path), RelayHoldDoc::default());
+        let any: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(any.is_empty(), "no quarantine on a missing file");
+    }
+
+    #[test]
+    fn load_replay_or_recover_quarantines_corrupt_and_starts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_hold_replay.cbor");
+        std::fs::write(&path, [0xFF_u8]).unwrap();
+        let tracker = load_replay_or_recover(&path);
+        assert!(tracker.is_empty(), "recovers to an empty tracker");
+        assert!(!path.exists(), "corrupt replay file moved aside");
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("relay_hold_replay.cbor.corrupt-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine file");
+    }
+
+    #[test]
+    fn relay_hold_persist_writes_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = RelayHoldPersist {
+            doc_path: dir.path().join("relay_hold.cbor"),
+            replay_path: dir.path().join("relay_hold_replay.cbor"),
+        };
+        use crate::fleet_sync::FleetPersist;
+        let doc = sample_doc();
+        let mut t = std::collections::BTreeMap::new();
+        t.insert(
+            "A".to_string(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "A".into(),
+            },
+        );
+        p.persist(&doc, &t).unwrap();
+        assert_eq!(load(&p.doc_path).unwrap(), doc);
+        assert_eq!(load_replay(&p.replay_path).unwrap(), t);
+    }
+}
