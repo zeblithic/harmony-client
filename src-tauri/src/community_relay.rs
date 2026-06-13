@@ -411,6 +411,41 @@ pub fn both_joined_members(
 }
 
 // =====================================================================
+// D40 sender-side helpers
+// =====================================================================
+
+use crate::owner_state_types::SpaceKind;
+
+/// Communities where BOTH `self_owner` and `recipient` are Joined members
+/// (D40 gate). Pure: `kind_of` and `is_joined` abstract the community-state
+/// registry so this is unit-testable. The caller passes the sender's own
+/// space-id list (`OwnerState.spaces` keys).
+pub fn find_shared_communities(
+    space_ids: &[SpaceId],
+    self_owner: &OwnerAddr,
+    recipient: &OwnerAddr,
+    kind_of: impl Fn(&SpaceId) -> SpaceKind,
+    is_joined: impl Fn(&SpaceId, &OwnerAddr) -> bool,
+) -> Vec<SpaceId> {
+    space_ids
+        .iter()
+        .filter(|s| kind_of(s) == SpaceKind::Community)
+        .filter(|s| is_joined(s, self_owner) && is_joined(s, recipient))
+        .copied()
+        .collect()
+}
+
+/// Sender-side last-resort rung (D40). Mirrors the butler deposit client: given
+/// the same outbox candidate the butler rung uses, seal the DepositPayload to
+/// R's advertised butler-set device(s) and deposit to a relay in a shared
+/// community. Returns true iff at least one relay acked. Never touches
+/// AttemptState (the caller treats an acked candidate as delivered-pending-pull).
+#[async_trait::async_trait]
+pub trait CommunityRelayDepositClient: Send + Sync {
+    async fn deposit(&self, req: &crate::butler_deposit::ButlerDepositRequest) -> bool;
+}
+
+// =====================================================================
 // Tests
 // =====================================================================
 
@@ -801,5 +836,35 @@ mod tests {
         let b = mint_test_owner(0x20);
         let membership = make_membership([]);
         assert!(!both_joined_members(&membership, &a.owner, &b.owner));
+    }
+
+    #[test]
+    fn find_shared_communities_includes_only_mutually_joined_community_spaces() {
+        use crate::owner_state_types::{OwnerAddr, SpaceId, SpaceKind};
+        let self_o = OwnerAddr([0x01; 16]);
+        let r = OwnerAddr([0x02; 16]);
+        let c_both = SpaceId([0xC1; 16]); // both joined -> included
+        let c_self_only = SpaceId([0xC2; 16]); // only self joined -> excluded
+        let dm = SpaceId([0xD0; 16]); // not a community -> excluded
+
+        let kinds = |s: &SpaceId| -> SpaceKind {
+            if *s == dm {
+                SpaceKind::Dm
+            } else {
+                SpaceKind::Community
+            }
+        };
+        let joined = |s: &SpaceId, who: &OwnerAddr| -> bool {
+            if *s == c_both {
+                true
+            } else if *s == c_self_only {
+                *who == self_o
+            } else {
+                false
+            }
+        };
+        let space_ids = vec![c_both, c_self_only, dm];
+        let got = find_shared_communities(&space_ids, &self_o, &r, kinds, joined);
+        assert_eq!(got, vec![c_both]);
     }
 }
