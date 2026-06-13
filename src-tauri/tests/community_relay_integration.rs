@@ -366,12 +366,18 @@ impl RelayPullCtx for TestRelayCtx {
         self.now_secs
     }
 
-    async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)> {
+    async fn held_for(
+        &self,
+        recipient_owner: &[u8; 16],
+        requester_device: &str,
+    ) -> Vec<(String, RelayHeldBlob)> {
         self.push_event("held_for");
         let doc = self.doc.lock().await;
         doc.entries
             .iter()
-            .filter(|(_, e)| &e.recipient_owner == recipient_owner)
+            .filter(|(_, e)| {
+                &e.recipient_owner == recipient_owner && !e.pulled_by.contains(requester_device)
+            })
             .map(|(k, e)| {
                 (
                     k.clone(),
@@ -1360,4 +1366,156 @@ async fn relay_prod_ctx_restart_durability_pull_via_prod_ctx() {
     );
 
     let _ = built2.engine.shutdown().await;
+}
+
+// =====================================================================
+// Prod-ctx Test 4: multi-blob backlog DRAIN — the per-device `held_for`
+// exclusion means a recipient device that pulls + acks its held blobs sees an
+// EMPTY response on its next pull (no re-serve of acked-but-not-yet-GC'd
+// entries), proving the bounded/drain contract end-to-end over the prod ctxs.
+// =====================================================================
+
+/// Build a deposit frame for the standard sender/recipient/community with a
+/// custom `storage_blob` (distinct content → distinct sealed content id →
+/// distinct hold-doc key). Returns `(frame, sealed_content_id)`.
+fn build_deposit_frame_with_blob(
+    sender: &TestOwner,
+    recipient: &TestOwner,
+    storage_blob: Vec<u8>,
+) -> (harmony_app::community_relay::RelayDepositFrame, [u8; 32]) {
+    let cid = community_id();
+    let payload = DepositPayload {
+        cidnotify_packet: vec![0x01, 0x02, 0x03, 0x04],
+        storage_blob,
+    };
+    let cert_bytes = harmony_owner::cbor::to_canonical(&sender.cert).expect("encode cert");
+    let frame = build_relay_deposit_frame(
+        recipient.owner.0,
+        &recipient.cert.device_pubkeys.classical.ed25519_verify,
+        sender.owner.0,
+        cid,
+        cert_bytes,
+        &sender.device_key,
+        &payload,
+    )
+    .expect("build_relay_deposit_frame");
+    let sealed_content_id = ContentId::for_book(
+        &frame.sealed_blob,
+        ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        },
+    )
+    .expect("content_id for sealed blob")
+    .to_bytes();
+    (frame, sealed_content_id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_prod_ctx_multi_blob_drain_no_reserve_after_ack() {
+    let sender = sender_owner();
+    let recipient = recipient_owner();
+    let relay_dev_id = relay_device_id();
+
+    let built = build_relay_engine(&relay_dev_id, Arc::new(NoopRelayPersist));
+    let (deposit_ctx, pull_ctx) = build_prod_ctxs(&built, true, all_joined_members());
+
+    // ----- (1) Deposit THREE distinct blobs for the recipient -----
+    let frames: Vec<_> = [
+        b"blob-one".to_vec(),
+        b"blob-two".to_vec(),
+        b"blob-three".to_vec(),
+    ]
+    .into_iter()
+    .map(|b| build_deposit_frame_with_blob(&sender, &recipient, b))
+    .collect();
+    for (frame, _cid) in &frames {
+        handle_relay_deposit_core(frame, &deposit_ctx)
+            .await
+            .expect("co-member deposit must be accepted");
+    }
+    assert_eq!(
+        built.doc.lock().await.entries.len(),
+        3,
+        "three held blobs after three deposits"
+    );
+
+    // ----- (2) First pull returns the full un-delivered set -----
+    let cert_bytes = harmony_owner::cbor::to_canonical(&recipient.cert).expect("encode cert");
+    let pull_sig = recipient
+        .device_key
+        .sign(&relay_pull_sig_payload(&recipient.owner.0, &community_id()))
+        .to_bytes()
+        .to_vec();
+    let query = RelayPullQuery {
+        recipient_owner: recipient.owner.0,
+        community_id: community_id(),
+        requester_enrollment_cert: cert_bytes.clone(),
+        sig: pull_sig.clone(),
+    };
+    let resp1 = handle_relay_pull_query(&query, &pull_ctx)
+        .await
+        .expect("first pull must succeed");
+    assert_eq!(
+        resp1.entries.len(),
+        3,
+        "first pull serves all three un-delivered blobs"
+    );
+
+    // ----- (3) Ack ALL three content ids (as the honest client would after
+    // a successful open+ingest) -----
+    let acked: Vec<[u8; 32]> = frames.iter().map(|(_, cid)| *cid).collect();
+    let ack_msg = RelayPullAck {
+        content_ids: acked.clone(),
+    };
+    let ack_sig = recipient
+        .device_key
+        .sign(&relay_pull_ack_sig_payload(
+            &recipient.owner.0,
+            &community_id(),
+            &acked,
+        ))
+        .to_bytes()
+        .to_vec();
+    handle_relay_pull_ack(
+        &recipient.owner.0,
+        &community_id(),
+        &ack_msg,
+        &cert_bytes,
+        &ack_sig,
+        &pull_ctx,
+    )
+    .await
+    .expect("pull ack must succeed");
+
+    // The entries linger (GC is a separate sweep), each now carrying this
+    // device in pulled_by.
+    let recipient_device_id = hex::encode(recipient.cert.device_pubkeys.classical.ed25519_verify);
+    {
+        let doc = built.doc.lock().await;
+        assert_eq!(doc.entries.len(), 3, "entries still present pre-GC");
+        assert!(
+            doc.entries
+                .values()
+                .all(|e| e.pulled_by.contains(&recipient_device_id)),
+            "every entry now carries this device in pulled_by"
+        );
+    }
+
+    // ----- (4) Second pull (SAME device) returns EMPTY — none re-served -----
+    let query2 = RelayPullQuery {
+        recipient_owner: recipient.owner.0,
+        community_id: community_id(),
+        requester_enrollment_cert: cert_bytes,
+        sig: pull_sig,
+    };
+    let resp2 = handle_relay_pull_query(&query2, &pull_ctx)
+        .await
+        .expect("second pull must succeed");
+    assert!(
+        resp2.entries.is_empty(),
+        "second pull re-serves nothing — all blobs already delivered+acked to this device"
+    );
+
+    let _ = built.engine.shutdown().await;
 }

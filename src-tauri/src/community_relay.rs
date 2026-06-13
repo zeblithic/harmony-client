@@ -34,6 +34,18 @@ pub const COMMUNITY_RELAY_DEPOSIT_ALPN: &[u8] = b"harmony/community-relay-deposi
 /// ALPN for the pull direction: recipient → relay pulls held blobs.
 pub const COMMUNITY_RELAY_PULL_ALPN: &[u8] = b"harmony/community-relay-pull/v1";
 
+/// Cap on a single pull-RESPONSE frame body ([`RelayPullResponse`], a
+/// `Vec<RelayHeldBlob>`). This is DISTINCT from
+/// [`crate::butler_deposit::DEPOSIT_MAX_FRAME_BYTES`] (256 KiB), which bounds
+/// one *per-blob* deposit frame: a pull response batches many held blobs into a
+/// single frame, so it needs a larger cap. 16 MiB is generous — it must be
+/// ≥ one maximum sealed blob (≤ 256 KiB) plus its CBOR envelope so that at
+/// least one held blob always fits in a response (the query handler size-batches
+/// to this cap, but a single oversize entry must never wedge the drain). The
+/// query / ack frames stay on the small 256 KiB cap; only the response frame
+/// uses this.
+pub const RELAY_PULL_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// HKDF info string for the relay sealed envelope. Distinct from both the
 /// butler-deposit and epoch-key-seal info strings (key-derivation domain
 /// separation ensures a ciphertext sealed for one context can never be

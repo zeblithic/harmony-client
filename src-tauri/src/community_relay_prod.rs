@@ -278,11 +278,20 @@ impl RelayPullCtx for ProdRelayPullCtx {
         now_epoch_secs()
     }
 
-    async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)> {
+    async fn held_for(
+        &self,
+        recipient_owner: &[u8; 16],
+        requester_device: &str,
+    ) -> Vec<(String, RelayHeldBlob)> {
         let doc = self.relay_hold_doc.lock().await;
         doc.entries
             .iter()
-            .filter(|(_, e)| &e.recipient_owner == recipient_owner)
+            // Recipient-scoped AND not yet pulled+acked by THIS device, so a
+            // device drains its backlog without re-serving acked-but-not-yet-
+            // GC'd entries (GC is a later periodic sweep).
+            .filter(|(_, e)| {
+                &e.recipient_owner == recipient_owner && !e.pulled_by.contains(requester_device)
+            })
             .map(|(k, e)| {
                 (
                     k.clone(),
@@ -1085,7 +1094,9 @@ mod tests {
             fake(&[(c, [0x01; 16])]),
         );
 
-        let mut got = ctx.held_for(&recipient).await;
+        // Requester device not in any entry's pulled_by → no per-device
+        // filtering, so this exercises the plain recipient-scoping.
+        let mut got = ctx.held_for(&recipient, "device-never-pulled").await;
         got.sort_by(|a, b| a.0.cmp(&b.0));
 
         assert_eq!(got.len(), 2, "exactly the recipient's two entries");
@@ -1114,8 +1125,49 @@ mod tests {
             optin_doc(c, true),
             fake(&[(c, [0x01; 16])]),
         );
-        let got = ctx.held_for(&[0xAA; 16]).await;
+        let got = ctx.held_for(&[0xAA; 16], "device-never-pulled").await;
         assert!(got.is_empty());
+    }
+
+    /// `held_for` excludes entries this requesting device has already
+    /// pulled+acked (its id is in `pulled_by`), so a device drains its backlog
+    /// without re-serving acked-but-not-yet-GC'd entries.
+    #[tokio::test]
+    async fn held_for_excludes_entries_already_pulled_by_this_device() {
+        let c = space(0xCC);
+        let recipient = [0xAA; 16];
+        let sender = [0x22; 16];
+        let device = "abc123-requester-device";
+
+        let mut doc = RelayHoldDoc::default();
+        let key_undelivered = RelayHoldDoc::key(&recipient, &[0x01; 32]);
+        let key_already_acked = RelayHoldDoc::key(&recipient, &[0x02; 32]);
+        doc.entries.insert(
+            key_undelivered.clone(),
+            hold_entry(recipient, sender, c, vec![1, 2, 3]),
+        );
+        // This entry was already acked by `device` — it lingers (GC is a later
+        // sweep) but must NOT be re-served to `device`.
+        let mut acked = hold_entry(recipient, sender, c, vec![4, 5, 6]);
+        acked.pulled_by.insert(device.to_string());
+        doc.entries.insert(key_already_acked.clone(), acked);
+
+        let doc_arc = Arc::new(tokio::sync::Mutex::new(doc));
+        let ctx = pull_ctx(
+            [0x01; 16],
+            doc_arc,
+            optin_doc(c, true),
+            fake(&[(c, [0x01; 16])]),
+        );
+
+        // This device sees only the undelivered entry.
+        let got = ctx.held_for(&recipient, device).await;
+        assert_eq!(got.len(), 1, "only the un-acked entry is served");
+        assert_eq!(got[0].0, key_undelivered);
+
+        // A DIFFERENT device that hasn't acked anything sees both entries.
+        let other = ctx.held_for(&recipient, "some-other-device").await;
+        assert_eq!(other.len(), 2, "another device still sees both");
     }
 
     // ---------------------------------------------------------------

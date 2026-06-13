@@ -36,10 +36,11 @@ use async_trait::async_trait;
 use ed25519_dalek::Signer;
 use tokio::sync::Notify;
 
-use crate::butler_deposit::{read_length_prefixed, write_length_prefixed};
+use crate::butler_deposit::{read_length_prefixed_with_max, write_length_prefixed};
 use crate::community_relay::{
     decode_relay_pull_response, encode_relay_pull_ack_frame, encode_relay_pull_query,
     relay_pull_ack_sig_payload, relay_pull_sig_payload, RelayPullAckFrame, RelayPullQuery,
+    RELAY_PULL_MAX_FRAME_BYTES,
 };
 use crate::community_relay_announce::CommunityRelayEntry;
 use crate::community_relay_pull::{open_and_ingest, RelayIngestCtx};
@@ -132,8 +133,10 @@ impl RelayPullTransport for IrohRelayPullTransport {
                 .await
                 .map_err(|e| format!("write query: {e}"))?;
 
-            // Message 2 — read the pull response.
-            let resp_bytes = read_length_prefixed(&mut recv)
+            // Message 2 — read the pull response. This frame batches many held
+            // blobs, so it uses the larger RELAY_PULL_MAX_FRAME_BYTES cap (the
+            // query write above + ack write below stay on the default cap).
+            let resp_bytes = read_length_prefixed_with_max(&mut recv, RELAY_PULL_MAX_FRAME_BYTES)
                 .await
                 .map_err(|e| format!("read response: {e}"))?;
             let resp = decode_relay_pull_response(&resp_bytes)

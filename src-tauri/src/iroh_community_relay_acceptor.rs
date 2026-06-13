@@ -45,12 +45,15 @@ use harmony_content::cid::{ContentFlags, ContentId};
 use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
 use iroh::endpoint::Connection;
 
-use crate::butler_deposit::{read_length_prefixed, write_length_prefixed};
+use crate::butler_deposit::{
+    read_length_prefixed, write_length_prefixed, write_length_prefixed_with_max,
+};
 use crate::community_relay::{
     decode_relay_deposit_frame, decode_relay_pull_ack_frame, decode_relay_pull_query,
     encode_relay_deposit_ack, encode_relay_pull_response, relay_deposit_sig_payload,
     relay_pull_ack_sig_payload, relay_pull_sig_payload, RelayDepositAck, RelayDepositFrame,
     RelayHeldBlob, RelayPullAck, RelayPullQuery, RelayPullResponse, RELAY_MAX_SEALED_BLOB_BYTES,
+    RELAY_PULL_MAX_FRAME_BYTES,
 };
 use crate::community_relay_hold_crdt::{RelayHoldDoc, RelayHoldEntry};
 use crate::owner_state_types::{Hlc, SpaceId};
@@ -363,18 +366,32 @@ pub trait RelayPullCtx: Send + Sync {
     /// Wall-clock now in epoch-SECONDS for `EnrollmentCert` expiry checks.
     fn now_secs(&self) -> u64;
 
-    /// All held blobs for `recipient_owner` (any sealed-to device). Returns
-    /// `(storage_key, RelayHeldBlob)` pairs so the ack handler can translate
-    /// content IDs to storage keys without a second lookup.
+    /// Held blobs for `recipient_owner` that `requester_device` has NOT yet
+    /// pulled+acked (i.e. entries whose `pulled_by` set does NOT contain
+    /// `requester_device`). Returns `(storage_key, RelayHeldBlob)` pairs so the
+    /// ack handler can translate content IDs to storage keys without a second
+    /// lookup.
     ///
-    /// This method is intentionally RECIPIENT-scoped: it returns ALL of R's
-    /// held blobs across the relay's served communities. The `community_id` on
-    /// the pull query is a membership-LIVENESS gate (proving the requester is a
-    /// current member of a community the relay serves, to prevent non-member
+    /// This method is intentionally RECIPIENT-scoped: it returns R's held blobs
+    /// across the relay's served communities. The `community_id` on the pull
+    /// query is a membership-LIVENESS gate (proving the requester is a current
+    /// member of a community the relay serves, to prevent non-member
     /// enumeration) — NOT a response filter. Confidentiality holds regardless
     /// because every blob is sealed to R's device key; no party other than R's
     /// device can open any of the returned blobs.
-    async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)>;
+    ///
+    /// The per-device `pulled_by` exclusion lets a recipient DRAIN a backlog
+    /// over repeated pulls: once a device acks a blob, that device's subsequent
+    /// pulls no longer re-serve it (GC is a separate, later sweep — see
+    /// `mark_pulled` — so already-acked entries linger until then and must be
+    /// filtered here to avoid re-serving them every pass). The caller
+    /// (`handle_relay_pull_query`) then size-batches the returned set to one
+    /// [`crate::community_relay::RELAY_PULL_MAX_FRAME_BYTES`] frame.
+    async fn held_for(
+        &self,
+        recipient_owner: &[u8; 16],
+        requester_device: &str,
+    ) -> Vec<(String, RelayHeldBlob)>;
 
     /// Record that `requester_device` pulled + acked the blobs at `keys` by
     /// unioning `requester_device` into each present entry's `pulled_by` set,
@@ -502,7 +519,11 @@ pub async fn handle_relay_pull_query(
     }
 
     // Steps 1-4 — cert decode + Master-issuer + owner-id-derived anchor + membership.
-    let (device_vk, _requester_device_id) = auth_pull_cert_and_membership(
+    // `requester_device_id` is the lowercase 64-hex of the cert's enrolled
+    // device ed25519 verify key — the SAME id the ack path unions into
+    // `pulled_by` via `mark_pulled`, so excluding already-pulled entries by it
+    // here drains exactly what that device has acked.
+    let (device_vk, requester_device_id) = auth_pull_cert_and_membership(
         &query.requester_enrollment_cert,
         &query.recipient_owner,
         &query.community_id,
@@ -518,10 +539,42 @@ pub async fn handle_relay_pull_query(
         &query.sig,
     )?;
 
-    // Step 6 — serve held blobs for this recipient (opaque).
-    let held = ctx.held_for(&query.recipient_owner).await;
-    let entries = held.into_iter().map(|(_, blob)| blob).collect();
+    // Step 6 — serve held blobs not yet pulled by this device (opaque), size-
+    // batched to fit one RELAY_PULL_MAX_FRAME_BYTES response frame. Un-included
+    // entries stay held for the requester's next pull (backlog drain).
+    let held = ctx
+        .held_for(&query.recipient_owner, &requester_device_id)
+        .await;
+    let entries = batch_held_to_frame(held);
     Ok(RelayPullResponse { entries })
+}
+
+/// Conservative per-entry CBOR overhead added on top of `sealed_blob.len()`
+/// when size-batching held blobs into one response frame: the map keys
+/// (`"so"`, `"sb"`), the byte-string length headers, and the 16-byte
+/// `sender_owner`. A small fixed value is deliberately over-generous so the
+/// accumulated estimate never undershoots the real encoded size.
+const PER_ENTRY_OVERHEAD: usize = 64;
+
+/// Greedily accumulate held blobs (in `held_for` order) into one response
+/// frame, stopping before the running estimate would exceed
+/// [`RELAY_PULL_MAX_FRAME_BYTES`]. ALWAYS includes at least the first entry
+/// even if it alone is near the cap — a single ≤256 KiB sealed blob always
+/// fits, so the drain never wedges. Un-included entries are dropped here and
+/// re-served on the requester's next pull.
+fn batch_held_to_frame(held: Vec<(String, RelayHeldBlob)>) -> Vec<RelayHeldBlob> {
+    let mut entries: Vec<RelayHeldBlob> = Vec::new();
+    let mut running: usize = 0;
+    for (_, blob) in held {
+        let cost = blob.sealed_blob.len().saturating_add(PER_ENTRY_OVERHEAD);
+        // Always include the first entry; otherwise stop once it would overflow.
+        if !entries.is_empty() && running.saturating_add(cost) > RELAY_PULL_MAX_FRAME_BYTES {
+            break;
+        }
+        running = running.saturating_add(cost);
+        entries.push(blob);
+    }
+    entries
 }
 
 // ----------------------------------------------------------------
@@ -885,12 +938,14 @@ impl IrohCommunityRelayPullAcceptor {
             .await
             .map_err(RelayPullConnError::QueryReject)?;
 
-        // Message 2 — pull response.
+        // Message 2 — pull response. This frame batches many held blobs, so it
+        // uses the larger RELAY_PULL_MAX_FRAME_BYTES cap (the query/ack frames
+        // above/below stay on the default 256 KiB deposit cap).
         let resp_bytes = encode_relay_pull_response(&resp)
             .map_err(|e| RelayPullConnError::EncodeResponse(e.to_string()))?;
         tokio::time::timeout(
             self.config.io_deadline,
-            write_length_prefixed(&mut send, &resp_bytes),
+            write_length_prefixed_with_max(&mut send, &resp_bytes, RELAY_PULL_MAX_FRAME_BYTES),
         )
         .await
         .map_err(|_| RelayPullConnError::IoTimeout {
@@ -1721,14 +1776,20 @@ mod tests {
             self.now_secs
         }
 
-        async fn held_for(&self, recipient_owner: &[u8; 16]) -> Vec<(String, RelayHeldBlob)> {
+        async fn held_for(
+            &self,
+            recipient_owner: &[u8; 16],
+            requester_device: &str,
+        ) -> Vec<(String, RelayHeldBlob)> {
             self.push_event("held_for");
             self.doc
                 .lock()
                 .unwrap()
                 .entries
                 .iter()
-                .filter(|(_, e)| &e.recipient_owner == recipient_owner)
+                .filter(|(_, e)| {
+                    &e.recipient_owner == recipient_owner && !e.pulled_by.contains(requester_device)
+                })
                 .map(|(k, e)| {
                     (
                         k.clone(),
@@ -1850,6 +1911,91 @@ mod tests {
         assert!(ev.iter().any(|e| e == "serves_community"));
         assert!(ev.iter().any(|e| e == "is_joined_member"));
         assert!(ev.iter().any(|e| e == "held_for"));
+    }
+
+    // ----------------------------------------------------------------
+    // Test 1b: query response is size-batched to one frame AND excludes
+    // entries this requesting device already pulled+acked.
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_pull_query_size_batches_and_excludes_already_pulled() {
+        let recipient = mint_test_owner(0x42);
+        let sender = mint_test_owner(0x51);
+        let cid = community_id();
+        let now_secs = 1_700_000_100u64;
+        let now_ms = 1_700_000_100_000u64;
+
+        // The requester device id is the lowercase 64-hex of the cert's enrolled
+        // device ed25519 verify key — exactly what the query handler derives.
+        let requester_device = hex::encode(recipient.cert.device_pubkeys.classical.ed25519_verify);
+
+        let mut ctx = TestRelayPullCtx::new(now_secs, now_ms);
+        ctx.serve(cid);
+        ctx.admit(cid, recipient.owner.0);
+
+        // Build a hold entry with an arbitrary unique key + sealed_blob, bypassing
+        // ContentId::for_book (whose own ~1 MiB cap is unrelated to the frame cap
+        // under test). `pulled` seeds the per-device exclusion.
+        let build = |seed: u8, blob: Vec<u8>, pulled: &[&str]| -> (String, RelayHoldEntry) {
+            let key = RelayHoldDoc::key(&recipient.owner.0, &[seed; 32]);
+            let entry = RelayHoldEntry {
+                recipient_owner: recipient.owner.0,
+                sender_owner: sender.owner.0,
+                community_id: cid,
+                sealed_blob: blob,
+                held_at: Hlc {
+                    wall_ms: now_ms - 1_000,
+                    logical: 0,
+                    device_id: "relay-device".into(),
+                },
+                held_by: "relay-device".into(),
+                pulled_by: pulled.iter().map(|s| s.to_string()).collect(),
+            };
+            (key, entry)
+        };
+
+        // Two large blobs (~10 MiB each) — together they exceed one 16 MiB
+        // response frame, so the batch must serve a subset.
+        let big = |fill: u8| vec![fill; 10 * 1024 * 1024];
+        let (key_a, entry_a) = build(0xA1, big(0xA1), &[]);
+        let (key_b, entry_b) = build(0xB2, big(0xB2), &[]);
+
+        // A third entry that this device has ALREADY pulled+acked — must be
+        // excluded entirely (it lingers pre-GC but is never re-served).
+        let (key_acked, entry_acked) = build(
+            0xC3,
+            b"already-delivered".to_vec(),
+            &[requester_device.as_str()],
+        );
+
+        ctx.preload_entry(key_a.clone(), entry_a);
+        ctx.preload_entry(key_b.clone(), entry_b);
+        ctx.preload_entry(key_acked.clone(), entry_acked);
+
+        let query = build_pull_query(&recipient, cid);
+        let resp = handle_relay_pull_query(&query, &ctx)
+            .await
+            .expect("valid pull query must succeed");
+
+        // The already-acked entry is never in the response.
+        assert!(
+            resp.entries
+                .iter()
+                .all(|b| b.sealed_blob != b"already-delivered".to_vec()),
+            "an entry already pulled by this device must be excluded"
+        );
+
+        // Two 10 MiB blobs would be ~20 MiB > 16 MiB cap, so only ONE of the
+        // big blobs fits this frame; the encoded response stays under the cap.
+        assert_eq!(resp.entries.len(), 1, "size-batched to a single big blob");
+        let encoded = encode_relay_pull_response(&resp).expect("encode response");
+        assert!(
+            encoded.len() <= RELAY_PULL_MAX_FRAME_BYTES,
+            "encoded response ({}) must fit the frame cap ({})",
+            encoded.len(),
+            RELAY_PULL_MAX_FRAME_BYTES
+        );
     }
 
     // ----------------------------------------------------------------
