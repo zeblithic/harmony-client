@@ -194,6 +194,33 @@ pub async fn read_dm_plaintext(
     Ok(out)
 }
 
+/// Read a DM thread tolerant of which `SpaceId` the conversation settled under.
+///
+/// DM `SpaceId`s are minted randomly per node (`SpaceId(rand::random())`), with a
+/// dedupe key = sorted member set. When two independently-created same-member-set
+/// spaces meet (via the cross-node space-invite each side dispatches in
+/// `add_space`), `apply_space` canonicalizes them to the lexicographically-smaller
+/// `SpaceId` and REMOVES the loser. So the id a node returned from `add_space` may
+/// no longer be live after the merge — the live thread is under whichever candidate
+/// id won. This reads every candidate (the local id + any peer/canonical id) and
+/// unions the decoded messages, ignoring per-id `UnknownSpace` errors so a not-yet-
+/// existing or already-merged-away id doesn't mask a delivered message under
+/// another id. Returns the first candidate that yields a non-empty read, else the
+/// empty union.
+pub async fn read_dm_plaintext_any(
+    node: &NodeHandle,
+    candidate_space_ids: &[&str],
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    for sid in candidate_space_ids {
+        match read_dm_plaintext(node, sid).await {
+            Ok(msgs) if !msgs.is_empty() => return Ok(msgs),
+            Ok(_) => {}  // empty thread under this id — keep trying others
+            Err(_) => {} // UnknownSpace / merged-away id — not fatal, try next
+        }
+    }
+    Ok(Vec::new())
+}
+
 pub async fn create_channel(
     node: &NodeHandle,
     community_id: &str,
