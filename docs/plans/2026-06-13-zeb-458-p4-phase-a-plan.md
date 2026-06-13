@@ -109,7 +109,6 @@ Mirror `dm_inbox_crdt.rs` exactly (same `merge_from`/`MergeOutcome` shape so it 
 ```rust
 pub struct RelayHoldEntry {
     pub recipient_owner: [u8; 16],
-    pub recipient_device: [u8; 16],
     pub sender_owner: [u8; 16],
     pub community_id: SpaceId,
     #[serde(with = "serde_bytes")] pub sealed_blob: Vec<u8>, // opaque
@@ -119,15 +118,17 @@ pub struct RelayHoldEntry {
 }
 pub struct RelayHoldDoc { pub entries: BTreeMap<String, RelayHoldEntry> }
 impl RelayHoldDoc {
-    // key = "{recipient_owner_hex}:{recipient_device_hex}:{content_id_hex}"
-    pub fn key(recipient_owner: &[u8;16], recipient_device: &[u8;16], content_id: &[u8;32]) -> String { ... }
+    // key = "{recipient_owner_hex}:{content_id_hex}" — content_id = ContentId(sealed_blob),
+    // which is UNIQUE per seal (each seal has a fresh ephemeral key), so it already
+    // distinguishes per-device copies; no device label is needed in the key.
+    pub fn key(recipient_owner: &[u8;16], content_id: &[u8;32]) -> String { ... }
     pub fn merge_from(&mut self, remote: RelayHoldDoc) -> MergeOutcome { ... } // new entries insert; existing → pulled_by union (grow-only), metadata first-writer-wins by held_at; Changed only on new/ig-growth — mirror dm_inbox_crdt L57
 }
 ```
 
-- Caps + GC are **pure helpers** here (the persist critical section lives in the Prod ctx, Task 3, mirroring `persist_entry`): `pub fn count_for_sender(&self, community_id, sender_owner) -> usize`, `pub fn live_count(&self) -> usize`. GC helper `pub fn gc(&mut self, now_ms: u64) -> bool` removing entries that are **covered** (`recipient_device ∈ pulled_by`) OR TTL-expired (`held_at.wall_ms + RELAY_HOLD_TTL_MS < now_ms`), with one-sweep deferral (mirror dm_inbox_ingest GC L247) — defer removal of an entry that became covered DURING this sweep so `pulled_by` replicates first.
+- Caps + GC are **pure helpers** here (the persist critical section lives in the Prod ctx, Task 3, mirroring `persist_entry`): `pub fn count_for_sender(&self, community_id, sender_owner) -> usize`, `pub fn live_count(&self) -> usize`. GC helper `pub fn gc(&mut self, now_ms: u64) -> bool` removing entries that are **covered** (`pulled_by` non-empty — only the device a blob was sealed to can open+ack its content_id, so a single ack means the intended device received it) OR TTL-expired (`held_at.wall_ms + RELAY_HOLD_TTL_MS < now_ms`), with one-sweep deferral (mirror dm_inbox_ingest GC L247) — defer removal of an entry that became covered DURING this sweep so `pulled_by` replicates across the relay's fleet first.
 
-- [ ] **Step 1: Failing tests** — key determinism; merge unions `pulled_by` + keeps first-writer metadata + Changed-flag semantics; `count_for_sender`/`live_count`; `gc` removes covered + TTL-expired, defers freshly-covered one sweep, keeps uncovered/unexpired.
+- [ ] **Step 1: Failing tests** — key determinism (recipient_owner + content_id); merge unions `pulled_by` + keeps first-writer metadata + Changed-flag semantics; `count_for_sender`/`live_count`; `gc` removes covered (`pulled_by` non-empty) + TTL-expired, defers freshly-covered one sweep, keeps uncovered/unexpired.
 - [ ] **Step 2: Run — FAIL.**
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run — PASS.**
@@ -164,7 +165,7 @@ Admission order (spec D36):
 1. `both_co_members(community_id, sender_owner, recipient_owner)` else `NotCoMember` (uniform; no oracle).
 2. Decode+verify `sender_enrollment_cert` (strict), `cert.owner_id == sender_owner`, Master-issued, owner-id-derived anchor `owner_id_from_master_ed25519(master) == sender_owner` (reuse `friend_graph::owner_id_from_master_ed25519`); else `BadCert`.
 3. Frame sig: `cert.device_pubkeys…ed25519_verify` verifies `relay_deposit_sig_payload(recipient_owner, community_id, sealed_blob)` over `frame.sig`; else `BadSig`.
-4. **NO decrypt** — compute `content_id = ContentId::for_book(sealed_blob, ContentFlags{encrypted:true,..})`; build `RelayHoldEntry { recipient_owner, recipient_device, sender_owner, community_id, sealed_blob, held_at: mint_hlc(), held_by: relay_device_id(), pulled_by: empty }`; `key = RelayHoldDoc::key(recipient_owner, recipient_device, &content_id)`; `persist_hold(key, entry)` → map `CapExceeded`→reject, `Inserted|Duplicate`→ack `RelayDepositAck{content_id}`.
+4. **NO decrypt** — compute `content_id = ContentId::for_book(sealed_blob, ContentFlags{encrypted:true,..})`; build `RelayHoldEntry { recipient_owner, sender_owner, community_id, sealed_blob, held_at: mint_hlc(), held_by: relay_device_id(), pulled_by: empty }`; `key = RelayHoldDoc::key(recipient_owner, &content_id)`; `persist_hold(key, entry)` → map `CapExceeded`→reject, `Inserted|Duplicate`→ack `RelayDepositAck{content_id}`.
 
 `ProdRelayDepositCtx` (build in Task 6) + a `#[cfg(test)] TestRelayDepositCtx` mock (call-order event probe like `TestCtx`).
 
