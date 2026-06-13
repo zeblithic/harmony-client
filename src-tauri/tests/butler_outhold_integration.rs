@@ -401,6 +401,21 @@ impl ButlerDepositCtx for TestButlerCtx {
         self.friends.get(sender_owner).copied()
     }
 
+    // ZEB-424: this outhold suite only deposits from friend senders, so the
+    // co-member admission fallback is never exercised here — always false.
+    async fn shares_live_group_dm(&self, _sender_owner: &[u8; 16]) -> bool {
+        false
+    }
+
+    // ZEB-424 (D28.1): co-member path unused here (friend-only senders).
+    async fn space_live_group_dm_co_member(
+        &self,
+        _space_id: &[u8; 16],
+        _sender_owner: &[u8; 16],
+    ) -> bool {
+        false
+    }
+
     fn now_secs(&self) -> u64 {
         // After the mint_test_owner cert's 1_700_000_000 signing timestamp.
         1_700_000_100
