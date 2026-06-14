@@ -225,16 +225,11 @@ async fn spawn_test_runtime() -> TestHarness {
 
     match ready_rx.await {
         Ok(Ok(())) => {}
-        // ZEB-165: UDP port collision causes silent test skipping if we
-        // return None here — the test then exits early with no
-        // assertions, producing false-green runs. Panic loudly so
-        // CI/local sees the port conflict instead of pretending the
-        // test passed. Enforced --test-threads=1 (per CLAUDE.md)
-        // prevents intra-suite collisions; inter-process collisions
-        // with some other harmony-node still surface honestly here.
-        Ok(Err(e)) if e.contains("Address already in use") => {
-            panic!("event loop failed to start due to address conflict: {e}");
-        }
+        // ZEB-446 made the Reticulum bind degradable (a 4242 collision warns and
+        // falls back to an ephemeral loopback bind), so `run()` no longer returns
+        // an "Address already in use" error — the old special-case arm is
+        // retired. Any real start failure still panics loudly here rather than
+        // skipping (the ZEB-165 / ZEB-420 anti-false-green invariant).
         Ok(Err(e)) => panic!("event loop failed to start: {e}"),
         Err(_) => panic!("event loop dropped ready signal"),
     }

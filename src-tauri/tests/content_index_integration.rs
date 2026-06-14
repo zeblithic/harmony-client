@@ -211,17 +211,12 @@ async fn ingest_list_pin_burn_roundtrip() {
     // channels. If startup fails the receivers are dropped and subsequent
     // `.send(...).unwrap()` calls would panic with a confusing "channel
     // closed" error — surface a clear message here instead.
-    //
-    // Port-in-use is the one case we skip rather than fail: when a Harmony
-    // app is already running on the dev machine the UDP port 4242 is busy,
-    // which is an environmental race, not a test regression. CI runs clean,
-    // so this skip doesn't hide real failures.
     match ready_rx.await {
         Ok(Ok(())) => {} // proceed
-        Ok(Err(e)) if e.contains("Address already in use") => {
-            eprintln!("skipping test: {e}");
-            return;
-        }
+        // ZEB-446 made the Reticulum bind degradable (a 4242 collision warns and
+        // falls back to an ephemeral loopback bind), so `run()` no longer returns
+        // an "Address already in use" error. A real start failure now fails loudly
+        // instead of being silently skipped (ZEB-420).
         Ok(Err(e)) => panic!("event loop failed to start: {e}"),
         Err(_) => panic!("event loop dropped ready signal"),
     }
@@ -513,10 +508,10 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
 
     match ready_rx.await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) if e.contains("Address already in use") => {
-            eprintln!("skipping test: {e}");
-            return;
-        }
+        // ZEB-446 made the Reticulum bind degradable (a 4242 collision warns and
+        // falls back to an ephemeral loopback bind), so `run()` no longer returns
+        // an "Address already in use" error. A real start failure now fails loudly
+        // instead of being silently skipped (ZEB-420).
         Ok(Err(e)) => panic!("event loop failed to start: {e}"),
         Err(_) => panic!("event loop dropped ready signal"),
     }
@@ -919,10 +914,10 @@ async fn fetch_complete_arm_pins_root_in_intent() {
 
     match ready_rx.await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) if e.contains("Address already in use") => {
-            eprintln!("skipping test: {e}");
-            return;
-        }
+        // ZEB-446 made the Reticulum bind degradable (a 4242 collision warns and
+        // falls back to an ephemeral loopback bind), so `run()` no longer returns
+        // an "Address already in use" error. A real start failure now fails loudly
+        // instead of being silently skipped (ZEB-420).
         Ok(Err(e)) => panic!("event loop failed to start: {e}"),
         Err(_) => panic!("event loop dropped ready signal"),
     }
@@ -1183,10 +1178,10 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
 
     match ready_rx.await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) if e.contains("Address already in use") => {
-            eprintln!("skipping test: {e}");
-            return;
-        }
+        // ZEB-446 made the Reticulum bind degradable (a 4242 collision warns and
+        // falls back to an ephemeral loopback bind), so `run()` no longer returns
+        // an "Address already in use" error. A real start failure now fails loudly
+        // instead of being silently skipped (ZEB-420).
         Ok(Err(e)) => panic!("event loop failed to start: {e}"),
         Err(_) => panic!("event loop dropped ready signal"),
     }
@@ -1509,10 +1504,10 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
 
     match ready_rx.await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) if e.contains("Address already in use") => {
-            eprintln!("skipping test: {e}");
-            return;
-        }
+        // ZEB-446 made the Reticulum bind degradable (a 4242 collision warns and
+        // falls back to an ephemeral loopback bind), so `run()` no longer returns
+        // an "Address already in use" error. A real start failure now fails loudly
+        // instead of being silently skipped (ZEB-420).
         Ok(Err(e)) => panic!("event loop failed to start: {e}"),
         Err(_) => panic!("event loop dropped ready signal"),
     }
