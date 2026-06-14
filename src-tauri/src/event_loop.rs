@@ -3357,7 +3357,9 @@ pub async fn run(
                             let cid_hex = hex::encode(cid.to_bytes());
                             let prefix = cid_hex.get(1..2).unwrap_or("");
                             let key = format!("harmony/content/{prefix}/{cid_hex}");
-                            fetch_via_zenoh(&session, &key).await
+                            // ZEB-409: bound a single leaf's payload (avatar path
+                            // passes Some(AVATAR_MAX_BYTES); other callers None).
+                            fetch_via_zenoh(&session, &key, max_bytes).await
                         }
                     };
                     // ZEB-159: wrap fetch_one so each successful fetch
@@ -3511,7 +3513,7 @@ pub async fn run(
                             let session_clone = session.clone();
                             let cas_op_tx_for_admit = cas_op_tx.clone();
                             tokio::spawn(async move {
-                                let fetch = fetch_via_zenoh(&session_clone, &key);
+                                let fetch = fetch_via_zenoh(&session_clone, &key, None);
                                 match tokio::time::timeout(timeout, fetch).await {
                                     Ok(Ok(bytes)) => {
                                         // ZEB-343 verify-on-fetch (spec §5.3):
@@ -5789,7 +5791,7 @@ async fn dispatch_action(
             let tx = zenoh_tx.clone();
             let session = session.clone();
             tokio::spawn(async move {
-                let result = fetch_via_zenoh(&session, &key_expr).await;
+                let result = fetch_via_zenoh(&session, &key_expr, None).await;
                 let _ = tx
                     .send(ZenohEvent::FetchResponse {
                         cid,
@@ -5807,7 +5809,7 @@ async fn dispatch_action(
             let tx = zenoh_tx.clone();
             let session = session.clone();
             tokio::spawn(async move {
-                let result = fetch_via_zenoh(&session, &key_expr).await;
+                let result = fetch_via_zenoh(&session, &key_expr, None).await;
                 let _ = tx
                     .send(ZenohEvent::FetchResponse {
                         cid,
@@ -5828,8 +5830,32 @@ async fn dispatch_action(
     }
 }
 
+/// ZEB-409: report whether a single leaf's payload exceeds the per-fetch
+/// ceiling, returning `Some(cap)` when it does (for the error message) and
+/// `None` otherwise. `max_bytes == None` is unbounded. Pure so the threshold is
+/// unit-testable without a Zenoh session — same philosophy as the frontend's
+/// pure `assertDecodedDimsOk`. Allows `len == cap` (rejects only strictly over),
+/// mirroring `fetch_recursive`'s assembled-total check.
+fn leaf_cap_exceeded(payload_len: usize, max_bytes: Option<usize>) -> Option<usize> {
+    match max_bytes {
+        Some(cap) if payload_len > cap => Some(cap),
+        _ => None,
+    }
+}
+
 /// Fetch content via Zenoh get() with a 30s timeout.
-async fn fetch_via_zenoh(session: &zenoh::Session, key_expr: &str) -> Result<Vec<u8>, String> {
+///
+/// ZEB-409: `max_bytes` bounds a single leaf's payload. When set, an oversized
+/// leaf is rejected from its declared `ZBytes::len()` BEFORE the contiguous
+/// `.to_vec()` copy (and before `fetch_recursive`'s assembled-total extend), so
+/// a hostile peer serving one large content-addressed leaf can't force the extra
+/// Rust-side materialization. `None` = unbounded (every caller except the avatar
+/// content-fetch path).
+async fn fetch_via_zenoh(
+    session: &zenoh::Session,
+    key_expr: &str,
+    max_bytes: Option<usize>,
+) -> Result<Vec<u8>, String> {
     let replies = session
         .get(key_expr)
         .await
@@ -5840,7 +5866,14 @@ async fn fetch_via_zenoh(session: &zenoh::Session, key_expr: &str) -> Result<Vec
         while let Ok(reply) = replies.recv_async().await {
             match reply.result() {
                 Ok(sample) => {
-                    return Ok(sample.payload().to_bytes().to_vec());
+                    let payload = sample.payload();
+                    let len = payload.len();
+                    if let Some(cap) = leaf_cap_exceeded(len, max_bytes) {
+                        return Err(format!(
+                            "leaf '{key_expr}' payload {len} exceeds max_bytes cap {cap}"
+                        ));
+                    }
+                    return Ok(payload.to_bytes().to_vec());
                 }
                 Err(err) => {
                     let msg = String::from_utf8_lossy(&err.payload().to_bytes()).into_owned();
@@ -6403,6 +6436,39 @@ mod descendants_tests {
         // Walker should still include the root itself; children are
         // unreachable and therefore silently skipped.
         assert_eq!(all, vec![root]);
+    }
+}
+
+#[cfg(test)]
+mod zeb_409_leaf_cap_tests {
+    use super::leaf_cap_exceeded;
+
+    #[test]
+    fn none_is_unbounded() {
+        // No cap: even a huge leaf is accepted (pre-ZEB-409 behavior for the
+        // non-avatar callers that pass `None`).
+        assert_eq!(leaf_cap_exceeded(10_000_000, None), None);
+        assert_eq!(leaf_cap_exceeded(0, None), None);
+    }
+
+    #[test]
+    fn under_and_at_cap_are_accepted() {
+        // Strictly-under and exactly-at-cap are allowed — mirrors
+        // fetch_recursive's assembled-total `out.len() > cap` boundary.
+        assert_eq!(leaf_cap_exceeded(100, Some(512)), None);
+        assert_eq!(leaf_cap_exceeded(512, Some(512)), None);
+    }
+
+    #[test]
+    fn over_cap_reports_the_cap() {
+        // One byte over → rejected, and the cap is surfaced for the error.
+        assert_eq!(leaf_cap_exceeded(513, Some(512)), Some(512));
+        // A 600KiB leaf under the 512KiB avatar cap is rejected pre-`to_vec`.
+        const AVATAR_CAP: usize = 512 * 1024;
+        assert_eq!(
+            leaf_cap_exceeded(600 * 1024, Some(AVATAR_CAP)),
+            Some(AVATAR_CAP)
+        );
     }
 }
 
