@@ -58,6 +58,16 @@ export function parseImageHeaderDims(
     bytes[6] === 0x1a &&
     bytes[7] === 0x0a
   ) {
+    // The first chunk of a valid PNG is always IHDR with a 13-byte body. Verify
+    // the chunk length (bytes 8–11 == 13) and type (bytes 12–15 == "IHDR")
+    // before trusting the width/height at fixed offsets, so a PNG-signature blob
+    // with a malformed first chunk falls through (null) instead of yielding
+    // garbage dimensions and spuriously rejecting the image.
+    const ihdrLenOk =
+      bytes[8] === 0x00 && bytes[9] === 0x00 && bytes[10] === 0x00 && bytes[11] === 0x0d;
+    const ihdrTypeOk =
+      bytes[12] === 0x49 && bytes[13] === 0x48 && bytes[14] === 0x44 && bytes[15] === 0x52;
+    if (!ihdrLenOk || !ihdrTypeOk) return null;
     const width = ((bytes[16] << 24) | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19]) >>> 0;
     const height = ((bytes[20] << 24) | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23]) >>> 0;
     return { width, height };
@@ -80,7 +90,9 @@ export function parseImageHeaderDims(
       if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) continue;
       if (offset + 1 >= bytes.length) return null;
       const segLen = (bytes[offset] << 8) | bytes[offset + 1]; // includes the 2 length bytes
-      if (segLen < 2) return null;
+      // A well-formed segment is ≥ 2 bytes (the length field itself) and must
+      // fit within the buffer; a lying / truncated segLen → unparseable → null.
+      if (segLen < 2 || offset + segLen > bytes.length) return null;
       const isSof =
         marker >= 0xc0 &&
         marker <= 0xcf &&
@@ -88,8 +100,11 @@ export function parseImageHeaderDims(
         marker !== 0xc8 && // JPG
         marker !== 0xcc; // DAC
       if (isSof) {
-        // payload after the length bytes: [precision(1)][height(2)][width(2)]
-        if (offset + 6 >= bytes.length) return null;
+        // The declared segment must actually cover the fields we read —
+        // [length(2)][precision(1)][height(2)][width(2)] = 7 bytes — before we
+        // trust the dimensions (the offset+segLen≤length check above then
+        // guarantees those indices are in-bounds).
+        if (segLen < 7) return null;
         const height = (bytes[offset + 3] << 8) | bytes[offset + 4];
         const width = (bytes[offset + 5] << 8) | bytes[offset + 6];
         return { width, height };

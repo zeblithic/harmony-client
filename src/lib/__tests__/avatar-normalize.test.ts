@@ -100,4 +100,36 @@ describe('avatar-normalize header-dimension guard (ZEB-408)', () => {
     expect(parseImageHeaderDims(jpegWithDims(640, 480))).toEqual({ width: 640, height: 480 });
     expect(parseImageHeaderDims(new Uint8Array([0x47, 0x49, 0x46]))).toBeNull();
   });
+
+  it('falls through (null) for a PNG signature whose first chunk is not IHDR (CodeAnt)', () => {
+    // Valid signature + huge dims at the fixed offsets, but the first chunk type
+    // is "IDAT", not "IHDR" — must not be trusted as authoritative dimensions.
+    const b = pngWithDims(100000, 100000);
+    b.set([0x49, 0x44, 0x41, 0x54], 12); // overwrite "IHDR" → "IDAT"
+    expect(parseImageHeaderDims(b)).toBeNull();
+    expect(() => assertHeaderDimsOk(b)).not.toThrow();
+    // A wrong IHDR chunk length is likewise rejected.
+    const b2 = pngWithDims(100000, 100000);
+    b2.set([0x00, 0x00, 0x00, 0xff], 8); // IHDR length != 13
+    expect(parseImageHeaderDims(b2)).toBeNull();
+  });
+
+  it('falls through (null) for a JPEG SOF whose declared length is too small or runs past the buffer (Qodo)', () => {
+    // SOF0 claiming segLen=4 (cannot hold precision+height+width) but with huge
+    // dimension bytes following — must not be trusted.
+    const tooSmall = new Uint8Array([
+      0xff, 0xd8, // SOI
+      0xff, 0xc0, // SOF0
+      0x00, 0x04, // segLen = 4 (real SOF needs ≥ 7)
+      0x08, 0xff, 0xff, 0xff, 0xff, // precision + huge height/width bytes
+    ]);
+    expect(parseImageHeaderDims(tooSmall)).toBeNull();
+    expect(() => assertHeaderDimsOk(tooSmall)).not.toThrow();
+
+    // A segment whose declared length runs past the end of the buffer.
+    const pastEnd = new Uint8Array([
+      0xff, 0xd8, 0xff, 0xc0, 0xff, 0xff, 0x08, 0x00, 0x40, 0x00, 0x40,
+    ]);
+    expect(parseImageHeaderDims(pastEnd)).toBeNull();
+  });
 });
