@@ -541,3 +541,119 @@ async fn s4_restart_durability() {
     run.mark_success();
     drop((alice, home));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S5: profile-card propagation (ZEB-341 / ZEB-464). After Bob joins Alice's
+// community (S1 first-contact establishes the transport path between two never-
+// met nodes), each publishes its signed owner card and subscribes to the peer's
+// card topic (keyed by owner_id). Both must resolve the peer's SIGNED
+// displayName via the headless card verbs ZEB-464 exposes — the last cross-peer
+// surface the two-agent suite couldn't drive, and the headless proof behind
+// ZEB-432 (community member cards rendering as truncated hex).
+//
+// Cards ride a Zenoh broadcast topic; a subscription needs only the peer's
+// ownerIdHex. The community join is the transport-establishing step — two never-
+// met nodes peer via iroh first-contact, not ambient scouting (same reason S1/S2
+// dial first). A Zenoh put isn't retained for a late subscriber, so we subscribe
+// BEFORE the convergence puts and re-publish each poll tick.
+//
+// The card VERBS are hard-asserted (boot, join, publish + subscribe accepted).
+// Card PROPAGATION is CHARACTERIZED, not hard-asserted: co-located it does NOT
+// converge (ZEB-466 — owner-global card topics don't route between two peers
+// connected only via a community; verify_card is self-contained so it's a
+// transport gap, not a crypto one). This is the likely substrate of ZEB-432; the
+// cross-machine S5 run answers whether card topics route cross-WAN. See the
+// CARD PROPAGATION block below.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s5_profile_card_propagation() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let (mut run, ah, bh, alice, bob) = two_minted_nodes("s5").await;
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    // Establish a transport path via a community join (S1 first-contact).
+    let community = create_community(&alice, "s5-community", true)
+        .await
+        .expect("create community");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins alice's community via iroh first-contact");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("alice sees bob joined (transport path established)");
+
+    const ALICE_CARD: &str = "Alice-ZEBbot";
+    const BOB_CARD: &str = "Bob-KOYAbot";
+
+    // Card publisher runtime is ready post-connect; surface an
+    // `owner card runtime not ready` as a clear failure rather than a silent
+    // never-arrives before the convergence poll.
+    publish_card_until_ok(&alice, ALICE_CARD, "gm from alice", Duration::from_secs(30))
+        .await
+        .expect("alice's card publisher is ready");
+    publish_card_until_ok(&bob, BOB_CARD, "gm from bob", Duration::from_secs(30))
+        .await
+        .expect("bob's card publisher is ready");
+
+    // Subscribe to the peer's card topic (by owner_id) BEFORE the convergence
+    // puts so each subscriber is live when the sample lands.
+    let a_sub = subscribe_member_card(&alice, &bob_owner)
+        .await
+        .expect("alice subscribes to bob's card");
+    let b_sub = subscribe_member_card(&bob, &alice_owner)
+        .await
+        .expect("bob subscribes to alice's card");
+
+    // CARD PROPAGATION — characterized, NOT hard-asserted (co-located gap; see
+    // ZEB-466), mirroring S2's DM-delivery treatment. The headless card verbs are
+    // PROVEN above: both nodes boot, join, and ACCEPT republish_owner_card +
+    // subscribe_member_card. Here we measure whether the signed card actually
+    // traverses to the peer's subscriber and verifies into its cache.
+    //
+    // FINDING (Ildwyn, 2026-06-14): co-located, neither side resolves the peer's
+    // card within 120s — even though (a) the community roster sync (Zenoh)
+    // converges between the SAME two nodes, (b) no `owner card sign failed`
+    // warning fires (cards ARE signed + published), and (c) `verify_card` is fully
+    // self-contained (the embedded Master enrollment cert + owner_id binding mean a
+    // just-met peer needs nothing external to verify). So it is a TRANSPORT/routing
+    // gap for owner-global card topics between two peers connected only via a
+    // community — NOT a verification gap — and the likely substrate of ZEB-432.
+    // The bounded poll records the outcome without hanging the suite on a known-
+    // blocked path; whether card topics route CROSS-WAN (via pkarr/relay) is the
+    // open question the cross-machine S5 run answers.
+    let converged = poll_until(Duration::from_secs(30), || async {
+        let _ = republish_owner_card(&alice, ALICE_CARD, "gm from alice").await;
+        let _ = republish_owner_card(&bob, BOB_CARD, "gm from bob").await;
+        let a_sees = cached_card_display_name(&alice, a_sub).await?;
+        let b_sees = cached_card_display_name(&bob, b_sub).await?;
+        Ok(
+            (a_sees.as_deref() == Some(BOB_CARD) && b_sees.as_deref() == Some(ALICE_CARD))
+                .then_some(()),
+        )
+    })
+    .await
+    .is_ok();
+    eprintln!(
+        "S5 card propagation: converged={converged} (expected FALSE co-located — \
+         owner-global card topics don't route between two community-only peers; see \
+         ZEB-466 + ZEB-432). The headless card verbs are proven by the accepted \
+         publish/subscribe calls above."
+    );
+
+    // Exercise the unsubscribe verb (best-effort cleanup).
+    unsubscribe_member_card(&alice, a_sub).await.ok();
+    unsubscribe_member_card(&bob, b_sub).await.ok();
+
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}

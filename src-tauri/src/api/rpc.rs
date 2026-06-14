@@ -203,9 +203,35 @@ struct PeerSessionIdArgs {
     peer_session_id: String,
 }
 
+/// ZEB-464: shared by the card/profile `get_cached_*` + `unsubscribe_*`
+/// verbs — a single `subscriptionId` returned from a prior subscribe.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscriptionIdArgs {
+    subscription_id: u64,
+}
+
+/// ZEB-464: `subscribe_peer_profile` keys on the peer's owner address hex
+/// (`peerAddr`), distinct from the card verbs' `ownerIdHex`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerAddrArgs {
+    peer_addr: String,
+}
+
+/// ZEB-464: `republish_owner_card` args (avatar/profile-page CIDs optional).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepublishOwnerCardArgs {
+    display_name: String,
+    status_text: String,
+    avatar_cid: Option<String>,
+    profile_page_root: Option<String>,
+}
+
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (35 commands). Every handler calls
+/// Build the curated v1 RPC surface (42 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
@@ -468,6 +494,72 @@ pub fn build_registry() -> RpcRegistry {
         |state, _sink, _a| async move { crate::pairing_commands::get_pairing_state_inner(state).await }
     );
 
+    // Profile cards (ZEB-341) + peer-profile broadcast (ZEB-281) — ZEB-464.
+    // The card/profile pub-sub runtime is wired in `start_node_inner` (shared
+    // by `serve`), so these expose the GUI's exact behavior headless — the
+    // last cross-peer surface the two-agent E2E suite couldn't drive. Cards
+    // ride a Zenoh broadcast topic keyed by owner_id, so propagation is
+    // exercisable both co-located and cross-WAN.
+    rpc!(
+        m,
+        "republish_owner_card",
+        RepublishOwnerCardArgs,
+        |state, _sink, a| async move {
+            crate::republish_owner_card_impl(
+                state,
+                a.display_name,
+                a.status_text,
+                a.avatar_cid,
+                a.profile_page_root,
+            )
+            .await
+        }
+    );
+    rpc!(
+        m,
+        "subscribe_member_card",
+        OwnerIdHexArgs,
+        |state, _sink, a| async move { crate::subscribe_member_card_impl(state, a.owner_id_hex).await }
+    );
+    rpc!(
+        m,
+        "get_cached_member_card",
+        SubscriptionIdArgs,
+        |state, _sink, a| async move {
+            crate::get_cached_member_card_impl(state, a.subscription_id).await
+        }
+    );
+    rpc!(
+        m,
+        "unsubscribe_member_card",
+        SubscriptionIdArgs,
+        |state, _sink, a| async move {
+            crate::unsubscribe_member_card_impl(state, a.subscription_id).await
+        }
+    );
+    rpc!(
+        m,
+        "subscribe_peer_profile",
+        PeerAddrArgs,
+        |state, _sink, a| async move { crate::subscribe_peer_profile_impl(state, a.peer_addr).await }
+    );
+    rpc!(
+        m,
+        "get_cached_peer_profile",
+        SubscriptionIdArgs,
+        |state, _sink, a| async move {
+            crate::get_cached_peer_profile_impl(state, a.subscription_id).await
+        }
+    );
+    rpc!(
+        m,
+        "unsubscribe_peer_profile",
+        SubscriptionIdArgs,
+        |state, _sink, a| async move {
+            crate::unsubscribe_peer_profile_impl(state, a.subscription_id).await
+        }
+    );
+
     RpcRegistry { handlers: m }
 }
 
@@ -606,6 +698,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn card_and_profile_commands_dispatch_with_ipc_parity_pre_node() {
+        // ZEB-464: the profile-card (ZEB-341) + peer-profile broadcast
+        // (ZEB-281) verbs must dispatch through the SAME `*_impl` seam the
+        // Tauri IPC layer uses, observing identical pre-node error strings.
+        let reg = build_registry();
+
+        // The owner-not-loaded read/subscribe verbs all surface the shared
+        // OWNER_NOT_LOADED_MSG (proves the seam is shared, args parsed).
+        for (cmd, args) in [
+            (
+                "subscribe_member_card",
+                serde_json::json!({ "ownerIdHex": "00112233445566778899aabbccddeeff" }),
+            ),
+            (
+                "get_cached_member_card",
+                serde_json::json!({ "subscriptionId": 1 }),
+            ),
+            (
+                "unsubscribe_member_card",
+                serde_json::json!({ "subscriptionId": 1 }),
+            ),
+            (
+                "subscribe_peer_profile",
+                serde_json::json!({ "peerAddr": "00112233445566778899aabbccddeeff" }),
+            ),
+            (
+                "get_cached_peer_profile",
+                serde_json::json!({ "subscriptionId": 1 }),
+            ),
+            (
+                "unsubscribe_peer_profile",
+                serde_json::json!({ "subscriptionId": 1 }),
+            ),
+        ] {
+            let err = reg
+                .dispatch(cmd, test_state(), test_sink(), args)
+                .await
+                .unwrap_err();
+            match err {
+                RpcError::Command(msg) => assert_eq!(
+                    msg,
+                    crate::OWNER_NOT_LOADED_MSG,
+                    "{cmd} must share the IPC owner-not-loaded error string"
+                ),
+                other => panic!("{cmd}: expected Command, got {other:?}"),
+            }
+        }
+
+        // republish_owner_card parses its camelCase args, then fails pre-node
+        // with the publish-side runtime error (proves args parsed + seam ran).
+        let err = reg
+            .dispatch(
+                "republish_owner_card",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "displayName": "ZEBbot", "statusText": "gm" }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            RpcError::Command(msg) => {
+                assert_eq!(msg, "owner card runtime not ready")
+            }
+            other => panic!("republish_owner_card: expected Command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn registry_has_exactly_the_curated_v1_surface() {
         let reg = build_registry();
         let mut names = reg.command_names();
@@ -660,6 +820,14 @@ mod tests {
             "confirm_pairing_sas",
             "cancel_pairing",
             "get_pairing_state",
+            // profile cards (ZEB-341) + peer-profile broadcast (ZEB-281) — ZEB-464
+            "republish_owner_card",
+            "subscribe_member_card",
+            "get_cached_member_card",
+            "unsubscribe_member_card",
+            "subscribe_peer_profile",
+            "get_cached_peer_profile",
+            "unsubscribe_peer_profile",
         ];
         expected.sort_unstable();
         assert_eq!(names, expected, "curated v1 surface drifted");

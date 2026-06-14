@@ -102,6 +102,20 @@ the cross-node redeem until it reports success; transient
 
    > NOTE: this exercises **ongoing community-state sync** + **reconnect**. Both now work co-located — the automated `s3_offline_channel_reconnect_catchup` passes 3/3 after the ZEB-462 (B) durability fix + a harness key fix. The cross-machine run additionally proves **cross-WAN** re-peering, which the co-located harness cannot (ZEB-444).
 
+### Scenario 5 — profile-card propagation (ZEB-341 / ZEB-464)
+
+Proves a member's **signed profile card** (display name + status) published on one node resolves on the other — the headless counterpart to the GUI's member-card resolution, and the cross-WAN proof behind ZEB-432 (community member cards rendering as truncated hex). Card verbs were headless-exposed by ZEB-464; cards ride a **Zenoh broadcast topic keyed by owner_id**, so a subscription needs only the peer's `ownerIdHex`.
+
+1. **A + B:** both in a community (run Scenario 1 first — this establishes the transport path; two never-met nodes peer via iroh first-contact, not ambient scouting).
+2. **A:** `republish_owner_card '{"displayName":"<A-name>","statusText":"<A-status>"}'` (poll until it returns Ok — the card publisher is wired post-connect, so it can briefly return `owner card runtime not ready`). **B:** same with B's name.
+3. **A:** `subscribe_member_card '{"ownerIdHex":"<B ownerId>"}'` → capture `subscriptionId`. **B:** same with A's ownerId. (Subscribe *before* the convergence puts — a Zenoh put isn't retained for a late subscriber; re-publish on each poll tick as belt-and-braces.)
+4. **A:** poll `get_cached_member_card '{"subscriptionId":<A-sub>}'` until it returns a card whose `displayName` == `<B-name>`. **B:** poll until A's `<A-name>` resolves.
+5. PASS when both sides resolve the peer's signed card name. `unsubscribe_member_card '{"subscriptionId":…}'` to clean up. Post `DONE S5 PASS`.
+
+   > NOTE (co-located gap — ZEB-466): the **single-machine** harness's `s5_profile_card_propagation` does NOT converge co-located — owner-global card topics don't route between two peers connected only via a community (the community roster syncs, but card topics don't; `verify_card` is self-contained so it's a transport gap, not crypto). So the co-located harness only **characterizes** propagation; **this cross-machine run is the actual test of whether card topics route cross-WAN** (via pkarr/relay). It is also the likely substrate of ZEB-432 — if cards don't traverse here either, that bug is at the transport layer, not the frontend. If step 4 times out, capture both nodes' `RUST_LOG=...profile_card_broadcast=debug` logs for ZEB-466.
+
+   > NOTE: the avatar (`avatarCid` on the card) resolves over the **public CAS content-fetch path** (ZEB-343/344/409/408), a separate layer — S5 asserts the signed name/status, not avatar bytes. The peer-profile broadcast verbs (`subscribe_peer_profile` / `get_cached_peer_profile` / `unsubscribe_peer_profile`, ZEB-281) are also headless-exposed by ZEB-464 for the fuller Reticulum profile, but are not asserted by this scenario.
+
 ## Artifacts on failure
 
 Each agent collects, into a run directory it reports back:
@@ -114,7 +128,7 @@ Attach both machines' artifacts to the ZEB-447 issue (or the relevant finding is
 
 ## Reference
 
-- Single-machine harness + assertions (canonical): `e2e-harness/README.md`, `e2e-harness/tests/e2e_two_node.rs` (S1–S4 passing; S3/S4 un-ignored after the ZEB-462 key-bug fix).
+- Single-machine harness + assertions (canonical): `e2e-harness/README.md`, `e2e-harness/tests/e2e_two_node.rs` (S1–S4 passing; S3/S4 un-ignored after the ZEB-462 key-bug fix; S5 card propagation added by ZEB-464).
 - Spec: `docs/specs/2026-06-13-zeb-447-two-agent-e2e-suite-design.md`.
 
 ## Known co-located limitations (what the single-machine harness still can't prove)
