@@ -305,12 +305,21 @@ pub fn resolve_app_data_dir() -> Result<std::path::PathBuf, String> {
 /// Pure resolution for [`resolve_app_data_dir`]: the `HARMONY_DATA_DIR` base
 /// override wins; else the platform base (`dirs::data_dir()`); else an error.
 /// Profile nesting via [`app_data_dir_in`] is applied to whichever base wins.
+///
+/// A set-but-blank `HARMONY_DATA_DIR` (empty or whitespace-only — e.g. a shell
+/// `HARMONY_DATA_DIR=` export) is treated as UNSET, NOT as a `""` base: otherwise
+/// it would resolve to a relative `net.zeblith.harmony/…` under the process CWD
+/// and scatter state to the wrong place (Qodo + CodeAnt, PR #264). A non-empty
+/// path (even relative) is honored as-is — that's a deliberate override value.
 pub(crate) fn resolve_app_data_dir_from(
     data_dir_override: Option<std::path::PathBuf>,
     platform_base: Option<std::path::PathBuf>,
     profile: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
     let base = data_dir_override
+        .filter(|p| {
+            !p.as_os_str().is_empty() && p.to_str().map(|s| !s.trim().is_empty()).unwrap_or(true)
+        })
         .or(platform_base)
         .ok_or_else(|| "cannot resolve platform data dir".to_string())?;
     Ok(app_data_dir_in(&base, profile))

@@ -204,6 +204,26 @@ mod tests {
                 .unwrap(),
             PathBuf::from("/real/appdata").join("net.zeblith.harmony"),
         );
+        // A set-but-BLANK override (empty or whitespace-only) is treated as
+        // unset and falls back to the platform base — NOT a relative "" base
+        // under CWD (Qodo + CodeAnt, PR #264).
+        for blank in ["", "   "] {
+            assert_eq!(
+                crate::resolve_app_data_dir_from(
+                    Some(PathBuf::from(blank)),
+                    Some(PathBuf::from("/real/appdata")),
+                    None,
+                )
+                .unwrap(),
+                PathBuf::from("/real/appdata").join("net.zeblith.harmony"),
+                "blank override {blank:?} must fall back to the platform base",
+            );
+        }
+        // A blank override with no platform base still errors (not a "" base).
+        assert_eq!(
+            crate::resolve_app_data_dir_from(Some(PathBuf::from("")), None, None).unwrap_err(),
+            "cannot resolve platform data dir",
+        );
         // Neither resolvable: the exact error `serve` aborted with on Windows.
         assert_eq!(
             crate::resolve_app_data_dir_from(None, None, None).unwrap_err(),
