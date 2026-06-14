@@ -172,6 +172,21 @@ pub struct FleetSyncEngine<S: Send + 'static> {
     _s: std::marker::PhantomData<fn() -> S>,
 }
 
+/// Abort the internal task if the engine is dropped without an explicit
+/// `shutdown().await`. The task only returns when it receives a shutdown
+/// message; once the engine (and thus `shutdown_tx`) is gone, that select arm
+/// is permanently disabled, so a plain drop would otherwise orphan the task —
+/// e.g. an aborted boot that constructed some FleetSync engines before a later
+/// step returned `Err` (ZEB-460). On the normal `shutdown().await` path the
+/// task has already returned and the handle was taken, so this is a no-op.
+impl<S: Send + 'static> Drop for FleetSyncEngine<S> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.task.get_mut().take() {
+            handle.abort();
+        }
+    }
+}
+
 impl<S> FleetSyncEngine<S>
 where
     S: CanonicalPayload + serde::de::DeserializeOwned + Clone + Send + 'static,
@@ -966,6 +981,38 @@ mod engine_tests {
             }
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_engine_without_shutdown_aborts_internal_task() {
+        // Regression (ZEB-460 review): a FleetSyncEngine dropped WITHOUT
+        // shutdown().await — e.g. an aborted boot that built some engines before
+        // a later dataset load returned Err — must not orphan its internal task.
+        // The task holds an Arc clone of `state`; the Drop impl aborts the task
+        // so that clone is released. Without the abort the task loops forever and
+        // the clone leaks (this poll would time out).
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let built = build_engine("dev-drop", Arc::clone(&cas), false);
+        let state = Arc::clone(&built.state);
+        assert!(
+            Arc::strong_count(&state) >= 2,
+            "internal task should hold a state clone while the engine is alive"
+        );
+        // Drop ONLY the engine-bearing Built; keep `state` to observe the task.
+        drop(built);
+        // After abort + reap, the task's `state` clone is released → count == 1.
+        let mut released = false;
+        for _ in 0..100 {
+            if Arc::strong_count(&state) == 1 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            released,
+            "internal task was not aborted on drop — its state clone leaked"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
