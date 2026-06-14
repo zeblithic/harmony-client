@@ -19885,6 +19885,33 @@ pub async fn create_community_inner(
         );
     }
 
+    // ZEB-462 B: durable-on-commit fence for the COMMUNITY MEMBERSHIP CRDT
+    // (mirrors the redeem path + the owner-state fence). The creator's own
+    // admin Join + #general channel-config events live only in memory until
+    // the publish-gated debounce; a SIGKILL before then would lose them
+    // (empty membership → the publish gate's synthetic Left for every
+    // publisher on restart). Publish-INDEPENDENT (`persist_now`) + bounded so
+    // a wedged engine can't hang the create; non-fatal (owner-state already
+    // durable, next boot's debounce recovers what this missed).
+    match tokio::time::timeout(OWNER_STATE_FENCE_TIMEOUT, engine_arc.persist_now()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(
+                community_id = %hex::encode(minted.community_id.0),
+                error = %e,
+                "ZEB-462 B: community-CRDT durable fence failed after create; \
+                 membership will persist on the next debounce / graceful shutdown"
+            );
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                community_id = %hex::encode(minted.community_id.0),
+                "ZEB-462 B: community-CRDT durable fence timed out after create; \
+                 membership will persist on the next debounce / graceful shutdown"
+            );
+        }
+    }
+
     Ok(hex::encode(minted.community_id.0))
 }
 
@@ -22067,6 +22094,36 @@ where
              pending channel-log spawns will be re-attempted via \
              reconcile_from_state at next start_node"
         );
+    }
+
+    // ZEB-462 B: durable-on-commit fence for the COMMUNITY MEMBERSHIP CRDT.
+    // The membership events (admin bootstrap + self Join) were inserted into
+    // the engine above but only reach `crdt.cbor` via the publish-gated
+    // debounce/shutdown arms — co-located the publish never durably lands, so
+    // a SIGKILL before the next debounce loses the entire membership (the gate
+    // then materializes admin + self as the synthetic `Left`/`left_at: None`
+    // for every publisher after restart). Fence it to disk now, mirroring the
+    // owner-state durable-on-commit fence (`fence_owner_state_flush`).
+    // Publish-INDEPENDENT (`persist_now`) + bounded so a wedged engine task
+    // can't hang the join. Non-fatal: the join already committed durably in
+    // owner-state, and the next boot's debounce recovers what this missed.
+    match tokio::time::timeout(OWNER_STATE_FENCE_TIMEOUT, engine_arc.persist_now()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(
+                community_id = %hex::encode(minted.community_id.0),
+                error = %e,
+                "ZEB-462 B: community-CRDT durable fence failed after redeem; \
+                 membership will persist on the next debounce / graceful shutdown"
+            );
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                community_id = %hex::encode(minted.community_id.0),
+                "ZEB-462 B: community-CRDT durable fence timed out after redeem; \
+                 membership will persist on the next debounce / graceful shutdown"
+            );
+        }
     }
 
     // 10. Return DTO with the invite's name + kind so the caller can
