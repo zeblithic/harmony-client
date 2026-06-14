@@ -211,11 +211,6 @@ async fn ingest_list_pin_burn_roundtrip() {
     // channels. If startup fails the receivers are dropped and subsequent
     // `.send(...).unwrap()` calls would panic with a confusing "channel
     // closed" error — surface a clear message here instead.
-    //
-    // Port-in-use is the one case we skip rather than fail: when a Harmony
-    // app is already running on the dev machine the UDP port 4242 is busy,
-    // which is an environmental race, not a test regression. CI runs clean,
-    // so this skip doesn't hide real failures.
     match ready_rx.await {
         Ok(Ok(())) => {} // proceed
         // ZEB-446 made the Reticulum bind degradable (a 4242 collision warns and

@@ -146,9 +146,9 @@ impl Drop for TestHarness {
 
 /// Spawn a fresh NodeRuntime on its own OS thread with its own tokio runtime,
 /// exactly matching the content_index_integration.rs harness pattern. Returns
-/// `Some(harness)` once the event loop signals ready, or `None` if the UDP
-/// port 4242 is already in use (another Harmony instance is running on the
-/// dev machine). Tests check the `None` case and return early (skipped).
+/// the harness once the event loop signals ready; panics on any start failure.
+/// (ZEB-446 made the Reticulum bind degradable, so a 4242 collision no longer
+/// fails startup — see the `ready_rx` match below.)
 async fn spawn_test_runtime() -> TestHarness {
     let tmp = tempfile::tempdir().unwrap();
     let app_data_dir = tmp.path().to_path_buf();
