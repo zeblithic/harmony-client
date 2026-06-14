@@ -759,3 +759,126 @@ async fn s5b_clean_relaunch_card_propagation_control() {
     run.mark_success();
     drop((alice, bob, ah, bh));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S5c — clean-state DIAL-ONLY probe for ZEB-468 (Ildwyn, 2026-06-14).
+//
+// s5b proved a STABLE co-located mesh routes cards — but it peered via LAN
+// multicast, so the ZEB-373 dynamic iroh dial (the ONLY Zenoh re-peer path that
+// exists cross-WAN, where there is no multicast) was never exercised. In S5 the
+// dial FAILED, but under restart-poisoned conditions. This probe answers the
+// remaining question: does the ZEB-373 dial establish a working Zenoh peer link
+// between two CLEAN full nodes when multicast is OFF?
+//
+// Setup: mint both, kill + re-spawn already-minted (single clean session each),
+// with HARMONY_ZENOH_DISABLE_MULTICAST=1 in the env so neither can peer via
+// multicast. Then join a community (clean nodes) — the membership reachability
+// exchange fires the dial, now the ONLY path to a Zenoh peer mesh. Publish /
+// subscribe owner cards and measure convergence.
+//
+// SKIPS (no-op) unless HARMONY_ZENOH_DISABLE_MULTICAST=1 is set — without it the
+// nodes peer via multicast and `connect_peer` reports success off that transport,
+// a FALSE POSITIVE for the dial. The harness inherits the parent env, so run as:
+//   HARMONY_ZENOH_DISABLE_MULTICAST=1 cargo nextest run --features e2e \
+//     -E 'test(s5c_clean_dial_only_card_propagation_probe)'
+//
+// EXPECTED: converged=TRUE → the clean dial works; the ZEB-468 fix is "just
+// restart-safety" and cross-WAN cards are viable. converged=FALSE → the dial is
+// independently broken and the fix must address it too.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s5c_clean_dial_only_card_propagation_probe() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    if !std::env::var("HARMONY_ZENOH_DISABLE_MULTICAST")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "s5c SKIPPED: requires HARMONY_ZENOH_DISABLE_MULTICAST=1 (dial-only probe; \
+             without it nodes peer via multicast → false positive). Re-run with the env set."
+        );
+        return;
+    }
+
+    let (mut run, ah, bh, mut alice, mut bob) = two_minted_nodes("s5c").await;
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    // Clean relaunch (single fresh session each, no mint-restart). With multicast
+    // disabled by env, these clean sessions can reach a Zenoh peer ONLY via the
+    // ZEB-373 iroh dial.
+    let a_cfg = alice.config.clone();
+    let b_cfg = bob.config.clone();
+    alice.kill().await.expect("kill alice");
+    bob.kill().await.expect("kill bob");
+    let alice = NodeHandle::spawn(a_cfg)
+        .await
+        .expect("respawn alice (already minted)");
+    let bob = NodeHandle::spawn(b_cfg)
+        .await
+        .expect("respawn bob (already minted)");
+
+    // Community join on the clean nodes → reachability exchange → fires the dial.
+    let community = create_community(&alice, "s5c-community", true)
+        .await
+        .expect("create community");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins alice's community via iroh first-contact (multicast off)");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("alice sees bob joined (roster rides the first-contact bi-stream)");
+
+    const ALICE_CARD: &str = "Alice-dial";
+    const BOB_CARD: &str = "Bob-dial";
+
+    publish_card_until_ok(&alice, ALICE_CARD, "gm dial", Duration::from_secs(30))
+        .await
+        .expect("alice card publisher ready");
+    publish_card_until_ok(&bob, BOB_CARD, "gm dial", Duration::from_secs(30))
+        .await
+        .expect("bob card publisher ready");
+
+    let a_sub = subscribe_member_card(&alice, &bob_owner)
+        .await
+        .expect("alice subscribes to bob's card");
+    let b_sub = subscribe_member_card(&bob, &alice_owner)
+        .await
+        .expect("bob subscribes to alice's card");
+
+    // Convergence here depends ENTIRELY on the ZEB-373 dial peering the two clean
+    // sessions (multicast off). Generous window + re-publish each tick (a Zenoh put
+    // is not retained for a late subscriber).
+    let converged = poll_until(Duration::from_secs(60), || async {
+        let _ = republish_owner_card(&alice, ALICE_CARD, "gm dial").await;
+        let _ = republish_owner_card(&bob, BOB_CARD, "gm dial").await;
+        let a_sees = cached_card_display_name(&alice, a_sub).await?;
+        let b_sees = cached_card_display_name(&bob, b_sub).await?;
+        Ok(
+            (a_sees.as_deref() == Some(BOB_CARD) && b_sees.as_deref() == Some(ALICE_CARD))
+                .then_some(()),
+        )
+    })
+    .await
+    .is_ok();
+    eprintln!(
+        "S5c clean dial-only card propagation: converged={converged} \
+         (TRUE → ZEB-373 dial works clean, cross-WAN cards viable; FALSE → the dial is \
+         independently broken and the ZEB-468 fix must address it, not just restarts)."
+    );
+
+    unsubscribe_member_card(&alice, a_sub).await.ok();
+    unsubscribe_member_card(&bob, b_sub).await.ok();
+
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}

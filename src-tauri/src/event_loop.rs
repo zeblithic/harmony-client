@@ -970,6 +970,24 @@ pub async fn run(
     }
 
     let mut config = zenoh::Config::default();
+    // Test/diagnostic seam (ZEB-468 dial probe): when HARMONY_ZENOH_DISABLE_MULTICAST
+    // is set, turn off Zenoh's LAN multicast scouting so two co-located nodes cannot
+    // peer via multicast — forcing the ZEB-373 dynamic iroh dial to be the ONLY Zenoh
+    // peer path. Lets the e2e harness exercise the dial in isolation (otherwise
+    // co-located nodes peer via multicast first, and `connect_peer` reports success
+    // off that pre-existing transport — a false positive for the dial). Production
+    // leaves this UNSET → multicast stays ON (default), byte-for-byte unchanged.
+    if std::env::var("HARMONY_ZENOH_DISABLE_MULTICAST")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        if let Err(e) = config.insert_json5("scouting/multicast/enabled", "false") {
+            let e = format!("zenoh config error (disable multicast): {e}");
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+        tracing::info!("HARMONY_ZENOH_DISABLE_MULTICAST set: LAN multicast scouting disabled");
+    }
     // ZEB-390: give this session a DETERMINISTIC zenoh id derived from our own
     // iroh node-id, so a peer dialing us via the dynamic dial driver can compute
     // the SAME zid and `connect_peer`'s post-handshake transport lookup actually
