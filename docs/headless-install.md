@@ -421,9 +421,19 @@ mode's `500` bodies unchanged, and vice versa.
   keychain — the same desktop backend described at the top of this file. On
   a box with no keychain, the `HARMONY_PASSPHRASE` encrypted-file fallback
   (see [Quickstart](#quickstart-linux-server--docker) above) applies as
-  usual; a first-class no-keychain serve mode is tracked in ZEB-449, and
-  `HARMONY_DISABLE_KEYCHAIN=1` is **not** a workaround (ZEB-450: it kills
-  iroh and blocks mint).
+  usual; the encrypted-file fallback now also covers the iroh transport key
+  (ZEB-449), so a keychain-less node networks normally as long as a
+  passphrase is configured.
+- **`HARMONY_DISABLE_KEYCHAIN=1` is not a "leave my keychain alone" switch.**
+  On a real launch it forces every vault read to the encrypted file, so
+  **without** `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE` it disables
+  iroh transport for the session — the node boots but can't network, and the
+  Network Health panel shows a persistent "this node can't network" banner
+  (ZEB-450). It does **not** block owner mint (the owner seed has its own
+  encrypted-file fallback). **Never set it on a real launch unless a
+  passphrase is configured** — it exists only for test-spawned children that
+  don't need transport and must not touch the developer's real keychain
+  (ZEB-428).
 - **The event stream is a firehose.** `GET /v1/events` delivers live events
   only — no replay, no resume. A slow consumer that falls behind receives an
   explicit `{"event": "_lagged"}` marker frame and continues from the live

@@ -88,7 +88,9 @@
     startupRetryHandle = setInterval(async () => {
       startupRetryElapsedMs += 2000;
       await refresh();
-      if (snap?.myNetwork || startupRetryElapsedMs >= 30000) {
+      // ZEB-450: stop once transport is up, the budget elapses, OR transport is
+      // disabled this session (a restart is required — retrying is pointless).
+      if (snap?.myNetwork || snap?.transportDisabledReason || startupRetryElapsedMs >= 30000) {
         if (startupRetryHandle) clearInterval(startupRetryHandle);
         startupRetryHandle = null;
       }
@@ -111,7 +113,9 @@
 
   onMount(async () => {
     await refresh();
-    if (!snap?.myNetwork) startStartupRetry();
+    // ZEB-450: don't auto-retry when transport is disabled this session — it
+    // won't recover without a restart, so the banner (not a spinner) is shown.
+    if (!snap?.myNetwork && !snap?.transportDisabledReason) startStartupRetry();
     // Race window: if the component unmounts between `refresh()` and the
     // listener resolving, the registered listener would leak. Capture the
     // resolved unlisten into a local first and tear down immediately if
@@ -164,7 +168,25 @@
   {#if !snap}
     <p data-testid="nh-initial-loading">Loading…</p>
   {:else}
-    {#if !snap.myNetwork}
+    {#if snap.transportDisabledReason}
+      <!-- ZEB-450: iroh transport failed to come up this session. Surface it
+           loudly here instead of leaving it in a boot log line. A restart is
+           required (with a keychain or HARMONY_PASSPHRASE[_FILE] configured),
+           so the "starting up…" auto-retry below is intentionally suppressed. -->
+      <section class="transport-disabled" data-testid="nh-transport-disabled" role="alert">
+        <h2>⚠ This node can’t network</h2>
+        <p class="reason" data-testid="nh-transport-disabled-reason">
+          {snap.transportDisabledReason}
+        </p>
+        <p class="muted">
+          Networking is off for this session. Restart with the OS keychain
+          available, or set <code>HARMONY_PASSPHRASE</code> /
+          <code>HARMONY_PASSPHRASE_FILE</code> (and avoid
+          <code>HARMONY_DISABLE_KEYCHAIN</code> on a real launch). See
+          <code>docs/headless-install.md</code>.
+        </p>
+      </section>
+    {:else if !snap.myNetwork}
       <section class="starting-up" data-testid="nh-starting-up">
         <p>Network is starting up…</p>
         <p class="muted">This can take 10–30 seconds on first launch.</p>
@@ -356,6 +378,22 @@
   }
   .status-unreachable {
     color: crimson;
+  }
+  /* ZEB-450: persistent "node can't network" banner. */
+  .transport-disabled {
+    border: 1px solid crimson;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+    background: rgba(220, 20, 60, 0.06);
+  }
+  .transport-disabled h2 {
+    color: crimson;
+    margin-top: 0;
+  }
+  .transport-disabled .reason {
+    font-family: monospace;
+    word-break: break-word;
   }
   .info-hover {
     cursor: help;
