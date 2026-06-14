@@ -107,8 +107,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       # ZEB-440: this is the only job that LINKS — 113+ integration-test
-      # binaries at ~90-108 MB each (full debuginfo, statically-linked lib)
-      # ≈ 10-12 GB of executables per build generation, before counting the
+      # binaries at ~90-108 MB each (line-tables-only debuginfo since ZEB-304,
+      # statically-linked lib) ≈ 10-12 GB of executables per build generation,
+      # before counting the
       # restored dep cache. The stock ubuntu-latest image leaves only
       # ~20 GB free, and June-2026 workspace growth (lib.rs +24%, test
       # files +19% in ten days) pushed peak usage past it: deterministic
