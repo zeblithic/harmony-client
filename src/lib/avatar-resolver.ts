@@ -1,5 +1,5 @@
 import type { TauriAdapter } from './zenoh-service';
-import { assertDecodedDimsOk } from './avatar-normalize';
+import { assertDecodedDimsOk, assertHeaderDimsOk } from './avatar-normalize';
 
 /** How long to wait before retrying a failed CID fetch (30s). */
 const RETRY_COOLDOWN_MS = 30_000;
@@ -45,8 +45,13 @@ export class AvatarResolver {
     try {
       const bytes = (await this.adapter.invoke('fetch_avatar', { cid })) as number[];
       if (this.destroyed) return;
+      const u8 = new Uint8Array(bytes);
       const mime = detectImageMime(bytes);
-      const blob = new Blob([new Uint8Array(bytes)], { type: mime });
+      const blob = new Blob([u8], { type: mime });
+      // ZEB-408: reject a decode bomb by its PNG/JPEG header dimensions BEFORE
+      // createImageBitmap allocates the decoded bitmap. An unparseable header
+      // falls through to the post-decode assertDecodedDimsOk guard below.
+      assertHeaderDimsOk(u8);
       // ZEB-344: decoded-dimension guard on the RECEIVE path (parity with
       // normalizeAvatar's ingest guard) — reject a decode bomb before its blob
       // URL ever reaches an <img>. A throw here lands in the catch → identicon.

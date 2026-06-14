@@ -49,6 +49,27 @@ describe('AvatarResolver — receive-side decode guard (ZEB-344)', () => {
     expect(resolver.resolve('bb')).toBeUndefined();
   });
 
+  it('rejects a header-declared decode bomb WITHOUT decoding it (ZEB-408)', async () => {
+    // A 24-byte PNG whose IHDR declares 100000x100000 — caught from the header
+    // before createImageBitmap ever allocates the decoded bitmap.
+    const headerBomb = [
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // signature
+      0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR len + "IHDR"
+      0x00, 0x01, 0x86, 0xa0, // width = 100000
+      0x00, 0x01, 0x86, 0xa0, // height = 100000
+    ];
+    const adapter = {
+      invoke: vi.fn().mockResolvedValue(headerBomb),
+    } as unknown as TauriAdapter;
+    const resolver = new AvatarResolver();
+    resolver.connectAdapter(adapter);
+
+    await (resolver as unknown as { fetchCid(cid: string): Promise<void> }).fetchCid('dd');
+
+    expect(createImageBitmapMock).not.toHaveBeenCalled();
+    expect(resolver.resolve('dd')).toBeUndefined();
+  });
+
   it('does not cache a URL when destroy() runs during the decode await', async () => {
     const resolver = new AvatarResolver();
     const adapter = makeAdapter();

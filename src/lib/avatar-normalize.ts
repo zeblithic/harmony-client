@@ -33,12 +33,98 @@ export function assertDecodedDimsOk(width: number, height: number): void {
 }
 
 /**
+ * Parse the pixel dimensions from a PNG (IHDR) or JPEG (SOFn) header WITHOUT
+ * decoding the image. Returns `null` for formats we don't parse (GIF/WebP), an
+ * unrecognized signature, or a header too short / malformed to read — callers
+ * fall back to the post-decode dimension guard for those.
+ *
+ * PNG: 8-byte signature, then the IHDR chunk — width is a big-endian u32 at byte
+ * offset 16, height at 20. JPEG: SOI (0xFFD8) then marker segments; a
+ * Start-Of-Frame marker (0xC0–0xCF, excluding DHT/JPG/DAC) carries
+ * `[precision(1)][height(2)][width(2)]` right after its 2-byte length.
+ */
+export function parseImageHeaderDims(
+  bytes: Uint8Array,
+): { width: number; height: number } | null {
+  // ── PNG ──
+  if (
+    bytes.length >= 24 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    const width = ((bytes[16] << 24) | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19]) >>> 0;
+    const height = ((bytes[20] << 24) | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23]) >>> 0;
+    return { width, height };
+  }
+
+  // ── JPEG ──
+  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 1 < bytes.length) {
+      if (bytes[offset] !== 0xff) return null; // not on a marker boundary
+      let marker = bytes[offset + 1];
+      // A run of 0xFF bytes is allowed as fill before a marker code.
+      while (marker === 0xff) {
+        offset += 1;
+        if (offset + 1 >= bytes.length) return null;
+        marker = bytes[offset + 1];
+      }
+      offset += 2; // consume 0xFF + marker code
+      // Standalone markers carry no length: TEM (0x01), RSTn/SOI/EOI (0xD0–0xD9).
+      if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) continue;
+      if (offset + 1 >= bytes.length) return null;
+      const segLen = (bytes[offset] << 8) | bytes[offset + 1]; // includes the 2 length bytes
+      if (segLen < 2) return null;
+      const isSof =
+        marker >= 0xc0 &&
+        marker <= 0xcf &&
+        marker !== 0xc4 && // DHT
+        marker !== 0xc8 && // JPG
+        marker !== 0xcc; // DAC
+      if (isSof) {
+        // payload after the length bytes: [precision(1)][height(2)][width(2)]
+        if (offset + 6 >= bytes.length) return null;
+        const height = (bytes[offset + 3] << 8) | bytes[offset + 4];
+        const width = (bytes[offset + 5] << 8) | bytes[offset + 6];
+        return { width, height };
+      }
+      offset += segLen;
+    }
+    return null;
+  }
+
+  return null;
+}
+
+/**
+ * Reject a decode bomb by its declared header dimensions BEFORE decoding.
+ * Parses PNG/JPEG header dims and runs {@link assertDecodedDimsOk} on them; a
+ * no-op for formats / headers we can't parse (the post-decode guard still
+ * applies there). Pure (no DOM) so it is unit-testable without `createImageBitmap`.
+ */
+export function assertHeaderDimsOk(bytes: Uint8Array): void {
+  const dims = parseImageHeaderDims(bytes);
+  if (dims) assertDecodedDimsOk(dims.width, dims.height);
+}
+
+/**
  * Normalize an image File to a 256x256 PNG byte array, center-cropped (cover).
  * Frontend-side so there is no Rust image dependency and served bytes are
  * hard-bounded. Returns the PNG bytes ready for `ingest_avatar_bytes`.
  */
 export async function normalizeAvatar(file: File): Promise<Uint8Array> {
   validateAvatarInput(file);
+  // ZEB-408: reject a decode bomb by its header dimensions BEFORE
+  // createImageBitmap allocates the decoded bitmap. Bounded read — the file is
+  // already ≤ AVATAR_MAX_INPUT_BYTES (validateAvatarInput above). An unparseable
+  // header falls through to the post-decode assertDecodedDimsOk guard below.
+  assertHeaderDimsOk(new Uint8Array(await file.arrayBuffer()));
   const bitmap = await createImageBitmap(file);
   try {
     // Decompression-bomb guard: reject an absurdly large decoded bitmap before
