@@ -9039,6 +9039,25 @@ async fn republish_owner_card(
     profile_page_root: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
+    republish_owner_card_impl(
+        state.inner(),
+        display_name,
+        status_text,
+        avatar_cid,
+        profile_page_root,
+    )
+    .await
+}
+
+/// ZEB-464: shared IPC/RPC seam — exposes owner-card republish on the
+/// headless `serve` surface with the exact behavior the GUI observes.
+pub(crate) async fn republish_owner_card_impl(
+    state: &std::sync::Mutex<NodeState>,
+    display_name: String,
+    status_text: String,
+    avatar_cid: Option<String>,
+    profile_page_root: Option<String>,
+) -> Result<(), String> {
     // None = no avatar (legitimate). A PRESENT-but-malformed hex must surface as
     // an Err rather than silently stripping the avatar from the republished card.
     let avatar_cid_bytes: Option<[u8; 32]> = match avatar_cid.as_deref() {
@@ -25539,6 +25558,14 @@ async fn subscribe_peer_profile(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     peer_addr: String,
 ) -> Result<u64, String> {
+    subscribe_peer_profile_impl(state_lock.inner(), peer_addr).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn subscribe_peer_profile_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    peer_addr: String,
+) -> Result<u64, String> {
     let (cache, request_tx, next_id) = {
         let g = state_lock
             .lock()
@@ -25584,6 +25611,14 @@ async fn unsubscribe_peer_profile(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     subscription_id: u64,
 ) -> Result<(), String> {
+    unsubscribe_peer_profile_impl(state_lock.inner(), subscription_id).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn unsubscribe_peer_profile_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    subscription_id: u64,
+) -> Result<(), String> {
     let request_tx = {
         let g = state_lock
             .lock()
@@ -25608,6 +25643,14 @@ async fn get_cached_peer_profile(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     subscription_id: u64,
 ) -> Result<Option<crate::profile_broadcast::DiscoveredProfileInfo>, String> {
+    get_cached_peer_profile_impl(state_lock.inner(), subscription_id).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn get_cached_peer_profile_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    subscription_id: u64,
+) -> Result<Option<crate::profile_broadcast::DiscoveredProfileInfo>, String> {
     let cache = {
         let g = state_lock
             .lock()
@@ -25626,6 +25669,14 @@ async fn get_cached_peer_profile(
 #[tauri::command]
 async fn subscribe_member_card(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    owner_id_hex: String,
+) -> Result<u64, String> {
+    subscribe_member_card_impl(state_lock.inner(), owner_id_hex).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn subscribe_member_card_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
     owner_id_hex: String,
 ) -> Result<u64, String> {
     let (cache, request_tx, next_id) = {
@@ -25670,6 +25721,14 @@ async fn unsubscribe_member_card(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     subscription_id: u64,
 ) -> Result<(), String> {
+    unsubscribe_member_card_impl(state_lock.inner(), subscription_id).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn unsubscribe_member_card_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    subscription_id: u64,
+) -> Result<(), String> {
     let (cache, request_tx) = {
         let g = state_lock
             .lock()
@@ -25700,6 +25759,14 @@ async fn unsubscribe_member_card(
 #[tauri::command]
 async fn get_cached_member_card(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    subscription_id: u64,
+) -> Result<Option<crate::profile_card_broadcast::DiscoveredCardInfo>, String> {
+    get_cached_member_card_impl(state_lock.inner(), subscription_id).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn get_cached_member_card_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
     subscription_id: u64,
 ) -> Result<Option<crate::profile_card_broadcast::DiscoveredCardInfo>, String> {
     let cache = {

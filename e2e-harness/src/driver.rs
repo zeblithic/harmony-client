@@ -344,3 +344,105 @@ pub async fn list_channel_messages(
         .await?;
     Ok(v.as_array().cloned().unwrap_or_default())
 }
+
+// ── Profile cards (ZEB-341) + peer-profile broadcast (ZEB-281) — ZEB-464 ──────
+//
+// Card propagation rides a Zenoh broadcast topic keyed by the owner's 16-byte
+// owner_id; a subscription needs only the peer's ownerIdHex. These wrap the
+// headless card verbs the two-agent suite needs to drive S5.
+
+/// Re-publish the local owner's signed profile card onto its owner_id-keyed
+/// Zenoh topic. Avatar / profile-page CIDs are omitted — card propagation is
+/// proven by the signed name/status; avatar bytes are the separate CAS layer.
+pub async fn republish_owner_card(
+    node: &NodeHandle,
+    display_name: &str,
+    status_text: &str,
+) -> anyhow::Result<()> {
+    node.rpc(
+        "republish_owner_card",
+        json!({ "displayName": display_name, "statusText": status_text }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Poll `republish_owner_card` until it is accepted. The card publisher runtime
+/// is wired post-connect (in `start_node_inner`), so right after mint the publish
+/// can fail with `owner card runtime not ready` until the Zenoh session is up —
+/// retry until Ok or `timeout`, surfacing the last error on timeout.
+pub async fn publish_card_until_ok(
+    node: &NodeHandle,
+    display_name: &str,
+    status_text: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_err = String::from("(no publish attempt completed before the deadline)");
+    loop {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "publish_card_until_ok timed out after {timeout:?}; last error: {last_err}"
+            );
+        }
+        match republish_owner_card(node, display_name, status_text).await {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Subscribe to a peer's profile-card topic (keyed by their owner_id hex).
+/// Returns the u64 subscription id for `cached_card_display_name` / unsubscribe.
+pub async fn subscribe_member_card(node: &NodeHandle, owner_id_hex: &str) -> anyhow::Result<u64> {
+    node.rpc(
+        "subscribe_member_card",
+        json!({ "ownerIdHex": owner_id_hex }),
+    )
+    .await?
+    .as_u64()
+    .ok_or_else(|| anyhow::anyhow!("subscribe_member_card did not return a u64 subscription id"))
+}
+
+/// Snapshot the latest verified card for a subscription, returning the signed
+/// `displayName` if a card has arrived (None = loading / not yet received).
+/// `DiscoveredCardInfo` is camelCase — a present-but-keyless card object is
+/// surfaced as a loud schema error, never a silent miss (the ZEB-462 wrong-key
+/// trap that masqueraded as a sync failure).
+pub async fn cached_card_display_name(
+    node: &NodeHandle,
+    subscription_id: u64,
+) -> anyhow::Result<Option<String>> {
+    let v = node
+        .rpc(
+            "get_cached_member_card",
+            json!({ "subscriptionId": subscription_id }),
+        )
+        .await?;
+    if v.is_null() {
+        return Ok(None);
+    }
+    let name = v
+        .get("displayName")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cached card missing string `displayName` key (DTO/schema mismatch?): {v}"
+            )
+        })?;
+    Ok(Some(name.to_string()))
+}
+
+/// Tear down a card subscription.
+pub async fn unsubscribe_member_card(
+    node: &NodeHandle,
+    subscription_id: u64,
+) -> anyhow::Result<()> {
+    node.rpc(
+        "unsubscribe_member_card",
+        json!({ "subscriptionId": subscription_id }),
+    )
+    .await
+    .map(|_| ())
+}

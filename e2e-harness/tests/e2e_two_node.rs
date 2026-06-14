@@ -541,3 +541,92 @@ async fn s4_restart_durability() {
     run.mark_success();
     drop((alice, home));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S5: profile-card propagation (ZEB-341 / ZEB-464). After Bob joins Alice's
+// community (S1 first-contact establishes the transport path between two never-
+// met nodes), each publishes its signed owner card and subscribes to the peer's
+// card topic (keyed by owner_id). Both must resolve the peer's SIGNED
+// displayName via the headless card verbs ZEB-464 exposes — the last cross-peer
+// surface the two-agent suite couldn't drive, and the headless proof behind
+// ZEB-432 (community member cards rendering as truncated hex).
+//
+// Cards ride a Zenoh broadcast topic; a subscription needs only the peer's
+// ownerIdHex. The community join is the transport-establishing step — two never-
+// met nodes peer via iroh first-contact, not ambient scouting (same reason S1/S2
+// dial first). A Zenoh put isn't retained for a late subscriber, so we subscribe
+// BEFORE the convergence puts and re-publish each poll tick as belt-and-braces
+// against a subscriber that declared just after a put. Assertions are MEANINGFUL:
+// each side resolves the EXACT signed displayName the peer published.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s5_profile_card_propagation() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let (mut run, ah, bh, alice, bob) = two_minted_nodes("s5").await;
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    // Establish a transport path via a community join (S1 first-contact).
+    let community = create_community(&alice, "s5-community", true)
+        .await
+        .expect("create community");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins alice's community via iroh first-contact");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("alice sees bob joined (transport path established)");
+
+    const ALICE_CARD: &str = "Alice-ZEBbot";
+    const BOB_CARD: &str = "Bob-KOYAbot";
+
+    // Card publisher runtime is ready post-connect; surface an
+    // `owner card runtime not ready` as a clear failure rather than a silent
+    // never-arrives before the convergence poll.
+    publish_card_until_ok(&alice, ALICE_CARD, "gm from alice", Duration::from_secs(30))
+        .await
+        .expect("alice's card publisher is ready");
+    publish_card_until_ok(&bob, BOB_CARD, "gm from bob", Duration::from_secs(30))
+        .await
+        .expect("bob's card publisher is ready");
+
+    // Subscribe to the peer's card topic (by owner_id) BEFORE the convergence
+    // puts so each subscriber is live when the sample lands.
+    let a_sub = subscribe_member_card(&alice, &bob_owner)
+        .await
+        .expect("alice subscribes to bob's card");
+    let b_sub = subscribe_member_card(&bob, &alice_owner)
+        .await
+        .expect("bob subscribes to alice's card");
+
+    // Each node resolves the peer's SIGNED displayName. Re-publish each tick as
+    // belt-and-braces against a subscriber that declared just after a put.
+    poll_until(Duration::from_secs(120), || async {
+        let _ = republish_owner_card(&alice, ALICE_CARD, "gm from alice").await;
+        let _ = republish_owner_card(&bob, BOB_CARD, "gm from bob").await;
+        let a_sees = cached_card_display_name(&alice, a_sub).await?;
+        let b_sees = cached_card_display_name(&bob, b_sub).await?;
+        Ok(
+            (a_sees.as_deref() == Some(BOB_CARD) && b_sees.as_deref() == Some(ALICE_CARD))
+                .then_some(()),
+        )
+    })
+    .await
+    .expect("both nodes resolve the peer's signed card displayName (ZEB-341/ZEB-464)");
+
+    // Exercise the unsubscribe verb (best-effort cleanup).
+    unsubscribe_member_card(&alice, a_sub).await.ok();
+    unsubscribe_member_card(&bob, b_sub).await.ok();
+
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}
