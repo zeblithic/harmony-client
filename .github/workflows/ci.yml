@@ -100,25 +100,6 @@ jobs:
     name: Rust — test (nextest)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # ZEB-441 (ZEB-440 lever 2): trim debuginfo for this job's builds.
-    # This is the only job that LINKS — every one of the 113+ integration-test
-    # binaries statically links the full harmony-app lib, and with the default
-    # dev/test `debug = 2` that lib's variable-level debuginfo is duplicated
-    # into all of them (~90-108 MB each ≈ 10-12 GB/generation). Nobody attaches
-    # a debugger to a CI runner, so variable-level info is pure dead weight;
-    # `line-tables-only` keeps the file:line tables backtraces need and drops
-    # the rest (typically 3-5× smaller binaries + a faster link phase).
-    #
-    # Set on `dev` (not `test`): the fat copy of the lib that every integration
-    # binary links is the non-`cfg(test)` build, which uses the `dev` profile;
-    # the `test` profile inherits `debug` from `dev`, so this one override
-    # covers both the lib and the test harnesses. Job-scoped env keeps local
-    # dev builds at full debugger fidelity — only CI trims. Applied to
-    # rust-test alone: `msrv` runs `cargo check` (emits no debuginfo) and
-    # `rust-check`'s clippy doesn't produce the fat linked binaries, so the
-    # win there is marginal and not worth the extra cache-key churn.
-    env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         working-directory: src-tauri
@@ -126,8 +107,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       # ZEB-440: this is the only job that LINKS — 113+ integration-test
-      # binaries at ~90-108 MB each (full debuginfo, statically-linked lib)
-      # ≈ 10-12 GB of executables per build generation, before counting the
+      # binaries at ~90-108 MB each (line-tables-only debuginfo since ZEB-304,
+      # statically-linked lib) ≈ 10-12 GB of executables per build generation,
+      # before counting the
       # restored dep cache. The stock ubuntu-latest image leaves only
       # ~20 GB free, and June-2026 workspace growth (lib.rs +24%, test
       # files +19% in ten days) pushed peak usage past it: deterministic
@@ -172,14 +154,7 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           workspaces: src-tauri
-          # ZEB-441: `test` → `test-v2` — MUST bump in lockstep with the
-          # debuginfo trim above. rust-cache keys on Cargo.lock + rustc/job
-          # but NOT on CARGO_PROFILE_* env, so without a new key the slim
-          # rebuild would restore the old full-debuginfo artifacts and carry
-          # them as dead disk weight (worst of both). The bump forces one cold
-          # generation; with save-if main-only, main re-populates `test-v2`
-          # slim on merge and later PRs restore the slim cache.
-          key: test-v2
+          key: test
           # ZEB-440: only main updates the cache. PR-branch saves (~1.1 GB
           # compressed per round for this key) had pushed the repo past its
           # 10 GB Actions-cache quota into LRU eviction churn. PR runs
