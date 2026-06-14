@@ -112,6 +112,8 @@ Proves a member's **signed profile card** (display name + status) published on o
 4. **A:** poll `get_cached_member_card '{"subscriptionId":<A-sub>}'` until it returns a card whose `displayName` == `<B-name>`. **B:** poll until A's `<A-name>` resolves.
 5. PASS when both sides resolve the peer's signed card name. `unsubscribe_member_card '{"subscriptionId":…}'` to clean up. Post `DONE S5 PASS`.
 
+   > NOTE (co-located gap — ZEB-466): the **single-machine** harness's `s5_profile_card_propagation` does NOT converge co-located — owner-global card topics don't route between two peers connected only via a community (the community roster syncs, but card topics don't; `verify_card` is self-contained so it's a transport gap, not crypto). So the co-located harness only **characterizes** propagation; **this cross-machine run is the actual test of whether card topics route cross-WAN** (via pkarr/relay). It is also the likely substrate of ZEB-432 — if cards don't traverse here either, that bug is at the transport layer, not the frontend. If step 4 times out, capture both nodes' `RUST_LOG=...profile_card_broadcast=debug` logs for ZEB-466.
+
    > NOTE: the avatar (`avatarCid` on the card) resolves over the **public CAS content-fetch path** (ZEB-343/344/409/408), a separate layer — S5 asserts the signed name/status, not avatar bytes. The peer-profile broadcast verbs (`subscribe_peer_profile` / `get_cached_peer_profile` / `unsubscribe_peer_profile`, ZEB-281) are also headless-exposed by ZEB-464 for the fuller Reticulum profile, but are not asserted by this scenario.
 
 ## Artifacts on failure
