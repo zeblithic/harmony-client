@@ -37,7 +37,7 @@ impl Drop for TestHarness {
     }
 }
 
-async fn spawn_test_runtime() -> Option<TestHarness> {
+async fn spawn_test_runtime() -> TestHarness {
     let tmp = tempdir().unwrap();
     let app_data_dir = tmp.path().to_path_buf();
 
@@ -201,20 +201,20 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
 
     match ready_rx.await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) if e.contains("Address already in use") => {
-            eprintln!("skipping test: {e}");
-            return None;
-        }
+        // ZEB-446 made the Reticulum bind degradable (a 4242 collision warns and
+        // falls back to an ephemeral loopback bind), so `run()` no longer returns
+        // an "Address already in use" error here. A real start failure now fails
+        // loudly instead of being silently skipped (ZEB-420).
         Ok(Err(e)) => panic!("event loop failed to start: {e}"),
         Err(_) => panic!("event loop dropped ready signal"),
     }
 
-    Some(TestHarness {
+    TestHarness {
         ingest_tx,
         verb_tx,
         _shutdown_tx: shutdown_tx,
         _tmp: tmp,
-    })
+    }
 }
 
 /// Ingest a built folder's manifest + bundle through the runtime.
@@ -319,10 +319,7 @@ async fn move_a_within_same_top_level_one_level_deep() {
     )
     .expect("build T");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &a_old).await;
     ingest_folder(&harness, &b_old).await;
@@ -413,10 +410,7 @@ async fn move_b_across_top_levels() {
     .expect("build T1");
     let t2_old = folders::build_folder("T2", &[]).expect("build T2");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &t1_old).await;
     ingest_folder(&harness, &t2_old).await;
@@ -495,10 +489,7 @@ async fn move_c_root_to_nested() {
     let (l_cid, l_bytes) = make_leaf(b"root-leaf");
     let f_old = folders::build_folder("F", &[]).expect("build F");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes.clone()).await;
     ingest_folder(&harness, &f_old).await;
 
@@ -572,10 +563,7 @@ async fn move_d_nested_to_root() {
     )
     .expect("build F");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &f_old).await;
 
@@ -644,10 +632,7 @@ async fn move_b_dst_rekey_conflict_at_stage_1_no_undo_path() {
     .expect("build T1");
     let t2_old = folders::build_folder("T2", &[]).expect("build T2");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &t1_old).await;
     ingest_folder(&harness, &t2_old).await;
@@ -730,10 +715,7 @@ async fn move_b_src_rekey_conflict_after_dst_commit_undo_reverts_dst() {
     .expect("build T1");
     let t2_old = folders::build_folder("T2", &[]).expect("build T2");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &t1_old).await;
     ingest_folder(&harness, &t2_old).await;
@@ -812,10 +794,7 @@ async fn move_cycle_rejected() {
     )
     .expect("build T");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_folder(&harness, &f_old).await;
     ingest_folder(&harness, &t_old).await;
 
@@ -871,10 +850,7 @@ async fn move_no_op_rejected() {
     )
     .expect("build T");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &t_old).await;
 
@@ -937,10 +913,7 @@ async fn move_name_collision_rejected() {
     )
     .expect("build T2");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, cid_a, bytes_a).await;
     ingest_leaf(&harness, cid_b, bytes_b).await;
     ingest_folder(&harness, &t1_old).await;
@@ -1025,10 +998,7 @@ async fn move_pin_cascade_a_within_same_root() {
     )
     .expect("build T");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &a_old).await;
     ingest_folder(&harness, &b_old).await;
@@ -1122,10 +1092,7 @@ async fn move_d_new_top_level_pin_defaults_unpinned() {
     )
     .expect("build F");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &f_old).await;
 
@@ -1178,10 +1145,7 @@ async fn move_top_level_to_root_rejected() {
         .expect("book cid")
         .to_bytes();
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
 
     let index = fresh_index();
@@ -1219,10 +1183,7 @@ async fn move_case_c_src_concurrently_rekeyed_compensates() {
     let (l_cid, l_bytes) = make_leaf(b"case-c-cas");
     let f_old = folders::build_folder("F", &[]).expect("build F");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &f_old).await;
 
@@ -1321,10 +1282,7 @@ async fn move_disambiguates_siblings_with_shared_cid() {
     )
     .expect("build T with two shared-CID siblings");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_folder(&harness, &empty).await;
     ingest_folder(&harness, &t_old).await;
 
@@ -1406,10 +1364,7 @@ async fn move_rejects_when_name_does_not_match_cid() {
     )
     .expect("build A");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &a_old).await;
 

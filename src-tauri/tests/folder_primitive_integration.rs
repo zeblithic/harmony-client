@@ -149,7 +149,7 @@ impl Drop for TestHarness {
 /// `Some(harness)` once the event loop signals ready, or `None` if the UDP
 /// port 4242 is already in use (another Harmony instance is running on the
 /// dev machine). Tests check the `None` case and return early (skipped).
-async fn spawn_test_runtime() -> Option<TestHarness> {
+async fn spawn_test_runtime() -> TestHarness {
     let tmp = tempfile::tempdir().unwrap();
     let app_data_dir = tmp.path().to_path_buf();
 
@@ -320,22 +320,22 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
 
     match ready_rx.await {
         Ok(Ok(())) => {} // proceed
-        Ok(Err(e)) if e.contains("Address already in use") => {
-            eprintln!("skipping test: {e}");
-            return None;
-        }
+        // ZEB-446 made the Reticulum bind degradable (a 4242 collision warns and
+        // falls back to an ephemeral loopback bind), so `run()` no longer returns
+        // an "Address already in use" error here. A real start failure now fails
+        // loudly instead of being silently skipped (ZEB-420).
         Ok(Err(e)) => panic!("event loop failed to start: {e}"),
         Err(_) => panic!("event loop dropped ready signal"),
     }
 
     // Move tempdir into the harness so it's cleaned up on Drop instead
     // of leaking via std::mem::forget (caught by PR #55 review).
-    Some(TestHarness {
+    TestHarness {
         ingest_tx,
         verb_tx,
         _shutdown_tx: shutdown_tx,
         _tmp: tmp,
-    })
+    }
 }
 
 // ── Test 1: pin_folder_cascades_to_nested_leaf ────────────────────────────
@@ -356,10 +356,7 @@ async fn pin_folder_cascades_to_nested_leaf() {
     )
     .expect("build folder");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
 
     harmony_app::send_ingest(
         &harness.ingest_tx,
@@ -481,10 +478,7 @@ async fn list_folder_end_to_end_with_two_children() {
     )
     .expect("build");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     harmony_app::send_ingest(&harness.ingest_tx, hex::encode(cid_a.to_bytes()), bytes_a)
         .await
         .unwrap();
@@ -530,10 +524,7 @@ async fn list_folder_end_to_end_with_two_children() {
 async fn list_folder_empty_returns_empty_vec() {
     let folder = folders::build_folder("Empty", &[]).expect("build");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     harmony_app::send_ingest(
         &harness.ingest_tx,
         hex::encode(folder.manifest_cid.to_bytes()),
@@ -565,10 +556,7 @@ async fn list_folder_empty_returns_empty_vec() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_folder_not_in_cache_returns_empty() {
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
 
     let random_cid_hex = hex::encode([0x42u8; 32]);
     let empty_pinned = std::collections::HashSet::new();
@@ -596,10 +584,7 @@ async fn list_folder_malformed_manifest_returns_error() {
     builder.add(leaf_cid);
     let (bundle_bytes, bundle_cid) = builder.build_with_flags(ContentFlags::default()).unwrap();
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     harmony_app::send_ingest(
         &harness.ingest_tx,
         hex::encode(leaf_cid.to_bytes()),

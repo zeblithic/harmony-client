@@ -292,15 +292,15 @@ fn spawn_event_loop(
     }
 }
 
-/// Await the ready signal, handling the expected port-in-use skip condition.
-/// Returns `false` if the test should be skipped (port in use on dev machine).
-async fn await_ready(ready_rx: oneshot::Receiver<Result<(), String>>) -> bool {
+/// Await the event-loop ready signal, panicking on any start failure.
+///
+/// ZEB-446 made the Reticulum bind degradable (a 4242 collision warns and falls
+/// back to an ephemeral loopback bind), so `run()` no longer returns an "Address
+/// already in use" error. A real start failure now fails loudly instead of being
+/// silently skipped (ZEB-420).
+async fn await_ready(ready_rx: oneshot::Receiver<Result<(), String>>) {
     match ready_rx.await {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) if e.contains("Address already in use") => {
-            eprintln!("skipping test: {e}");
-            false
-        }
+        Ok(Ok(())) => {}
         Ok(Err(e)) => panic!("event loop failed to start: {e}"),
         Err(_) => panic!("event loop dropped ready signal"),
     }
@@ -335,9 +335,7 @@ async fn creator_ingests_video_recipient_fetches_bytes() {
         Arc::clone(&recipient_cache),
     );
 
-    if !await_ready(handles.ready_rx).await {
-        return;
-    }
+    await_ready(handles.ready_rx).await;
 
     // ── Step 1: ingest via IngestRequest (creator side) ─────────────────
     let (ack_tx, ack_rx) = oneshot::channel();
@@ -430,9 +428,7 @@ async fn fetch_content_for_unknown_cid_returns_err() {
         Arc::clone(&vine_cache),
     );
 
-    if !await_ready(handles.ready_rx).await {
-        return;
-    }
+    await_ready(handles.ready_rx).await;
 
     // ReadBytes for a never-ingested CID must return None promptly.
     let (read_tx, read_rx) = oneshot::channel();
@@ -483,9 +479,7 @@ async fn descriptor_arrives_before_video_cid_resolves_fetch_content_retry() {
         Arc::clone(&recipient_cache),
     );
 
-    if !await_ready(handles.ready_rx).await {
-        return;
-    }
+    await_ready(handles.ready_rx).await;
 
     // ── Step 1: descriptor arrives on recipient (content not yet present) ─
     let vine_id = "test-vine-002";
