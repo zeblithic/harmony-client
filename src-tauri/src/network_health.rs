@@ -39,6 +39,18 @@ pub struct NetworkHealthSnapshot {
     pub peers: Vec<PeerHealth>,
     pub pkarr_status: PkarrHealthSummary,
     pub dial_status: DialHealthSummary,
+    /// ZEB-450: set when the iroh transport could not be brought up this
+    /// session (key load/create failed, or endpoint bind failed, at boot).
+    /// `None` = transport is up or still initializing normally; `Some(reason)`
+    /// carries the loud, actionable explanation (the same class of string
+    /// `load_or_create_secret_key` returns) so the UI can show a persistent
+    /// "this node can't network" banner instead of the failure living only in a
+    /// boot log line. Stamped by the `network_health_snapshot` IPC from
+    /// `NodeState` — the disabled case has no `NetworkHealthService` to read
+    /// from, so this is intentionally orthogonal to the health sources.
+    /// `#[serde(default)]` keeps a pre-field snapshot forward-compatible.
+    #[serde(default)]
+    pub transport_disabled_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -302,6 +314,10 @@ impl NetworkHealthSnapshot {
                 relays: Vec::new(),
             },
             dial_status: DialHealthSummary::default(),
+            // ZEB-450: the empty snapshot is the "iroh not ready / no service"
+            // path. The reason (if transport is disabled this session) is
+            // stamped on by the IPC from NodeState; default None here.
+            transport_disabled_reason: None,
         }
     }
 }
@@ -312,6 +328,21 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// ZEB-450: stamp the boot-time transport-disabled reason onto a snapshot.
+///
+/// Pure so the `network_health_snapshot` IPC's stamping is unit-testable
+/// without constructing a full `NodeState`. Applied uniformly to BOTH the
+/// service snapshot and the `empty()` (service-absent) snapshot, so the single
+/// caller covers the disabled case (no `NetworkHealthService`) and any future
+/// degraded-but-running case. Overwrites whatever the constructor defaulted.
+pub(crate) fn stamp_transport_status(
+    mut snap: NetworkHealthSnapshot,
+    reason: Option<String>,
+) -> NetworkHealthSnapshot {
+    snap.transport_disabled_reason = reason;
+    snap
 }
 
 // ── Pure synthesis functions (no iroh, no network) ──────────────────
@@ -603,6 +634,10 @@ impl NetworkHealthService {
             // ZEB-373 Task 5: real dynamic-dial telemetry, read from the
             // shared DialTelemetry via the DialSnapshot source.
             dial_status: self.dial.dial_summary(),
+            // ZEB-450: a live service means transport is up — never disabled.
+            // The disabled case has no service and goes through the IPC's
+            // empty()-path stamp instead.
+            transport_disabled_reason: None,
         }
     }
 
@@ -1717,6 +1752,52 @@ mod tests {
         assert_eq!(s.pkarr_status.community_publish_count, 0);
         assert!(s.pkarr_status.recent_fallback_events.is_empty());
         assert!(!s.app_version.is_empty());
+        // ZEB-450: the empty snapshot must NOT spuriously claim transport is
+        // disabled — `my_network: None` already covers "still starting up". A
+        // reason is only ever set by the IPC stamp from NodeState.
+        assert!(s.transport_disabled_reason.is_none());
+    }
+
+    #[test]
+    fn zeb_450_stamp_transport_status_sets_overwrites_and_clears() {
+        // None passes through (transport up / still booting).
+        let stamped = stamp_transport_status(NetworkHealthSnapshot::empty(), None);
+        assert!(stamped.transport_disabled_reason.is_none());
+
+        // Some carries the actionable reason verbatim.
+        let reason = "iroh transport unavailable this session: no keychain \
+                      available and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set";
+        let stamped =
+            stamp_transport_status(NetworkHealthSnapshot::empty(), Some(reason.to_string()));
+        assert_eq!(stamped.transport_disabled_reason.as_deref(), Some(reason));
+
+        // Overwrites any prior value (the constructor default must not stick).
+        let mut seeded = NetworkHealthSnapshot::empty();
+        seeded.transport_disabled_reason = Some("stale".to_string());
+        let cleared = stamp_transport_status(seeded, None);
+        assert!(cleared.transport_disabled_reason.is_none());
+    }
+
+    #[test]
+    fn zeb_450_transport_disabled_reason_serializes_camel_case() {
+        // Pins the wire contract the frontend type/banner depends on.
+        let mut snap = NetworkHealthSnapshot::empty();
+        snap.transport_disabled_reason = Some("transport off".to_string());
+        let json = serde_json::to_string(&snap).expect("serialize");
+        assert!(
+            json.contains("\"transportDisabledReason\":\"transport off\""),
+            "expected camelCase key in {json}"
+        );
+        // Round-trips, and a payload predating the field deserializes to None.
+        let back: NetworkHealthSnapshot = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(
+            back.transport_disabled_reason.as_deref(),
+            Some("transport off")
+        );
+        let legacy = json.replace(",\"transportDisabledReason\":\"transport off\"", "");
+        let legacy_snap: NetworkHealthSnapshot =
+            serde_json::from_str(&legacy).expect("forward-compat deserialize");
+        assert!(legacy_snap.transport_disabled_reason.is_none());
     }
 
     fn fixture_snapshot_with_full_ids() -> NetworkHealthSnapshot {
@@ -1752,6 +1833,7 @@ mod tests {
                 relays: Vec::new(),
             },
             dial_status: DialHealthSummary::default(),
+            transport_disabled_reason: None,
         }
     }
 

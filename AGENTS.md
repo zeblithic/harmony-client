@@ -46,6 +46,20 @@ cp -rf source dest          # NOT: cp -r source dest
 - Do NOT create markdown TODO lists for persistent tracking
 - Do NOT duplicate tracking systems
 
+## Code Review Bots (PR review process)
+
+PRs are reviewed by automated bots in a **strict order**. Do not run them out of order or trigger them eagerly.
+
+1. **Qodo and CodeAnt — first pass (automatic).** Both run automatically on every push; no trigger needed. Read all three comment surfaces: inline review threads, PR issue-comments (Qodo/CodeAnt post findings here), and PR reviews.
+2. **Address everything from Qodo + CodeAnt.** Bundle fixes locally and push once per round (avoid a flurry of tiny pushes). Each push re-runs Qodo + CodeAnt + CI. Repeat until they are clean.
+3. **CodeRabbit — final pass (manual, once).** Org auto-review is **off**; CodeRabbit runs only when you comment `@coderabbitai review`. Trigger it **exactly once, after Qodo + CodeAnt have converged** on the final code — never before (it would review code that is about to change) and never while it is inside a rate-limit window. It is the last gate.
+
+**Cursor / Bugbot:** presumed **unavailable** (moved to usage-based pricing). Do not wait for it or expect comments; it returns only if the maintainer re-enables it at their discretion.
+
+**Greptile:** maintainer-triggered only. **Never** trigger it and **never** write the literal `@greptile` in a comment — the at-mention itself starts a billed run. The PR author is in Greptile's excluded-authors list, so it auto-skips.
+
+**Converged** = CI green **and** Qodo + CodeAnt clean **and** the single CodeRabbit pass addressed (the end of available feedback). At that point the PR is ready for human merge review. **Never auto-merge** — the maintainer merges.
+
 ## Landing the Plane (Session Completion)
 
 **When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.

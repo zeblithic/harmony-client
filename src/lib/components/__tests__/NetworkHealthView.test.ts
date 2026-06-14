@@ -245,3 +245,49 @@ describe('NetworkHealthView', () => {
     await waitFor(() => expect(btn.disabled).toBe(true));
   });
 });
+
+describe('NetworkHealthView — transport-disabled banner (ZEB-450)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const REASON =
+    'iroh transport unavailable this session: no keychain available and ' +
+    'HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set';
+
+  it('renders the loud banner with the boot reason when transport is disabled this session', async () => {
+    mockInvoke.mockResolvedValue({ ...emptySnap(), transportDisabledReason: REASON });
+    render(NetworkHealthView);
+
+    const banner = await screen.findByTestId('nh-transport-disabled');
+    expect(banner.getAttribute('role')).toBe('alert');
+    expect(screen.getByTestId('nh-transport-disabled-reason').textContent).toContain(REASON);
+    // The banner REPLACES the bland "starting up…" placeholder — transport
+    // won't recover without a restart, so the auto-retry spinner must not show.
+    expect(screen.queryByTestId('nh-starting-up')).toBeNull();
+  });
+
+  it('shows "starting up…" (not the banner) when no transport reason is set', async () => {
+    mockInvoke.mockResolvedValue(emptySnap()); // transportDisabledReason absent
+    render(NetworkHealthView);
+
+    await waitFor(() => screen.getByTestId('nh-starting-up'));
+    expect(screen.queryByTestId('nh-transport-disabled')).toBeNull();
+  });
+
+  it('offers a "Check again" button that re-fetches and clears the banner on recovery (Qodo)', async () => {
+    // Auto-retry is suppressed while disabled, so the banner must still give the
+    // user a way to pick up a recovery — otherwise the view can stale on the
+    // "can't network" state after a restart fixes transport.
+    mockInvoke
+      .mockResolvedValueOnce({ ...emptySnap(), transportDisabledReason: REASON }) // onMount: disabled
+      .mockResolvedValueOnce(readySnap()); // recheck: transport recovered
+    render(NetworkHealthView);
+
+    const btn = await screen.findByTestId('nh-transport-recheck');
+    await fireEvent.click(btn);
+
+    await waitFor(() => expect(screen.queryByTestId('nh-transport-disabled')).toBeNull());
+    expect(screen.getByTestId('nh-my-network')).toBeTruthy();
+  });
+});

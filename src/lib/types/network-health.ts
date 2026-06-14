@@ -96,6 +96,15 @@ export interface NetworkHealthSnapshot {
    * live `network_health_snapshot` responses always include it. (Greptile, PR #190.)
    */
   dialStatus?: DialHealthSummary;
+  /**
+   * ZEB-450: set when the iroh transport could not be brought up this session
+   * (key load/create failed — e.g. HARMONY_DISABLE_KEYCHAIN with no passphrase —
+   * or endpoint bind failed at boot). `null`/absent when transport is up or
+   * still initializing. Drives a persistent "this node can't network" banner so
+   * the failure is loud in the UI instead of buried in a boot log line. Optional
+   * for forward-compat with pre-field snapshots (Rust `#[serde(default)]`).
+   */
+  transportDisabledReason?: string | null;
 }
 
 export type StepOutcome =
