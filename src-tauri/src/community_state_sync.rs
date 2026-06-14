@@ -894,6 +894,12 @@ pub struct CommunitySyncEngine {
     /// actual publish.
     has_pending_dirty: Arc<AtomicBool>,
     flush_now_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
+    /// ZEB-462 B: publish-INDEPENDENT durable persist. Routes a `persist_now`
+    /// request through the single-writer task (same discipline as `flush_now`)
+    /// which `persist_both`s WITHOUT publishing — fences the community
+    /// membership CRDT to disk on join-commit so a crash before the next
+    /// debounce can't lose it.
+    persist_now_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
     /// Carries `Result<(), CommunitySyncError>` so the final publish +
     /// persist errors propagate to the caller rather than being silently
     /// swallowed by `()`. Mirrors `owner_state_sync::SyncEngine`'s
@@ -1007,6 +1013,8 @@ impl CommunitySyncEngine {
         let notify_dirty = Arc::new(Notify::new());
         let has_pending_dirty = Arc::new(AtomicBool::new(false));
         let (flush_now_tx, flush_now_rx) = mpsc::channel(8);
+        // ZEB-462 B: publish-independent persist channel (join-commit fence).
+        let (persist_now_tx, persist_now_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Clone the state Arc into the engine BEFORE moving cfg.state
@@ -1079,6 +1087,7 @@ impl CommunitySyncEngine {
             notify_dirty: Arc::clone(&notify_dirty),
             has_pending_dirty: Arc::clone(&has_pending_dirty),
             flush_now_rx,
+            persist_now_rx,
             shutdown_rx,
             identity_resolver: cfg.identity_resolver,
             error_tx: cfg.error_tx,
@@ -1094,6 +1103,7 @@ impl CommunitySyncEngine {
             notify_dirty,
             has_pending_dirty,
             flush_now_tx,
+            persist_now_tx,
             shutdown_tx,
             task: Mutex::new(Some(task)),
             state: state_for_engine,
@@ -1691,6 +1701,27 @@ impl CommunitySyncEngine {
             .map_err(|_| CommunitySyncError::TransportClosed)?
     }
 
+    /// ZEB-462 B: durably persist the community membership CRDT to disk NOW,
+    /// WITHOUT publishing. Routes through the single-writer task so it cannot
+    /// race the debounced persist. Used by the redeem path to fence the
+    /// just-inserted membership (admin bootstrap + self Join) on join-commit,
+    /// so a crash before the next debounce can't lose it. CRDT-ONLY: writes
+    /// `crdt.cbor` but NOT `replay.cbor` — fencing the tracker here could
+    /// durably record an unpublished `next_hlc` advance left in memory by a
+    /// prior failed publish (Cursor / CodeRabbit PR #253). Does NOT publish and
+    /// does NOT clear the dirty bit — a pending state-root publish still fires
+    /// on the next debounce.
+    pub async fn persist_now(&self) -> Result<(), CommunitySyncError> {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        self.persist_now_tx
+            .send(resp_tx)
+            .await
+            .map_err(|_| CommunitySyncError::TransportClosed)?;
+        resp_rx
+            .await
+            .map_err(|_| CommunitySyncError::TransportClosed)?
+    }
+
     /// Stop the internal task, flushing any pending writes first. If
     /// the engine task was already gone (channel closed before our send
     /// landed), returns `Ok(())` — there was nothing to flush.
@@ -1736,6 +1767,8 @@ struct InternalCtx {
     notify_dirty: Arc<Notify>,
     has_pending_dirty: Arc<AtomicBool>,
     flush_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
+    /// ZEB-462 B: publish-independent persist request channel (join-commit fence).
+    persist_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
     shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
     identity_resolver: Option<Arc<dyn IdentityResolver>>,
     error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
@@ -2309,23 +2342,33 @@ async fn internal_task(mut ctx: InternalCtx) {
                         ctx.has_pending_dirty.store(true, Ordering::Release);
                     }
                 }
-                // Only persist after a SUCCESSFUL publish. Persisting
-                // on failure would record next_hlc's tracker advance
-                // even though peers never received the publish — a
-                // restart would skip the retry and leave the community
-                // out-of-sync until clock-time advances past the
-                // unpersisted HLC. Errors here are logged + swallowed
-                // (debounce wakeup has no caller to surface a Result
-                // to; dropping the loop on a transient disk error
-                // would silently disable sync for this community).
-                if pub_result.is_ok() {
-                    if let Err(e) = persist_both(&ctx).await {
-                        tracing::warn!(
-                            community_id = ?ctx.community_id,
-                            error = %e,
-                            "community persist_both failed after debounce publish"
-                        );
-                    }
+                // ZEB-462 B: persist the CRDT (`crdt.cbor`) UNCONDITIONALLY —
+                // the membership events are validated, durable facts that must
+                // survive a crash even when this publish never landed. Persist
+                // the `replay.cbor` tracker advance ONLY on publish success:
+                // recording next_hlc's advance after a failed publish would
+                // make a restart skip the retry and leave the community
+                // out-of-sync until clock-time passes the unpersisted HLC, so
+                // on failure we leave the on-disk tracker un-advanced. The
+                // dirty bit was restored above, so the next publish OPPORTUNITY
+                // retries it — a later mutation's debounce (mutations re-arm the
+                // timer via notify_dirty), flush_now, or shutdown — note that
+                // restoring the bit alone does NOT re-arm this debounce timer
+                // (next_wakeup was cleared), so the retry waits for one of those
+                // triggers. Errors are logged + swallowed (the debounce wakeup
+                // has no caller to surface a Result to; dropping the loop on a
+                // transient disk error would silently disable sync).
+                let persist_result = if pub_result.is_ok() {
+                    persist_both(&ctx).await
+                } else {
+                    persist_crdt_only(&ctx).await
+                };
+                if let Err(e) = persist_result {
+                    tracing::warn!(
+                        community_id = ?ctx.community_id,
+                        error = %e,
+                        "community persist failed after debounce publish"
+                    );
                 }
             }
             Some(resp_tx) = ctx.flush_now_rx.recv() => {
@@ -2335,19 +2378,45 @@ async fn internal_task(mut ctx: InternalCtx) {
                 if pub_result.is_err() && was_dirty {
                     ctx.has_pending_dirty.store(true, Ordering::Release);
                 }
-                // Persist matches the public contract: flush_now()
-                // returns after both publish AND on-disk persist
-                // complete (mirrors owner_state_sync::SyncEngine). Only
-                // persist on publish success to avoid recording an
-                // unpublished HLC advance; on persist failure surface
-                // the error to the caller via and()-chained Result.
+                // Persist matches the public contract: flush_now() returns
+                // after both publish AND on-disk persist complete (mirrors
+                // owner_state_sync::SyncEngine). ZEB-462 B: persist the CRDT
+                // unconditionally (validated events are durable facts); persist
+                // the replay-tracker advance only on publish success (an
+                // unpublished HLC advance must not be recorded). On publish
+                // failure we still persist `crdt.cbor` but surface the publish
+                // error to the caller via the and()-chained Result.
                 let final_result = if pub_result.is_ok() {
                     let persist_result = persist_both(&ctx).await;
                     pub_result.and(persist_result)
                 } else {
+                    if let Err(e) = persist_crdt_only(&ctx).await {
+                        tracing::warn!(
+                            community_id = ?ctx.community_id,
+                            error = %e,
+                            "community crdt persist failed after flush_now publish failure"
+                        );
+                    }
                     pub_result
                 };
                 let _ = resp_tx.send(final_result);
+            }
+            Some(resp_tx) = ctx.persist_now_rx.recv() => {
+                // ZEB-462 B: publish-INDEPENDENT durable persist (join-commit
+                // fence). CRDT-ONLY by design (Cursor / CodeRabbit PR #253): a
+                // prior failed debounce/flush publish advances `ctx.tracker`
+                // in-memory via `next_hlc` while `persist_crdt_only` deliberately
+                // leaves the on-disk tracker un-advanced. `persist_both` here
+                // would fence that UNPUBLISHED advance to `replay.cbor`, undoing
+                // the failure split and skipping the publish retry after a
+                // restart. The fence only needs the membership CRDT durable;
+                // `replay.cbor` is persisted by the receive arm (accepted
+                // inbound) and the publish arms (on confirmed publish), never by
+                // this fence. Deliberately does NOT touch `has_pending_dirty`:
+                // any pending state-root publish still fires on the next
+                // debounce / flush_now.
+                let persist_result = persist_crdt_only(&ctx).await;
+                let _ = resp_tx.send(persist_result);
             }
             maybe_bytes = ctx.subscriber_rx.recv(), if !inbound_closed => {
                 let Some(bytes) = maybe_bytes else {
@@ -2479,31 +2548,39 @@ async fn internal_task(mut ctx: InternalCtx) {
                 } else {
                     Ok(())
                 };
-                // Persist gating mirrors the debounce / flush_now arms:
-                // only checkpoint state to disk after a SUCCESSFUL
-                // publish. Persisting after a failed publish would
-                // record next_hlc's tracker advance even though peers
-                // never received the final root — on restart the in-
-                // memory `has_pending_dirty` is gone, so there's no
-                // signal to retry. The receive-side (no publish, just
-                // a tracker advance from accepted inbound) is a
-                // separate concern: persist runs on every successful
-                // accept-and-merge in the subscriber arm, so by the
-                // time we reach shutdown the on-disk replay tracker is
-                // already up to date for accepted publishes.
+                // ZEB-462 B: persist the CRDT (`crdt.cbor`) UNCONDITIONALLY —
+                // a SIGKILL never reaches this arm, but a GRACEFUL shutdown
+                // that cannot publish (transport already torn down, no live
+                // peers) must still durably checkpoint the validated
+                // membership rather than lose it. The `replay.cbor` tracker
+                // advance is still gated on a SUCCESSFUL publish: recording
+                // next_hlc's advance after a failed publish would, on restart
+                // (in-memory `has_pending_dirty` gone), leave no signal to
+                // retry. The receive-side (no publish, just a tracker advance
+                // from accepted inbound) is a separate concern: persist runs
+                // on every successful accept-and-merge in the subscriber arm,
+                // so by shutdown the on-disk replay tracker is already current
+                // for accepted publishes.
                 //
-                // If we never even attempted a publish (was_dirty=false)
-                // we still flush so any receive-side updates this loop
-                // accepted but didn't yet persist (only possible if a
-                // shutdown raced in between accept and persist) reach
-                // disk. In practice the subscriber arm calls persist
-                // before yielding back to select!, so this is a belt-
-                // and-suspenders flush — cheap, safe, and visible in
-                // tests.
+                // If we never even attempted a publish (was_dirty=false) we
+                // still persist_both so any receive-side updates this loop
+                // accepted but didn't yet persist (only possible if a shutdown
+                // raced in between accept and persist) reach disk. In practice
+                // the subscriber arm calls persist before yielding back to
+                // select!, so this is a belt-and-suspenders flush — cheap,
+                // safe, and visible in tests.
                 let final_result = if pub_result.is_ok() {
                     let persist_result = persist_both(&ctx).await;
                     pub_result.and(persist_result)
                 } else {
+                    // Publish failed, but the CRDT must still reach disk.
+                    if let Err(e) = persist_crdt_only(&ctx).await {
+                        tracing::warn!(
+                            community_id = ?ctx.community_id,
+                            error = %e,
+                            "community crdt persist failed during shutdown after publish failure"
+                        );
+                    }
                     pub_result
                 };
                 // Surface persist+publish failures to the caller —
@@ -3589,6 +3666,37 @@ async fn persist_replay_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError
     tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
         save_replay(&replay_path, &tracker_snap)
             .map_err(|e| CommunitySyncError::Persist(e.to_string()))
+    })
+    .await
+    .map_err(|join_err| {
+        CommunitySyncError::Persist(format!("spawn_blocking join failed: {join_err}"))
+    })??;
+    Ok(())
+}
+
+/// CRDT-only persist for the publish-FAILURE case (ZEB-462 B). The
+/// community membership CRDT is a monotonic accumulation of VALIDATED
+/// events — durable facts that must survive a crash regardless of whether
+/// the outbound state-root publish landed. The publish-gated arms
+/// (debounce / flush_now / shutdown) therefore persist `crdt.cbor`
+/// unconditionally and only withhold the `replay.cbor` tracker advance
+/// when the publish failed — that advance (from `encode_root_packet`'s
+/// `next_hlc`) is meaningless until peers actually receive it, so leaving
+/// it un-persisted lets the next boot retry the publish from the same HLC.
+///
+/// Without this, a joiner whose co-located publish never durably lands
+/// would never write `crdt.cbor` until a GRACEFUL shutdown — a SIGKILL
+/// then loses the entire membership (admin + self), which materializes as
+/// the publish gate's synthetic `Left`/`left_at: None` for every
+/// publisher after restart (ZEB-462 B).
+///
+/// Same lock + runtime discipline as `persist_both`: snapshot the CRDT
+/// under its lock, drop the guard, run the disk write in `spawn_blocking`.
+async fn persist_crdt_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
+    let state_snap = ctx.state.lock().await.clone();
+    let crdt_path = ctx.paths.crdt.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
+        save_crdt(&crdt_path, &state_snap).map_err(|e| CommunitySyncError::Persist(e.to_string()))
     })
     .await
     .map_err(|join_err| {
@@ -4741,6 +4849,26 @@ impl CommunitySyncRegistry {
             None => Err(CommunitySyncError::TransportClosed),
         }
     }
+
+    /// ZEB-462 B: durably fence the community membership CRDT for
+    /// `community_id` to disk NOW, publish-independent, if an engine is
+    /// spawned. Used by the redeem path's join-commit durable fence (mirrors
+    /// `fence_owner_state_flush` for owner-state). A missing engine returns
+    /// `Ok(())` — the caller treats it as a best-effort fence (the next boot's
+    /// debounce/scan recovers), NOT a hard join failure.
+    pub async fn persist_now(&self, community_id: &SpaceId) -> Result<(), CommunitySyncError> {
+        // Clone the Arc<Engine> out from under the map lock (same rationale as
+        // `flush_now`): don't hold the registry mutex across the engine's
+        // oneshot reply wait.
+        let engine = {
+            let engines = self.engines.lock().await;
+            engines.get(community_id).cloned()
+        };
+        match engine {
+            Some(e) => e.persist_now().await,
+            None => Ok(()),
+        }
+    }
 }
 
 /// Identity resolver backed by Sub-A's owner-device cache. The cache
@@ -5327,6 +5455,233 @@ mod tests {
             crdt_path.exists(),
             "rollback must NOT delete a pre-existing persistence dir \
              (the user's community history)"
+        );
+    }
+
+    // ── ZEB-462 B: community membership CRDT crash-durability ──────────
+
+    /// Build a minimal signed membership event to seed an engine's in-memory
+    /// CRDT. Bypasses verify (inserted directly into `state.events`) — these
+    /// tests exercise the persist round-trip, not the verify path.
+    fn seed_membership_event(community_id: SpaceId, actor: OwnerAddr) -> SignedMembershipEvent {
+        let payload = crate::community_membership::EventPayload {
+            id: [0xee; 16],
+            community_id,
+            kind: crate::community_membership::MembershipEventKind::Join,
+            actor,
+            at: crate::owner_state_types::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "seed-dev".to_string(),
+            },
+        };
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        crate::community_membership::sign_event(&payload, &sk).expect("sign_event")
+    }
+
+    /// `persist_now` durably fences the in-memory CRDT to disk WITHOUT
+    /// publishing (the join-commit fence). A SIGKILL right after a join must
+    /// not lose membership the engine holds only in memory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persist_now_fences_crdt_without_publishing_zeb462() {
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0xd1; 16]);
+        let community_dir = fix
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0));
+        let crdt_path = community_dir.join("crdt.cbor");
+        let replay_path = community_dir.join("replay.cbor");
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+        let engine = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
+            )
+            .await
+            .expect("spawn_engine_with_guard");
+        guard.commit();
+
+        let event = seed_membership_event(community_id, fix.admin_addr);
+        let eid = event.id;
+        engine.state().lock().await.events.insert(eid, event);
+
+        // Publish-independent durable fence (the join-commit path). No publish
+        // has run, yet the CRDT must be on disk after this returns.
+        engine.persist_now().await.expect("persist_now");
+
+        let loaded = load_crdt(&crdt_path, community_id).expect("load_crdt after persist_now");
+        assert!(
+            loaded.events.contains_key(&eid),
+            "persist_now must durably write the in-memory membership event"
+        );
+        // CRDT-ONLY regression (Cursor / CodeRabbit PR #253): persist_now must
+        // NOT write replay.cbor — fencing the tracker here could durably record
+        // an unpublished next_hlc advance left in memory by a failed publish.
+        // `persist_both` would create replay.cbor; `persist_crdt_only` does not.
+        assert!(
+            !replay_path.exists(),
+            "persist_now must be CRDT-only — it must not fence the replay tracker"
+        );
+
+        engine.shutdown().await.ok();
+    }
+
+    /// A flush whose PUBLISH fails must still persist the CRDT — validated
+    /// membership events are durable facts. Pre-fix the persist was gated on
+    /// publish success, so a co-located joiner whose publish never landed
+    /// never wrote `crdt.cbor`, and a SIGKILL lost the entire membership
+    /// (admin + self → the gate's synthetic `Left` for every publisher).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_persists_crdt_even_when_publish_fails_zeb462() {
+        let mut fix = build_test_fixture().await;
+        let community_id = SpaceId([0xd2; 16]);
+        let crdt_path = fix
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0))
+            .join("crdt.cbor");
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+        let engine = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
+            )
+            .await
+            .expect("spawn_engine_with_guard");
+        guard.commit();
+
+        // Drop the adapter request that owns `pub_rx` so the engine's outbound
+        // publish channel has no receiver — models the co-located "publish
+        // never lands" case. (The fixture's CAS receiver is also dropped, so
+        // the encode step fails first regardless; this makes the intent
+        // explicit + robust to encode-path changes.)
+        let adapter_req = fix
+            .community_adapter_rx
+            .recv()
+            .await
+            .expect("adapter request");
+        drop(adapter_req);
+
+        let event = seed_membership_event(community_id, fix.admin_addr);
+        let eid = event.id;
+        engine.state().lock().await.events.insert(eid, event);
+
+        // flush_now publishes (FAILS — no CAS / no receiver) then, with the
+        // fix, still persists the CRDT. The Result surfaces the publish error.
+        let flush_result = engine.flush_now().await;
+        assert!(
+            flush_result.is_err(),
+            "publish must fail with the adapter receiver + CAS dropped"
+        );
+
+        let loaded =
+            load_crdt(&crdt_path, community_id).expect("load_crdt after failed-publish flush");
+        assert!(
+            loaded.events.contains_key(&eid),
+            "ZEB-462 B: CRDT must persist even when the publish failed"
+        );
+
+        engine.shutdown().await.ok();
+    }
+
+    /// Cursor PR #253 R2: when the join-commit `persist_now` fence FAILS, it
+    /// must re-arm the engine's dirty bit (mirroring `fence_owner_state_flush`)
+    /// so the next debounce / shutdown retries the persist. Without the re-arm,
+    /// a prior in-flight debounce that cleared the dirty bit (publish ok,
+    /// `persist_both` failed) followed by a failed fence leaves `crdt.cbor`
+    /// stale with nothing armed, and a SIGKILL loses the membership.
+    ///
+    /// Rig the failure deterministically: shut the engine down first so the
+    /// fence's `persist_now()` cannot be serviced (it returns `TransportClosed`,
+    /// or at worst times out) — no timing race. Both failure branches of the
+    /// fence call `notify_dirty`, so the dirty bit must be set afterward
+    /// regardless of which one fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fence_rearms_debounce_when_persist_fails_zeb462() {
+        use std::sync::atomic::Ordering;
+
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0xd3; 16]);
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+        let engine = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
+            )
+            .await
+            .expect("spawn_engine_with_guard");
+        guard.commit();
+
+        // Stop the single-writer task so the fence's `persist_now` can never be
+        // serviced — a deterministic stand-in for a wedged / failed persist.
+        engine.shutdown().await.ok();
+        // Establish the precondition explicitly: a clear dirty bit, so a
+        // post-fence `true` can only have come from the fence's re-arm.
+        engine.has_pending_dirty.store(false, Ordering::Relaxed);
+
+        // The real production helper, run against a dead engine: `persist_now`
+        // fails, so the fence must re-arm the debounce.
+        crate::fence_community_crdt_persist(
+            &engine,
+            std::time::Duration::from_secs(5),
+            "zeb462_fence_test",
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+        )
+        .await;
+
+        assert!(
+            engine.has_pending_dirty.load(Ordering::Relaxed),
+            "a failed join-commit fence must re-arm the dirty bit so the next \
+             debounce / shutdown retries the membership persist (Cursor PR #253 R2)"
         );
     }
 
