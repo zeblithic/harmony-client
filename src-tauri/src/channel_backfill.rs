@@ -247,6 +247,22 @@ pub const EPOCH_REARM_COOLDOWN_MS: u64 = 60_000;
 /// [`run_backfill_driver`] and [`run_root_fetch_driver`].
 pub const PERIODIC_RESYNC_FLOOR_MS: u64 = 3_600_000;
 
+/// Per-driver jitter span (ms) added on top of [`PERIODIC_RESYNC_FLOOR_MS`]
+/// so drivers that reach Idle together — notably the burst spawned at
+/// startup — do NOT form a thundering herd of synchronized re-queries
+/// (Qodo, PR #257). 10 min. Each driver picks its own offset once via
+/// [`periodic_resync_interval_ms`].
+pub const PERIODIC_RESYNC_JITTER_MS: u64 = 600_000;
+
+/// Production resync interval for one driver: the floor plus uniform
+/// jitter in `[0, PERIODIC_RESYNC_JITTER_MS)`, chosen ONCE per spawn so
+/// satisfied latches de-synchronize and don't re-query in lockstep. Tests
+/// pass a fixed `Some(ms)` directly instead, for deterministic timing.
+pub fn periodic_resync_interval_ms() -> u64 {
+    use rand::Rng;
+    PERIODIC_RESYNC_FLOOR_MS + rand::thread_rng().gen_range(0..PERIODIC_RESYNC_JITTER_MS)
+}
+
 /// Wait for a transport-epoch bump. Pends forever when no watch is
 /// wired; returns false when the epoch sender dropped — callers
 /// degrade to no-epoch mode (`epoch_rx = None`) rather than exiting,
@@ -258,13 +274,15 @@ async fn epoch_bump(epoch_rx: &mut Option<tokio::sync::watch::Receiver<u64>>) ->
     }
 }
 
-/// Fire after `interval_ms` when set; pend forever when `None` (the
-/// periodic re-sync is disabled) so its `select!` arm never wins. Mirrors
-/// [`epoch_bump`]'s pend-when-absent shape (ZEB-425).
+/// Fire after `interval_ms` when set to a positive value; pend forever
+/// otherwise so its `select!` arm never wins. `None` AND `Some(0)` both
+/// disable the floor: a zero interval would complete immediately on every
+/// Idle loop, spinning re-arm/fetch with no delay (CodeAnt, PR #257).
+/// Mirrors [`epoch_bump`]'s pend-when-absent shape (ZEB-425).
 async fn resync_tick(interval_ms: Option<u64>) {
     match interval_ms {
-        Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
-        None => std::future::pending().await,
+        Some(ms) if ms > 0 => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+        _ => std::future::pending().await,
     }
 }
 
@@ -387,7 +405,7 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
         }
         match latch.next_action(now_ms()) {
             BackfillAction::Idle => {
-                if epoch_rx.is_none() && resync_interval_ms.is_none() {
+                if epoch_rx.is_none() && !matches!(resync_interval_ms, Some(ms) if ms > 0) {
                     return;
                 }
                 tokio::select! {
@@ -653,7 +671,7 @@ pub async fn run_root_fetch_driver<Rq, RqFut>(
         }
         match latch.next_action(now_ms()) {
             RootFetchAction::Idle => {
-                if epoch_rx.is_none() && resync_interval_ms.is_none() {
+                if epoch_rx.is_none() && !matches!(resync_interval_ms, Some(ms) if ms > 0) {
                     return;
                 }
                 tokio::select! {
@@ -1951,6 +1969,42 @@ mod tests {
             requests.load(Ordering::SeqCst),
             1,
             "no re-arm may fire once shutdown is signaled"
+        );
+    }
+
+    /// `Some(0)` must behave exactly like `None` (disabled): the driver
+    /// returns on Idle instead of spinning the resync arm with no delay
+    /// (CodeAnt PR #257 — a zero interval would hot-loop re-arm/fetch).
+    #[tokio::test(start_paused = true)]
+    async fn resync_zero_interval_is_disabled_returns_on_idle() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_page = move |_since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                PageFetch::Completed(0, 256) // satisfied
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        // epoch None + resync Some(0): 0 == disabled → return on Idle.
+        // If 0 were honored as an interval this future would never
+        // complete (hot loop / park), hanging the test.
+        run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            || async { None::<Hlc> },
+            shutdown_rx,
+            None,
+            Some(0),
+            move || start.elapsed().as_millis() as u64,
+        )
+        .await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "Some(0) must be disabled: one request, then return on Idle (no spin)"
         );
     }
 }
