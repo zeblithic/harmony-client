@@ -19889,28 +19889,16 @@ pub async fn create_community_inner(
     // (mirrors the redeem path + the owner-state fence). The creator's own
     // admin Join + #general channel-config events live only in memory until
     // the publish-gated debounce; a SIGKILL before then would lose them
-    // (empty membership → the publish gate's synthetic Left for every
-    // publisher on restart). Publish-INDEPENDENT (`persist_now`) + bounded so
-    // a wedged engine can't hang the create; non-fatal (owner-state already
-    // durable, next boot's debounce recovers what this missed).
-    match tokio::time::timeout(OWNER_STATE_FENCE_TIMEOUT, engine_arc.persist_now()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::warn!(
-                community_id = %hex::encode(minted.community_id.0),
-                error = %e,
-                "ZEB-462 B: community-CRDT durable fence failed after create; \
-                 membership will persist on the next debounce / graceful shutdown"
-            );
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
-                community_id = %hex::encode(minted.community_id.0),
-                "ZEB-462 B: community-CRDT durable fence timed out after create; \
-                 membership will persist on the next debounce / graceful shutdown"
-            );
-        }
-    }
+    // (empty membership → the publish gate's synthetic Left for every publisher
+    // on restart). The helper persists publish-independently, is bounded so a
+    // wedged engine can't hang the create, and re-arms the debounce on failure.
+    fence_community_crdt_persist(
+        &engine_arc,
+        OWNER_STATE_FENCE_TIMEOUT,
+        "create_community",
+        &hex::encode(minted.community_id.0),
+    )
+    .await;
 
     Ok(hex::encode(minted.community_id.0))
 }
@@ -22099,32 +22087,18 @@ where
     // ZEB-462 B: durable-on-commit fence for the COMMUNITY MEMBERSHIP CRDT.
     // The membership events (admin bootstrap + self Join) were inserted into
     // the engine above but only reach `crdt.cbor` via the publish-gated
-    // debounce/shutdown arms — co-located the publish never durably lands, so
-    // a SIGKILL before the next debounce loses the entire membership (the gate
+    // debounce/shutdown arms — co-located the publish never durably lands, so a
+    // SIGKILL before the next debounce loses the entire membership (the gate
     // then materializes admin + self as the synthetic `Left`/`left_at: None`
-    // for every publisher after restart). Fence it to disk now, mirroring the
-    // owner-state durable-on-commit fence (`fence_owner_state_flush`).
-    // Publish-INDEPENDENT (`persist_now`) + bounded so a wedged engine task
-    // can't hang the join. Non-fatal: the join already committed durably in
-    // owner-state, and the next boot's debounce recovers what this missed.
-    match tokio::time::timeout(OWNER_STATE_FENCE_TIMEOUT, engine_arc.persist_now()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::warn!(
-                community_id = %hex::encode(minted.community_id.0),
-                error = %e,
-                "ZEB-462 B: community-CRDT durable fence failed after redeem; \
-                 membership will persist on the next debounce / graceful shutdown"
-            );
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
-                community_id = %hex::encode(minted.community_id.0),
-                "ZEB-462 B: community-CRDT durable fence timed out after redeem; \
-                 membership will persist on the next debounce / graceful shutdown"
-            );
-        }
-    }
+    // for every publisher after restart). The helper fences it to disk now,
+    // publish-independently + bounded, and re-arms the debounce on failure.
+    fence_community_crdt_persist(
+        &engine_arc,
+        OWNER_STATE_FENCE_TIMEOUT,
+        "redeem_invite",
+        &hex::encode(minted.community_id.0),
+    )
+    .await;
 
     // 10. Return DTO with the invite's name + kind so the caller can
     // render the new community without re-decoding the URL or
@@ -38245,6 +38219,50 @@ pub(crate) async fn fence_owner_state_flush(
                 timeout_ms = timeout.as_millis() as u64,
                 community_id = %community_id,
                 "{context}: owner-state flush_now timed out; re-arming debounce"
+            );
+            engine.notify_dirty();
+        }
+    }
+}
+
+/// ZEB-462 B: durable-on-commit fence for the COMMUNITY MEMBERSHIP CRDT,
+/// the publish-independent twin of [`fence_owner_state_flush`]. Routes a
+/// `persist_now` through the engine's single-writer task (writes `crdt.cbor`,
+/// never `replay.cbor`) so the just-committed membership (admin bootstrap +
+/// self Join + default `#general`) survives a SIGKILL before the publish-gated
+/// debounce. Bounded so a wedged engine task can't hang create/redeem;
+/// non-fatal (owner-state is already durable, and the next boot's debounce
+/// recovers whatever this missed).
+///
+/// On failure OR timeout it re-arms the engine's dirty bit + debounce timer via
+/// `notify_dirty` (Cursor PR #253 R2): an in-flight debounce could have cleared
+/// the dirty bit on a successful publish whose `persist_both` then failed,
+/// leaving `crdt.cbor` stale with no retry armed. Without this re-arm, a second
+/// failure here would let a SIGKILL lose the membership — exactly the bug this
+/// ticket closes. Mirrors `fence_owner_state_flush`'s re-arm precisely.
+pub(crate) async fn fence_community_crdt_persist(
+    engine: &crate::community_state_sync::CommunitySyncEngine,
+    timeout: std::time::Duration,
+    context: &'static str,
+    community_id: &str,
+) {
+    match tokio::time::timeout(timeout, engine.persist_now()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                community_id = %community_id,
+                "{context}: community-CRDT persist_now failed; re-arming debounce \
+                 so membership persists on the next publish / shutdown"
+            );
+            engine.notify_dirty();
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis() as u64,
+                community_id = %community_id,
+                "{context}: community-CRDT persist_now timed out; re-arming debounce \
+                 so membership persists on the next publish / shutdown"
             );
             engine.notify_dirty();
         }

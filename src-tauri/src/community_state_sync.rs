@@ -5617,6 +5617,74 @@ mod tests {
         engine.shutdown().await.ok();
     }
 
+    /// Cursor PR #253 R2: when the join-commit `persist_now` fence FAILS, it
+    /// must re-arm the engine's dirty bit (mirroring `fence_owner_state_flush`)
+    /// so the next debounce / shutdown retries the persist. Without the re-arm,
+    /// a prior in-flight debounce that cleared the dirty bit (publish ok,
+    /// `persist_both` failed) followed by a failed fence leaves `crdt.cbor`
+    /// stale with nothing armed, and a SIGKILL loses the membership.
+    ///
+    /// Rig the failure deterministically: shut the engine down first so the
+    /// fence's `persist_now()` cannot be serviced (it returns `TransportClosed`,
+    /// or at worst times out) — no timing race. Both failure branches of the
+    /// fence call `notify_dirty`, so the dirty bit must be set afterward
+    /// regardless of which one fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fence_rearms_debounce_when_persist_fails_zeb462() {
+        use std::sync::atomic::Ordering;
+
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0xd3; 16]);
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+        let engine = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                fix.community_adapter_tx.clone(),
+                None,
+                None,
+                None,
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
+            )
+            .await
+            .expect("spawn_engine_with_guard");
+        guard.commit();
+
+        // Stop the single-writer task so the fence's `persist_now` can never be
+        // serviced — a deterministic stand-in for a wedged / failed persist.
+        engine.shutdown().await.ok();
+        // Establish the precondition explicitly: a clear dirty bit, so a
+        // post-fence `true` can only have come from the fence's re-arm.
+        engine.has_pending_dirty.store(false, Ordering::Relaxed);
+
+        // The real production helper, run against a dead engine: `persist_now`
+        // fails, so the fence must re-arm the debounce.
+        crate::fence_community_crdt_persist(
+            &engine,
+            std::time::Duration::from_secs(5),
+            "zeb462_fence_test",
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+        )
+        .await;
+
+        assert!(
+            engine.has_pending_dirty.load(Ordering::Relaxed),
+            "a failed join-commit fence must re-arm the dirty bit so the next \
+             debounce / shutdown retries the membership persist (Cursor PR #253 R2)"
+        );
+    }
+
     /// ZEB-436 PR #229 R1 (Qodo): the pre-existence marker must be the
     /// community DIR, not `crdt.cbor` — durable channel-log history
     /// lives under `channels/...` and can exist while `crdt.cbor` is
