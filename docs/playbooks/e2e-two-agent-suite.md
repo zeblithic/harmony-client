@@ -68,8 +68,9 @@ per-scenario steps. The protocol is identical; only the transport differs.
 
 Assert with the SAME predicates the Rust harness uses (so results are comparable):
 roster membership status is `"joined"` (lowercase); friend status is `"active"`;
-DM body is hex-encoded on `read_dm_thread`; channel presence is `id` in
-`list_channels`. First contact is racy (~75–90s pkarr propagation) — **poll/retry**
+DM body is hex-encoded on `read_dm_thread`; channel presence is `channelId` in
+`list_channels` (the DTO is camelCase — `id` is always absent, see the harness key
+fix). First contact is racy (~75–90s pkarr propagation) — **poll/retry**
 the cross-node redeem until it reports success; transient
 `pkarr resolve: no relays available` is retryable (relay warm-up), not a failure.
 

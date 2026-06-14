@@ -298,13 +298,24 @@ pub async fn channels_contains(
     community_id: &str,
     channel_id: &str,
 ) -> anyhow::Result<bool> {
-    Ok(list_channels(node, community_id)
-        .await?
-        .iter()
-        // `ChannelInfoDto` is `#[serde(rename_all = "camelCase")]`, so the id
-        // field serializes as `channelId` (NOT `id`). Checking the wrong key
-        // makes this silently always-false → poll_until always times out.
-        .any(|c| c.get("channelId").and_then(Value::as_str) == Some(channel_id)))
+    // `ChannelInfoDto` is `#[serde(rename_all = "camelCase")]`, so the id field
+    // serializes as `channelId` (NOT `id`). Checking the wrong key makes this
+    // silently always-false → poll_until always times out, masquerading as a
+    // sync failure (exactly the ZEB-462 misdiagnosis). Guard against a future
+    // DTO rename by surfacing a missing key as a loud schema error rather than a
+    // silent miss: an empty list is "not converged yet" (keep polling), but a
+    // non-empty list whose objects lack `channelId` is a contract mismatch.
+    for c in list_channels(node, community_id).await? {
+        let id = c.get("channelId").and_then(Value::as_str).ok_or_else(|| {
+            anyhow::anyhow!(
+                "channel object missing string `channelId` key (DTO/schema mismatch?): {c}"
+            )
+        })?;
+        if id == channel_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub async fn post_channel_message(

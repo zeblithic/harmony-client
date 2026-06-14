@@ -461,7 +461,10 @@ async fn s3_offline_channel_reconnect_catchup() {
 
     // ZEB-434: Bob catches up the offline-created channel after reconnect (works
     // post-ZEB-462(B) + the channelId key fix; see this scenario's header note).
-    poll_until(Duration::from_secs(120), || async {
+    // 180s ceiling: catch-up is typically fast, but this is a now-un-ignored,
+    // network-racy CI test — the poll returns the instant the channel appears, so
+    // the extra slack only buys margin on a slow runner (zero happy-path cost).
+    poll_until(Duration::from_secs(180), || async {
         Ok(channels_contains(&bob, &community, &channel)
             .await?
             .then_some(()))
@@ -515,17 +518,22 @@ async fn s4_restart_durability() {
         let comms = alice
             .rpc("list_owner_communities", serde_json::json!({}))
             .await?;
-        let found = comms
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    // `CommunityNavDto` is camelCase: the id field is `spaceId`,
-                    // NOT `id`. Wrong key → always-false → 120s timeout even when
-                    // the community rehydrated correctly.
-                    .any(|c| c.get("spaceId").and_then(|v| v.as_str()) == Some(community.as_str()))
-            })
-            .unwrap_or(false);
-        Ok(found.then_some(()))
+        // `CommunityNavDto` is camelCase: the id field is `spaceId`, NOT `id`.
+        // Wrong key → always-false → 120s timeout even when the community
+        // rehydrated correctly. Surface a future DTO rename as a loud schema
+        // error: an empty list is "not rehydrated yet" (keep polling), but a
+        // present community object missing `spaceId` is a contract mismatch.
+        for c in comms.as_array().cloned().unwrap_or_default() {
+            let sid = c.get("spaceId").and_then(|v| v.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "community object missing string `spaceId` key (DTO/schema mismatch?): {c}"
+                )
+            })?;
+            if sid == community.as_str() {
+                return Ok(Some(()));
+            }
+        }
+        Ok(None)
     })
     .await
     .expect("community rehydrated after restart (ZEB-393)");
