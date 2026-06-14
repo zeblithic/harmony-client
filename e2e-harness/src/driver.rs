@@ -387,7 +387,18 @@ pub async fn publish_card_until_ok(
         }
         match republish_owner_card(node, display_name, status_text).await {
             Ok(()) => return Ok(()),
-            Err(e) => last_err = e.to_string(),
+            // Only the pre-connect "owner card runtime not ready" is transient
+            // (the card publisher is wired post-connect). Any other error —
+            // malformed avatar/profile-page hex, a poisoned lock, a publish
+            // failure — is NOT retryable; fail fast so it surfaces immediately
+            // instead of being masked by a timeout (Qodo, PR #263).
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("owner card runtime not ready") {
+                    return Err(e);
+                }
+                last_err = msg;
+            }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
