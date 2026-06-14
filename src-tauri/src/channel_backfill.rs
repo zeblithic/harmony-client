@@ -238,6 +238,31 @@ impl BackfillLatch {
 /// Governs BOTH [`run_backfill_driver`] and [`run_root_fetch_driver`].
 pub const EPOCH_REARM_COOLDOWN_MS: u64 = 60_000;
 
+/// Anti-entropy floor (ZEB-425): re-arm a satisfied backfill/root-fetch
+/// latch at most this long after it last (re-)synced, regardless of
+/// transport-epoch bumps. 1 h — well above [`EPOCH_REARM_COOLDOWN_MS`], so
+/// it only acts when the edge-triggered re-arm never fires (holders
+/// reachable only via a router, a queryable that matched after its peer's
+/// zid was already seen, or a same-zid reconnect). Governs BOTH
+/// [`run_backfill_driver`] and [`run_root_fetch_driver`].
+pub const PERIODIC_RESYNC_FLOOR_MS: u64 = 3_600_000;
+
+/// Per-driver jitter span (ms) added on top of [`PERIODIC_RESYNC_FLOOR_MS`]
+/// so drivers that reach Idle together — notably the burst spawned at
+/// startup — do NOT form a thundering herd of synchronized re-queries
+/// (Qodo, PR #257). 10 min. Each driver picks its own offset once via
+/// [`periodic_resync_interval_ms`].
+pub const PERIODIC_RESYNC_JITTER_MS: u64 = 600_000;
+
+/// Production resync interval for one driver: the floor plus uniform
+/// jitter in `[0, PERIODIC_RESYNC_JITTER_MS)`, chosen ONCE per spawn so
+/// satisfied latches de-synchronize and don't re-query in lockstep. Tests
+/// pass a fixed `Some(ms)` directly instead, for deterministic timing.
+pub fn periodic_resync_interval_ms() -> u64 {
+    use rand::Rng;
+    PERIODIC_RESYNC_FLOOR_MS + rand::thread_rng().gen_range(0..PERIODIC_RESYNC_JITTER_MS)
+}
+
 /// Wait for a transport-epoch bump. Pends forever when no watch is
 /// wired; returns false when the epoch sender dropped — callers
 /// degrade to no-epoch mode (`epoch_rx = None`) rather than exiting,
@@ -246,6 +271,18 @@ async fn epoch_bump(epoch_rx: &mut Option<tokio::sync::watch::Receiver<u64>>) ->
     match epoch_rx.as_mut() {
         Some(rx) => rx.changed().await.is_ok(),
         None => std::future::pending().await,
+    }
+}
+
+/// Fire after `interval_ms` when set to a positive value; pend forever
+/// otherwise so its `select!` arm never wins. `None` AND `Some(0)` both
+/// disable the floor: a zero interval would complete immediately on every
+/// Idle loop, spinning re-arm/fetch with no delay (CodeAnt, PR #257).
+/// Mirrors [`epoch_bump`]'s pend-when-absent shape (ZEB-425).
+async fn resync_tick(interval_ms: Option<u64>) {
+    match interval_ms {
+        Some(ms) if ms > 0 => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+        _ => std::future::pending().await,
     }
 }
 
@@ -319,18 +356,28 @@ const BACKFILL_DRIVER_MIN_WAIT_MS: u64 = 250;
 ///   loop.)
 /// - `shutdown_rx` flipping to `true` — or its sender dropping —
 ///   ends the driver promptly during a backoff wait.
-/// - `epoch_rx = None` preserves the legacy contract exactly:
-///   return-on-Idle, no parking (used by tests and any caller without
-///   a transport watch). With `Some`, a bump while Idle (or
-///   mid-backoff) re-arms via [`BackfillLatch::reset`] with a FRESH
-///   `current_watermark()` read — the verified log watermark at re-arm
-///   time, never the spawn-time one and never anything reply-derived,
-///   so a hostile holder can't have advanced it. Re-arm queries are
-///   deferred to [`EPOCH_REARM_COOLDOWN_MS`] since the last request —
-///   deferred, not dropped (same flap-storm guard as
+/// - `epoch_rx = None` with `resync_interval_ms = None` preserves the
+///   legacy contract exactly: return-on-Idle, no parking (used by tests
+///   and any caller without a transport watch). With `Some`, a bump while
+///   Idle (or mid-backoff) re-arms via [`BackfillLatch::reset`] with a
+///   FRESH `current_watermark()` read — the verified log watermark at
+///   re-arm time, never the spawn-time one and never anything
+///   reply-derived, so a hostile holder can't have advanced it. Re-arm
+///   queries are deferred to [`EPOCH_REARM_COOLDOWN_MS`] since the last
+///   request — deferred, not dropped (same flap-storm guard as
 ///   [`run_root_fetch_driver`], spec D7). If the epoch SENDER drops,
-///   the driver degrades to the `None` contract (keeps any backoff
-///   retries running; returns on Idle) instead of exiting mid-latch.
+///   the driver degrades to the no-epoch contract (keeps any backoff
+///   retries running; returns on Idle only if resync is also disabled)
+///   instead of exiting mid-latch.
+/// - `resync_interval_ms = Some(ms)` arms the ZEB-425 anti-entropy floor:
+///   a satisfied latch re-arms every `ms` even with NO epoch bump,
+///   re-reading the verified watermark exactly like the epoch path. It
+///   only acts when the edge-triggered re-arm never fires (router-only
+///   holders, late-matching queryables, same-zid reconnects). No cooldown
+///   — the interval is itself the rate limit (a re-armed latch with
+///   still-no-holders backs off via `WaitUntil`, never straight back to
+///   Idle, so the floor cannot storm). `None` disables it (production
+///   passes [`PERIODIC_RESYNC_FLOOR_MS`]).
 /// - `now_ms` injects the wall clock (dm_outhold_apply testability
 ///   precedent): production passes a `SystemTime`-based closure;
 ///   tests pair a `tokio::time::Instant`-based closure with paused
@@ -341,6 +388,7 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     current_watermark: Wm,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
+    resync_interval_ms: Option<u64>,
     now_ms: impl Fn() -> u64,
 ) where
     Rq: Fn(Option<Hlc>) -> RqFut,
@@ -357,7 +405,7 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
         }
         match latch.next_action(now_ms()) {
             BackfillAction::Idle => {
-                if epoch_rx.is_none() {
+                if epoch_rx.is_none() && !matches!(resync_interval_ms, Some(ms) if ms > 0) {
                     return;
                 }
                 tokio::select! {
@@ -365,14 +413,23 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         if !bumped {
                             // Epoch sender dropped: degrade to no-epoch
                             // mode rather than abandoning the latch —
-                            // backoff/shutdown flow continues; Idle
-                            // then returns (legacy contract).
+                            // backoff/shutdown flow continues; Idle then
+                            // returns unless the resync floor still parks it.
                             epoch_rx = None;
                             continue;
                         }
                         if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
                             return;
                         }
+                        latch.reset(current_watermark().await);
+                    }
+                    _ = resync_tick(resync_interval_ms) => {
+                        // ZEB-425 anti-entropy floor: re-arm regardless of
+                        // epoch bumps, re-reading the verified watermark
+                        // exactly like the epoch path. No cooldown — see the
+                        // `resync_interval_ms` doc (the interval is the rate
+                        // limit; a re-armed no-holder latch backs off via
+                        // WaitUntil, never straight back to Idle).
                         latch.reset(current_watermark().await);
                     }
                     changed = shutdown_rx.changed() => {
@@ -578,13 +635,22 @@ impl Default for RootFetchLatch {
 /// - `request_root()` issues one state-root query and resolves to a
 ///   [`RootFetch`]. Reply payloads travel through the engine's normal
 ///   inbound path; the driver only sees counts.
-/// - `epoch_rx = None` preserves return-on-Idle (used by tests and any
-///   caller without a transport watch).
+/// - `epoch_rx = None` with `resync_interval_ms = None` preserves
+///   return-on-Idle (used by tests and any caller without a transport
+///   watch).
 /// - Re-arm queries are deferred to [`EPOCH_REARM_COOLDOWN_MS`] since
 ///   the last request — deferred, not dropped (spec D7). If the epoch
-///   SENDER drops, the driver degrades to the `None` contract (keeps
-///   any backoff retries running; returns on Idle) instead of exiting
-///   mid-latch.
+///   SENDER drops, the driver degrades to the no-epoch contract (keeps
+///   any backoff retries running; returns on Idle only if resync is also
+///   disabled) instead of exiting mid-latch.
+/// - `resync_interval_ms = Some(ms)` arms the ZEB-425 anti-entropy floor:
+///   a satisfied latch re-arms (`reset()`) every `ms` even with NO epoch
+///   bump, covering holders the never-seen-zid signal misses (router-only
+///   peers, late-matching queryables, same-zid reconnects). No cooldown —
+///   the interval is the rate limit (a re-armed no-responder latch backs
+///   off via `WaitUntil`, never straight back to Idle, so it cannot
+///   storm). `None` disables it (production passes
+///   [`PERIODIC_RESYNC_FLOOR_MS`]).
 /// - `now_ms` injects the wall clock (paused-time testability — same
 ///   precedent as `run_backfill_driver`).
 pub async fn run_root_fetch_driver<Rq, RqFut>(
@@ -592,6 +658,7 @@ pub async fn run_root_fetch_driver<Rq, RqFut>(
     request_root: Rq,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
+    resync_interval_ms: Option<u64>,
     now_ms: impl Fn() -> u64,
 ) where
     Rq: Fn() -> RqFut,
@@ -604,7 +671,7 @@ pub async fn run_root_fetch_driver<Rq, RqFut>(
         }
         match latch.next_action(now_ms()) {
             RootFetchAction::Idle => {
-                if epoch_rx.is_none() {
+                if epoch_rx.is_none() && !matches!(resync_interval_ms, Some(ms) if ms > 0) {
                     return;
                 }
                 tokio::select! {
@@ -612,14 +679,22 @@ pub async fn run_root_fetch_driver<Rq, RqFut>(
                         if !bumped {
                             // Epoch sender dropped: degrade to no-epoch
                             // mode rather than abandoning the latch —
-                            // backoff/shutdown flow continues; Idle
-                            // then returns (legacy contract).
+                            // backoff/shutdown flow continues; Idle then
+                            // returns unless the resync floor still parks it.
                             epoch_rx = None;
                             continue;
                         }
                         if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
                             return;
                         }
+                        latch.reset();
+                    }
+                    _ = resync_tick(resync_interval_ms) => {
+                        // ZEB-425 anti-entropy floor: re-arm regardless of
+                        // epoch bumps. No cooldown — see the
+                        // `resync_interval_ms` doc (the interval is the rate
+                        // limit; a re-armed no-responder latch backs off via
+                        // WaitUntil, never straight back to Idle).
                         latch.reset();
                     }
                     changed = shutdown_rx.changed() => {
@@ -957,6 +1032,7 @@ mod tests {
             || async { None::<Hlc> },
             shutdown_rx,
             None,
+            None,
             move || start.elapsed().as_millis() as u64,
         )
         .await;
@@ -1013,6 +1089,7 @@ mod tests {
             current_watermark,
             shutdown_rx,
             None,
+            None,
             move || start.elapsed().as_millis() as u64,
         )
         .await;
@@ -1055,6 +1132,7 @@ mod tests {
             request_page,
             || async { None::<Hlc> },
             shutdown_rx,
+            None,
             None,
             move || start.elapsed().as_millis() as u64,
         ));
@@ -1101,6 +1179,7 @@ mod tests {
             || async { None::<Hlc> },
             shutdown_rx,
             None,
+            None,
             move || start.elapsed().as_millis() as u64,
         ));
         while requests.load(Ordering::SeqCst) < 1 {
@@ -1146,6 +1225,7 @@ mod tests {
             request_page,
             || async { None::<Hlc> },
             shutdown_rx,
+            None,
             None,
             move || start.elapsed().as_millis() as u64,
         )
@@ -1194,6 +1274,7 @@ mod tests {
             || async { Some(hlc(200)) },
             shutdown_rx,
             Some(epoch_rx),
+            None,
             move || start.elapsed().as_millis() as u64,
         ));
         while requests.load(Ordering::SeqCst) < 1 {
@@ -1241,6 +1322,7 @@ mod tests {
             || async { None },
             shutdown_rx,
             Some(epoch_rx),
+            None,
             move || start.elapsed().as_millis() as u64,
         ));
         // Request #1 fires (NoReply) and the driver enters its backoff.
@@ -1422,6 +1504,7 @@ mod tests {
             request_root,
             shutdown_rx,
             Some(epoch_rx),
+            None,
             move || start.elapsed().as_millis() as u64,
         ));
         // Request #1 fires at spawn (no sleep involved) — yield until
@@ -1468,6 +1551,7 @@ mod tests {
             request_root,
             shutdown_rx,
             None,
+            None,
             move || start.elapsed().as_millis() as u64,
         )
         .await;
@@ -1493,6 +1577,7 @@ mod tests {
             request_root,
             shutdown_rx,
             Some(epoch_rx),
+            None,
             move || start.elapsed().as_millis() as u64,
         ));
         // Wait deterministically until the request has been answered,
@@ -1527,6 +1612,7 @@ mod tests {
             request_root,
             shutdown_rx,
             Some(epoch_rx),
+            None,
             move || start.elapsed().as_millis() as u64,
         )
         .await;
@@ -1556,6 +1642,7 @@ mod tests {
             request_root,
             shutdown_rx,
             Some(epoch_rx),
+            None,
             move || start.elapsed().as_millis() as u64,
         ));
         // Wait for request #1 to fire.
@@ -1599,6 +1686,7 @@ mod tests {
             request_root,
             shutdown_rx,
             Some(epoch_rx),
+            None,
             move || start.elapsed().as_millis() as u64,
         ));
         // Request #1 fires (NoReply) and the driver enters its 30s backoff.
@@ -1666,6 +1754,7 @@ mod tests {
             request_root,
             shutdown_rx,
             Some(epoch_rx),
+            None,
             move || start.elapsed().as_millis() as u64,
         ));
         // Wait for request #1 (answered → satisfied). `last_request_at`
@@ -1704,5 +1793,218 @@ mod tests {
         }
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         driver.abort();
+    }
+
+    // ── ZEB-425: periodic re-sync anti-entropy floor ─────────────────
+
+    /// With NO epoch bump, a satisfied channel-backfill latch must still
+    /// re-arm on the periodic floor — and a re-armed latch that finds no
+    /// holder must back off (never storm straight back into Idle).
+    #[tokio::test(start_paused = true)]
+    async fn backfill_periodic_resync_fires_then_backs_off_no_storm() {
+        const RESYNC_MS: u64 = 200_000;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        // Req #1: clean empty page → satisfied (parks on Idle).
+        // Req #2 (the periodic re-arm) onward: no holder → NoReply →
+        // backoff.
+        let request_page = move |_since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    PageFetch::Completed(0, 256)
+                } else {
+                    PageFetch::NoReply
+                }
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        // epoch_rx = None: the ONLY thing that can re-arm a satisfied
+        // latch here is the periodic floor.
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            || async { None::<Hlc> },
+            shutdown_rx,
+            None,
+            Some(RESYNC_MS),
+            move || start.elapsed().as_millis() as u64,
+        ));
+        // Req #1 fires + satisfies → driver parks (resync keeps it alive
+        // despite epoch_rx = None).
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !driver.is_finished(),
+            "resync-enabled driver must park on Idle, not return"
+        );
+        // Just shy of the floor: no re-arm yet.
+        tokio::time::advance(Duration::from_millis(RESYNC_MS - 1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "periodic re-arm must not fire before the interval elapses"
+        );
+        // Cross the floor: re-arm fires req #2 (NoReply → backoff).
+        tokio::time::advance(Duration::from_millis(2)).await;
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        // No storm: req #2 got NoReply, so the latch is now backing off
+        // (30 s), NOT immediately re-Idle. A third request must wait out
+        // the backoff, not fire instantly.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "a re-armed no-holder latch must back off, not storm"
+        );
+        tokio::time::advance(Duration::from_millis(BACKFILL_RETRY_BASE_MS + 1)).await;
+        while requests.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        driver.abort();
+    }
+
+    /// With NO epoch bump, a satisfied root-fetch latch (community or mail
+    /// root, both `run_root_fetch_driver`) must still re-arm on the floor.
+    #[tokio::test(start_paused = true)]
+    async fn root_fetch_periodic_resync_refetches_when_no_epoch_bump() {
+        const RESYNC_MS: u64 = 200_000;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        // Every request is answered → satisfied → parks each round.
+        let request_root = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                RootFetch::Answered
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_root_fetch_driver(
+            RootFetchLatch::new(),
+            request_root,
+            shutdown_rx,
+            None,            // no epoch watch
+            Some(RESYNC_MS), // periodic floor is the only re-arm
+            move || start.elapsed().as_millis() as u64,
+        ));
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !driver.is_finished(),
+            "resync-enabled root driver must park on Idle, not return"
+        );
+        tokio::time::advance(Duration::from_millis(RESYNC_MS - 1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "root re-arm must not fire before the interval elapses"
+        );
+        tokio::time::advance(Duration::from_millis(2)).await;
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        driver.abort();
+    }
+
+    /// Shutdown must end the driver promptly even while it is parked on
+    /// the periodic-resync floor (no epoch watch) — not block for the
+    /// full interval.
+    #[tokio::test(start_paused = true)]
+    async fn backfill_resync_enabled_stops_on_shutdown_while_parked() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_page = move |_since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                PageFetch::Completed(0, 256) // satisfied → parks
+            }
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            || async { None::<Hlc> },
+            shutdown_rx,
+            None,
+            Some(PERIODIC_RESYNC_FLOOR_MS), // the real 1 h floor
+            move || start.elapsed().as_millis() as u64,
+        ));
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!driver.is_finished(), "must park on the resync floor");
+        // Shutdown while parked — must win against the 1 h resync sleep.
+        shutdown_tx.send(true).expect("send shutdown");
+        driver.await.expect("driver task");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "no re-arm may fire once shutdown is signaled"
+        );
+    }
+
+    /// `Some(0)` must behave exactly like `None` (disabled): the driver
+    /// returns on Idle instead of spinning the resync arm with no delay
+    /// (CodeAnt PR #257 — a zero interval would hot-loop re-arm/fetch).
+    #[tokio::test(start_paused = true)]
+    async fn resync_zero_interval_is_disabled_returns_on_idle() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_page = move |_since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                PageFetch::Completed(0, 256) // satisfied
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        // epoch None + resync Some(0): 0 == disabled → return on Idle.
+        // If 0 were honored as an interval this future would never
+        // complete (hot loop / park), hanging the test.
+        run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            || async { None::<Hlc> },
+            shutdown_rx,
+            None,
+            Some(0),
+            move || start.elapsed().as_millis() as u64,
+        )
+        .await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "Some(0) must be disabled: one request, then return on Idle (no spin)"
+        );
     }
 }

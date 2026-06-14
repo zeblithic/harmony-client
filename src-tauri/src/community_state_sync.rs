@@ -4679,6 +4679,11 @@ impl CommunitySyncRegistry {
                 request_root,
                 driver_shutdown_rx,
                 transport_epoch_rx,
+                // ZEB-425: anti-entropy floor — re-arm the community root
+                // fetch ~hourly (jittered per driver to avoid a startup
+                // thundering herd) even with no epoch bump (router-only
+                // gateways / late queryables / same-zid reconnects).
+                Some(crate::channel_backfill::periodic_resync_interval_ms()),
                 || {
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -6783,6 +6788,10 @@ mod tests {
                 RootFetchLatch::new(),
                 request_root.clone(),
                 shutdown_rx,
+                None,
+                // resync disabled (epoch None too): the driver must return
+                // on Idle once satisfied, as this test's 30 s timeout
+                // assumes.
                 None,
                 // Real wall clock is fine — the driver satisfies on the
                 // first request; no backoff sleeps on the happy path.
