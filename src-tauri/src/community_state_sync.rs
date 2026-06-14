@@ -1701,14 +1701,16 @@ impl CommunitySyncEngine {
             .map_err(|_| CommunitySyncError::TransportClosed)?
     }
 
-    /// ZEB-462 B: durably persist the community CRDT to disk NOW, WITHOUT
-    /// publishing. Routes through the single-writer task so it cannot race the
-    /// debounced persist. Used by the redeem path to fence the just-inserted
-    /// membership (admin bootstrap + self Join) on join-commit, so a crash
-    /// before the next debounce can't lose it. Returns once `crdt.cbor` (+ the
-    /// current replay tracker) is on disk. Does NOT publish and does NOT clear
-    /// the dirty bit — a pending state-root publish still fires on the next
-    /// debounce.
+    /// ZEB-462 B: durably persist the community membership CRDT to disk NOW,
+    /// WITHOUT publishing. Routes through the single-writer task so it cannot
+    /// race the debounced persist. Used by the redeem path to fence the
+    /// just-inserted membership (admin bootstrap + self Join) on join-commit,
+    /// so a crash before the next debounce can't lose it. CRDT-ONLY: writes
+    /// `crdt.cbor` but NOT `replay.cbor` — fencing the tracker here could
+    /// durably record an unpublished `next_hlc` advance left in memory by a
+    /// prior failed publish (Cursor / CodeRabbit PR #253). Does NOT publish and
+    /// does NOT clear the dirty bit — a pending state-root publish still fires
+    /// on the next debounce.
     pub async fn persist_now(&self) -> Result<(), CommunitySyncError> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.persist_now_tx
@@ -2347,11 +2349,15 @@ async fn internal_task(mut ctx: InternalCtx) {
                 // recording next_hlc's advance after a failed publish would
                 // make a restart skip the retry and leave the community
                 // out-of-sync until clock-time passes the unpersisted HLC, so
-                // on failure we leave the on-disk tracker un-advanced (the
-                // dirty bit was restored above, so the next debounce retries
-                // the publish). Errors are logged + swallowed (the debounce
-                // wakeup has no caller to surface a Result to; dropping the
-                // loop on a transient disk error would silently disable sync).
+                // on failure we leave the on-disk tracker un-advanced. The
+                // dirty bit was restored above, so the next publish OPPORTUNITY
+                // retries it — a later mutation's debounce (mutations re-arm the
+                // timer via notify_dirty), flush_now, or shutdown — note that
+                // restoring the bit alone does NOT re-arm this debounce timer
+                // (next_wakeup was cleared), so the retry waits for one of those
+                // triggers. Errors are logged + swallowed (the debounce wakeup
+                // has no caller to surface a Result to; dropping the loop on a
+                // transient disk error would silently disable sync).
                 let persist_result = if pub_result.is_ok() {
                     persist_both(&ctx).await
                 } else {
@@ -2397,12 +2403,19 @@ async fn internal_task(mut ctx: InternalCtx) {
             }
             Some(resp_tx) = ctx.persist_now_rx.recv() => {
                 // ZEB-462 B: publish-INDEPENDENT durable persist (join-commit
-                // fence). `persist_both` checkpoints crdt.cbor + the current
-                // replay tracker WITHOUT a publish — no `next_hlc` advance, so
-                // there is no unpublished-HLC concern. Deliberately does NOT
-                // touch `has_pending_dirty`: any pending state-root publish
-                // still fires on the next debounce / flush_now.
-                let persist_result = persist_both(&ctx).await;
+                // fence). CRDT-ONLY by design (Cursor / CodeRabbit PR #253): a
+                // prior failed debounce/flush publish advances `ctx.tracker`
+                // in-memory via `next_hlc` while `persist_crdt_only` deliberately
+                // leaves the on-disk tracker un-advanced. `persist_both` here
+                // would fence that UNPUBLISHED advance to `replay.cbor`, undoing
+                // the failure split and skipping the publish retry after a
+                // restart. The fence only needs the membership CRDT durable;
+                // `replay.cbor` is persisted by the receive arm (accepted
+                // inbound) and the publish arms (on confirmed publish), never by
+                // this fence. Deliberately does NOT touch `has_pending_dirty`:
+                // any pending state-root publish still fires on the next
+                // debounce / flush_now.
+                let persist_result = persist_crdt_only(&ctx).await;
                 let _ = resp_tx.send(persist_result);
             }
             maybe_bytes = ctx.subscriber_rx.recv(), if !inbound_closed => {
@@ -5473,11 +5486,12 @@ mod tests {
     async fn persist_now_fences_crdt_without_publishing_zeb462() {
         let fix = build_test_fixture().await;
         let community_id = SpaceId([0xd1; 16]);
-        let crdt_path = fix
+        let community_dir = fix
             .identity_dir
             .join("communities")
-            .join(hex::encode(community_id.0))
-            .join("crdt.cbor");
+            .join(hex::encode(community_id.0));
+        let crdt_path = community_dir.join("crdt.cbor");
+        let replay_path = community_dir.join("replay.cbor");
 
         let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -5516,6 +5530,14 @@ mod tests {
         assert!(
             loaded.events.contains_key(&eid),
             "persist_now must durably write the in-memory membership event"
+        );
+        // CRDT-ONLY regression (Cursor / CodeRabbit PR #253): persist_now must
+        // NOT write replay.cbor — fencing the tracker here could durably record
+        // an unpublished next_hlc advance left in memory by a failed publish.
+        // `persist_both` would create replay.cbor; `persist_crdt_only` does not.
+        assert!(
+            !replay_path.exists(),
+            "persist_now must be CRDT-only — it must not fence the replay tracker"
         );
 
         engine.shutdown().await.ok();
