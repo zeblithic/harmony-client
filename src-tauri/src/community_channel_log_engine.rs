@@ -1823,6 +1823,10 @@ impl ChannelLogRegistry {
             // ZEB-434 Task 7: park-on-Idle + re-arm on transport-epoch
             // bumps (None preserves the legacy return-on-Idle path).
             self.config.transport_epoch_rx.clone(),
+            // ZEB-425: anti-entropy floor — re-arm hourly even with no
+            // epoch bump (router-only holders / late queryables / same-zid
+            // reconnects the never-seen-zid signal misses).
+            Some(crate::channel_backfill::PERIODIC_RESYNC_FLOOR_MS),
             || {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

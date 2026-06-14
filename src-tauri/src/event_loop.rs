@@ -2833,6 +2833,10 @@ pub async fn run(
                 request_root,
                 mail_shutdown_rx,
                 epoch_rx_mail,
+                // ZEB-425: anti-entropy floor — re-arm the mail-root fetch
+                // hourly even with no epoch bump (router-only gateways /
+                // late queryables / same-zid reconnects).
+                Some(crate::channel_backfill::PERIODIC_RESYNC_FLOOR_MS),
                 || {
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
