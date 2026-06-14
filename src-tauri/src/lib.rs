@@ -1110,6 +1110,14 @@ pub struct NodeState {
     /// outcomes. `Some` once `start_node_inner` constructs it (after iroh
     /// boots); `None` on a default NodeState or after `clear_iroh_handles`.
     pub dial_telemetry: Option<std::sync::Arc<crate::network_health::DialTelemetry>>,
+    /// ZEB-450: set at boot when the iroh transport could NOT be brought up this
+    /// session — key load/create failed (e.g. keychain disabled with no
+    /// `HARMONY_PASSPHRASE`), or the endpoint bind failed. Carries the loud,
+    /// actionable reason so `network_health_snapshot` can stamp it onto the
+    /// snapshot and the UI shows a persistent "this node can't network" banner
+    /// instead of the failure living only in a boot log line. `None` when
+    /// transport is up (the common case) or on a default/cleared NodeState.
+    pub transport_disabled_reason: Option<String>,
     /// ZEB-321 Phase 1 Task 8: `force_handle` of the publisher's `Notify`,
     /// stashed here so the `connectivity_force_republish` IPC (Task 9) can
     /// wake the publisher loop without holding the whole publisher Arc.
@@ -1272,6 +1280,9 @@ impl NodeState {
         // ZEB-373: drop the shared dial telemetry so a restart rebuilds a
         // fresh Arc shared between the new driver and new NetworkHealthService.
         self.dial_telemetry = None;
+        // ZEB-450: clear the stale transport-disabled reason so a restart
+        // re-derives it from the fresh boot (a recovered keychain clears it).
+        self.transport_disabled_reason = None;
         self.iroh_publisher_force = None;
         // ZEB-323 Phase 2b: abort the pkarr publisher task and drop Arcs.
         if let Some(h) = self.pkarr_publisher_handle.take() {
@@ -1482,6 +1493,8 @@ impl Default for NodeState {
             reachability_resolver: None,
             // ZEB-373: shared dial telemetry stays None until start_node wires it.
             dial_telemetry: None,
+            // ZEB-450: no transport-disabled reason until a boot sets one.
+            transport_disabled_reason: None,
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
             iroh_accept_handle: None,
@@ -3503,6 +3516,11 @@ pub async fn start_node_inner(
         // `NetworkHealthService`'s `ProdDialSnapshot` (constructed in the
         // install block). The driver writes; the snapshot reads.
         let dial_telemetry = std::sync::Arc::new(crate::network_health::DialTelemetry::new());
+        // ZEB-450: set in the boot Err arms below when the iroh transport can't
+        // come up this session, then stashed into NodeState so the
+        // `network_health_snapshot` IPC surfaces it as a UI banner — instead of
+        // the failure living only in the `tracing::warn!` log lines.
+        let mut transport_disabled_reason: Option<String> = None;
         {
             reachability_resolver = crate::reachability_resolver::ReachabilityResolver::new();
             match crate::iroh_endpoint::load_or_create_secret_key() {
@@ -3563,6 +3581,11 @@ pub async fn start_node_inner(
                                 error = %e,
                                 "iroh endpoint bind failed; ZEB-321 transport disabled this session",
                             );
+                            // ZEB-450: surface the bind failure to the UI.
+                            transport_disabled_reason = Some(format!(
+                                "iroh transport unavailable this session \
+                                 (endpoint bind failed): {e}"
+                            ));
                             iroh_endpoint_arc = None;
                             iroh_handles_for_loop = None;
                         }
@@ -3574,6 +3597,12 @@ pub async fn start_node_inner(
                         "iroh secret key load/create failed; \
                          ZEB-321 transport disabled this session",
                     );
+                    // ZEB-450: `e` already carries the actionable remediation for
+                    // the keychain-disabled / no-passphrase case (set
+                    // HARMONY_PASSPHRASE[_FILE]; see docs/headless-install.md);
+                    // surface it to the UI rather than burying it in the log.
+                    transport_disabled_reason =
+                        Some(format!("iroh transport unavailable this session: {e}"));
                     iroh_endpoint_arc = None;
                     iroh_handles_for_loop = None;
                 }
@@ -7973,6 +8002,11 @@ pub async fn start_node_inner(
                         // production ProdDialSnapshot below reads the SAME
                         // counters the event-loop dial driver writes.
                         guard.dial_telemetry = Some(std::sync::Arc::clone(&dial_telemetry));
+                        // ZEB-450: stash the boot-time transport-disabled reason
+                        // (Some only when iroh failed to come up above) so the
+                        // `network_health_snapshot` IPC can surface it as a UI
+                        // banner. `.take()` — this is the single owner.
+                        guard.transport_disabled_reason = transport_disabled_reason.take();
                         guard.iroh_publisher_force =
                             iroh_publisher_arc.as_ref().map(|p| p.force_handle());
                         // ZEB-321 Phase 1 PR #157 round 1 + round 4
@@ -43147,7 +43181,7 @@ async fn network_health_snapshot(
 pub(crate) async fn network_health_snapshot_impl(
     state: &std::sync::Mutex<NodeState>,
 ) -> Result<crate::network_health::NetworkHealthSnapshot, String> {
-    let (svc, settings_path, relay_client) = {
+    let (svc, settings_path, relay_client, transport_disabled_reason) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -43155,6 +43189,8 @@ pub(crate) async fn network_health_snapshot_impl(
             g.network_health.clone(),
             g.pkarr_settings_path.clone(),
             g.pkarr_relay_client.clone(),
+            // ZEB-450: surface a boot-time transport failure to the UI.
+            g.transport_disabled_reason.clone(),
         )
     };
     let snap = match svc {
@@ -43178,7 +43214,12 @@ pub(crate) async fn network_health_snapshot_impl(
             snap
         }
     };
-    Ok(snap)
+    // ZEB-450: stamp the boot-time transport-disabled reason onto BOTH paths
+    // (live service = always None; service-absent/disabled = the actual reason).
+    Ok(crate::network_health::stamp_transport_status(
+        snap,
+        transport_disabled_reason,
+    ))
 }
 
 /// Spec §5.3 + §6.1. Returns Err only on truly exceptional cases
@@ -47503,6 +47544,8 @@ mod start_node_race_tests {
             reachability_resolver: None,
             // ZEB-373: dial telemetry unused in race tests.
             dial_telemetry: None,
+            // ZEB-450: transport-disabled reason unused in race tests.
+            transport_disabled_reason: None,
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
             iroh_accept_handle: None,
