@@ -348,43 +348,50 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     };
 
     // Deterministically wait until A's session has discovered and matched B's
-    // channel subscriber before publishing, rather than a fixed sleep that races
-    // CI scheduling. The two engines run on separate loopback zenoh sessions, so
-    // publisher↔subscriber matching depends on inter-session discovery — the
-    // contention-sensitive step. A fixed 1s wait flaked under full-suite CI load
-    // (ZEB-459): A's first burst published before B's subscriber was matched, and
-    // those messages were lost on the live path (the live wire does not replay),
-    // stalling the first drain checkpoint until the 30s ceiling. Polling the
-    // publisher's matching status proceeds exactly when A can reach B's
-    // subscriber, at any CI speed.
+    // REMOTE channel subscriber before publishing, rather than a fixed sleep that
+    // races CI scheduling. The two engines run on separate loopback zenoh
+    // sessions, so matching B's subscriber depends on inter-session discovery —
+    // the contention-sensitive step. A fixed 1s wait flaked under full-suite CI
+    // load (ZEB-459): A's first burst published before B's subscriber was
+    // matched, and those messages were lost on the live path (the live wire does
+    // not replay), stalling the first drain checkpoint until its 30s ceiling.
+    //
+    // `Locality::Remote` is load-bearing: A's own channel-log adapter also
+    // declares a subscriber on this key on `session_a` (event_loop.rs), so a
+    // default (`Any`) matching check would be satisfied by A's *local* subscriber
+    // and pass before B was reachable — reintroducing the race. Restricting to
+    // remote subscribers waits for B specifically. `matching_status` reads the
+    // session's routing tables (no network round-trip), so an `Err` means a real
+    // session failure — surface it loudly rather than masking it as a timeout.
     let readiness_topic = format!(
         "harmony/channels/{}/{}/events",
         hex::encode(community_id.0),
         hex::encode(channel_id.0)
     );
-    let readiness_pub = Arc::new(
-        session_a
-            .declare_publisher(
-                zenoh::key_expr::KeyExpr::try_from(readiness_topic).expect("readiness topic key"),
-            )
+    let readiness_pub = session_a
+        .declare_publisher(
+            zenoh::key_expr::KeyExpr::try_from(readiness_topic).expect("readiness topic key"),
+        )
+        .allowed_destination(zenoh::sample::Locality::Remote)
+        .await
+        .expect("declare readiness publisher");
+    let readiness_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let matched = readiness_pub
+            .matching_status()
             .await
-            .expect("declare readiness publisher"),
-    );
-    wait_until(
-        || {
-            let readiness_pub = Arc::clone(&readiness_pub);
-            async move {
-                readiness_pub
-                    .matching_status()
-                    .await
-                    .map(|s| s.matching())
-                    .unwrap_or(false)
-            }
-        },
-        Duration::from_secs(30),
-    )
-    .await
-    .expect("A must match B's channel subscriber before publishing (ZEB-459 live-wire readiness)");
+            .expect("matching_status query failed")
+            .matching();
+        if matched {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < readiness_deadline,
+            "A never matched B's remote channel subscriber within 30s \
+             (inter-session zenoh discovery did not complete — live wire not ready)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     // Brief settle so the matched route is fully installed before the first put.
     tokio::time::sleep(Duration::from_millis(250)).await;
 
