@@ -657,3 +657,105 @@ async fn s5_profile_card_propagation() {
     run.mark_success();
     drop((alice, bob, ah, bh));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S5b — clean-relaunch CONTROL for ZEB-468 (Ildwyn, 2026-06-14).
+//
+// S5 shows cards don't propagate co-located. ZEB-468 root-caused that to the
+// mint-driven node RESTART breaking Zenoh peering (deterministic-zid remap +
+// failed ZEB-373 re-peer dial + dead TCP accept loop). `two_minted_nodes` mints
+// (= restarts) both nodes, so every S5 run begins from that restart-poisoned
+// state.
+//
+// This control removes exactly that one variable: after minting, KILL both nodes
+// and re-spawn them with the SAME config. Each boots ALREADY-minted (identity
+// rehydrates from disk → no re-mint, no mint-restart) into a single clean Zenoh
+// session, and re-peers co-located via LAN multicast with NO lingering same-zid
+// session to collide with. Cards are owner-GLOBAL (`card_topic_for(owner_id)`,
+// not community-scoped), so no community join is needed — the ONLY variable under
+// test is whether a STABLE co-located mesh routes owner cards.
+//
+// EXPECTED (ZEB-468 hypothesis): converged=TRUE here, vs S5's FALSE → the restart
+// is the sole trigger and a healthy mesh routes cards fine. If this is ALSO false,
+// there is a second, deeper transport problem to chase. Characterized (not hard-
+// asserted) like S5 so the outcome is read from the eprintln either way.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s5b_clean_relaunch_card_propagation_control() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let (mut run, ah, bh, mut alice, mut bob) = two_minted_nodes("s5b").await;
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    // Clean relaunch: hard-kill both, then re-spawn with the SAME config so each
+    // rehydrates its minted identity from disk (no re-mint → no mint-restart, so a
+    // single fresh Zenoh session per process — none of S5's restart poisoning).
+    let a_cfg = alice.config.clone();
+    let b_cfg = bob.config.clone();
+    alice.kill().await.expect("kill alice");
+    bob.kill().await.expect("kill bob");
+    let alice = NodeHandle::spawn(a_cfg)
+        .await
+        .expect("respawn alice (already minted)");
+    let bob = NodeHandle::spawn(b_cfg)
+        .await
+        .expect("respawn bob (already minted)");
+
+    // Identity rehydrated, NOT re-minted: same owner ids, and this boot did not
+    // restart (mint is what restarts; we did not call it here).
+    assert_eq!(
+        owner_id(&alice).await,
+        alice_owner,
+        "alice rehydrates the same owner (no re-mint)"
+    );
+    assert_eq!(
+        owner_id(&bob).await,
+        bob_owner,
+        "bob rehydrates the same owner (no re-mint)"
+    );
+
+    const ALICE_CARD: &str = "Alice-clean";
+    const BOB_CARD: &str = "Bob-clean";
+
+    publish_card_until_ok(&alice, ALICE_CARD, "gm clean", Duration::from_secs(30))
+        .await
+        .expect("alice card publisher ready post-relaunch");
+    publish_card_until_ok(&bob, BOB_CARD, "gm clean", Duration::from_secs(30))
+        .await
+        .expect("bob card publisher ready post-relaunch");
+
+    let a_sub = subscribe_member_card(&alice, &bob_owner)
+        .await
+        .expect("alice subscribes to bob's card");
+    let b_sub = subscribe_member_card(&bob, &alice_owner)
+        .await
+        .expect("bob subscribes to alice's card");
+
+    // Give the clean sessions time to multicast-peer, re-publishing each tick (a
+    // Zenoh put is not retained for a late subscriber).
+    let converged = poll_until(Duration::from_secs(45), || async {
+        let _ = republish_owner_card(&alice, ALICE_CARD, "gm clean").await;
+        let _ = republish_owner_card(&bob, BOB_CARD, "gm clean").await;
+        let a_sees = cached_card_display_name(&alice, a_sub).await?;
+        let b_sees = cached_card_display_name(&bob, b_sub).await?;
+        Ok(
+            (a_sees.as_deref() == Some(BOB_CARD) && b_sees.as_deref() == Some(ALICE_CARD))
+                .then_some(()),
+        )
+    })
+    .await
+    .is_ok();
+    eprintln!(
+        "S5b clean-relaunch card propagation: converged={converged} \
+         (ZEB-468 hypothesis expects TRUE — a stable, non-restarted co-located mesh \
+         routes owner cards; contrast S5's FALSE post-mint-restart)."
+    );
+
+    unsubscribe_member_card(&alice, a_sub).await.ok();
+    unsubscribe_member_card(&bob, b_sub).await.ok();
+
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}
