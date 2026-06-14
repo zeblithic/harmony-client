@@ -99,7 +99,7 @@ the cross-node redeem until it reports success; transient
 4. **B:** relaunch `serve --profile e2e` (same profile/data-dir → rehydrates).
 5. **B:** poll `list_channels '{"communityId":"…"}'` until `channelId` appears. PASS = B caught up the offline-created channel. Post `DONE S3 PASS`.
 
-   > NOTE: this is the scenario that exercises **ongoing community-state sync** + **reconnect**, both of which fail between two co-located nodes (ZEB-462 A/B). The cross-machine run is the real validation. If it fails cross-machine too, that escalates ZEB-462 from a co-located limitation to a product bug.
+   > NOTE: this exercises **ongoing community-state sync** + **reconnect**. Both now work co-located — the automated `s3_offline_channel_reconnect_catchup` passes 3/3 after the ZEB-462 (B) durability fix + a harness key fix. The cross-machine run additionally proves **cross-WAN** re-peering, which the co-located harness cannot (ZEB-444).
 
 ## Artifacts on failure
 
@@ -113,13 +113,15 @@ Attach both machines' artifacts to the ZEB-447 issue (or the relevant finding is
 
 ## Reference
 
-- Single-machine harness + assertions (canonical): `e2e-harness/README.md`, `e2e-harness/tests/e2e_two_node.rs` (S1/S2 passing; S3/S4 `#[ignore]`'d with FINDING blocks).
+- Single-machine harness + assertions (canonical): `e2e-harness/README.md`, `e2e-harness/tests/e2e_two_node.rs` (S1–S4 passing; S3/S4 un-ignored after the ZEB-462 key-bug fix).
 - Spec: `docs/specs/2026-06-13-zeb-447-two-agent-e2e-suite-design.md`.
 
-## Known co-located limitations (why some scenarios are cross-machine-only)
+## Known co-located limitations (what the single-machine harness still can't prove)
 
-The single-machine harness surfaced these (all filed); they are the reason S3/S4 are `#[ignore]`'d there and must be proven cross-machine:
+- **ZEB-461** — 1:1 DM byte-delivery needs a DM transport (`OwnerDeviceCache`) that the Reticulum-disabled co-located harness can't populate. S2 asserts friendship + `send_dm` acceptance; byte-delivery is characterized, not asserted.
+- **Cross-WAN re-peering** — S3 proves co-located restart→reconnect→catch-up, but two co-located nodes share a host; it does NOT prove re-peering between two real LANs/WANs after a restart. That is the cross-machine run's unique job (ZEB-444).
 
-- **ZEB-461** — 1:1 DM byte-delivery needs a DM transport (`OwnerDeviceCache`) that the Reticulum-disabled co-located harness can't populate.
-- **ZEB-462 (A)** — ongoing community-state sync ("startup root query: no responder") doesn't establish between two co-located nodes; only first-contact/handshake-time state delivery works co-located. Likely a co-located transport-peering limitation (ongoing sync is proven across real machines, ZEB-330).
-- **ZEB-462 (B)** — a node's OWN community membership rehydrates as `Left` after a restart (confirmed single-node, even on graceful shutdown), dropping the community from `list_owner_communities`. A real durability bug — fix this and S3/S4 should pass.
+Resolved (no longer co-located limitations):
+
+- **ZEB-462 (A)** "ongoing co-located sync never establishes / no-responder re-peering" — a NON-bug: an artifact of a harness assertion checking the wrong JSON key (`id` vs camelCase `channelId`). With the key fixed, co-located ongoing sync + offline→restart→catch-up pass (S3, proven 3/3).
+- **ZEB-462 (B)** "own membership rehydrates as `Left`" — the real two-node admin-as-`Left` publish-gate durability bug was fixed (#253). The single-node "rehydrates as `Left`" symptom was the same wrong-key artifact (`id` vs `spaceId`); S4 passes.

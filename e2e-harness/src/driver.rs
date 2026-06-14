@@ -301,7 +301,10 @@ pub async fn channels_contains(
     Ok(list_channels(node, community_id)
         .await?
         .iter()
-        .any(|c| c.get("id").and_then(Value::as_str) == Some(channel_id)))
+        // `ChannelInfoDto` is `#[serde(rename_all = "camelCase")]`, so the id
+        // field serializes as `channelId` (NOT `id`). Checking the wrong key
+        // makes this silently always-false → poll_until always times out.
+        .any(|c| c.get("channelId").and_then(Value::as_str) == Some(channel_id)))
 }
 
 pub async fn post_channel_message(

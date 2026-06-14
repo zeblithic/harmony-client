@@ -39,17 +39,21 @@ machine** (two co-located nodes):
 |---|---|---|
 | `s1_invite_join_roster_convergence` | invite → iroh first-contact join → roster converges both ways | ✅ pass |
 | `s2_friend_graph_and_dm_send` | friend-token iroh handshake → friendship `active` both ways (ZEB-431 DM-picker graph) + `send_dm` accepted. (1:1 DM byte-**delivery** is characterized, not asserted — co-located gap ZEB-461.) | ✅ pass |
-| `s3_offline_channel_reconnect_catchup` | channel created while peer offline → reconnect catch-up (ZEB-434) | ⏸ `#[ignore]` — ZEB-462 |
-| `s4_restart_durability` | single-node community survives a restart (ZEB-393) | ⏸ `#[ignore]` — ZEB-462 (B) |
+| `s3_offline_channel_reconnect_catchup` | channel created while peer offline → reconnect catch-up (ZEB-434) | ✅ pass |
+| `s4_restart_durability` | single-node community survives a restart (ZEB-393) | ✅ pass |
 
-The single-machine harness reliably validates **first-contact + join/handshake-
-time state** (S1, S2). It cannot validate **ongoing community-state sync**, **1:1
-DM byte-delivery**, or **restart catch-up** between two co-located nodes — those
-ride the cross-machine playbook (`docs/playbooks/e2e-two-agent-suite.md`). The
-`#[ignore]`'d tests carry FINDING blocks; the gaps are filed as **ZEB-461** (DM
-delivery) and **ZEB-462** (co-located ongoing sync + restart membership
-rehydration). Run an ignored scenario explicitly with
-`cargo test --features e2e -- --ignored s3_offline`.
+The single-machine harness validates **first-contact + join/handshake-time state**
+(S1, S2), **single-node restart durability** (S4), and **co-located ongoing
+community-state sync + offline→restart→catch-up** (S3). S3/S4 were previously
+`#[ignore]`'d "blocked by ZEB-462", but that was a harness bug — the assertions
+checked `c.get("id")` while the DTOs are camelCase (`channelId` / `spaceId`), so
+they always timed out and *looked* like a sync failure. With the keys corrected
+and the ZEB-462 (B) membership-CRDT durability fix on main (#253), both pass
+reliably (S3 proven 3/3). The one remaining co-located gap is **1:1 DM
+byte-delivery** (ZEB-461, characterized not asserted). **Cross-WAN** reachability
+(two real machines / LANs) is still only exercised by the cross-machine playbook
+(`docs/playbooks/e2e-two-agent-suite.md`, ZEB-444) — a co-located pass does not
+prove cross-WAN re-peering.
 
 ## CI
 
