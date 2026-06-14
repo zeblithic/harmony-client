@@ -178,4 +178,36 @@ mod tests {
                 .join("coord")
         );
     }
+
+    /// ZEB-465: the `HARMONY_DATA_DIR` base override wins over the platform
+    /// base; without either, the same error `serve` printed on Windows when
+    /// `dirs::data_dir()` returned None (which ignores the APPDATA override).
+    #[test]
+    fn resolve_app_data_dir_override_wins_else_platform_else_errors() {
+        use std::path::PathBuf;
+        // Override present: used as the base, with profile nesting applied.
+        assert_eq!(
+            crate::resolve_app_data_dir_from(
+                Some(PathBuf::from("/run/tmp")),
+                Some(PathBuf::from("/real/appdata")),
+                Some("alice"),
+            )
+            .unwrap(),
+            PathBuf::from("/run/tmp")
+                .join("net.zeblith.harmony")
+                .join("profiles")
+                .join("alice"),
+        );
+        // No override: falls back to the platform base (production path).
+        assert_eq!(
+            crate::resolve_app_data_dir_from(None, Some(PathBuf::from("/real/appdata")), None)
+                .unwrap(),
+            PathBuf::from("/real/appdata").join("net.zeblith.harmony"),
+        );
+        // Neither resolvable: the exact error `serve` aborted with on Windows.
+        assert_eq!(
+            crate::resolve_app_data_dir_from(None, None, None).unwrap_err(),
+            "cannot resolve platform data dir",
+        );
+    }
 }

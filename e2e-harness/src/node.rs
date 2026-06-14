@@ -79,13 +79,18 @@ impl NodeHandle {
             .env("HOME", &config.home)
             // Windows identity dir uses USERPROFILE; keep both pointed at the temp root.
             .env("USERPROFILE", &config.home)
-            // App-data derives from XDG_DATA_HOME (Linux) / APPDATA (Windows); pin
-            // both UNDER the temp HOME so the node's `api/{port,token}` always land
-            // where `wait_for_api_dir` walks, even when the dev/CI env already sets
-            // them (CodeAnt/Qodo: data-dir not isolated). macOS uses Library under
-            // the overridden HOME and ignores XDG, so this is harmless there.
+            // App-data dir: pin it UNDER the temp HOME so the node's
+            // `api/{port,token}` always land where `wait_for_api_dir` walks, even
+            // when the dev/CI env already sets data-dir vars (CodeAnt/Qodo: data-dir
+            // not isolated). ZEB-465: the old `.env("APPDATA", …)` override was a
+            // NO-OP on Windows — `dirs::data_dir()` (v6) reads the Roaming AppData
+            // *known folder* via Win32, ignores `APPDATA`, and returned None in this
+            // stripped child env, so `serve` aborted at boot with "cannot resolve
+            // platform data dir". `HARMONY_DATA_DIR` is the deterministic cross-OS
+            // override the node honors before `dirs`; XDG_DATA_HOME stays as
+            // belt-and-braces for the Linux path (the override wins everywhere).
+            .env("HARMONY_DATA_DIR", config.home.join("data"))
             .env("XDG_DATA_HOME", config.home.join("xdg-data"))
-            .env("APPDATA", config.home.join("appdata"))
             .env("HARMONY_PASSPHRASE", &config.passphrase)
             .env("HARMONY_RETICULUM_PORT", "0")
             .env("HARMONY_API_PORT", "0")

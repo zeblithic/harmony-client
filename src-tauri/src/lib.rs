@@ -286,9 +286,34 @@ impl<R: tauri::Runtime> crate::iroh_friend_acceptor::FriendEventEmit for tauri::
 /// profile.
 /// Public for the serve path and the api_server integration test (ZEB-445).
 /// ZEB-446: profile-aware — named profiles nest under profiles/<name>.
+///
+/// ZEB-465: honors a `HARMONY_DATA_DIR` base override (used by tests and the
+/// e2e-harness to isolate a spawned node's data under a per-run temp dir).
+/// On Windows `dirs::data_dir()` (v6) resolves the Roaming AppData *known
+/// folder* via Win32 and ignores the `APPDATA` env var — so without this
+/// override a spawned `serve` node cannot be redirected at all (it aborted at
+/// boot with "cannot resolve platform data dir"). Production launches leave the
+/// env unset and resolve via `dirs` exactly as before.
 pub fn resolve_app_data_dir() -> Result<std::path::PathBuf, String> {
-    let base = dirs::data_dir().ok_or_else(|| "cannot resolve platform data dir".to_string())?;
-    Ok(app_data_dir_in(&base, crate::profile::active_profile()))
+    resolve_app_data_dir_from(
+        std::env::var_os("HARMONY_DATA_DIR").map(std::path::PathBuf::from),
+        dirs::data_dir(),
+        crate::profile::active_profile(),
+    )
+}
+
+/// Pure resolution for [`resolve_app_data_dir`]: the `HARMONY_DATA_DIR` base
+/// override wins; else the platform base (`dirs::data_dir()`); else an error.
+/// Profile nesting via [`app_data_dir_in`] is applied to whichever base wins.
+pub(crate) fn resolve_app_data_dir_from(
+    data_dir_override: Option<std::path::PathBuf>,
+    platform_base: Option<std::path::PathBuf>,
+    profile: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    let base = data_dir_override
+        .or(platform_base)
+        .ok_or_else(|| "cannot resolve platform data dir".to_string())?;
+    Ok(app_data_dir_in(&base, profile))
 }
 
 /// Pure join for [`resolve_app_data_dir`] (and app_tracing's log dir):
