@@ -83,6 +83,20 @@
     }
   }
 
+  // ZEB-450: manual re-check from the transport-disabled banner. Auto-retry is
+  // suppressed while transport is disabled (recovery needs a node restart, so
+  // polling the same dead session forever is wasteful), but the user still needs
+  // a way to pick up a recovery — e.g. after restarting the node with a keychain
+  // or HARMONY_PASSPHRASE set. If the re-check clears the reason but transport is
+  // still coming up (myNetwork absent), re-enter the normal startup polling so
+  // the view converges without further clicks. (Qodo: banner could otherwise
+  // stale if no network-health-changed event fires after recovery.)
+  async function recheckTransport(): Promise<void> {
+    startupRetryElapsedMs = 0;
+    await refresh();
+    if (!snap?.transportDisabledReason && !snap?.myNetwork) startStartupRetry();
+  }
+
   function startStartupRetry(): void {
     if (startupRetryHandle) return;
     startupRetryHandle = setInterval(async () => {
@@ -185,6 +199,9 @@
           <code>HARMONY_DISABLE_KEYCHAIN</code> on a real launch). See
           <code>docs/headless-install.md</code>.
         </p>
+        <button onclick={recheckTransport} data-testid="nh-transport-recheck">
+          Check again
+        </button>
       </section>
     {:else if !snap.myNetwork}
       <section class="starting-up" data-testid="nh-starting-up">

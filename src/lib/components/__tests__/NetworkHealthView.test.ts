@@ -274,4 +274,20 @@ describe('NetworkHealthView — transport-disabled banner (ZEB-450)', () => {
     await waitFor(() => screen.getByTestId('nh-starting-up'));
     expect(screen.queryByTestId('nh-transport-disabled')).toBeNull();
   });
+
+  it('offers a "Check again" button that re-fetches and clears the banner on recovery (Qodo)', async () => {
+    // Auto-retry is suppressed while disabled, so the banner must still give the
+    // user a way to pick up a recovery — otherwise the view can stale on the
+    // "can't network" state after a restart fixes transport.
+    mockInvoke
+      .mockResolvedValueOnce({ ...emptySnap(), transportDisabledReason: REASON }) // onMount: disabled
+      .mockResolvedValueOnce(readySnap()); // recheck: transport recovered
+    render(NetworkHealthView);
+
+    const btn = await screen.findByTestId('nh-transport-recheck');
+    await fireEvent.click(btn);
+
+    await waitFor(() => expect(screen.queryByTestId('nh-transport-disabled')).toBeNull());
+    expect(screen.getByTestId('nh-my-network')).toBeTruthy();
+  });
 });
