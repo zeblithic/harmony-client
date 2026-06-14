@@ -89,6 +89,16 @@ describe('incoming-call-queue (ZEB-364)', () => {
     expect(q.drain().map((e) => e.callId)).toEqual(['call-1']);
   });
 
+  it('size excludes canceled events so it matches what drain returns (Greptile)', () => {
+    const q = createIncomingCallQueue();
+    q.queue(ev(1));
+    q.queue(ev(2));
+    expect(q.size).toBe(2);
+    q.cancel('call-1');
+    expect(q.size).toBe(1); // the canceled event no longer counts
+    expect(q.drain().map((e) => e.callId)).toEqual(['call-2']);
+  });
+
   it('caps at 32 buffered events and drops the newest beyond the cap', () => {
     const q = createIncomingCallQueue();
     for (let i = 0; i < 40; i++) q.queue(ev(i));

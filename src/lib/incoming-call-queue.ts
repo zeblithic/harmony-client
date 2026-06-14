@@ -46,7 +46,11 @@ export interface IncomingCallQueue {
    * `cancel`ed, and clear the buffer (events + cancellations).
    */
   drain(): IncomingCallEvent[];
-  /** Number of currently-buffered events (for assertions / diagnostics). */
+  /**
+   * Number of buffered events that drain() would return — i.e. excluding any
+   * whose call was already canceled (for assertions / diagnostics). Kept in
+   * step with drain() so `size` never reports a phantom non-empty queue.
+   */
   readonly size: number;
 }
 
@@ -76,7 +80,10 @@ export function createIncomingCallQueue(): IncomingCallQueue {
       return out;
     },
     get size(): number {
-      return pending.length;
+      // Effective drainable count: exclude events whose call was canceled so
+      // `size` matches what drain() returns (Greptile) — otherwise a caller
+      // could see a non-empty queue that drains to nothing.
+      return pending.filter((e) => !canceled.has(e.callId)).length;
     },
   };
 }
