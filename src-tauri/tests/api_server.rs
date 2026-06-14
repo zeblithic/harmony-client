@@ -338,7 +338,16 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
         }),
     )
     .await;
-    assert_eq!(r.status(), 200, "post_channel_message must succeed");
+    // ZEB-467: capture the backend error body so a future flake pins WHY
+    // post_channel_message failed (the create→post channel-log engine race
+    // historically surfaced here as a bare 500). The body is otherwise
+    // unused — the next phase issues a fresh request.
+    let post_status = r.status();
+    let post_body = r.text().await.unwrap_or_default();
+    assert_eq!(
+        post_status, 200,
+        "post_channel_message must succeed; got {post_status} with body: {post_body}"
+    );
 
     // ── Phase 6i: list_channel_messages — exactly one message ───────────
     let r = rpc(

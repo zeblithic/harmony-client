@@ -4875,28 +4875,18 @@ pub async fn start_node_inner(
                                                         return;
                                                     }
                                                 };
-                                                let membership_key =
-                                                    community_engine.membership_key();
-                                                let key = crate::community_channel_log::derive_channel_key(
-                                                &membership_key,
-                                                &cid,
-                                                &chid,
-                                            );
-                                                let state_at_hlc =
-                                                    community_engine.state_at_hlc_resolver();
-                                                // ZEB-399: channel-log verify
-                                                // authenticates posts against
-                                                // materialized membership — no
-                                                // identity resolver needed.
-                                                match registry
-                                                    .spawn(
-                                                        cid,
-                                                        chid,
-                                                        key,
-                                                        state_at_hlc,
-                                                        hlc_tracker,
-                                                    )
-                                                    .await
+                                                // ZEB-467: shared with the
+                                                // eager spawn in
+                                                // create_channel_impl so the
+                                                // two paths cannot drift.
+                                                match crate::register_channel_log_engine(
+                                                    &registry,
+                                                    &community_engine,
+                                                    cid,
+                                                    chid,
+                                                    hlc_tracker,
+                                                )
+                                                .await
                                                 {
                                                     Ok(crate::community_channel_log_engine::SpawnOutcome::Spawned(_)) => {}
                                                     Ok(crate::community_channel_log_engine::SpawnOutcome::DeferredForCommit) => {
@@ -18118,6 +18108,47 @@ async fn create_channel(
     create_channel_impl(state_lock.inner(), community_id, name, write_power, kind).await
 }
 
+/// ZEB-467: register (spawn) the channel-log engine for `(community_id,
+/// channel_id)` from the community engine's current membership key +
+/// state-at-HLC resolver.
+///
+/// Shared by two call sites so they cannot drift:
+/// 1. `create_channel_impl`, which calls it **eagerly** before returning so
+///    a caller that posts immediately (the headless serve API, or
+///    `post_channel_message` right after `create_channel`) does not race the
+///    async community-delta consumer.
+/// 2. the community-delta consumer's `Created` hook (`run_community_delta_consumer`),
+///    which spawns the engine when a `ChannelCreate` materializes — locally
+///    (a beat after the eager spawn, a no-op) or for a remote channel.
+///
+/// Idempotent: `spawn` → `spawn_inner_now` returns the existing engine on a
+/// second call, so the eager and consumer-driven paths converge safely. The
+/// channel-log verifier authenticates posts against materialized membership
+/// (ZEB-399), so no identity resolver is threaded here.
+pub(crate) async fn register_channel_log_engine(
+    channel_log_registry: &std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
+    community_engine: &std::sync::Arc<crate::community_state_sync::CommunitySyncEngine>,
+    community_id: crate::owner_state_types::SpaceId,
+    channel_id: crate::community_membership::ChannelId,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+) -> Result<
+    crate::community_channel_log_engine::SpawnOutcome,
+    crate::community_channel_log_engine::ChannelLogEngineError,
+> {
+    let membership_key = community_engine.membership_key();
+    let key = crate::community_channel_log::derive_channel_key(
+        &membership_key,
+        &community_id,
+        &channel_id,
+    );
+    let state_at_hlc = community_engine.state_at_hlc_resolver();
+    channel_log_registry
+        .spawn(community_id, channel_id, key, state_at_hlc, hlc_tracker)
+        .await
+}
+
 /// ZEB-445: shared IPC/RPC seam.
 pub(crate) async fn create_channel_impl(
     state: &std::sync::Mutex<NodeState>,
@@ -18151,7 +18182,15 @@ pub(crate) async fn create_channel_impl(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+        channel_log_registry,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -18162,6 +18201,10 @@ pub(crate) async fn create_channel_impl(
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
+            // ZEB-467: Option — absent only before the node finishes
+            // standing up (the eager spawn below skips and the delta
+            // consumer covers it); present in steady state.
+            g.channel_log_registry.clone(),
         )
     };
 
@@ -18247,6 +18290,40 @@ pub(crate) async fn create_channel_impl(
         outcome,
         crate::community_state_crdt::InsertOutcome::Inserted
     ) {
+        // ZEB-467: eagerly register the channel-log engine for the new
+        // channel BEFORE returning, so a caller that posts immediately
+        // (the headless serve API, or `post_channel_message` right after
+        // this returns) finds the engine instead of racing the async
+        // community-delta consumer — which otherwise spawns it only after
+        // it processes the `Created` delta, intermittently 500-ing the
+        // first post with "no engine for {community}/{channel}". The spawn
+        // is idempotent with the consumer's later spawn, and steady-state
+        // channel creation runs outside any community transaction so it
+        // takes spawn's fast-path (never `DeferredForCommit`).
+        if let Some(channel_log_registry) = channel_log_registry {
+            if let Err(e) = register_channel_log_engine(
+                &channel_log_registry,
+                &engine_arc,
+                space_id,
+                channel_id,
+                hlc_tracker,
+            )
+            .await
+            {
+                // Non-fatal: the channel WAS created (its CRDT event is
+                // committed and replicates). The delta consumer still
+                // spawns the engine on the `Created` delta; the caller may
+                // just need to retry the first post. Log rather than mask a
+                // successful create.
+                tracing::warn!(
+                    community_id = %hex::encode(space_id.0),
+                    channel_id = %hex::encode(channel_id.0),
+                    error = ?e,
+                    "create_channel: eager channel-log engine spawn failed; \
+                     delta consumer will retry on the Created delta"
+                );
+            }
+        }
         Ok(hex::encode(channel_id.0))
     } else {
         Err(format!(
@@ -20417,18 +20494,16 @@ mod create_community_inner_tests {
                             Some(e) => e,
                             None => return,
                         };
-                        let membership_key = community_engine.membership_key();
-                        let key = crate::community_channel_log::derive_channel_key(
-                            &membership_key,
-                            &cid,
-                            &chid,
-                        );
-                        let state_at_hlc = community_engine.state_at_hlc_resolver();
-                        // ZEB-399: channel-log verify authenticates posts
-                        // against materialized membership — no resolver.
-                        let _ = registry
-                            .spawn(cid, chid, key, state_at_hlc, hlc_tracker)
-                            .await;
+                        // ZEB-467: same shared helper as production +
+                        // create_channel_impl.
+                        let _ = crate::register_channel_log_engine(
+                            &registry,
+                            &community_engine,
+                            cid,
+                            chid,
+                            hlc_tracker,
+                        )
+                        .await;
                     }
                 },
                 // ZEB-249 Task 6: epoch-event hook — no-op in test
@@ -20543,6 +20618,134 @@ mod create_community_inner_tests {
             .await,
             "happy path: commit() must spawn the #general channel-log engine \
              (engines_count must be 1 after deferred-spawn drain)"
+        );
+    }
+
+    /// ZEB-467 regression: `create_channel_impl` must register the channel-log
+    /// engine EAGERLY — before it returns — so a caller that posts immediately
+    /// (the headless serve API, or `post_channel_message` right after
+    /// `create_channel`) finds the engine instead of racing the async
+    /// community-delta consumer and getting a 500 "no engine for ...".
+    ///
+    /// Determinism: once the community + its `#general` engine are up, we
+    /// **abort the delta consumer**. With the consumer dead, the ONLY path
+    /// that can register a *second* channel-log engine is the eager spawn
+    /// inside `create_channel_impl` — so `engines_count == 2` proves the eager
+    /// spawn fired. Before the fix it would stay `1` and an immediate
+    /// `post_channel_message` would 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_channel_eagerly_spawns_channel_log_engine_for_immediate_post() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        // Create the community: spawns the community engine + the `#general`
+        // channel-log engine (via the wired consumer + transaction commit).
+        let community_id_hex = create_community_inner(
+            "eager-spawn-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None, // ZEB-434: no transport-epoch watch in this test
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        // Wait until `#general` is registered, then KILL the consumer so it can
+        // never spawn another engine — making the eager spawn the only path to
+        // a second engine.
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned before we abort the consumer"
+        );
+        let consumer = fixture._consumer_drainer;
+        consumer.abort();
+        let _ = consumer.await; // Err(Cancelled) — the task is now fully stopped.
+
+        let id_bytes: [u8; 16] = hex::decode(&community_id_hex)
+            .expect("hex community_id")
+            .as_slice()
+            .try_into()
+            .expect("16 bytes");
+        let community_id = crate::owner_state_types::SpaceId(id_bytes);
+
+        // A fully owner-loaded NodeState for create_channel_impl. The
+        // dm_outbox's community_signing_key + cert MUST match the community the
+        // engine materialized (fixture.signing_key / fixture.enrollment_cert)
+        // so the minted ChannelCreate verifies against the bootstrap-enrolled
+        // device key; the Reticulum (device #1) identity is unused by
+        // create_channel and is a throwaway.
+        let retic = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let device_hash = crate::owner_state_types::DeviceIdentityHash(retic.identity.address_hash);
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                fixture.device_id.clone(),
+                fixture.self_owner,
+                device_hash,
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x11; 32])),
+                std::sync::Arc::new(retic),
+                std::sync::Arc::clone(&fixture.signing_key),
+                fixture.enrollment_cert.clone(),
+            ),
+        ));
+
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(std::sync::Arc::clone(&dm_outbox)),
+            ..NodeState::default()
+        });
+
+        // Create a second channel through the production IPC seam.
+        let new_channel_hex = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "second-channel".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("create_channel_impl must succeed");
+
+        let new_chid_bytes: [u8; 16] = hex::decode(&new_channel_hex)
+            .expect("hex channel_id")
+            .as_slice()
+            .try_into()
+            .expect("16 bytes");
+        let new_chid = crate::community_membership::ChannelId(new_chid_bytes);
+
+        // The consumer is dead: the second engine can only exist because
+        // create_channel_impl spawned it eagerly. This is the regression guard.
+        assert_eq!(
+            fixture.channel_log_registry.engines_count_for_test().await,
+            2,
+            "create_channel_impl must EAGERLY spawn the new channel's log engine \
+             (consumer aborted) — otherwise an immediate post_channel_message races and 500s (ZEB-467)"
+        );
+        assert!(
+            fixture
+                .channel_log_registry
+                .engine(&community_id, &new_chid)
+                .await
+                .is_some(),
+            "the newly-created channel's log engine must be registered immediately so an \
+             immediate post_channel_message finds it instead of returning 500"
         );
     }
 
