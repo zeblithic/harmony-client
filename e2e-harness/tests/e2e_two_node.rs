@@ -394,33 +394,26 @@ async fn s2_friend_graph_and_dm_send() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// S3: channel reconnect catch-up (ZEB-434) — #[ignore]'d, blocked by ZEB-462.
+// S3: channel reconnect catch-up (ZEB-434). Alice creates a channel while Bob is
+// hard-offline (SIGKILL); after Bob relaunches against his persisted profile he
+// must catch up that channel.
 //
-// The single-machine harness CANNOT validate community channel propagation:
-// ongoing community-state sync does not establish between two co-located headless
-// nodes (see the FINDING block below — reproduced WITHOUT any restart). Only
-// first-contact + join/handshake-time state delivery works co-located (that is
-// what S1 roster + S2 friendship exercise). Channel propagation — live OR
-// offline-catch-up — needs ongoing zenoh/iroh community sync, which only
-// establishes across real machines (ZEB-330). So the canonical ZEB-434
-// offline→restart→catch-up test below is #[ignore]'d and is validated via the
-// cross-machine playbook + the ZEB-462 fix.
+// History: this was long #[ignore]'d "blocked by ZEB-462", with a FINDING block
+// here asserting that ongoing co-located community-state sync simply never
+// establishes (persistent "startup root query: no responder", "reproduced even
+// WITHOUT a restart"). That conclusion was an ARTIFACT of a harness bug:
+// `channels_contains` checked `c.get("id")`, but `ChannelInfoDto` is camelCase
+// (`channelId`), so the assertion was always-false and `poll_until` always timed
+// out regardless of whether catch-up actually succeeded. With the key corrected,
+// AND the ZEB-462 (B) community-membership-CRDT durability fix on main (#253), Bob
+// reliably re-peers (pkarr re-resolve + ZEB-373 iroh dial) and catches up the
+// offline-created channel in ~90-110s (dominated by first-contact). Proven 3/3
+// across the decisive run + two reliability re-runs. So co-located ongoing
+// community-state sync DOES work; only cross-WAN reachability remains a separate,
+// cross-machine-playbook concern (ZEB-444). ZEB-462 (A) "no-responder re-peering"
+// was a non-bug — the wrong key masked working behavior.
 // ─────────────────────────────────────────────────────────────────────────────
-// FINDING (ZEB-462): community channel catch-up does NOT complete between two
-// co-located headless nodes. The ROOT cause is (A) ongoing community-state sync
-// never establishes co-located: BOTH nodes log "startup root query: no responder"
-// persistently — reproduced even WITHOUT a restart (a channel Alice creates while
-// Bob is online + joined never reaches Bob). Only first-contact + join/handshake-
-// time state delivery works co-located (S1 roster, S2 friendship). On the restart
-// path there is additionally (B) Bob's rehydrated membership showing the admin
-// Alice as `Left` (left_at: None) → he rejects her publishes. (A) is most likely
-// a co-located transport-peering limitation (ongoing sync is proven across REAL
-// machines, ZEB-330); (B) is a possible membership-rehydration bug. Both tracked
-// in ZEB-462. This test encodes the correct ZEB-434 expectation and is the
-// natural cross-machine-playbook scenario; ignored here until ZEB-462.
-// Run explicitly: `cargo test --features e2e -- --ignored s3_offline`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "blocked by ZEB-462: restart breaks community reconnect + catch-up (no-responder re-peering + admin rehydrated as Left)"]
 async fn s3_offline_channel_reconnect_catchup() {
     use e2e_harness::driver::*;
     use std::time::Duration;
@@ -466,9 +459,12 @@ async fn s3_offline_channel_reconnect_catchup() {
         .await
         .expect("bob relaunches against persisted profile/home");
 
-    // ZEB-434 expectation (currently blocked by ZEB-462): Bob catches up the
-    // offline-created channel after reconnect.
-    poll_until(Duration::from_secs(120), || async {
+    // ZEB-434: Bob catches up the offline-created channel after reconnect (works
+    // post-ZEB-462(B) + the channelId key fix; see this scenario's header note).
+    // 180s ceiling: catch-up is typically fast, but this is a now-un-ignored,
+    // network-racy CI test — the poll returns the instant the channel appears, so
+    // the extra slack only buys margin on a slow runner (zero happy-path cost).
+    poll_until(Duration::from_secs(180), || async {
         Ok(channels_contains(&bob, &community, &channel)
             .await?
             .then_some(()))
@@ -481,22 +477,20 @@ async fn s3_offline_channel_reconnect_catchup() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// S4: single-node restart durability (ZEB-393) — #[ignore]'d, blocked by ZEB-462
-// finding (B). Mint → create community → restart → the community must rehydrate
-// and appear in `list_owner_communities`.
+// S4: single-node restart durability (ZEB-393). Mint → create community →
+// graceful restart → the community must rehydrate and appear in
+// `list_owner_communities`.
 //
-// FINDING (ZEB-462 B): this FAILS, single-node, even with a GRACEFUL shutdown
-// (so it is NOT a crash-before-flush / debounce edge). After restart the node
-// rehydrates the community (`registered case-C pkarr publications … count=1`) but
-// materializes the OWNER's own membership as `Left` (left_at: None) — it then
-// drops its own community publishes ("publisher … not joined … status: Left") and
-// `list_owner_communities` returns empty. So a clean restart can make a node's
-// OWN communities disappear from the list. This is a real membership-rehydration
-// durability bug (ZEB-462 B, confirmed single-node), NOT a harness bug — ignored
-// until fixed. Run explicitly: `cargo test --features e2e -- --ignored s4_restart`.
+// History: #[ignore]'d "blocked by ZEB-462 (B)" on the belief that a single-node
+// restart rehydrates the owner's own membership as `Left` and drops the community
+// from `list_owner_communities`. That was a HARNESS bug, not a product bug: the
+// poll checked `c.get("id")`, but `CommunityNavDto` is camelCase (`spaceId`), so
+// it was always-false and timed out even though the community rehydrated fine —
+// boot logs show it spawns an engine + `registered case-C pkarr publications …
+// count=1`, both of which require `left_at.is_none()`. With the key corrected this
+// passes in ~13s. Single-node owner-state durability (ZEB-393) is intact.
 // ─────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "blocked by ZEB-462 (B): single-node restart rehydrates the owner's own membership as Left → community drops out of list_owner_communities (fails even on graceful shutdown)"]
 async fn s4_restart_durability() {
     use e2e_harness::driver::*;
     use std::time::Duration;
@@ -524,14 +518,22 @@ async fn s4_restart_durability() {
         let comms = alice
             .rpc("list_owner_communities", serde_json::json!({}))
             .await?;
-        let found = comms
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .any(|c| c.get("id").and_then(|v| v.as_str()) == Some(community.as_str()))
-            })
-            .unwrap_or(false);
-        Ok(found.then_some(()))
+        // `CommunityNavDto` is camelCase: the id field is `spaceId`, NOT `id`.
+        // Wrong key → always-false → 120s timeout even when the community
+        // rehydrated correctly. Surface a future DTO rename as a loud schema
+        // error: an empty list is "not rehydrated yet" (keep polling), but a
+        // present community object missing `spaceId` is a contract mismatch.
+        for c in comms.as_array().cloned().unwrap_or_default() {
+            let sid = c.get("spaceId").and_then(|v| v.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "community object missing string `spaceId` key (DTO/schema mismatch?): {c}"
+                )
+            })?;
+            if sid == community.as_str() {
+                return Ok(Some(()));
+            }
+        }
+        Ok(None)
     })
     .await
     .expect("community rehydrated after restart (ZEB-393)");
