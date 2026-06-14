@@ -89,30 +89,40 @@ pub fn load(path: &Path) -> Result<DmOutholdDoc, SyncError> {
     }
 }
 
-/// Load the dm-outhold doc, or — on a corruption/IO error (NOT NotFound) — log
-/// loudly, quarantine the bad file (renamed aside, never overwritten), and
-/// start fresh. Prevents the silent-data-loss path where a load error becomes
-/// an empty doc that the next persist writes over pending outhold entries.
-pub fn load_doc_or_recover(path: &Path) -> DmOutholdDoc {
+/// Load the dm-outhold doc, recovering from genuine on-disk corruption.
+///
+/// - `Ok(doc)` on success (or `Ok(default)` when the file is missing).
+/// - `Err(SyncError::CborDecode)` (permanent corruption) → quarantine the bad
+///   file aside (`.corrupt-<ms>`, bytes preserved) and self-heal to
+///   `Ok(default())` so the app still boots and never bricks on corruption.
+/// - any other error — a transient I/O failure (`SyncError::Persist`) → the file
+///   is left untouched and the error is propagated (ZEB-460); quarantining it
+///   would orphan pending outhold entries and let the next persist overwrite
+///   them with an empty doc, so the caller fails the boot loudly and retries
+///   next launch with the file intact.
+pub fn load_doc_or_recover(path: &Path) -> Result<DmOutholdDoc, SyncError> {
     match load(path) {
-        Ok(doc) => doc,
-        Err(e) => {
+        Ok(doc) => Ok(doc),
+        Err(e @ SyncError::CborDecode(_)) => {
             quarantine(path, &e);
-            DmOutholdDoc::default()
+            Ok(DmOutholdDoc::default())
         }
+        Err(e) => Err(e),
     }
 }
 
 /// Same recovery contract as [`load_doc_or_recover`], but for the replay
-/// tracker: on a corruption/IO error (NOT NotFound) the bad file is
-/// quarantined and an empty tracker returned, never silently overwritten.
-pub fn load_replay_or_recover(path: &Path) -> BTreeMap<String, Hlc> {
+/// tracker: `CborDecode` corruption is quarantined and an empty tracker
+/// returned; a transient `Persist` error is left untouched and propagated
+/// (ZEB-460).
+pub fn load_replay_or_recover(path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
     match load_replay(path) {
-        Ok(t) => t,
-        Err(e) => {
+        Ok(t) => Ok(t),
+        Err(e @ SyncError::CborDecode(_)) => {
             quarantine(path, &e);
-            BTreeMap::new()
+            Ok(BTreeMap::new())
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -274,7 +284,7 @@ mod tests {
             "trailing bytes must surface CborDecode, got {err:?}"
         );
         // And recovery quarantines it rather than silently starting fresh-on-write.
-        let recovered = load_doc_or_recover(&path);
+        let recovered = load_doc_or_recover(&path).unwrap();
         assert_eq!(recovered, DmOutholdDoc::default());
         assert!(!path.exists(), "corrupt file was quarantined");
     }
@@ -306,7 +316,7 @@ mod tests {
         let path = dir.path().join("dm_outhold.cbor");
         // Unknown schema version byte → load() returns Err(CborDecode).
         std::fs::write(&path, [0xFF_u8, 0x01, 0x02]).unwrap();
-        let doc = load_doc_or_recover(&path);
+        let doc = load_doc_or_recover(&path).unwrap();
         assert_eq!(
             doc,
             DmOutholdDoc::default(),
@@ -339,7 +349,7 @@ mod tests {
         // quarantine file should be created.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dm_outhold.cbor");
-        assert_eq!(load_doc_or_recover(&path), DmOutholdDoc::default());
+        assert_eq!(load_doc_or_recover(&path).unwrap(), DmOutholdDoc::default());
         let any: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -348,11 +358,54 @@ mod tests {
     }
 
     #[test]
+    fn load_doc_or_recover_propagates_transient_io_without_quarantine() {
+        // A transient I/O error (NOT corruption) must surface as Err and must
+        // NOT be quarantined: quarantining would orphan real data and let the
+        // next persist overwrite it with an empty doc (ZEB-460). Force a
+        // SyncError::Persist by pointing load() at a directory — std::fs::read
+        // on a dir returns a non-NotFound error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.cbor");
+        std::fs::create_dir(&path).unwrap();
+        let err = load_doc_or_recover(&path).unwrap_err();
+        assert!(
+            matches!(err, SyncError::Persist(_)),
+            "transient I/O must surface Persist, got {err:?}"
+        );
+        assert!(path.is_dir(), "the file is left untouched, not quarantined");
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert!(
+            quarantined.is_empty(),
+            "a transient error must not create a quarantine file"
+        );
+    }
+
+    #[test]
+    fn load_replay_or_recover_propagates_transient_io_without_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay.cbor");
+        std::fs::create_dir(&path).unwrap();
+        let err = load_replay_or_recover(&path).unwrap_err();
+        assert!(
+            matches!(err, SyncError::Persist(_)),
+            "transient I/O must surface Persist, got {err:?}"
+        );
+        assert!(
+            path.is_dir(),
+            "the replay file is left untouched, not quarantined"
+        );
+    }
+
+    #[test]
     fn load_replay_or_recover_quarantines_corrupt_and_starts_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dm_outhold_replay.cbor");
         std::fs::write(&path, [0xFF_u8]).unwrap(); // unknown schema version
-        let tracker = load_replay_or_recover(&path);
+        let tracker = load_replay_or_recover(&path).unwrap();
         assert!(tracker.is_empty(), "recovers to an empty tracker");
         assert!(!path.exists(), "corrupt replay file moved aside");
         let quarantined: Vec<_> = std::fs::read_dir(dir.path())

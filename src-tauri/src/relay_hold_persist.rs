@@ -91,30 +91,40 @@ pub fn load(path: &Path) -> Result<RelayHoldDoc, SyncError> {
     }
 }
 
-/// Load the relay-hold doc, or — on a corruption/IO error (NOT NotFound) — log
-/// loudly, quarantine the bad file (renamed aside, never overwritten), and
-/// start fresh. Prevents the silent-data-loss path where a load error becomes
-/// an empty doc that the next persist writes over held blobs.
-pub fn load_doc_or_recover(path: &Path) -> RelayHoldDoc {
+/// Load the relay-hold doc, recovering from genuine on-disk corruption.
+///
+/// - `Ok(doc)` on success (or `Ok(default)` when the file is missing).
+/// - `Err(SyncError::CborDecode)` (permanent corruption) → quarantine the bad
+///   file aside (`.corrupt-<ms>`, bytes preserved) and self-heal to
+///   `Ok(default())` so the app still boots and never bricks on corruption.
+/// - any other error — a transient I/O failure (`SyncError::Persist`) → the file
+///   is left untouched and the error is propagated (ZEB-460); quarantining it
+///   would orphan held blobs and let the next persist overwrite them with an
+///   empty doc, so the caller fails the boot loudly and retries next launch with
+///   the file intact.
+pub fn load_doc_or_recover(path: &Path) -> Result<RelayHoldDoc, SyncError> {
     match load(path) {
-        Ok(doc) => doc,
-        Err(e) => {
+        Ok(doc) => Ok(doc),
+        Err(e @ SyncError::CborDecode(_)) => {
             quarantine(path, &e);
-            RelayHoldDoc::default()
+            Ok(RelayHoldDoc::default())
         }
+        Err(e) => Err(e),
     }
 }
 
 /// Same recovery contract as [`load_doc_or_recover`], but for the replay
-/// tracker: on a corruption/IO error (NOT NotFound) the bad file is
-/// quarantined and an empty tracker returned, never silently overwritten.
-pub fn load_replay_or_recover(path: &Path) -> BTreeMap<String, Hlc> {
+/// tracker: `CborDecode` corruption is quarantined and an empty tracker
+/// returned; a transient `Persist` error is left untouched and propagated
+/// (ZEB-460).
+pub fn load_replay_or_recover(path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
     match load_replay(path) {
-        Ok(t) => t,
-        Err(e) => {
+        Ok(t) => Ok(t),
+        Err(e @ SyncError::CborDecode(_)) => {
             quarantine(path, &e);
-            BTreeMap::new()
+            Ok(BTreeMap::new())
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -274,7 +284,7 @@ mod tests {
             matches!(err, SyncError::CborDecode(_)),
             "trailing bytes must surface CborDecode, got {err:?}"
         );
-        let recovered = load_doc_or_recover(&path);
+        let recovered = load_doc_or_recover(&path).unwrap();
         assert_eq!(recovered, RelayHoldDoc::default());
         assert!(!path.exists(), "corrupt file was quarantined");
     }
@@ -302,7 +312,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold.cbor");
         std::fs::write(&path, [0xFF_u8, 0x01, 0x02]).unwrap();
-        let doc = load_doc_or_recover(&path);
+        let doc = load_doc_or_recover(&path).unwrap();
         assert_eq!(
             doc,
             RelayHoldDoc::default(),
@@ -333,7 +343,7 @@ mod tests {
     fn load_doc_or_recover_missing_is_default_no_quarantine() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold.cbor");
-        assert_eq!(load_doc_or_recover(&path), RelayHoldDoc::default());
+        assert_eq!(load_doc_or_recover(&path).unwrap(), RelayHoldDoc::default());
         let any: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -342,11 +352,54 @@ mod tests {
     }
 
     #[test]
+    fn load_doc_or_recover_propagates_transient_io_without_quarantine() {
+        // A transient I/O error (NOT corruption) must surface as Err and must
+        // NOT be quarantined: quarantining would orphan real data and let the
+        // next persist overwrite it with an empty doc (ZEB-460). Force a
+        // SyncError::Persist by pointing load() at a directory — std::fs::read
+        // on a dir returns a non-NotFound error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.cbor");
+        std::fs::create_dir(&path).unwrap();
+        let err = load_doc_or_recover(&path).unwrap_err();
+        assert!(
+            matches!(err, SyncError::Persist(_)),
+            "transient I/O must surface Persist, got {err:?}"
+        );
+        assert!(path.is_dir(), "the file is left untouched, not quarantined");
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert!(
+            quarantined.is_empty(),
+            "a transient error must not create a quarantine file"
+        );
+    }
+
+    #[test]
+    fn load_replay_or_recover_propagates_transient_io_without_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay.cbor");
+        std::fs::create_dir(&path).unwrap();
+        let err = load_replay_or_recover(&path).unwrap_err();
+        assert!(
+            matches!(err, SyncError::Persist(_)),
+            "transient I/O must surface Persist, got {err:?}"
+        );
+        assert!(
+            path.is_dir(),
+            "the replay file is left untouched, not quarantined"
+        );
+    }
+
+    #[test]
     fn load_replay_or_recover_quarantines_corrupt_and_starts_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold_replay.cbor");
         std::fs::write(&path, [0xFF_u8]).unwrap();
-        let tracker = load_replay_or_recover(&path);
+        let tracker = load_replay_or_recover(&path).unwrap();
         assert!(tracker.is_empty(), "recovers to an empty tracker");
         assert!(!path.exists(), "corrupt replay file moved aside");
         let quarantined: Vec<_> = std::fs::read_dir(dir.path())

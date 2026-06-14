@@ -3947,10 +3947,12 @@ pub async fn start_node_inner(
                     let notes_replay_path =
                         identity_dir.join(crate::notes_persist::NOTES_REPLAY_FILENAME);
                     let notes_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::notes_persist::load_doc_or_recover(&notes_path),
+                        crate::notes_persist::load_doc_or_recover(&notes_path)
+                            .map_err(|e| format!("load notes doc: {e}"))?,
                     ));
                     let notes_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::notes_persist::load_replay_or_recover(&notes_replay_path),
+                        crate::notes_persist::load_replay_or_recover(&notes_replay_path)
+                            .map_err(|e| format!("load notes replay: {e}"))?,
                     ));
                     let (notes_out_tx, notes_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                     let (notes_in_tx, notes_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -4009,10 +4011,12 @@ pub async fn start_node_inner(
                     let dm_inbox_replay_path =
                         identity_dir.join(crate::dm_inbox_persist::DM_INBOX_REPLAY_FILENAME);
                     let dm_inbox_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::dm_inbox_persist::load_doc_or_recover(&dm_inbox_path),
+                        crate::dm_inbox_persist::load_doc_or_recover(&dm_inbox_path)
+                            .map_err(|e| format!("load dm-inbox doc: {e}"))?,
                     ));
                     let dm_inbox_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::dm_inbox_persist::load_replay_or_recover(&dm_inbox_replay_path),
+                        crate::dm_inbox_persist::load_replay_or_recover(&dm_inbox_replay_path)
+                            .map_err(|e| format!("load dm-inbox replay: {e}"))?,
                     ));
                     let (dm_inbox_out_tx, dm_inbox_out_rx) =
                         tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -4131,10 +4135,12 @@ pub async fn start_node_inner(
                     let relay_hold_replay_path =
                         identity_dir.join(crate::relay_hold_persist::RELAY_HOLD_REPLAY_FILENAME);
                     let relay_hold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::relay_hold_persist::load_doc_or_recover(&relay_hold_path),
+                        crate::relay_hold_persist::load_doc_or_recover(&relay_hold_path)
+                            .map_err(|e| format!("load relay-hold doc: {e}"))?,
                     ));
                     let relay_hold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::relay_hold_persist::load_replay_or_recover(&relay_hold_replay_path),
+                        crate::relay_hold_persist::load_replay_or_recover(&relay_hold_replay_path)
+                            .map_err(|e| format!("load relay-hold replay: {e}"))?,
                     ));
                     let (relay_hold_out_tx, relay_hold_out_rx) =
                         tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -4174,12 +4180,14 @@ pub async fn start_node_inner(
                     let relay_optin_replay_path =
                         identity_dir.join(crate::relay_optin_persist::RELAY_OPTIN_REPLAY_FILENAME);
                     let relay_optin_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::relay_optin_persist::load_doc_or_recover(&relay_optin_path),
+                        crate::relay_optin_persist::load_doc_or_recover(&relay_optin_path)
+                            .map_err(|e| format!("load relay-optin doc: {e}"))?,
                     ));
                     let relay_optin_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                         crate::relay_optin_persist::load_replay_or_recover(
                             &relay_optin_replay_path,
-                        ),
+                        )
+                        .map_err(|e| format!("load relay-optin replay: {e}"))?,
                     ));
                     let (relay_optin_out_tx, relay_optin_out_rx) =
                         tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -4258,10 +4266,12 @@ pub async fn start_node_inner(
                     let dm_outhold_replay_path =
                         identity_dir.join(crate::dm_outhold_persist::DM_OUTHOLD_REPLAY_FILENAME);
                     let dm_outhold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::dm_outhold_persist::load_doc_or_recover(&dm_outhold_path),
+                        crate::dm_outhold_persist::load_doc_or_recover(&dm_outhold_path)
+                            .map_err(|e| format!("load dm-outhold doc: {e}"))?,
                     ));
                     let dm_outhold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::dm_outhold_persist::load_replay_or_recover(&dm_outhold_replay_path),
+                        crate::dm_outhold_persist::load_replay_or_recover(&dm_outhold_replay_path)
+                            .map_err(|e| format!("load dm-outhold replay: {e}"))?,
                     ));
                     let (dm_outhold_out_tx, dm_outhold_out_rx) =
                         tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -4343,7 +4353,8 @@ pub async fn start_node_inner(
                     let fleet_net_replay_path =
                         identity_dir.join(crate::fleet_net_persist::FLEET_NET_REPLAY_FILENAME);
                     let initial_fleet_net_doc =
-                        crate::fleet_net_persist::load_doc_or_recover(&fleet_net_path);
+                        crate::fleet_net_persist::load_doc_or_recover(&fleet_net_path)
+                            .map_err(|e| format!("load fleet-net doc: {e}"))?;
                     // ZEB-418 P2 Task 7 (D15): SYNCHRONOUS snapshot of the
                     // fleet-net doc, seeded from the loaded doc. The pkarr
                     // routing-blob builder is a sync `Fn() -> Vec<u8>` and
@@ -4357,7 +4368,8 @@ pub async fn start_node_inner(
                     let fleet_net_doc =
                         std::sync::Arc::new(tokio::sync::Mutex::new(initial_fleet_net_doc));
                     let fleet_net_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::fleet_net_persist::load_replay_or_recover(&fleet_net_replay_path),
+                        crate::fleet_net_persist::load_replay_or_recover(&fleet_net_replay_path)
+                            .map_err(|e| format!("load fleet-net replay: {e}"))?,
                     ));
                     let (fleet_net_out_tx, fleet_net_out_rx) =
                         tokio::sync::mpsc::channel::<Vec<u8>>(64);
