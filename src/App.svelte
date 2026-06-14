@@ -459,9 +459,15 @@
   // `callSession &&` guards keep it correct even if it were torn down mid-replay.
   function handleIncomingDmCall(p: IncomingCallEvent): void {
     callSession?.onIncoming(p.callId, p.callerOwner, p.spaceId);
-    // Only raise the banner if we actually entered 'incoming' (a busy session
-    // auto-declines with reason 'busy' and stays put — no banner then).
-    if (callSession && get(callSession.state).phase === 'incoming') {
+    // Only raise the banner if the session actually ADOPTED this invite — in
+    // 'incoming' AND tracking this exact callId. onIncoming busy-declines a
+    // second invite while already ringing (stays on the original call), so
+    // without the callId check the banner + OS notification would overwrite to
+    // the new caller while accept/decline still act on the original — a
+    // shown-vs-acted mismatch (CodeRabbit). Mirrors the group handler's guard;
+    // reachable here when the startup drain replays two buffered invites.
+    const st = callSession ? get(callSession.state) : null;
+    if (st && st.phase === 'incoming' && st.callId === p.callId) {
       const card = resolveCard(p.callerOwner);
       incomingCall = {
         callId: p.callId,
