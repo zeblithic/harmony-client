@@ -55,6 +55,40 @@ describe('incoming-call-queue (ZEB-364)', () => {
     expect(group.drain().map((e) => e.callId)).toEqual(['call-2', 'call-3']);
   });
 
+  it('suppresses a buffered ring whose call was canceled during the window (ZEB-364 phantom-ring)', () => {
+    const q = createIncomingCallQueue();
+    q.queue(ev(1));
+    q.queue(ev(2));
+    q.cancel('call-1'); // caller rang then canceled before the session built
+    const drained = q.drain();
+    expect(drained.map((e) => e.callId)).toEqual(['call-2']);
+  });
+
+  it('cancel is order-independent — recorded before the matching queue still suppresses', () => {
+    const q = createIncomingCallQueue();
+    q.cancel('call-1');
+    q.queue(ev(1));
+    expect(q.drain()).toEqual([]);
+  });
+
+  it('a cancel for an unrelated callId leaves the ring intact', () => {
+    const q = createIncomingCallQueue();
+    q.queue(ev(1));
+    q.cancel('call-999');
+    expect(q.drain().map((e) => e.callId)).toEqual(['call-1']);
+  });
+
+  it('drain clears cancellations too — a later identical callId is not suppressed', () => {
+    const q = createIncomingCallQueue();
+    q.queue(ev(1));
+    q.cancel('call-1');
+    expect(q.drain()).toEqual([]);
+    // A fresh ring with the same id in a later window must NOT be suppressed by
+    // a stale cancellation.
+    q.queue(ev(1));
+    expect(q.drain().map((e) => e.callId)).toEqual(['call-1']);
+  });
+
   it('caps at 32 buffered events and drops the newest beyond the cap', () => {
     const q = createIncomingCallQueue();
     for (let i = 0; i < 40; i++) q.queue(ev(i));

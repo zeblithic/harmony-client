@@ -425,13 +425,15 @@
         // 'incoming' (accepted / declined / canceled / timeout).
         if (s.phase !== 'incoming') groupIncomingCall = null;
       });
-      // ZEB-364: replay any incoming-call events that arrived before the sessions
+      // ZEB-364: replay incoming-call events that arrived before the sessions
       // existed (startup race). callSession/groupCall + their banner-clearing
       // subscriptions are now wired, so handleIncoming* behaves exactly as it
-      // would for a live event. FIFO drain; group events re-await their member-
-      // cache warm inside the handler.
+      // would for a live event. drain() already drops rings whose call was
+      // canceled during the window. Group handlers are awaited sequentially so
+      // they replay in FIFO order and a rejection surfaces to the catch below
+      // (a bare `void` diverged from the live listener, which awaits).
       for (const p of dmIncomingQueue.drain()) handleIncomingDmCall(p);
-      for (const p of groupIncomingQueue.drain()) void handleIncomingGroupCall(invoke, p);
+      for (const p of groupIncomingQueue.drain()) await handleIncomingGroupCall(invoke, p);
       // ZEB-356: now that owner identity is present (buildVoiceSession only runs
       // then), request notification permission once so an incoming call's banner
       // isn't lost to a permission-prompt race. Deferred here (not app-init) so
@@ -1897,7 +1899,12 @@
 
       const unlistenCallCanceled = await listen('call-canceled', (event) => {
         const p = (event as { payload: { callId: string } }).payload;
-        callSession?.onRemoteCanceled(p.callId);
+        // ZEB-364: if the caller cancels while callSession is still null (startup
+        // window), record it so the drain suppresses the matching buffered ring
+        // instead of replaying a call that's already gone. Once the session
+        // exists, cancels route normally and clear an already-replayed ring.
+        if (!callSession) { dmIncomingQueue.cancel(p.callId); return; }
+        callSession.onRemoteCanceled(p.callId);
       });
       fileManagerService.addUnlisten(unlistenCallCanceled);
 
