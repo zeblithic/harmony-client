@@ -87,6 +87,7 @@
   import { getGroupCallSession, type GroupCallSession } from './lib/group-call-session';
   import { groupCallBanners } from './lib/group-call-banner-store';
   import { ensureGroupMembers, getCachedGroupMembers, invalidateGroupMembers } from './lib/group-dm-members-cache';
+  import { createIncomingCallQueue, type IncomingCallEvent } from './lib/incoming-call-queue';
   import { toastStore } from './lib/stores/toast';
   import { get } from 'svelte/store';
   import { classifyOwnerIdentity, type OwnerIdentityState } from './lib/owner-gate';
@@ -201,6 +202,14 @@
   // 'incoming' (the groupCallStateUnsub subscription below). The toast body reads
   // "{caller} is calling {group name}".
   let groupIncomingCall = $state<{ callId: string; spaceId: string; callerName: string; groupName: string; callerAvatarUrl?: string } | null>(null);
+  // ZEB-364: buffers for incoming-call signaling that lands during the startup
+  // window — after the `incoming-call` / `incoming-group-call` listeners are
+  // registered but before buildVoiceSession builds callSession / groupCall.
+  // Drained in buildVoiceSession once the sessions exist; without this a ring
+  // arriving in that window is silently dropped (callSession?.onIncoming no-ops
+  // while null). One buffer per call kind.
+  const dmIncomingQueue = createIncomingCallQueue();
+  const groupIncomingQueue = createIncomingCallQueue();
   // Unsubscribe for the callSession.state subscription that clears the toast;
   // torn down on unmount via fileManagerService.addUnlisten.
   let callStateUnsub: (() => void) | null = null;
@@ -416,6 +425,13 @@
         // 'incoming' (accepted / declined / canceled / timeout).
         if (s.phase !== 'incoming') groupIncomingCall = null;
       });
+      // ZEB-364: replay any incoming-call events that arrived before the sessions
+      // existed (startup race). callSession/groupCall + their banner-clearing
+      // subscriptions are now wired, so handleIncoming* behaves exactly as it
+      // would for a live event. FIFO drain; group events re-await their member-
+      // cache warm inside the handler.
+      for (const p of dmIncomingQueue.drain()) handleIncomingDmCall(p);
+      for (const p of groupIncomingQueue.drain()) void handleIncomingGroupCall(invoke, p);
       // ZEB-356: now that owner identity is present (buildVoiceSession only runs
       // then), request notification permission once so an incoming call's banner
       // isn't lost to a permission-prompt race. Deferred here (not app-init) so
@@ -433,6 +449,67 @@
       voiceSessionInit = false;
       const msg = err instanceof Error ? err.message : String(err);
       console.warn('[harmony-client] get_self_voice_identity not yet available:', msg);
+    }
+  }
+
+  // ZEB-364: 1:1 incoming-call routing, shared by the live `incoming-call`
+  // listener and the startup-queue drain. Callers ensure callSession exists; the
+  // `callSession &&` guards keep it correct even if it were torn down mid-replay.
+  function handleIncomingDmCall(p: IncomingCallEvent): void {
+    callSession?.onIncoming(p.callId, p.callerOwner, p.spaceId);
+    // Only raise the banner if we actually entered 'incoming' (a busy session
+    // auto-declines with reason 'busy' and stays put — no banner then).
+    if (callSession && get(callSession.state).phase === 'incoming') {
+      const card = resolveCard(p.callerOwner);
+      incomingCall = {
+        callId: p.callId,
+        spaceId: p.spaceId,
+        callerName: card?.displayName ?? p.callerOwner.slice(0, 8),
+        ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
+      };
+      // ZEB-356: escalate to the OS if the window is unfocused (no-op if focused).
+      void incomingCallAlerter?.notify({
+        id: p.callId,
+        title: 'Incoming call',
+        body: `${incomingCall.callerName} is calling`,
+      });
+    }
+  }
+
+  // ZEB-364: group incoming-call routing, shared by the `incoming-group-call`
+  // listener and the startup-queue drain. Takes `invoke` explicitly because it
+  // warms the group-member cache — the live listener passes its IIFE-scoped
+  // adapter, the drain passes buildVoiceSession's.
+  async function handleIncomingGroupCall(
+    invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>,
+    p: IncomingCallEvent,
+  ): Promise<void> {
+    // Best-effort cache warm: a transient get_group_dm_members failure must NOT
+    // abort the handler and drop the ring (roster degrades to live beacons only).
+    await ensureGroupMembers(invoke, p.spaceId).catch(() => {});
+    groupCall?.onIncomingGroup(p.callId, p.callerOwner, p.spaceId);
+    // Only escalate if the session actually ADOPTED this invite — in 'incoming'
+    // AND tracking this exact callId (onIncomingGroup no-ops when not idle, so a
+    // second invite while ringing leaves the session on the original call).
+    const gst = groupCall ? get(groupCall.state) : null;
+    if (gst && gst.phase === 'incoming' && gst.callId === p.callId) {
+      const card = resolveCard(p.callerOwner);
+      const name = card?.displayName ?? p.callerOwner.slice(0, 8);
+      const groupName = navService.nodes.find((n) => n.id === p.spaceId)?.name ?? 'a group';
+      // T13: raise the in-app ring toast (cleared when the group phase leaves
+      // 'incoming' via the subscription in buildVoiceSession).
+      groupIncomingCall = {
+        callId: p.callId,
+        spaceId: p.spaceId,
+        callerName: name,
+        groupName,
+        ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
+      };
+      void incomingCallAlerter?.notify({
+        id: p.callId,
+        title: 'Incoming group call',
+        body: `${name} is calling ${groupName}`,
+      });
     }
   }
 
@@ -1785,26 +1862,12 @@
       // guard with `callSession?.`). Each handler is callId-guarded inside the
       // session, so stale events for an old call can't disturb a current one.
       const unlistenIncomingCall = await listen('incoming-call', (event) => {
-        const p = (event as { payload: { callId: string; callerOwner: string; spaceId: string } }).payload;
-        callSession?.onIncoming(p.callId, p.callerOwner, p.spaceId);
-        // Only raise the banner if we actually entered 'incoming' (a busy session
-        // auto-declines with reason 'busy' and stays put — no banner then).
-        if (callSession && get(callSession.state).phase === 'incoming') {
-          const card = resolveCard(p.callerOwner);
-          incomingCall = {
-            callId: p.callId,
-            spaceId: p.spaceId,
-            callerName: card?.displayName ?? p.callerOwner.slice(0, 8),
-            ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
-          };
-          // ZEB-356: escalate to the OS if the window is unfocused (no-op if
-          // focused — the in-app toast above suffices).
-          void incomingCallAlerter?.notify({
-            id: p.callId,
-            title: 'Incoming call',
-            body: `${incomingCall.callerName} is calling`,
-          });
-        }
+        const p = (event as { payload: IncomingCallEvent }).payload;
+        // ZEB-364: callSession is built lazily in buildVoiceSession (fired via
+        // `void`). A ring arriving before it exists must be buffered, not dropped
+        // — the drain in buildVoiceSession replays it through the same handler.
+        if (!callSession) { dmIncomingQueue.queue(p); return; }
+        handleIncomingDmCall(p);
       });
       fileManagerService.addUnlisten(unlistenIncomingCall);
 
@@ -1852,38 +1915,11 @@
       // members cache (resolveMembers) is warm before the roster merge — that's
       // what renders the ringing/declined rows on the very first beacon.
       fileManagerService.addUnlisten(await listen('incoming-group-call', async (event) => {
-        const p = (event as { payload: { callId: string; callerOwner: string; spaceId: string } }).payload;
-        // Best-effort cache warm: a transient get_group_dm_members failure must
-        // NOT abort the handler and drop the ring (the roster degrades to live
-        // beacons only — no ringing rows — until a later event re-warms it).
-        await ensureGroupMembers(invoke, p.spaceId).catch(() => {});
-        groupCall?.onIncomingGroup(p.callId, p.callerOwner, p.spaceId);
-        // Only escalate if the session actually ADOPTED this invite — i.e. it's in
-        // 'incoming' AND tracking this exact callId. `onIncomingGroup` no-ops when
-        // not idle (D6), so a second invite arriving while we're already ringing
-        // for a different call leaves the session on the original; without the
-        // callId check the toast + OS alert would overwrite to the new call while
-        // accept/decline still act on the original — a shown-vs-acted mismatch.
-        const gst = groupCall ? get(groupCall.state) : null;
-        if (gst && gst.phase === 'incoming' && gst.callId === p.callId) {
-          const card = resolveCard(p.callerOwner);
-          const name = card?.displayName ?? p.callerOwner.slice(0, 8);
-          const groupName = navService.nodes.find((n) => n.id === p.spaceId)?.name ?? 'a group';
-          // T13: raise the in-app ring toast (rendered next to the 1:1 toast).
-          // Cleared when the group phase leaves 'incoming' (subscription above).
-          groupIncomingCall = {
-            callId: p.callId,
-            spaceId: p.spaceId,
-            callerName: name,
-            groupName,
-            ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
-          };
-          void incomingCallAlerter?.notify({
-            id: p.callId,
-            title: 'Incoming group call',
-            body: `${name} is calling ${groupName}`,
-          });
-        }
+        const p = (event as { payload: IncomingCallEvent }).payload;
+        // ZEB-364: groupCall is built lazily in buildVoiceSession; buffer a ring
+        // that arrives before it exists so the drain can replay it (else dropped).
+        if (!groupCall) { groupIncomingQueue.queue(p); return; }
+        await handleIncomingGroupCall(invoke, p);
       }));
 
       fileManagerService.addUnlisten(await listen('group-call-presence-changed', async (event) => {
