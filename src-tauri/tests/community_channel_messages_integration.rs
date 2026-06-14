@@ -347,10 +347,46 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         SpawnOutcome::DeferredForCommit => panic!("unexpected deferred spawn"),
     };
 
-    // Give Zenoh subscribers + queryables time to declare and peers
-    // time to discover. 1s is conservative; the registry-fixture tests
-    // use shorter waits but they don't drive messages through the wire.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Deterministically wait until A's session has discovered and matched B's
+    // channel subscriber before publishing, rather than a fixed sleep that races
+    // CI scheduling. The two engines run on separate loopback zenoh sessions, so
+    // publisher↔subscriber matching depends on inter-session discovery — the
+    // contention-sensitive step. A fixed 1s wait flaked under full-suite CI load
+    // (ZEB-459): A's first burst published before B's subscriber was matched, and
+    // those messages were lost on the live path (the live wire does not replay),
+    // stalling the first drain checkpoint until the 30s ceiling. Polling the
+    // publisher's matching status proceeds exactly when A can reach B's
+    // subscriber, at any CI speed.
+    let readiness_topic = format!(
+        "harmony/channels/{}/{}/events",
+        hex::encode(community_id.0),
+        hex::encode(channel_id.0)
+    );
+    let readiness_pub = Arc::new(
+        session_a
+            .declare_publisher(
+                zenoh::key_expr::KeyExpr::try_from(readiness_topic).expect("readiness topic key"),
+            )
+            .await
+            .expect("declare readiness publisher"),
+    );
+    wait_until(
+        || {
+            let readiness_pub = Arc::clone(&readiness_pub);
+            async move {
+                readiness_pub
+                    .matching_status()
+                    .await
+                    .map(|s| s.matching())
+                    .unwrap_or(false)
+            }
+        },
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("A must match B's channel subscriber before publishing (ZEB-459 live-wire readiness)");
+    // Brief settle so the matched route is fully installed before the first put.
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     // ── Phase 1: A posts 100 messages live ───────────────────────────
     // ZEB-288: publish in small DRAIN-SYNCED batches so the engine→adapter
