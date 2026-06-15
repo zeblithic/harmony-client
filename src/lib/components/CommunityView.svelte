@@ -479,6 +479,8 @@
       {members}
       {ownAddress}
       {trustService}
+      {resolveCard}
+      {resolveNickname}
       collapsed={membersPanelCollapsed}
     />
   </div>

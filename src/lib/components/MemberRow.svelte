@@ -2,6 +2,7 @@
   import type { CommunityMember } from '../types';
   import type { ResolvedCard } from '../member-card-service';
   import Avatar from './Avatar.svelte';
+  import { nonEmpty } from '../display-label';
 
   export type KebabAction =
     | 'kick'
@@ -115,9 +116,9 @@
   // $derived so the reactive nickname map / card Map upgrades re-render
   // automatically — no one-time snapshot.
   let displayName = $derived(
-    resolveNickname?.(member.address) ??
-      resolveCard?.(member.address)?.displayName ??
-      member.displayName ??
+    nonEmpty(resolveNickname?.(member.address)) ??
+      nonEmpty(resolveCard?.(member.address)?.displayName) ??
+      nonEmpty(member.displayName) ??
       member.address.slice(0, 8)
   );
   // ZEB-432 (PR #240 review): the owner-card popover is the identity drill-down,
@@ -126,8 +127,8 @@
   // FriendsPanel, whose popover uses the resolved card name while its row label
   // is nickname-first). Same card-first ladder the row used before ZEB-432.
   let cardDisplayName = $derived(
-    resolveCard?.(member.address)?.displayName ??
-      member.displayName ??
+    nonEmpty(resolveCard?.(member.address)?.displayName) ??
+      nonEmpty(member.displayName) ??
       member.address.slice(0, 8)
   );
   let joinedDate = $derived(
