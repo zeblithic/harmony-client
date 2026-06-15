@@ -1505,6 +1505,7 @@ mod groupdm_membership_tests {
                     devices: vec![DeviceIdentityHash([0u8; 16])],
                     device_identity_pubs: vec![Some(identity_pub_for(device))],
                     learned_at: hlc(),
+                    device_tunnel_contacts: vec![None],
                 },
             );
         }

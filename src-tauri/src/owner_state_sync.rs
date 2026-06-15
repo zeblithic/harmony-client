@@ -293,6 +293,9 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
             addr,
             entry.devices,
             entry.device_identity_pubs,
+            // ZEB-473: replicate the remote's parallel tunnel-contact vec
+            // verbatim (this is a self-device owner-state sync, not a stub).
+            entry.device_tunnel_contacts,
             entry.learned_at,
         );
     }
@@ -1866,7 +1869,13 @@ mod integration_tests {
         // A learns a per-OwnerAddr device list.
         {
             let mut a = dev.a_state.lock().await;
-            a.apply_owner_device_update(owner, devices.clone(), pubs.clone(), learned.clone());
+            a.apply_owner_device_update(
+                owner,
+                devices.clone(),
+                pubs.clone(),
+                Vec::new(),
+                learned.clone(),
+            );
         }
         dev.a_engine.notify_dirty();
         let converged = wait_until(

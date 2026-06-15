@@ -1015,6 +1015,10 @@ pub fn process_friend_request(
                 req.from_addr,
                 req.sender_devices.clone(),
                 req.device_identity_pubs.clone(),
+                // ZEB-473 Task 4: tunnel contacts are populated in Task 5
+                // (real friend-handshake reachability/PQ). Empty parallel
+                // vec for now — `apply_owner_device_update` pads to None.
+                Vec::new(),
                 learned_at,
             )
         {

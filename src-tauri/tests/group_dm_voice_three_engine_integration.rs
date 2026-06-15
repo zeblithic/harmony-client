@@ -139,6 +139,7 @@ fn state_with(space_id: SpaceId, enrolled: &[(OwnerAddr, [u8; 32])]) -> OwnerSta
                 devices: vec![DeviceIdentityHash([0u8; 16])],
                 device_identity_pubs: vec![Some(identity_pub_for(device))],
                 learned_at: hlc_seed(),
+                device_tunnel_contacts: vec![None],
             },
         );
     }

@@ -248,6 +248,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         OwnerDeviceEntry {
             devices: vec![DeviceIdentityHash(alice.identity.address_hash)],
             device_identity_pubs: vec![Some(alice_pub)],
+            device_tunnel_contacts: vec![None],
             learned_at: Hlc {
                 wall_ms: 50_000,
                 logical: 0,

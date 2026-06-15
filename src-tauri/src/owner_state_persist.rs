@@ -603,6 +603,7 @@ mod tests {
             OwnerAddr([2; 16]),
             sorted_hashes.clone(),
             sorted_pubs.clone(),
+            vec![],
             hlc(1),
         );
 

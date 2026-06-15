@@ -1576,6 +1576,9 @@ impl DmOutbox {
             signed.inviter,
             signed.sender_devices.clone(),
             device_identity_pubs,
+            // ZEB-473: no tunnel contacts on this DM-receive cache refresh
+            // (populated only on the friend handshake, Task 5).
+            Vec::new(),
             learned_at,
         );
         if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
@@ -1703,6 +1706,9 @@ impl DmOutbox {
                 resolved_owner,
                 signed.sender_devices.clone(),
                 updated_pubs,
+                // ZEB-473: no tunnel contacts on this DM-receive cache
+                // refresh (populated only on the friend handshake, Task 5).
+                Vec::new(),
                 Hlc {
                     wall_ms: wall_now_ms,
                     logical: 0,
@@ -1951,6 +1957,9 @@ impl DmOutbox {
             resolved_owner,
             signed.ack_from_devices.clone(),
             updated_pubs,
+            // ZEB-473: no tunnel contacts on this DM-ack cache refresh
+            // (populated only on the friend handshake, Task 5).
+            Vec::new(),
             Hlc {
                 wall_ms: wall_now_ms,
                 logical: 0,
@@ -3138,6 +3147,7 @@ mod tests {
             OwnerDeviceEntry {
                 devices: vec![DeviceIdentityHash([0xa1; 16])],
                 device_identity_pubs: vec![Some([0x11; 64])],
+                device_tunnel_contacts: vec![None],
                 learned_at: Hlc {
                     wall_ms: 1,
                     logical: 0,
@@ -3171,6 +3181,7 @@ mod tests {
             OwnerDeviceEntry {
                 devices: vec![shared],
                 device_identity_pubs: vec![Some([0x11; 64])],
+                device_tunnel_contacts: vec![None],
                 learned_at: Hlc {
                     wall_ms: 1,
                     logical: 0,
@@ -3183,6 +3194,7 @@ mod tests {
             OwnerDeviceEntry {
                 devices: vec![shared], // same hash claimed by a different owner
                 device_identity_pubs: vec![Some([0x22; 64])],
+                device_tunnel_contacts: vec![None],
                 learned_at: Hlc {
                     wall_ms: 1,
                     logical: 0,
@@ -4309,16 +4321,19 @@ mod tests {
         let bob_entry = OwnerDeviceEntry {
             devices: vec![bob_dev],
             device_identity_pubs: vec![Some([0xbb; 64])],
+            device_tunnel_contacts: vec![None],
             learned_at: learned_at.clone(),
         };
         let carol_old_entry = OwnerDeviceEntry {
             devices: vec![carol_dev_old],
             device_identity_pubs: vec![Some([0xc1; 64])],
+            device_tunnel_contacts: vec![None],
             learned_at: learned_at.clone(),
         };
         let carol_new_entry = OwnerDeviceEntry {
             devices: vec![carol_dev_new],
             device_identity_pubs: vec![Some([0xc2; 64])],
+            device_tunnel_contacts: vec![None],
             learned_at,
         };
 
@@ -5190,6 +5205,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![Some(alice_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -5511,6 +5527,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![Some(alice_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -5712,6 +5729,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![None], // pre-bootstrap: hash known, pub not yet learned
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -5814,6 +5832,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![Some(alice_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -5950,6 +5969,7 @@ mod tests {
             bob,
             vec![bob_device_hash],
             vec![Some(bob_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -6071,6 +6091,7 @@ mod tests {
             mallory,
             vec![mallory_device_hash],
             vec![Some(mallory_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 60,
                 logical: 0,
@@ -7142,6 +7163,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![Some(alice_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -7346,6 +7368,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![Some(alice_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,

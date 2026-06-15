@@ -620,6 +620,7 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
             OwnerDeviceEntry {
                 devices: vec![DeviceIdentityHash([0xAAu8; 16])],
                 device_identity_pubs: vec![None],
+                device_tunnel_contacts: vec![None],
                 learned_at: Hlc {
                     wall_ms: 100_000,
                     logical: 0,

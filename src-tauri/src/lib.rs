@@ -39098,8 +39098,15 @@ async fn apply_handshaked_friend(
         }
     }
     if !sender_devices.is_empty() {
-        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) =
-            state.apply_owner_device_update(addr, sender_devices, device_identity_pubs, learned_at)
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = state
+            .apply_owner_device_update(
+                addr,
+                sender_devices,
+                device_identity_pubs,
+                // ZEB-473 Task 4: tunnel contacts populated in Task 5.
+                Vec::new(),
+                learned_at,
+            )
         {
             return Err(format!("device-cache apply rejected: {reason:?}"));
         }
