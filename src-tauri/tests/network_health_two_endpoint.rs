@@ -101,6 +101,12 @@ async fn ping_round_trip_between_two_endpoints() {
         .with_test_writer()
         .try_init();
 
+    // ZEB-374: pre-pay iroh's ~30s first-bind global init OUTSIDE the asserted
+    // 60s budget so full-suite contention can't charge it against the handshake
+    // and blow the timeout. nextest is process-per-test, so every iroh test
+    // pays this init once; the ZEB-347 pattern moves it before the budget.
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
     // Outer 60s budget (matches `pkarr_iroh_redeem_full_integration`).
     // Under nextest --all-targets concurrency the iroh connect handshake
     // can take several seconds while the host is saturated; in isolation
