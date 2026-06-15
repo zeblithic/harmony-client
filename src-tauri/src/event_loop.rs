@@ -1,50 +1,18 @@
 //! Simplified NodeRuntime event loop for the Tauri desktop client.
 //!
 //! Adapted from harmony-node's event_loop.rs, stripped down to:
-//! - UDP socket (Reticulum mesh broadcast/unicast)
 //! - Zenoh session (pub/sub, queryables, content fetch)
 //! - 250ms timer tick
 //!
 //! No disk/archive/S3 persistence, no inference.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use harmony_content::book::MemoryBookStore;
 use harmony_runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
-use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
-
-/// Well-known UDP port for Reticulum mesh — must match harmony-node default
-/// so that all nodes on the LAN broadcast/listen on the same port.
-const RETICULUM_UDP_PORT: u16 = 4242;
-
-/// ZEB-446: HARMONY_RETICULUM_PORT parse. Unset/blank → default 4242;
-/// `0` → `None` = Reticulum LAN discovery disabled this session; garbage →
-/// warn + the default. Reticulum is default-ON, so a bad override must not
-/// silently change behavior (contrast `api/gui_host.rs::parse_api_port`,
-/// where the feature is opt-in and disabling loudly is the right failure
-/// mode).
-pub(crate) fn parse_reticulum_port(raw: Option<&str>) -> Option<u16> {
-    let raw = raw.map(str::trim).filter(|s| !s.is_empty());
-    let Some(raw) = raw else {
-        return Some(RETICULUM_UDP_PORT);
-    };
-    match raw.parse::<u16>() {
-        Ok(0) => None,
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::warn!(
-                value = raw,
-                error = %e,
-                "HARMONY_RETICULUM_PORT invalid; using default 4242"
-            );
-            Some(RETICULUM_UDP_PORT)
-        }
-    }
-}
 
 /// Handles passed from `start_node` (lib.rs) into the event loop so the
 /// Zenoh adapter can wire the SyncEngine's mpsc channels to Zenoh pub/sub.
@@ -884,74 +852,6 @@ pub async fn run(
             }
         };
     }
-
-    // ZEB-446: the Reticulum LAN-discovery bind is degradable. The port
-    // comes from HARMONY_RETICULUM_PORT (unset → 4242; 0 → disabled;
-    // garbage → warn + 4242), and a failed bind — typically another local
-    // instance holding the port — must NOT kill transport init: zenoh,
-    // iroh, and pkarr carry on, and two local instances still interconnect
-    // via zenoh scouting. This also retires the ZEB-420/ZEB-165 class of
-    // integration-test failures racing on the fixed port (tests set 0).
-    //
-    // The socket stays non-Option at its ~20 downstream call sites: a
-    // disabled/degraded session gets a loopback-bound ephemeral "dead"
-    // socket that receives nothing (nobody knows its port) and whose
-    // 255.255.255.255 broadcasts fail or route nowhere (loopback-bound) —
-    // already swallowed by the `let _ = udp.send_to(...)` announce sites.
-    let reticulum_port =
-        parse_reticulum_port(std::env::var("HARMONY_RETICULUM_PORT").ok().as_deref());
-    let live_udp = match reticulum_port {
-        Some(port) => match cancellable!(UdpSocket::bind(format!("0.0.0.0:{port}")), "UDP bind") {
-            Ok(s) => match s.set_broadcast(true) {
-                Ok(()) => {
-                    tracing::info!(port, "UDP socket bound");
-                    Some(s)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        port,
-                        error = %e,
-                        "UDP set_broadcast failed; Reticulum LAN discovery disabled this session"
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    port,
-                    error = %e,
-                    "UDP bind failed (another local instance holding the port?); \
-                     Reticulum LAN discovery disabled this session"
-                );
-                None
-            }
-        },
-        None => {
-            tracing::info!(
-                "HARMONY_RETICULUM_PORT=0 — Reticulum LAN discovery disabled this session"
-            );
-            None
-        }
-    };
-    let udp = match live_udp {
-        Some(s) => s,
-        None => match cancellable!(UdpSocket::bind("127.0.0.1:0"), "fallback UDP bind") {
-            Ok(s) => s,
-            Err(e) => {
-                // Even a loopback-ephemeral bind failed: that is a genuine
-                // environment failure, not a port collision — keep it fatal.
-                let e = format!("fallback UDP bind failed: {e}");
-                let _ = ready_tx.send(Err(e));
-                return;
-            }
-        },
-    };
-    let broadcast_addr: SocketAddr = format!(
-        "255.255.255.255:{}",
-        reticulum_port.unwrap_or(RETICULUM_UDP_PORT)
-    )
-    .parse()
-    .expect("static broadcast addr");
 
     // ZEB-373: install the dial-hint sender on the resolver BEFORE the static-seed
     // snapshot (`iroh_connect_locators` below) and before `zenoh::open`, so a peer
@@ -2611,17 +2511,7 @@ pub async fn run(
 
     // ── Process startup actions (declare queryables + subscribers) ────
     for action in startup_actions {
-        dispatch_action(
-            action,
-            &session,
-            &zenoh_tx,
-            &udp,
-            &broadcast_addr,
-            &app,
-            &closing,
-            &own_zid,
-        )
-        .await;
+        dispatch_action(action, &session, &zenoh_tx, &app, &closing, &own_zid).await;
     }
 
     // Subscribe to community channel messages for real-time messaging.
@@ -2631,8 +2521,6 @@ pub async fn run(
         },
         &session,
         &zenoh_tx,
-        &udp,
-        &broadcast_addr,
         &app,
         &closing,
         &own_zid,
@@ -2646,8 +2534,6 @@ pub async fn run(
         },
         &session,
         &zenoh_tx,
-        &udp,
-        &broadcast_addr,
         &app,
         &closing,
         &own_zid,
@@ -2661,8 +2547,6 @@ pub async fn run(
         },
         &session,
         &zenoh_tx,
-        &udp,
-        &broadcast_addr,
         &app,
         &closing,
         &own_zid,
@@ -2683,8 +2567,6 @@ pub async fn run(
         },
         &session,
         &zenoh_tx,
-        &udp,
-        &broadcast_addr,
         &app,
         &closing,
         &own_zid,
@@ -2706,8 +2588,6 @@ pub async fn run(
             },
             &session,
             &zenoh_tx,
-            &udp,
-            &broadcast_addr,
             &app,
             &closing,
             &own_zid,
@@ -2744,8 +2624,6 @@ pub async fn run(
             },
             &session,
             &zenoh_tx,
-            &udp,
-            &broadcast_addr,
             &app,
             &closing,
             &own_zid,
@@ -2757,8 +2635,6 @@ pub async fn run(
             },
             &session,
             &zenoh_tx,
-            &udp,
-            &broadcast_addr,
             &app,
             &closing,
             &own_zid,
@@ -2870,8 +2746,6 @@ pub async fn run(
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let start = std::time::Instant::now();
-
-    let mut udp_buf = vec![0u8; 65535];
 
     // Directly connected Zenoh peers — refreshed every 20 timer ticks (~5s).
     // Used to derive hop distance: ZID in this set → hop 1, else → hop 2.
@@ -3139,27 +3013,6 @@ pub async fn run(
         let mut should_tick = false;
 
         tokio::select! {
-            // ── UDP inbound ──────────────────────────────────────────
-            // Intentionally does NOT set should_tick — matches harmony-node.
-            // Packets are buffered and processed on the next 250ms timer tick.
-            // This ensures tick_count and filter broadcast timers advance at
-            // wall-clock rate regardless of packet arrival rate.
-            result = udp.recv_from(&mut udp_buf) => {
-                match result {
-                    Ok((len, _addr)) => {
-                        let now = start.elapsed().as_millis() as u64;
-                        runtime.push_event(RuntimeEvent::InboundPacket {
-                            interface_name: "udp0".to_string(),
-                            raw: udp_buf[..len].to_vec(),
-                            now,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(err = %e, "UDP recv error");
-                    }
-                }
-            }
-
             // ── 250ms timer tick ─────────────────────────────────────
             _ = timer.tick() => {
                 let now = start.elapsed().as_millis() as u64;
@@ -3447,8 +3300,8 @@ pub async fn run(
                     // Tick immediately so content is committed before replying.
                     for action in runtime.tick() {
                         handle_runtime_action_or_dispatch(
-                            action, &session, &zenoh_tx, &udp,
-                            &broadcast_addr, &app, &closing, &own_zid,
+                            action, &session, &zenoh_tx,
+                            &app, &closing, &own_zid,
                             dm_outbox.as_ref(), crdt_state.as_ref(),
                             cas_handle.as_ref(), unicast_send_tx.as_ref(),
                             community_registry.as_ref(),
@@ -3478,8 +3331,8 @@ pub async fn run(
                         });
                         for action in runtime.tick() {
                             handle_runtime_action_or_dispatch(
-                                action, &session, &zenoh_tx, &udp,
-                                &broadcast_addr, &app, &closing, &own_zid,
+                                action, &session, &zenoh_tx,
+                                &app, &closing, &own_zid,
                                 dm_outbox.as_ref(), crdt_state.as_ref(),
                                 cas_handle.as_ref(), unicast_send_tx.as_ref(),
                                 community_registry.as_ref(),
@@ -5247,8 +5100,6 @@ pub async fn run(
                     action,
                     &session,
                     &zenoh_tx,
-                    &udp,
-                    &broadcast_addr,
                     &app,
                     &closing,
                     &own_zid,
@@ -5275,8 +5126,6 @@ pub async fn run(
                 retry_action,
                 &session,
                 &zenoh_tx,
-                &udp,
-                &broadcast_addr,
                 &app,
                 &closing,
                 &own_zid,
@@ -5480,7 +5329,7 @@ fn emit_group_voice_signal_event(
 ///
 /// NOTE: a focused unit test for the requeue behavior is deferred — the
 /// `handle_runtime_action_or_dispatch` helper requires an `AppHandle`,
-/// `zenoh::Session`, `UdpSocket`, and several other handles to call,
+/// `zenoh::Session`, and several other handles to call,
 /// which the existing event_loop test modules don't currently scaffold.
 /// The fix-up is verified via type-checking of the requeue branch + the
 /// dm_outbox-side tests for the channel-pressure path.
@@ -5489,8 +5338,6 @@ async fn handle_runtime_action_or_dispatch(
     action: RuntimeAction,
     session: &zenoh::Session,
     zenoh_tx: &mpsc::Sender<ZenohEvent>,
-    udp: &UdpSocket,
-    broadcast_addr: &SocketAddr,
     app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     closing: &Arc<AtomicBool>,
     own_zid: &str,
@@ -5667,42 +5514,19 @@ async fn handle_runtime_action_or_dispatch(
         // diagnostic).
         return;
     }
-    dispatch_action(
-        action,
-        session,
-        zenoh_tx,
-        udp,
-        broadcast_addr,
-        app,
-        closing,
-        own_zid,
-    )
-    .await;
+    dispatch_action(action, session, zenoh_tx, app, closing, own_zid).await;
 }
 
 /// Dispatch a single RuntimeAction to the platform I/O layer.
-#[allow(clippy::too_many_arguments)] // pre-existing; tracked for refactor
 async fn dispatch_action(
     action: RuntimeAction,
     session: &zenoh::Session,
     zenoh_tx: &mpsc::Sender<ZenohEvent>,
-    udp: &UdpSocket,
-    broadcast_addr: &SocketAddr,
     app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     closing: &Arc<AtomicBool>,
     own_zid: &str,
 ) {
     match action {
-        // ── Network: Reticulum packet send ───────────────────────────
-        RuntimeAction::SendOnInterface { raw, weight, .. } => {
-            if let Some(w) = weight {
-                if rand::random::<f32>() >= w {
-                    return;
-                }
-            }
-            let _ = udp.send_to(&raw, broadcast_addr).await;
-        }
-
         // ── Zenoh: publish ───────────────────────────────────────────
         RuntimeAction::Publish { key_expr, payload } => {
             let session = session.clone();
@@ -9023,35 +8847,4 @@ pub async fn open_session_with_runtime(
     let session = zenoh::session::init(runtime.clone().into()).await?;
     runtime.start().await?;
     Ok((runtime, session))
-}
-
-#[cfg(test)]
-mod reticulum_port_tests {
-    #[test]
-    fn parse_reticulum_port_matrix() {
-        assert_eq!(
-            super::parse_reticulum_port(None),
-            Some(4242),
-            "unset → default"
-        );
-        assert_eq!(
-            super::parse_reticulum_port(Some("")),
-            Some(4242),
-            "blank → default"
-        );
-        assert_eq!(super::parse_reticulum_port(Some("  ")), Some(4242));
-        assert_eq!(super::parse_reticulum_port(Some("0")), None, "0 → disabled");
-        assert_eq!(super::parse_reticulum_port(Some("4343")), Some(4343));
-        assert_eq!(super::parse_reticulum_port(Some(" 4343 ")), Some(4343));
-        assert_eq!(
-            super::parse_reticulum_port(Some("notaport")),
-            Some(4242),
-            "garbage → warn + default (Reticulum is default-on)"
-        );
-        assert_eq!(
-            super::parse_reticulum_port(Some("70000")),
-            Some(4242),
-            "u16 overflow → default"
-        );
-    }
 }
