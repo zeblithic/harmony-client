@@ -2583,6 +2583,28 @@ async fn internal_task(mut ctx: InternalCtx) {
                     }
                     pub_result
                 };
+                // ZEB-463: a graceful shutdown can race a concurrent rollback
+                // that removes this community's persistence directory — a
+                // freshly-spawned engine rolled back via
+                // shutdown_engine_and_cleanup_persistence (detached task)
+                // while shutdown_all flushes the SAME engine. The final flush
+                // then fails with Persist(ENOENT) against a directory that is
+                // being intentionally discarded, which is not a durability
+                // failure. Downgrade that one case to Ok; ANY other persist
+                // failure — the dir still exists — still propagates loudly per
+                // ZEB-460.
+                let final_result =
+                    if shutdown_flush_lost_race_to_dir_removal(&final_result, &ctx.paths.crdt) {
+                        tracing::debug!(
+                            community_id = ?ctx.community_id,
+                            "community persistence dir removed during shutdown \
+                             (concurrent rollback); treating the final flush as a \
+                             no-op (ZEB-463)"
+                        );
+                        Ok(())
+                    } else {
+                        final_result
+                    };
                 // Surface persist+publish failures to the caller —
                 // suppressing them mirrors the same silent-corruption
                 // failure mode `owner_state_sync` explicitly rejects.
@@ -3629,6 +3651,30 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
 /// corrupt the live file. Failures bubble up as
 /// `CommunitySyncError::Persist` so the shutdown arm can surface them
 /// to the caller; the wakeup / merge arms log + continue.
+/// ZEB-463: decide whether a graceful-shutdown final-flush failure is the
+/// benign "lost the race with a concurrent rollback that removed this
+/// community's persistence directory" case.
+///
+/// `write_atomic` always `create_dir_all`s its parent before writing, so the
+/// only way a shutdown persist fails with the directory missing is a
+/// concurrent `remove_dir_all` from the rollback path
+/// (`shutdown_engine_and_cleanup_persistence`, spawned detached by the spawn
+/// guard's Drop/abort) racing `shutdown_all`'s flush of the same engine. The
+/// data is being discarded on purpose, so the flush failure is not a
+/// durability loss.
+///
+/// Returns `true` ONLY for a `Persist` error whose target directory is now
+/// gone. Every other outcome — `Ok`, a non-`Persist` error, or a `Persist`
+/// error whose directory still exists (a real disk failure) — returns `false`
+/// so it still propagates loudly (ZEB-460).
+fn shutdown_flush_lost_race_to_dir_removal(
+    result: &Result<(), CommunitySyncError>,
+    crdt_path: &std::path::Path,
+) -> bool {
+    matches!(result, Err(CommunitySyncError::Persist(_)))
+        && crdt_path.parent().map(|p| !p.exists()).unwrap_or(false)
+}
+
 async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     // Snapshot under locks — clones are cheap (CRDT is a BTreeMap of
     // signed events, tracker is a small per-device map), and far
@@ -5324,6 +5370,50 @@ mod tests {
             fix.registry.has_engine(&community_id).await,
             "engine must remain after commit"
         );
+    }
+
+    /// ZEB-463 regression: a graceful-shutdown final flush that fails
+    /// because a concurrent rollback removed the community's persistence
+    /// directory must be treated as a benign no-op (the data is being
+    /// discarded on purpose), while EVERY other failure still propagates.
+    ///
+    /// The race itself (a `remove_dir_all` interleaving inside
+    /// `write_atomic`, which `create_dir_all`s its parent first) is a true
+    /// TOCTOU and not deterministically reproducible, so we test the exact
+    /// decision predicate the shutdown arm applies, against a real present
+    /// vs. absent directory.
+    #[test]
+    fn shutdown_flush_dir_removal_predicate_only_downgrades_persist_with_missing_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let present_dir = tmp.path().join("communities").join("aa");
+        std::fs::create_dir_all(&present_dir).expect("mkdir present");
+        let crdt_present = present_dir.join("crdt.cbor");
+
+        // Never created — models the dir a concurrent rollback removed.
+        let crdt_missing = tmp.path().join("communities").join("bb").join("crdt.cbor");
+
+        // Persist error + dir gone → benign (downgrade to Ok).
+        assert!(shutdown_flush_lost_race_to_dir_removal(
+            &Err(CommunitySyncError::Persist(
+                "io: No such file or directory (os error 2)".into()
+            )),
+            &crdt_missing,
+        ));
+        // Persist error + dir present → a REAL durability failure: must propagate.
+        assert!(!shutdown_flush_lost_race_to_dir_removal(
+            &Err(CommunitySyncError::Persist("io: disk full".into())),
+            &crdt_present,
+        ));
+        // Success is never downgraded.
+        assert!(!shutdown_flush_lost_race_to_dir_removal(
+            &Ok(()),
+            &crdt_missing
+        ));
+        // A non-Persist error (even with a missing dir) is not this case.
+        assert!(!shutdown_flush_lost_race_to_dir_removal(
+            &Err(CommunitySyncError::TransportClosed),
+            &crdt_missing,
+        ));
     }
 
     /// Spec §7.1 #2: spawn engine, drop guard without commit, verify
