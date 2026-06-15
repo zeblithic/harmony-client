@@ -8082,7 +8082,11 @@ mod tests {
         // deposit-only transport. AttemptState now exists → deposit rung fires
         // → butler acks → mark_ack_delivered → surfaces in newly_delivered.
         let outcome2 = drain_with_deposit_only_transport(&mut o, &mut state, 15_000).await;
-        assert_eq!(mock.calls().len(), 1, "deposit rung must fire exactly once on tick 2");
+        assert_eq!(
+            mock.calls().len(),
+            1,
+            "deposit rung must fire exactly once on tick 2"
+        );
         let req = &mock.calls()[0];
         assert_eq!(req.entry_id, entry_id);
         assert_eq!(req.recipient_owner, bob);
@@ -8125,7 +8129,10 @@ mod tests {
             );
         }
 
-        let stored = state.outbox.get(&entry_id).expect("entry still present after all ticks");
+        let stored = state
+            .outbox
+            .get(&entry_id)
+            .expect("entry still present after all ticks");
         assert!(
             matches!(stored.delivery_status, DeliveryStatus::Pending),
             "entry stays Pending without a deposit client, never errored"
