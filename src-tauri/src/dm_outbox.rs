@@ -1643,7 +1643,6 @@ impl DmOutbox {
         outbox_arc: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
         state_arc: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
         cas: std::sync::Arc<dyn ContentStore>,
-        unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
         app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
         signed: crate::dm_envelope::DmCidNotifySigned,
         signature: [u8; 64],
@@ -1814,71 +1813,14 @@ impl DmOutbox {
                     });
             }
 
-            // Build + try_send acks (cheap — non-blocking).
-            let our_ack_devices = state_g
-                .owner_device_cache
-                .devices
-                .get(&outbox_g.self_owner)
-                .map(|e| e.devices.clone())
-                .filter(|devs| devs.contains(&outbox_g.our_signing_device_hash))
-                .unwrap_or_else(|| vec![outbox_g.our_signing_device_hash]);
-            let ack_signed = crate::dm_envelope::DmAckSigned {
-                space_id: signed.space_id,
-                message_cid: signed.message_cid,
-                ack_from_owner_addr: outbox_g.self_owner,
-                ack_from_devices: our_ack_devices,
-                signing_device_hash: outbox_g.our_signing_device_hash,
-            };
-            // Ack pipeline: build + encode + try_send. Failures here
-            // do NOT abort — apply_inbox already mutated state, and
-            // skipping the post-lock IPC emit would diverge UI from
-            // persisted state. Match the existing channel-pressure
-            // pattern below: log + continue. Sender retransmits the
-            // CidNotify which produces a fresh ack opportunity.
-            let ack_wire_opt =
-                match crate::dm_envelope::build_signed_ack(ack_signed, &outbox_g.signing_key) {
-                    Ok(packet) => match crate::dm_envelope::encode_packet(&packet) {
-                        Ok(w) => Some(w),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = ?DmReceiveError::Decode(format!("encode_packet ack: {e}")),
-                                "handle_cidnotify_lifted Phase C: ack encode failed; \
-                                 continuing to dm-received emit so UI stays in sync \
-                                 with persisted inbox; sender will retransmit CidNotify"
-                            );
-                            None
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            error = ?DmReceiveError::Decode(format!("build_signed_ack: {e}")),
-                            "handle_cidnotify_lifted Phase C: ack build failed; \
-                             continuing to dm-received emit so UI stays in sync \
-                             with persisted inbox; sender will retransmit CidNotify"
-                        );
-                        None
-                    }
-                };
-            // DORMANT (ZEB-474 → ZEB-473/Move 1a): the Reticulum unicast
-            // carrier is removed; these ack packets reach the pinned core's
-            // SendUnicastToDevice handler and are dropped (no worse than
-            // today — off-LAN acks already dropped). Move 1a rewires this
-            // fan-out onto the iroh tunnel. Delivery confirmation in the
-            // interim comes from the butler-deposit ack, not this read-ack.
-            if let Some(ack_wire) = ack_wire_opt {
-                for device in &signed.sender_devices {
-                    let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
-                    if let Err(e) = unicast_send_tx.try_send(UnicastSendRequest {
-                        destination_hash: dest_hash,
-                        packet: ack_wire.clone(),
-                    }) {
-                        tracing::warn!(
-                            error = ?e,
-                            "handle_cidnotify_lifted Phase C: ack fan-out dropped due to channel pressure; sender will retransmit CidNotify"
-                        );
-                    }
-                }
-            }
+            // ZEB-473 (Move 1a): the read-ack unicast fan-out (build DmAckSigned
+            // + try_send one per `signed.sender_devices`) was removed along with
+            // the Reticulum carrier (harmony#280). Those ack packets reached the
+            // dropped `SendUnicastToDevice` bridge and went nowhere, so removing
+            // the build+fan-out changes nothing observable. Delivery confirmation
+            // already comes from the butler-deposit ack, not this read-ack; the
+            // dm-received IPC emit below keeps the UI in sync. Re-wiring the
+            // read-ack onto the iroh tunnel is a later move.
 
             drain_outcome
         }; // locks dropped here
@@ -5357,8 +5299,11 @@ mod tests {
     /// returned errors / outcomes now inspect post-call state directly:
     /// - `state.inbox.contains_key(...)` for InboxEntry presence
     /// - `state.owner_device_cache.devices.get(...)` for cache state
-    /// - the `rx` channel for ack fan-out (drained from caller after this
-    ///   helper returns)
+    ///
+    /// ZEB-473 (Move 1a): the read-ack unicast fan-out was removed with the
+    /// Reticulum carrier, so `handle_cidnotify_lifted` no longer emits acks.
+    /// The `_tx` param is retained only so callers can keep a paired `rx` to
+    /// assert that NO ack fires; it is intentionally not forwarded to the fn.
     ///
     /// `&mut outbox` and `&mut state` are returned as the unwrapped owned
     /// values so callers can assign back: `let (outbox, state) = run(...)`.
@@ -5367,7 +5312,7 @@ mod tests {
         outbox: DmOutbox,
         state: OwnerState,
         cas: std::sync::Arc<dyn ContentStore>,
-        tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        _tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
         signed: crate::dm_envelope::DmCidNotifySigned,
         signature: [u8; 64],
         signed_bytes: Vec<u8>,
@@ -5382,7 +5327,6 @@ mod tests {
             std::sync::Arc::clone(&outbox_arc),
             std::sync::Arc::clone(&state_arc),
             cas,
-            tx,
             app,
             signed,
             signature,
@@ -5452,31 +5396,23 @@ mod tests {
         let entry = state.inbox.get(&inbox_key).unwrap();
         assert_eq!(entry.from, alice);
 
-        // One UnicastSendRequest emitted per sender device (one device
-        // here, so exactly one).
-        let req = rx.try_recv().expect("ack must have been pushed");
-        assert!(!req.packet.is_empty(), "ack packet bytes must be non-empty");
-        assert!(rx.try_recv().is_err(), "exactly one ack expected");
-        // Ack packet decodes as DmAck with our signing_device_hash.
-        let ack = crate::dm_envelope::decode_packet(&req.packet).unwrap();
-        match ack {
-            crate::dm_envelope::DmPacket::Ack { signed: ack, .. } => {
-                assert_eq!(ack.space_id, space_id);
-                assert_eq!(ack.message_cid, message_cid);
-                assert_eq!(ack.ack_from_owner_addr, bob);
-            }
-            other => panic!("expected DmAck, got {other:?}"),
-        }
+        // ZEB-473 (Move 1a): the read-ack unicast fan-out was removed with the
+        // Reticulum carrier (harmony#280) — `handle_cidnotify_lifted` no longer
+        // emits a DmAck. The InboxEntry write above is the load-bearing receive
+        // contract; delivery confirmation comes from the butler-deposit ack.
+        assert!(
+            rx.try_recv().is_err(),
+            "no read-ack must fire (Reticulum carrier removed, ZEB-473)"
+        );
     }
 
     #[tokio::test]
     async fn handle_unicast_cidnotify_duplicate_no_dm_received_emit() {
         // Atomic-emit semantics: a duplicate notify (same composite key)
         // MUST NOT re-emit dm-received. apply_inbox returns NoOp/Merged
-        // on the second call → newly_received stays empty. (The first
-        // call's full-ack-fan-out behavior is exercised by the happy-path
-        // test above; this test only checks the second-call
-        // empty-newly_received contract.)
+        // on the second call → newly_received stays empty. (This test only
+        // checks the second-call empty-newly_received contract; the read-ack
+        // fan-out was removed in ZEB-473 with the Reticulum carrier.)
         let alice = OwnerAddr([0x01; 16]);
         let bob = OwnerAddr([0x02; 16]);
         let space_id = SpaceId([7; 16]);
@@ -5519,9 +5455,9 @@ mod tests {
             .expect("first call must populate inbox")
             .clone();
         assert_eq!(first_entry.received_at.wall_ms, 500);
-        // Drain the ack the first call emitted so we can check the second
-        // call's emit count cleanly.
-        let _ = rx.try_recv();
+        // ZEB-473 (Move 1a): no read-ack fires anymore (Reticulum carrier
+        // removed); the channel is empty after the first call.
+        assert!(rx.try_recv().is_err(), "no read-ack must fire (ZEB-473)");
 
         // Second call — same packet bytes, different wall_now_ms (600).
         // apply_inbox returns Merged/NoOp (composite key already exists),
@@ -7009,7 +6945,7 @@ mod tests {
         let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
 
         let outbox = make_outbox_synthetic("bob-dev", bob);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
 
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
@@ -7020,7 +6956,6 @@ mod tests {
             std::sync::Arc::clone(&outbox_arc),
             std::sync::Arc::clone(&state_arc),
             std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
-            tx,
             app,
             signed,
             signature,
@@ -7058,8 +6993,9 @@ mod tests {
             .unwrap_or_else(|_| panic!("state Arc has lingering refs"))
             .into_inner();
 
-        // Phase C must have decrypted via prior-keys fallback,
-        // installed the InboxEntry, and fanned out one ack.
+        // Phase C must have decrypted via prior-keys fallback and
+        // installed the InboxEntry. ZEB-473 (Move 1a): the read-ack
+        // fan-out was removed with the Reticulum carrier, so no ack fires.
         let inbox_key = crate::owner_state_types::InboxKey {
             space_id,
             message_cid,
@@ -7070,8 +7006,10 @@ mod tests {
         );
         let entry = state.inbox.get(&inbox_key).unwrap();
         assert_eq!(entry.from, alice);
-        let req = rx.try_recv().expect("ack must have fanned out");
-        assert!(!req.packet.is_empty(), "ack packet must be non-empty");
+        assert!(
+            rx.try_recv().is_err(),
+            "no read-ack must fire (Reticulum carrier removed, ZEB-473)"
+        );
     }
 
     #[tokio::test]
@@ -7116,7 +7054,7 @@ mod tests {
         let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
 
         let outbox = make_outbox_synthetic("bob-dev", bob);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
         let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
@@ -7126,7 +7064,6 @@ mod tests {
             std::sync::Arc::clone(&outbox_arc),
             std::sync::Arc::clone(&state_arc),
             std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
-            tx,
             app,
             signed,
             signature,
@@ -7286,7 +7223,7 @@ mod tests {
         let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
 
         let outbox = make_outbox_synthetic("bob-dev", bob);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
         let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
@@ -7296,7 +7233,6 @@ mod tests {
             std::sync::Arc::clone(&outbox_arc),
             std::sync::Arc::clone(&state_arc),
             std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
-            tx,
             app,
             signed,
             signature,
@@ -7483,7 +7419,7 @@ mod tests {
             get_call_count: std::sync::atomic::AtomicUsize::new(0),
         });
         let outbox = make_outbox_synthetic("bob-dev", bob);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
         let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
@@ -7496,7 +7432,6 @@ mod tests {
             std::sync::Arc::clone(&outbox_arc),
             std::sync::Arc::clone(&state_arc),
             std::sync::Arc::clone(&cas) as std::sync::Arc<dyn ContentStore>,
-            tx,
             app,
             signed,
             signature,

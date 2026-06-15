@@ -53,7 +53,7 @@ use harmony_app::community_state_sync::{
     CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
-use harmony_app::dm_outbox::{DmOutbox, UnicastSendRequest};
+use harmony_app::dm_outbox::DmOutbox;
 use harmony_app::event_loop::{ChannelLogAdapterRequest, CommunityAdapterRequest};
 use harmony_app::iroh_endpoint::{alpn, IrohEndpoint};
 use harmony_app::iroh_invite_acceptor::IrohInviteHandshakeAcceptor;
@@ -249,7 +249,9 @@ struct TwoPartySetup {
     bob_dm_outbox: Arc<TokioMutex<DmOutbox>>,
     bob_channel_log_registry: Arc<ChannelLogRegistry>,
     bob_adapter_tx: mpsc::Sender<CommunityAdapterRequest>,
-    bob_unicast_tx: mpsc::Sender<UnicastSendRequest>,
+    // ZEB-473 (Move 1a): `bob_unicast_tx` removed with the Reticulum carrier.
+    // `bob_unicast_count` stays at 0 structurally (no unicast producer exists);
+    // the post-redeem assertion now documents that structural invariant.
     bob_unicast_count: Arc<AtomicUsize>,
 
     // ── pkarr ───────────────────────────────────────────────────────────
@@ -558,19 +560,13 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
         }
     });
 
-    let (bob_unicast_tx, mut bob_unicast_rx) = mpsc::channel::<UnicastSendRequest>(8);
-    // ZEB-325 PR #159 R6 (Cursor HIGH): count Reticulum unicast sends so
-    // the post-redeem assertion can prove the iroh-redeem path skipped
-    // the fan-out entirely when pre_delivered_countersign was in hand.
-    // Pre-fix, populating bob_crdt_state with alice's device (below)
-    // would have caused the fan-out to fire — the counter would be ≥1.
+    // ZEB-325 PR #159 R6 (Cursor HIGH): the iroh-redeem path must not enqueue
+    // any Reticulum unicast sends when a pre_delivered_countersign is in hand.
+    // ZEB-473 (Move 1a): the unicast channel was removed entirely, so this is
+    // now structurally guaranteed — `bob_unicast_count` stays at 0 with no
+    // producer/drainer. Retained so the post-redeem assertion still documents
+    // the invariant.
     let bob_unicast_count = Arc::new(AtomicUsize::new(0));
-    let bob_unicast_count_sink = Arc::clone(&bob_unicast_count);
-    tokio::spawn(async move {
-        while bob_unicast_rx.recv().await.is_some() {
-            bob_unicast_count_sink.fetch_add(1, Ordering::Relaxed);
-        }
-    });
 
     // ZEB-339 dual-identity DmOutbox wiring for Bob:
     //   self_owner            = bob_comm.owner  (community actor)
@@ -667,7 +663,6 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
         bob_dm_outbox,
         bob_channel_log_registry,
         bob_adapter_tx,
-        bob_unicast_tx,
         bob_unicast_count,
         invite_pub,
         pkarr_resolver,
@@ -848,7 +843,6 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             Arc::clone(&s.registry_bob),
             s.bob_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            s.bob_unicast_tx.clone(),
             Arc::clone(&s.bob_dm_outbox),
             Arc::clone(&s.bob_channel_log_registry),
             // ZEB-427: legacy tests predate the durability fence; pass no
@@ -1155,7 +1149,6 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
             Arc::clone(&s.registry_bob),
             s.bob_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            s.bob_unicast_tx.clone(),
             Arc::clone(&s.bob_dm_outbox),
             Arc::clone(&s.bob_channel_log_registry),
             // ZEB-427: legacy tests predate the durability fence; pass no
@@ -1425,7 +1418,6 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
             Arc::clone(&s.registry_bob),
             s.bob_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            s.bob_unicast_tx.clone(),
             Arc::clone(&s.bob_dm_outbox),
             Arc::clone(&s.bob_channel_log_registry),
             // ZEB-427: the engine under test — the fence must flush it
