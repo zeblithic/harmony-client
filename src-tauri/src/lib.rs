@@ -21480,7 +21480,6 @@ pub async fn redeem_invite_inner<F>(
     channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     fence_check: F,
     identity_dir: Option<std::path::PathBuf>,
-    allow_no_reticulum_destinations: bool,
 ) -> Result<RedeemInviteResultDto, String>
 where
     F: Fn() -> Result<(), String>,
@@ -21501,7 +21500,6 @@ where
         channel_log_registry,
         fence_check,
         identity_dir,
-        allow_no_reticulum_destinations,
         RedeemInviteOverrides::default(),
     )
     .await
@@ -21544,14 +21542,12 @@ pub async fn redeem_invite_inner_with_overrides<F>(
     // Write failure is always non-fatal — the join proceeds; the user just won't
     // see pre-fork history.
     identity_dir: Option<std::path::PathBuf>,
-    // ZEB-325 Phase 2c: when true, skip the Reticulum-destinations fast-fail
-    // (`destinations.is_empty()` early-Err). The caller has guaranteed an
-    // alternate transport (typically iroh-borne Zenoh CRDT sync) and the
-    // PendingJoin event will reach the admin via the engine's state-root
-    // publisher rather than the per-device unicast fan-out. Default false at
-    // every existing callsite to preserve current redeem_invite IPC semantics
-    // (no known device → invite cannot route).
-    allow_no_reticulum_destinations: bool,
+    // ZEB-474 (Move 2): the `allow_no_reticulum_destinations` fast-fail was
+    // removed — invite redemption always proceeds via iroh (Zenoh CRDT sync /
+    // iroh handshake). The `destinations.is_empty()` guard is gone; the
+    // dormant PendingJoin unicast fan-out (Site 3) still routes through
+    // `unicast_send_tx` and will be rewired in Move 1a (ZEB-473).
+    //
     // ZEB-325 Phase 2c option A: pre-minted artifacts + pre-delivered
     // counter-sign event. See `RedeemInviteOverrides` docs.
     overrides: RedeemInviteOverrides,
@@ -22066,58 +22062,40 @@ where
             }
         }
 
-        // 7c. Resolve inviter's Reticulum destination(s) and send.
+        // 7c. Dormant PendingJoin unicast fan-out (ZEB-474 → ZEB-473/Move 1a).
         //
-        // ZEB-325 PR #159 R6 (Cursor HIGH): when `pre_delivered_countersign`
-        // is Some, the countersign has already been inserted locally at
-        // step 7b above — Reticulum fan-out is not the request channel
-        // for this redemption (iroh already discharged it). Skip the
-        // entire fan-out block. Without this guard, a joiner with stale
-        // Reticulum DM cache for the inviter (destinations non-empty)
-        // would take the fan-out path; if every `try_send` failed
-        // (likely as Reticulum is being deprioritized) the function
-        // would Err and the rollback would tear down the engine even
-        // though the countersign is already committed.
+        // The Reticulum destinations fast-fail (`destinations.is_empty()` early-Err
+        // guarded by `allow_no_reticulum_destinations`) is removed (ZEB-474 Move 2):
+        // invite redemption always proceeds via iroh (Zenoh CRDT sync / iroh
+        // handshake) — that was exactly the `allow_no_reticulum_destinations == true`
+        // behavior. The PendingJoin reaches the admin via the engine's state-root
+        // publisher.
         //
-        // The original `allow_no_reticulum_destinations` gate below
-        // remains correct for the empty-destinations case it was
-        // designed for, but it's now subordinate to the stronger
-        // signal: "we already have the countersign, no transport
-        // request is needed."
+        // The unicast fan-out below is DORMANT (ZEB-474 → ZEB-473/Move 1a): the
+        // Reticulum carrier is gone; these packets reach the pinned core's
+        // SendUnicastToDevice handler and are dropped (no worse than today off-LAN).
+        // Move 1a (ZEB-473) rewires this fan-out onto the iroh tunnel.
+        //
+        // ZEB-325 PR #159 R6: when `pre_delivered_countersign` is Some, the
+        // countersign has already been inserted at step 7b — skip the fan-out
+        // entirely (it was never the request channel for the iroh handshake path).
         let inviter_addr = payload.admin_addr;
         if overrides.pre_delivered_countersign.is_some() {
             tracing::debug!(
                 inviter = %hex::encode(inviter_addr.0),
                 "redeem_invite_inner: pre_delivered_countersign present — skipping \
-                 Reticulum unicast fan-out (countersign already inserted at step 7b)"
+                 dormant unicast fan-out (countersign already inserted at step 7b)"
             );
         } else {
             let destinations =
                 resolve_destinations_for_owner(crdt_state.as_ref(), inviter_addr).await;
             if destinations.is_empty() {
-                if allow_no_reticulum_destinations {
-                    // ZEB-325 Phase 2c: no Reticulum destinations — but the caller
-                    // has guaranteed an alternate transport (iroh-borne Zenoh CRDT
-                    // sync). Skip the Reticulum unicast fan-out entirely and
-                    // proceed to the oneshot await; the engine's state-root
-                    // publisher will carry the PendingJoin to the inviter via
-                    // Zenoh once an iroh link is up.
-                    tracing::debug!(
-                        inviter = %hex::encode(inviter_addr.0),
-                        "redeem_invite_inner: no Reticulum destinations; relying on CRDT sync \
-                         (allow_no_reticulum_destinations=true)"
-                    );
-                } else {
-                    // No known device for inviter → drop oneshot.
-                    let _ = community_registry
-                        .take_pending_redemption(&minted.bootstrap_join.id)
-                        .await;
-                    // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                    return Err(format!(
-                        "no known device for inviter {} — invite cannot route",
-                        hex::encode(inviter_addr.0)
-                    ));
-                }
+                // ZEB-474: no destinations — proceed via CRDT sync (iroh-only now).
+                tracing::debug!(
+                    inviter = %hex::encode(inviter_addr.0),
+                    "redeem_invite_inner: no unicast destinations; \
+                     proceeding via CRDT sync (ZEB-474: Reticulum carrier removed)"
+                );
             } else {
                 // Per-destination fan-out with at-least-one-success semantics.
                 //
@@ -22651,7 +22629,6 @@ pub(crate) async fn redeem_invite_impl(
         channel_log_registry,
         fence_check,
         crate::owner_commands::resolve_identity_dir().ok(),
-        false, // ZEB-325: redeem_invite IPC keeps Reticulum-required semantics.
     )
     .await?;
 
@@ -22793,7 +22770,6 @@ where
         channel_log_registry,
         fence_check,
         crate::owner_commands::resolve_identity_dir().ok(),
-        false, // ZEB-325: open-community wrapper keeps Reticulum-required semantics.
     )
     .await
 }
@@ -23208,7 +23184,6 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             None,  // identity_dir: no fork fields in this test
-            false, // ZEB-325: happy path uses Reticulum-required semantics.
         )
         .await;
 
@@ -23226,508 +23201,6 @@ mod redeem_invite_inner_tests {
                 .has_pending_transaction_for_test(&community_id),
             "happy path: channel_log transaction must be committed (no lingering pending entry)"
         );
-    }
-
-    // ── ZEB-325 Phase 2c: allow_no_reticulum_destinations gate ─────────────────
-
-    /// ZEB-325 Phase 2c: when caller passes `allow_no_reticulum_destinations =
-    /// true` and `resolve_destinations_for_owner` returns empty, the function
-    /// must NOT early-return with "no known device for inviter"; it must
-    /// proceed straight to the oneshot await. With no admin device sending a
-    /// counter-sign (which is the whole point of the iroh path — the wire
-    /// goes via CRDT sync, but in this unit test there is no Zenoh session),
-    /// the oneshot will time out after `HARMONY_REDEEM_INVITE_TIMEOUT_MS`
-    /// (we set it to 500ms for speed). The function must then return Ok with
-    /// `pending: true`, encoding "PendingJoin is on the wire; admins will
-    /// counter-sign when they next come online" — same semantics as the
-    /// existing 5s fast-path timeout.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn redeem_invite_inner_allow_no_reticulum_destinations_skips_fast_fail() {
-        // Speed the oneshot timeout (default 5s) so the test runs in <1s.
-        // SAFETY: env var; nextest isolates each test in its own process so
-        // no cross-test races.
-        // SAFETY: set_var is unsafe in Rust 2024; this test owns its env.
-        unsafe {
-            std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", "500");
-        }
-
-        // ── Custom fixture (cannot use build_redeem_invite_test_fixture) ──
-        //
-        // ZEB-254 verify_event for PendingJoin (community_membership.rs:
-        // PendingJoinJoinerPubMismatch) requires that
-        // `Identity::from_public_bytes(joiner_identity_pub).address_hash`
-        // equals `event.actor.0`. mint_redemption builds joiner_identity_pub
-        // from `signing_key` alone: X25519 priv derived via
-        // ed25519_priv_to_x25519 (dalek to_scalar_bytes), Ed25519 pub from
-        // signing_key.verifying_key(). The shared fixture's `self_owner` is
-        // derived from `PrivateIdentity::from_seed`'s HKDF-x25519 (independent
-        // of ed25519), so its address_hash does NOT match the mint-derived
-        // hash — fine for the OPEN happy_path test (Join verifies by signature
-        // alone), but fails the PendingJoin actor-hash gate. This test builds
-        // its own registry whose self_owner + resolver agree with the
-        // signing-key-derived joiner_identity_pub.
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-
-        // ZEB-339: the joiner is an enrolled-device owner. mint_redemption builds
-        // a PendingJoin whose actor = owner_id, signed by the device key, carrying
-        // the joiner's Master cert — verify_event resolves the signer via the cert
-        // (cert.owner_id == actor), superseding the old joiner-pub address-hash
-        // gate. A separate PrivateIdentity backs the DM-layer DmOutbox plumbing.
-        let joiner_owner = crate::community_membership::mint_test_owner(0xBB);
-        let joiner_self_owner = joiner_owner.owner;
-        let signing_key = std::sync::Arc::new(joiner_owner.device_key.clone());
-        let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        // ZEB-339: admin is now an enrolled-device owner. admin_addr is the
-        // master/owner hash; the bootstrap Join is signed by the device key and
-        // carries the admin's EnrollmentCert. verify_admin_bootstrap uses
-        // enrolled_key_from_cert + verify_membership_signer (cert model).
-        // The invite token is also signed by the admin's device key so
-        // verify_invite_token_sig_with_enrolled can validate it against the
-        // enrolled device key materialized from the admin's bootstrap Join.
-        let admin_owner = crate::community_membership::mint_test_owner(0xAA);
-        let admin_addr = admin_owner.owner;
-        // admin_pub: a 64-byte [x25519 || ed25519] representation used by the
-        // TwoOwnerResolver (for the legacy rehydration path) and bound as
-        // admin_identity_pub on the engine. The engine ignores it post-ZEB-339
-        // (VerifyContext no longer carries it), but we must supply a plausible
-        // value so bind_admin_identity_pub succeeds.
-        let admin_pub = {
-            let ed25519_pub = admin_owner.cert.device_pubkeys.classical.ed25519_verify;
-            let mut combined = [0u8; 64];
-            combined[32..].copy_from_slice(&ed25519_pub);
-            combined
-        };
-
-        // The 64-byte joiner pub carried for the DM/transport layer (X25519 ||
-        // Ed25519 derived from the joiner's device key). Not consumed by the
-        // ZEB-339 membership signer-resolution path.
-        let joiner_pub_64 = {
-            let x25519_priv = crate::dm_signing::ed25519_priv_to_x25519(&signing_key);
-            let x25519_pub =
-                x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
-            let ed25519_pub = signing_key.verifying_key().to_bytes();
-            let mut combined = [0u8; 64];
-            combined[..32].copy_from_slice(x25519_pub.as_bytes());
-            combined[32..].copy_from_slice(&ed25519_pub);
-            combined
-        };
-
-        struct TwoOwnerResolver {
-            admin: OwnerAddr,
-            admin_pub: [u8; 64],
-            joiner: OwnerAddr,
-            joiner_pub: [u8; 64],
-        }
-        #[async_trait::async_trait]
-        impl crate::community_state_sync::IdentityResolver for TwoOwnerResolver {
-            async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
-                if *addr == self.admin {
-                    Some(self.admin_pub)
-                } else if *addr == self.joiner {
-                    Some(self.joiner_pub)
-                } else {
-                    None
-                }
-            }
-        }
-
-        let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
-        let cs: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
-            cas_op_tx,
-            std::time::Duration::from_millis(1000),
-        ));
-        let community_registry =
-            std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
-                device_id: "joiner-dev".into(),
-                content_store: cs,
-                identity_resolver: std::sync::Arc::new(TwoOwnerResolver {
-                    admin: admin_addr,
-                    admin_pub,
-                    joiner: joiner_self_owner,
-                    joiner_pub: joiner_pub_64,
-                }),
-                identity_dir: tmp.path().to_path_buf(),
-                debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
-                error_tx: None,
-                delta_tx: None,
-                self_owner: joiner_self_owner,
-                signing_key: std::sync::Arc::clone(&signing_key),
-                crdt_state: None,
-                nav_emitter: None,
-            }));
-
-        let (community_adapter_tx, _community_adapter_rx) =
-            mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
-        let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
-
-        // ZEB-339: use new_synthetic — DmOutbox cert is a separate DM-layer
-        // fixture; the community-redeem join uses enrollment_cert (joiner_owner.cert).
-        let test_owner_lib16712 = crate::community_membership::mint_test_owner(0xE2);
-        let community_signing_key_lib16712 = std::sync::Arc::new(
-            ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16712.device_key.to_bytes()),
-        );
-        let enrollment_cert_lib16712 = test_owner_lib16712.cert;
-        // ZEB-339: the cert passed to redeem_invite_inner is the JOINER's own
-        // cert (binds joiner_self_owner → signing_key); the DmOutbox cert above
-        // stays a separate DM-layer fixture.
-        let enrollment_cert = joiner_owner.cert.clone();
-        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new_synthetic(
-            "joiner-dev".into(),
-            joiner_self_owner,
-            DeviceIdentityHash(joiner_self_owner.0),
-            std::sync::Arc::clone(&signing_key),
-            std::sync::Arc::new(joiner_identity),
-            community_signing_key_lib16712,
-            enrollment_cert_lib16712,
-        )));
-
-        let (channel_log_adapter_tx, _channel_log_adapter_rx) =
-            mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
-        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
-            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
-        let channel_log_registry =
-            std::sync::Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
-                adapter_request_tx: channel_log_adapter_tx,
-                sink,
-                identity_dir: tmp.path().to_path_buf(),
-                self_owner: joiner_self_owner,
-                self_device_id: "joiner-dev".into(),
-                signing_key: std::sync::Arc::clone(&signing_key),
-                engine_config: ChannelLogEngineConfig::default(),
-                transport_epoch_rx: None,
-            }));
-
-        let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
-        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
-
-        // ── Build the invite-only payload ──
-        let community_id = SpaceId([0xf6; 16]);
-        let membership_key = EpochKey::new([0x42; 32]);
-
-        // ZEB-339: build the admin's cert-bearing bootstrap-Join. The event
-        // is signed by the admin's device key and carries the admin's
-        // EnrollmentCert so verify_admin_bootstrap can run enrolled_key_from_cert
-        // + verify_membership_signer (cert model). After insertion, the admin's
-        // device key is materialized into enrolled_device_keys, which allows
-        // verify_invite_token_sig_with_enrolled to validate the invite token.
-        let admin_bootstrap = {
-            let payload = crate::community_membership::EventPayload {
-                id: [0x11; 16],
-                community_id,
-                kind: crate::community_membership::MembershipEventKind::Join,
-                actor: admin_addr,
-                at: Hlc {
-                    wall_ms: 900,
-                    logical: 0,
-                    device_id: "admin-dev".into(),
-                },
-            };
-            let mut ev = crate::community_membership::sign_event(&payload, &admin_owner.device_key)
-                .expect("sign admin bootstrap");
-            ev.enrollment = Some(admin_owner.cert.clone());
-            ev
-        };
-
-        // Build the admin-signed invite-token. ZEB-339: the token is signed
-        // by the admin's device key so verify_invite_token_sig_with_enrolled
-        // (P5 in verify_event for PendingJoin) can validate it against the
-        // enrolled device key materialized from the admin's bootstrap Join.
-        let token_minted_at = Hlc {
-            wall_ms: 950,
-            logical: 0,
-            device_id: "admin-dev".into(),
-        };
-        let placeholder_token = crate::community_invite::InviteToken {
-            inviter: admin_addr,
-            invitee_hint: Some(joiner_self_owner),
-            minted_at: token_minted_at.clone(),
-            expires_at: None,
-            sig: [0u8; 64],
-        };
-        let token_payload_bytes =
-            crate::community_invite::canonical_invite_token_bytes(&placeholder_token)
-                .expect("canonical token bytes");
-        let token_sig = {
-            use ed25519_dalek::Signer as _;
-            admin_owner.device_key.sign(&token_payload_bytes).to_bytes()
-        };
-        let invite_token = crate::community_invite::InviteToken {
-            inviter: admin_addr,
-            invitee_hint: Some(joiner_self_owner),
-            minted_at: token_minted_at,
-            expires_at: None,
-            sig: token_sig,
-        };
-
-        // Seal the epoch key to the joiner's x25519 pub (derived from the
-        // joiner's ed25519 signing key, matching mint_redemption's derivation).
-        let sealed_epoch_key = {
-            let joiner_ed25519_pub32 = signing_key.verifying_key().to_bytes();
-            let x25519_pub = crate::dm_signing::ed25519_pub_to_x25519(&joiner_ed25519_pub32)
-                .expect("ed25519→x25519");
-            crate::dm_signing::seal_to_owner(&x25519_pub, membership_key.as_bytes())
-                .expect("seal epoch key")
-        };
-
-        let invite_payload = CommunityInvitePayload {
-            community_id,
-            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
-                epoch: 0,
-                sealed_epoch_key,
-                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
-            },
-            admin_addr,
-            community_name: "Phase2cTestCom".into(),
-            is_invite_only: true,
-            expires_at: None,
-            invite_token: Some(invite_token),
-            admin_bootstrap: Some(admin_bootstrap),
-            admin_identity_pub: Some(admin_pub),
-            forked_from: None,
-            pre_fork_snapshot: None,
-            // ZEB-339: invite-only payloads must carry the inviter's
-            // EnrollmentCert. This test exercises the no-Reticulum-destinations
-            // fast-fail skip, not cert verification, so any valid cert suffices.
-            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA1).cert),
-            untargeted_decrypt_key: None,
-        };
-
-        let invite_url =
-            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
-
-        // Pre-call: owner-state has no devices for admin_addr →
-        // resolve_destinations_for_owner returns empty.
-        // (Implicit from OwnerState::default().)
-
-        // Drive with allow_no_reticulum_destinations = true.
-        let result = redeem_invite_inner(
-            invite_url,
-            std::sync::Arc::clone(&crdt_state),
-            std::sync::Arc::clone(&hlc_tracker),
-            "joiner-dev".to_string(),
-            joiner_self_owner,
-            std::sync::Arc::clone(&signing_key),
-            enrollment_cert.clone(),
-            std::sync::Arc::clone(&community_registry),
-            community_adapter_tx,
-            None, // ZEB-434: no transport-epoch watch in this test
-            unicast_send_tx,
-            std::sync::Arc::clone(&dm_outbox),
-            std::sync::Arc::clone(&channel_log_registry),
-            || Ok(()),
-            None,
-            true, // allow_no_reticulum_destinations
-        )
-        .await;
-
-        // Must Ok (not the "no known device for inviter" Err that would
-        // fire with allow_no_reticulum_destinations = false). The gate
-        // bypass is the load-bearing assertion: function proceeded past
-        // the destinations.is_empty() check instead of early-returning Err.
-        let dto = result.expect(
-            "redeem_invite_inner with allow_no_reticulum_destinations=true \
-             and empty destinations must NOT early-return Err; it must \
-             proceed past the destinations fast-fail to the oneshot await",
-        );
-
-        // The PendingJoin is on the wire (engine state-root publisher will
-        // carry it via Zenoh CRDT sync once an iroh link is up). Note:
-        // `dto.pending` here may be false because the engine's local
-        // `insert_local_event` hook (community_state_sync.rs ~1523) fires
-        // the oneshot keyed on `event.id` (which equals the PendingJoin id
-        // we register against), so the oneshot await returns Ok immediately
-        // rather than timing out. This is identical to the OPEN happy_path
-        // semantics. Either way, the load-bearing assertion is "Ok, not the
-        // pre-Phase-2c early-Err". When iroh-borne CRDT sync actually
-        // delivers a JoinCountersign from the admin, dto.pending=false
-        // accurately reflects the joined state.
-        assert_eq!(dto.community_id, hex::encode(community_id.0));
-        assert_eq!(dto.community_name, "Phase2cTestCom");
-        assert!(dto.is_invite_only);
-
-        // Belt-and-suspenders: prove the gate is load-bearing. Re-run with
-        // allow_no_reticulum_destinations = false and verify we get the
-        // expected pre-Phase-2c Err. We have to rebuild the invite_url and
-        // a fresh registry (the prior call mutated state). Construct only
-        // what's needed for the call to reach the destinations check.
-        let tmp2 = tempfile::TempDir::new().expect("tempdir 2");
-        let (cas_op_tx2, _cas_op_rx2) = mpsc::channel(8);
-        let cs2: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
-            cas_op_tx2,
-            std::time::Duration::from_millis(1000),
-        ));
-        let community_registry2 =
-            std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
-                device_id: "joiner-dev".into(),
-                content_store: cs2,
-                identity_resolver: std::sync::Arc::new(TwoOwnerResolver {
-                    admin: admin_addr,
-                    admin_pub,
-                    joiner: joiner_self_owner,
-                    joiner_pub: joiner_pub_64,
-                }),
-                identity_dir: tmp2.path().to_path_buf(),
-                debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
-                error_tx: None,
-                delta_tx: None,
-                self_owner: joiner_self_owner,
-                signing_key: std::sync::Arc::clone(&signing_key),
-                crdt_state: None,
-                nav_emitter: None,
-            }));
-        let (adapter_tx2, _adapter_rx2) =
-            mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
-        let (unicast_tx2, _unicast_rx2) = mpsc::channel::<UnicastSendRequest>(16);
-        let crdt_state2 = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
-        let hlc_tracker2 = std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
-
-        // Re-encode the same invite_payload (different community_id so the
-        // registry doesn't reject as duplicate). Rebuild signed admin
-        // bootstrap + invite_token for the new community_id.
-        // ZEB-339: use the same admin_owner (cert model) as run 1.
-        let community_id_b = SpaceId([0xf7; 16]);
-        let admin_bootstrap_b = {
-            let payload = crate::community_membership::EventPayload {
-                id: [0x12; 16],
-                community_id: community_id_b,
-                kind: crate::community_membership::MembershipEventKind::Join,
-                actor: admin_addr,
-                at: Hlc {
-                    wall_ms: 900,
-                    logical: 0,
-                    device_id: "admin-dev".into(),
-                },
-            };
-            let mut ev = crate::community_membership::sign_event(&payload, &admin_owner.device_key)
-                .expect("sign admin bootstrap (run 2)");
-            ev.enrollment = Some(admin_owner.cert.clone());
-            ev
-        };
-        let placeholder_token_b = crate::community_invite::InviteToken {
-            inviter: admin_addr,
-            invitee_hint: Some(joiner_self_owner),
-            minted_at: Hlc {
-                wall_ms: 950,
-                logical: 0,
-                device_id: "admin-dev".into(),
-            },
-            expires_at: None,
-            sig: [0u8; 64],
-        };
-        let token_payload_bytes_b =
-            crate::community_invite::canonical_invite_token_bytes(&placeholder_token_b)
-                .expect("canonical token bytes (run 2)");
-        let token_sig_b = {
-            use ed25519_dalek::Signer as _;
-            admin_owner
-                .device_key
-                .sign(&token_payload_bytes_b)
-                .to_bytes()
-        };
-        let invite_token_b = crate::community_invite::InviteToken {
-            sig: token_sig_b,
-            ..placeholder_token_b
-        };
-        let sealed_epoch_key_b = {
-            let joiner_ed25519_pub32 = signing_key.verifying_key().to_bytes();
-            let x25519_pub = crate::dm_signing::ed25519_pub_to_x25519(&joiner_ed25519_pub32)
-                .expect("ed25519→x25519 (run 2)");
-            crate::dm_signing::seal_to_owner(&x25519_pub, membership_key.as_bytes())
-                .expect("seal epoch key (run 2)")
-        };
-        let invite_payload_b = CommunityInvitePayload {
-            community_id: community_id_b,
-            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
-                epoch: 0,
-                sealed_epoch_key: sealed_epoch_key_b,
-                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
-            },
-            admin_addr,
-            community_name: "Phase2cTestComB".into(),
-            is_invite_only: true,
-            expires_at: None,
-            invite_token: Some(invite_token_b),
-            admin_bootstrap: Some(admin_bootstrap_b),
-            admin_identity_pub: Some(admin_pub),
-            forked_from: None,
-            pre_fork_snapshot: None,
-            // ZEB-339: invite-only payloads must carry the inviter's cert.
-            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA2).cert),
-            untargeted_decrypt_key: None,
-        };
-        let invite_url_b = crate::community_invite::encode_invite_url(&invite_payload_b)
-            .expect("encode invite url (run 2)");
-        // ZEB-339: supply synthetic community_signing_key for the DmOutbox
-        // (a separate DM-layer fixture), and use the joiner's own cert as
-        // enrollment_cert_b (matching joiner_self_owner) for the second
-        // redeem_invite_inner call.
-        // ZEB-339: use new_synthetic — same rationale as dm_outbox above.
-        let test_owner_lib16973 = crate::community_membership::mint_test_owner(0xE3);
-        let community_signing_key_lib16973 = std::sync::Arc::new(
-            ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16973.device_key.to_bytes()),
-        );
-        let enrollment_cert_lib16973 = test_owner_lib16973.cert;
-        // The enrollment cert passed to redeem_invite_inner MUST match the joiner's
-        // self_owner (cert.owner_id == joiner_self_owner.0). Use the joiner's cert.
-        let enrollment_cert_b = joiner_owner.cert.clone();
-        let dm_outbox_b = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new_synthetic(
-            "joiner-dev".into(),
-            joiner_self_owner,
-            DeviceIdentityHash(joiner_self_owner.0),
-            std::sync::Arc::clone(&signing_key),
-            std::sync::Arc::new(PrivateIdentity::from_seed(&[0xbb; 32])),
-            community_signing_key_lib16973,
-            enrollment_cert_lib16973,
-        )));
-        let (channel_log_adapter_tx_b, _channel_log_adapter_rx_b) =
-            mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
-        let sink_b: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
-            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
-        let channel_log_registry_b =
-            std::sync::Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
-                adapter_request_tx: channel_log_adapter_tx_b,
-                sink: sink_b,
-                identity_dir: tmp2.path().to_path_buf(),
-                self_owner: joiner_self_owner,
-                self_device_id: "joiner-dev".into(),
-                signing_key: std::sync::Arc::clone(&signing_key),
-                engine_config: ChannelLogEngineConfig::default(),
-                transport_epoch_rx: None,
-            }));
-
-        let baseline_err = redeem_invite_inner(
-            invite_url_b,
-            std::sync::Arc::clone(&crdt_state2),
-            std::sync::Arc::clone(&hlc_tracker2),
-            "joiner-dev".to_string(),
-            joiner_self_owner,
-            std::sync::Arc::clone(&signing_key),
-            enrollment_cert_b.clone(),
-            std::sync::Arc::clone(&community_registry2),
-            adapter_tx2,
-            None, // ZEB-434: no transport-epoch watch in this test
-            unicast_tx2,
-            std::sync::Arc::clone(&dm_outbox_b),
-            std::sync::Arc::clone(&channel_log_registry_b),
-            || Ok(()),
-            None,
-            false, // baseline: pre-Phase-2c semantics → must Err
-        )
-        .await;
-        let err_msg = baseline_err.expect_err(
-            "with allow_no_reticulum_destinations=false and empty destinations, \
-             redeem_invite_inner must surface the pre-Phase-2c 'no known device' Err",
-        );
-        assert!(
-            err_msg.contains("no known device for inviter"),
-            "expected 'no known device for inviter' Err, got: {err_msg}",
-        );
-
-        // Cleanup the env var so it doesn't bleed into other tests.
-        // (nextest isolates per-process so this is belt-and-suspenders.)
-        unsafe {
-            std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
-        }
     }
 
     // ── Existing tests ─────────────────────────────────────────────────────────
@@ -23876,7 +23349,6 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             Some(tmp.path().to_path_buf()),
-            false, // ZEB-325: fork-invite test uses Reticulum-required semantics.
         )
         .await;
 
@@ -24003,7 +23475,6 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             Some(tmp.path().to_path_buf()),
-            false, // ZEB-325: fork-invite test uses Reticulum-required semantics.
         )
         .await;
 
@@ -24111,7 +23582,6 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             Some(tmp.path().to_path_buf()),
-            false, // ZEB-325: fork-invite test uses Reticulum-required semantics.
         )
         .await;
 
@@ -24366,7 +23836,6 @@ mod zeb436_orphan_adoption_tests {
                 }
             },
             None,
-            false,
         )
         .await
     }
@@ -24616,8 +24085,7 @@ mod zeb436_orphan_adoption_tests {
         _tmp: tempfile::TempDir,
     }
 
-    /// Inline cert-model rig (mirrors
-    /// `redeem_invite_inner_allow_no_reticulum_destinations_skips_fast_fail`):
+    /// Inline cert-model rig for invite-only orphan adoption tests:
     /// the shared fixture's resolver doesn't admit a cert-model admin, and
     /// the invite-only path needs the admin bootstrap + token signed by an
     /// enrolled device key.
@@ -24911,7 +24379,6 @@ mod zeb436_orphan_adoption_tests {
             std::sync::Arc::clone(&rig.channel_log_registry),
             || Ok(()),
             None,
-            true, // allow_no_reticulum_destinations
         )
         .await;
 
@@ -25060,7 +24527,6 @@ mod zeb436_orphan_adoption_tests {
             std::sync::Arc::clone(&rig.channel_log_registry),
             || Ok(()),
             None,
-            true, // allow_no_reticulum_destinations
         )
         .await;
 
@@ -38971,13 +38437,6 @@ where
             channel_log_registry,
             fence_check,
             identity_dir,
-            // Adoption mints no membership event and awaits no
-            // countersign. If the inner's authoritative re-check declines
-            // to adopt (probe raced a concurrent commit), the minted
-            // PendingJoin still reaches the admin via the engine's Zenoh
-            // state-root publish — the same contract as the handshake
-            // path's `true` at step 12 below.
-            true,
         )
         .await;
         return match result {
@@ -39561,7 +39020,6 @@ where
         channel_log_registry,
         fence_check,
         identity_dir,
-        true, // allow_no_reticulum_destinations
         overrides,
     )
     .await;
