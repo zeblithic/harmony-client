@@ -22093,48 +22093,31 @@ where
                      proceeding via CRDT sync (ZEB-474: Reticulum carrier removed)"
                 );
             } else {
-                // Per-destination fan-out with at-least-one-success semantics.
-                //
-                // The inviter may have multiple devices (any of which can
-                // counter-sign). Reticulum unicast is best-effort per
-                // destination — if even one queue-side `try_send` succeeds the
-                // packet is on its way and we cannot retract it, so a partial
-                // failure followed by local rollback would leave the receiver
-                // counter-signing while we tear down the engine here. Track
-                // success across the loop and ONLY roll back when all
-                // destinations failed.
-                let mut any_sent = false;
-                let mut last_err: Option<String> = None;
+                // DORMANT (ZEB-474 → ZEB-473/Move 1a): best-effort unicast
+                // fan-out of the PendingJoin to the inviter's devices. The
+                // Reticulum carrier is gone, so these try_sends reach the
+                // dormant SendUnicastToDevice bridge and are dropped at the
+                // core. Redemption delivery is now via CRDT state-root sync
+                // (the oneshot await at step 7d below, which on timeout
+                // explicitly does NOT roll back). A failed fan-out must
+                // therefore NOT roll back either — doing so would wrongly
+                // fail a redemption that succeeds over CRDT whenever a stale
+                // OwnerDeviceCache yields non-empty-but-unsendable
+                // destinations. This matches the empty-destinations branch
+                // above, which already proceeds via CRDT. Move 1a rewires
+                // this fan-out onto the iroh tunnel.
                 for destination_hash in &destinations {
-                    match unicast_send_tx.try_send(crate::dm_outbox::UnicastSendRequest {
+                    if let Err(e) = unicast_send_tx.try_send(crate::dm_outbox::UnicastSendRequest {
                         destination_hash: *destination_hash,
                         packet: wire.clone(),
                     }) {
-                        Ok(()) => any_sent = true,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                destination_hash = %hex::encode(destination_hash),
-                                "redeem_invite unicast try_send failed for destination — \
-                                 continuing fan-out"
-                            );
-                            last_err = Some(e.to_string());
-                        }
+                        tracing::debug!(
+                            error = %e,
+                            destination_hash = %hex::encode(destination_hash),
+                            "redeem_invite dormant unicast fan-out try_send failed \
+                             (non-fatal; redemption proceeds via CRDT sync)"
+                        );
                     }
-                }
-                if !any_sent {
-                    let _ = community_registry
-                        .take_pending_redemption(&minted.bootstrap_join.id)
-                        .await;
-                    // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                    return Err(format!(
-                        "unicast_send_tx try_send failed for all {} destination(s){}",
-                        destinations.len(),
-                        last_err
-                            .as_deref()
-                            .map(|s| format!(" (last error: {s})"))
-                            .unwrap_or_default()
-                    ));
                 }
             }
         } // end: else { … } from R6 pre_delivered_countersign guard
