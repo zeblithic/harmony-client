@@ -753,6 +753,17 @@ pub struct NodeState {
     /// cleared on stop_node to mirror its lifecycle. Unsigned routing hints.
     dm_local_dsa_pubkey: Option<Vec<u8>>,
     dm_local_kem_pubkey: Option<Vec<u8>>,
+    /// ZEB-473 (Move 1a): this node's own PQ *private* identity (ML-DSA-65
+    /// signing + ML-KEM-768 decapsulation secret keys), retained past boot so
+    /// the upcoming tunnel acceptor / dialer can pass it as the self-input to
+    /// `TunnelSession::new_responder` / `new_initiator`. Captured in
+    /// `start_node` from `identity::load_or_generate` (the same `pq` whose
+    /// public half backs `dm_local_dsa_pubkey` / `dm_local_kem_pubkey` above)
+    /// and `Arc`-wrapped so it can be shared across tokio tasks without
+    /// re-reading the on-disk identity. Cleared on stop_node to mirror the
+    /// public stashes' lifecycle, so a stale identity's secret keys never
+    /// outlive an identity switch. No live consumer yet (Task 2 retains only).
+    dm_pq_identity: Option<std::sync::Arc<harmony_identity::PqPrivateIdentity>>,
     /// ZEB-217 Sub-C Phase 3 Task 9: sender used by IPC handlers
     /// (`create_community`, `redeem_invite`) to dispatch a
     /// `CommunityAdapterRequest` into the event loop, where it's
@@ -1413,6 +1424,7 @@ impl Default for NodeState {
             dm_identity_pub_64: None,
             dm_local_dsa_pubkey: None,
             dm_local_kem_pubkey: None,
+            dm_pq_identity: None,
             community_adapter_request_tx: None,
             // ZEB-434 D6: stays None until start_node wires the
             // transport-epoch watch.
@@ -1861,6 +1873,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // stale identity's keys never leak into a new identity's handshakes.
         let _ = guard.dm_local_dsa_pubkey.take();
         let _ = guard.dm_local_kem_pubkey.take();
+        // ZEB-473 (Move 1a) Task 2: drop our retained PQ private identity so a
+        // stale identity's secret keys never outlive an identity switch
+        // (zeroized on the Arc's final drop). Mirrors the public stashes.
+        let _ = guard.dm_pq_identity.take();
         // ZEB-371: drop the owner KeyTree so a restart (or identity switch)
         // re-derives a fresh one from the new master seed rather than sealing
         // friend secrets under the prior identity's keys.
@@ -2820,6 +2836,9 @@ pub async fn start_node_inner(
         // ZEB-461: clear the local PQ pubkeys alongside the identity pub.
         let _ = guard.dm_local_dsa_pubkey.take();
         let _ = guard.dm_local_kem_pubkey.take();
+        // ZEB-473 (Move 1a) Task 2: drop our retained PQ private identity so a
+        // stale identity's secret keys never outlive an identity switch.
+        let _ = guard.dm_pq_identity.take();
         // ZEB-217 Sub-C Phase 3 Task 9: clear the previous adapter-
         // request sender so it doesn't outlive the previous event
         // loop. The new event loop is constructed below with a fresh
@@ -3032,7 +3051,14 @@ pub async fn start_node_inner(
         // config and before `pq_pub` is dropped.
         let dm_local_dsa_pubkey_owned: Vec<u8> = local_dsa_pubkey.to_vec();
         let dm_local_kem_pubkey_owned: Vec<u8> = local_kem_pubkey.to_vec();
-        drop(pq);
+        // ZEB-473 (Move 1a) Task 2: retain the PQ *private* identity past boot
+        // instead of dropping it. The public stashes above are already captured
+        // from `pq.public_identity()`; now `Arc`-wrap the private identity so
+        // the upcoming tunnel acceptor / dialer (later ZEB-473 tasks) can use
+        // it as the self-input to `TunnelSession::new_responder` /
+        // `new_initiator`. Stashed on NodeState (`dm_pq_identity`) below,
+        // alongside the public pubkeys. No live consumer yet — retention only.
+        let pq_identity = std::sync::Arc::new(pq);
 
         // ZEB-228 Phase 4: capture our 64-byte combined identity_pub
         // (X25519_pub(32) || Ed25519_pub(32) per
@@ -7845,6 +7871,13 @@ pub async fn start_node_inner(
                         // identity bytes were moved into the runtime config.
                         guard.dm_local_dsa_pubkey = Some(dm_local_dsa_pubkey_owned);
                         guard.dm_local_kem_pubkey = Some(dm_local_kem_pubkey_owned);
+                        // ZEB-473 (Move 1a) Task 2: stash our own PQ private
+                        // identity (Arc-wrapped above, sibling of the public
+                        // pubkeys) so later tunnel acceptor / dialer tasks can
+                        // grab it as the self-input without re-reading the
+                        // on-disk identity. Cleared on stop alongside the
+                        // public stashes.
+                        guard.dm_pq_identity = Some(pq_identity);
                         // ZEB-217 Sub-C Phase 3 Task 9: store the adapter-
                         // request sender so create_community / Phase 4
                         // redeem_invite can dispatch on-demand
@@ -47374,6 +47407,7 @@ mod start_node_race_tests {
             dm_identity_pub_64: None,
             dm_local_dsa_pubkey: None,
             dm_local_kem_pubkey: None,
+            dm_pq_identity: None,
             community_adapter_request_tx: None,
             transport_epoch_rx: None,
             voting_log_adapter_request_tx: None,
