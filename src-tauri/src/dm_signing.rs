@@ -649,14 +649,14 @@ mod tests {
     ///   name_hash        = SHA256("harmony.dm")[:10]
     ///   destination_hash = SHA256(name_hash || identity_address_hash)[:16]
     /// Verifying the inline replica matches a re-derivation against the same
-    /// input pins the helper bytes — if harmony-reticulum's formula ever
-    /// drifts, the next dep bump will surface the mismatch via this test.
+    /// input pins the helper bytes — the formula is transport-agnostic (ZEB-474:
+    /// renamed from compute_dm_destination_hash_matches_reticulum_formula).
     #[test]
-    fn compute_dm_destination_hash_matches_reticulum_formula() {
+    fn compute_dm_destination_hash_matches_pinned_formula() {
         use sha2::{Digest, Sha256};
         let identity_hash = [0xabu8; 16];
 
-        // Reproduce the Reticulum formula directly here.
+        // Reproduce the formula directly here.
         let mut name_hasher = Sha256::new();
         name_hasher.update(b"harmony.dm");
         let name_full: [u8; 32] = name_hasher.finalize().into();

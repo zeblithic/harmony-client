@@ -21,7 +21,6 @@ use harmony_app::dm_outbox::DmOutbox;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_types::{
     DeliveryStatus, DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind,
-    TransportBinding,
 };
 use harmony_app::read_dm_thread_inner;
 
@@ -34,9 +33,7 @@ fn make_dm_space(space_id: SpaceId, alice: OwnerAddr, bob: OwnerAddr) -> Space {
         parent: None,
         community_id: None,
         name: "Alice <-> Bob".into(),
-        transport: Some(TransportBinding::Reticulum {
-            participants: vec![],
-        }),
+        transport: None,
         members,
         custom_name: None,
         notification_pref: None,

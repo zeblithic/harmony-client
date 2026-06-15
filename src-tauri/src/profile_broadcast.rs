@@ -784,9 +784,7 @@ mod tests {
     #[tokio::test]
     async fn owner_state_source_returns_opted_in_community_space_ids() {
         use crate::owner_state_crdt::OwnerState;
-        use crate::owner_state_types::{
-            DmContentKey, EpochKey, OwnerAddr, Space, SpaceKind, TransportBinding,
-        };
+        use crate::owner_state_types::{DmContentKey, EpochKey, OwnerAddr, Space, SpaceKind};
 
         let zero_hlc = Hlc {
             wall_ms: 0,
@@ -849,9 +847,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "Some DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
             custom_name: None,
             notification_pref: None,

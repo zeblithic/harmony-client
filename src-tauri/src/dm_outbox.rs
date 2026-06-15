@@ -291,6 +291,38 @@ impl DmTransport for RuntimeUnicastTransport {
     }
 }
 
+/// ZEB-474 (coalescence Move 2): the Reticulum unicast carrier is gone.
+/// In the interim before Move 1a (ZEB-473) brings up a live iroh-tunnel DM
+/// carrier, DM delivery is store-and-forward only — the outbox's deposit
+/// rung (butler → community-relay) carries the signed cidnotify to the
+/// recipient over iroh and marks the entry delivered on butler-ack.
+///
+/// This transport is therefore a no-op "direct send" that always signals
+/// `Transient`. Returning `Transient` (not `Ok`) is deliberate: it steers
+/// every DM into the deposit rung (the `pre_failure_count >= 1` transient
+/// gate fires deposit on the next drain pass). An `Ok` would make the
+/// outbox treat the DM as "sent, awaiting ack" and it would never deposit.
+///
+/// Move 1a replaces this with `IrohTunnelDmTransport` on the same
+/// `DmTransport` seam — no other outbox code changes.
+pub struct DepositOnlyDmTransport;
+
+#[async_trait]
+impl DmTransport for DepositOnlyDmTransport {
+    async fn send(
+        &self,
+        _entry: &OutboxEntry,
+        _recipient: OwnerAddr,
+        _destinations: Vec<[u8; 16]>,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::Transient(
+            "deposit-only interim (ZEB-474): no direct DM carrier; \
+             routing via butler/community-relay deposit"
+                .to_string(),
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AttemptState {
     last_attempt_wall_ms: u64,
@@ -1553,23 +1585,17 @@ impl DmOutbox {
         // Build the Space from the invite. Mirror what add_space's DM/group-DM
         // handling will produce (Phase 4 will produce these on the SEND side
         // as outbound invites; here we mirror the same shape on the RECEIVE
-        // side as inbound invite acceptance). Transport binding is Reticulum
-        // (DM kinds always are).
+        // side as inbound invite acceptance).
+        // ZEB-474: DM/GroupDm Spaces carry transport=None (deposit-only;
+        // the Reticulum carrier was removed). Delivery uses OwnerDeviceCache,
+        // not Space.transport.
         let space = crate::owner_state_types::Space {
             id: signed.space_id,
             kind: signed.kind,
             parent: None,
             community_id: None,
             name: format!("DM with {}", hex::encode(signed.inviter.0)),
-            // `participants` is a `Vec<ReticulumDest>` of opaque transport
-            // identifiers; we don't have those for the inviter's owners
-            // here (only their `OwnerAddr`s — the receiver-side code path
-            // resolves OwnerAddr → DeviceIdentityHash via OwnerDeviceCache
-            // at send time, not from `Space.transport.participants`). Leave
-            // empty; matches the existing test fixture pattern.
-            transport: Some(crate::owner_state_types::TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: signed.members,
             custom_name: None,
             notification_pref: None,
@@ -1833,6 +1859,12 @@ impl DmOutbox {
                         None
                     }
                 };
+            // DORMANT (ZEB-474 → ZEB-473/Move 1a): the Reticulum unicast
+            // carrier is removed; these ack packets reach the pinned core's
+            // SendUnicastToDevice handler and are dropped (no worse than
+            // today — off-LAN acks already dropped). Move 1a rewires this
+            // fan-out onto the iroh tunnel. Delivery confirmation in the
+            // interim comes from the butler-deposit ack, not this read-ack.
             if let Some(ack_wire) = ack_wire_opt {
                 for device in &signed.sender_devices {
                     let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
@@ -2636,7 +2668,7 @@ pub(crate) fn dm_received_event_payload(
 mod tests {
     use super::*;
     use crate::content_store::InMemoryStub;
-    use crate::owner_state_types::{ContentId, DmContentKey, InboxEntry, Space, TransportBinding};
+    use crate::owner_state_types::{ContentId, DmContentKey, InboxEntry, Space};
 
     /// Test-only helper: build a `DmOutbox` with synthetic materials for
     /// tests that don't exercise community-signing paths. Routes through
@@ -2795,9 +2827,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "Bob".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members,
             custom_name: None,
             notification_pref: None,
@@ -5234,9 +5264,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "Alice".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: sorted.to_vec(),
             custom_name: None,
             notification_pref: None,
@@ -5562,9 +5590,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "Alice".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: sorted.to_vec(),
             custom_name: None,
             notification_pref: None,
@@ -5766,9 +5792,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "Alice".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: sorted.to_vec(),
             custom_name: None,
             notification_pref: None,
@@ -5869,9 +5893,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "Alice".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: sorted.to_vec(),
             custom_name: None,
             notification_pref: None,
@@ -7199,9 +7221,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "trio".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: members.clone(),
             custom_name: None,
             notification_pref: None,
@@ -7966,13 +7986,148 @@ mod tests {
             Some(hex::encode(message_cid.to_bytes()).as_str()),
         );
     }
+
+    // ── ZEB-474 Task 1: DepositOnlyDmTransport unit test ─────────────────────
+
+    #[tokio::test]
+    async fn deposit_only_transport_send_signals_transient_to_steer_into_deposit_rung() {
+        // ZEB-474: the deposit-only transport must never claim a direct send
+        // succeeded — returning Transient is what steers the outbox into its
+        // butler/community-relay deposit rung (which performs real delivery and
+        // calls mark_ack_delivered on ack). An Ok here would be a silent
+        // black-hole: the outbox would treat the DM as "sent, awaiting ack"
+        // and never deposit it.
+        let t = DepositOnlyDmTransport;
+        let entry = OutboxEntry {
+            id: OutboxEntryId([1u8; 16]),
+            space_id: SpaceId([7u8; 16]),
+            recipient_owners: vec![],
+            message_cid: ContentId::from_bytes([9u8; 32]),
+            created_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            delivered_to: BTreeSet::new(),
+            delivery_status: DeliveryStatus::Pending,
+        };
+        let recipient = OwnerAddr([3u8; 16]);
+        let err = t
+            .send(&entry, recipient, vec![[1u8; 16]])
+            .await
+            .expect_err("deposit-only send must signal Transient, never Ok");
+        assert!(matches!(err, TransportError::Transient(_)));
+    }
+
+    // ── ZEB-474 Task 3: deposit-routing integration test ─────────────────────
+
+    /// Drive one drain tick with `DepositOnlyDmTransport` (always Transient).
+    async fn drain_with_deposit_only_transport(
+        o: &mut DmOutbox,
+        state: &mut OwnerState,
+        wall_now_ms: u64,
+    ) -> DrainOutcome {
+        let transport = DepositOnlyDmTransport;
+        o.drain(state, &transport, wall_now_ms).await
+    }
+
+    /// With `DepositOnlyDmTransport` wired and a butler deposit client
+    /// installed + acking, the DM routes through the deposit rung and is
+    /// marked delivered via `mark_ack_delivered` on the second drain pass
+    /// (first drain records the initial Transient; second fires the rung).
+    #[tokio::test]
+    async fn deposit_only_transport_routes_dm_to_deposit_rung_and_delivers_on_ack() {
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        let entry_id = entry.id;
+        let space_id = SpaceId([1u8; 16]);
+        let message_cid = ContentId::from_bytes([3u8; 32]);
+
+        let mut state = OwnerState::default();
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = make_outbox_synthetic("dev", alice);
+        let mock = MockDepositClient::returning(DepositRungOutcome::Acked);
+        o.set_butler_deposit_client(mock.clone());
+
+        // Tick 1 (t=10_000): first Transient from deposit-only transport.
+        // No prior AttemptState → deposit rung must NOT fire yet.
+        let outcome1 = drain_with_deposit_only_transport(&mut o, &mut state, 10_000).await;
+        assert!(
+            mock.calls().is_empty(),
+            "first transient must not fire deposit rung (no prior AttemptState)"
+        );
+        assert!(outcome1.newly_delivered.is_empty());
+
+        // Tick 2 (t=15_000, backoff window elapsed): second Transient from
+        // deposit-only transport. AttemptState now exists → deposit rung fires
+        // → butler acks → mark_ack_delivered → surfaces in newly_delivered.
+        let outcome2 = drain_with_deposit_only_transport(&mut o, &mut state, 15_000).await;
+        assert_eq!(
+            mock.calls().len(),
+            1,
+            "deposit rung must fire exactly once on tick 2"
+        );
+        let req = &mock.calls()[0];
+        assert_eq!(req.entry_id, entry_id);
+        assert_eq!(req.recipient_owner, bob);
+        assert_eq!(req.space_id, space_id);
+        assert_eq!(req.message_cid, message_cid);
+        assert_eq!(
+            outcome2.newly_delivered,
+            vec![(space_id, message_cid, bob)],
+            "butler ack must surface in newly_delivered (dm-delivered emit)"
+        );
+        let stored = state.outbox.get(&entry_id).expect("entry still present");
+        assert!(stored.delivered_to.contains(&bob), "bob marked delivered");
+        assert!(
+            matches!(stored.delivery_status, DeliveryStatus::Complete),
+            "sole recipient acked via butler -> Complete"
+        );
+    }
+
+    /// With `DepositOnlyDmTransport` and NO deposit client installed, the
+    /// entry remains queued (Pending) — never delivered, never errored —
+    /// across several drain passes (the rung is never consulted).
+    #[tokio::test]
+    async fn deposit_only_transport_no_client_entry_remains_queued() {
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(9, vec![bob], 1_000);
+        let entry_id = entry.id;
+
+        let mut state = OwnerState::default();
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = make_outbox_synthetic("dev", alice);
+        // No deposit client installed — outbox has no deposit rung.
+
+        for tick_ms in [10_000u64, 15_000, 25_000, 55_000] {
+            let outcome = drain_with_deposit_only_transport(&mut o, &mut state, tick_ms).await;
+            assert!(
+                outcome.newly_delivered.is_empty(),
+                "no delivery possible without deposit client (tick {tick_ms})"
+            );
+        }
+
+        let stored = state
+            .outbox
+            .get(&entry_id)
+            .expect("entry still present after all ticks");
+        assert!(
+            matches!(stored.delivery_status, DeliveryStatus::Pending),
+            "entry stays Pending without a deposit client, never errored"
+        );
+        assert!(stored.delivered_to.is_empty());
+    }
 }
 
 #[cfg(test)]
 mod outhold_write_tests {
     use super::*;
     use crate::content_store::InMemoryStub;
-    use crate::owner_state_types::{DmContentKey, Space, TransportBinding};
+    use crate::owner_state_types::{DmContentKey, Space};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -8009,9 +8164,7 @@ mod outhold_write_tests {
             parent: None,
             community_id: None,
             name: "Bob".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members,
             custom_name: None,
             notification_pref: None,

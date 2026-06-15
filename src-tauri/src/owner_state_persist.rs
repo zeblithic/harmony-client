@@ -264,7 +264,7 @@ mod tests {
     use crate::owner_state_crdt::{ApplyOutcome, OwnerState};
     use crate::owner_state_types::{
         ContentId, DeliveryStatus, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, ReadMarker, Space,
-        SpaceId, SpaceKind, TransportBinding,
+        SpaceId, SpaceKind,
     };
 
     #[test]
@@ -358,9 +358,8 @@ mod tests {
                 last_read_at: hlc(150),
             },
         );
-        let _ = (TransportBinding::Reticulum {
-            participants: vec![],
-        },); // ensure import isn't dead
+        // ZEB-474: TransportBinding::Reticulum variant removed (flag-day-for-alpha);
+        // the Zenoh variant keeps the import alive via the Space fixtures above.
         s
     }
 
@@ -558,9 +557,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "alice-bob".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,

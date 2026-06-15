@@ -9,7 +9,7 @@
 use harmony_app::dm_outbox::{DmOutbox, StubTransport};
 use harmony_app::owner_state_crdt::{ApplyOutcome, OwnerState};
 use harmony_app::owner_state_types::{
-    DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
+    DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind,
 };
 
 #[tokio::test]
@@ -38,9 +38,7 @@ async fn send_dm_round_trip_through_dm_outbox() {
         parent: None,
         community_id: None,
         name: "Bob".into(),
-        transport: Some(TransportBinding::Reticulum {
-            participants: vec![],
-        }),
+        transport: None,
         members: vec![alice, bob],
         custom_name: None,
         notification_pref: None,

@@ -2903,8 +2903,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         Arc::clone(&dm_outbox),
         channel_log_registry,
         || Ok(()),
-        None,
-        false, // ZEB-325: this test exercises the Reticulum-required fast-fail path.
+        None, // ZEB-325: this test exercises the Reticulum-required fast-fail path.
     )
     .await;
 

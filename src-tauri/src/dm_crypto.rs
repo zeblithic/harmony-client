@@ -234,16 +234,14 @@ mod tests {
     #[test]
     fn compute_aad_dm_uses_dedupe_key() {
         // Two DM Spaces with the same sorted members must yield the same AAD.
-        // Use TransportBinding::Reticulum so validate_invariants would pass.
+        // ZEB-474: transport=None (Reticulum variant removed).
         let s1 = crate::owner_state_types::Space {
             id: SpaceId([1; 16]),
             kind: SpaceKind::Dm,
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(crate::owner_state_types::TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,

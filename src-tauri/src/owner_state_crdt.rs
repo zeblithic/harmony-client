@@ -1136,9 +1136,7 @@ mod apply_space_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: members.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
             custom_name: None,
             notification_pref: None,
@@ -1585,9 +1583,7 @@ mod apply_space_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,
@@ -1610,9 +1606,7 @@ mod apply_space_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,
@@ -1784,9 +1778,7 @@ mod apply_space_tests {
             parent: None,
             community_id: None,
             name: "Hijacked".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16]), OwnerAddr([3; 16])],
             custom_name: None,
             notification_pref: None,
@@ -2478,7 +2470,7 @@ mod canonicalization_tests {
     use super::*;
     use crate::owner_state_types::{
         ContentId, DeliveryStatus, Hlc, InboxEntry, OutboxEntry, OutboxEntryId, OwnerAddr,
-        ReadMarker, SpaceKind, TransportBinding,
+        ReadMarker, SpaceKind,
     };
 
     fn hlc(w: u64) -> Hlc {
@@ -2497,9 +2489,7 @@ mod canonicalization_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: members.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
             custom_name: None,
             notification_pref: None,
@@ -2891,9 +2881,7 @@ mod crypto_integration_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             // Sorted ascending — required by validate_invariants.
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
@@ -3559,9 +3547,7 @@ mod owner_device_cache_tests {
 #[cfg(test)]
 mod merge_prior_content_keys_tests {
     use super::*;
-    use crate::owner_state_types::{
-        DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
-    };
+    use crate::owner_state_types::{DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
 
     fn key(byte: u8) -> DmContentKey {
         DmContentKey::new([byte; 32])
@@ -3581,9 +3567,7 @@ mod merge_prior_content_keys_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,
@@ -3728,9 +3712,7 @@ mod dm_crypto_integration_tests {
     use super::*;
     use crate::dm_crypto::{compute_aad, decrypt_dm_message, encrypt_dm_message};
     use crate::dm_envelope::MessagePayload;
-    use crate::owner_state_types::{
-        DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
-    };
+    use crate::owner_state_types::{DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
 
     fn dm_at(id_byte: u8, ck: DmContentKey) -> Space {
         let hlc = Hlc {
@@ -3744,9 +3726,7 @@ mod dm_crypto_integration_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,

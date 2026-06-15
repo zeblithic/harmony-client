@@ -944,7 +944,8 @@ mod tests {
         assert_canonical::<OwnerDeviceEntry>();
         assert_canonical::<SpaceKind>();
         assert_canonical::<NotificationPref>();
-        assert_canonical::<ReticulumDest>();
+        // ZEB-474: assert_canonical::<ReticulumDest>() removed — ReticulumDest
+        // type was deleted (flag-day-for-alpha wire-format change).
         assert_canonical::<TransportBinding>();
         assert_canonical::<Space>();
         assert_canonical::<DedupeKey>();

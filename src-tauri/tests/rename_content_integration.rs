@@ -177,8 +177,6 @@ async fn spawn_test_runtime() -> TestHarness {
                     None,
                     None,
                     None,
-                    None,
-                    None,
                     Vec::new(),
                     {
                         let (_tx, rx) = tokio::sync::mpsc::channel::<

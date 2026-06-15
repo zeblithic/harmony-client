@@ -265,8 +265,6 @@ async fn spawn_test_runtime() -> TestHarness {
                     None,       // dm_transport — DM outbox not exercised in this test
                     None,       // crdt_state — DM outbox not exercised in this test
                     None,       // unicast_send_rx — DM transport not exercised in this test
-                    None,       // cas_handle — DM transport not exercised in this test
-                    None,       // unicast_send_tx — DM transport not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
                     {
                         // Phase 3 Task 9: on-demand adapter request channel; not

@@ -74,7 +74,6 @@ use harmony_app::owner_state_crdt::{ApplyOutcome, OwnerState};
 use harmony_app::owner_state_crypto::KeyTree;
 use harmony_app::owner_state_types::{
     DeliveryStatus, DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind,
-    TransportBinding,
 };
 use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
 use tokio::sync::{mpsc, Mutex};
@@ -198,9 +197,7 @@ fn make_dm_space(id_byte: u8, mut members: Vec<OwnerAddr>) -> Space {
         parent: None,
         community_id: None,
         name: "Bob".into(),
-        transport: Some(TransportBinding::Reticulum {
-            participants: vec![],
-        }),
+        transport: None,
         members,
         custom_name: None,
         notification_pref: None,

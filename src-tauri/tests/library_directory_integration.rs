@@ -888,7 +888,6 @@ async fn click_to_join_redeem_invite_smoke() {
         Arc::clone(&channel_log_registry),
         || Ok(()),
         None,
-        false, // ZEB-325: library-directory click-to-join uses Reticulum-required semantics.
     )
     .await;
 

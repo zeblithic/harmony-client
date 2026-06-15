@@ -528,8 +528,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         Arc::clone(&bob_dm_outbox),
         bob_channel_log_registry,
         || Ok(()),
-        None,
-        false, // ZEB-325: invite-only integration test uses Reticulum-required semantics.
+        None, // ZEB-325: invite-only integration test uses Reticulum-required semantics.
     )
     .await;
 

@@ -46,7 +46,6 @@ use harmony_app::community_membership::{mint_test_owner, ChannelId};
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_types::{
     DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, OwnerDeviceEntry, Space, SpaceId, SpaceKind,
-    TransportBinding,
 };
 use harmony_app::voice_crypto::{
     decrypt_dm_voice_packet, encrypt_dm_voice_packet, VoiceCryptoError, VOICE_DM_PACKET_AAD,
@@ -105,9 +104,7 @@ fn group_dm_space(id: SpaceId, members: Vec<OwnerAddr>) -> Space {
         parent: None,
         community_id: None,
         name: "Group".into(),
-        transport: Some(TransportBinding::Reticulum {
-            participants: vec![],
-        }),
+        transport: None,
         members,
         custom_name: None,
         notification_pref: None,
