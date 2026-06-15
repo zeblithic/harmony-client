@@ -18300,7 +18300,26 @@ pub(crate) async fn create_channel_impl(
         // is idempotent with the consumer's later spawn, and steady-state
         // channel creation runs outside any community transaction so it
         // takes spawn's fast-path (never `DeferredForCommit`).
-        if let Some(channel_log_registry) = channel_log_registry {
+        //
+        // CodeAnt (PR #267): re-fence immediately before the spawn. The
+        // earlier fence ran BEFORE `insert_local_event`; a `stop_node`
+        // racing in between nullifies `channel_log_registry` (without
+        // bumping generation — the registry-presence check is the signal)
+        // and drives `shutdown_all` on the now-detached Arc. Spawning into
+        // that stale registry would orphan a channel-log engine + its tasks
+        // past node stop. Skip the eager spawn if the node was stopped or a
+        // new generation started; the channel is still created and
+        // `reconcile_from_state` spawns its engine at next start. (Residual
+        // window between this check and `spawn().await` is the same
+        // best-effort bound the community insert above already accepts —
+        // the std `NodeState` mutex can't be held across the async spawn.)
+        let node_still_live = {
+            let g = state
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            g.generation == snapshot_generation && g.channel_log_registry.is_some()
+        };
+        if let Some(channel_log_registry) = channel_log_registry.filter(|_| node_still_live) {
             if let Err(e) = register_channel_log_engine(
                 &channel_log_registry,
                 &engine_arc,

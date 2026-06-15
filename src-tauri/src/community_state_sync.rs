@@ -517,6 +517,17 @@ pub enum CommunitySyncError {
     TransportClosed,
     #[error("persist: {0}")]
     Persist(String),
+    /// ZEB-463: a persist whose target directory was missing (io
+    /// `NotFound`) — the parent dir was removed out from under the write,
+    /// typically by a concurrent spawn-rollback
+    /// (`shutdown_engine_and_cleanup_persistence`) discarding a
+    /// freshly-spawned engine. Distinct from `Persist` so the graceful-
+    /// shutdown arm can CAUSALLY downgrade ONLY this case to `Ok` (the data
+    /// is being intentionally discarded) while every real durability fault —
+    /// disk full, permissions — still propagates loudly (ZEB-460). Qodo
+    /// (PR #267) flagged the earlier dir-exists heuristic as non-causal.
+    #[error("persist: directory missing: {0}")]
+    PersistDirMissing(String),
     /// Decoded blob's `community_id` doesn't match the engine's
     /// expected community. Distinct from `CborDecode` because the
     /// wire form parsed cleanly — the failure is routing/integrity,
@@ -2593,8 +2604,7 @@ async fn internal_task(mut ctx: InternalCtx) {
                 // failure. Downgrade that one case to Ok; ANY other persist
                 // failure — the dir still exists — still propagates loudly per
                 // ZEB-460.
-                let final_result =
-                    if shutdown_flush_lost_race_to_dir_removal(&final_result, &ctx.paths.crdt) {
+                let final_result = if shutdown_flush_lost_race_to_dir_removal(&final_result) {
                         tracing::debug!(
                             community_id = ?ctx.community_id,
                             "community persistence dir removed during shutdown \
@@ -3651,28 +3661,35 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
 /// corrupt the live file. Failures bubble up as
 /// `CommunitySyncError::Persist` so the shutdown arm can surface them
 /// to the caller; the wakeup / merge arms log + continue.
+/// Map a per-community save (`save_crdt`/`save_replay`) `PersistError` to a
+/// `CommunitySyncError`, routing the io-`NotFound` case — a missing parent
+/// directory, i.e. the ZEB-463 rollback race — to `PersistDirMissing` so the
+/// shutdown arm can CAUSALLY downgrade it. `write_atomic` always
+/// `create_dir_all`s its parent first, so the only way a save fails with
+/// `NotFound` is a concurrent `remove_dir_all` deleting the dir mid-write.
+/// Every other failure becomes a plain `Persist`.
+fn map_persist_err(e: crate::community_state_persist::PersistError) -> CommunitySyncError {
+    use crate::community_state_persist::PersistError;
+    match &e {
+        PersistError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            CommunitySyncError::PersistDirMissing(e.to_string())
+        }
+        _ => CommunitySyncError::Persist(e.to_string()),
+    }
+}
+
 /// ZEB-463: decide whether a graceful-shutdown final-flush failure is the
 /// benign "lost the race with a concurrent rollback that removed this
 /// community's persistence directory" case.
 ///
-/// `write_atomic` always `create_dir_all`s its parent before writing, so the
-/// only way a shutdown persist fails with the directory missing is a
-/// concurrent `remove_dir_all` from the rollback path
-/// (`shutdown_engine_and_cleanup_persistence`, spawned detached by the spawn
-/// guard's Drop/abort) racing `shutdown_all`'s flush of the same engine. The
-/// data is being discarded on purpose, so the flush failure is not a
-/// durability loss.
-///
-/// Returns `true` ONLY for a `Persist` error whose target directory is now
-/// gone. Every other outcome — `Ok`, a non-`Persist` error, or a `Persist`
-/// error whose directory still exists (a real disk failure) — returns `false`
-/// so it still propagates loudly (ZEB-460).
-fn shutdown_flush_lost_race_to_dir_removal(
-    result: &Result<(), CommunitySyncError>,
-    crdt_path: &std::path::Path,
-) -> bool {
-    matches!(result, Err(CommunitySyncError::Persist(_)))
-        && crdt_path.parent().map(|p| !p.exists()).unwrap_or(false)
+/// CAUSAL: keys on `PersistDirMissing` — the variant `map_persist_err`
+/// produces ONLY when the underlying io error was `NotFound` — rather than a
+/// post-hoc dir-existence heuristic (which Qodo, PR #267, flagged as able to
+/// suppress an unrelated IO fault if the dir happened to vanish after the
+/// error). Every other outcome — `Ok`, a non-persist error, or a real
+/// `Persist` disk fault — returns `false` so it still propagates (ZEB-460).
+fn shutdown_flush_lost_race_to_dir_removal(result: &Result<(), CommunitySyncError>) -> bool {
+    matches!(result, Err(CommunitySyncError::PersistDirMissing(_)))
 }
 
 async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
@@ -3684,10 +3701,8 @@ async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     let crdt_path = ctx.paths.crdt.clone();
     let replay_path = ctx.paths.replay.clone();
     tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
-        save_crdt(&crdt_path, &state_snap)
-            .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
-        save_replay(&replay_path, &tracker_snap)
-            .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+        save_crdt(&crdt_path, &state_snap).map_err(map_persist_err)?;
+        save_replay(&replay_path, &tracker_snap).map_err(map_persist_err)?;
         Ok(())
     })
     .await
@@ -3710,8 +3725,7 @@ async fn persist_replay_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError
     let tracker_snap = ctx.tracker.lock().await.clone();
     let replay_path = ctx.paths.replay.clone();
     tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
-        save_replay(&replay_path, &tracker_snap)
-            .map_err(|e| CommunitySyncError::Persist(e.to_string()))
+        save_replay(&replay_path, &tracker_snap).map_err(map_persist_err)
     })
     .await
     .map_err(|join_err| {
@@ -3742,7 +3756,7 @@ async fn persist_crdt_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError> 
     let state_snap = ctx.state.lock().await.clone();
     let crdt_path = ctx.paths.crdt.clone();
     tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
-        save_crdt(&crdt_path, &state_snap).map_err(|e| CommunitySyncError::Persist(e.to_string()))
+        save_crdt(&crdt_path, &state_snap).map_err(map_persist_err)
     })
     .await
     .map_err(|join_err| {
@@ -3806,6 +3820,7 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
         CommunitySyncError::BlobNotFound { .. } => "blob_not_found",
         CommunitySyncError::TransportClosed => "transport_closed",
         CommunitySyncError::Persist(_) => "persist_failed",
+        CommunitySyncError::PersistDirMissing(_) => "persist_failed",
         CommunitySyncError::MisroutedBlob { .. } => "misrouted_blob",
         CommunitySyncError::MissingIdentityResolver => "missing_identity_resolver",
         CommunitySyncError::PublisherNotJoined { .. } => "publisher_not_joined",
@@ -5380,39 +5395,50 @@ mod tests {
     /// The race itself (a `remove_dir_all` interleaving inside
     /// `write_atomic`, which `create_dir_all`s its parent first) is a true
     /// TOCTOU and not deterministically reproducible, so we test the exact
-    /// decision predicate the shutdown arm applies, against a real present
-    /// vs. absent directory.
+    /// decision predicate the shutdown arm applies — keyed CAUSALLY on the
+    /// `PersistDirMissing` variant (Qodo PR #267), not a dir-exists heuristic.
     #[test]
-    fn shutdown_flush_dir_removal_predicate_only_downgrades_persist_with_missing_dir() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let present_dir = tmp.path().join("communities").join("aa");
-        std::fs::create_dir_all(&present_dir).expect("mkdir present");
-        let crdt_present = present_dir.join("crdt.cbor");
+    fn shutdown_flush_dir_removal_predicate_only_downgrades_persist_dir_missing() {
+        // The predicate downgrades ONLY the causal PersistDirMissing variant.
+        assert!(shutdown_flush_lost_race_to_dir_removal(&Err(
+            CommunitySyncError::PersistDirMissing("io: No such file or directory".into())
+        )));
+        // A real persist disk fault (e.g. ENOSPC) must still propagate.
+        assert!(!shutdown_flush_lost_race_to_dir_removal(&Err(
+            CommunitySyncError::Persist("io: disk full".into())
+        )));
+        // Success and unrelated errors are never downgraded.
+        assert!(!shutdown_flush_lost_race_to_dir_removal(&Ok(())));
+        assert!(!shutdown_flush_lost_race_to_dir_removal(&Err(
+            CommunitySyncError::TransportClosed
+        )));
+    }
 
-        // Never created — models the dir a concurrent rollback removed.
-        let crdt_missing = tmp.path().join("communities").join("bb").join("crdt.cbor");
-
-        // Persist error + dir gone → benign (downgrade to Ok).
-        assert!(shutdown_flush_lost_race_to_dir_removal(
-            &Err(CommunitySyncError::Persist(
-                "io: No such file or directory (os error 2)".into()
-            )),
-            &crdt_missing,
+    /// ZEB-463 (Qodo PR #267): `map_persist_err` routes ONLY io `NotFound` to
+    /// `PersistDirMissing` — the causal signal the shutdown arm keys on —
+    /// while every other failure stays a plain `Persist` so real durability
+    /// faults still propagate.
+    #[test]
+    fn map_persist_err_routes_only_not_found_to_dir_missing() {
+        use crate::community_state_persist::PersistError;
+        // io NotFound → PersistDirMissing
+        assert!(matches!(
+            map_persist_err(PersistError::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound
+            ))),
+            CommunitySyncError::PersistDirMissing(_)
         ));
-        // Persist error + dir present → a REAL durability failure: must propagate.
-        assert!(!shutdown_flush_lost_race_to_dir_removal(
-            &Err(CommunitySyncError::Persist("io: disk full".into())),
-            &crdt_present,
+        // Another io kind (e.g. PermissionDenied) → plain Persist
+        assert!(matches!(
+            map_persist_err(PersistError::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
+            CommunitySyncError::Persist(_)
         ));
-        // Success is never downgraded.
-        assert!(!shutdown_flush_lost_race_to_dir_removal(
-            &Ok(()),
-            &crdt_missing
-        ));
-        // A non-Persist error (even with a missing dir) is not this case.
-        assert!(!shutdown_flush_lost_race_to_dir_removal(
-            &Err(CommunitySyncError::TransportClosed),
-            &crdt_missing,
+        // A non-io PersistError → plain Persist
+        assert!(matches!(
+            map_persist_err(PersistError::CborEncode("bad".into())),
+            CommunitySyncError::Persist(_)
         ));
     }
 
