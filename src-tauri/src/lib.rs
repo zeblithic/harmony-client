@@ -10063,9 +10063,7 @@ pub fn add_space_dm_inner(
     ),
     String,
 > {
-    use crate::owner_state_types::{
-        DmContentKey, OwnerAddr, ReticulumDest, Space, SpaceId, SpaceKind, TransportBinding,
-    };
+    use crate::owner_state_types::{DmContentKey, OwnerAddr, Space, SpaceId, SpaceKind};
 
     // ── 1. Validate kind + recipients. ───────────────────────────────
     if !matches!(kind, SpaceKind::Dm | SpaceKind::GroupDm) {
@@ -10141,13 +10139,11 @@ pub fn add_space_dm_inner(
         community_id: None,
         name,
         members: all_members.clone(),
-        // DM kinds always Reticulum; participants populated lazily as
-        // announces propagate (Phase 3b currently leaves it empty —
-        // resolution happens via OwnerDeviceCache, not the Space's
-        // transport binding).
-        transport: Some(TransportBinding::Reticulum {
-            participants: Vec::<ReticulumDest>::new(),
-        }),
+        // ZEB-474: DM/GroupDm Spaces carry transport=None (deposit-only;
+        // the Reticulum carrier was removed). Delivery resolves via
+        // OwnerDeviceCache at send time. Move 1a (ZEB-473) may add an
+        // iroh transport binding here.
+        transport: None,
         custom_name: None,
         notification_pref: None,
         left_at: None,
@@ -23183,7 +23179,7 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
-            None,  // identity_dir: no fork fields in this test
+            None, // identity_dir: no fork fields in this test
         )
         .await;
 

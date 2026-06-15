@@ -1136,9 +1136,7 @@ mod apply_space_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: members.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
             custom_name: None,
             notification_pref: None,
@@ -1585,9 +1583,7 @@ mod apply_space_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,
@@ -1610,9 +1606,7 @@ mod apply_space_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,
@@ -1784,9 +1778,7 @@ mod apply_space_tests {
             parent: None,
             community_id: None,
             name: "Hijacked".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16]), OwnerAddr([3; 16])],
             custom_name: None,
             notification_pref: None,
@@ -2497,9 +2489,7 @@ mod canonicalization_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: members.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
             custom_name: None,
             notification_pref: None,
@@ -2891,9 +2881,7 @@ mod crypto_integration_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             // Sorted ascending — required by validate_invariants.
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
@@ -3581,9 +3569,7 @@ mod merge_prior_content_keys_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,
@@ -3744,9 +3730,7 @@ mod dm_crypto_integration_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,

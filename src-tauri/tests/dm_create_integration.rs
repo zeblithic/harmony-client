@@ -12,7 +12,7 @@
 //!
 //! Behaviors covered:
 //!   1. Happy path — Dm kind generates content_key, builds Space CRDT
-//!      entry with sorted self+recipient members + Reticulum transport,
+//!      entry with sorted self+recipient members + transport=None (deposit-only),
 //!      applies it to OwnerState via `apply_space_with_canonicalization`,
 //!      and emits one signed `DmInvite` per known recipient device.
 //!   2. GroupDm with 15 recipients (16 total members at cap) succeeds.
@@ -28,7 +28,7 @@ use harmony_app::dm_envelope::{decode_packet, DmPacket};
 use harmony_app::dm_signing;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_types::{
-    DeviceIdentityHash, Hlc, OwnerAddr, OwnerDeviceEntry, SpaceKind, TransportBinding,
+    DeviceIdentityHash, Hlc, OwnerAddr, OwnerDeviceEntry, SpaceKind,
 };
 
 /// Build a complete identity for a participant in the test:
@@ -130,10 +130,11 @@ async fn add_space_dm_kind_generates_content_key_and_dispatches_invite() {
     assert!(space.members.windows(2).all(|w| w[0] < w[1]));
     assert!(space.content_key.is_some(), "DM must have content_key");
     assert!(space.prior_content_keys.is_empty());
-    assert!(matches!(
-        space.transport,
-        Some(TransportBinding::Reticulum { .. })
-    ));
+    // ZEB-474: DM spaces carry transport=None (deposit-only; Reticulum variant removed).
+    assert!(
+        space.transport.is_none(),
+        "DM space must have transport=None"
+    );
     assert_eq!(space.name, "DM with Bob");
     assert!(space.validate_invariants().is_ok(), "Space invariants hold");
 

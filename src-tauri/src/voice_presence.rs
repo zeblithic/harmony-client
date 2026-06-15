@@ -1445,7 +1445,7 @@ mod groupdm_membership_tests {
     use super::*;
     use crate::owner_state_crdt::OwnerState;
     use crate::owner_state_types::{
-        DeviceIdentityHash, DmContentKey, OwnerDeviceEntry, Space, SpaceKind, TransportBinding,
+        DeviceIdentityHash, DmContentKey, OwnerDeviceEntry, Space, SpaceKind,
     };
 
     fn hlc() -> Hlc {
@@ -1472,9 +1472,7 @@ mod groupdm_membership_tests {
             parent: None,
             community_id: None,
             name: "Group".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members,
             custom_name: None,
             notification_pref: None,

@@ -695,9 +695,7 @@ mod wire_identity_tests {
         // real content-addressed value, not the empty-state CID.
         let mut state = OwnerState::default();
         {
-            use crate::owner_state_types::{
-                OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
-            };
+            use crate::owner_state_types::{OwnerAddr, Space, SpaceId, SpaceKind};
             let h = Hlc {
                 wall_ms: 7,
                 logical: 0,
@@ -711,9 +709,7 @@ mod wire_identity_tests {
                     parent: None,
                     community_id: None,
                     name: "DM".into(),
-                    transport: Some(TransportBinding::Reticulum {
-                        participants: vec![],
-                    }),
+                    transport: None,
                     members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
                     custom_name: None,
                     notification_pref: None,
@@ -1441,7 +1437,7 @@ mod publisher_tests {
 mod integration_tests {
     use super::*;
     use crate::content_store::InMemoryStub;
-    use crate::owner_state_types::{OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding};
+    use crate::owner_state_types::{OwnerAddr, Space, SpaceId, SpaceKind};
     use std::time::Duration;
 
     async fn wait_until<F, Fut>(mut cond: F, timeout: Duration) -> bool
@@ -1482,9 +1478,7 @@ mod integration_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: sorted.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
             custom_name: None,
             notification_pref: None,

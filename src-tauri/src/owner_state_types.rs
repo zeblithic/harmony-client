@@ -26,8 +26,8 @@ where
 }
 
 /// Helper: serialize a `Vec<u8>` as CBOR bstr (major type 2). Used by
-/// variable-length opaque-bytes wrapper types like `ReticulumDest` so
-/// they don't accidentally encode as a CBOR array of u8 (major type 4).
+/// variable-length opaque-bytes wrapper types so they don't accidentally
+/// encode as a CBOR array of u8 (major type 4).
 ///
 /// Crate-public so DM wire types (`dm_envelope::MessagePayload.body`)
 /// and future Phase 2/3b modules can reuse the same byte-efficient
@@ -1084,24 +1084,16 @@ pub enum SpaceKind {
     GroupDm,
 }
 
-/// Reticulum destination identifier — opaque bytes for Phase 2 (ZEB-16
-/// plane B has not finalized the wire shape). Wrapped as a newtype so
-/// future protocol changes don't ripple through every caller.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ReticulumDest(
-    #[serde(
-        serialize_with = "serialize_vec_as_bstr",
-        deserialize_with = "deserialize_vec_from_bstr"
-    )]
-    pub Vec<u8>,
-);
-
 /// Transport binding. Internally tagged so the wire format is one CBOR
 /// map per binding (not nested). Discriminant key `tg` (2 chars to match
 /// the inner field key length per `canonical_cbor_encode`'s same-length-
-/// keys precondition); variant codes `z` / `r` (1 char — values, not keys,
-/// so not subject to that rule); inner field names `tp` / `pa`.
+/// keys precondition); variant codes `z` (1 char — values, not keys,
+/// so not subject to that rule); inner field name `tp`.
+///
+/// ZEB-474: The `Reticulum { participants }` variant and the `ReticulumDest`
+/// newtype have been removed (flag-day-for-alpha CBOR wire-format change).
+/// DM/GroupDm Spaces now carry `transport: None` (deposit-only; no live
+/// point-to-point binding until Move 1a / ZEB-473 adds an iroh binding).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "tg")]
 pub enum TransportBinding {
@@ -1109,11 +1101,6 @@ pub enum TransportBinding {
     Zenoh {
         #[serde(rename = "tp")] // "topic"
         topic: String,
-    },
-    #[serde(rename = "r")]
-    Reticulum {
-        #[serde(rename = "pa")] // "participants"
-        participants: Vec<ReticulumDest>,
     },
 }
 
@@ -1158,7 +1145,6 @@ impl_canonical!(
     OwnerDeviceEntry,
     SpaceKind,
     NotificationPref,
-    ReticulumDest,
     TransportBinding,
     Space,
     DedupeKey,
@@ -1408,34 +1394,10 @@ mod enum_tests {
         assert_eq!(b, recovered);
     }
 
-    #[test]
-    fn transport_binding_reticulum_round_trip() {
-        let b = TransportBinding::Reticulum {
-            participants: vec![ReticulumDest(vec![1, 2, 3])],
-        };
-        let mut bytes = Vec::new();
-        into_writer(&b, &mut bytes).unwrap();
-        let recovered: TransportBinding = from_reader(&bytes[..]).unwrap();
-        assert_eq!(b, recovered);
-    }
-
-    /// Regression for PR #73 round 2 review: ReticulumDest must encode
-    /// as CBOR bstr (major type 2), not as a CBOR array of u8 (major
-    /// type 4). Pin the wire bytes so any future serde-attribute change
-    /// that breaks bstr emission fails loudly.
-    #[test]
-    fn reticulum_dest_emits_cbor_bstr() {
-        let d = ReticulumDest(vec![0xde, 0xad, 0xbe, 0xef]);
-        let mut bytes = Vec::new();
-        into_writer(&d, &mut bytes).unwrap();
-        // CBOR bstr len=4: 0x44 (major type 2, length 4) + the 4 bytes.
-        // CBOR array len=4 would be 0x84 + four u8-encoded values
-        // (each itself another byte or two), so this byte pattern would
-        // never match an array encoding.
-        assert_eq!(bytes, vec![0x44, 0xde, 0xad, 0xbe, 0xef]);
-        let recovered: ReticulumDest = from_reader(&bytes[..]).unwrap();
-        assert_eq!(d, recovered);
-    }
+    // ZEB-474: transport_binding_reticulum_round_trip and
+    // reticulum_dest_emits_cbor_bstr tests deleted — the
+    // TransportBinding::Reticulum variant and ReticulumDest type were
+    // removed (flag-day-for-alpha CBOR wire-format change).
 
     #[test]
     fn notification_pref_round_trip() {
@@ -1728,9 +1690,11 @@ impl Space {
                         "dm members must be sorted ascending (canonical CBOR determinism)".into(),
                     ));
                 }
-                match &self.transport {
-                    Some(TransportBinding::Reticulum { .. }) => {}
-                    _ => return Err(InvariantError("dm must have reticulum transport".into())),
+                // ZEB-474: deposit-only DMs carry no live point-to-point
+                // transport binding (the Reticulum carrier was removed).
+                // Move 1a (ZEB-473) may reintroduce an iroh binding here.
+                if self.transport.is_some() {
+                    return Err(InvariantError("dm must have transport=None".into()));
                 }
             }
             SpaceKind::GroupDm => {
@@ -1748,13 +1712,11 @@ impl Space {
                             .into(),
                     ));
                 }
-                match &self.transport {
-                    Some(TransportBinding::Reticulum { .. }) => {}
-                    _ => {
-                        return Err(InvariantError(
-                            "group-dm must have reticulum transport".into(),
-                        ))
-                    }
+                // ZEB-474: deposit-only GroupDMs carry no live point-to-point
+                // transport binding (the Reticulum carrier was removed).
+                // Move 1a (ZEB-473) may reintroduce an iroh binding here.
+                if self.transport.is_some() {
+                    return Err(InvariantError("group-dm must have transport=None".into()));
                 }
             }
             SpaceKind::Community => {
@@ -2362,9 +2324,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: (0..n_members).map(|i| OwnerAddr([i as u8; 16])).collect(),
             custom_name: None,
             notification_pref: None,
@@ -2395,9 +2355,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "Group".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: (0..n).map(|i| OwnerAddr([i as u8; 16])).collect(),
             custom_name: None,
             notification_pref: None,
@@ -2431,9 +2389,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1u8; 16]), OwnerAddr([1u8; 16])],
             custom_name: None,
             notification_pref: None,
@@ -2468,9 +2424,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             // Reverse order — bob > alice but listed bob-first.
             members: vec![OwnerAddr([2u8; 16]), OwnerAddr([1u8; 16])],
             custom_name: None,
@@ -2502,9 +2456,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "Group".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![
                 OwnerAddr([3u8; 16]),
                 OwnerAddr([1u8; 16]),
@@ -2542,9 +2494,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "Group".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             // 4 entries but only 3 distinct — len passes 3..=16 but
             // dedupe_key would collapse to 3 sorted members.
             members: vec![
@@ -2603,15 +2553,12 @@ mod space_tests {
                 .validate_invariants()
                 .is_err()
         );
-        // Wrong transport → reject.
-        assert!(mk_channel(
-            Some(SpaceId([5u8; 16])),
-            Some(TransportBinding::Reticulum {
-                participants: vec![]
-            })
-        )
-        .validate_invariants()
-        .is_err());
+        // Wrong transport (None instead of Zenoh) → reject.
+        // ZEB-474: was formerly tested with Reticulum variant (now removed);
+        // None is the other non-Zenoh value and Channel requires Zenoh.
+        assert!(mk_channel(Some(SpaceId([5u8; 16])), None)
+            .validate_invariants()
+            .is_err());
         // Both correct → pass.
         assert!(mk_channel(
             Some(SpaceId([5u8; 16])),
@@ -2634,9 +2581,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: m,
             custom_name: None,
             notification_pref: None,
@@ -2715,9 +2660,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,
@@ -2755,9 +2698,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: (0u8..3).map(|i| OwnerAddr([i; 16])).collect(),
             custom_name: None,
             notification_pref: None,
@@ -2868,9 +2809,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,
@@ -2906,9 +2845,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,
@@ -2948,9 +2885,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "x".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
             custom_name: None,
             notification_pref: None,
@@ -3635,9 +3570,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "dm".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
             custom_name: None,
             notification_pref: None,
@@ -3721,9 +3654,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "DM".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
             custom_name: None,
             notification_pref: None,
@@ -3768,9 +3699,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "dm".to_string(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([2u8; 16]), OwnerAddr([3u8; 16])],
             custom_name: None,
             notification_pref: None,
@@ -3882,9 +3811,7 @@ mod space_tests {
             parent: None,
             community_id: None,
             name: "dm".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
             custom_name: None,
             notification_pref: None,

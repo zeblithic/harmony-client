@@ -1585,23 +1585,17 @@ impl DmOutbox {
         // Build the Space from the invite. Mirror what add_space's DM/group-DM
         // handling will produce (Phase 4 will produce these on the SEND side
         // as outbound invites; here we mirror the same shape on the RECEIVE
-        // side as inbound invite acceptance). Transport binding is Reticulum
-        // (DM kinds always are).
+        // side as inbound invite acceptance).
+        // ZEB-474: DM/GroupDm Spaces carry transport=None (deposit-only;
+        // the Reticulum carrier was removed). Delivery uses OwnerDeviceCache,
+        // not Space.transport.
         let space = crate::owner_state_types::Space {
             id: signed.space_id,
             kind: signed.kind,
             parent: None,
             community_id: None,
             name: format!("DM with {}", hex::encode(signed.inviter.0)),
-            // `participants` is a `Vec<ReticulumDest>` of opaque transport
-            // identifiers; we don't have those for the inviter's owners
-            // here (only their `OwnerAddr`s — the receiver-side code path
-            // resolves OwnerAddr → DeviceIdentityHash via OwnerDeviceCache
-            // at send time, not from `Space.transport.participants`). Leave
-            // empty; matches the existing test fixture pattern.
-            transport: Some(crate::owner_state_types::TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: signed.members,
             custom_name: None,
             notification_pref: None,
@@ -2674,7 +2668,7 @@ pub(crate) fn dm_received_event_payload(
 mod tests {
     use super::*;
     use crate::content_store::InMemoryStub;
-    use crate::owner_state_types::{ContentId, DmContentKey, InboxEntry, Space, TransportBinding};
+    use crate::owner_state_types::{ContentId, DmContentKey, InboxEntry, Space};
 
     /// Test-only helper: build a `DmOutbox` with synthetic materials for
     /// tests that don't exercise community-signing paths. Routes through
@@ -2833,9 +2827,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "Bob".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members,
             custom_name: None,
             notification_pref: None,
@@ -5272,9 +5264,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "Alice".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: sorted.to_vec(),
             custom_name: None,
             notification_pref: None,
@@ -5600,9 +5590,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "Alice".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: sorted.to_vec(),
             custom_name: None,
             notification_pref: None,
@@ -5804,9 +5792,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "Alice".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: sorted.to_vec(),
             custom_name: None,
             notification_pref: None,
@@ -5907,9 +5893,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "Alice".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: sorted.to_vec(),
             custom_name: None,
             notification_pref: None,
@@ -7237,9 +7221,7 @@ mod tests {
             parent: None,
             community_id: None,
             name: "trio".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members: members.clone(),
             custom_name: None,
             notification_pref: None,
@@ -8145,7 +8127,7 @@ mod tests {
 mod outhold_write_tests {
     use super::*;
     use crate::content_store::InMemoryStub;
-    use crate::owner_state_types::{DmContentKey, Space, TransportBinding};
+    use crate::owner_state_types::{DmContentKey, Space};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -8182,9 +8164,7 @@ mod outhold_write_tests {
             parent: None,
             community_id: None,
             name: "Bob".into(),
-            transport: Some(TransportBinding::Reticulum {
-                participants: vec![],
-            }),
+            transport: None,
             members,
             custom_name: None,
             notification_pref: None,
