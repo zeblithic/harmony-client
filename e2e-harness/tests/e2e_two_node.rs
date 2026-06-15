@@ -241,24 +241,22 @@ async fn s1_invite_join_roster_convergence() {
 // id-equality; it asserts the (correct) inequality-at-creation and reads tolerant
 // of whichever id the thread settles under (`read_dm_plaintext_any`).
 //
-// DM DELIVERY GAP (documented product/harness limitation — see report).
-// DM unicast resolves `OwnerAddr → device destinations` via `OwnerDeviceCache`,
-// populated by Reticulum announce propagation ("Flow A"). The harness sets
-// `HARMONY_RETICULUM_PORT=0` (`e2e-harness/src/node.rs`), DISABLING Reticulum LAN
-// discovery — mandatory for two co-located nodes, which would otherwise collide on
-// the single fixed broadcast/bind port (`255.255.255.255:{port}`). With no live
-// Reticulum socket the two nodes never exchange the announces that fill
-// `OwnerDeviceCache`, so `resolve_destinations` returns empty and `send_dm` retries
-// forever with `transport temporarily unavailable: no known devices for recipient`
-// (observed in alice.stderr.log). The iroh-based friend handshake does NOT populate
-// a DM transport destination. Net: DM *delivery* between two same-host headless
-// nodes is unreachable in this harness regardless of how first-contact happens
-// (the community-warm fallback hits the same wall — the blocker is the disabled
-// Reticulum transport, not the friend path). So below we PROVE the DM send is
-// accepted by the engine, then *characterize* (not hard-assert) delivery with a
-// short bounded poll, recording whether bytes round-tripped. The hard assertions
-// are the parts that genuinely work end-to-end: real friendship active both ways +
-// real DM-space creation with the verified id semantics.
+// DM DELIVERY: two layers, one now fixed (ZEB-461 Tasks 5-7), one still pending.
+// DM unicast resolves `OwnerAddr → device destinations` via `OwnerDeviceCache`.
+// BEFORE ZEB-461 that cache was populated only by Reticulum announce propagation,
+// which the harness disables (`HARMONY_RETICULUM_PORT=0`, mandatory so two
+// co-located nodes don't collide on the fixed LAN broadcast port) — so the cache
+// stayed empty and `send_dm` retried forever with "no known devices for recipient".
+// ZEB-461 Tasks 5-7 fix THAT layer: the iroh friend handshake now carries + learns
+// each side's device bundle into `OwnerDeviceCache`, so `resolve_destinations`
+// resolves the peer's devices with NO Reticulum socket. The remaining layer is the
+// DM transport itself: per-device unicast still rides the Reticulum path
+// (`SendUnicastToDevice`), which can't route co-located and is being deprecated in
+// favour of a DM-over-iroh carrier (repurposing the PQ `harmony-tunnel` session;
+// tracked separately — see docs/analysis/2026-06-14-transport-00-SYNTHESIS.md). So
+// below we hard-assert the parts that work end-to-end (friendship active both ways +
+// DM-space creation + `send_dm` accepted/resolved) and *characterize* (not assert)
+// byte round-trip, which lights up once the DM-over-iroh carrier lands.
 // ─────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s2_friend_graph_and_dm_send() {
@@ -332,13 +330,13 @@ async fn s2_friend_graph_and_dm_send() {
     let candidates: Vec<&str> = vec![a_space.as_str(), b_space.as_str()];
 
     // DM send must be ACCEPTED by the engine (the IPC returns Ok — the message is
-    // CAS-stored + queued on the outbox). Delivery is then characterized, not
-    // hard-asserted (see the DM DELIVERY GAP note above): a bounded poll records
-    // whether the bytes round-trip. In this harness they do not (Reticulum LAN
-    // transport disabled → "no known devices for recipient"); on a transport that
-    // populates OwnerDeviceCache (real LAN / two hosts) the same poll would observe
-    // delivery. The bounded poll keeps the scenario fast + honest rather than
-    // hanging 120s on a known-blocked path.
+    // CAS-stored + queued on the outbox). With ZEB-461 Tasks 5-7 the recipient's
+    // devices now resolve from `OwnerDeviceCache` (handshake-populated), so the send
+    // gets a real destination instead of "no known devices". Delivery is still
+    // characterized, not hard-asserted: the per-device unicast rides the Reticulum
+    // path that can't route co-located and is being replaced by a DM-over-iroh
+    // carrier (PQ `harmony-tunnel` repurpose, tracked separately). The bounded poll
+    // keeps the scenario fast + honest rather than hanging on the pending carrier.
     send_dm(&alice, &a_space, b"hello-from-alice", "text/plain")
         .await
         .expect("alice's send_dm is accepted by the engine (CAS-stored + queued)");
