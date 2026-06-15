@@ -1865,6 +1865,12 @@ impl DmOutbox {
                         None
                     }
                 };
+            // DORMANT (ZEB-474 → ZEB-473/Move 1a): the Reticulum unicast
+            // carrier is removed; these ack packets reach the pinned core's
+            // SendUnicastToDevice handler and are dropped (no worse than
+            // today — off-LAN acks already dropped). Move 1a rewires this
+            // fan-out onto the iroh tunnel. Delivery confirmation in the
+            // interim comes from the butler-deposit ack, not this read-ack.
             if let Some(ack_wire) = ack_wire_opt {
                 for device in &signed.sender_devices {
                     let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);

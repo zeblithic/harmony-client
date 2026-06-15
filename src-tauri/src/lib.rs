@@ -10295,6 +10295,10 @@ pub fn add_space_dm_inner(
             Some(e) => e,
             None => continue, // recipient unknown — outbox loop on first send_dm recovers
         };
+        // DORMANT (ZEB-474 → ZEB-473/Move 1a): Reticulum carrier removed;
+        // these DmInvite packets reach the pinned core's SendUnicastToDevice
+        // handler and are dropped. Off-LAN Space-membership invites already
+        // failed to deliver; Move 1a rewires this onto the iroh tunnel.
         for device in &entry.devices {
             let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
             sends.push(crate::dm_outbox::UnicastSendRequest {
