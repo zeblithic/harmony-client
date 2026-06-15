@@ -39805,11 +39805,21 @@ pub async fn connectivity_link_friend_iroh_inner(
     // consumed below (step 8) to derive + KeyTree-seal the friendship secret once
     // the accept carries the inviter's ephemeral public.
     let (self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+    // ZEB-461: the device bundle / reachability / PQ keys ship EMPTY for now;
+    // Task 6 fills them with real values. The empty bundle's digest is still
+    // bound into the request signature so the wire stays consistent.
+    let req_sender_devices: Vec<crate::owner_state_types::DeviceIdentityHash> = vec![];
+    let req_device_identity_pubs: Vec<Option<[u8; 64]>> = vec![];
+    let req_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+        &req_sender_devices,
+        &req_device_identity_pubs,
+    );
     let req_sig = self_device2_signing_key
         .sign(&friend_request_sig_preimage(
             self_owner,
             Some(&payload.token.sig),
             &self_eph_pub,
+            &req_devices_digest,
         ))
         .to_bytes();
     let request = FriendLinkRequest {
@@ -39819,6 +39829,12 @@ pub async fn connectivity_link_friend_iroh_inner(
         eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment,
         sig: req_sig,
+        sender_devices: req_sender_devices,
+        device_identity_pubs: req_device_identity_pubs,
+        iroh_node_id: [0u8; 32],
+        home_relay_url: None,
+        pq_dsa_pubkey: vec![],
+        pq_kem_pubkey: vec![],
     };
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
     let wire_len = wire.len() as u32;
@@ -39929,12 +39945,19 @@ pub async fn connectivity_link_friend_iroh_inner(
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
+    // ZEB-461: bind the accepter's device-bundle digest (computed from the bundle
+    // the accept carries) into the verified accept preimage.
+    let accept_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+        &accepted.sender_devices,
+        &accepted.device_identity_pubs,
+    );
     accept_vk
         .verify_strict(
             &friend_accept_sig_preimage(
                 payload.inviter_addr,
                 Some(&payload.token.sig),
                 &accepted.eph_x25519_pub,
+                &accept_devices_digest,
             ),
             &Signature::from_bytes(&accepted.sig),
         )
@@ -42006,11 +42029,20 @@ pub async fn connectivity_add_friend_by_key_inner(
     // 5. Build + device-#2-sign a token-LESS FriendLinkRequest. `token_sig` is
     //    None end-to-end (Path A); the sig binds our ephemeral X25519 public.
     let (self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+    // ZEB-461: empty device bundle / reachability / PQ keys for now (Task 6 fills
+    // them); the empty bundle's digest is still bound into the request signature.
+    let req_sender_devices: Vec<crate::owner_state_types::DeviceIdentityHash> = vec![];
+    let req_device_identity_pubs: Vec<Option<[u8; 64]>> = vec![];
+    let req_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+        &req_sender_devices,
+        &req_device_identity_pubs,
+    );
     let req_sig = self_device2_signing_key
         .sign(&friend_request_sig_preimage(
             self_owner,
             None,
             &self_eph_pub,
+            &req_devices_digest,
         ))
         .to_bytes();
     let request = FriendLinkRequest {
@@ -42020,6 +42052,12 @@ pub async fn connectivity_add_friend_by_key_inner(
         eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment,
         sig: req_sig,
+        sender_devices: req_sender_devices,
+        device_identity_pubs: req_device_identity_pubs,
+        iroh_node_id: [0u8; 32],
+        home_relay_url: None,
+        pq_dsa_pubkey: vec![],
+        pq_kem_pubkey: vec![],
     };
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
     let wire_len = wire.len() as u32;
@@ -42129,9 +42167,19 @@ pub async fn connectivity_add_friend_by_key_inner(
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
+    // ZEB-461: bind the accepter's device-bundle digest into the verified preimage.
+    let accept_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+        &accepted.sender_devices,
+        &accepted.device_identity_pubs,
+    );
     accept_vk
         .verify_strict(
-            &friend_accept_sig_preimage(target_addr_master, None, &accepted.eph_x25519_pub),
+            &friend_accept_sig_preimage(
+                target_addr_master,
+                None,
+                &accepted.eph_x25519_pub,
+                &accept_devices_digest,
+            ),
             &Signature::from_bytes(&accepted.sig),
         )
         .map_err(|_| "friend accept signature invalid".to_string())?;
