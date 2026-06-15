@@ -39730,6 +39730,43 @@ fn build_self_handshake_reachability(
     })
 }
 
+/// Apply a freshly-handshaked friend + their advertised device bundle to owner
+/// state under ONE lock. Shared by BOTH dialer paths (token-redeem
+/// `connectivity_link_friend_iroh_inner` and add-by-key
+/// `connectivity_add_friend_by_key_inner`) so the ZEB-461 device-cache
+/// population cannot drift between them — it did: Greptile flagged (P1, #269)
+/// that the add-by-key path verified the accept's bundle digest but never wrote
+/// the devices, reproducing the exact DM-routing gap ZEB-461 closes.
+///
+/// `learned_at` is this node's local HLC (anti-forgery: never the peer's claimed
+/// time). An empty `sender_devices` is skipped so a peer that advertised nothing
+/// never LWW-clobbers a previously-known-good cache entry.
+async fn apply_handshaked_friend(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    addr: crate::owner_state_types::OwnerAddr,
+    entry: crate::friend_graph::FriendEntry,
+    sender_devices: Vec<crate::owner_state_types::DeviceIdentityHash>,
+    device_identity_pubs: Vec<Option<[u8; 64]>>,
+    learned_at: crate::owner_state_types::Hlc,
+) -> Result<(), String> {
+    let mut state = crdt_state.lock().await;
+    match state.apply_friend_update(addr, entry) {
+        crate::owner_state_crdt::ApplyOutcome::Inserted
+        | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {}
+        crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+            return Err(format!("friend-graph apply rejected: {reason:?}"));
+        }
+    }
+    if !sender_devices.is_empty() {
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) =
+            state.apply_owner_device_update(addr, sender_devices, device_identity_pubs, learned_at)
+        {
+            return Err(format!("device-cache apply rejected: {reason:?}"));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn connectivity_link_friend_iroh_inner(
     token_url: String,
@@ -40095,37 +40132,18 @@ pub async fn connectivity_link_friend_iroh_inner(
         learned_at: learned_at.clone(),
         sealed_secret: Some(sealed),
     };
-    {
-        let mut state = crdt_state.lock().await;
-        match state.apply_friend_update(payload.inviter_addr, entry) {
-            crate::owner_state_crdt::ApplyOutcome::Inserted
-            | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {}
-            crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
-                return Err(format!("friend-graph apply rejected: {reason:?}"));
-            }
-        }
-
-        // ZEB-461 Task 7: learn the inviter's advertised devices (carried in the
-        // accept) so the DM outbox can route to this friend even without a shared
-        // community. Keyed by the inviter's OwnerAddr (same key as the friend
-        // write). `learned_at` is this node's local HLC (the same value stamped
-        // on the friend entry) — never the peer's claimed time (handle_invite
-        // anti-forgery rule). Skip an empty bundle so we never LWW-clobber a
-        // previously-known-good cache entry (an empty bundle means "peer
-        // advertised nothing", NOT "peer has zero devices").
-        if !accepted.sender_devices.is_empty() {
-            if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = state
-                .apply_owner_device_update(
-                    payload.inviter_addr,
-                    accepted.sender_devices.clone(),
-                    accepted.device_identity_pubs.clone(),
-                    learned_at,
-                )
-            {
-                return Err(format!("device-cache apply rejected: {reason:?}"));
-            }
-        }
-    }
+    // ZEB-461 Task 7: learn the inviter's advertised devices (carried in the
+    // accept) so the DM outbox can route to this friend even without a shared
+    // community. Shared helper keeps this in lockstep with the add-by-key path.
+    apply_handshaked_friend(
+        &crdt_state,
+        payload.inviter_addr,
+        entry,
+        accepted.sender_devices.clone(),
+        accepted.device_identity_pubs.clone(),
+        learned_at,
+    )
+    .await?;
 
     tracing::info!(
         friend = %hex::encode(payload.inviter_addr.0),
@@ -42354,19 +42372,22 @@ pub async fn connectivity_add_friend_by_key_inner(
         status: crate::friend_graph::FriendStatus::Active,
         established_via: crate::friend_graph::FriendOrigin::MutualKey,
         referrable: false,
-        learned_at,
+        learned_at: learned_at.clone(),
         sealed_secret: Some(sealed),
     };
-    {
-        let mut state = crdt_state.lock().await;
-        match state.apply_friend_update(target_addr_master, entry) {
-            crate::owner_state_crdt::ApplyOutcome::Inserted
-            | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {}
-            crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
-                return Err(format!("friend-graph apply rejected: {reason:?}"));
-            }
-        }
-    }
+    // ZEB-461: learn the target's advertised devices (carried in the accept) so
+    // the DM outbox can route to this key-introduced friend even without a shared
+    // community. Shared helper keeps this in lockstep with the token path —
+    // Greptile P1 on #269 found this path previously dropped the device update.
+    apply_handshaked_friend(
+        &crdt_state,
+        target_addr_master,
+        entry,
+        accepted.sender_devices.clone(),
+        accepted.device_identity_pubs.clone(),
+        learned_at,
+    )
+    .await?;
 
     tracing::info!(
         friend = %hex::encode(target_addr_master.0),
@@ -42600,6 +42621,59 @@ mod friend_ipc_tests {
                 sealed_secret: None,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn apply_handshaked_friend_populates_cache_and_skips_empty() {
+        // A valid, self-consistent device bundle (each Some(pub) hashes to its
+        // parallel device hash, so apply_owner_device_update accepts it) — the
+        // same construction the acceptor-side cache test uses.
+        let id = harmony_identity::PrivateIdentity::from_seed(&[0x5e; 32]);
+        let pub64 = id.public_identity().to_public_bytes();
+        let (devices, pubs) = crate::dm_tunnel_contact::self_device_bundle(pub64);
+        assert!(!devices.is_empty(), "fixture must advertise a device");
+
+        // Non-empty bundle → friend applied AND device cache populated. This is
+        // the dialer-side population BOTH handshake paths now share via the
+        // helper; Greptile P1 on #269 was the add-by-key path skipping it.
+        let state = tokio::sync::Mutex::new(OwnerState::default());
+        let (addr, entry) = friend_entry(0x33, FriendStatus::Active, 10);
+        apply_handshaked_friend(&state, addr, entry, devices.clone(), pubs.clone(), hlc(10))
+            .await
+            .expect("apply must succeed");
+        {
+            let s = state.lock().await;
+            assert!(
+                list_friends_inner(&s)
+                    .iter()
+                    .any(|f| f.owner_id_hex == hex::encode(addr.0)),
+                "friend must be applied"
+            );
+            let cache = s
+                .owner_device_cache
+                .devices
+                .get(&addr)
+                .expect("device cache entry for the new friend");
+            assert_eq!(
+                cache.devices, devices,
+                "cache must learn the accepted bundle"
+            );
+        }
+
+        // Empty bundle → friend still applied, cache untouched (skip-on-empty so
+        // an advertised-nothing peer can't LWW-clobber a known-good entry).
+        let state2 = tokio::sync::Mutex::new(OwnerState::default());
+        let (addr2, entry2) = friend_entry(0x44, FriendStatus::Active, 10);
+        apply_handshaked_friend(&state2, addr2, entry2, vec![], vec![], hlc(10))
+            .await
+            .expect("apply must succeed with an empty bundle");
+        {
+            let s = state2.lock().await;
+            assert!(
+                !s.owner_device_cache.devices.contains_key(&addr2),
+                "an empty bundle must not create a device-cache entry"
+            );
+        }
     }
 
     #[test]
