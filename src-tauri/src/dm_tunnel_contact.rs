@@ -20,9 +20,22 @@ use crate::owner_state_types::DeviceIdentityHash;
 pub fn self_device_bundle(
     identity_pub_64: [u8; 64],
 ) -> (Vec<DeviceIdentityHash>, Vec<Option<[u8; 64]>>) {
-    let hash = crate::dm_signing::derive_device_hash_from_identity_pub(&identity_pub_64)
-        .expect("our own identity pub must derive a device hash");
-    (vec![hash], vec![Some(identity_pub_64)])
+    // Our own identity pub is minted in-process and is normally always valid, so
+    // a `None` here means our identity material is corrupt (e.g. truncated /
+    // bit-flipped on disk). Degrade gracefully — advertise an EMPTY bundle (the
+    // receive side treats that as "no devices advertised" and skips it) rather
+    // than `.expect()`-panicking the whole node. Loud `error!` so the corruption
+    // is still visible.
+    match crate::dm_signing::derive_device_hash_from_identity_pub(&identity_pub_64) {
+        Some(hash) => (vec![hash], vec![Some(identity_pub_64)]),
+        None => {
+            tracing::error!(
+                "self identity pub did not derive a device hash (corrupt identity?); \
+                 advertising an empty device bundle"
+            );
+            (vec![], vec![])
+        }
+    }
 }
 
 #[cfg(test)]
@@ -40,5 +53,25 @@ mod tests {
         assert_eq!(pubs, vec![Some(pub64)]);
         let expected = crate::dm_signing::derive_device_hash_from_identity_pub(&pub64).unwrap();
         assert_eq!(devices[0], expected);
+    }
+
+    #[test]
+    fn self_device_bundle_degrades_to_empty_on_unparseable_pub() {
+        // CodeAnt: a corrupt self identity must NOT abort the process. `from_bytes`
+        // rejects an Ed25519 half that doesn't decompress to a curve point (~half
+        // of arbitrary encodings), so a corrupt-on-disk pub can reach the `None`
+        // branch. Search for such a value (varying the Ed25519 half), then assert
+        // the bundle degrades to EMPTY rather than panicking.
+        let bad = (0u32..2000)
+            .map(|i| {
+                let mut p = [0u8; 64];
+                p[32..36].copy_from_slice(&i.to_le_bytes());
+                p
+            })
+            .find(|p| crate::dm_signing::derive_device_hash_from_identity_pub(p).is_none())
+            .expect("an off-curve Ed25519 half must exist in the search space");
+        let (devices, pubs) = self_device_bundle(bad);
+        assert!(devices.is_empty());
+        assert!(pubs.is_empty());
     }
 }

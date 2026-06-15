@@ -186,6 +186,60 @@ mod vec_opt_bstr64 {
     }
 }
 
+/// Serde for `sender_devices: Vec<DeviceIdentityHash>` that REJECTS a sequence
+/// longer than `MAX_DEVICES_PER_OWNER` on decode — defense-in-depth against a
+/// hostile peer padding the bundle (mirrors the cap on the parallel
+/// `device_identity_pubs` via [`vec_opt_bstr64`]). The whole packet is already
+/// bounded by `FRIEND_MAX_PACKET_LEN` and `apply_owner_device_update` truncates
+/// at the cache, but capping here keeps the two parallel vecs symmetric and
+/// rejects the oversized packet before the digest is computed over it. Serialize
+/// is a plain pass-through (byte-identical to the derived `Vec` impl, so the
+/// pinned wire fixtures are unaffected).
+mod vec_devhash_capped {
+    use crate::owner_state_types::{DeviceIdentityHash, MAX_DEVICES_PER_OWNER};
+    use serde::de::{Error as DeError, SeqAccess, Visitor};
+    use serde::ser::SerializeSeq;
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &[DeviceIdentityHash], s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(v.len()))?;
+        for d in v {
+            seq.serialize_element(d)?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<DeviceIdentityHash>, D::Error> {
+        struct CapVisitor;
+        impl<'de> Visitor<'de> for CapVisitor {
+            type Value = Vec<DeviceIdentityHash>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "a sequence of at most {MAX_DEVICES_PER_OWNER} device hashes"
+                )
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out: Vec<DeviceIdentityHash> =
+                    Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_DEVICES_PER_OWNER));
+                while let Some(elem) = seq.next_element::<DeviceIdentityHash>()? {
+                    if out.len() >= MAX_DEVICES_PER_OWNER {
+                        return Err(A::Error::custom(format!(
+                            "sender_devices exceeds MAX_DEVICES_PER_OWNER ({MAX_DEVICES_PER_OWNER})"
+                        )));
+                    }
+                    out.push(elem);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_seq(CapVisitor)
+    }
+}
+
 /// Maximum bytes the acceptor reads per friend-handshake packet. The wire shape
 /// is `[u32 LE length-prefix][body]`; any prefix exceeding this is rejected to
 /// defend against memory-exhaustion by an adversarial dialer. 256 KiB matches
@@ -271,7 +325,7 @@ pub struct FriendLinkRequest {
     /// (an attacker can't swap the requester's claimed device list). Encodes as
     /// `DeviceIdentityHash` bstr(16) elements. `#[serde(default)]` for back-compat
     /// with pre-ZEB-461 peers (absent → empty).
-    #[serde(rename = "d", default)]
+    #[serde(rename = "d", default, with = "vec_devhash_capped")]
     pub sender_devices: Vec<DeviceIdentityHash>,
     /// ZEB-461: full identity pubs parallel-indexed to `sender_devices` (`Some` =
     /// pub known, `None` = known-by-hash only). Also bound into `sig` via
@@ -354,7 +408,7 @@ pub struct FriendLinkAccepted {
     /// ZEB-461: the accepter's device bundle (mirrors `FriendLinkRequest`); lets
     /// the requester seed an `OwnerDeviceCache` entry for the new friend. Bound
     /// into `sig` via `devices_digest`.
-    #[serde(rename = "d", default)]
+    #[serde(rename = "d", default, with = "vec_devhash_capped")]
     pub sender_devices: Vec<DeviceIdentityHash>,
     /// ZEB-461: identity pubs parallel-indexed to `sender_devices`. Bound into
     /// `sig` via `devices_digest`.
@@ -1744,6 +1798,26 @@ mod tests {
         let bytes = encode_friend_request(&req).expect("encode");
         let back = decode_friend_request(&bytes).expect("decode");
         assert_eq!(req, back);
+    }
+
+    /// ZEB-461 (Qodo): an oversized `sender_devices` (> MAX_DEVICES_PER_OWNER) is
+    /// REJECTED on decode — defense-in-depth against a hostile peer padding the
+    /// bundle. Serialize is pass-through, so we can build the oversized wire; the
+    /// cap fires on the receive side.
+    #[test]
+    fn friend_request_rejects_oversized_sender_devices() {
+        use crate::owner_state_types::MAX_DEVICES_PER_OWNER;
+        let (mut req, _, _) = signed_request(0x21, [9u8; 64]);
+        req.sender_devices = (0..=MAX_DEVICES_PER_OWNER as u8)
+            .map(|i| DeviceIdentityHash([i; 16]))
+            .collect();
+        assert!(req.sender_devices.len() > MAX_DEVICES_PER_OWNER);
+        let bytes = encode_friend_request(&req).expect("encode (serialize is pass-through)");
+        let err = decode_friend_request(&bytes);
+        assert!(
+            matches!(err, Err(FriendHandshakeError::Decode(_))),
+            "oversized sender_devices must be rejected on decode, got: {err:?}"
+        );
     }
 
     /// ZEB-461: an accept with ALL new fields populated must round-trip.
