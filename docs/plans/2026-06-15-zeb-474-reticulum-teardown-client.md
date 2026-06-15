@@ -356,7 +356,29 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 - [ ] **Step 1: Find every production constructor of a Reticulum-bound Space.** Run: `grep -rn "TransportBinding::Reticulum" src-tauri/src/ | grep -v "#\[cfg(test)\]"` — but that won't catch test mods cleanly; instead grep all, then for each hit decide prod vs test by context. Production DM-space creation lives in the invite/handle paths (`grep -n "transport: Some(crate::owner_state_types::TransportBinding::Reticulum\|transport: Some(TransportBinding::Reticulum" src-tauri/src/lib.rs src-tauri/src/*.rs`). For each PRODUCTION constructor, change `transport: Some(TransportBinding::Reticulum { participants: ... })` → `transport: None`.
 
-> The `participants: Vec<ReticulumDest>` field is not read in the delivery path (delivery uses `OwnerDeviceCache`), so dropping to `None` loses no live behavior. Confirm by grepping for any read of `.transport` that matches `Reticulum { participants }` and destructures `participants` for use — if one exists outside tests, STOP and report (it would be an unflagged live consumer).
+> **Delivery is NOT affected** — confirmed: `dm_outbox.rs:~1600` resolves destinations "at send time, not from `Space.transport.participants`" (delivery uses `OwnerDeviceCache`). So `participants` is dead metadata for delivery; dropping to `None` loses no live behavior.
+
+- [ ] **Step 1b: Update `validate_invariants` — it REQUIRES the variant (load-bearing).** `Space::validate_invariants` in `src/owner_state_types.rs` (~1675–1920) gates transport per `SpaceKind`. Today: `SpaceKind::Dm` (~1731) and `SpaceKind::GroupDm` (~1751) each do `match &self.transport { Some(TransportBinding::Reticulum { .. }) => {} _ => return Err(... "must have reticulum transport") }`. With DM/GroupDm spaces now `transport: None`, change BOTH arms to require `None` instead:
+
+```rust
+            SpaceKind::Dm => {
+                // ... (keep the 2-distinct-members + sorted-ascending checks) ...
+                // ZEB-474: deposit-only DMs carry no live point-to-point
+                // transport binding (the Reticulum carrier was removed).
+                // Move 1a (ZEB-473) may reintroduce an iroh binding here.
+                if self.transport.is_some() {
+                    return Err(InvariantError("dm must have transport=None".into()));
+                }
+            }
+            SpaceKind::GroupDm => {
+                // ... (keep the 3..=16-distinct-members + sorted-ascending checks) ...
+                if self.transport.is_some() {
+                    return Err(InvariantError("group-dm must have transport=None".into()));
+                }
+            }
+```
+
+Leave the `Channel`/`PublicChannel` arms (require `Zenoh`) and `Folder`/`Community` arms (require `None`) untouched. **Consequence for the fixture sweep (Task 9): DM/GroupDm Reticulum fixtures MUST become `None`, never `Zenoh` — a Zenoh binding now fails DM validation.** Update any test that asserts the old `"dm must have reticulum transport"` / `"group-dm must have reticulum transport"` error to assert the new `"...must have transport=None"` message (grep those strings).
 
 - [ ] **Step 2: Remove the variant + struct.** In `src/owner_state_types.rs`: delete the `#[serde(rename = "r")] Reticulum { ... }` variant (~1107–1118), the `ReticulumDest` struct (~1092–1095), and the `ReticulumDest` entry in the `impl_canonical!` list (~1161, grep `ReticulumDest`).
 
@@ -382,7 +404,7 @@ Mechanical. Every remaining reference is a test/fixture building a `Space`. Repl
 
 - [ ] **Step 1: Enumerate.** `grep -rln "TransportBinding::Reticulum\|ReticulumDest" src-tauri/src src-tauri/tests`.
 
-- [ ] **Step 2: Sweep src fixtures.** For each `src/` hit: replace `Some(TransportBinding::Reticulum { participants: ... })` → `None` (preferred) or, if the surrounding code needs a `Some(TransportBinding)` (e.g. it later matches `Zenoh`), `Some(TransportBinding::Zenoh { topic: String::new() })`. Remove now-unused `TransportBinding` / `ReticulumDest` imports flagged by clippy.
+- [ ] **Step 2: Sweep src fixtures.** Every `TransportBinding::Reticulum` fixture was on a Dm/GroupDm space (the only kinds that used it). Replace each `transport: Some(TransportBinding::Reticulum { participants: ... })` → `transport: None`. **Always `None`, never `Zenoh`** — per Task 8 Step 1b the validator now requires `transport=None` for Dm/GroupDm, so a `Zenoh` binding would fail `validate_invariants`. (If you find a Reticulum fixture on a non-DM kind that genuinely needs a `Some` binding, that space was already invalid under the old validator — STOP and report.) Remove now-unused `TransportBinding` / `ReticulumDest` imports flagged by clippy.
 
 - [ ] **Step 3: Handle the wire-format pinning sites specially.**
   - `src/owner_state_persist.rs:361` (live-format regression `let _ = (TransportBinding::Reticulum { ... })`): delete that line — the variant no longer exists. If the test's purpose was to pin the `r` tag's CBOR, replace it with a comment noting the variant was removed in ZEB-474 (flag-day-for-alpha), keeping the surrounding `Zenoh` pinning intact.
