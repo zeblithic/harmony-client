@@ -80,4 +80,32 @@ describe('ChannelMembersPanel — ZEB-432 label ladder', () => {
     expect(names).toContain('BackendName'); // backend displayName when present
     expect(names).toContain('beadfeed'); // hex fallback when nothing resolves
   });
+
+  it('treats a whitespace-only card name as absent and falls through to backend name', () => {
+    // The backend card publish caps length but has no non-empty constraint, so a
+    // peer can publish display_name = "" / "   "; the ladder must not render it.
+    const card: ResolvedCard = { displayName: '   ', statusText: '' };
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({
+        members: [self, member({ address: PEER, displayName: 'BackendName' })],
+        resolveCard: (id: string) => (id === PEER ? card : undefined),
+      }),
+    });
+    const names = renderedNames(container);
+    expect(names).toContain('BackendName');
+    expect(names).not.toContain('   '); // never a blank/whitespace label
+  });
+
+  it('falls to hex when the card name is empty and there is no backend name', () => {
+    const card: ResolvedCard = { displayName: '', statusText: '' };
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({
+        members: [self, member({ address: PEER, displayName: undefined })],
+        resolveCard: () => card, // empty for everyone
+      }),
+    });
+    const names = renderedNames(container);
+    expect(names).toContain('deadbeef'); // PEER hex prefix
+    expect(names.every((n) => n.trim().length > 0)).toBe(true); // no blank labels
+  });
 });

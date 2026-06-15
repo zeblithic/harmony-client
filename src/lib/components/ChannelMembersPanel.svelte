@@ -4,6 +4,7 @@
   import Avatar from './Avatar.svelte';
   import type { TrustService } from '../trust-service';
   import type { ResolvedCard } from '../member-card-service';
+  import { nonEmpty } from '../display-label';
 
   let {
     members,
@@ -35,9 +36,9 @@
   // without this ladder the always-visible Members panel only ever showed hex.
   function memberLabel(m: CommunityMember): string {
     return (
-      resolveNickname?.(m.address) ??
-      resolveCard?.(m.address)?.displayName ??
-      m.displayName ??
+      nonEmpty(resolveNickname?.(m.address)) ??
+      nonEmpty(resolveCard?.(m.address)?.displayName) ??
+      nonEmpty(m.displayName) ??
       m.address.slice(0, 8)
     );
   }

@@ -8,6 +8,7 @@
   import PollMessage from './PollMessage.svelte';
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
   import type { ResolvedCard } from '../member-card-service';
+  import { nonEmpty } from '../display-label';
 
   let {
     communityId,
@@ -321,7 +322,11 @@
   // hex. Read through both resolvers so the reactive nickname map / card Map
   // re-render the author label automatically.
   function authorLabel(author: string): string {
-    return resolveNickname?.(author) ?? resolveCard?.(author)?.displayName ?? author.slice(0, 8);
+    return (
+      nonEmpty(resolveNickname?.(author)) ??
+      nonEmpty(resolveCard?.(author)?.displayName) ??
+      author.slice(0, 8)
+    );
   }
 
   function handleAuthorClick(author: string, ev: MouseEvent) {
@@ -334,7 +339,7 @@
         // must not masquerade as the cryptographic identity (mirrors
         // FriendsPanel). The inline author label stays nickname-first.
         ownerIdHex: author,
-        displayName: card?.displayName ?? author.slice(0, 8),
+        displayName: nonEmpty(card?.displayName) ?? author.slice(0, 8),
         statusText: card?.statusText ?? '',
         avatarUrl: card?.avatarUrl,
         // No power known for message authors → role line omitted.
