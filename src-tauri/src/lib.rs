@@ -3821,22 +3821,14 @@ pub async fn start_node_inner(
                             own_enrollment_cert,
                         ),
                     ));
-                    // Production transport: RuntimeUnicastTransport pushes
-                    // signed CidNotify packets into unicast_send_tx, which
-                    // event_loop::run translates into
-                    // RuntimeEvent::SendUnicastToDevice. OwnerAddr →
-                    // device-hash resolution happens inside drain (which
-                    // has `&OwnerState` from the event-loop's mutex guard),
-                    // not in the transport — splitting resolution out
-                    // sidesteps the recursive-lock deadlock that broke
-                    // delivery in the original Phase 3b shape.
+                    // ZEB-474 (Move 2): the Reticulum unicast carrier is
+                    // removed. DM delivery is deposit-only in the interim —
+                    // DepositOnlyDmTransport::send signals Transient, which
+                    // steers every DM into the outbox's butler/community-relay
+                    // deposit rung (carried to the recipient over iroh).
+                    // Move 1a (ZEB-473) swaps in IrohTunnelDmTransport here.
                     let transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
-                        std::sync::Arc::new(crate::dm_outbox::RuntimeUnicastTransport::new(
-                            unicast_send_tx.clone(),
-                            self_owner,
-                            our_signing_device_hash,
-                            std::sync::Arc::clone(&signing_key_arc),
-                        ));
+                        std::sync::Arc::new(crate::dm_outbox::DepositOnlyDmTransport);
 
                     let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
                         std::sync::Arc::clone(&kt),
