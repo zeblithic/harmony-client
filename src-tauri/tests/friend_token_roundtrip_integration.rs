@@ -129,6 +129,12 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
         .with_test_writer()
         .try_init();
 
+    // ZEB-374: pre-pay iroh's ~30s first-bind global init OUTSIDE the asserted
+    // 60s budget (the ZEB-347 pattern) so full-suite contention can't push the
+    // two-endpoint handshake past the timeout. nextest is process-per-test, so
+    // every iroh test pays this init once.
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
     // ZEB-347: generous outer timeout so a wedged handshake fails the test fast
     // rather than hanging the whole suite. Bumped 45s→60s to cover the added
     // second (replay) redeem that asserts the one-shot property.

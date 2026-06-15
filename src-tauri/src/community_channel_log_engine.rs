@@ -1590,7 +1590,11 @@ impl ChannelLogRegistry {
             .join(&community_id_hex)
             .join("channels")
             .join(&channel_id_hex);
-        std::fs::create_dir_all(&root_dir).map_err(|e| {
+        // Qodo (PR #267): async create_dir_all so spawn's only blocking fs
+        // call doesn't park a tokio worker — matters now that
+        // create_channel_impl awaits spawn eagerly on the IPC path (ZEB-467),
+        // not just the background delta consumer.
+        tokio::fs::create_dir_all(&root_dir).await.map_err(|e| {
             ChannelLogEngineError::Persist(ChannelLogPersistError::Io(e.to_string()))
         })?;
 

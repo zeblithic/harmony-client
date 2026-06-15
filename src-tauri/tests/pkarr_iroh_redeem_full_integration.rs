@@ -729,6 +729,12 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         .with_test_writer()
         .try_init();
 
+    // ZEB-374 audit: setup_two_party_iroh_handshake binds two real iroh
+    // endpoints INSIDE the 60s budget. Pre-pay iroh's ~30s first-bind global
+    // init OUTSIDE the budget (the ZEB-347 pattern) so full-suite contention
+    // can't charge it against the handshake and flake the timeout.
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
     tokio::time::timeout(Duration::from_secs(60), async {
         let s = setup_two_party_iroh_handshake().await;
 
@@ -1046,6 +1052,12 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
         .with_test_writer()
         .try_init();
 
+    // ZEB-374 audit: setup_two_party_iroh_handshake binds two real iroh
+    // endpoints INSIDE the 60s budget. Pre-pay iroh's ~30s first-bind global
+    // init OUTSIDE the budget (the ZEB-347 pattern) so full-suite contention
+    // can't charge it against the handshake and flake the timeout.
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
     tokio::time::timeout(Duration::from_secs(60), async {
         let s = setup_two_party_iroh_handshake().await;
 
@@ -1298,6 +1310,12 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
         )
         .with_test_writer()
         .try_init();
+
+    // ZEB-374 audit: setup_two_party_iroh_handshake binds two real iroh
+    // endpoints INSIDE the 60s budget. Pre-pay iroh's ~30s first-bind global
+    // init OUTSIDE the budget (the ZEB-347 pattern) so full-suite contention
+    // can't charge it against the handshake and flake the timeout.
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
 
     tokio::time::timeout(Duration::from_secs(60), async {
         let s = setup_two_party_iroh_handshake().await;
