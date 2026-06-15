@@ -172,7 +172,6 @@ pub mod friend_requests;
 pub mod friend_token;
 pub mod identity;
 pub mod identity_commands;
-pub mod inbound_packet;
 pub mod invite_mint;
 pub mod iroh_butler_acceptor;
 pub mod iroh_community_relay_acceptor;
@@ -7624,15 +7623,6 @@ pub async fn start_node_inner(
                 let dm_outbox_for_loop = dm_outbox_arc.clone();
                 let dm_transport_for_loop = dm_transport_arc.clone();
                 let crdt_state_for_loop = crdt_state_for_state.clone();
-                // ZEB-227 Path B Task 11: extra handles for the
-                // RuntimeAction::UnicastReceived interception block in event_loop.
-                // cas_handle: handle_cidnotify_lifted does a 500ms-timeout cas.get; reuse
-                //   the same RuntimeContentStore the SyncEngine consumes.
-                // unicast_send_tx_for_loop: handle_cidnotify_lifted pushes DmAck fan-out
-                //   into the same channel the production transport uses for
-                //   outbound CidNotify. Same channel, both directions push.
-                let cas_handle_for_loop = content_store_for_state.clone();
-                let unicast_send_tx_for_loop = Some(unicast_send_tx.clone());
                 // ZEB-217 Sub-C Phase 2: per-community Zenoh adapter requests.
                 // Move (not clone) — the Vec carries Receiver halves the engines
                 // already own the matching Sender / other-half for; only the
@@ -7803,8 +7793,6 @@ pub async fn start_node_inner(
                                 dm_transport_for_loop,
                                 crdt_state_for_loop,
                                 Some(unicast_send_rx),
-                                cas_handle_for_loop,
-                                unicast_send_tx_for_loop,
                                 community_adapter_requests_for_loop,
                                 community_adapter_request_rx,
                                 voting_log_adapter_request_rx,
