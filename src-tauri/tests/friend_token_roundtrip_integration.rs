@@ -321,6 +321,7 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
                 response_read_timeout: Duration::from_millis(10_000),
                 write_timeout: Duration::from_millis(10_000),
             },
+            None, // self_reachability — empty bundle for this test
         )
         .await
         .expect("connectivity_link_friend_iroh_inner must succeed on the happy path");
@@ -466,6 +467,7 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
                 response_read_timeout: Duration::from_millis(10_000),
                 write_timeout: Duration::from_millis(10_000),
             },
+            None, // self_reachability — empty bundle for this test
         )
         .await;
         assert!(

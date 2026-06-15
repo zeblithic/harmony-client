@@ -30,7 +30,9 @@
 //! Requester → acceptor: [`FriendLinkRequest`].
 //! Acceptor → requester: [`FriendLinkAccepted`].
 
-use crate::owner_state_types::{deserialize_bytes_from_bstr, serialize_bytes_as_bstr, OwnerAddr};
+use crate::owner_state_types::{
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, DeviceIdentityHash, OwnerAddr,
+};
 use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +60,183 @@ mod opt_bstr64 {
             }
             None => Ok(None),
         }
+    }
+}
+
+/// Serde for `Vec<Option<[u8; 64]>>` as a CBOR array whose elements are each
+/// either a bstr(64) (`Some`) or CBOR null (`None`). Mirrors
+/// `owner_state_types::{serialize,deserialize}_device_identity_pubs` (the
+/// `OwnerDeviceEntry.device_identity_pubs` parallel-vec encoding) so the
+/// ZEB-461 device bundle a friend ships over the handshake encodes identically
+/// to how that same parallel vec is stored on the receiver. Order is meaningful
+/// (parallel-indexed to `sender_devices`), so decode never sorts or dedups; it
+/// only bounds length at `MAX_DEVICES_PER_OWNER` against a hostile peer.
+mod vec_opt_bstr64 {
+    use crate::owner_state_types::MAX_DEVICES_PER_OWNER;
+    use serde::de::{Error as DeError, SeqAccess, Visitor};
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &[Option<[u8; 64]>], s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(v.len()))?;
+        // serde's blanket `[T; N]: Serialize` only covers small N, so wrap each
+        // element in a newtype that emits bstr(64) / null explicitly.
+        struct BstrOpt<'a>(&'a Option<[u8; 64]>);
+        impl serde::Serialize for BstrOpt<'_> {
+            fn serialize<S2: Serializer>(&self, s: S2) -> Result<S2::Ok, S2::Error> {
+                match self.0 {
+                    Some(bytes) => s.serialize_bytes(bytes),
+                    None => s.serialize_none(),
+                }
+            }
+        }
+        for opt in v {
+            seq.serialize_element(&BstrOpt(opt))?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Option<[u8; 64]>>, D::Error> {
+        /// One element: CBOR null (→ None) or bstr(64) (→ Some).
+        struct OptPubVisitor;
+        impl<'de> Visitor<'de> for OptPubVisitor {
+            type Value = Option<[u8; 64]>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "CBOR null or a 64-byte CBOR byte string")
+            }
+            fn visit_none<E: DeError>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_unit<E: DeError>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+                d.deserialize_bytes(BytesVisitor).map(Some)
+            }
+            fn visit_bytes<E: DeError>(self, value: &[u8]) -> Result<Self::Value, E> {
+                BytesVisitor.visit_bytes(value).map(Some)
+            }
+            fn visit_byte_buf<E: DeError>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                BytesVisitor.visit_byte_buf(v).map(Some)
+            }
+        }
+
+        struct BytesVisitor;
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = [u8; 64];
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a 64-byte CBOR byte string")
+            }
+            fn visit_bytes<E: DeError>(self, value: &[u8]) -> Result<[u8; 64], E> {
+                let arr: [u8; 64] = value.try_into().map_err(|_| {
+                    E::custom(format!(
+                        "device identity pub must be 64 bytes, got {}",
+                        value.len()
+                    ))
+                })?;
+                Ok(arr)
+            }
+            fn visit_byte_buf<E: DeError>(self, v: Vec<u8>) -> Result<[u8; 64], E> {
+                self.visit_bytes(&v)
+            }
+        }
+
+        struct OptPub(Option<[u8; 64]>);
+        impl<'de> Deserialize<'de> for OptPub {
+            fn deserialize<D2: Deserializer<'de>>(d: D2) -> Result<Self, D2::Error> {
+                d.deserialize_any(OptPubVisitor).map(OptPub)
+            }
+        }
+
+        struct CapVisitor;
+        impl<'de> Visitor<'de> for CapVisitor {
+            type Value = Vec<Option<[u8; 64]>>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "an array of at most {MAX_DEVICES_PER_OWNER} optional 64-byte identity pubs"
+                )
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                if let Some(n) = seq.size_hint() {
+                    if n > MAX_DEVICES_PER_OWNER {
+                        return Err(A::Error::custom(format!(
+                            "device_identity_pubs array length {n} exceeds MAX_DEVICES_PER_OWNER ({MAX_DEVICES_PER_OWNER})"
+                        )));
+                    }
+                }
+                let cap = seq
+                    .size_hint()
+                    .unwrap_or(MAX_DEVICES_PER_OWNER)
+                    .min(MAX_DEVICES_PER_OWNER);
+                let mut out: Vec<Option<[u8; 64]>> = Vec::with_capacity(cap);
+                while let Some(item) = seq.next_element::<OptPub>()? {
+                    if out.len() >= MAX_DEVICES_PER_OWNER {
+                        return Err(A::Error::custom(format!(
+                            "device_identity_pubs array exceeds MAX_DEVICES_PER_OWNER ({MAX_DEVICES_PER_OWNER})"
+                        )));
+                    }
+                    out.push(item.0);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_seq(CapVisitor)
+    }
+}
+
+/// Serde for `sender_devices: Vec<DeviceIdentityHash>` that REJECTS a sequence
+/// longer than `MAX_DEVICES_PER_OWNER` on decode — defense-in-depth against a
+/// hostile peer padding the bundle (mirrors the cap on the parallel
+/// `device_identity_pubs` via [`vec_opt_bstr64`]). The whole packet is already
+/// bounded by `FRIEND_MAX_PACKET_LEN` and `apply_owner_device_update` truncates
+/// at the cache, but capping here keeps the two parallel vecs symmetric and
+/// rejects the oversized packet before the digest is computed over it. Serialize
+/// is a plain pass-through (byte-identical to the derived `Vec` impl, so the
+/// pinned wire fixtures are unaffected).
+mod vec_devhash_capped {
+    use crate::owner_state_types::{DeviceIdentityHash, MAX_DEVICES_PER_OWNER};
+    use serde::de::{Error as DeError, SeqAccess, Visitor};
+    use serde::ser::SerializeSeq;
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &[DeviceIdentityHash], s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(v.len()))?;
+        for d in v {
+            seq.serialize_element(d)?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<DeviceIdentityHash>, D::Error> {
+        struct CapVisitor;
+        impl<'de> Visitor<'de> for CapVisitor {
+            type Value = Vec<DeviceIdentityHash>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "a sequence of at most {MAX_DEVICES_PER_OWNER} device hashes"
+                )
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out: Vec<DeviceIdentityHash> =
+                    Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_DEVICES_PER_OWNER));
+                while let Some(elem) = seq.next_element::<DeviceIdentityHash>()? {
+                    if out.len() >= MAX_DEVICES_PER_OWNER {
+                        return Err(A::Error::custom(format!(
+                            "sender_devices exceeds MAX_DEVICES_PER_OWNER ({MAX_DEVICES_PER_OWNER})"
+                        )));
+                    }
+                    out.push(elem);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_seq(CapVisitor)
     }
 }
 
@@ -140,6 +319,42 @@ pub struct FriendLinkRequest {
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
     pub sig: [u8; 64],
+    /// ZEB-461: the requester's device bundle (their `OwnerDeviceEntry.devices`),
+    /// so the acceptor can seed an `OwnerDeviceCache` entry for the new friend's
+    /// owner without a separate fetch. Bound into `sig` via `devices_digest`
+    /// (an attacker can't swap the requester's claimed device list). Encodes as
+    /// `DeviceIdentityHash` bstr(16) elements. `#[serde(default)]` for back-compat
+    /// with pre-ZEB-461 peers (absent → empty).
+    #[serde(rename = "d", default, with = "vec_devhash_capped")]
+    pub sender_devices: Vec<DeviceIdentityHash>,
+    /// ZEB-461: full identity pubs parallel-indexed to `sender_devices` (`Some` =
+    /// pub known, `None` = known-by-hash only). Also bound into `sig` via
+    /// `devices_digest`. Encoded like `OwnerDeviceEntry.device_identity_pubs`.
+    #[serde(rename = "p", default, with = "vec_opt_bstr64")]
+    pub device_identity_pubs: Vec<Option<[u8; 64]>>,
+    /// ZEB-461: the requester's iroh `NodeId` (routing hint for the cross-WAN DM
+    /// tunnel). A routing hint only (a wrong value just fails the tunnel, no
+    /// compromise), so it is NOT signed. Stored as a CBOR bstr(32).
+    #[serde(
+        rename = "i",
+        default,
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub iroh_node_id: [u8; 32],
+    /// ZEB-461: the requester's home-relay URL (routing hint; unsigned). `None`
+    /// when no relay is configured.
+    #[serde(rename = "r", default)]
+    pub home_relay_url: Option<String>,
+    /// ZEB-461: the requester's post-quantum DSA public key for the tunnel.
+    /// Routing/key material consumed by later tasks; unsigned (a wrong value just
+    /// fails the tunnel handshake). Encoded as a CBOR bstr.
+    #[serde(rename = "q", default, with = "serde_bytes")]
+    pub pq_dsa_pubkey: Vec<u8>,
+    /// ZEB-461: the requester's post-quantum KEM public key for the tunnel.
+    /// Unsigned, same rationale as `pq_dsa_pubkey`. Encoded as a CBOR bstr.
+    #[serde(rename = "k", default, with = "serde_bytes")]
+    pub pq_kem_pubkey: Vec<u8>,
 }
 
 /// The acceptor's reply: "accepted; here is my own proof so you can add me back
@@ -182,14 +397,40 @@ pub struct FriendLinkAccepted {
     #[serde(rename = "c")]
     pub enrollment: EnrollmentCert,
     /// Accepter's device-#2 Ed25519 signature over
-    /// `friend_accept_sig_preimage(from_addr, token_sig, eph_x25519_pub)`.
-    /// Stored as a CBOR bstr(64).
+    /// `friend_accept_sig_preimage(from_addr, token_sig, eph_x25519_pub,
+    /// devices_digest)`. Stored as a CBOR bstr(64).
     #[serde(
         rename = "s",
         serialize_with = "serialize_bytes_as_bstr",
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
     pub sig: [u8; 64],
+    /// ZEB-461: the accepter's device bundle (mirrors `FriendLinkRequest`); lets
+    /// the requester seed an `OwnerDeviceCache` entry for the new friend. Bound
+    /// into `sig` via `devices_digest`.
+    #[serde(rename = "d", default, with = "vec_devhash_capped")]
+    pub sender_devices: Vec<DeviceIdentityHash>,
+    /// ZEB-461: identity pubs parallel-indexed to `sender_devices`. Bound into
+    /// `sig` via `devices_digest`.
+    #[serde(rename = "p", default, with = "vec_opt_bstr64")]
+    pub device_identity_pubs: Vec<Option<[u8; 64]>>,
+    /// ZEB-461: the accepter's iroh `NodeId` (unsigned routing hint). bstr(32).
+    #[serde(
+        rename = "i",
+        default,
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub iroh_node_id: [u8; 32],
+    /// ZEB-461: the accepter's home-relay URL (unsigned routing hint).
+    #[serde(rename = "r", default)]
+    pub home_relay_url: Option<String>,
+    /// ZEB-461: the accepter's post-quantum DSA public key (unsigned). bstr.
+    #[serde(rename = "q", default, with = "serde_bytes")]
+    pub pq_dsa_pubkey: Vec<u8>,
+    /// ZEB-461: the accepter's post-quantum KEM public key (unsigned). bstr.
+    #[serde(rename = "k", default, with = "serde_bytes")]
+    pub pq_kem_pubkey: Vec<u8>,
 }
 
 /// The acceptor's reply on the `harmony/friend/v1` ALPN. ZEB-371 Task 12:
@@ -217,41 +458,98 @@ pub enum FriendLinkResponse {
     Pending,
 }
 
+/// ZEB-461: SHA-256 digest of the canonical CBOR encoding of the device bundle
+/// tuple `(sender_devices, device_identity_pubs)`. Bound into the friend
+/// request/accept signatures so a peer cannot have its claimed device list (or
+/// the parallel identity pubs) swapped in flight — mirroring how
+/// `DmInviteSigned` carries `sender_devices` inside its signed body. The two
+/// vecs are parallel-indexed, so both go into the digest. `device_identity_pubs`
+/// is encoded via the same bstr(64)/null shape used on the wire (see
+/// [`vec_opt_bstr64`]) so the digest is stable regardless of serde array limits.
+pub fn friend_devices_digest(
+    devices: &[DeviceIdentityHash],
+    pubs: &[Option<[u8; 64]>],
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    // A tiny wrapper so the pubs vec encodes via vec_opt_bstr64 (bstr(64)/null)
+    // inside the tuple — keeping the digest input identical to the wire bytes.
+    #[derive(Serialize)]
+    struct Bundle<'a> {
+        devices: &'a [DeviceIdentityHash],
+        #[serde(with = "vec_opt_bstr64")]
+        pubs: &'a [Option<[u8; 64]>],
+    }
+    let mut buf = Vec::new();
+    ciborium::into_writer(&Bundle { devices, pubs }, &mut buf)
+        .expect("friend device bundle always encodes");
+    let mut hasher = Sha256::new();
+    hasher.update(&buf);
+    hasher.finalize().into()
+}
+
+/// ZEB-461: this node's own reachability + identity material to advertise in an
+/// outbound friend handshake (request OR accept). `None` at a build site means
+/// "ship the empty bundle" (tests / pre-identity); `Some` fills the real values.
+///
+/// The device bundle is DERIVED from `identity_pub_64` via
+/// [`crate::dm_tunnel_contact::self_device_bundle`] and is SIGNED (its
+/// `friend_devices_digest` is bound into the handshake signature). Reachability
+/// (`iroh_node_id`, `home_relay_url`) and the PQ keys (`pq_dsa_pubkey`,
+/// `pq_kem_pubkey`) are UNSIGNED routing hints — a wrong value just fails the
+/// tunnel, so they are deliberately NOT part of the digest.
+#[derive(Clone)]
+pub struct SelfHandshakeReachability {
+    pub identity_pub_64: [u8; 64],
+    pub iroh_node_id: [u8; 32],
+    pub home_relay_url: Option<String>,
+    pub pq_dsa_pubkey: Vec<u8>,
+    pub pq_kem_pubkey: Vec<u8>,
+}
+
 /// Canonical preimage bytes the requester's device-#2 key signs for a
 /// [`FriendLinkRequest`]. A small CBOR-encoded tuple `("hfr1", from_addr,
-/// token_sig, eph)` — the `"hfr1"` domain tag makes a friend-request signature
-/// unmistakable for any other Ed25519 signature this device produces. ZEB-371:
-/// the signature now binds the requester's ephemeral X25519 public key (so an
-/// attacker can't swap the rendezvous key) and the optional token.
+/// token_sig, eph, devices_digest)` — the `"hfr1"` domain tag makes a
+/// friend-request signature unmistakable for any other Ed25519 signature this
+/// device produces. ZEB-371: the signature binds the requester's ephemeral
+/// X25519 public key (so an attacker can't swap the rendezvous key) and the
+/// optional token. ZEB-461: it also binds `devices_digest` (the requester's
+/// device bundle) so the bundle can't be tampered. The reachability + PQ keys
+/// are unsigned routing hints (a wrong value just fails the tunnel).
 pub fn friend_request_sig_preimage(
     from_addr: OwnerAddr,
     token_sig: Option<&[u8; 64]>,
     eph_x25519_pub: &[u8; 32],
+    devices_digest: &[u8; 32],
 ) -> Vec<u8> {
-    sig_preimage("hfr1", from_addr, token_sig, eph_x25519_pub)
+    sig_preimage("hfr1", from_addr, token_sig, eph_x25519_pub, devices_digest)
 }
 
 /// Canonical preimage bytes the accepter's device-#2 key signs for a
 /// [`FriendLinkAccepted`]. Domain-separated from the request preimage by the
 /// `"hfa1"` tag so a request signature can never be replayed as an accept.
 /// ZEB-371: binds the accepter's ephemeral X25519 public key + optional token.
+/// ZEB-461: also binds `devices_digest` (the accepter's device bundle).
 pub fn friend_accept_sig_preimage(
     from_addr: OwnerAddr,
     token_sig: Option<&[u8; 64]>,
     eph_x25519_pub: &[u8; 32],
+    devices_digest: &[u8; 32],
 ) -> Vec<u8> {
-    sig_preimage("hfa1", from_addr, token_sig, eph_x25519_pub)
+    sig_preimage("hfa1", from_addr, token_sig, eph_x25519_pub, devices_digest)
 }
 
 /// Shared preimage builder. The byte arrays are wrapped via `serde_bytes` so
 /// they encode as CBOR bstrs (not N-element arrays), keeping the preimage
 /// compact and stable. `token_sig` is `Option` (absent for the future Path-A
 /// no-token flow); `None` vs `Some` produces a distinct preimage.
+/// `devices_digest` (ZEB-461) binds the sender's device bundle.
 fn sig_preimage(
     domain: &'static str,
     from_addr: OwnerAddr,
     token_sig: Option<&[u8; 64]>,
     eph_x25519_pub: &[u8; 32],
+    devices_digest: &[u8; 32],
 ) -> Vec<u8> {
     #[derive(Serialize)]
     struct Preimage<'a> {
@@ -259,6 +557,7 @@ fn sig_preimage(
         from_addr: OwnerAddr,
         token_sig: Option<&'a serde_bytes::Bytes>,
         eph: &'a serde_bytes::Bytes,
+        devices_digest: &'a serde_bytes::Bytes,
     }
     let mut out = Vec::new();
     // Infallible for this fixed-shape value; an encode error would be a logic
@@ -269,6 +568,7 @@ fn sig_preimage(
             from_addr,
             token_sig: token_sig.map(|t| serde_bytes::Bytes::new(t)),
             eph: serde_bytes::Bytes::new(eph_x25519_pub),
+            devices_digest: serde_bytes::Bytes::new(devices_digest),
         },
         &mut out,
     )
@@ -595,8 +895,13 @@ pub fn authenticate_friend_request(
     let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)?;
     let vk = VerifyingKey::from_bytes(&device_key)
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
-    let preimage =
-        friend_request_sig_preimage(req.from_addr, req.token_sig.as_ref(), &req.eph_x25519_pub);
+    let devices_digest = friend_devices_digest(&req.sender_devices, &req.device_identity_pubs);
+    let preimage = friend_request_sig_preimage(
+        req.from_addr,
+        req.token_sig.as_ref(),
+        &req.eph_x25519_pub,
+        &devices_digest,
+    );
     vk.verify_strict(&preimage, &Signature::from_bytes(&req.sig))
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
     Ok(())
@@ -628,16 +933,23 @@ pub fn process_friend_request(
     self_device2: &ed25519_dalek::SigningKey,
     keytree: &crate::owner_state_crypto::KeyTree,
     now_secs: u64,
+    self_reachability: Option<&SelfHandshakeReachability>,
 ) -> Result<FriendLinkAccepted, FriendHandshakeError> {
     // 1. Authenticate the requester's cert → enrolled device-#2 key.
     let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)?;
 
-    // 2. Verify the request signature over the canonical preimage (now binds the
-    // requester's ephemeral X25519 key + optional token).
+    // 2. Verify the request signature over the canonical preimage (binds the
+    // requester's ephemeral X25519 key + optional token + ZEB-461 device-bundle
+    // digest computed from the bundle the request carries).
     let vk = VerifyingKey::from_bytes(&device_key)
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
-    let preimage =
-        friend_request_sig_preimage(req.from_addr, req.token_sig.as_ref(), &req.eph_x25519_pub);
+    let req_devices_digest = friend_devices_digest(&req.sender_devices, &req.device_identity_pubs);
+    let preimage = friend_request_sig_preimage(
+        req.from_addr,
+        req.token_sig.as_ref(),
+        &req.eph_x25519_pub,
+        &req_devices_digest,
+    );
     vk.verify_strict(&preimage, &Signature::from_bytes(&req.sig))
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
 
@@ -679,7 +991,7 @@ pub fn process_friend_request(
             FriendOrigin::MutualKey
         },
         referrable: false,
-        learned_at,
+        learned_at: learned_at.clone(),
         sealed_secret: Some(sealed),
     };
     match state.apply_friend_update(req.from_addr, entry) {
@@ -689,18 +1001,72 @@ pub fn process_friend_request(
         }
     }
 
+    // ZEB-461 Task 7: learn the requester's devices so the DM outbox can route
+    // to them (a friend without a shared community would otherwise have an empty
+    // device cache → no DM destination). `learned_at` is this node's local HLC
+    // (the same value stamped on the friend entry just above) — never the peer's
+    // claimed time (handle_invite anti-forgery rule). Skip an empty bundle so we
+    // never LWW-clobber a previously-known-good cache entry (an empty bundle
+    // means "peer advertised nothing": older client, or a failed self-bind →
+    // None path — NOT "peer has zero devices").
+    if !req.sender_devices.is_empty() {
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = state
+            .apply_owner_device_update(
+                req.from_addr,
+                req.sender_devices.clone(),
+                req.device_identity_pubs.clone(),
+                learned_at,
+            )
+        {
+            return Err(FriendHandshakeError::ApplyRejected(format!(
+                "device cache: {reason:?}"
+            )));
+        }
+    }
+
     // 6. Build + sign the mutual accept reply. The accept sig binds to the same
-    // token_sig as the request it answers (domain-separated from the request)
-    // plus this side's ephemeral X25519 public.
-    let accept_preimage =
-        friend_accept_sig_preimage(self_owner, req.token_sig.as_ref(), &self_eph_pub);
+    // token_sig as the request it answers (domain-separated from the request),
+    // this side's ephemeral X25519 public, and (ZEB-461) this side's device-
+    // bundle digest. ZEB-461 Task 6: when `self_reachability` is `Some`, fill the
+    // REAL self device bundle + reachability + PQ keys; when `None` (tests /
+    // pre-identity) ship the EMPTY bundle exactly as before. Either way the
+    // digest is computed from the SAME (devices, pubs) placed on the wire, so the
+    // signature stays consistent with the bundle a peer re-digests on receipt.
+    let (accept_devices, accept_device_pubs): (Vec<DeviceIdentityHash>, Vec<Option<[u8; 64]>>) =
+        match self_reachability {
+            Some(r) => crate::dm_tunnel_contact::self_device_bundle(r.identity_pub_64),
+            None => (vec![], vec![]),
+        };
+    let accept_devices_digest = friend_devices_digest(&accept_devices, &accept_device_pubs);
+    let accept_preimage = friend_accept_sig_preimage(
+        self_owner,
+        req.token_sig.as_ref(),
+        &self_eph_pub,
+        &accept_devices_digest,
+    );
     let sig = self_device2.sign(&accept_preimage).to_bytes();
+    // Unsigned routing hints: real values when `Some`, empty/zero/None when not.
+    let (iroh_node_id, home_relay_url, pq_dsa_pubkey, pq_kem_pubkey) = match self_reachability {
+        Some(r) => (
+            r.iroh_node_id,
+            r.home_relay_url.clone(),
+            r.pq_dsa_pubkey.clone(),
+            r.pq_kem_pubkey.clone(),
+        ),
+        None => ([0u8; 32], None, vec![], vec![]),
+    };
     Ok(FriendLinkAccepted {
         from_addr: self_owner,
         display: self_display,
         eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment.clone(),
         sig,
+        sender_devices: accept_devices,
+        device_identity_pubs: accept_device_pubs,
+        iroh_node_id,
+        home_relay_url,
+        pq_dsa_pubkey,
+        pq_kem_pubkey,
     })
 }
 
@@ -753,6 +1119,10 @@ where
     /// PROMPT a KNOWN requester — never relaxes authentication, and never
     /// auto-accepts an UNKNOWN owner.
     auto_accept_known: bool,
+    /// ZEB-461 Task 6: this node's own device bundle + reachability + PQ keys to
+    /// advertise in the accept it signs. `None` (the default; tests) ships the
+    /// empty bundle. Production wires the real values via `with_self_reachability`.
+    self_reachability: Option<SelfHandshakeReachability>,
     config: FriendAcceptorConfig,
 }
 
@@ -818,6 +1188,8 @@ where
             pending_requests: None,
             // ZEB-371 spec §7.1 default: auto-accept KNOWN requesters is ON.
             auto_accept_known: true,
+            // ZEB-461: default to the empty self bundle; production fills it.
+            self_reachability: None,
             config,
         }
     }
@@ -863,6 +1235,15 @@ where
     /// persisted setting and passes it here.
     pub fn with_auto_accept_known(mut self, auto_accept_known: bool) -> Self {
         self.auto_accept_known = auto_accept_known;
+        self
+    }
+
+    /// ZEB-461: advertise this node's device bundle + reachability + PQ keys in
+    /// the outbound accept it signs. `None` (the default) ships the empty bundle.
+    /// Fluent setter (default `None`) so existing call sites — including tests —
+    /// keep compiling without an explicit `None`.
+    pub fn with_self_reachability(mut self, r: Option<SelfHandshakeReachability>) -> Self {
+        self.self_reachability = r;
         self
     }
 
@@ -1101,6 +1482,7 @@ where
                         &self.device2_signing_key,
                         &self.keytree,
                         now_secs,
+                        self.self_reachability.as_ref(),
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1130,6 +1512,7 @@ where
                         &self.device2_signing_key,
                         &self.keytree,
                         now_secs,
+                        self.self_reachability.as_ref(),
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1365,7 +1748,13 @@ mod tests {
         let owner = mint_test_owner(owner_seed);
         let device_key = owner.cert.device_pubkeys.classical.ed25519_verify;
         let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
-        let preimage = friend_request_sig_preimage(owner.owner, Some(&token_sig), &eph_pub);
+        // ZEB-461: sign over the (empty) device-bundle digest so the request
+        // authenticates. Tests that need a populated bundle re-sign explicitly.
+        let devices: Vec<DeviceIdentityHash> = vec![];
+        let device_pubs: Vec<Option<[u8; 64]>> = vec![];
+        let devices_digest = friend_devices_digest(&devices, &device_pubs);
+        let preimage =
+            friend_request_sig_preimage(owner.owner, Some(&token_sig), &eph_pub, &devices_digest);
         let sig = owner.device_key.sign(&preimage).to_bytes();
         let req = FriendLinkRequest {
             from_addr: owner.owner,
@@ -1374,6 +1763,12 @@ mod tests {
             eph_x25519_pub: eph_pub,
             enrollment: owner.cert,
             sig,
+            sender_devices: devices,
+            device_identity_pubs: device_pubs,
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
         };
         (req, device_key, eph_pub)
     }
@@ -1386,6 +1781,67 @@ mod tests {
         assert_eq!(req, back);
     }
 
+    /// ZEB-461: a request with ALL new bundle/reachability/PQ fields populated
+    /// (non-empty) must round-trip byte-identically through the codec.
+    #[test]
+    fn friend_request_roundtrips_with_device_bundle() {
+        let (mut req, _, _) = signed_request(0x21, [9u8; 64]);
+        req.sender_devices = vec![
+            DeviceIdentityHash([0xaa; 16]),
+            DeviceIdentityHash([0xbb; 16]),
+        ];
+        req.device_identity_pubs = vec![Some([0xcc; 64]), None];
+        req.iroh_node_id = [0xde; 32];
+        req.home_relay_url = Some("https://relay.example/".into());
+        req.pq_dsa_pubkey = vec![1, 2, 3, 4, 5];
+        req.pq_kem_pubkey = vec![9, 8, 7];
+        let bytes = encode_friend_request(&req).expect("encode");
+        let back = decode_friend_request(&bytes).expect("decode");
+        assert_eq!(req, back);
+    }
+
+    /// ZEB-461 (Qodo): an oversized `sender_devices` (> MAX_DEVICES_PER_OWNER) is
+    /// REJECTED on decode — defense-in-depth against a hostile peer padding the
+    /// bundle. Serialize is pass-through, so we can build the oversized wire; the
+    /// cap fires on the receive side.
+    #[test]
+    fn friend_request_rejects_oversized_sender_devices() {
+        use crate::owner_state_types::MAX_DEVICES_PER_OWNER;
+        let (mut req, _, _) = signed_request(0x21, [9u8; 64]);
+        req.sender_devices = (0..=MAX_DEVICES_PER_OWNER as u8)
+            .map(|i| DeviceIdentityHash([i; 16]))
+            .collect();
+        assert!(req.sender_devices.len() > MAX_DEVICES_PER_OWNER);
+        let bytes = encode_friend_request(&req).expect("encode (serialize is pass-through)");
+        let err = decode_friend_request(&bytes);
+        assert!(
+            matches!(err, Err(FriendHandshakeError::Decode(_))),
+            "oversized sender_devices must be rejected on decode, got: {err:?}"
+        );
+    }
+
+    /// ZEB-461: an accept with ALL new fields populated must round-trip.
+    #[test]
+    fn friend_accepted_roundtrips_with_device_bundle() {
+        let owner = mint_test_owner(0x22);
+        let acc = FriendLinkAccepted {
+            from_addr: owner.owner,
+            display: None,
+            eph_x25519_pub: [0x77; 32],
+            enrollment: owner.cert,
+            sig: [4u8; 64],
+            sender_devices: vec![DeviceIdentityHash([0x11; 16])],
+            device_identity_pubs: vec![Some([0x22; 64])],
+            iroh_node_id: [0x33; 32],
+            home_relay_url: Some("https://relay.example/accept".into()),
+            pq_dsa_pubkey: vec![42; 8],
+            pq_kem_pubkey: vec![7; 4],
+        };
+        let bytes = encode_friend_accepted(&acc).expect("encode");
+        let back = decode_friend_accepted(&bytes).expect("decode");
+        assert_eq!(acc, back);
+    }
+
     #[test]
     fn friend_accepted_round_trips() {
         let owner = mint_test_owner(0x22);
@@ -1395,6 +1851,12 @@ mod tests {
             eph_x25519_pub: [0x77; 32],
             enrollment: owner.cert,
             sig: [4u8; 64],
+            sender_devices: vec![],
+            device_identity_pubs: vec![],
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
         };
         let bytes = encode_friend_accepted(&acc).expect("encode");
         let back = decode_friend_accepted(&bytes).expect("decode");
@@ -1450,6 +1912,12 @@ mod tests {
             eph_x25519_pub: [0x77; 32],
             enrollment: owner.cert,
             sig: [4u8; 64],
+            sender_devices: vec![],
+            device_identity_pubs: vec![],
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
         };
 
         // 257-byte display → must FAIL to decode.
@@ -1500,6 +1968,12 @@ mod tests {
             eph_x25519_pub: [0x77; 32],
             enrollment: owner.cert,
             sig: [6u8; 64],
+            sender_devices: vec![],
+            device_identity_pubs: vec![],
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
         };
         let bytes = encode_friend_accepted(&acc).expect("encode");
 
@@ -1638,14 +2112,23 @@ mod tests {
             verify_enrolled_device(&req.enrollment, req.from_addr, 0).expect("valid cert");
         assert_eq!(resolved, device_key);
         let vk = VerifyingKey::from_bytes(&resolved).expect("vk");
-        let preimage =
-            friend_request_sig_preimage(req.from_addr, req.token_sig.as_ref(), &req.eph_x25519_pub);
+        let devices_digest = friend_devices_digest(&req.sender_devices, &req.device_identity_pubs);
+        let preimage = friend_request_sig_preimage(
+            req.from_addr,
+            req.token_sig.as_ref(),
+            &req.eph_x25519_pub,
+            &devices_digest,
+        );
         vk.verify_strict(&preimage, &Signature::from_bytes(&req.sig))
             .expect("untampered sig verifies");
 
         // A tampered sig (or a preimage over a different token_sig) must fail.
-        let bad_preimage =
-            friend_request_sig_preimage(req.from_addr, Some(&[0u8; 64]), &req.eph_x25519_pub);
+        let bad_preimage = friend_request_sig_preimage(
+            req.from_addr,
+            Some(&[0u8; 64]),
+            &req.eph_x25519_pub,
+            &devices_digest,
+        );
         assert!(vk
             .verify_strict(&bad_preimage, &Signature::from_bytes(&req.sig))
             .is_err());
@@ -1654,16 +2137,38 @@ mod tests {
     #[test]
     fn request_preimage_binds_ephemeral_key() {
         let eph = [0x42u8; 32];
-        let p1 = friend_request_sig_preimage(OwnerAddr([1; 16]), Some(&[9u8; 64]), &eph);
+        let dig = [0u8; 32];
+        let p1 = friend_request_sig_preimage(OwnerAddr([1; 16]), Some(&[9u8; 64]), &eph, &dig);
         let mut eph2 = eph;
         eph2[0] ^= 1;
-        let p2 = friend_request_sig_preimage(OwnerAddr([1; 16]), Some(&[9u8; 64]), &eph2);
+        let p2 = friend_request_sig_preimage(OwnerAddr([1; 16]), Some(&[9u8; 64]), &eph2, &dig);
         assert_ne!(
             p1, p2,
             "a different ephemeral key must change the signed preimage"
         );
-        let p3 = friend_request_sig_preimage(OwnerAddr([1; 16]), None, &eph);
+        let p3 = friend_request_sig_preimage(OwnerAddr([1; 16]), None, &eph, &dig);
         assert_ne!(p1, p3, "None vs Some(token) must differ");
+        // ZEB-461: a different device-bundle digest must change the preimage.
+        let dig2 = [1u8; 32];
+        let p4 = friend_request_sig_preimage(OwnerAddr([1; 16]), Some(&[9u8; 64]), &eph, &dig2);
+        assert_ne!(
+            p1, p4,
+            "a different device-bundle digest must change the signed preimage"
+        );
+    }
+
+    /// ZEB-461: the device-bundle digest must change when either the device list
+    /// or the parallel identity pubs change — so a peer can't have its bundle
+    /// swapped without invalidating the signature.
+    #[test]
+    fn devices_digest_binds_bundle() {
+        let d0 = friend_devices_digest(&[], &[]);
+        let d1 = friend_devices_digest(&[DeviceIdentityHash([1; 16])], &[None]);
+        let d2 = friend_devices_digest(&[DeviceIdentityHash([2; 16])], &[None]);
+        let d3 = friend_devices_digest(&[DeviceIdentityHash([1; 16])], &[Some([9; 64])]);
+        assert_ne!(d0, d1, "empty vs non-empty bundle must differ");
+        assert_ne!(d1, d2, "a different device hash must change the digest");
+        assert_ne!(d1, d3, "a different identity pub must change the digest");
     }
 
     #[test]
@@ -1706,6 +2211,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
         )
         .expect("valid request processed");
 
@@ -1732,12 +2238,15 @@ mod tests {
         let self_device_key = verify_enrolled_device(&accepted.enrollment, accepted.from_addr, 0)
             .expect("self cert verifies");
         let vk = VerifyingKey::from_bytes(&self_device_key).expect("vk");
-        // The accept binds the accepter's own (randomly-generated) ephemeral key,
-        // which we read back off the returned accept.
+        // The accept binds the accepter's own (randomly-generated) ephemeral key
+        // + (ZEB-461) its device-bundle digest, both read back off the accept.
+        let accept_digest =
+            friend_devices_digest(&accepted.sender_devices, &accepted.device_identity_pubs);
         let accept_preimage = friend_accept_sig_preimage(
             accepted.from_addr,
             Some(&token_sig),
             &accepted.eph_x25519_pub,
+            &accept_digest,
         );
         vk.verify_strict(&accept_preimage, &Signature::from_bytes(&accepted.sig))
             .expect("accept sig verifies against self enrolled device key");
@@ -1752,7 +2261,13 @@ mod tests {
         let requester = mint_test_owner(0x61);
         let token_sig = [0x5a; 64];
         let (req_eph_sk, req_eph_pub) = generate_ephemeral();
-        let preimage = friend_request_sig_preimage(requester.owner, Some(&token_sig), &req_eph_pub);
+        let req_devices_digest = friend_devices_digest(&[], &[]);
+        let preimage = friend_request_sig_preimage(
+            requester.owner,
+            Some(&token_sig),
+            &req_eph_pub,
+            &req_devices_digest,
+        );
         let sig = requester.device_key.sign(&preimage).to_bytes();
         let req = FriendLinkRequest {
             from_addr: requester.owner,
@@ -1761,6 +2276,12 @@ mod tests {
             eph_x25519_pub: req_eph_pub,
             enrollment: requester.cert,
             sig,
+            sender_devices: vec![],
+            device_identity_pubs: vec![],
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
         };
 
         let kt = KeyTree::derive(&[9u8; 32]).expect("kt");
@@ -1775,6 +2296,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
         )
         .expect("processed");
 
@@ -1815,6 +2337,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
         )
         .expect_err("bad sig rejected");
         assert!(matches!(err, FriendHandshakeError::SignatureInvalid));
@@ -1835,7 +2358,13 @@ mod tests {
         let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
         // Sign with the imposter's owner addr in the preimage so the request is
         // internally consistent except for the cert↔from_addr binding.
-        let preimage = friend_request_sig_preimage(imposter.owner, Some(&token_sig), &eph_pub);
+        let devices_digest = friend_devices_digest(&[], &[]);
+        let preimage = friend_request_sig_preimage(
+            imposter.owner,
+            Some(&token_sig),
+            &eph_pub,
+            &devices_digest,
+        );
         let sig = imposter.device_key.sign(&preimage).to_bytes();
         let req = FriendLinkRequest {
             from_addr: imposter.owner, // claims to be imposter…
@@ -1844,6 +2373,12 @@ mod tests {
             eph_x25519_pub: eph_pub,
             enrollment: requester.cert, // …but presents requester's cert
             sig,
+            sender_devices: vec![],
+            device_identity_pubs: vec![],
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
         };
 
         let kt = crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt");
@@ -1858,6 +2393,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
         )
         .expect_err("owner-mismatched cert rejected");
         assert!(matches!(err, FriendHandshakeError::EnrollmentOwnerMismatch));
@@ -2188,7 +2724,8 @@ mod tests {
     fn signed_request_no_token(owner_seed: u8) -> FriendLinkRequest {
         let owner = mint_test_owner(owner_seed);
         let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
-        let preimage = friend_request_sig_preimage(owner.owner, None, &eph_pub);
+        let devices_digest = friend_devices_digest(&[], &[]);
+        let preimage = friend_request_sig_preimage(owner.owner, None, &eph_pub, &devices_digest);
         let sig = owner.device_key.sign(&preimage).to_bytes();
         FriendLinkRequest {
             from_addr: owner.owner,
@@ -2197,7 +2734,115 @@ mod tests {
             eph_x25519_pub: eph_pub,
             enrollment: owner.cert,
             sig,
+            sender_devices: vec![],
+            device_identity_pubs: vec![],
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
         }
+    }
+
+    /// ZEB-461 Task 7: a signed, well-formed request carrying a VALID,
+    /// self-consistent device bundle (each `Some(pub)` hashes to its parallel
+    /// device hash, so `apply_owner_device_update` accepts it). The bundle is
+    /// bound into `devices_digest`, which the request signature covers — so the
+    /// digest must be computed over the REAL bundle before signing. Returns the
+    /// request and the device hashes it advertises (the cache should learn them).
+    fn signed_request_with_devices(owner_seed: u8) -> (FriendLinkRequest, Vec<DeviceIdentityHash>) {
+        let owner = mint_test_owner(owner_seed);
+        let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+        // A self-consistent device bundle (hash derived from a real identity pub).
+        let id = harmony_identity::PrivateIdentity::from_seed(&[owner_seed; 32]);
+        let pub64 = id.public_identity().to_public_bytes();
+        let (devices, pubs) = crate::dm_tunnel_contact::self_device_bundle(pub64);
+        let devices_digest = friend_devices_digest(&devices, &pubs);
+        let preimage = friend_request_sig_preimage(owner.owner, None, &eph_pub, &devices_digest);
+        let sig = owner.device_key.sign(&preimage).to_bytes();
+        let req = FriendLinkRequest {
+            from_addr: owner.owner,
+            display: Some("carol".into()),
+            token_sig: None,
+            eph_x25519_pub: eph_pub,
+            enrollment: owner.cert,
+            sig,
+            sender_devices: devices.clone(),
+            device_identity_pubs: pubs,
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
+        };
+        (req, devices)
+    }
+
+    #[test]
+    fn process_friend_request_populates_owner_device_cache() {
+        // ZEB-461 Task 7: on accept, the requester's advertised device bundle is
+        // learned into the local OwnerDeviceCache (keyed by the requester's
+        // OwnerAddr) so the DM outbox can resolve a route to that friend even
+        // without a shared community.
+        use crate::owner_state_crypto::KeyTree;
+        let (req, expected_devices) = signed_request_with_devices(0x90);
+        let me = mint_test_owner(0x91);
+        let kt = KeyTree::derive(&[7u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        process_friend_request(
+            &mut state,
+            test_hlc(5),
+            &req,
+            me.owner,
+            None,
+            &me.cert,
+            &me.device_key,
+            &kt,
+            0,
+            None,
+        )
+        .expect("processed");
+        let entry = state
+            .owner_device_cache
+            .devices
+            .get(&req.from_addr)
+            .expect("cache entry for requester");
+        assert_eq!(entry.devices, expected_devices);
+    }
+
+    #[test]
+    fn process_friend_request_empty_bundle_does_not_touch_device_cache() {
+        // ZEB-461 Task 7 skip-on-empty guard: an EMPTY advertised bundle (older
+        // client, or a None-reachability self path) must NOT create or clobber a
+        // cache entry — storing an empty list under a newer HLC would LWW-clobber
+        // a previously-known-good entry.
+        use crate::owner_state_crypto::KeyTree;
+        let req = signed_request_no_token(0x92);
+        assert!(
+            req.sender_devices.is_empty(),
+            "the no-token builder ships an empty device bundle"
+        );
+        let me = mint_test_owner(0x93);
+        let kt = KeyTree::derive(&[8u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        process_friend_request(
+            &mut state,
+            test_hlc(5),
+            &req,
+            me.owner,
+            None,
+            &me.cert,
+            &me.device_key,
+            &kt,
+            0,
+            None,
+        )
+        .expect("processed");
+        assert!(
+            !state
+                .owner_device_cache
+                .devices
+                .contains_key(&req.from_addr),
+            "an empty bundle must not create a device-cache entry"
+        );
     }
 
     #[test]
@@ -2235,6 +2880,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
         )
         .expect("no-token request processed");
         let entry = state
@@ -2260,6 +2906,12 @@ mod tests {
             eph_x25519_pub: [0x12; 32],
             enrollment: owner.cert,
             sig: [0x34; 64],
+            sender_devices: vec![],
+            device_identity_pubs: vec![],
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
         };
         for resp in [
             FriendLinkResponse::Accepted(Box::new(acc)),
