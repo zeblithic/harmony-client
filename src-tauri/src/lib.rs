@@ -39900,16 +39900,10 @@ pub async fn connectivity_link_friend_iroh_inner(
     // pre-identity). The digest is computed from the SAME (devices, pubs) placed
     // on the wire, so the request signature stays consistent with the bundle a
     // peer re-digests on receipt. Reachability + PQ keys are unsigned hints.
-    let (req_sender_devices, req_device_identity_pubs): (
-        Vec<crate::owner_state_types::DeviceIdentityHash>,
-        Vec<Option<[u8; 64]>>,
-    ) = match self_reachability.as_ref() {
-        Some(r) => crate::dm_tunnel_contact::self_device_bundle(r.identity_pub_64),
-        None => (vec![], vec![]),
-    };
+    let req_bundle = crate::dm_tunnel_contact::self_request_bundle(self_reachability.as_ref());
     let req_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
-        &req_sender_devices,
-        &req_device_identity_pubs,
+        &req_bundle.sender_devices,
+        &req_bundle.device_identity_pubs,
     );
     let req_sig = self_device2_signing_key
         .sign(&friend_request_sig_preimage(
@@ -39919,16 +39913,6 @@ pub async fn connectivity_link_friend_iroh_inner(
             &req_devices_digest,
         ))
         .to_bytes();
-    let (req_iroh_node_id, req_home_relay_url, req_pq_dsa_pubkey, req_pq_kem_pubkey) =
-        match self_reachability.as_ref() {
-            Some(r) => (
-                r.iroh_node_id,
-                r.home_relay_url.clone(),
-                r.pq_dsa_pubkey.clone(),
-                r.pq_kem_pubkey.clone(),
-            ),
-            None => ([0u8; 32], None, vec![], vec![]),
-        };
     let request = FriendLinkRequest {
         from_addr: self_owner,
         display: self_display,
@@ -39936,12 +39920,12 @@ pub async fn connectivity_link_friend_iroh_inner(
         eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment,
         sig: req_sig,
-        sender_devices: req_sender_devices,
-        device_identity_pubs: req_device_identity_pubs,
-        iroh_node_id: req_iroh_node_id,
-        home_relay_url: req_home_relay_url,
-        pq_dsa_pubkey: req_pq_dsa_pubkey,
-        pq_kem_pubkey: req_pq_kem_pubkey,
+        sender_devices: req_bundle.sender_devices,
+        device_identity_pubs: req_bundle.device_identity_pubs,
+        iroh_node_id: req_bundle.iroh_node_id,
+        home_relay_url: req_bundle.home_relay_url,
+        pq_dsa_pubkey: req_bundle.pq_dsa_pubkey,
+        pq_kem_pubkey: req_bundle.pq_kem_pubkey,
     };
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
     let wire_len = wire.len() as u32;
@@ -42186,16 +42170,10 @@ pub async fn connectivity_add_friend_by_key_inner(
     // node's self-values when present; ship the EMPTY bundle when `None`. The
     // digest is computed from the SAME (devices, pubs) placed on the wire so the
     // request signature stays consistent. Reachability + PQ keys are unsigned.
-    let (req_sender_devices, req_device_identity_pubs): (
-        Vec<crate::owner_state_types::DeviceIdentityHash>,
-        Vec<Option<[u8; 64]>>,
-    ) = match self_reachability.as_ref() {
-        Some(r) => crate::dm_tunnel_contact::self_device_bundle(r.identity_pub_64),
-        None => (vec![], vec![]),
-    };
+    let req_bundle = crate::dm_tunnel_contact::self_request_bundle(self_reachability.as_ref());
     let req_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
-        &req_sender_devices,
-        &req_device_identity_pubs,
+        &req_bundle.sender_devices,
+        &req_bundle.device_identity_pubs,
     );
     let req_sig = self_device2_signing_key
         .sign(&friend_request_sig_preimage(
@@ -42205,16 +42183,6 @@ pub async fn connectivity_add_friend_by_key_inner(
             &req_devices_digest,
         ))
         .to_bytes();
-    let (req_iroh_node_id, req_home_relay_url, req_pq_dsa_pubkey, req_pq_kem_pubkey) =
-        match self_reachability.as_ref() {
-            Some(r) => (
-                r.iroh_node_id,
-                r.home_relay_url.clone(),
-                r.pq_dsa_pubkey.clone(),
-                r.pq_kem_pubkey.clone(),
-            ),
-            None => ([0u8; 32], None, vec![], vec![]),
-        };
     let request = FriendLinkRequest {
         from_addr: self_owner,
         display: self_display,
@@ -42222,12 +42190,12 @@ pub async fn connectivity_add_friend_by_key_inner(
         eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment,
         sig: req_sig,
-        sender_devices: req_sender_devices,
-        device_identity_pubs: req_device_identity_pubs,
-        iroh_node_id: req_iroh_node_id,
-        home_relay_url: req_home_relay_url,
-        pq_dsa_pubkey: req_pq_dsa_pubkey,
-        pq_kem_pubkey: req_pq_kem_pubkey,
+        sender_devices: req_bundle.sender_devices,
+        device_identity_pubs: req_bundle.device_identity_pubs,
+        iroh_node_id: req_bundle.iroh_node_id,
+        home_relay_url: req_bundle.home_relay_url,
+        pq_dsa_pubkey: req_bundle.pq_dsa_pubkey,
+        pq_kem_pubkey: req_bundle.pq_kem_pubkey,
     };
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
     let wire_len = wire.len() as u32;

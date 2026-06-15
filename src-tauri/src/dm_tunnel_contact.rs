@@ -38,6 +38,54 @@ pub fn self_device_bundle(
     }
 }
 
+/// The self-side values a `FriendLinkRequest` carries (ZEB-461): the SIGNED
+/// device bundle (`sender_devices` + `device_identity_pubs`, bound into the
+/// handshake signature via `friend_devices_digest`) plus the UNSIGNED iroh
+/// reachability + PQ routing hints.
+pub struct SelfRequestBundle {
+    pub sender_devices: Vec<DeviceIdentityHash>,
+    pub device_identity_pubs: Vec<Option<[u8; 64]>>,
+    pub iroh_node_id: [u8; 32],
+    pub home_relay_url: Option<String>,
+    pub pq_dsa_pubkey: Vec<u8>,
+    pub pq_kem_pubkey: Vec<u8>,
+}
+
+/// Build the self-side request bundle from this node's handshake reachability,
+/// in ONE place so the two request-build sites (`connectivity_redeem_invite_*`
+/// token-redeem and `connectivity_add_friend_by_key_inner`) can't drift.
+///
+/// With `Some`, fills the real device bundle (derived from `identity_pub_64`)
+/// together with the reachability and PQ keys. With `None` (tests / pre-identity),
+/// yields the EMPTY bundle and zero/`None` hints — byte-identical to the per-site
+/// `match` blocks it replaces. The caller still computes the signed digest from
+/// `sender_devices`/`device_identity_pubs`, so the wire signature is unchanged.
+pub fn self_request_bundle(
+    self_reachability: Option<&crate::iroh_friend_acceptor::SelfHandshakeReachability>,
+) -> SelfRequestBundle {
+    match self_reachability {
+        Some(r) => {
+            let (sender_devices, device_identity_pubs) = self_device_bundle(r.identity_pub_64);
+            SelfRequestBundle {
+                sender_devices,
+                device_identity_pubs,
+                iroh_node_id: r.iroh_node_id,
+                home_relay_url: r.home_relay_url.clone(),
+                pq_dsa_pubkey: r.pq_dsa_pubkey.clone(),
+                pq_kem_pubkey: r.pq_kem_pubkey.clone(),
+            }
+        }
+        None => SelfRequestBundle {
+            sender_devices: vec![],
+            device_identity_pubs: vec![],
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +121,36 @@ mod tests {
         let (devices, pubs) = self_device_bundle(bad);
         assert!(devices.is_empty());
         assert!(pubs.is_empty());
+    }
+
+    #[test]
+    fn self_request_bundle_matches_per_field_extraction() {
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let pub64 = private.public_identity().to_public_bytes();
+        let reach = crate::iroh_friend_acceptor::SelfHandshakeReachability {
+            identity_pub_64: pub64,
+            iroh_node_id: [7u8; 32],
+            home_relay_url: Some("https://relay.example".to_string()),
+            pq_dsa_pubkey: vec![1, 2, 3],
+            pq_kem_pubkey: vec![4, 5, 6],
+        };
+        // `Some` mirrors the device bundle + reachability the old match blocks built.
+        let b = self_request_bundle(Some(&reach));
+        let (devices, pubs) = self_device_bundle(pub64);
+        assert_eq!(b.sender_devices, devices);
+        assert_eq!(b.device_identity_pubs, pubs);
+        assert_eq!(b.iroh_node_id, [7u8; 32]);
+        assert_eq!(b.home_relay_url.as_deref(), Some("https://relay.example"));
+        assert_eq!(b.pq_dsa_pubkey, vec![1, 2, 3]);
+        assert_eq!(b.pq_kem_pubkey, vec![4, 5, 6]);
+
+        // `None` is the pre-identity / test path: EMPTY bundle + zero/None hints.
+        let n = self_request_bundle(None);
+        assert!(n.sender_devices.is_empty());
+        assert!(n.device_identity_pubs.is_empty());
+        assert_eq!(n.iroh_node_id, [0u8; 32]);
+        assert!(n.home_relay_url.is_none());
+        assert!(n.pq_dsa_pubkey.is_empty());
+        assert!(n.pq_kem_pubkey.is_empty());
     }
 }

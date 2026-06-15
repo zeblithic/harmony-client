@@ -253,7 +253,7 @@ async fn s1_invite_join_roster_convergence() {
 // DM transport itself: per-device unicast still rides the Reticulum path
 // (`SendUnicastToDevice`), which can't route co-located and is being deprecated in
 // favour of a DM-over-iroh carrier (repurposing the PQ `harmony-tunnel` session;
-// tracked separately — see docs/analysis/2026-06-14-transport-00-SYNTHESIS.md). So
+// ZEB-473 — see docs/analysis/2026-06-14-transport-00-SYNTHESIS.md). So
 // below we hard-assert the parts that work end-to-end (friendship active both ways +
 // DM-space creation + `send_dm` accepted/resolved) and *characterize* (not assert)
 // byte round-trip, which lights up once the DM-over-iroh carrier lands.
@@ -377,8 +377,10 @@ async fn s2_friend_graph_and_dm_send() {
 
     eprintln!(
         "S2 DM delivery: alice→bob={delivered_a_to_b} bob→alice={delivered_b_to_a} \
-         (both expected FALSE in this harness: Reticulum LAN transport disabled, \
-         OwnerDeviceCache never populated — see DM DELIVERY GAP note + report)"
+         (both expected FALSE in this harness: OwnerDeviceCache IS now populated via \
+         the friend handshake — ZEB-461 reachability primitive — but there is still no \
+         live DM byte carrier in the client; byte-delivery awaits the DM-over-iroh \
+         tunnel, ZEB-473. See DM DELIVERY GAP note + report)"
     );
 
     // Hard scenario result = the parts that genuinely work end-to-end:
