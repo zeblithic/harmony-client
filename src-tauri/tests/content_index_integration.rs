@@ -156,8 +156,6 @@ async fn ingest_list_pin_burn_roundtrip() {
                     None,       // dm_transport — DM outbox not exercised in this test
                     None,       // crdt_state — DM outbox not exercised in this test
                     None,       // unicast_send_rx — DM transport not exercised in this test
-                    None,       // cas_handle — DM transport not exercised in this test
-                    None,       // unicast_send_tx — DM transport not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
                     {
                         // Phase 3 Task 9: on-demand adapter request channel; tx
@@ -455,8 +453,6 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     None,       // dm_transport — DM outbox not exercised in this test
                     None,       // crdt_state — DM outbox not exercised in this test
                     None,       // unicast_send_rx — DM transport not exercised in this test
-                    None,       // cas_handle — DM transport not exercised in this test
-                    None,       // unicast_send_tx — DM transport not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
                     {
                         // Phase 3 Task 9: on-demand adapter request channel; tx
@@ -861,8 +857,6 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     None,       // dm_transport — DM outbox not exercised in this test
                     None,       // crdt_state — DM outbox not exercised in this test
                     None,       // unicast_send_rx — DM transport not exercised in this test
-                    None,       // cas_handle — DM transport not exercised in this test
-                    None,       // unicast_send_tx — DM transport not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
                     {
                         // Phase 3 Task 9: on-demand adapter request channel; tx
@@ -1124,8 +1118,6 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     pin_intent,
                     fetch_completion_tx,
                     fetch_completion_rx,
-                    None,
-                    None,
                     None,
                     None,
                     None,
@@ -1450,8 +1442,6 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     pin_intent,
                     fetch_completion_tx,
                     fetch_completion_rx,
-                    None,
-                    None,
                     None,
                     None,
                     None,
