@@ -5332,6 +5332,30 @@ pub async fn run(
         handle.abort();
     }
     let _ = session.close().await;
+    // ZEB-468: `session.close()` does NOT close an *adopted* runtime. We build the
+    // session via `zenoh::session::init(DynamicRuntime)` (open_session_with_runtime),
+    // so its `static_runtime` is None and `Session::close_inner` only sends a session
+    // face-close — it never calls the Runtime's `manager.close()`. Across a restart
+    // (mint, or app quit) that leaks every transport + TCP listener:
+    //   • the peer keeps our old (identity-stable, ZEB-390) zid's face → the restarted
+    //     session's re-declarations are rejected "Resource remapped. Remapping
+    //     unsupported!" → the Zenoh pub/sub mesh never re-forms (cards don't route);
+    //   • the orphaned TCP accept loop hot-spins on a shutting-down Tokio runtime
+    //     ("…being shutdown…"), burning CPU until the process exits.
+    // Close the runtime ourselves: `Runtime::close()` runs `terminate_all_async()`
+    // (cancels the accept loops) + `manager.close()` (closes transports → the peer
+    // drops our face). Bounded by a timeout so a stalled transport-close can never
+    // wedge a mint/restart; on timeout we proceed (the thread runtime drops anyway —
+    // strictly better than today's no-close).
+    const ZENOH_RUNTIME_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    match tokio::time::timeout(ZENOH_RUNTIME_CLOSE_TIMEOUT, zenoh_runtime.close()).await {
+        Ok(Ok(())) => tracing::info!("zenoh runtime closed"),
+        Ok(Err(e)) => tracing::warn!("zenoh runtime close error: {e}"),
+        Err(_) => tracing::warn!(
+            "zenoh runtime close timed out after {ZENOH_RUNTIME_CLOSE_TIMEOUT:?}; \
+             proceeding with teardown"
+        ),
+    }
     tracing::info!("event loop stopped");
 }
 

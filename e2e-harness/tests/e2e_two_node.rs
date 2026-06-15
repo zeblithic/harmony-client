@@ -882,3 +882,131 @@ async fn s5c_clean_dial_only_card_propagation_probe() {
     run.mark_success();
     drop((alice, bob, ah, bh));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S5d — ZEB-468 restart-safety REGRESSION (hard-asserted). Ildwyn, 2026-06-15.
+//
+// s5b/s5c CHARACTERIZE; this one GUARDS. It is the minimal repro of the ZEB-468
+// bug: `two_minted_nodes` mints (= RESTARTS) both nodes, which is the exact
+// restart-poisoning. No community is needed — owner cards are global and s5b
+// proved a *clean* co-located mesh routes them with no community. The ONLY
+// difference from s5b's passing control is that here we KEEP the mint-restart
+// instead of doing a clean relaunch.
+//
+// Root cause (see ZEB-468): `open_session_with_runtime` adopts an external zenoh
+// `Runtime` via `session::init(DynamicRuntime)`, so `static_runtime` is None and
+// `session.close()` only sends a face-close — it never calls the Runtime's
+// `manager.close()`. Across the mint-restart that leaks every transport/listener:
+//   • the peer keeps our old (deterministic) zid's face → the restarted session's
+//     re-declarations are rejected "Resource remapped. Remapping unsupported!";
+//   • the TCP accept loop spins on the shutting-down Tokio runtime
+//     ("…being shutdown…").
+// Both block the owner-card pub/sub mesh from re-forming, so cards never converge.
+//
+// The fix closes the adopted runtime on shutdown. AFTER it, this restarted mesh
+// behaves like s5b's clean one: cards converge, with 0 remap + 0 accept-spin.
+//
+// BEFORE the fix this test FAILS (converged=false, dozens of remap + hundreds of
+// accept-spin lines); after it, it PASSES. The 0/0 baseline matches s5b's
+// measured clean-relaunch control.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s5d_restart_card_propagation_regression() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let (mut run, ah, bh, mut alice, mut bob) = two_minted_nodes("s5d").await;
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    const ALICE_CARD: &str = "Alice-restart";
+    const BOB_CARD: &str = "Bob-restart";
+
+    publish_card_until_ok(&alice, ALICE_CARD, "gm restart", Duration::from_secs(30))
+        .await
+        .expect("alice card publisher ready");
+    publish_card_until_ok(&bob, BOB_CARD, "gm restart", Duration::from_secs(30))
+        .await
+        .expect("bob card publisher ready");
+
+    let a_sub = subscribe_member_card(&alice, &bob_owner)
+        .await
+        .expect("alice subscribes to bob's card");
+    let b_sub = subscribe_member_card(&bob, &alice_owner)
+        .await
+        .expect("bob subscribes to alice's card");
+
+    // Convergence depends on the restarted co-located mesh re-forming cleanly.
+    // Re-publish each tick (a Zenoh put is not retained for a late subscriber).
+    let converged = poll_until(Duration::from_secs(60), || async {
+        let _ = republish_owner_card(&alice, ALICE_CARD, "gm restart").await;
+        let _ = republish_owner_card(&bob, BOB_CARD, "gm restart").await;
+        let a_sees = cached_card_display_name(&alice, a_sub).await?;
+        let b_sees = cached_card_display_name(&bob, b_sub).await?;
+        Ok(
+            (a_sees.as_deref() == Some(BOB_CARD) && b_sees.as_deref() == Some(ALICE_CARD))
+                .then_some(()),
+        )
+    })
+    .await
+    .is_ok();
+
+    unsubscribe_member_card(&alice, a_sub).await.ok();
+    unsubscribe_member_card(&bob, b_sub).await.ok();
+
+    // Read the per-node stderr logs for the transport-health signals. Kill first
+    // (awaited) so each child's stderr File is flushed + closed before we read it
+    // — a hard kill is abrupt (no graceful teardown), so it adds no teardown spam
+    // of its own. Capture the dir BEFORE mark_success (which deletes it on pass).
+    let log_dir = run.log_dir();
+    alice.kill().await.expect("kill alice");
+    bob.kill().await.expect("kill bob");
+    // A read failure here must be LOUD, not silent: the transport-health checks below
+    // are line counts over these logs, so an unreadable/missing log would silently
+    // report remap=0/accept_spin=0 and let the test pass without verifying anything
+    // (e.g. if a child's stderr File failed to flush/close on the awaited kill above).
+    // An empty measurement is a broken guard, not a clean result — fail hard instead.
+    let read_log = |profile: &str| {
+        let path = log_dir.join(format!("{profile}.stderr.log"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "ZEB-468 regression: cannot read {profile} stderr log at {}: {e}. \
+                 The remap/accept_spin assertions count lines in this log, so an \
+                 unreadable log would silently pass (0/0) — failing instead.",
+                path.display()
+            )
+        })
+    };
+    let alice_log = read_log("alice");
+    let bob_log = read_log("bob");
+    let count = |needle: &str| -> usize {
+        alice_log.matches(needle).count() + bob_log.matches(needle).count()
+    };
+    // Defect 1: peer rejects the restarted session's re-declarations under the
+    // same deterministic zid because the old face was never dropped.
+    let remap = count("Remapping unsupported");
+    // Defect 3: TCP accept loop polling `accept()` on a shutting-down runtime.
+    let accept_spin = count("being shutdown");
+
+    assert!(
+        converged,
+        "ZEB-468 regression: owner cards must propagate between two co-located nodes \
+         after the mint-driven restart (got converged=false; remap={remap}, \
+         accept_spin={accept_spin}). The mint-restart is leaking the Zenoh transport."
+    );
+    assert_eq!(
+        remap, 0,
+        "ZEB-468 regression: a restarted session must not be rejected as a same-zid \
+         remap — the old transport must be cleanly closed so the peer drops its face \
+         (found {remap} `Remapping unsupported` lines across both nodes)."
+    );
+    assert_eq!(
+        accept_spin, 0,
+        "ZEB-468 regression: the Zenoh TCP accept loop must be cancelled on restart, \
+         not left spinning on a shutting-down runtime (found {accept_spin} \
+         `being shutdown` lines across both nodes)."
+    );
+
+    run.mark_success();
+    drop((ah, bh));
+}
