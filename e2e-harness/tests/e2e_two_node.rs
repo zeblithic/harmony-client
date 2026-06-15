@@ -961,8 +961,21 @@ async fn s5d_restart_card_propagation_regression() {
     let log_dir = run.log_dir();
     alice.kill().await.expect("kill alice");
     bob.kill().await.expect("kill bob");
+    // A read failure here must be LOUD, not silent: the transport-health checks below
+    // are line counts over these logs, so an unreadable/missing log would silently
+    // report remap=0/accept_spin=0 and let the test pass without verifying anything
+    // (e.g. if a child's stderr File failed to flush/close on the awaited kill above).
+    // An empty measurement is a broken guard, not a clean result — fail hard instead.
     let read_log = |profile: &str| {
-        std::fs::read_to_string(log_dir.join(format!("{profile}.stderr.log"))).unwrap_or_default()
+        let path = log_dir.join(format!("{profile}.stderr.log"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "ZEB-468 regression: cannot read {profile} stderr log at {}: {e}. \
+                 The remap/accept_spin assertions count lines in this log, so an \
+                 unreadable log would silently pass (0/0) — failing instead.",
+                path.display()
+            )
+        })
     };
     let alice_log = read_log("alice");
     let bob_log = read_log("bob");
