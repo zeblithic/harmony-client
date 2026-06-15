@@ -3547,9 +3547,7 @@ mod owner_device_cache_tests {
 #[cfg(test)]
 mod merge_prior_content_keys_tests {
     use super::*;
-    use crate::owner_state_types::{
-        DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind,
-    };
+    use crate::owner_state_types::{DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
 
     fn key(byte: u8) -> DmContentKey {
         DmContentKey::new([byte; 32])
@@ -3714,9 +3712,7 @@ mod dm_crypto_integration_tests {
     use super::*;
     use crate::dm_crypto::{compute_aad, decrypt_dm_message, encrypt_dm_message};
     use crate::dm_envelope::MessagePayload;
-    use crate::owner_state_types::{
-        DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind,
-    };
+    use crate::owner_state_types::{DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
 
     fn dm_at(id_byte: u8, ck: DmContentKey) -> Space {
         let hlc = Hlc {
