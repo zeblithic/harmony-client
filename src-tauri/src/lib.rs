@@ -40108,7 +40108,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         status: crate::friend_graph::FriendStatus::Active,
         established_via: crate::friend_graph::FriendOrigin::Token,
         referrable: false,
-        learned_at,
+        learned_at: learned_at.clone(),
         sealed_secret: Some(sealed),
     };
     {
@@ -40118,6 +40118,27 @@ pub async fn connectivity_link_friend_iroh_inner(
             | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {}
             crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
                 return Err(format!("friend-graph apply rejected: {reason:?}"));
+            }
+        }
+
+        // ZEB-461 Task 7: learn the inviter's advertised devices (carried in the
+        // accept) so the DM outbox can route to this friend even without a shared
+        // community. Keyed by the inviter's OwnerAddr (same key as the friend
+        // write). `learned_at` is this node's local HLC (the same value stamped
+        // on the friend entry) — never the peer's claimed time (handle_invite
+        // anti-forgery rule). Skip an empty bundle so we never LWW-clobber a
+        // previously-known-good cache entry (an empty bundle means "peer
+        // advertised nothing", NOT "peer has zero devices").
+        if !accepted.sender_devices.is_empty() {
+            if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = state
+                .apply_owner_device_update(
+                    payload.inviter_addr,
+                    accepted.sender_devices.clone(),
+                    accepted.device_identity_pubs.clone(),
+                    learned_at,
+                )
+            {
+                return Err(format!("device-cache apply rejected: {reason:?}"));
             }
         }
     }

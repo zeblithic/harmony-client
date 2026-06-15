@@ -937,13 +937,36 @@ pub fn process_friend_request(
             FriendOrigin::MutualKey
         },
         referrable: false,
-        learned_at,
+        learned_at: learned_at.clone(),
         sealed_secret: Some(sealed),
     };
     match state.apply_friend_update(req.from_addr, entry) {
         ApplyOutcome::Inserted | ApplyOutcome::Merged { .. } => {}
         ApplyOutcome::Rejected(reason) => {
             return Err(FriendHandshakeError::ApplyRejected(format!("{reason:?}")));
+        }
+    }
+
+    // ZEB-461 Task 7: learn the requester's devices so the DM outbox can route
+    // to them (a friend without a shared community would otherwise have an empty
+    // device cache → no DM destination). `learned_at` is this node's local HLC
+    // (the same value stamped on the friend entry just above) — never the peer's
+    // claimed time (handle_invite anti-forgery rule). Skip an empty bundle so we
+    // never LWW-clobber a previously-known-good cache entry (an empty bundle
+    // means "peer advertised nothing": older client, or a failed self-bind →
+    // None path — NOT "peer has zero devices").
+    if !req.sender_devices.is_empty() {
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = state
+            .apply_owner_device_update(
+                req.from_addr,
+                req.sender_devices.clone(),
+                req.device_identity_pubs.clone(),
+                learned_at,
+            )
+        {
+            return Err(FriendHandshakeError::ApplyRejected(format!(
+                "device cache: {reason:?}"
+            )));
         }
     }
 
@@ -2644,6 +2667,108 @@ mod tests {
             pq_dsa_pubkey: vec![],
             pq_kem_pubkey: vec![],
         }
+    }
+
+    /// ZEB-461 Task 7: a signed, well-formed request carrying a VALID,
+    /// self-consistent device bundle (each `Some(pub)` hashes to its parallel
+    /// device hash, so `apply_owner_device_update` accepts it). The bundle is
+    /// bound into `devices_digest`, which the request signature covers — so the
+    /// digest must be computed over the REAL bundle before signing. Returns the
+    /// request and the device hashes it advertises (the cache should learn them).
+    fn signed_request_with_devices(owner_seed: u8) -> (FriendLinkRequest, Vec<DeviceIdentityHash>) {
+        let owner = mint_test_owner(owner_seed);
+        let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+        // A self-consistent device bundle (hash derived from a real identity pub).
+        let id = harmony_identity::PrivateIdentity::from_seed(&[owner_seed; 32]);
+        let pub64 = id.public_identity().to_public_bytes();
+        let (devices, pubs) = crate::dm_tunnel_contact::self_device_bundle(pub64);
+        let devices_digest = friend_devices_digest(&devices, &pubs);
+        let preimage = friend_request_sig_preimage(owner.owner, None, &eph_pub, &devices_digest);
+        let sig = owner.device_key.sign(&preimage).to_bytes();
+        let req = FriendLinkRequest {
+            from_addr: owner.owner,
+            display: Some("carol".into()),
+            token_sig: None,
+            eph_x25519_pub: eph_pub,
+            enrollment: owner.cert,
+            sig,
+            sender_devices: devices.clone(),
+            device_identity_pubs: pubs,
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
+        };
+        (req, devices)
+    }
+
+    #[test]
+    fn process_friend_request_populates_owner_device_cache() {
+        // ZEB-461 Task 7: on accept, the requester's advertised device bundle is
+        // learned into the local OwnerDeviceCache (keyed by the requester's
+        // OwnerAddr) so the DM outbox can resolve a route to that friend even
+        // without a shared community.
+        use crate::owner_state_crypto::KeyTree;
+        let (req, expected_devices) = signed_request_with_devices(0x90);
+        let me = mint_test_owner(0x91);
+        let kt = KeyTree::derive(&[7u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        process_friend_request(
+            &mut state,
+            test_hlc(5),
+            &req,
+            me.owner,
+            None,
+            &me.cert,
+            &me.device_key,
+            &kt,
+            0,
+            None,
+        )
+        .expect("processed");
+        let entry = state
+            .owner_device_cache
+            .devices
+            .get(&req.from_addr)
+            .expect("cache entry for requester");
+        assert_eq!(entry.devices, expected_devices);
+    }
+
+    #[test]
+    fn process_friend_request_empty_bundle_does_not_touch_device_cache() {
+        // ZEB-461 Task 7 skip-on-empty guard: an EMPTY advertised bundle (older
+        // client, or a None-reachability self path) must NOT create or clobber a
+        // cache entry — storing an empty list under a newer HLC would LWW-clobber
+        // a previously-known-good entry.
+        use crate::owner_state_crypto::KeyTree;
+        let req = signed_request_no_token(0x92);
+        assert!(
+            req.sender_devices.is_empty(),
+            "the no-token builder ships an empty device bundle"
+        );
+        let me = mint_test_owner(0x93);
+        let kt = KeyTree::derive(&[8u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        process_friend_request(
+            &mut state,
+            test_hlc(5),
+            &req,
+            me.owner,
+            None,
+            &me.cert,
+            &me.device_key,
+            &kt,
+            0,
+            None,
+        )
+        .expect("processed");
+        assert!(
+            !state
+                .owner_device_cache
+                .devices
+                .contains_key(&req.from_addr),
+            "an empty bundle must not create a device-cache entry"
+        );
     }
 
     #[test]
