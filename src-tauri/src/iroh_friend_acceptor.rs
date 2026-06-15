@@ -434,6 +434,25 @@ pub fn friend_devices_digest(
     hasher.finalize().into()
 }
 
+/// ZEB-461: this node's own reachability + identity material to advertise in an
+/// outbound friend handshake (request OR accept). `None` at a build site means
+/// "ship the empty bundle" (tests / pre-identity); `Some` fills the real values.
+///
+/// The device bundle is DERIVED from `identity_pub_64` via
+/// [`crate::dm_tunnel_contact::self_device_bundle`] and is SIGNED (its
+/// `friend_devices_digest` is bound into the handshake signature). Reachability
+/// (`iroh_node_id`, `home_relay_url`) and the PQ keys (`pq_dsa_pubkey`,
+/// `pq_kem_pubkey`) are UNSIGNED routing hints — a wrong value just fails the
+/// tunnel, so they are deliberately NOT part of the digest.
+#[derive(Clone)]
+pub struct SelfHandshakeReachability {
+    pub identity_pub_64: [u8; 64],
+    pub iroh_node_id: [u8; 32],
+    pub home_relay_url: Option<String>,
+    pub pq_dsa_pubkey: Vec<u8>,
+    pub pq_kem_pubkey: Vec<u8>,
+}
+
 /// Canonical preimage bytes the requester's device-#2 key signs for a
 /// [`FriendLinkRequest`]. A small CBOR-encoded tuple `("hfr1", from_addr,
 /// token_sig, eph, devices_digest)` — the `"hfr1"` domain tag makes a
@@ -860,6 +879,7 @@ pub fn process_friend_request(
     self_device2: &ed25519_dalek::SigningKey,
     keytree: &crate::owner_state_crypto::KeyTree,
     now_secs: u64,
+    self_reachability: Option<&SelfHandshakeReachability>,
 ) -> Result<FriendLinkAccepted, FriendHandshakeError> {
     // 1. Authenticate the requester's cert → enrolled device-#2 key.
     let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)?;
@@ -930,11 +950,16 @@ pub fn process_friend_request(
     // 6. Build + sign the mutual accept reply. The accept sig binds to the same
     // token_sig as the request it answers (domain-separated from the request),
     // this side's ephemeral X25519 public, and (ZEB-461) this side's device-
-    // bundle digest. The bundle/reachability/PQ fields ship EMPTY for now —
-    // Task 6 fills them with real values; the digest of the empty bundle still
-    // gets signed so the wire stays consistent and Task 6's fill is a drop-in.
-    let accept_devices: Vec<DeviceIdentityHash> = vec![];
-    let accept_device_pubs: Vec<Option<[u8; 64]>> = vec![];
+    // bundle digest. ZEB-461 Task 6: when `self_reachability` is `Some`, fill the
+    // REAL self device bundle + reachability + PQ keys; when `None` (tests /
+    // pre-identity) ship the EMPTY bundle exactly as before. Either way the
+    // digest is computed from the SAME (devices, pubs) placed on the wire, so the
+    // signature stays consistent with the bundle a peer re-digests on receipt.
+    let (accept_devices, accept_device_pubs): (Vec<DeviceIdentityHash>, Vec<Option<[u8; 64]>>) =
+        match self_reachability {
+            Some(r) => crate::dm_tunnel_contact::self_device_bundle(r.identity_pub_64),
+            None => (vec![], vec![]),
+        };
     let accept_devices_digest = friend_devices_digest(&accept_devices, &accept_device_pubs);
     let accept_preimage = friend_accept_sig_preimage(
         self_owner,
@@ -943,6 +968,16 @@ pub fn process_friend_request(
         &accept_devices_digest,
     );
     let sig = self_device2.sign(&accept_preimage).to_bytes();
+    // Unsigned routing hints: real values when `Some`, empty/zero/None when not.
+    let (iroh_node_id, home_relay_url, pq_dsa_pubkey, pq_kem_pubkey) = match self_reachability {
+        Some(r) => (
+            r.iroh_node_id,
+            r.home_relay_url.clone(),
+            r.pq_dsa_pubkey.clone(),
+            r.pq_kem_pubkey.clone(),
+        ),
+        None => ([0u8; 32], None, vec![], vec![]),
+    };
     Ok(FriendLinkAccepted {
         from_addr: self_owner,
         display: self_display,
@@ -951,10 +986,10 @@ pub fn process_friend_request(
         sig,
         sender_devices: accept_devices,
         device_identity_pubs: accept_device_pubs,
-        iroh_node_id: [0u8; 32],
-        home_relay_url: None,
-        pq_dsa_pubkey: vec![],
-        pq_kem_pubkey: vec![],
+        iroh_node_id,
+        home_relay_url,
+        pq_dsa_pubkey,
+        pq_kem_pubkey,
     })
 }
 
@@ -1007,6 +1042,10 @@ where
     /// PROMPT a KNOWN requester — never relaxes authentication, and never
     /// auto-accepts an UNKNOWN owner.
     auto_accept_known: bool,
+    /// ZEB-461 Task 6: this node's own device bundle + reachability + PQ keys to
+    /// advertise in the accept it signs. `None` (the default; tests) ships the
+    /// empty bundle. Production wires the real values via `with_self_reachability`.
+    self_reachability: Option<SelfHandshakeReachability>,
     config: FriendAcceptorConfig,
 }
 
@@ -1072,6 +1111,8 @@ where
             pending_requests: None,
             // ZEB-371 spec §7.1 default: auto-accept KNOWN requesters is ON.
             auto_accept_known: true,
+            // ZEB-461: default to the empty self bundle; production fills it.
+            self_reachability: None,
             config,
         }
     }
@@ -1117,6 +1158,15 @@ where
     /// persisted setting and passes it here.
     pub fn with_auto_accept_known(mut self, auto_accept_known: bool) -> Self {
         self.auto_accept_known = auto_accept_known;
+        self
+    }
+
+    /// ZEB-461: advertise this node's device bundle + reachability + PQ keys in
+    /// the outbound accept it signs. `None` (the default) ships the empty bundle.
+    /// Fluent setter (default `None`) so existing call sites — including tests —
+    /// keep compiling without an explicit `None`.
+    pub fn with_self_reachability(mut self, r: Option<SelfHandshakeReachability>) -> Self {
+        self.self_reachability = r;
         self
     }
 
@@ -1355,6 +1405,7 @@ where
                         &self.device2_signing_key,
                         &self.keytree,
                         now_secs,
+                        self.self_reachability.as_ref(),
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1384,6 +1435,7 @@ where
                         &self.device2_signing_key,
                         &self.keytree,
                         now_secs,
+                        self.self_reachability.as_ref(),
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -2062,6 +2114,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
         )
         .expect("valid request processed");
 
@@ -2146,6 +2199,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
         )
         .expect("processed");
 
@@ -2186,6 +2240,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
         )
         .expect_err("bad sig rejected");
         assert!(matches!(err, FriendHandshakeError::SignatureInvalid));
@@ -2241,6 +2296,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
         )
         .expect_err("owner-mismatched cert rejected");
         assert!(matches!(err, FriendHandshakeError::EnrollmentOwnerMismatch));
@@ -2625,6 +2681,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
         )
         .expect("no-token request processed");
         let entry = state
