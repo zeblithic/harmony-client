@@ -209,29 +209,44 @@ impl DmTransport for IrohTunnelDmTransport {
                 sender_devices: vec![self.our_signing_device_hash],
                 signing_device_hash: self.our_signing_device_hash,
             };
-            // ZEB-484: inline the encrypted blob when it fits; else bare CidNotify.
-            match build_tunnel_dm_packet(&self.cas, &signed, &self.signing_key, entry.message_cid)
-                .await
-            {
-                Ok(packet) => {
-                    for (node_id, contact) in &targets {
-                        self.mgr.send_dm(*node_id, contact, packet.clone());
+            // ZEB-485: SPAWN the blob build + tunnel `send_dm`, do NOT await it
+            // inline. `build_tunnel_dm_packet` reads the local CAS via
+            // `CasOp::GetLocal`, which is serviced by the SAME event loop that
+            // drives this outbox drain inline (its timer tick does
+            // `drain_lifted(...).await`). Awaiting `get_local` here deadlocks:
+            // the loop is blocked on the drain and can never reply to its own
+            // `GetLocal`. Spawning frees the loop to service `GetLocal`; we
+            // return `Transient` immediately and the deposit rung carries
+            // durability regardless. (Resolving targets above only locks
+            // `crdt_state` — not the CasOp bridge — so it stays inline.)
+            let mgr = std::sync::Arc::clone(&self.mgr);
+            let cas = std::sync::Arc::clone(&self.cas);
+            let signing_key = std::sync::Arc::clone(&self.signing_key);
+            let message_cid = entry.message_cid;
+            tokio::spawn(async move {
+                // ZEB-484: inline the encrypted blob when it fits; else bare CidNotify.
+                match build_tunnel_dm_packet(&cas, &signed, &signing_key, message_cid).await {
+                    Ok(packet) => {
+                        for (node_id, contact) in &targets {
+                            mgr.send_dm(*node_id, contact, packet.clone());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            recipient = ?recipient,
+                            error = %e,
+                            "ZEB-484: tunnel DM packet build failed; deposit rung still covers this DM"
+                        );
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        recipient = ?recipient,
-                        error = %e,
-                        "ZEB-484: tunnel DM packet build failed; deposit rung still covers this DM"
-                    );
-                }
-            }
+            });
         }
 
         // ALWAYS return Transient (never Ok): the tunnel is a parallel
         // liveness attempt; the outbox's deposit rung is the durability
         // guarantee and must fire for every DM (spec §5.7). See module docs for
-        // why Transient (not Ok) is the correct contract.
+        // why Transient (not Ok) is the correct contract. The spawned attempt
+        // above runs concurrently and never blocks the drain.
         Err(TransportError::Transient(
             "ZEB-473: tunnel attempted (best-effort liveness); deposit rung carries durability"
                 .to_string(),
@@ -261,6 +276,26 @@ mod tests {
         let local_pq = Arc::new(PqPrivateIdentity::generate(&mut rand::rngs::OsRng));
         let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
         Arc::new(TunnelManager::new(endpoint, local_pq, ingest_tx))
+    }
+
+    /// ZEB-485: `IrohTunnelDmTransport::send` SPAWNS the build + tunnel `send_dm`
+    /// (to avoid the `get_local` `CasOp::GetLocal` re-entrancy deadlock against
+    /// the event loop), so the routed packet is observable only after the spawned
+    /// task runs. The recipient NodeId is pre-registered as an Active handle (via
+    /// `register_inbound`) so `send_dm` routes over `cmd_tx` — NOT a lazy dial
+    /// whose fast failure to the synthetic contact would evict the pending before
+    /// we observe it. Drain the next routed `SendDm` payload, polling until the
+    /// spawn delivers it. Panics on timeout.
+    async fn wait_for_routed(
+        cmd_rx: &mut tokio::sync::mpsc::Receiver<crate::tunnel_manager::TunnelCommand>,
+    ) -> Vec<u8> {
+        for _ in 0..200 {
+            if let Ok(crate::tunnel_manager::TunnelCommand::SendDm(p)) = cmd_rx.try_recv() {
+                return p;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("spawned tunnel send_dm never routed a packet");
     }
 
     fn synthetic_outbox_entry(space: SpaceId, cid: ContentId, recipient: OwnerAddr) -> OutboxEntry {
@@ -339,6 +374,11 @@ mod tests {
         let cid = ContentId::from_bytes([0xee; 32]);
         let entry = synthetic_outbox_entry(space, cid, recipient);
 
+        // ZEB-485: pre-register an Active handle for the recipient NodeId so the
+        // SPAWNED send_dm routes over cmd_tx; a lazy dial to the synthetic contact
+        // would fail fast and evict the pending before we could observe it.
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
+
         // Always-deposit invariant: send returns Transient (drives deposit).
         let err = transport
             .send(&entry, recipient, Vec::new())
@@ -351,10 +391,7 @@ mod tests {
 
         // The manager received exactly one send_dm for the derived NodeId, with
         // the byte-identical built packet buffered on the dialing handle.
-        let pending = mgr
-            .test_pending_packets(&expected_node_id)
-            .expect("send_dm must have registered a session for the derived NodeId");
-        assert_eq!(pending.len(), 1, "exactly one DM routed to the tunnel");
+        let routed = wait_for_routed(&mut cmd_rx).await;
 
         // The routed bytes must be the live build_dm_packet output for this DM.
         let signed = crate::dm_envelope::DmCidNotifySigned {
@@ -366,10 +403,7 @@ mod tests {
         };
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
         let expected = build_dm_packet(signed, &signing_key).expect("build expected packet");
-        assert_eq!(
-            pending[0], expected,
-            "routed packet must match build_dm_packet"
-        );
+        assert_eq!(routed, expected, "routed packet must match build_dm_packet");
 
         // And no spurious session for any other NodeId.
         assert!(
@@ -569,16 +603,16 @@ mod tests {
 
         let transport = make_transport(Arc::clone(&mgr), state, Arc::clone(&cas));
         let entry = synthetic_outbox_entry(SpaceId([0xcc; 16]), cid, recipient);
+        // ZEB-485: pre-register an Active handle so the spawned send_dm routes over
+        // cmd_tx (see send_resolves_contact_and_routes_to_manager for why).
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
         let _ = transport
             .send(&entry, recipient, Vec::new())
             .await
             .expect_err("always-deposit: send returns Transient");
 
-        let pending = mgr
-            .test_pending_packets(&expected_node_id)
-            .expect("a session was registered for the derived NodeId");
-        assert_eq!(pending.len(), 1);
-        match crate::dm_envelope::decode_packet(&pending[0]).expect("decode routed packet") {
+        let routed = wait_for_routed(&mut cmd_rx).await;
+        match crate::dm_envelope::decode_packet(&routed).expect("decode routed packet") {
             crate::dm_envelope::DmPacket::CidNotifyWithBlob {
                 signed,
                 storage_blob,
@@ -629,18 +663,18 @@ mod tests {
 
         let transport = make_transport(Arc::clone(&mgr), state, Arc::clone(&cas));
         let entry = synthetic_outbox_entry(SpaceId([0xcc; 16]), cid, recipient);
+        // ZEB-485: pre-register an Active handle so the spawned send_dm routes over
+        // cmd_tx (see send_resolves_contact_and_routes_to_manager for why).
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
         let _ = transport
             .send(&entry, recipient, Vec::new())
             .await
             .expect_err("Transient");
 
-        let pending = mgr
-            .test_pending_packets(&expected_node_id)
-            .expect("session registered");
-        assert_eq!(pending.len(), 1);
+        let routed = wait_for_routed(&mut cmd_rx).await;
         assert!(
             matches!(
-                crate::dm_envelope::decode_packet(&pending[0]).unwrap(),
+                crate::dm_envelope::decode_packet(&routed).unwrap(),
                 crate::dm_envelope::DmPacket::CidNotify { .. }
             ),
             "an oversize blob must fall back to a bare CidNotify"
