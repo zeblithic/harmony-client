@@ -61,6 +61,12 @@ flume = "0.11"
 # multi-thread runtime), "macros" (tokio::select! in the shutdown path),
 # "signal" (ctrl-c / SIGTERM handling in wait_for_exit_signal).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+# ZEB-473 (DM-over-iroh, Move 1a): the tunnel session loop reads length-prefixed
+# frames off the iroh bi-stream inside a `tokio::select!`; `FramedRead` +
+# `LengthDelimitedCodec` buffers partial reads internally so a cancelled read
+# future (when another select arm fires) does not discard consumed bytes. Already
+# in the lock transitively (iroh/zenoh); a direct entry makes the codec importable.
+tokio-util = { version = "0.7", features = ["codec"] }
 tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-os = "2"

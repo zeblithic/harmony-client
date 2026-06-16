@@ -193,6 +193,14 @@ pub struct IrohZenohLinkManager {
     community_relay_pull_acceptor: std::sync::OnceLock<
         Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>,
     >,
+    /// ZEB-473 (Move 1a): late-installed acceptor for inbound
+    /// `harmony/tunnel/v1` connections (the PQ DM tunnel). Same lifecycle as the
+    /// butler/relay acceptors — no boot-window queue; a tunnel dial arriving
+    /// before install is closed without reply, which the sender's
+    /// always-deposit durability path covers (a missed live tunnel never makes
+    /// delivery worse). Typed as the generic `IrohHandshakeDispatcher` trait
+    /// object so the transport layer stays decoupled from the tunnel module.
+    tunnel_acceptor: std::sync::OnceLock<Arc<dyn IrohHandshakeDispatcher>>,
 }
 
 impl IrohZenohLinkManager {
@@ -212,6 +220,7 @@ impl IrohZenohLinkManager {
             butler_deposit_acceptor: std::sync::OnceLock::new(),
             community_relay_deposit_acceptor: std::sync::OnceLock::new(),
             community_relay_pull_acceptor: std::sync::OnceLock::new(),
+            tunnel_acceptor: std::sync::OnceLock::new(),
         }
     }
 
@@ -249,6 +258,19 @@ impl IrohZenohLinkManager {
         acceptor: Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>,
     ) -> Result<(), Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>> {
         self.community_relay_pull_acceptor.set(acceptor)
+    }
+
+    /// ZEB-473 (Move 1a): install the PQ DM tunnel acceptor used by the accept
+    /// loop to route inbound `harmony/tunnel/v1` connections. Install-once
+    /// (mirrors the butler-deposit acceptor); a second install returns the
+    /// supplied acceptor back as `Err`. No pending queue — dropping a tunnel
+    /// dial pre-install is graceful (the sender's always-deposit durability path
+    /// covers a missed live tunnel).
+    pub fn install_tunnel_acceptor(
+        &self,
+        acceptor: Arc<dyn IrohHandshakeDispatcher>,
+    ) -> Result<(), Arc<dyn IrohHandshakeDispatcher>> {
+        self.tunnel_acceptor.set(acceptor)
     }
 
     /// ZEB-368: expose the resolver so the event loop can enumerate known peers
@@ -487,6 +509,24 @@ impl IrohZenohLinkManager {
                         } else {
                             tracing::debug!(
                                 "ZEB-458: community relay pull before acceptor installed; closing"
+                            );
+                            conn.close(0u32.into(), b"");
+                        }
+                    } else if alpn_used == alpn::HARMONY_TUNNEL_V1 {
+                        // ZEB-473 (Move 1a): inbound PQ DM tunnel. Spawn so a
+                        // slow/hung peer can't block the accept loop (the
+                        // responder driver owns the connection for the tunnel's
+                        // whole lifetime). No boot-window queue: a tunnel dial
+                        // arriving before the acceptor installs is closed, and
+                        // the sender's always-deposit durability path covers the
+                        // missed live tunnel.
+                        if let Some(acceptor) = mgr.tunnel_acceptor.get().cloned() {
+                            tokio::spawn(async move {
+                                acceptor.handle_connection(conn).await;
+                            });
+                        } else {
+                            tracing::debug!(
+                                "ZEB-473: tunnel dial before acceptor installed; closing"
                             );
                             conn.close(0u32.into(), b"");
                         }

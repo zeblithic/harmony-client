@@ -179,6 +179,7 @@ pub mod iroh_endpoint;
 pub mod iroh_friend_acceptor;
 pub mod iroh_invite_acceptor;
 pub mod iroh_pex_acceptor;
+pub mod iroh_tunnel_acceptor;
 pub mod library_directory;
 pub mod mail;
 pub mod mail_sync;
@@ -227,6 +228,11 @@ pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
 pub mod state_snapshot;
+// ZEB-473 (DM-over-iroh, Move 1a): the per-peer PQ tunnel session map
+// (TunnelManager) + per-connection async driver (tunnel_task: responder
+// acceptor + initiator dialer over the persistent iroh endpoint).
+pub mod tunnel_manager;
+pub mod tunnel_task;
 pub mod vine_feed_cache;
 pub mod voice;
 pub mod voice_crypto;
@@ -764,6 +770,13 @@ pub struct NodeState {
     /// public stashes' lifecycle, so a stale identity's secret keys never
     /// outlive an identity switch. No live consumer yet (Task 2 retains only).
     dm_pq_identity: Option<std::sync::Arc<harmony_identity::PqPrivateIdentity>>,
+    /// ZEB-473 (DM-over-iroh, Move 1a): the per-peer PQ tunnel session map.
+    /// Built at boot (when the iroh endpoint bound + the PQ identity is in hand)
+    /// and shared here so the Task 8 `IrohTunnelDmTransport` can route outbound
+    /// DMs through it (`tunnel_manager.send_dm(...)`). `None` when iroh bind
+    /// failed (no tunnel transport — DMs stay deposit-only). Cleared on stop_node
+    /// so a stale identity's live tunnels never outlive an identity switch.
+    tunnel_manager: Option<std::sync::Arc<crate::tunnel_manager::TunnelManager>>,
     /// ZEB-217 Sub-C Phase 3 Task 9: sender used by IPC handlers
     /// (`create_community`, `redeem_invite`) to dispatch a
     /// `CommunityAdapterRequest` into the event loop, where it's
@@ -1425,6 +1438,7 @@ impl Default for NodeState {
             dm_local_dsa_pubkey: None,
             dm_local_kem_pubkey: None,
             dm_pq_identity: None,
+            tunnel_manager: None,
             community_adapter_request_tx: None,
             // ZEB-434 D6: stays None until start_node wires the
             // transport-epoch watch.
@@ -1877,6 +1891,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // stale identity's secret keys never outlive an identity switch
         // (zeroized on the Arc's final drop). Mirrors the public stashes.
         let _ = guard.dm_pq_identity.take();
+        // ZEB-473 (Move 1a): drop the tunnel session map so a stale identity's
+        // live tunnels (and their cmd channels) are torn down on stop; a new
+        // identity rebuilds a fresh manager at boot.
+        let _ = guard.tunnel_manager.take();
         // ZEB-371: drop the owner KeyTree so a restart (or identity switch)
         // re-derives a fresh one from the new master seed rather than sealing
         // friend secrets under the prior identity's keys.
@@ -2839,6 +2857,9 @@ pub async fn start_node_inner(
         // ZEB-473 (Move 1a) Task 2: drop our retained PQ private identity so a
         // stale identity's secret keys never outlive an identity switch.
         let _ = guard.dm_pq_identity.take();
+        // ZEB-473 (Move 1a): drop the tunnel session map so a stale identity's
+        // live tunnels are torn down on stop.
+        let _ = guard.tunnel_manager.take();
         // ZEB-217 Sub-C Phase 3 Task 9: clear the previous adapter-
         // request sender so it doesn't outlive the previous event
         // loop. The new event loop is constructed below with a fresh
@@ -3548,6 +3569,14 @@ pub async fn start_node_inner(
         // the later install. Stays `None` when iroh bind failed.
         let mut iroh_link_mgr_for_handshake: Option<
             std::sync::Arc<crate::zenoh_iroh_transport::IrohZenohLinkManager>,
+        > = None;
+        // ZEB-473 (DM-over-iroh, Move 1a): the per-peer PQ tunnel session map,
+        // constructed in the acceptor-install block below (once `pq_identity` +
+        // the iroh endpoint + link manager are available) and stored on
+        // NodeState so the Task 8 `DmTransport` can reach it. `None` when iroh
+        // bind failed (no tunnel transport) — exactly like the deposit rung.
+        let mut tunnel_manager_for_state: Option<
+            std::sync::Arc<crate::tunnel_manager::TunnelManager>,
         > = None;
         // ZEB-321 Phase 1 PR #157 round 4 (Greptile P1): JoinHandle of
         // the iroh accept loop. Captured here (not dropped via
@@ -6888,6 +6917,59 @@ pub async fn start_node_inner(
                             );
                         }
 
+                        // ── ZEB-473 (DM-over-iroh, Move 1a) Task 6/7: build the
+                        //    per-peer PQ tunnel session map (TunnelManager),
+                        //    spawn the placeholder inbound-DM drain (Task 9
+                        //    replaces it with the real verify/decrypt/ingest),
+                        //    and late-install the tunnel acceptor on the iroh
+                        //    link manager (same late-install seam as the butler
+                        //    acceptor; the accept loop closes pre-install
+                        //    `harmony/tunnel/v1` connections gracefully until
+                        //    this set lands). Gated on a bound iroh endpoint —
+                        //    without it there is no tunnel transport (and DMs
+                        //    stay deposit-only, exactly the butler rung's gate).
+                        if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
+                            // The ingest seam (Task 9 swaps the consumer): the
+                            // tunnel loops push each received DM payload onto
+                            // `tunnel_ingest_tx`; the drain below logs + drops.
+                            let (tunnel_ingest_tx, mut tunnel_ingest_rx) =
+                                tokio::sync::mpsc::channel::<crate::tunnel_manager::InboundDm>(256);
+                            tokio::spawn(async move {
+                                while let Some(dm) = tunnel_ingest_rx.recv().await {
+                                    tracing::info!(
+                                        peer = %hex::encode(dm.peer_node_id),
+                                        payload_len = dm.payload.len(),
+                                        "tunnel DM received (ingest wired in ZEB-473 Task 9)"
+                                    );
+                                }
+                            });
+
+                            let tunnel_manager =
+                                std::sync::Arc::new(crate::tunnel_manager::TunnelManager::new(
+                                    (**ep_arc).clone(),
+                                    std::sync::Arc::clone(&pq_identity),
+                                    tunnel_ingest_tx.clone(),
+                                ));
+                            let tunnel_acceptor: std::sync::Arc<
+                                dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
+                            > = std::sync::Arc::new(
+                                crate::iroh_tunnel_acceptor::IrohTunnelAcceptor::new(
+                                    std::sync::Arc::clone(&pq_identity),
+                                    std::sync::Arc::clone(&tunnel_manager),
+                                    tunnel_ingest_tx,
+                                ),
+                            );
+                            if link_mgr.install_tunnel_acceptor(tunnel_acceptor).is_err() {
+                                tracing::warn!(
+                                    "ZEB-473: tunnel acceptor already installed on iroh \
+                                     link manager — keeping the prior instance"
+                                );
+                            }
+                            // Share the manager onto NodeState so the Task 8
+                            // DmTransport can route outbound DMs through it.
+                            tunnel_manager_for_state = Some(tunnel_manager);
+                        }
+
                         // ZEB-418 SP2 P1 Task 8: build the production
                         // sender-side butler deposit client and inject it
                         // into the DmOutbox so the drain's deposit rung can
@@ -7878,6 +7960,11 @@ pub async fn start_node_inner(
                         // on-disk identity. Cleared on stop alongside the
                         // public stashes.
                         guard.dm_pq_identity = Some(pq_identity);
+                        // ZEB-473 (Move 1a): store the per-peer PQ tunnel session
+                        // map (built in the acceptor-install block above, or
+                        // `None` if iroh bind failed) so the Task 8 DmTransport
+                        // can route outbound DMs through it.
+                        guard.tunnel_manager = tunnel_manager_for_state;
                         // ZEB-217 Sub-C Phase 3 Task 9: store the adapter-
                         // request sender so create_community / Phase 4
                         // redeem_invite can dispatch on-demand
@@ -47479,6 +47566,7 @@ mod start_node_race_tests {
             dm_local_dsa_pubkey: None,
             dm_local_kem_pubkey: None,
             dm_pq_identity: None,
+            tunnel_manager: None,
             community_adapter_request_tx: None,
             transport_epoch_rx: None,
             voting_log_adapter_request_tx: None,
