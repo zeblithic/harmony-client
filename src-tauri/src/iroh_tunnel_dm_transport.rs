@@ -31,10 +31,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::dm_outbox::{build_dm_packet, DmTransport, TransportError};
+use crate::content_store::ContentStore;
+use crate::dm_outbox::{build_dm_packet, build_dm_packet_with_blob, DmTransport, TransportError};
 use crate::owner_state_crdt::OwnerState;
 use crate::owner_state_types::{DeviceIdentityHash, OutboxEntry, OwnerAddr};
 use crate::tunnel_manager::{node_id_from_dsa_pubkey, TunnelManager};
+
+/// ZEB-484: inline-blob ceiling on the ASSEMBLED `CidNotifyWithBlob` packet size.
+/// Comfortably below the tunnel frame cap (`DATA_MAX_MESSAGE = 2 MiB`,
+/// `tunnel_task.rs`): a full 1 MiB CAS book + storage envelope + the CidNotify +
+/// framing fit with ~0.5 MiB headroom, and a single book never exceeds it. Over
+/// this, `send` falls back to a bare `CidNotify` and the deposit rung carries it.
+pub(crate) const INLINE_BLOB_MAX: usize = 1_572_864; // 1.5 MiB
 
 /// Resolve a recipient owner's reachable per-device tunnel targets:
 /// `(NodeId = blake3(pq_dsa_pubkey), contact)` for each bound device that
@@ -108,6 +116,9 @@ pub struct IrohTunnelDmTransport {
     /// Our signing device hash (the single-device `sender_devices` + the
     /// `signing_device_hash` claim).
     our_signing_device_hash: DeviceIdentityHash,
+    /// ZEB-484: the local CAS, read on `send` to inline the encrypted DM blob
+    /// over the tunnel for live delivery (when it fits `INLINE_BLOB_MAX`).
+    cas: Arc<dyn ContentStore>,
 }
 
 impl IrohTunnelDmTransport {
@@ -117,6 +128,7 @@ impl IrohTunnelDmTransport {
         signing_key: Arc<ed25519_dalek::SigningKey>,
         self_owner: OwnerAddr,
         our_signing_device_hash: DeviceIdentityHash,
+        cas: Arc<dyn ContentStore>,
     ) -> Self {
         Self {
             mgr,
@@ -124,6 +136,7 @@ impl IrohTunnelDmTransport {
             signing_key,
             self_owner,
             our_signing_device_hash,
+            cas,
         }
     }
 
@@ -142,6 +155,36 @@ impl IrohTunnelDmTransport {
         let state = self.crdt_state.lock().await;
         resolve_owner_tunnel_targets(&state, recipient)
     }
+}
+
+/// ZEB-484: build the tunnel DM packet for one DM — `CidNotifyWithBlob` (inline
+/// blob) when the blob is in CAS and the assembled packet fits `INLINE_BLOB_MAX`,
+/// else the bare `CidNotify` (durability is the deposit rung's job either way).
+async fn build_tunnel_dm_packet(
+    cas: &Arc<dyn ContentStore>,
+    signed: &crate::dm_envelope::DmCidNotifySigned,
+    signing_key: &ed25519_dalek::SigningKey,
+    message_cid: crate::owner_state_types::ContentId,
+) -> Result<Vec<u8>, String> {
+    // ZEB-484 (Qodo): LOCAL-only read — the sender's own DM blob is always in
+    // local CAS, and a miss must fall back to a bare CidNotify rather than turn
+    // the send path into a blocking network fetch that leaks an encrypted DM CID
+    // onto the wire (`get` is `GetOrFetch` on the production store).
+    if let Ok(Some(blob)) = cas.get_local(&message_cid).await {
+        match build_dm_packet_with_blob(signed.clone(), signing_key, blob) {
+            Ok(packet) if packet.len() <= INLINE_BLOB_MAX => return Ok(packet),
+            Ok(_) => {
+                // Oversize for the frame budget — fall through to bare CidNotify.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ZEB-484: with-blob packet build failed; sending bare CidNotify"
+                );
+            }
+        }
+    }
+    build_dm_packet(signed.clone(), signing_key)
 }
 
 #[async_trait]
@@ -166,24 +209,20 @@ impl DmTransport for IrohTunnelDmTransport {
                 sender_devices: vec![self.our_signing_device_hash],
                 signing_device_hash: self.our_signing_device_hash,
             };
-            // Build ONCE; the same wire bytes go to every device (the recipient
-            // dedups across devices by CID anyway).
-            match build_dm_packet(signed, &self.signing_key) {
+            // ZEB-484: inline the encrypted blob when it fits; else bare CidNotify.
+            match build_tunnel_dm_packet(&self.cas, &signed, &self.signing_key, entry.message_cid)
+                .await
+            {
                 Ok(packet) => {
                     for (node_id, contact) in &targets {
-                        // Fire-and-forget liveness attempt: lazily dials/reuses
-                        // the per-device PQ tunnel. Never blocks on connect.
                         self.mgr.send_dm(*node_id, contact, packet.clone());
                     }
                 }
                 Err(e) => {
-                    // Packet build failure is local + permanent-ish, but we
-                    // still fall through to the deposit rung below (the deposit
-                    // path rebuilds its own packet), so just log.
                     tracing::warn!(
                         recipient = ?recipient,
                         error = %e,
-                        "ZEB-473: tunnel DM packet build failed; deposit rung still covers this DM"
+                        "ZEB-484: tunnel DM packet build failed; deposit rung still covers this DM"
                     );
                 }
             }
@@ -243,6 +282,7 @@ mod tests {
     fn make_transport(
         mgr: Arc<TunnelManager>,
         state: Arc<tokio::sync::Mutex<OwnerState>>,
+        cas: Arc<dyn crate::content_store::ContentStore>,
     ) -> IrohTunnelDmTransport {
         let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
         IrohTunnelDmTransport::new(
@@ -251,6 +291,7 @@ mod tests {
             signing_key,
             OwnerAddr([0xff; 16]),
             DeviceIdentityHash([0xaa; 16]),
+            cas,
         )
     }
 
@@ -288,7 +329,11 @@ mod tests {
         );
         let state = Arc::new(tokio::sync::Mutex::new(owner_state));
 
-        let transport = make_transport(Arc::clone(&mgr), state);
+        let transport = make_transport(
+            Arc::clone(&mgr),
+            state,
+            Arc::new(crate::content_store::InMemoryStub::default()),
+        );
 
         let space = SpaceId([0xcc; 16]);
         let cid = ContentId::from_bytes([0xee; 32]);
@@ -438,7 +483,11 @@ mod tests {
             },
         );
         let state = Arc::new(tokio::sync::Mutex::new(owner_state));
-        let transport = make_transport(Arc::clone(&mgr), state);
+        let transport = make_transport(
+            Arc::clone(&mgr),
+            state,
+            Arc::new(crate::content_store::InMemoryStub::default()),
+        );
 
         let entry = synthetic_outbox_entry(
             SpaceId([0xcc; 16]),
@@ -462,7 +511,11 @@ mod tests {
     async fn send_unknown_recipient_returns_transient() {
         let mgr = test_manager().await;
         let state = Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
-        let transport = make_transport(mgr, state);
+        let transport = make_transport(
+            mgr,
+            state,
+            Arc::new(crate::content_store::InMemoryStub::default()),
+        );
 
         let recipient = OwnerAddr([0x77; 16]);
         let entry = synthetic_outbox_entry(
@@ -476,5 +529,121 @@ mod tests {
             .await
             .expect_err("unknown recipient must return Transient");
         assert!(matches!(err, TransportError::Transient(_)));
+    }
+
+    /// ZEB-484: a recipient with a tunnel contact AND the blob in CAS → `send`
+    /// routes a `CidNotifyWithBlob` carrying that exact blob.
+    #[tokio::test]
+    async fn send_with_blob_in_cas_routes_cidnotify_with_blob() {
+        let mgr = test_manager().await;
+        let recipient = OwnerAddr([0x11; 16]);
+        let dsa_pubkey = vec![0x07u8; 1952];
+        let contact = DeviceTunnelContact {
+            iroh_node_id: [0x09; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: dsa_pubkey.clone(),
+            pq_kem_pubkey: vec![0x08u8; 1184],
+        };
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+        let mut owner_state = OwnerState::default();
+        owner_state.owner_device_cache.devices.insert(
+            recipient,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0x33; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+                device_tunnel_contacts: vec![Some(contact)],
+            },
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+        let cid = ContentId::from_bytes([0xee; 32]);
+        let blob = vec![0xCDu8; 2048];
+        let cas: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        cas.put(cid, blob.clone()).await.expect("seed blob in CAS");
+
+        let transport = make_transport(Arc::clone(&mgr), state, Arc::clone(&cas));
+        let entry = synthetic_outbox_entry(SpaceId([0xcc; 16]), cid, recipient);
+        let _ = transport
+            .send(&entry, recipient, Vec::new())
+            .await
+            .expect_err("always-deposit: send returns Transient");
+
+        let pending = mgr
+            .test_pending_packets(&expected_node_id)
+            .expect("a session was registered for the derived NodeId");
+        assert_eq!(pending.len(), 1);
+        match crate::dm_envelope::decode_packet(&pending[0]).expect("decode routed packet") {
+            crate::dm_envelope::DmPacket::CidNotifyWithBlob {
+                signed,
+                storage_blob,
+                ..
+            } => {
+                assert_eq!(signed.message_cid, cid, "carries the DM's message_cid");
+                assert_eq!(storage_blob, blob, "inlines the exact CAS blob");
+            }
+            other => panic!("expected CidNotifyWithBlob, got {other:?}"),
+        }
+    }
+
+    /// ZEB-484: a blob larger than the frame budget → `send` falls back to a bare
+    /// `CidNotify` (deposit rung carries durability).
+    #[tokio::test]
+    async fn send_oversize_blob_falls_back_to_bare_cidnotify() {
+        let mgr = test_manager().await;
+        let recipient = OwnerAddr([0x11; 16]);
+        let dsa_pubkey = vec![0x07u8; 1952];
+        let contact = DeviceTunnelContact {
+            iroh_node_id: [0x09; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: dsa_pubkey.clone(),
+            pq_kem_pubkey: vec![0x08u8; 1184],
+        };
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+        let mut owner_state = OwnerState::default();
+        owner_state.owner_device_cache.devices.insert(
+            recipient,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0x33; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+                device_tunnel_contacts: vec![Some(contact)],
+            },
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+        let cid = ContentId::from_bytes([0xee; 32]);
+        let blob = vec![0x00u8; INLINE_BLOB_MAX]; // assembled packet exceeds the ceiling
+        let cas: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        cas.put(cid, blob).await.expect("seed oversize blob");
+
+        let transport = make_transport(Arc::clone(&mgr), state, Arc::clone(&cas));
+        let entry = synthetic_outbox_entry(SpaceId([0xcc; 16]), cid, recipient);
+        let _ = transport
+            .send(&entry, recipient, Vec::new())
+            .await
+            .expect_err("Transient");
+
+        let pending = mgr
+            .test_pending_packets(&expected_node_id)
+            .expect("session registered");
+        assert_eq!(pending.len(), 1);
+        assert!(
+            matches!(
+                crate::dm_envelope::decode_packet(&pending[0]).unwrap(),
+                crate::dm_envelope::DmPacket::CidNotify { .. }
+            ),
+            "an oversize blob must fall back to a bare CidNotify"
+        );
     }
 }

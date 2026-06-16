@@ -342,6 +342,19 @@ pub(crate) fn build_dm_packet(
     crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
 }
 
+/// ZEB-484: build a `CidNotifyWithBlob` wire packet — the signed CidNotify plus
+/// the encrypted `storage_blob` inline. Parallel to `build_dm_packet`.
+pub(crate) fn build_dm_packet_with_blob(
+    signed: crate::dm_envelope::DmCidNotifySigned,
+    signing_key: &ed25519_dalek::SigningKey,
+    storage_blob: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let packet =
+        crate::dm_envelope::build_signed_cidnotify_with_blob(signed, signing_key, storage_blob)
+            .map_err(|e| format!("build_signed_cidnotify_with_blob: {e}"))?;
+    crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AttemptState {
     last_attempt_wall_ms: u64,
@@ -1481,6 +1494,17 @@ impl DmOutbox {
             crate::dm_envelope::DmPacket::CidNotify { .. } => {
                 tracing::warn!(
                     "handle_unicast received CidNotify; expected event_loop pre-decode to spawn handle_cidnotify_lifted instead. Dropping packet."
+                );
+                Ok(DrainOutcome::default())
+            }
+            // ZEB-484 Task 1: the wire variant + codec exist, but the receive
+            // path for the inline blob is wired by a LATER task. The live
+            // carrier is the tunnel ingest path (`ingest_dm_packet`); this
+            // dormant outbox dispatch never produces it, so drop+warn rather
+            // than mishandle.
+            crate::dm_envelope::DmPacket::CidNotifyWithBlob { .. } => {
+                tracing::warn!(
+                    "handle_unicast received CidNotifyWithBlob; inline-blob receive path is not wired on this dispatch. Dropping packet."
                 );
                 Ok(DrainOutcome::default())
             }
@@ -8298,6 +8322,7 @@ mod tests {
             Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])),
             alice,
             DeviceIdentityHash([0xaa; 16]),
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
         );
 
         // Tick 1 (t=10_000): first Transient → no prior AttemptState → no rung.

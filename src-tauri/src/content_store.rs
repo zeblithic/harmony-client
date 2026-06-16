@@ -63,6 +63,19 @@ pub trait ContentStore: Send + Sync {
     async fn put(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError>;
     async fn get(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError>;
 
+    /// Local-only read: returns bytes already present in the local cache, NEVER
+    /// triggering a network fetch. The default delegates to `get` (correct for
+    /// stores whose `get` is already local-only, e.g. `InMemoryStub`);
+    /// `RuntimeContentStore` overrides it with the local-cache-only
+    /// `CasOp::GetLocal`. Use this on latency/privacy-sensitive paths that must
+    /// NOT emit a network CID lookup on a local miss — e.g. the tunnel send rung
+    /// (ZEB-484): the sender's own DM blob is always local, and a miss must fall
+    /// back to a bare CidNotify rather than fetch (and leak) an encrypted DM CID
+    /// over the network.
+    async fn get_local(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        self.get(cid).await
+    }
+
     /// Like `put`, but also marks `cid` serveable to peers over CAS even though
     /// it carries the `encrypted` flag (ZEB-395 community-root sharing). The
     /// default impl is identical to `put`; only `RuntimeContentStore` registers
@@ -222,6 +235,25 @@ impl ContentStore for RuntimeContentStore {
             .map_err(|_| ContentStoreError::Io("event loop unavailable (reply)".into()))?
     }
 
+    async fn get_local(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        // ZEB-484: local-cache-only — NEVER a network fetch (unlike `get`'s
+        // `GetOrFetch`). `CasOp::GetLocal` replies the cached bytes (already
+        // integrity-checked at admit) or `None` on a miss; it never spawns a
+        // Zenoh GET, so a caller on the send path can't be turned into a
+        // blocking/leaky network lookup of an encrypted DM CID.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cas_op_tx
+            .send(CasOp::GetLocal {
+                cid: *cid,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ContentStoreError::Io("event loop unavailable (send)".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ContentStoreError::Io("event loop unavailable (reply)".into()))
+    }
+
     async fn put_serveable(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {
         // Admit first; only record as serveable after a successful put.
         self.put(cid, blob).await?;
@@ -263,6 +295,35 @@ mod tests {
     async fn get_missing_returns_none() {
         let store = InMemoryStub::default();
         assert!(store.get(&cid(99)).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_get_local_routes_getlocal_and_returns_cached_blob() {
+        // ZEB-484: RuntimeContentStore::get_local must send the local-cache-only
+        // `CasOp::GetLocal` (NEVER `GetOrFetch`) and return its reply. Simulate the
+        // event loop receiving exactly one GetLocal for the asked CID and replying
+        // with cached bytes; assert get_local plumbs them through.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CasOp>(4);
+        let store = RuntimeContentStore::new(tx, std::time::Duration::from_millis(500));
+        let want_cid = cid(0x7a);
+        let want_blob = vec![1u8, 2, 3, 4];
+
+        let blob_for_task = want_blob.clone();
+        let task = tokio::spawn(async move {
+            match rx.recv().await.expect("a CasOp was sent") {
+                CasOp::GetLocal { cid, reply } => {
+                    assert_eq!(cid, want_cid, "get_local must request the asked CID");
+                    reply
+                        .send(Some(blob_for_task))
+                        .expect("reply receiver alive");
+                }
+                other => panic!("get_local must send CasOp::GetLocal, got {other:?}"),
+            }
+        });
+
+        let got = store.get_local(&want_cid).await.expect("get_local ok");
+        assert_eq!(got, Some(want_blob), "get_local returns the GetLocal reply");
+        task.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
