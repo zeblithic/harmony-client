@@ -402,6 +402,11 @@ pub(crate) async fn ingest_dm_packet(
     // 1. Decode + dispatch on the DmPacket variant (ZEB-482). The tunnel
     //    carries a discriminated `DmPacket`; today only `Invite` (DM-Space
     //    bootstrap) and `CidNotify` (the encrypted-blob notification) ride it.
+    // ZEB-484: an inline blob (from a `CidNotifyWithBlob`) is carried out of the
+    // dispatch here and CAS-put AFTER Phase 2 admission (see the 2b block) so a
+    // rejected packet never causes a CAS write (Qodo). `None` for every other
+    // variant.
+    let mut inline_blob: Option<Vec<u8>> = None;
     let (signed, signature, signed_bytes) = match crate::dm_envelope::decode_packet(packet_bytes)
         .map_err(|e| format!("decode_packet: {e}"))?
     {
@@ -467,25 +472,11 @@ pub(crate) async fn ingest_dm_packet(
             storage_blob,
         } => {
             // ZEB-484 (Move 1c): the live tunnel carried the encrypted blob
-            // inline. CAS-put it FIRST under its content-addressed CID — the SAME
-            // `for_book` flags the butler sweeper uses (`cas_put`, this file) — so
-            // the Phase 3 fetch below hits local CAS instead of the (deliberately
-            // refusing) content-serve queryable. The CID is recomputed FROM the
-            // blob, so a blob that does NOT hash to the signed `message_cid` lands
-            // under a different key: Phase 3's `get(message_cid)` then misses and
-            // delivery FAILS CLOSED (Phase 3b re-checks the binding too).
-            let cid = harmony_content::cid::ContentId::for_book(
-                &storage_blob,
-                harmony_content::cid::ContentFlags {
-                    encrypted: true,
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| format!("CidNotifyWithBlob for_book: {e:?}"))?;
-            content_store
-                .put(cid, storage_blob)
-                .await
-                .map_err(|e| format!("CidNotifyWithBlob CAS put: {e:?}"))?;
+            // inline. Carry it past the dispatch; it is CAS-put AFTER Phase 2
+            // admission (block 2b) — never here, so a rejected/invalid packet
+            // cannot pollute the CAS (Qodo). The rest of the pipeline is the bare
+            // CidNotify path verbatim.
+            inline_blob = Some(storage_blob);
             (signed, signature, signed_bytes)
         }
     };
@@ -507,6 +498,31 @@ pub(crate) async fn ingest_dm_packet(
         .map_err(|e| format!("verify_cidnotify_admission: {e:?}"))?;
         resolved_owner
     };
+
+    // 2b. ZEB-484 (Move 1c): if the live tunnel carried the blob inline, CAS-put
+    //     it NOW — AFTER Phase 2 admission — so an invalid/rejected packet (bad
+    //     signature, non-member, unknown device) NEVER causes a CAS write (Qodo:
+    //     no cache pollution from unadmitted tunnel traffic). Bind the blob to the
+    //     signed `message_cid` by content-addressing BEFORE writing: a mismatch
+    //     fails closed with no write. Phase 3's `get(message_cid)` then hits this
+    //     local put, exactly like the butler/deposit path it mirrors.
+    if let Some(inline_blob) = inline_blob {
+        let inline_cid = harmony_content::cid::ContentId::for_book(
+            &inline_blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("CidNotifyWithBlob for_book: {e:?}"))?;
+        if inline_cid != signed.message_cid {
+            return Err("CidNotifyWithBlob: inline blob CID does not match message_cid".into());
+        }
+        content_store
+            .put(signed.message_cid, inline_blob)
+            .await
+            .map_err(|e| format!("CidNotifyWithBlob CAS put: {e:?}"))?;
+    }
 
     // 3. CAS fetch the storage blob by the packet's message_cid (the tunnel
     //    carries only the packet; the blob must already be locally available
@@ -1559,6 +1575,62 @@ mod tests {
                 .iter()
                 .any(|(n, _)| n == crate::dm_outbox::DM_RECEIVED_EVENT),
             "a CidNotifyWithBlob must emit dm-received"
+        );
+    }
+
+    /// ZEB-484 (Qodo security): a `CidNotifyWithBlob` whose sender is NOT admitted
+    /// (here: no Space exists → Phase-2 admission fails) must be rejected WITHOUT
+    /// writing the inline blob to CAS — otherwise invalid tunnel traffic could
+    /// pollute the local CAS with arbitrary blobs. The CAS-put happens only AFTER
+    /// admission (block 2b), so a fresh store stays empty on rejection.
+    #[tokio::test]
+    async fn ingest_dm_packet_cidnotify_with_blob_unadmitted_does_not_cas_put() {
+        let fx = build_dm_ingest_fixture(b"unadmitted-blob").await;
+        let blob = fx
+            .content_store
+            .get(&fx.message_cid)
+            .await
+            .unwrap()
+            .expect("fixture stored the encrypted blob");
+        let (signed, signature, signed_bytes) =
+            match crate::dm_envelope::decode_packet(&fx.packet).unwrap() {
+                crate::dm_envelope::DmPacket::CidNotify {
+                    signed,
+                    signature,
+                    signed_bytes,
+                } => (signed, signature, signed_bytes),
+                other => panic!("fixture packet must be a bare CidNotify, got {other:?}"),
+            };
+        let with_blob = crate::dm_envelope::DmPacket::CidNotifyWithBlob {
+            signed,
+            signature,
+            signed_bytes,
+            storage_blob: blob,
+        };
+        let wire = crate::dm_envelope::encode_packet(&with_blob).unwrap();
+
+        // FRESH state with NO Space → admission fails BEFORE the post-admission
+        // CAS-put. Fresh empty store so any write would be observable.
+        let empty_state =
+            std::sync::Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
+        let fresh_store: Arc<dyn crate::content_store::ContentStore> =
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+
+        let err = ingest_dm_packet(
+            &empty_state,
+            &fresh_store,
+            &fx.sink,
+            fx.bob,
+            &fx.bob_device_id,
+            [0u8; 32],
+            &wire,
+        )
+        .await
+        .expect_err("an unadmitted CidNotifyWithBlob must be rejected");
+        assert!(!err.is_empty());
+        assert!(
+            fresh_store.get(&fx.message_cid).await.unwrap().is_none(),
+            "a rejected (unadmitted) CidNotifyWithBlob must NOT write its blob to CAS"
         );
     }
 

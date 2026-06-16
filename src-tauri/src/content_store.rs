@@ -63,6 +63,19 @@ pub trait ContentStore: Send + Sync {
     async fn put(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError>;
     async fn get(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError>;
 
+    /// Local-only read: returns bytes already present in the local cache, NEVER
+    /// triggering a network fetch. The default delegates to `get` (correct for
+    /// stores whose `get` is already local-only, e.g. `InMemoryStub`);
+    /// `RuntimeContentStore` overrides it with the local-cache-only
+    /// `CasOp::GetLocal`. Use this on latency/privacy-sensitive paths that must
+    /// NOT emit a network CID lookup on a local miss — e.g. the tunnel send rung
+    /// (ZEB-484): the sender's own DM blob is always local, and a miss must fall
+    /// back to a bare CidNotify rather than fetch (and leak) an encrypted DM CID
+    /// over the network.
+    async fn get_local(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        self.get(cid).await
+    }
+
     /// Like `put`, but also marks `cid` serveable to peers over CAS even though
     /// it carries the `encrypted` flag (ZEB-395 community-root sharing). The
     /// default impl is identical to `put`; only `RuntimeContentStore` registers
@@ -220,6 +233,25 @@ impl ContentStore for RuntimeContentStore {
         reply_rx
             .await
             .map_err(|_| ContentStoreError::Io("event loop unavailable (reply)".into()))?
+    }
+
+    async fn get_local(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        // ZEB-484: local-cache-only — NEVER a network fetch (unlike `get`'s
+        // `GetOrFetch`). `CasOp::GetLocal` replies the cached bytes (already
+        // integrity-checked at admit) or `None` on a miss; it never spawns a
+        // Zenoh GET, so a caller on the send path can't be turned into a
+        // blocking/leaky network lookup of an encrypted DM CID.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cas_op_tx
+            .send(CasOp::GetLocal {
+                cid: *cid,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ContentStoreError::Io("event loop unavailable (send)".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ContentStoreError::Io("event loop unavailable (reply)".into()))
     }
 
     async fn put_serveable(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {

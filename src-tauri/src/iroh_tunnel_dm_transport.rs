@@ -166,7 +166,11 @@ async fn build_tunnel_dm_packet(
     signing_key: &ed25519_dalek::SigningKey,
     message_cid: crate::owner_state_types::ContentId,
 ) -> Result<Vec<u8>, String> {
-    if let Ok(Some(blob)) = cas.get(&message_cid).await {
+    // ZEB-484 (Qodo): LOCAL-only read — the sender's own DM blob is always in
+    // local CAS, and a miss must fall back to a bare CidNotify rather than turn
+    // the send path into a blocking network fetch that leaks an encrypted DM CID
+    // onto the wire (`get` is `GetOrFetch` on the production store).
+    if let Ok(Some(blob)) = cas.get_local(&message_cid).await {
         match build_dm_packet_with_blob(signed.clone(), signing_key, blob) {
             Ok(packet) if packet.len() <= INLINE_BLOB_MAX => return Ok(packet),
             Ok(_) => {

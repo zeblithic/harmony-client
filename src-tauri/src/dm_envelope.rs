@@ -581,7 +581,13 @@ fn decode_cidnotify_with_blob(rest: &[u8]) -> Result<DmPacket, DecodeError> {
             .try_into()
             .expect("split_at(4) yields exactly 4 bytes"),
     ) as usize;
-    if after_len.len() < body_len + 64 {
+    // Checked add: `body_len` is attacker-controlled (from the wire u32). On a
+    // 32-bit target `body_len + 64` could wrap and bypass the guard, panicking in
+    // `split_at` below. Parsing untrusted bytes must never panic. (Qodo)
+    let need = body_len
+        .checked_add(64)
+        .ok_or(DecodeError::TooShortForSignature)?;
+    if after_len.len() < need {
         return Err(DecodeError::TooShortForSignature);
     }
     let (body_bytes, after_body) = after_len.split_at(body_len);
@@ -1603,6 +1609,22 @@ mod tests {
     #[test]
     fn dm_packet_cidnotify_with_blob_truncated_rejected() {
         let err = decode_packet(&[0x04, 0x00, 0x00]).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::TooShortForSignature),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn dm_packet_cidnotify_with_blob_huge_len_rejected_without_panic() {
+        // A 0x04 packet claiming body_len = u32::MAX with only a few trailing
+        // bytes must be rejected GRACEFULLY — no panic, even where `body_len + 64`
+        // would overflow usize on a 32-bit target (Qodo: untrusted parsing must
+        // never panic; the decoder uses `checked_add`).
+        let mut wire = vec![0x04];
+        wire.extend_from_slice(&u32::MAX.to_be_bytes());
+        wire.extend_from_slice(&[0u8; 8]);
+        let err = decode_packet(&wire).unwrap_err();
         assert!(
             matches!(err, DecodeError::TooShortForSignature),
             "got {err:?}"
