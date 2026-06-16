@@ -1375,19 +1375,22 @@ impl DmOutbox {
     /// builds (lib.rs:10410), so a deposited copy bootstraps the same Space. It is
     /// NOT byte-identical to the tunnel invite: `sender_devices` is a singleton of
     /// this signing device (matching `build_cidnotify_packet_bytes`), not the
-    /// sender's full device list — benign, since the co-deposited CidNotify
-    /// already drives the recipient's OwnerDeviceCache to that singleton.
-    /// `Ok(None)` ONLY for a genuinely non-DM Space (no invite is meaningful —
-    /// the deposit proceeds with just the CidNotify). For a DM/GroupDm Space the
-    /// For a DM/GroupDm Space the invite IS load-bearing for offline recovery,
-    /// so an absent `content_key` or a sign/encode failure returns `Err`: the
-    /// caller then SKIPS the deposit candidate and leaves the entry pending for
-    /// retry (CodeRabbit) rather than deposit a CidNotify an offline recipient
-    /// would recover into `SpaceNotFound`. `Ok(None)` means "no invite is
-    /// meaningful, deposit the CidNotify alone": a genuinely non-DM Space, or a
-    /// missing Space record (a defensive path — a real DM outbox entry always has
-    /// its Space; we can't tell a vanished record is a DM, so we don't fail the
-    /// deposit on it).
+    /// sender's full device list — benign, because the deposit-recover path
+    /// bootstraps ONLY the Space (it never refreshes the OwnerDeviceCache from a
+    /// deposited invite, see `apply_invite`'s `refresh_owner_device_cache`), and
+    /// the recipient already knows the sender's devices from the friend handshake.
+    ///
+    /// `Ok(Some)` for a healthy DM/GroupDm Space. `Ok(None)` for a genuinely
+    /// non-DM Space, OR a missing Space record — deposit the CidNotify alone. A
+    /// missing record is unreachable for a real DM outbox entry (the DM Space is
+    /// created and fleet-replicated alongside the entry, and "leave DM" sets
+    /// `left_at` rather than removing the record), and we can't classify a vanished
+    /// record as a DM, so we don't fail closed on it. For a DM/GroupDm Space that
+    /// EXISTS, the invite IS load-bearing for offline recovery, so an absent
+    /// `content_key` or a sign/encode failure returns `Err`: the caller then SKIPS
+    /// the deposit candidate and leaves the entry pending for retry (CodeRabbit)
+    /// rather than deposit a CidNotify an offline recipient would recover into
+    /// `SpaceNotFound`.
     fn build_invite_packet_bytes(
         &self,
         state: &OwnerState,
@@ -1644,6 +1647,8 @@ impl DmOutbox {
             // existing (uncalled) behavior. The live tunnel ingest path
             // (`ingest_dm_packet`) passes `Some(owner)`.
             None,
+            // ZEB-483: dormant authenticated path — refresh the cache as before.
+            true,
         )
     }
 
@@ -2057,6 +2062,13 @@ pub(crate) fn apply_invite(
     // `handle_invite` method has no transport-peer context and passes `None`,
     // preserving its existing (uncalled) behavior.
     expected_inviter: Option<OwnerAddr>,
+    // ZEB-483 (CodeRabbit): whether to refresh the OwnerDeviceCache from the
+    // invite. `true` for the authenticated tunnel / dormant path (it legitimately
+    // learns the inviter's signing device). `false` for the deposit-recover path,
+    // which has already verified the sender against the pristine cache and must
+    // NOT let a sender-claimed device list regress that verified state — it
+    // bootstraps ONLY the Space.
+    refresh_owner_device_cache: bool,
 ) -> Result<DrainOutcome, DmReceiveError> {
     // SECURITY (CodeRabbit F1): bind the payload-controlled `signed.inviter` to
     // the authenticated tunnel peer BEFORE touching any trust state (cache or
@@ -2092,38 +2104,10 @@ pub(crate) fn apply_invite(
         signed.signing_device_hash,
     )?;
 
-    // Phase 3b auto-accept: write Space + cache + cached identity pub.
+    // Phase 3b auto-accept: write the Space, and — on the authenticated
+    // tunnel/dormant path only — refresh the OwnerDeviceCache.
     // (Phase 4 will replace this with a stage-pending-invite + UI prompt
     // path; follow-up ticket filed at PR-creation time per spec.)
-
-    // Build a parallel pubs vec: Some(inviter_identity_pub) at the signer's
-    // index, None everywhere else. The receiver knows the inviter's
-    // identity pub for the device that signed THIS invite, but has no pubs
-    // for the inviter's other devices yet — they remain pre-bootstrap
-    // until the next invite-equivalent flow.
-    let mut device_identity_pubs: Vec<Option<[u8; 64]>> = vec![None; signed.sender_devices.len()];
-    let signer_idx = signed
-        .sender_devices
-        .iter()
-        .position(|d| *d == signed.signing_device_hash)
-        .expect("sanity gate 2 already verified signing_device_hash ∈ sender_devices");
-    device_identity_pubs[signer_idx] = Some(signed.inviter_identity_pub);
-
-    // SECURITY: the OwnerDeviceCache LWW HLC must record when WE
-    // learned about these devices, NOT the timestamp the inviter
-    // claims they sent the invite. Using `signed.created_at` here
-    // would let an attacker forge a far-future HLC (e.g.,
-    // wall_ms = u64::MAX / 2) on a single malicious invite,
-    // pinning the local cache and rejecting every legitimate
-    // future update from the same owner as `StaleHlc` — a
-    // denial-of-updates attack. Mirror the pattern that
-    // `handle_cidnotify_lifted` Phase A already uses (local wall clock
-    // + our device_id).
-    let learned_at = Hlc {
-        wall_ms: wall_now_ms,
-        logical: 0,
-        device_id: device_id.to_string(),
-    };
 
     // Build the Space from the invite. Mirror what add_space's DM/group-DM
     // handling will produce (Phase 4 will produce these on the SEND side
@@ -2160,23 +2144,64 @@ pub(crate) fn apply_invite(
         return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
     }
 
-    // SECURITY (CodeRabbit F2): only write the OwnerDeviceCache AFTER the Space
-    // apply succeeds. A malformed/rejected invite must not alter trust state, so
-    // the cache mutation is sequenced behind the Space's invariant check. The
-    // cache update does NOT feed the Space apply (they are independent), so this
-    // reordering is purely a "commit cache last" guard with no behavioral change
-    // on the happy path.
-    let cache_outcome = state.apply_owner_device_update(
-        signed.inviter,
-        signed.sender_devices,
-        device_identity_pubs,
-        // ZEB-473: no tunnel contacts on this DM-receive cache refresh
-        // (populated only on the friend handshake, Task 5).
-        Vec::new(),
-        learned_at,
-    );
-    if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
-        return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
+    // ZEB-483 (CodeRabbit): the OwnerDeviceCache refresh is gated. The
+    // authenticated tunnel / dormant path (`refresh_owner_device_cache = true`)
+    // legitimately learns the inviter's signing device from the invite. The
+    // deposit-recover path passes `false`: it has ALREADY verified the sender
+    // against the PRISTINE cache (which is authoritative — see
+    // `verify_cidnotify_sender_binding`), and applying the invite's singleton,
+    // sender-claimed `sender_devices` at a fresh local HLC would let a stale or
+    // replayed deposited invite SHRINK / regress that verified device set
+    // (`apply_owner_device_update` is LWW-by-`learned_at` and REPLACES, not
+    // unions, the device list). Deposit recovery therefore bootstraps ONLY the
+    // Space; the verified CidNotify path owns all cache mutation.
+    if refresh_owner_device_cache {
+        // Build a parallel pubs vec: Some(inviter_identity_pub) at the signer's
+        // index, None everywhere else. The receiver knows the inviter's
+        // identity pub for the device that signed THIS invite, but has no pubs
+        // for the inviter's other devices yet — they remain pre-bootstrap
+        // until the next invite-equivalent flow.
+        let mut device_identity_pubs: Vec<Option<[u8; 64]>> =
+            vec![None; signed.sender_devices.len()];
+        let signer_idx = signed
+            .sender_devices
+            .iter()
+            .position(|d| *d == signed.signing_device_hash)
+            .expect("sanity gate 2 already verified signing_device_hash ∈ sender_devices");
+        device_identity_pubs[signer_idx] = Some(signed.inviter_identity_pub);
+
+        // SECURITY: the OwnerDeviceCache LWW HLC must record when WE
+        // learned about these devices, NOT the timestamp the inviter
+        // claims they sent the invite. Using `signed.created_at` here
+        // would let an attacker forge a far-future HLC (e.g.,
+        // wall_ms = u64::MAX / 2) on a single malicious invite,
+        // pinning the local cache and rejecting every legitimate
+        // future update from the same owner as `StaleHlc` — a
+        // denial-of-updates attack. Mirror the pattern that
+        // `handle_cidnotify_lifted` Phase A already uses (local wall clock
+        // + our device_id).
+        let learned_at = Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        };
+
+        // SECURITY (CodeRabbit F2): only write the OwnerDeviceCache AFTER the
+        // Space apply succeeds (above). A malformed/rejected invite must not
+        // alter trust state, so the cache mutation is sequenced behind the
+        // Space's invariant check.
+        let cache_outcome = state.apply_owner_device_update(
+            signed.inviter,
+            signed.sender_devices,
+            device_identity_pubs,
+            // ZEB-473: no tunnel contacts on this DM-receive cache refresh
+            // (populated only on the friend handshake, Task 5).
+            Vec::new(),
+            learned_at,
+        );
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
+            return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
+        }
     }
 
     Ok(DrainOutcome::default())
@@ -2248,6 +2273,10 @@ pub(crate) fn apply_deposited_invite(
         &signed_bytes,
         wall_now_ms,
         Some(expected_inviter),
+        // ZEB-483 (CodeRabbit): deposit-recover bootstraps ONLY the Space. The
+        // sender was already verified against the pristine cache, so this invite
+        // must NOT mutate authenticated device-cache state.
+        false,
     )
     .map(|_| ())
     .map_err(|e| format!("apply_invite: {e:?}"))
@@ -3999,6 +4028,7 @@ mod tests {
             &signed_bytes,
             20_000,
             Some(o.self_owner), // expected inviter
+            true,               // full apply (Space + cache) on a fresh recipient
         );
         assert!(
             outcome.is_ok(),
@@ -5649,6 +5679,7 @@ mod tests {
             &body_bytes,
             200,
             None,
+            true, // F2 guard: cache write is sequenced after the Space apply (which rejects first)
         )
         .unwrap_err();
         assert!(

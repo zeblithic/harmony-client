@@ -451,6 +451,8 @@ pub(crate) async fn ingest_dm_packet(
                 &signed_bytes,
                 now_ms,
                 Some(expected_inviter),
+                // ZEB-483: authenticated tunnel path — refresh the cache.
+                true,
             )
             .map_err(|e| format!("apply_invite: {e:?}"))?;
             return Ok(false);

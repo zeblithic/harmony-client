@@ -83,10 +83,15 @@ impl DmInboxDoc {
                     // retry-timing skew. Promote `None → Some` so bootstrap
                     // bytes are never lost, and flag `changed` so the promotion
                     // nudges ingestion (an entry that previously rejected with
-                    // `SpaceNotFound` can now bootstrap its Space). A genuine
-                    // `Some ≠ Some` conflict is impossible on a correct sender
-                    // (the invite is a deterministic rebuild of the same Space
-                    // record) — keep the local copy and warn rather than churn.
+                    // `SpaceNotFound` can now bootstrap its Space). A `Some ≠
+                    // Some` divergence is not expected in the common case (the
+                    // invite is a deterministic rebuild of a stable Space
+                    // record), but it CAN arise — e.g. a re-deposit after a
+                    // content-key rotation or member change, or a multi-device
+                    // sender signing the rebuilt invite with different keys. Both
+                    // copies bootstrap the same Space, so keep the local one
+                    // (first-writer-wins, consistent with the deposit-metadata
+                    // rule below) and warn rather than churn.
                     let mut invite_promoted = false;
                     match (&l.invite_packet, &r.invite_packet) {
                         (None, Some(inv)) => {
