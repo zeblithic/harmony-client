@@ -129,10 +129,8 @@ impl TunnelManager {
     /// Send (or queue) a sealed+signed DM packet to `peer_node_id` over a PQ
     /// tunnel, lazily dialing if no session exists.
     ///
-    /// `#[allow(dead_code)]` until ZEB-473 Task 8 wires the `DmTransport`
-    /// consumer; the dial machinery + collision dedup it exercises is fully
-    /// implemented and unit-tested now.
-    #[allow(dead_code)] // ZEB-473 Task 8 wires this (IrohTunnelDmTransport -> send_dm)
+    /// ZEB-473 Task 8: consumed by `IrohTunnelDmTransport` (the live DM
+    /// carrier) — one call per recipient device with a `DeviceTunnelContact`.
     pub fn send_dm(
         self: &Arc<Self>,
         peer_node_id: [u8; 32],
@@ -372,6 +370,20 @@ impl TunnelManager {
         sessions
             .get(peer_node_id)
             .map(|h| (h.state, h.role, h.pending.len()))
+    }
+
+    /// Test-only: snapshot the buffered (pending) DM packets queued for
+    /// `peer_node_id`. Returns `None` when no session is registered. Used by
+    /// the cross-module `IrohTunnelDmTransport` unit test to assert that
+    /// `send_dm` routed a built packet to the right NodeId (a fresh `send_dm`
+    /// to an unknown peer inserts a `Dialing` handle and buffers the packet
+    /// in `pending` — the background dial to the test contact never connects).
+    #[cfg(test)]
+    pub(crate) fn test_pending_packets(&self, peer_node_id: &[u8; 32]) -> Option<Vec<Vec<u8>>> {
+        let sessions = self.sessions.lock().expect("poisoned");
+        sessions
+            .get(peer_node_id)
+            .map(|h| h.pending.iter().cloned().collect())
     }
 
     /// Test-only: send a DM packet over the live handle registered for

@@ -257,10 +257,7 @@ impl DmTransport for RuntimeUnicastTransport {
             sender_devices: vec![self.our_signing_device_hash],
             signing_device_hash: self.our_signing_device_hash,
         };
-        let packet = crate::dm_envelope::build_signed_cidnotify(signed, &self.signing_key)
-            .map_err(|e| TransportError::Permanent(format!("build_signed_cidnotify: {e}")))?;
-        let wire = crate::dm_envelope::encode_packet(&packet)
-            .map_err(|e| TransportError::Permanent(format!("encode_packet: {e}")))?;
+        let wire = build_dm_packet(signed, &self.signing_key).map_err(TransportError::Permanent)?;
 
         for destination_hash in destinations {
             // Use try_send (not send().await) because this transport runs
@@ -321,6 +318,28 @@ impl DmTransport for DepositOnlyDmTransport {
                 .to_string(),
         ))
     }
+}
+
+/// Build the sealed+signed DM wire bytes for a `DmCidNotifySigned` —
+/// `build_signed_cidnotify` (sign with the Reticulum device signing key)
+/// → `encode_packet` (canonical-CBOR framing). ZEB-473 Task 8 factored this
+/// out of the deposit path (`DmOutbox::build_cidnotify_packet_bytes`) so the
+/// live tunnel carrier (`IrohTunnelDmTransport`) produces byte-identical
+/// packets — the recipient's verify/decrypt/ingest pipeline sees exactly
+/// what a deposit arrival would carry, and CRDT-inbox dedup collapses the
+/// deposit copy with the tunnel copy.
+///
+/// Encode is effectively infallible (fixed-shape struct over canonical CBOR),
+/// but both inner calls are fallible, so this returns `Result<_, String>`
+/// (matching the deposit path's existing error propagation) rather than
+/// panicking.
+pub(crate) fn build_dm_packet(
+    signed: crate::dm_envelope::DmCidNotifySigned,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<Vec<u8>, String> {
+    let packet = crate::dm_envelope::build_signed_cidnotify(signed, signing_key)
+        .map_err(|e| format!("build_signed_cidnotify: {e}"))?;
+    crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1334,9 +1353,7 @@ impl DmOutbox {
             sender_devices: vec![self.our_signing_device_hash],
             signing_device_hash: self.our_signing_device_hash,
         };
-        let packet = crate::dm_envelope::build_signed_cidnotify(signed, &self.signing_key)
-            .map_err(|e| format!("build_signed_cidnotify: {e}"))?;
-        crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
+        build_dm_packet(signed, &self.signing_key)
     }
 
     /// Build + push one butler-deposit candidate for `(entry_id,
@@ -8043,6 +8060,79 @@ mod tests {
             matches!(stored.delivery_status, DeliveryStatus::Complete),
             "sole recipient acked via butler -> Complete"
         );
+    }
+
+    /// ZEB-473 Task 8 — always-deposit invariant for the LIVE tunnel carrier:
+    /// with `IrohTunnelDmTransport` installed (replacing the deposit-only
+    /// interim) and a butler deposit client acking, a DM STILL routes through
+    /// the deposit rung and delivers — no durability regression. The tunnel
+    /// transport returns the SAME `Transient` contract, so the rung fires on
+    /// the second drain pass exactly as before. (Here the transport's own
+    /// resolution cache is empty, so it routes nothing to the tunnel — the
+    /// point is that the deposit rung fires regardless of tunnel outcome.)
+    #[tokio::test]
+    async fn tunnel_transport_still_routes_dm_to_deposit_rung_and_delivers_on_ack() {
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        let entry_id = entry.id;
+        let space_id = SpaceId([1u8; 16]);
+        let message_cid = ContentId::from_bytes([3u8; 32]);
+
+        let mut state = OwnerState::default();
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = make_outbox_synthetic("dev", alice);
+        let mock = MockDepositClient::returning(crate::butler_deposit::DepositRungOutcome::Acked);
+        o.set_butler_deposit_client(mock.clone());
+
+        // Build the live tunnel transport over a real loopback iroh endpoint.
+        let endpoint = {
+            let sk = iroh::SecretKey::generate();
+            crate::iroh_endpoint::IrohEndpoint::new_with_secret(sk)
+                .await
+                .expect("bind loopback iroh endpoint")
+        };
+        let local_pq = Arc::new(harmony_identity::PqPrivateIdentity::generate(
+            &mut rand::rngs::OsRng,
+        ));
+        let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
+        let mgr = Arc::new(crate::tunnel_manager::TunnelManager::new(
+            endpoint, local_pq, ingest_tx,
+        ));
+        let transport = crate::iroh_tunnel_dm_transport::IrohTunnelDmTransport::new(
+            mgr,
+            Arc::new(tokio::sync::Mutex::new(OwnerState::default())),
+            Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])),
+            alice,
+            DeviceIdentityHash([0xaa; 16]),
+        );
+
+        // Tick 1 (t=10_000): first Transient → no prior AttemptState → no rung.
+        let outcome1 = o.drain(&mut state, &transport, 10_000).await;
+        assert!(
+            mock.calls().is_empty(),
+            "first transient must not fire deposit rung (no prior AttemptState)"
+        );
+        assert!(outcome1.newly_delivered.is_empty());
+
+        // Tick 2 (backoff window elapsed): second Transient → rung fires → ack.
+        let outcome2 = o.drain(&mut state, &transport, 15_000).await;
+        assert_eq!(
+            mock.calls().len(),
+            1,
+            "deposit rung must fire exactly once on tick 2 even with the live tunnel transport"
+        );
+        assert_eq!(mock.calls()[0].entry_id, entry_id);
+        assert_eq!(mock.calls()[0].recipient_owner, bob);
+        assert_eq!(
+            outcome2.newly_delivered,
+            vec![(space_id, message_cid, bob)],
+            "butler ack must surface (no durability regression from the tunnel carrier)"
+        );
+        let stored = state.outbox.get(&entry_id).expect("entry still present");
+        assert!(stored.delivered_to.contains(&bob), "bob marked delivered");
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
     }
 
     /// With `DepositOnlyDmTransport` and NO deposit client installed, the

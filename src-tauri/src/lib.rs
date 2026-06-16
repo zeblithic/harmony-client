@@ -180,6 +180,7 @@ pub mod iroh_friend_acceptor;
 pub mod iroh_invite_acceptor;
 pub mod iroh_pex_acceptor;
 pub mod iroh_tunnel_acceptor;
+pub mod iroh_tunnel_dm_transport;
 pub mod library_directory;
 pub mod mail;
 pub mod mail_sync;
@@ -3846,13 +3847,17 @@ pub async fn start_node_inner(
                             own_enrollment_cert,
                         ),
                     ));
-                    // ZEB-474 (Move 2): the Reticulum unicast carrier is
-                    // removed. DM delivery is deposit-only in the interim —
-                    // DepositOnlyDmTransport::send signals Transient, which
-                    // steers every DM into the outbox's butler/community-relay
-                    // deposit rung (carried to the recipient over iroh).
-                    // Move 1a (ZEB-473) swaps in IrohTunnelDmTransport here.
-                    let transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
+                    // ZEB-474 (Move 2) → ZEB-473 (Move 1a): the deposit-only
+                    // interim default. `DepositOnlyDmTransport::send` signals
+                    // Transient, steering every DM into the outbox's
+                    // butler/community-relay deposit rung. This is REPLACED
+                    // below (just before the NodeState lift-out, once the
+                    // `TunnelManager` exists) with `IrohTunnelDmTransport` when
+                    // the iroh endpoint bound — but kept as the fallback when
+                    // there is no tunnel transport this session, in which case
+                    // DMs remain deposit-only exactly as before. Both return
+                    // Transient → the always-deposit invariant holds either way.
+                    let mut transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
                         std::sync::Arc::new(crate::dm_outbox::DepositOnlyDmTransport);
 
                     let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
@@ -7489,6 +7494,30 @@ pub async fn start_node_inner(
                         outbox.lock().await.set_outhold(
                             std::sync::Arc::clone(&dm_outhold_doc),
                             std::sync::Arc::new(move || outhold_engine.notify_dirty()),
+                        );
+                    }
+
+                    // ── ZEB-473 (DM-over-iroh, Move 1a) Task 8: swap the
+                    //    deposit-only default for the live PQ-tunnel carrier
+                    //    once the `TunnelManager` exists (it's built in the
+                    //    iroh-endpoint-gated acceptor-install block above). When
+                    //    the iroh endpoint did NOT bind this session,
+                    //    `tunnel_manager_for_state` is None and `transport`
+                    //    stays `DepositOnlyDmTransport` → DMs remain
+                    //    deposit-only, exactly the same gate the butler rung
+                    //    uses. Both transports return Transient, so the
+                    //    always-deposit invariant holds in either branch — the
+                    //    tunnel is purely a parallel liveness attempt layered on
+                    //    top of the unchanged deposit rung (spec §5.7).
+                    if let Some(tunnel_mgr) = tunnel_manager_for_state.as_ref() {
+                        transport = std::sync::Arc::new(
+                            crate::iroh_tunnel_dm_transport::IrohTunnelDmTransport::new(
+                                std::sync::Arc::clone(tunnel_mgr),
+                                std::sync::Arc::clone(&crdt_state),
+                                signing_key_arc.clone(),
+                                self_owner,
+                                our_signing_device_hash,
+                            ),
                         );
                     }
 
