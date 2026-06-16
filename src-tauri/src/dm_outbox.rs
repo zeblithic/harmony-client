@@ -1369,6 +1369,40 @@ impl DmOutbox {
         build_dm_packet(signed, &self.signing_key)
     }
 
+    /// ZEB-483: rebuild + sign the DmInvite wire bytes for a DM-Space deposit —
+    /// the SAME `DmInviteSigned` `add_space_dm_inner` builds for the tunnel
+    /// carrier (lib.rs:10410), reconstructed from the persisted `Space` record so
+    /// a deposited invite bootstraps the Space exactly like a tunnel arrival.
+    /// Returns `None` for non-DM Spaces, a missing Space record, or a Space with
+    /// no content_key (the CidNotify still deposits without it).
+    fn build_invite_packet_bytes(&self, state: &OwnerState, space_id: &SpaceId) -> Option<Vec<u8>> {
+        let space = state.spaces.get(space_id)?;
+        if !matches!(space.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+            return None;
+        }
+        let content_key = space.content_key.clone()?;
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id: space.id,
+            kind: space.kind,
+            members: space.members.clone(),
+            inviter: self.self_owner,
+            content_key,
+            sender_devices: vec![self.our_signing_device_hash],
+            created_at: space.created_at.clone(),
+            signing_device_hash: self.our_signing_device_hash,
+            inviter_identity_pub: self.private_identity.public_identity().to_public_bytes(),
+        };
+        match crate::dm_envelope::build_signed_invite(signed, &self.signing_key)
+            .and_then(|p| crate::dm_envelope::encode_packet(&p))
+        {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!(error = %e, space_id = ?space_id, "ZEB-483: invite rebuild failed; depositing CidNotify without invite");
+                None
+            }
+        }
+    }
+
     /// Build + push one butler-deposit candidate for `(entry_id,
     /// recipient)` — shared by `drain_phase_c`'s Err-arm transient-failure
     /// rung (P1 Task 8) and its Ok-arm sent-but-never-acked rung (P2
@@ -1394,7 +1428,7 @@ impl DmOutbox {
                 space_id: entry.space_id,
                 message_cid: entry.message_cid,
                 cidnotify_packet,
-                invite_packet: None,
+                invite_packet: self.build_invite_packet_bytes(state, &entry.space_id),
                 now_ms,
             }),
             Err(err) => tracing::warn!(
@@ -3764,6 +3798,98 @@ mod tests {
             mock.calls().len(),
             1,
             "deposit must be attempted at most once per backoff window"
+        );
+    }
+
+    /// ZEB-483: a DM-space deposit request carries a piggybacked signed
+    /// DmInvite that a FRESH recipient state can apply (signature + admission
+    /// gates pass) to bootstrap the DM Space from the deposit rung.
+    #[tokio::test]
+    async fn deposit_candidate_attaches_signed_invite_for_dm_space() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Failed("butlers unreachable".into()));
+        // deposit_rung_fixture installs a DM Space for the entry; ensure it has
+        // a content_key + both members so the invite rebuild has its inputs.
+        // The entry's space_id is SpaceId([1u8; 16]) (entry_with_age), so the
+        // DM space must share that id.
+        let space_id = SpaceId([1u8; 16]);
+        install_space(&mut state, make_dm_space(1, vec![o.self_owner, bob]));
+
+        // Drive two transient failures to trip the deposit rung (the first never
+        // deposits, the second does — matches the existing rung tests).
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+            .await;
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+            .await;
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1, "deposit rung fires once");
+        let invite_bytes = calls[0]
+            .invite_packet
+            .as_ref()
+            .expect("DM-space deposit must carry a piggybacked invite");
+
+        // The invite decodes to a DmPacket::Invite for the same Space, inviter == sender.
+        let packet = crate::dm_envelope::decode_packet(invite_bytes).expect("decode invite");
+        let crate::dm_envelope::DmPacket::Invite {
+            signed,
+            signature,
+            signed_bytes,
+        } = packet
+        else {
+            panic!("expected Invite");
+        };
+        assert_eq!(signed.space_id, space_id);
+        assert_eq!(signed.inviter, o.self_owner);
+        assert!(signed.members.contains(&o.self_owner) && signed.members.contains(&bob));
+
+        // And a FRESH recipient state applies it (signature + admission gates pass).
+        let mut rx = OwnerState::default();
+        let outcome = crate::dm_outbox::apply_invite(
+            &mut rx,
+            bob,       // recipient self
+            "bob-dev", // recipient device id
+            signed,
+            signature,
+            &signed_bytes,
+            20_000,
+            Some(o.self_owner), // expected inviter
+        );
+        assert!(
+            outcome.is_ok(),
+            "rebuilt invite must apply on a fresh recipient: {outcome:?}"
+        );
+        assert!(
+            rx.spaces.contains_key(&space_id),
+            "Space bootstrapped from the deposited invite"
+        );
+    }
+
+    /// ZEB-483: a non-DM (Community) space yields no piggybacked invite.
+    #[tokio::test]
+    async fn deposit_candidate_omits_invite_for_non_dm_space() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Failed("x".into()));
+        // Replace the space with a community (non-DM) space sharing the entry's
+        // id. Insert directly into `state.spaces` rather than via `install_space`
+        // — a Community space requires the full epoch/admin invariant set that
+        // `apply_space_with_canonicalization` validates on insert, none of which
+        // matters here: this test only exercises `build_invite_packet_bytes`'s
+        // `SpaceKind` guard, which short-circuits before reading any other field.
+        let mut community = make_dm_space(1, vec![o.self_owner, bob]);
+        community.kind = SpaceKind::Community;
+        community.content_key = None;
+        state.spaces.insert(community.id, community);
+
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+            .await;
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+            .await;
+
+        assert_eq!(
+            mock.calls()[0].invite_packet,
+            None,
+            "non-DM deposit carries no invite"
         );
     }
 
