@@ -460,14 +460,33 @@ pub(crate) async fn ingest_dm_packet(
                 "tunnel DM packet is an Ack (not handled on the tunnel ingest path)".into(),
             );
         }
-        // ZEB-484 Task 1: the wire variant + codec exist, but the receive path
-        // that handles the inline blob is wired by a LATER task. Until then,
-        // reject it explicitly (the drain logs + drops) rather than silently
-        // mishandle it — never panic the drain.
-        crate::dm_envelope::DmPacket::CidNotifyWithBlob { .. } => {
-            return Err(
-                "tunnel DM packet is a CidNotifyWithBlob (inline-blob ingest not yet wired)".into(),
-            );
+        crate::dm_envelope::DmPacket::CidNotifyWithBlob {
+            signed,
+            signature,
+            signed_bytes,
+            storage_blob,
+        } => {
+            // ZEB-484 (Move 1c): the live tunnel carried the encrypted blob
+            // inline. CAS-put it FIRST under its content-addressed CID — the SAME
+            // `for_book` flags the butler sweeper uses (`cas_put`, this file) — so
+            // the Phase 3 fetch below hits local CAS instead of the (deliberately
+            // refusing) content-serve queryable. The CID is recomputed FROM the
+            // blob, so a blob that does NOT hash to the signed `message_cid` lands
+            // under a different key: Phase 3's `get(message_cid)` then misses and
+            // delivery FAILS CLOSED (Phase 3b re-checks the binding too).
+            let cid = harmony_content::cid::ContentId::for_book(
+                &storage_blob,
+                harmony_content::cid::ContentFlags {
+                    encrypted: true,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| format!("CidNotifyWithBlob for_book: {e:?}"))?;
+            content_store
+                .put(cid, storage_blob)
+                .await
+                .map_err(|e| format!("CidNotifyWithBlob CAS put: {e:?}"))?;
+            (signed, signature, signed_bytes)
         }
     };
 
@@ -1476,6 +1495,70 @@ mod tests {
                 .iter()
                 .all(|(n, _)| n != crate::dm_outbox::DM_RECEIVED_EVENT),
             "an invite must not emit dm-received"
+        );
+    }
+
+    /// ZEB-484: a `CidNotifyWithBlob` delivers the DM live — the inline blob is
+    /// CAS-put (no zenoh content query) and `dm-received` fires. Proven by using
+    /// a FRESH (empty) content store: if the inline path didn't CAS-put the blob,
+    /// Phase 3's `get(message_cid)` would miss and no `dm-received` would emit.
+    #[tokio::test]
+    async fn ingest_dm_packet_cidnotify_with_blob_delivers_live() {
+        let fx = build_dm_ingest_fixture(b"hello-over-tunnel").await;
+
+        let blob = fx
+            .content_store
+            .get(&fx.message_cid)
+            .await
+            .unwrap()
+            .expect("fixture stored the encrypted blob");
+        let (signed, signature, signed_bytes) =
+            match crate::dm_envelope::decode_packet(&fx.packet).unwrap() {
+                crate::dm_envelope::DmPacket::CidNotify {
+                    signed,
+                    signature,
+                    signed_bytes,
+                } => (signed, signature, signed_bytes),
+                other => panic!("fixture packet must be a bare CidNotify, got {other:?}"),
+            };
+        let with_blob = crate::dm_envelope::DmPacket::CidNotifyWithBlob {
+            signed,
+            signature,
+            signed_bytes,
+            storage_blob: blob,
+        };
+        let wire = crate::dm_envelope::encode_packet(&with_blob).unwrap();
+
+        let fresh_store: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        assert!(
+            fresh_store.get(&fx.message_cid).await.unwrap().is_none(),
+            "precondition: the fresh store does not yet hold the blob"
+        );
+
+        let applied = ingest_dm_packet(
+            &fx.crdt_state,
+            &fresh_store,
+            &fx.sink,
+            fx.bob,
+            &fx.bob_device_id,
+            [0u8; 32],
+            &wire,
+        )
+        .await
+        .expect("a CidNotifyWithBlob from an admitted sender must deliver");
+        assert!(applied, "a delivered DM emits dm-received (Ok(true))");
+
+        assert!(
+            fresh_store.get(&fx.message_cid).await.unwrap().is_some(),
+            "the inline blob must be CAS-put so the recipient can read it"
+        );
+        assert!(
+            fx.sink_handle
+                .frames()
+                .iter()
+                .any(|(n, _)| n == crate::dm_outbox::DM_RECEIVED_EVENT),
+            "a CidNotifyWithBlob must emit dm-received"
         );
     }
 
