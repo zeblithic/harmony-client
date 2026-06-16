@@ -61,7 +61,7 @@ Rejected alternatives:
 
 ## 4. Architecture & data flow
 
-```
+```text
 SENDER (online)                               RECIPIENT (online, no butler)
   send_dm → encrypt MessagePayload
           → storage_blob in local CAS
@@ -127,15 +127,22 @@ covers it in practice; the budget is a frame-safety ceiling, not an expected-com
 
 ## 7. Receive path (`dm_inbox_ingest.rs`)
 
-`ingest_dm_packet` dispatches on the `DmPacket` variant. Add the `CidNotifyWithBlob` arm:
+`ingest_dm_packet` dispatches on the `DmPacket` variant. The `CidNotifyWithBlob` arm carries
+the inline `storage_blob` past the dispatch (it does NOT write to CAS in the arm) and yields
+the inner `signed` / `signature` / `signed_bytes` like the bare `CidNotify` arm. The blob is
+then CAS-put **after Phase-2 admission**, never before:
 
-1. `cas_put(storage_blob)` first (mirrors the butler sweeper at `dm_inbox_ingest.rs:160`).
-2. Delegate to the **existing** `CidNotify` handling using the inner `signed` / `signature`
-   / `signed_bytes` — Phase-3's `content_store.get(message_cid)` now hits local CAS (no
-   zenoh round-trip), Phase-3b binding still verifies content-addressing, Phase-4 decrypts
-   and applies, Phase-6 emits `dm-received`.
-3. If `cas_put` fails, fall through to the existing `CidNotify` path (which then attempts the
-   CAS-fetch and errors as today) — the inline blob is strictly best-effort.
+1. Dispatch: the `CidNotifyWithBlob` arm sets `inline_blob = Some(storage_blob)` and falls
+   through to the shared pipeline (so a rejected/invalid packet never causes a CAS write —
+   no cache pollution from unadmitted tunnel traffic).
+2. Phase-2 admission runs (`verify_cidnotify_admission`) exactly as for a bare `CidNotify`.
+3. **Block 2b (post-admission):** if `inline_blob` is present, recompute
+   `ContentId::for_book(blob)` and require it `== signed.message_cid` (mismatch → error, no
+   write); then `content_store.put(message_cid, blob)`.
+4. Phase-3 reads the blob from LOCAL CAS via `get_local` (never `GetOrFetch` — an encrypted
+   DM CID is never network-servable, so a network fetch could only waste a round-trip + leak
+   the CID); Phase-3b re-verifies the binding; Phase-4 decrypts/applies; Phase-6 emits
+   `dm-received`. A local miss falls through to the deposit path.
 
 No change to admission, decrypt, binding, or emit logic — they are reused verbatim.
 

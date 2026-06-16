@@ -524,13 +524,16 @@ pub(crate) async fn ingest_dm_packet(
             .map_err(|e| format!("CidNotifyWithBlob CAS put: {e:?}"))?;
     }
 
-    // 3. CAS fetch the storage blob by the packet's message_cid (the tunnel
-    //    carries only the packet; the blob must already be locally available
-    //    via the SAME CAS the deposit/community-relay path populates). 500ms
-    //    timeout, matching the direct path's Phase B.
+    // 3. Read the storage blob from LOCAL CAS by the packet's message_cid. The
+    //    blob is already local: either block 2b just put the inline one, or the
+    //    deposit/community-relay sweeper populated it. `get_local` (Greptile) —
+    //    NOT `get`/`GetOrFetch` — because an encrypted DM CID is never network-
+    //    servable anyway (content-serve refuses encrypted CIDs), so a network
+    //    fetch could only waste a round-trip + leak the CID; a local miss falls
+    //    through to the deposit path. 500ms timeout guards the event-loop hop.
     let blob = match tokio::time::timeout(
         std::time::Duration::from_millis(500),
-        content_store.get(&signed.message_cid),
+        content_store.get_local(&signed.message_cid),
     )
     .await
     {
@@ -1631,6 +1634,57 @@ mod tests {
         assert!(
             fresh_store.get(&fx.message_cid).await.unwrap().is_none(),
             "a rejected (unadmitted) CidNotifyWithBlob must NOT write its blob to CAS"
+        );
+    }
+
+    /// ZEB-484 (CodeRabbit): the inline path's block-2b CID binding fails closed —
+    /// an ADMITTED `CidNotifyWithBlob` whose inline blob does NOT hash to the
+    /// signed `message_cid` is rejected with the block-2b error and no CAS write.
+    /// (Complements `ingest_dm_packet_rejects_blob_whose_cid_mismatches_signed_cid`,
+    /// which covers the CAS-FETCH path; this covers the INLINE path.)
+    #[tokio::test]
+    async fn ingest_dm_packet_cidnotify_with_blob_cid_mismatch_rejected() {
+        let fx = build_dm_ingest_fixture(b"mismatch-blob").await;
+        let (signed, signature, signed_bytes) =
+            match crate::dm_envelope::decode_packet(&fx.packet).unwrap() {
+                crate::dm_envelope::DmPacket::CidNotify {
+                    signed,
+                    signature,
+                    signed_bytes,
+                } => (signed, signature, signed_bytes),
+                other => panic!("fixture packet must be a bare CidNotify, got {other:?}"),
+            };
+        // A blob that does NOT hash to `signed.message_cid`.
+        let with_blob = crate::dm_envelope::DmPacket::CidNotifyWithBlob {
+            signed,
+            signature,
+            signed_bytes,
+            storage_blob: vec![0xABu8; 64],
+        };
+        let wire = crate::dm_envelope::encode_packet(&with_blob).unwrap();
+
+        // Admitted sender (fixture state holds the Space) → Phase 2 passes → block
+        // 2b's CID binding fires. Fresh empty store to observe no write.
+        let fresh_store: Arc<dyn crate::content_store::ContentStore> =
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+        let err = ingest_dm_packet(
+            &fx.crdt_state,
+            &fresh_store,
+            &fx.sink,
+            fx.bob,
+            &fx.bob_device_id,
+            [0u8; 32],
+            &wire,
+        )
+        .await
+        .expect_err("a CID-mismatched inline blob must be rejected");
+        assert!(
+            err.contains("inline blob CID does not match message_cid"),
+            "expected the block-2b binding error, got: {err}"
+        );
+        assert!(
+            fresh_store.get(&fx.message_cid).await.unwrap().is_none(),
+            "a mismatched inline blob must NOT be written to CAS"
         );
     }
 

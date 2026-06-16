@@ -297,6 +297,35 @@ mod tests {
         assert!(store.get(&cid(99)).await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn runtime_get_local_routes_getlocal_and_returns_cached_blob() {
+        // ZEB-484: RuntimeContentStore::get_local must send the local-cache-only
+        // `CasOp::GetLocal` (NEVER `GetOrFetch`) and return its reply. Simulate the
+        // event loop receiving exactly one GetLocal for the asked CID and replying
+        // with cached bytes; assert get_local plumbs them through.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CasOp>(4);
+        let store = RuntimeContentStore::new(tx, std::time::Duration::from_millis(500));
+        let want_cid = cid(0x7a);
+        let want_blob = vec![1u8, 2, 3, 4];
+
+        let blob_for_task = want_blob.clone();
+        let task = tokio::spawn(async move {
+            match rx.recv().await.expect("a CasOp was sent") {
+                CasOp::GetLocal { cid, reply } => {
+                    assert_eq!(cid, want_cid, "get_local must request the asked CID");
+                    reply
+                        .send(Some(blob_for_task))
+                        .expect("reply receiver alive");
+                }
+                other => panic!("get_local must send CasOp::GetLocal, got {other:?}"),
+            }
+        });
+
+        let got = store.get_local(&want_cid).await.expect("get_local ok");
+        assert_eq!(got, Some(want_blob), "get_local returns the GetLocal reply");
+        task.await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_puts_all_land() {
         use std::sync::Arc;

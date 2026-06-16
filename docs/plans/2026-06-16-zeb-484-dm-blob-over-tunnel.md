@@ -285,6 +285,13 @@ git commit -m "feat(zeb-484): DmPacket::CidNotifyWithBlob variant + length-delim
 
 - [ ] **Step 1: Add the `CidNotifyWithBlob` dispatch arm**
 
+> **Post-review correction (Qodo security finding, shipped):** the arm below CAS-puts the
+> blob inside the dispatch, *before* Phase-2 admission — which lets a rejected packet pollute
+> the CAS. The SHIPPED code instead has the arm only carry the blob out (`inline_blob =
+> Some(storage_blob)`) and CAS-puts it in a **post-admission block (2b)** that binds
+> `for_book(blob) == message_cid` before writing, with Phase-3 reading via `get_local`. See
+> spec §7 for the final flow; the snippet below is the original (pre-correction) plan.
+
 In `ingest_dm_packet`, inside the `match crate::dm_envelope::decode_packet(...)?` block, add a new arm AFTER the `DmPacket::Ack { .. }` arm (before the closing `}` of the match at ~line 463):
 
 ```rust

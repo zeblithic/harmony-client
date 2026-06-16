@@ -161,11 +161,18 @@ pub struct DmAckSigned {
     pub signing_device_hash: DeviceIdentityHash,
 }
 
-/// Discriminated union of Reticulum DM packets. Wire layout per packet:
+/// Discriminated union of DM packets. The uniform wire layout per packet is
 /// `[u8 discriminant][CBOR(signed_body)][64 raw signature bytes]` with
 /// discriminants 0x01=Invite, 0x02=CidNotify, 0x03=Ack. The signature
 /// tail is 64 raw bytes (NOT a CBOR bstr — encode appends via
 /// `extend_from_slice`, decode splits via `split_at(len - 64)`).
+///
+/// 0x04=CidNotifyWithBlob (ZEB-484) is the ONE exception: it carries a second
+/// variable-length field (the inline `storage_blob`) after the signature, so it
+/// uses an explicit length-delimited layout
+/// `[0x04][u32 BE len(signed_bytes)][signed_bytes][64 sig][storage_blob]` and its
+/// OWN encode/decode path (`decode_cidnotify_with_blob`) — the "sig = last 64
+/// bytes" split above does NOT apply to it.
 ///
 /// Each variant carries:
 /// - `signed`: the typed body the signature covers.
@@ -259,7 +266,10 @@ pub enum DecodeError {
 }
 
 /// Encode a fully-built DmPacket to the wire layout
-/// `[disc][signed_bytes][signature]`.
+/// `[disc][signed_bytes][signature]` (Invite/CidNotify/Ack). The
+/// `CidNotifyWithBlob` variant (0x04) instead emits the length-delimited
+/// `[0x04][u32 BE len(signed_bytes)][signed_bytes][signature][storage_blob]` via
+/// an early return — see the `DmPacket` docs.
 ///
 /// **Mutation guard.** Re-encodes `signed` and asserts byte-equality
 /// with the cached `signed_bytes` (which was the source for `signature`
