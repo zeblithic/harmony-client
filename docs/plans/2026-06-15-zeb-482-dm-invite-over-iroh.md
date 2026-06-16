@@ -236,6 +236,7 @@ cargo fmt --all
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 cargo nextest run --locked --workspace --all-targets --features test-fixtures
 ```
+
 Expected: fmt clean, clippy clean (`-D warnings`), nextest 0 failures.
 
 - [ ] **Step 4: Frontend gates** (no frontend change expected, but CI runs them):
@@ -243,6 +244,7 @@ Expected: fmt clean, clippy clean (`-D warnings`), nextest 0 failures.
 ```bash
 npx tsc --noEmit && npx vitest run
 ```
+
 Expected: clean (no-op for this PR).
 
 - [ ] **Step 5: Commit.**

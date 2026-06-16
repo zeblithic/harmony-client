@@ -304,6 +304,40 @@ pub async fn run_dm_inbox_ingest_sweeper(
     // recv() == None: every nudge sender dropped (engine shutdown).
 }
 
+/// CodeRabbit F1 (ZEB-482): reverse-resolve the owner an authenticated tunnel
+/// peer belongs to. Scans the `OwnerDeviceCache` for the FIRST owner whose entry
+/// carries a `DeviceTunnelContact` whose tunnel NodeId
+/// (`blake3(pq_dsa_pubkey)`, via [`node_id_from_dsa_pubkey`]) equals the peer's
+/// authenticated `peer_node_id`. This is the exact inverse of
+/// `iroh_tunnel_dm_transport::resolve_owner_tunnel_targets` (owner → contacts →
+/// NodeId), so a legitimate friend whose handshake populated the cache resolves
+/// here. Returns `None` when no cached contact matches — the caller must then
+/// REJECT the invite (an unbindable peer cannot be trusted to name an inviter).
+///
+/// The friend handshake (ZEB-473) is what populates each friend's
+/// owner → devices → `DeviceTunnelContact`, so a real friend's invite binds; a
+/// device we have never handshaked (no contact cached) is unbindable.
+fn resolve_owner_for_peer(
+    state: &crate::owner_state_crdt::OwnerState,
+    peer_node_id: [u8; 32],
+) -> Option<crate::owner_state_types::OwnerAddr> {
+    state
+        .owner_device_cache
+        .devices
+        .iter()
+        .find(|(_owner, entry)| {
+            entry
+                .device_tunnel_contacts
+                .iter()
+                .flatten()
+                .any(|contact| {
+                    crate::tunnel_manager::node_id_from_dsa_pubkey(&contact.pq_dsa_pubkey)
+                        == peer_node_id
+                })
+        })
+        .map(|(owner, _entry)| *owner)
+}
+
 /// ZEB-473 (DM-over-iroh, Move 1a) Task 9: ingest ONE inbound DM packet
 /// delivered live over the PQ tunnel, through the SAME verify → decrypt →
 /// `apply_inbox` → `dm-received` sequence a deposit-delivered DM takes.
@@ -358,6 +392,11 @@ pub(crate) async fn ingest_dm_packet(
     sink: &Arc<dyn crate::node_event_sink::NodeEventSink>,
     self_owner: crate::owner_state_types::OwnerAddr,
     device_id: &str,
+    // ZEB-482 (CodeRabbit F1): the authenticated tunnel peer's NodeId
+    // (`blake3(peer ML-DSA pubkey)`, carried on `InboundDm::peer_node_id`). Used
+    // ONLY by the `Invite` arm to bind the payload-controlled `inviter` field to
+    // the device the frame actually arrived from — see `resolve_owner_for_peer`.
+    peer_node_id: [u8; 32],
     packet_bytes: &[u8],
 ) -> Result<bool, String> {
     // 1. Decode + dispatch on the DmPacket variant (ZEB-482). The tunnel
@@ -384,6 +423,20 @@ pub(crate) async fn ingest_dm_packet(
                 .unwrap_or_default()
                 .as_millis() as u64;
             let mut state = crdt_state.lock().await;
+            // CodeRabbit F1: resolve the owner the AUTHENTICATED tunnel peer
+            // belongs to (reverse lookup over the OwnerDeviceCache populated by
+            // the friend handshake) and bind `apply_invite` to it. An invite
+            // whose `signed.inviter` claims a DIFFERENT owner than the sending
+            // device is rejected before any cache/Space mutation. An invite we
+            // CANNOT bind to a known owner (no cached contact matches the peer)
+            // is also rejected — an unbindable invite must not be trusted.
+            let expected_inviter =
+                resolve_owner_for_peer(&state, peer_node_id).ok_or_else(|| {
+                    format!(
+                        "apply_invite: unbindable tunnel peer {} (no cached owner contact matches)",
+                        hex::encode(peer_node_id)
+                    )
+                })?;
             crate::dm_outbox::apply_invite(
                 &mut state,
                 self_owner,
@@ -392,6 +445,7 @@ pub(crate) async fn ingest_dm_packet(
                 signature,
                 &signed_bytes,
                 now_ms,
+                Some(expected_inviter),
             )
             .map_err(|e| format!("apply_invite: {e:?}"))?;
             return Ok(false);
@@ -1234,6 +1288,8 @@ mod tests {
             &fx.sink,
             fx.bob,
             &fx.bob_device_id,
+            // CidNotify path ignores peer_node_id (only the Invite arm binds).
+            [0u8; 32],
             &fx.packet,
         )
         .await
@@ -1275,6 +1331,7 @@ mod tests {
             &fx.sink,
             fx.bob,
             &fx.bob_device_id,
+            [0u8; 32],
             &fx.packet,
         )
         .await
@@ -1344,16 +1401,45 @@ mod tests {
         })
         .unwrap();
 
+        // CodeRabbit F1: the tunnel ingest path binds `signed.inviter` to the
+        // authenticated peer by reverse-resolving the OwnerDeviceCache. The
+        // friend handshake (ZEB-473) populated Alice's owner → device →
+        // DeviceTunnelContact, so seed that contact (strictly-OLDER `learned_at`
+        // than the invite's wall clock so the invite's cache write preserves it)
+        // and dial in with the peer NodeId derived from its PQ DSA pubkey.
+        let alice_dsa_pubkey = vec![0x07u8; 1952];
+        let peer_node_id = crate::tunnel_manager::node_id_from_dsa_pubkey(&alice_dsa_pubkey);
+        {
+            let mut st = state.lock().await;
+            st.apply_owner_device_update(
+                alice,
+                vec![alice_device_hash],
+                vec![None],
+                vec![Some(crate::owner_state_types::DeviceTunnelContact {
+                    iroh_node_id: [0x09; 32],
+                    home_relay_url: None,
+                    pq_dsa_pubkey: alice_dsa_pubkey.clone(),
+                    pq_kem_pubkey: vec![0x08u8; 1184],
+                })],
+                Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "handshake".into(),
+                },
+            );
+        }
+
         let applied = ingest_dm_packet(
             &state,
             &content_store,
             &sink,
             bob,
             "bob-device-64hex",
+            peer_node_id,
             &packet,
         )
         .await
-        .expect("a known-good invite must apply");
+        .expect("a known-good invite from a bound peer must apply");
         assert!(!applied, "an invite never emits dm-received (Ok(false))");
 
         // The DM Space bootstrapped from the invite.
@@ -1384,6 +1470,224 @@ mod tests {
         );
     }
 
+    /// CodeRabbit F1 (security): an invite whose `signed.inviter` names a
+    /// DIFFERENT owner than the authenticated tunnel peer is REJECTED — the
+    /// invite is genuinely signed by Alice's device (signature verifies) but
+    /// claims `inviter = Carol`. The peer reverse-resolves to Alice (cached
+    /// contact), so the inviter-bind gate fires and NEITHER the OwnerDeviceCache
+    /// NOR the Space is mutated, and no event is emitted. Without the bind, a
+    /// valid signer could poison the cache (map its device under any owner) +
+    /// seed a spoofed DM Space.
+    #[tokio::test]
+    async fn ingest_dm_packet_rejects_invite_whose_inviter_mismatches_tunnel_peer() {
+        let bob = OwnerAddr([0xB0; 16]);
+        let space_id = SpaceId([0x77; 16]);
+        let state = std::sync::Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(std::sync::Arc::clone(&sink_handle));
+
+        // Alice's device signs the invite (the authenticated tunnel peer).
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let alice_pub = private_alice.public_identity();
+        let alice_identity_pub = alice_pub.to_public_bytes();
+        let alice = OwnerAddr([0xA1; 16]);
+        let alice_device_hash =
+            crate::owner_state_types::DeviceIdentityHash(alice_pub.address_hash);
+
+        // ...but the invite CLAIMS Carol as the inviter (the forgery).
+        let carol = OwnerAddr([0xCC; 16]);
+
+        let mut members = vec![carol, bob];
+        members.sort();
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id,
+            kind: crate::owner_state_types::SpaceKind::Dm,
+            members,
+            inviter: carol,
+            content_key: crate::owner_state_types::DmContentKey::new([0x42; 32]),
+            sender_devices: vec![alice_device_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            signing_device_hash: alice_device_hash,
+            inviter_identity_pub: alice_identity_pub,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+        let packet = crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Invite {
+            signed,
+            signature,
+            signed_bytes,
+        })
+        .unwrap();
+
+        // The peer reverse-resolves to ALICE (her contact is cached), not Carol.
+        let alice_dsa_pubkey = vec![0x07u8; 1952];
+        let peer_node_id = crate::tunnel_manager::node_id_from_dsa_pubkey(&alice_dsa_pubkey);
+        {
+            let mut st = state.lock().await;
+            st.apply_owner_device_update(
+                alice,
+                vec![alice_device_hash],
+                vec![None],
+                vec![Some(crate::owner_state_types::DeviceTunnelContact {
+                    iroh_node_id: [0x09; 32],
+                    home_relay_url: None,
+                    pq_dsa_pubkey: alice_dsa_pubkey.clone(),
+                    pq_kem_pubkey: vec![0x08u8; 1184],
+                })],
+                Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "handshake".into(),
+                },
+            );
+        }
+
+        // Snapshot Alice's cache entry + the Space set BEFORE the call so we can
+        // prove neither was mutated by the rejected invite.
+        let (alice_entry_before, spaces_len_before) = {
+            let st = state.lock().await;
+            (
+                st.owner_device_cache.devices.get(&alice).cloned(),
+                st.spaces.len(),
+            )
+        };
+
+        let err = ingest_dm_packet(
+            &state,
+            &content_store,
+            &sink,
+            bob,
+            "bob-device-64hex",
+            peer_node_id,
+            &packet,
+        )
+        .await
+        .expect_err("an inviter-vs-peer mismatch must be rejected");
+        assert!(
+            err.contains("InviterMismatch"),
+            "rejection must come from the inviter-bind gate (got: {err})"
+        );
+
+        let st = state.lock().await;
+        // Carol's owner was NEVER cached (no poisoning).
+        assert!(
+            !st.owner_device_cache.devices.contains_key(&carol),
+            "a rejected mismatched invite must not cache the claimed (Carol) owner"
+        );
+        // Alice's pre-existing entry is byte-for-byte unchanged.
+        assert_eq!(
+            st.owner_device_cache.devices.get(&alice).cloned(),
+            alice_entry_before,
+            "the bound peer's own cache entry must be untouched by a rejected invite"
+        );
+        // No spoofed DM Space.
+        assert!(
+            !st.spaces.contains_key(&space_id),
+            "a rejected mismatched invite must not seed a spoofed DM Space"
+        );
+        assert_eq!(
+            st.spaces.len(),
+            spaces_len_before,
+            "no Space mutation on a rejected invite"
+        );
+        drop(st);
+        assert!(
+            sink_handle.frames().is_empty(),
+            "a rejected invite must not emit"
+        );
+    }
+
+    /// CodeRabbit F1: an invite from a peer that cannot be reverse-resolved to
+    /// any cached owner (no handshake contact matches the authenticated NodeId)
+    /// is REJECTED — an unbindable invite must not be trusted, even if it is
+    /// otherwise well-formed and self-consistently signed.
+    #[tokio::test]
+    async fn ingest_dm_packet_rejects_invite_from_unbindable_peer() {
+        let bob = OwnerAddr([0xB0; 16]);
+        let space_id = SpaceId([0x77; 16]);
+        let state = std::sync::Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(std::sync::Arc::clone(&sink_handle));
+
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let alice_pub = private_alice.public_identity();
+        let alice_identity_pub = alice_pub.to_public_bytes();
+        let alice = OwnerAddr([0xA1; 16]);
+        let alice_device_hash =
+            crate::owner_state_types::DeviceIdentityHash(alice_pub.address_hash);
+
+        let mut members = vec![alice, bob];
+        members.sort();
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id,
+            kind: crate::owner_state_types::SpaceKind::Dm,
+            members,
+            inviter: alice,
+            content_key: crate::owner_state_types::DmContentKey::new([0x42; 32]),
+            sender_devices: vec![alice_device_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            signing_device_hash: alice_device_hash,
+            inviter_identity_pub: alice_identity_pub,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+        let packet = crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Invite {
+            signed,
+            signature,
+            signed_bytes,
+        })
+        .unwrap();
+
+        // NO contact is seeded — the OwnerDeviceCache is empty, so the peer
+        // NodeId reverse-lookup finds no owner and the invite is unbindable.
+        let unknown_peer_node_id = [0xEE; 32];
+
+        let err = ingest_dm_packet(
+            &state,
+            &content_store,
+            &sink,
+            bob,
+            "bob-device-64hex",
+            unknown_peer_node_id,
+            &packet,
+        )
+        .await
+        .expect_err("an invite from an unbindable peer must be rejected");
+        assert!(
+            err.contains("unbindable"),
+            "rejection must come from the unbindable-peer gate (got: {err})"
+        );
+
+        let st = state.lock().await;
+        assert!(
+            st.owner_device_cache.devices.is_empty(),
+            "an unbindable invite must not mutate the cache"
+        );
+        assert!(
+            !st.spaces.contains_key(&space_id),
+            "an unbindable invite must not seed a Space"
+        );
+        drop(st);
+        assert!(
+            sink_handle.frames().is_empty(),
+            "an unbindable invite must not emit"
+        );
+    }
+
     /// A bad packet (corrupted bytes / unknown sender) is rejected as `Err`
     /// with NO inbox mutation and NO emit — the drain logs+drops it.
     #[tokio::test]
@@ -1403,6 +1707,7 @@ mod tests {
             &fx.sink,
             fx.bob,
             &fx.bob_device_id,
+            [0u8; 32],
             &tampered,
         )
         .await
@@ -1491,6 +1796,7 @@ mod tests {
             &fx.sink,
             fx.bob,
             &fx.bob_device_id,
+            [0u8; 32],
             &fx.packet,
         )
         .await
@@ -1551,6 +1857,7 @@ mod tests {
             &fx.sink,
             fx.bob,
             &fx.bob_device_id,
+            [0u8; 32],
             &fx.packet,
         )
         .await

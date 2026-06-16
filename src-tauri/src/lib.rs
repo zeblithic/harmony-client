@@ -6965,6 +6965,10 @@ pub async fn start_node_inner(
                                         &drain_sink,
                                         drain_self_owner,
                                         &drain_device_id,
+                                        // ZEB-482 (CodeRabbit F1): bind a tunnel
+                                        // invite's inviter to the authenticated
+                                        // sending device.
+                                        dm.peer_node_id,
                                         &dm.payload,
                                     )
                                     .await
@@ -10754,13 +10758,17 @@ mod add_space_tunnel_routing_tests {
         // Recipient (Bob): cached with a single device + (optional) tunnel contact.
         let recipient = OwnerAddr([0xB0; 16]);
         let dsa_pubkey = vec![0x07u8; 1952];
-        let recipient_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
         let contact = recipient_contact.unwrap_or(DeviceTunnelContact {
             iroh_node_id: [0x09; 32],
             home_relay_url: None,
             pq_dsa_pubkey: dsa_pubkey,
             pq_kem_pubkey: vec![0x08u8; 1184],
         });
+        // CodeRabbit F6: derive the returned NodeId from the contact ACTUALLY
+        // installed (the caller-supplied one when present), not the hardcoded
+        // default — otherwise a test passing a custom contact gets a
+        // `recipient_node_id` inconsistent with the cache it asserts against.
+        let recipient_node_id = node_id_from_dsa_pubkey(&contact.pq_dsa_pubkey);
         let mut owner_state = crate::owner_state_crdt::OwnerState::default();
         owner_state.owner_device_cache.devices.insert(
             recipient,

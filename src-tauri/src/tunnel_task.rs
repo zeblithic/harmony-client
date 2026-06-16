@@ -900,6 +900,7 @@ mod tests {
                     &drain_sink,
                     drain_self_owner,
                     &drain_device,
+                    dm.peer_node_id,
                     &dm.payload,
                 )
                 .await;

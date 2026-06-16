@@ -389,11 +389,28 @@ mod tests {
             "routed bytes must be the passed packet"
         );
 
-        // An unknown recipient routes nothing (no panic, no spurious session).
+        // An unknown recipient routes nothing — neither a spurious new session
+        // NOR a misrouted packet to the EXISTING target. Capture the resolved
+        // target's pending count first, fire at an unknown recipient, then assert
+        // both invariants: no `[0;32]` session was created AND the real target's
+        // pending count is unchanged (catches a regression that routes unknown
+        // recipients to an existing target).
+        let target_pending_before = mgr
+            .test_pending_packets(&expected_node_id)
+            .map(|p| p.len())
+            .expect("the resolved target session exists from the first send");
         send_packet_to_owner_tunnels(&crdt_state, &mgr, OwnerAddr([0xEE; 16]), &payload).await;
         assert!(
             mgr.test_pending_packets(&[0x00; 32]).is_none(),
             "no session for an unrelated NodeId"
+        );
+        let target_pending_after = mgr
+            .test_pending_packets(&expected_node_id)
+            .map(|p| p.len())
+            .expect("the resolved target session must still exist");
+        assert_eq!(
+            target_pending_after, target_pending_before,
+            "an unknown recipient must NOT route anything to the existing target"
         );
     }
 
