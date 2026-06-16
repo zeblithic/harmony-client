@@ -839,6 +839,7 @@ mod tests {
             sender_owner: SENDER_OWNER,
             cidnotify_packet: packet,
             storage_blob: format!("blob-{}", hex::encode(&cid[..4])).into_bytes(),
+            invite_packet: None,
             deposited_at: hlc(deposited_ms),
             deposited_by: "butler-device".into(),
             ingested_by: ig.iter().map(|s| s.to_string()).collect(),

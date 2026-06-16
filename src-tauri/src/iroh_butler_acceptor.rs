@@ -668,6 +668,7 @@ pub async fn handle_deposit_core(
         sender_owner: frame.sender_owner,
         cidnotify_packet: payload.cidnotify_packet,
         storage_blob: payload.storage_blob,
+        invite_packet: None,
         deposited_at: ctx.mint_hlc().await,
         deposited_by: ctx.device_id(),
         ingested_by: BTreeSet::new(),
@@ -951,6 +952,7 @@ mod tests {
         let payload = DepositPayload {
             cidnotify_packet: cidnotify_packet.clone(),
             storage_blob: storage_blob.clone(),
+            invite_packet: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1128,6 +1130,7 @@ mod tests {
             sender_owner,
             cidnotify_packet: Vec::new(),
             storage_blob: Vec::new(),
+            invite_packet: None,
             deposited_at: Hlc {
                 wall_ms: 1,
                 logical: 0,
@@ -1329,6 +1332,7 @@ mod tests {
         let payload = DepositPayload {
             cidnotify_packet: f.cidnotify_packet.clone(),
             storage_blob: f.storage_blob.clone(),
+            invite_packet: None,
         };
         let butler_vk = butler_device_sk().verifying_key().to_bytes();
         let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
@@ -1649,6 +1653,7 @@ mod tests {
         let frame = reframe(&DepositPayload {
             cidnotify_packet: tampered_packet,
             storage_blob: f.storage_blob.clone(),
+            invite_packet: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -1670,6 +1675,7 @@ mod tests {
         let frame = reframe(&DepositPayload {
             cidnotify_packet: mismatch_packet,
             storage_blob: f.storage_blob.clone(),
+            invite_packet: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -1693,6 +1699,7 @@ mod tests {
         let frame = reframe(&DepositPayload {
             cidnotify_packet: foreign_packet,
             storage_blob: f.storage_blob.clone(),
+            invite_packet: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();

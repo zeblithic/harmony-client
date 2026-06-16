@@ -738,6 +738,7 @@ impl crate::community_relay::CommunityRelayDepositClient for ProdCommunityRelayD
         let payload = DepositPayload {
             cidnotify_packet: req.cidnotify_packet.clone(),
             storage_blob,
+            invite_packet: req.invite_packet.clone(),
         };
 
         // 4. Fan out: the FIRST relay that acks ≥1 sealed copy wins. For each
@@ -1613,6 +1614,7 @@ mod tests {
             space_id: SpaceId([0xDD; 16]),
             message_cid: cid,
             cidnotify_packet: vec![0x01, 0x02, 0x03],
+            invite_packet: None,
             now_ms: TEST_NOW,
         }
     }

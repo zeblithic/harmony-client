@@ -214,6 +214,7 @@ mod tests {
         DepositPayload {
             cidnotify_packet: vec![tag; 4],
             storage_blob: vec![tag + 1; 5],
+            invite_packet: None,
         }
     }
 

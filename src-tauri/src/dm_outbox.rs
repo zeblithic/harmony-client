@@ -1394,6 +1394,7 @@ impl DmOutbox {
                 space_id: entry.space_id,
                 message_cid: entry.message_cid,
                 cidnotify_packet,
+                invite_packet: None,
                 now_ms,
             }),
             Err(err) => tracing::warn!(

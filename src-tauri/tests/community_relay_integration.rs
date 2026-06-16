@@ -492,6 +492,7 @@ fn build_fixture() -> RelayFixture {
     let payload = DepositPayload {
         cidnotify_packet: vec![0x01, 0x02, 0x03, 0x04],
         storage_blob: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+        invite_packet: None,
     };
     let cert_bytes = harmony_owner::cbor::to_canonical(&sender.cert).expect("encode cert");
     let frame = build_relay_deposit_frame(
@@ -1387,6 +1388,7 @@ fn build_deposit_frame_with_blob(
     let payload = DepositPayload {
         cidnotify_packet: vec![0x01, 0x02, 0x03, 0x04],
         storage_blob,
+        invite_packet: None,
     };
     let cert_bytes = harmony_owner::cbor::to_canonical(&sender.cert).expect("encode cert");
     let frame = build_relay_deposit_frame(

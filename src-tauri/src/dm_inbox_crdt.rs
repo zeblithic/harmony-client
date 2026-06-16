@@ -20,6 +20,17 @@ pub struct DmInboxEntry {
     /// The CAS storage blob ([ver][nonce][ct][tag]).
     #[serde(rename = "pl", with = "serde_bytes")]
     pub storage_blob: Vec<u8>,
+    /// ZEB-483: optional signed DmInvite packet bytes, carried through from the
+    /// sealed `DepositPayload` by the butler acceptor. Applied on recover to
+    /// bootstrap the DM Space before CidNotify admission. `None` for non-DM /
+    /// legacy deposits.
+    #[serde(
+        rename = "iv",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub invite_packet: Option<Vec<u8>>,
     #[serde(rename = "da")]
     pub deposited_at: Hlc,
     /// SP1 device_id (64-hex).
@@ -99,6 +110,7 @@ mod tests {
             sender_owner: [7u8; 16],
             cidnotify_packet: vec![1, 2, 3],
             storage_blob: vec![4, 5, 6],
+            invite_packet: None,
             deposited_at: at,
             deposited_by: by.into(),
             ingested_by: ig.iter().map(|s| s.to_string()).collect(),

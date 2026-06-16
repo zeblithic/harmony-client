@@ -617,6 +617,7 @@ mod tests {
         DepositPayload {
             cidnotify_packet: vec![0x01, 0x02, 0x03, 0x04],
             storage_blob: vec![0x05, 0x06, 0x07, 0x08, 0x09],
+            invite_packet: None,
         }
     }
 

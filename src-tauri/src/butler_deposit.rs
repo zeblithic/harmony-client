@@ -49,6 +49,12 @@ pub const BUTLER_DEPOSIT_SEAL_INFO: &[u8] = b"harmony-zeb-418-butler-deposit-v1"
 /// allocated.
 pub const DEPOSIT_MAX_FRAME_BYTES: usize = 256 * 1024;
 
+/// ZEB-483: per-deposit cap on the piggybacked DmInvite packet bytes. A DM
+/// invite is a few hundred bytes (member set + 32-byte content key + 64-byte
+/// identity pub + 64-byte sig); 4 KiB is a generous ceiling that still bars a
+/// malicious sender from inflating butler/relay storage via the invite field.
+pub const MAX_DEPOSIT_INVITE_BYTES: usize = 4096;
+
 /// Maximum number of [`crate::reachability_record::ButlerSetEntry`]s carried
 /// in the pkarr routing blob's butler set (spec §3: ordered priority list,
 /// max 2 in v1). Readers truncate anything longer (defence against oversized
@@ -148,6 +154,18 @@ pub struct DepositPayload {
     /// The CAS storage blob ([ver][nonce][ct][tag]).
     #[serde(rename = "pl", with = "serde_bytes")]
     pub storage_blob: Vec<u8>,
+    /// ZEB-483: optional signed DmInvite packet bytes (a `DmPacket::Invite`),
+    /// piggybacked so an offline-at-create recipient bootstraps the DM Space
+    /// from the deposit rung. Opaque to the butler/relay (sealed end-to-end);
+    /// applied + verified on recover. `None` for non-DM deposits and legacy
+    /// senders.
+    #[serde(
+        rename = "iv",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub invite_packet: Option<Vec<u8>>,
 }
 
 // Manual CanonicalPayload registration (the `impl_canonical!` macro in
@@ -300,6 +318,10 @@ pub struct ButlerDepositRequest {
     pub message_cid: ContentId,
     /// Full signed CidNotify packet bytes (discriminant+body+sig).
     pub cidnotify_packet: Vec<u8>,
+    /// ZEB-483: signed DmInvite packet bytes for the recipient to bootstrap the
+    /// DM Space from the deposit rung; `None` for non-DM Spaces. Copied verbatim
+    /// into the sealed `DepositPayload` by each deposit client.
+    pub invite_packet: Option<Vec<u8>>,
     /// Wall-clock now (ms) at candidacy time — drives the `bs_at` freshness
     /// check against the resolved routing blob.
     pub now_ms: u64,
@@ -512,6 +534,7 @@ impl ButlerDepositClient for IrohButlerDepositClient {
         let payload = DepositPayload {
             cidnotify_packet: req.cidnotify_packet.clone(),
             storage_blob,
+            invite_packet: req.invite_packet.clone(),
         };
 
         // 3. Priority order, first ack wins. The frame is rebuilt per
@@ -644,10 +667,57 @@ mod tests {
         let payload = DepositPayload {
             cidnotify_packet: vec![0x01, 0x02, 0x03],
             storage_blob: vec![0x04, 0x05, 0x06, 0x07],
+            invite_packet: None,
         };
         let bytes = encode_deposit_payload(&payload).expect("encode");
         let back = decode_deposit_payload(&bytes).expect("decode");
         assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn deposit_payload_round_trips_invite_packet_and_decodes_legacy_as_none() {
+        // (a) Some(invite) round-trips.
+        let with_invite = DepositPayload {
+            cidnotify_packet: vec![1, 2, 3],
+            storage_blob: vec![4, 5, 6],
+            invite_packet: Some(vec![7, 8, 9]),
+        };
+        let bytes = encode_deposit_payload(&with_invite).expect("encode");
+        assert_eq!(decode_deposit_payload(&bytes).expect("decode"), with_invite);
+
+        // (b) None round-trips and (skip_serializing_if) omits the key.
+        let without = DepositPayload {
+            cidnotify_packet: vec![1],
+            storage_blob: vec![2],
+            invite_packet: None,
+        };
+        let bytes_none = encode_deposit_payload(&without).expect("encode none");
+        assert_eq!(
+            decode_deposit_payload(&bytes_none).expect("decode none"),
+            without
+        );
+
+        // (c) A LEGACY payload (encoded by a struct WITHOUT invite_packet) decodes
+        //     to invite_packet: None — proving forward-compat for old senders.
+        #[derive(serde::Serialize)]
+        struct LegacyDepositPayload {
+            #[serde(rename = "cn", with = "serde_bytes")]
+            cidnotify_packet: Vec<u8>,
+            #[serde(rename = "pl", with = "serde_bytes")]
+            storage_blob: Vec<u8>,
+        }
+        let legacy = LegacyDepositPayload {
+            cidnotify_packet: vec![1],
+            storage_blob: vec![2],
+        };
+        // Encode via ciborium directly (byte-identical to
+        // `canonical_cbor_encode`, which this local test struct can't satisfy —
+        // the `CanonicalPayload` sealed trait is module-private).
+        let mut legacy_bytes = Vec::new();
+        ciborium::into_writer(&legacy, &mut legacy_bytes).expect("legacy encode");
+        let decoded = decode_deposit_payload(&legacy_bytes).expect("legacy decode");
+        assert_eq!(decoded.invite_packet, None);
+        assert_eq!(decoded.cidnotify_packet, vec![1]);
     }
 
     /// The sealed envelope round-trips under the butler info string, and is
