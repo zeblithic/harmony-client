@@ -891,13 +891,16 @@ mod tests {
         let drain_cas = Arc::clone(&fx.content_store);
         let drain_sink = Arc::clone(&fx.sink);
         let drain_device = fx.bob_device_id.clone();
+        let drain_self_owner = fx.bob;
         let drain = tokio::spawn(async move {
             while let Some(dm) = resp_ingest_rx.recv().await {
                 let _ = ingest_dm_packet(
                     &drain_state,
                     &drain_cas,
                     &drain_sink,
+                    drain_self_owner,
                     &drain_device,
+                    dm.peer_node_id,
                     &dm.payload,
                 )
                 .await;

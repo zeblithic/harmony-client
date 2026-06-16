@@ -401,8 +401,34 @@ impl TunnelManager {
         }
 
         // Normal path: our own Dialing initiator handle. Flip to Active + flush.
+        //
+        // ZEB-482: flush WITHOUT draining `pending` (clone each packet, leave the
+        // queue intact). In a simultaneous-dial collision (both peers `send_dm`
+        // and dial each other at once — exactly what the DM-Space invite does, as
+        // it fires the moment the friend handshake lands), an inbound responder
+        // session can win the lower-NodeId dedup AFTER our dial completes. When
+        // that happens, `register_inbound` redirects the loser's `pending` onto
+        // the surviving session (`drain_pending_into`). If we had drained pending
+        // here, the redirect would find nothing and the just-flushed packet —
+        // already transmitted over the LOSING initiator connection the peer
+        // discards — would be lost. Retaining pending lets the redirect re-deliver
+        // it over the winning session. The DM packets (`apply_invite` idempotent
+        // on `space_id`; `apply_inbox` idempotent on `(space_id, message_cid)`)
+        // dedup a duplicate harmlessly, so the at-most-once-extra send is safe.
+        // After Active, new sends go via `cmd_tx` directly (not `pending`), so the
+        // retained queue is never re-flushed by another `note_active`.
+        //
+        // Greptile P2: enforce that at-most-once flush IN-FUNCTION rather than by
+        // call-site discipline alone. We reach here only with role == Initiator
+        // (the Responder branch above returned or panicked); a second
+        // `note_active` on an already-Active initiator handle would re-clone and
+        // re-send the RETAINED `pending` queue. Guard against it so a future
+        // refactor that calls `note_active` twice can't silently double-send.
+        if handle.state == TunnelHandleState::Active {
+            return;
+        }
         handle.state = TunnelHandleState::Active;
-        while let Some(packet) = handle.pending.pop_front() {
+        for packet in handle.pending.iter().cloned() {
             if handle
                 .cmd_tx
                 .try_send(TunnelCommand::SendDm(packet))
@@ -591,10 +617,14 @@ mod tests {
 
         mgr.note_active(peer);
 
-        // The handle is now Active with an empty pending queue.
+        // The handle is now Active. ZEB-482: `pending` is RETAINED (not drained)
+        // after the flush so a later simultaneous-dial dedup-loss can redirect the
+        // same (idempotent) DMs onto the winning session via `register_inbound`'s
+        // `drain_pending_into` — see `note_active`'s flush comment. So pending
+        // still holds the 3 buffered DMs.
         assert_eq!(
             mgr.handle_snapshot(&peer).map(|(s, _, p)| (s, p)),
-            Some((TunnelHandleState::Active, 0))
+            Some((TunnelHandleState::Active, 3))
         );
 
         // The three buffered DMs flushed over cmd_tx, in order.
@@ -608,6 +638,26 @@ mod tests {
             got,
             vec![b"dm-1".to_vec(), b"dm-2".to_vec(), b"dm-3".to_vec()],
             "pending DMs must flush in FIFO order on Active"
+        );
+
+        // Greptile P2 idempotency: a SECOND note_active on the now-Active handle
+        // must NOT re-flush the RETAINED pending queue (the in-function guard
+        // returns early). Without the guard, the clone-flush would re-send all 3.
+        mgr.note_active(peer);
+        let mut extra = Vec::new();
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let TunnelCommand::SendDm(p) = cmd {
+                extra.push(p);
+            }
+        }
+        assert!(
+            extra.is_empty(),
+            "a second note_active must not re-flush retained pending (got {extra:?})"
+        );
+        // Pending is still retained (the early-return doesn't touch it).
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, _, p)| (s, p)),
+            Some((TunnelHandleState::Active, 3))
         );
     }
 

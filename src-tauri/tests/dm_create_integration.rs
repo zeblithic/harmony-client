@@ -25,7 +25,6 @@ use ed25519_dalek::SigningKey;
 
 use harmony_app::add_space_dm_inner;
 use harmony_app::dm_envelope::{decode_packet, DmPacket};
-use harmony_app::dm_signing;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_types::{
     DeviceIdentityHash, Hlc, OwnerAddr, OwnerDeviceEntry, SpaceKind,
@@ -105,7 +104,7 @@ async fn add_space_dm_kind_generates_content_key_and_dispatches_invite() {
         "alice",
     );
 
-    let (space_id, sends, was_merge) = add_space_dm_inner(
+    let (space_id, fanout) = add_space_dm_inner(
         &mut state,
         &alice_signing_key,
         &alice_identity_pub,
@@ -119,7 +118,11 @@ async fn add_space_dm_kind_generates_content_key_and_dispatches_invite() {
         None,
     )
     .expect("add_space_dm_inner must succeed");
-    assert!(!was_merge, "first creation must not be a merge");
+    // A fresh create returns `Some(fanout)`; `None` would mean a dedupe-merge.
+    assert!(
+        fanout.is_some(),
+        "first creation must not be a merge (returns Some fanout)"
+    );
 
     // Space is in CRDT.
     let space = state.spaces.get(&space_id).expect("space inserted");
@@ -139,17 +142,15 @@ async fn add_space_dm_kind_generates_content_key_and_dispatches_invite() {
     assert_eq!(space.name, "DM with Bob");
     assert!(space.validate_invariants().is_ok(), "Space invariants hold");
 
-    // One DmInvite was dispatched to Bob's known device.
-    assert_eq!(sends.len(), 1, "one recipient device → one outbound");
-    let send = &sends[0];
-    assert_eq!(
-        send.destination_hash,
-        dm_signing::compute_dm_destination_hash(bob_device.0),
-        "dispatched to Bob's DM destination"
-    );
+    // ZEB-482: the invite fan-out carries the signed wire bytes + the
+    // recipient OWNERS (the caller resolves each owner → tunnel device(s)
+    // and routes over the iroh tunnel; addressing is no longer per-device
+    // Reticulum destination hashes).
+    let (invite_wire, recipients) = fanout.expect("a fresh create returns Some(fanout)");
+    assert_eq!(recipients, vec![bob_owner], "one recipient owner: Bob");
 
     // Decode the packet and check the DmInvite shape.
-    let decoded = decode_packet(&send.packet).expect("packet decodes");
+    let decoded = decode_packet(&invite_wire).expect("packet decodes");
     match decoded {
         DmPacket::Invite { signed, .. } => {
             assert_eq!(signed.space_id, space_id);
@@ -183,7 +184,7 @@ async fn add_space_group_dm_with_15_recipients_succeeds() {
     // total members, exactly at the cap.
     let recipients: Vec<OwnerAddr> = (0..15u8).map(|i| OwnerAddr([0x10 + i; 16])).collect();
 
-    let (space_id, _sends, _was_merge) = add_space_dm_inner(
+    let (space_id, _fanout) = add_space_dm_inner(
         &mut state,
         &alice_signing_key,
         &alice_identity_pub,
@@ -313,9 +314,10 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
     //     Space's id, not a fresh one — so the outer command's
     //     state.spaces.get(&canonical_id) succeeds);
     //   - signal `was_merge=true`;
-    //   - dispatch ZERO additional DmInvites (the existing Space was
-    //     already invited at original creation; re-firing here would
-    //     just produce duplicate invite handling on the recipient).
+    //   - return `fanout=None` (no additional DmInvite tunnel-send — the
+    //     existing Space was already invited at original creation;
+    //     re-firing here would just produce duplicate invite handling on
+    //     the recipient).
     let (alice_owner, alice_device, alice_identity_pub, alice_signing_key) = make_party(0xa1);
     let (bob_owner, bob_device, bob_identity_pub, _bob_signing_key) = make_party(0xb2);
 
@@ -338,7 +340,7 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
     );
 
     // First create — Inserted.
-    let (first_id, first_sends, first_merge) = add_space_dm_inner(
+    let (first_id, first_fanout) = add_space_dm_inner(
         &mut state,
         &alice_signing_key,
         &alice_identity_pub,
@@ -352,11 +354,12 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
         None,
     )
     .expect("first create must succeed");
-    assert!(!first_merge, "first create must not be a merge");
+    // `Some(fanout)` IS the not-a-merge signal (a merge returns `None`).
+    let (_first_wire, first_recipients) = first_fanout.expect("first create returns Some(fanout)");
     assert_eq!(
-        first_sends.len(),
-        1,
-        "first create dispatches one invite to Bob"
+        first_recipients,
+        vec![bob_owner],
+        "first create fans the invite out to Bob"
     );
 
     // Second create with the same members (different name to prove
@@ -366,7 +369,7 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
     // load-bearing assertion is "second_id IS the live entry in
     // state.spaces", not "second_id == first_id" (which only holds
     // when the second mint loses the tie-break).
-    let (second_id, second_sends, second_merge) = add_space_dm_inner(
+    let (second_id, second_fanout) = add_space_dm_inner(
         &mut state,
         &alice_signing_key,
         &alice_identity_pub,
@@ -380,15 +383,16 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
         None,
     )
     .expect("second create must succeed (dedupe path)");
-    assert!(second_merge, "second create must be a merge (dedupe)");
     assert!(
         state.spaces.contains_key(&second_id),
         "second create returns a canonical SpaceId that's live in state.spaces \
          (NOT a stale loser id whose entry was dropped by the dedupe merge)"
     );
+    // `None` fanout IS the merge signal: the dedupe path must NOT re-dispatch
+    // a DmInvite (the existing Space was already invited at original creation).
     assert!(
-        second_sends.is_empty(),
-        "second create must NOT re-dispatch DmInvite (existing was already invited)"
+        second_fanout.is_none(),
+        "second create must be a merge (dedupe) → no fanout"
     );
 
     // Post-condition: state.spaces has exactly one DM Space for this

@@ -1532,112 +1532,26 @@ impl DmOutbox {
         signed_bytes: &[u8],
         wall_now_ms: u64,
     ) -> Result<DrainOutcome, DmReceiveError> {
-        // Sanity gate 1: inviter ∈ members.
-        if !signed.members.contains(&signed.inviter) {
-            return Err(DmReceiveError::InviterNotInMembers);
-        }
-        // Sanity gate 2: signing_device_hash ∈ sender_devices.
-        // (decode_packet already enforces this — defense-in-depth here.)
-        if !signed.sender_devices.contains(&signed.signing_device_hash) {
-            return Err(DmReceiveError::SigningDeviceNotInSenderDevices);
-        }
-        // Sanity gate 3: self_owner ∈ members.
-        if !signed.members.contains(&self.self_owner) {
-            return Err(DmReceiveError::ReceiverNotInMembers);
-        }
-        // Verify signature using inline inviter_identity_pub (64-byte combined
-        // identity pubs — verify_dm_packet_signature splits + uses Ed25519
-        // half for the actual signature verification, X25519 half participates
-        // only in the device-hash recomputation that defeats key-substitution).
-        crate::dm_signing::verify_dm_packet_signature(
+        // ZEB-482: the auto-accept body now lives in the shared free function
+        // `apply_invite` so the tunnel ingest path (`ingest_dm_packet`, which
+        // holds the owner-state lock but has no outbox handle) applies the
+        // identical trust gates. This method stays the (dormant) outbox entry
+        // point, delegating to the single source of truth.
+        apply_invite(
+            state,
+            self.self_owner,
+            &self.device_id,
+            signed,
+            signature,
             signed_bytes,
-            &signature,
-            &signed.inviter_identity_pub,
-            signed.signing_device_hash,
-        )?;
-
-        // Phase 3b auto-accept: write Space + cache + cached identity pub.
-        // (Phase 4 will replace this with a stage-pending-invite + UI prompt
-        // path; follow-up ticket filed at PR-creation time per spec.)
-
-        // Build a parallel pubs vec: Some(inviter_identity_pub) at the signer's
-        // index, None everywhere else. The receiver knows the inviter's
-        // identity pub for the device that signed THIS invite, but has no pubs
-        // for the inviter's other devices yet — they remain pre-bootstrap
-        // until the next invite-equivalent flow.
-        let mut device_identity_pubs: Vec<Option<[u8; 64]>> =
-            vec![None; signed.sender_devices.len()];
-        let signer_idx = signed
-            .sender_devices
-            .iter()
-            .position(|d| *d == signed.signing_device_hash)
-            .expect("sanity gate 2 already verified signing_device_hash ∈ sender_devices");
-        device_identity_pubs[signer_idx] = Some(signed.inviter_identity_pub);
-
-        // SECURITY: the OwnerDeviceCache LWW HLC must record when WE
-        // learned about these devices, NOT the timestamp the inviter
-        // claims they sent the invite. Using `signed.created_at` here
-        // would let an attacker forge a far-future HLC (e.g.,
-        // wall_ms = u64::MAX / 2) on a single malicious invite,
-        // pinning the local cache and rejecting every legitimate
-        // future update from the same owner as `StaleHlc` — a
-        // denial-of-updates attack. Mirror the pattern that
-        // `handle_cidnotify_lifted` Phase A already uses (local wall clock
-        // + our device_id).
-        let learned_at = Hlc {
-            wall_ms: wall_now_ms,
-            logical: 0,
-            device_id: self.device_id.clone(),
-        };
-        let cache_outcome = state.apply_owner_device_update(
-            signed.inviter,
-            signed.sender_devices.clone(),
-            device_identity_pubs,
-            // ZEB-473: no tunnel contacts on this DM-receive cache refresh
-            // (populated only on the friend handshake, Task 5).
-            Vec::new(),
-            learned_at,
-        );
-        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
-            return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
-        }
-
-        // Build the Space from the invite. Mirror what add_space's DM/group-DM
-        // handling will produce (Phase 4 will produce these on the SEND side
-        // as outbound invites; here we mirror the same shape on the RECEIVE
-        // side as inbound invite acceptance).
-        // ZEB-474: DM/GroupDm Spaces carry transport=None (deposit-only;
-        // the Reticulum carrier was removed). Delivery uses OwnerDeviceCache,
-        // not Space.transport.
-        let space = crate::owner_state_types::Space {
-            id: signed.space_id,
-            kind: signed.kind,
-            parent: None,
-            community_id: None,
-            name: format!("DM with {}", hex::encode(signed.inviter.0)),
-            transport: None,
-            members: signed.members,
-            custom_name: None,
-            notification_pref: None,
-            left_at: None,
-            created_at: signed.created_at.clone(),
-            updated_at: signed.created_at,
-            content_key: Some(signed.content_key),
-            prior_content_keys: vec![],
-            current_epoch: None,
-            current_epoch_key: None,
-            old_epoch_keys: std::collections::BTreeMap::new(),
-            admin_addr: None,
-            is_invite_only: None,
-            shared_in_profile: false,
-            pending_join_at: None,
-        };
-        let space_outcome = state.apply_space_with_canonicalization(space);
-        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = space_outcome {
-            return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
-        }
-
-        Ok(DrainOutcome::default())
+            wall_now_ms,
+            // CodeRabbit F1: the dormant outbox method has no authenticated
+            // transport-peer context, so it cannot bind the inviter. It is never
+            // reached over an untrusted carrier; pass `None` to preserve its
+            // existing (uncalled) behavior. The live tunnel ingest path
+            // (`ingest_dm_packet`) passes `Some(owner)`.
+            None,
+        )
     }
 
     /// ZEB-241: lock-lifted CidNotify handler. Manages its
@@ -2017,6 +1931,164 @@ impl DmOutbox {
     }
 }
 
+/// ZEB-482: auto-accept a received DmInvite — write the DM Space + cache the
+/// inviter's devices/identity-pub. Idempotent on `space_id`. Shared by the
+/// (dormant) outbox `handle_invite` method and the tunnel ingest path so both
+/// apply identical trust gates. No IPC emit (invites carry no `dm-received`).
+///
+/// Parameterized on `self_owner` / `device_id` (the receiver's identity)
+/// instead of `&self.*` so the ingest path — which holds the owner-state lock
+/// but has no `DmOutbox` handle — can call it directly. Behavior is identical
+/// to the prior `handle_invite` body.
+// The arg list is the receiver identity + the verified-invite triple + the
+// learned-at clock + the F1 inviter-bind hint; threading them through a struct
+// would not improve clarity at this single shared call boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_invite(
+    state: &mut OwnerState,
+    self_owner: OwnerAddr,
+    device_id: &str,
+    signed: crate::dm_envelope::DmInviteSigned,
+    signature: [u8; 64],
+    signed_bytes: &[u8],
+    wall_now_ms: u64,
+    // ZEB-482 (CodeRabbit F1): the owner the AUTHENTICATED tunnel peer resolves
+    // to. `verify_dm_packet_signature` only authenticates the signing DEVICE; it
+    // does NOT prove the payload-controlled `signed.inviter` (OwnerAddr) is the
+    // peer that actually sent this frame. Without this bind, a valid signer (a
+    // malicious friend) could claim `inviter = <victim owner>` and poison the
+    // receiver's OwnerDeviceCache (mapping the attacker's device under the
+    // victim's owner) + create a spoofed DM Space. The tunnel ingest path passes
+    // `Some(owner)` resolved from the peer's DeviceTunnelContact and we reject any
+    // `signed.inviter` mismatch BEFORE any state mutation. The dormant outbox
+    // `handle_invite` method has no transport-peer context and passes `None`,
+    // preserving its existing (uncalled) behavior.
+    expected_inviter: Option<OwnerAddr>,
+) -> Result<DrainOutcome, DmReceiveError> {
+    // SECURITY (CodeRabbit F1): bind the payload-controlled `signed.inviter` to
+    // the authenticated tunnel peer BEFORE touching any trust state (cache or
+    // Space). When the caller cannot supply an expected owner (`None`), behavior
+    // is unchanged — that path (the dormant outbox method) is never reached over
+    // an untrusted transport.
+    if let Some(expected) = expected_inviter {
+        if signed.inviter != expected {
+            return Err(DmReceiveError::InviterMismatch);
+        }
+    }
+    // Sanity gate 1: inviter ∈ members.
+    if !signed.members.contains(&signed.inviter) {
+        return Err(DmReceiveError::InviterNotInMembers);
+    }
+    // Sanity gate 2: signing_device_hash ∈ sender_devices.
+    // (decode_packet already enforces this — defense-in-depth here.)
+    if !signed.sender_devices.contains(&signed.signing_device_hash) {
+        return Err(DmReceiveError::SigningDeviceNotInSenderDevices);
+    }
+    // Sanity gate 3: self_owner ∈ members.
+    if !signed.members.contains(&self_owner) {
+        return Err(DmReceiveError::ReceiverNotInMembers);
+    }
+    // Verify signature using inline inviter_identity_pub (64-byte combined
+    // identity pubs — verify_dm_packet_signature splits + uses Ed25519
+    // half for the actual signature verification, X25519 half participates
+    // only in the device-hash recomputation that defeats key-substitution).
+    crate::dm_signing::verify_dm_packet_signature(
+        signed_bytes,
+        &signature,
+        &signed.inviter_identity_pub,
+        signed.signing_device_hash,
+    )?;
+
+    // Phase 3b auto-accept: write Space + cache + cached identity pub.
+    // (Phase 4 will replace this with a stage-pending-invite + UI prompt
+    // path; follow-up ticket filed at PR-creation time per spec.)
+
+    // Build a parallel pubs vec: Some(inviter_identity_pub) at the signer's
+    // index, None everywhere else. The receiver knows the inviter's
+    // identity pub for the device that signed THIS invite, but has no pubs
+    // for the inviter's other devices yet — they remain pre-bootstrap
+    // until the next invite-equivalent flow.
+    let mut device_identity_pubs: Vec<Option<[u8; 64]>> = vec![None; signed.sender_devices.len()];
+    let signer_idx = signed
+        .sender_devices
+        .iter()
+        .position(|d| *d == signed.signing_device_hash)
+        .expect("sanity gate 2 already verified signing_device_hash ∈ sender_devices");
+    device_identity_pubs[signer_idx] = Some(signed.inviter_identity_pub);
+
+    // SECURITY: the OwnerDeviceCache LWW HLC must record when WE
+    // learned about these devices, NOT the timestamp the inviter
+    // claims they sent the invite. Using `signed.created_at` here
+    // would let an attacker forge a far-future HLC (e.g.,
+    // wall_ms = u64::MAX / 2) on a single malicious invite,
+    // pinning the local cache and rejecting every legitimate
+    // future update from the same owner as `StaleHlc` — a
+    // denial-of-updates attack. Mirror the pattern that
+    // `handle_cidnotify_lifted` Phase A already uses (local wall clock
+    // + our device_id).
+    let learned_at = Hlc {
+        wall_ms: wall_now_ms,
+        logical: 0,
+        device_id: device_id.to_string(),
+    };
+
+    // Build the Space from the invite. Mirror what add_space's DM/group-DM
+    // handling will produce (Phase 4 will produce these on the SEND side
+    // as outbound invites; here we mirror the same shape on the RECEIVE
+    // side as inbound invite acceptance).
+    // ZEB-474: DM/GroupDm Spaces carry transport=None (deposit-only;
+    // the Reticulum carrier was removed). Delivery uses OwnerDeviceCache,
+    // not Space.transport.
+    let space = crate::owner_state_types::Space {
+        id: signed.space_id,
+        kind: signed.kind,
+        parent: None,
+        community_id: None,
+        name: format!("DM with {}", hex::encode(signed.inviter.0)),
+        transport: None,
+        members: signed.members,
+        custom_name: None,
+        notification_pref: None,
+        left_at: None,
+        created_at: signed.created_at.clone(),
+        updated_at: signed.created_at,
+        content_key: Some(signed.content_key),
+        prior_content_keys: vec![],
+        current_epoch: None,
+        current_epoch_key: None,
+        old_epoch_keys: std::collections::BTreeMap::new(),
+        admin_addr: None,
+        is_invite_only: None,
+        shared_in_profile: false,
+        pending_join_at: None,
+    };
+    let space_outcome = state.apply_space_with_canonicalization(space);
+    if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = space_outcome {
+        return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
+    }
+
+    // SECURITY (CodeRabbit F2): only write the OwnerDeviceCache AFTER the Space
+    // apply succeeds. A malformed/rejected invite must not alter trust state, so
+    // the cache mutation is sequenced behind the Space's invariant check. The
+    // cache update does NOT feed the Space apply (they are independent), so this
+    // reordering is purely a "commit cache last" guard with no behavioral change
+    // on the happy path.
+    let cache_outcome = state.apply_owner_device_update(
+        signed.inviter,
+        signed.sender_devices,
+        device_identity_pubs,
+        // ZEB-473: no tunnel contacts on this DM-receive cache refresh
+        // (populated only on the friend handshake, Task 5).
+        Vec::new(),
+        learned_at,
+    );
+    if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
+        return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
+    }
+
+    Ok(DrainOutcome::default())
+}
+
 /// ZEB-233: lock-lifted drain entrypoint for production.
 ///
 /// Three-phase structure mirroring `handle_cidnotify_lifted` (ZEB-241):
@@ -2347,6 +2419,13 @@ pub enum DmReceiveError {
     SigningDeviceNotInSenderDevices,
     #[error("self_owner_addr must be in DmInvite.members")]
     ReceiverNotInMembers,
+    /// CodeRabbit F1: the payload-controlled `DmInvite.inviter` does not match
+    /// the owner the authenticated tunnel peer resolves to. A valid signer
+    /// claiming another owner's `OwnerAddr` is rejected BEFORE any cache/Space
+    /// mutation — this defeats cache-poisoning + spoofed-DM-Space via an
+    /// inviter-field forgery on the authenticated tunnel ingest path.
+    #[error("DmInvite.inviter does not match the authenticated tunnel peer's owner")]
+    InviterMismatch,
     #[error("ack from owner not in OutboxEntry.recipient_owners")]
     AckFromNonRecipient,
     #[error("OutboxEntry not found for (space_id, message_cid)")]
@@ -5190,6 +5269,82 @@ mod tests {
             err
         );
         assert!(!state.spaces.contains_key(&SpaceId([7; 16])));
+    }
+
+    /// CodeRabbit F2: an invite whose Space fails its Phase-1 invariants (here a
+    /// `Dm`-kind Space carrying 3 members — DMs require exactly 2) must leave the
+    /// `OwnerDeviceCache` UNCHANGED. The Space apply now runs BEFORE the cache
+    /// write, so a rejected Space returns `Err` before any trust-state mutation —
+    /// a malformed/rejected invite can no longer seed the inviter's device cache.
+    #[tokio::test]
+    async fn apply_invite_rejected_space_leaves_owner_device_cache_unchanged() {
+        use crate::owner_state_crdt::OwnerState;
+        let mut state = OwnerState::default();
+
+        let alice = OwnerAddr([0xaa; 16]);
+        let outbox = make_outbox_synthetic("device", alice);
+        let self_owner = outbox.self_owner;
+
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+
+        let inviter = OwnerAddr([0x01; 16]);
+        // A 3-member `Dm` Space — fails `validate_invariants` ("dm must have
+        // exactly 2 distinct members"). Members are sorted ascending and include
+        // both inviter and self_owner so apply_invite's sanity gates 1+3 pass and
+        // the Space apply is the ONLY thing that rejects.
+        let mut members = vec![inviter, self_owner, OwnerAddr([0xee; 16])];
+        members.sort();
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id: SpaceId([7; 16]),
+            kind: SpaceKind::Dm,
+            members,
+            inviter,
+            content_key: DmContentKey::new([0xaa; 32]),
+            sender_devices: vec![device_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice".into(),
+            },
+            signing_device_hash: device_hash,
+            inviter_identity_pub: identity_pub,
+        };
+        let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private.sign(&body_bytes);
+
+        // `None` for expected_inviter isolates the F2 (cache-on-reject) concern
+        // from the F1 inviter-bind gate. The Space apply is what rejects here.
+        let err = apply_invite(
+            &mut state,
+            self_owner,
+            &outbox.device_id,
+            signed,
+            signature,
+            &body_bytes,
+            200,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DmReceiveError::CrdtRejected(_)),
+            "a 3-member Dm Space must be rejected by apply_space_with_canonicalization, got {:?}",
+            err
+        );
+
+        // The Space was never written...
+        assert!(
+            !state.spaces.contains_key(&SpaceId([7; 16])),
+            "rejected Space must not be persisted"
+        );
+        // ...and the inviter's device cache was NEVER touched (F2: cache write is
+        // sequenced AFTER a successful Space apply).
+        assert!(
+            !state.owner_device_cache.devices.contains_key(&inviter),
+            "a Space-rejected invite must NOT mutate the OwnerDeviceCache"
+        );
     }
 
     // ── Phase 3b Task 10: handle_cidnotify_lifted tests ────────────────────────

@@ -396,58 +396,57 @@ async fn s2_friend_graph_and_dm_send() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// S2 (hard-assert): live 1:1 DM byte-delivery over the PQ tunnel (ZEB-473).
+// S2 (hard-assert): live 1:1 DM byte-delivery over the PQ tunnel (ZEB-473/482).
 //
 // Two co-located headless nodes friend each other, Alice sends a DM, and Bob MUST
 // receive the DM byte — asserted BOTH ways: the `dm-received` WS event fires on Bob
-// AND the plaintext lands in Bob's DM thread. This is the exact assertion that fails
-// pre-carrier; it gates the DM-over-iroh path end-to-end co-located.
+// AND the plaintext lands in Bob's DM thread. This gates the DM-over-iroh path
+// end-to-end co-located.
 //
-// ── WHY THIS IS `#[ignore]`'d (precise, empirically captured 2026-06-15) ──────
-// Running this test against the Tasks-1-9 binary reveals the PQ tunnel path works
-// up to — but not through — DM-Space admission. Both node stderr logs show, for
-// every DM, in BOTH directions:
+// ── STATE (ZEB-482 invite carrier landed; co-located byte-delivery STILL gated) ──
+// ZEB-473 (Move 1a) proved the PQ tunnel DIALS + HANDSHAKES co-located and that
+// `IrohTunnelDmTransport` routes a signed CidNotify the peer's `ingest_dm_packet`
+// receives — but every tunnel DM was then rejected at
+// `verify_cidnotify_admission: SpaceNotFound`, because a DM `Space` (random
+// per-owner `SpaceId` + per-Space `content_key`) had no cross-owner carrier after
+// the Reticulum unicast invite was removed in harmony#280.
 //
-//   ZEB-473: tunnel DM rejected; dropping (deposit rung covers durability)
-//       peer=<peer-node-id> payload_len=184
-//       reason=verify_cidnotify_admission: SpaceNotFound
+// ZEB-482 (Move 1b) re-wires the already-built DmInvite fan-out onto the SAME
+// tunnel: `add_space_impl` routes the signed `DmInvite` over `send_dm` at
+// Space-creation time (before the first CidNotify), and `ingest_dm_packet` now
+// dispatches `DmPacket::Invite` into the shared `apply_invite` auto-accept. This is
+// PROVEN to land co-located: with ZEB-482 the receiver's rejection reason advances
+// from `SpaceNotFound` → `CAS fetch: no successful reply`. I.e. the Space now
+// bootstraps from the invite and admission SUCCEEDS — the `SpaceNotFound` gap this
+// test documented is closed. (A simultaneous-dial tunnel-dedup fix in
+// `tunnel_manager::note_active` — retain `pending` so a dedup-loss redirects the
+// invite onto the winning session — was needed for the invite to survive the
+// invite/invite collision both nodes trigger the instant they friend.)
 //
-// So co-located, end-to-end:
-//   ✓ the per-device PQ tunnel DIALS + HANDSHAKES between the two nodes,
-//   ✓ `IrohTunnelDmTransport` builds the signed CidNotify and routes it,
-//   ✓ the inbound tunnel loop DELIVERS the 184-byte packet to the peer,
-//   ✓ the drain runs it through `ingest_dm_packet` → `verify_cidnotify_admission`,
-//   ✗ which REJECTS it: `SpaceNotFound`. (The CAS blob fetch — the other suspected
-//     gap — is never even reached.)
+// REMAINING gap (out of ZEB-482 scope): the encrypted DM *blob* is not deliverable
+// co-located. The tunnel carries only the CidNotify (by ZEB-473 design); the blob
+// is fetched from CAS via the `harmony/content/{shard}/{cid}` zenoh query — but the
+// content-serve queryable REFUSES encrypted CIDs (`content_cid_servable` gate:
+// "private encrypted content stays unservable" — a deliberate confidentiality
+// property; serving DM ciphertext to any querier leaks it to non-recipients). With
+// no deposit/relay rung present co-located (butler/community-relay), Bob has no path
+// to the blob, so the `dm-received` assert below still times out. Closing this is
+// the DEPOSIT-carrier parity work tracked by **ZEB-483** (deposit the DM — blob
+// inline — for offline/cross-WAN bootstrap, which is also the co-located byte path
+// here), NOT the invite-carrier ZEB-482 owns.
 //
-// Root cause (NOT a ZEB-473 regression — an upstream carrier gap ZEB-473 exposes):
-// a DM Space is minted with a RANDOM per-owner `SpaceId` AND a per-Space random
-// `content_key` (`add_space_dm_inner`). For Bob to admit + decrypt Alice's DM he
-// must hold the SAME Space (same id, same content_key) Alice signed/encrypted
-// under. That Space reaches a recipient via the DmInvite, which used to ride the
-// Reticulum unicast carrier — REMOVED in harmony#280 (`add_space` now discards the
-// `sends` Vec; see lib.rs `add_space_impl`, the "ZEB-473 (Move 1a)" note). The
-// only remaining Space carrier is owner-state-root CRDT sync, which is keyed per
-// owner KeyTree — it replicates a Space across one owner's OWN devices, NOT across
-// two different friend owners. So co-located there is currently NO cross-owner DM-
-// Space carrier: even if SpaceIds matched, the differing content_keys would fail
-// decrypt. Re-wiring the DmInvite fan-out onto the iroh tunnel is an explicit
-// "later move" (lib.rs add_space_impl + add_space_dm_inner ZEB-474 notes), out of
-// ZEB-473 Move 1a scope.
-//
-// This test is therefore kept as a HARD ASSERT (it is NOT weakened to pass) and is
-// `#[ignore]`'d so it documents the exact remaining gap and flips green for free
-// the moment the DM-Space carrier lands. Run it explicitly with:
-//   cargo nextest run --features e2e -E 'test(s2_dm_delivery_over_tunnel_hard_assert)' \
-//       --run-ignored all
+// So this stays a HARD ASSERT (NOT weakened) and `#[ignore]`'d: it documents the
+// now-precise remaining gap and flips green the moment the DM-blob deposit/serve
+// path lands (ZEB-483). Run it explicitly with:
+//   cargo nextest run --features e2e -E 'test(s2_dm_delivery_over_tunnel_hard_assert)'
 // ─────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ZEB-473: tunnel delivers the signed CidNotify co-located, but the DM \
-            Space (random per-owner SpaceId + content_key) has no cross-owner carrier \
-            (DmInvite rode Reticulum, removed in harmony#280; re-wiring onto the tunnel \
-            is a later move) → receiver rejects every tunnel DM at \
-            verify_cidnotify_admission: SpaceNotFound. Un-ignore once the DM-Space \
-            invite carrier lands."]
+#[ignore = "ZEB-482 landed the DM-Space invite carrier (admission advances \
+            SpaceNotFound → CAS-fetch, Space now bootstraps), but co-located DM \
+            byte-delivery still needs the encrypted blob, which the content-serve \
+            queryable refuses (encrypted=unservable) and no deposit/relay rung \
+            carries co-located. Un-ignore once the DM-blob deposit/serve path lands \
+            (ZEB-483)."]
 async fn s2_dm_delivery_over_tunnel_hard_assert() {
     use e2e_harness::driver::*;
     use std::time::Duration;
