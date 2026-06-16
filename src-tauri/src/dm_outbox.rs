@@ -1484,6 +1484,17 @@ impl DmOutbox {
                 );
                 Ok(DrainOutcome::default())
             }
+            // ZEB-484 Task 1: the wire variant + codec exist, but the receive
+            // path for the inline blob is wired by a LATER task. The live
+            // carrier is the tunnel ingest path (`ingest_dm_packet`); this
+            // dormant outbox dispatch never produces it, so drop+warn rather
+            // than mishandle.
+            crate::dm_envelope::DmPacket::CidNotifyWithBlob { .. } => {
+                tracing::warn!(
+                    "handle_unicast received CidNotifyWithBlob; inline-blob receive path is not wired on this dispatch. Dropping packet."
+                );
+                Ok(DrainOutcome::default())
+            }
         }
     }
 

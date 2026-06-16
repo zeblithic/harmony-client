@@ -196,6 +196,22 @@ pub enum DmPacket {
         signature: [u8; 64],
         signed_bytes: Vec<u8>,
     },
+    /// ZEB-484 (Move 1c): a `CidNotify` carrying the encrypted DM `storage_blob`
+    /// inline, for live peer-to-peer delivery over the PQ tunnel when the
+    /// recipient has no butler. `signed`/`signature`/`signed_bytes` are IDENTICAL
+    /// to a bare `CidNotify` (the same Ed25519 signature authenticates them); the
+    /// `storage_blob` carries no separate signature because it is bound by
+    /// content-addressing — the receiver recomputes
+    /// `ContentId::for_book(storage_blob)` and rejects a mismatch. The wire layout
+    /// is length-delimited (two variable-length fields), distinct from the
+    /// `[disc][body][64-sig]` layout of the other three variants. See
+    /// `encode_packet` / `decode_packet`.
+    CidNotifyWithBlob {
+        signed: DmCidNotifySigned,
+        signature: [u8; 64],
+        signed_bytes: Vec<u8>,
+        storage_blob: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -260,6 +276,36 @@ pub enum DecodeError {
 /// verbatim preserves byte-exactness on decode→encode round trips
 /// (relay scenarios), since the on-wire body is preserved bit-for-bit.
 pub fn encode_packet(packet: &DmPacket) -> Result<Vec<u8>, EncodeError> {
+    // ZEB-484: the blob-carrying variant has two variable-length fields, so it
+    // uses an explicit length-delimited layout instead of the shared
+    // [disc][signed_bytes][64-sig] layout. Handle + return early.
+    if let DmPacket::CidNotifyWithBlob {
+        signed,
+        signature,
+        signed_bytes,
+        storage_blob,
+    } = packet
+    {
+        let re_encoded = crate::owner_state_crypto::canonical_cbor_encode(signed)
+            .map_err(|e| EncodeError::ReSerialize(format!("re-encode signed body: {e}")))?;
+        if re_encoded != *signed_bytes {
+            return Err(EncodeError::SignedMutated(
+                "DmPacket CidNotifyWithBlob variant: signed mutated post-build (re-encode \
+                 mismatches cached signed_bytes; signature would not cover wire body)"
+                    .to_string(),
+            ));
+        }
+        let body_len = u32::try_from(signed_bytes.len()).map_err(|_| {
+            EncodeError::Cbor("CidNotifyWithBlob signed_bytes length exceeds u32".to_string())
+        })?;
+        let mut out = Vec::with_capacity(1 + 4 + signed_bytes.len() + 64 + storage_blob.len());
+        out.push(0x04);
+        out.extend_from_slice(&body_len.to_be_bytes());
+        out.extend_from_slice(signed_bytes);
+        out.extend_from_slice(signature);
+        out.extend_from_slice(storage_blob);
+        return Ok(out);
+    }
     let (disc, signed_bytes, signature): (u8, &Vec<u8>, &[u8; 64]) = match packet {
         DmPacket::Invite {
             signed,
@@ -308,6 +354,9 @@ pub fn encode_packet(packet: &DmPacket) -> Result<Vec<u8>, EncodeError> {
                 ));
             }
             (0x03, signed_bytes, signature)
+        }
+        DmPacket::CidNotifyWithBlob { .. } => {
+            unreachable!("CidNotifyWithBlob is handled by the early return above")
         }
     };
     let mut out = Vec::with_capacity(1 + signed_bytes.len() + 64);
@@ -367,8 +416,33 @@ pub fn build_signed_ack(
     })
 }
 
+/// ZEB-484: build a `CidNotifyWithBlob` packet — a signed `CidNotify` (signed
+/// EXACTLY like `build_signed_cidnotify`) plus the encrypted `storage_blob`
+/// carried inline. The blob is NOT signed; it is bound by content-addressing at
+/// the receiver (`ContentId::for_book(storage_blob) == signed.message_cid`).
+pub fn build_signed_cidnotify_with_blob(
+    signed: DmCidNotifySigned,
+    signing_key: &ed25519_dalek::SigningKey,
+    storage_blob: Vec<u8>,
+) -> Result<DmPacket, EncodeError> {
+    let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed)
+        .map_err(|e| EncodeError::Cbor(e.to_string()))?;
+    let signature = crate::dm_signing::sign_dm_packet(&signed_bytes, signing_key);
+    Ok(DmPacket::CidNotifyWithBlob {
+        signed,
+        signature,
+        signed_bytes,
+        storage_blob,
+    })
+}
+
 pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
     let (disc, rest) = bytes.split_first().ok_or(DecodeError::Empty)?;
+    // ZEB-484: the blob-carrying variant is length-delimited (two variable
+    // fields); it does NOT use the "sig = last 64 bytes" split used below.
+    if *disc == 0x04 {
+        return decode_cidnotify_with_blob(rest);
+    }
     // Need at least 1 byte of body + 64 bytes of signature.
     if rest.len() < 64 + 1 {
         return Err(DecodeError::TooShortForSignature);
@@ -489,6 +563,55 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
         other => return Err(DecodeError::UnknownDiscriminant(*other)),
     };
     Ok(packet)
+}
+
+/// ZEB-484: decode the length-delimited `CidNotifyWithBlob` body (everything
+/// after the `0x04` discriminant):
+/// `[u32 BE len(signed_bytes)][signed_bytes][64 sig][storage_blob]`.
+/// Applies the same CidNotify structural invariants as the `0x02` arm and
+/// requires a non-empty blob (an empty blob is malformed — the sender would use
+/// a bare `CidNotify`).
+fn decode_cidnotify_with_blob(rest: &[u8]) -> Result<DmPacket, DecodeError> {
+    if rest.len() < 4 {
+        return Err(DecodeError::TooShortForSignature);
+    }
+    let (len_bytes, after_len) = rest.split_at(4);
+    let body_len = u32::from_be_bytes(
+        len_bytes
+            .try_into()
+            .expect("split_at(4) yields exactly 4 bytes"),
+    ) as usize;
+    if after_len.len() < body_len + 64 {
+        return Err(DecodeError::TooShortForSignature);
+    }
+    let (body_bytes, after_body) = after_len.split_at(body_len);
+    let (signature_bytes, storage_blob) = after_body.split_at(64);
+    let signature: [u8; 64] = signature_bytes
+        .try_into()
+        .expect("split_at(64) yields exactly 64 bytes");
+    if storage_blob.is_empty() {
+        return Err(DecodeError::Invalid(
+            "CidNotifyWithBlob.storage_blob must be non-empty",
+        ));
+    }
+    let signed: DmCidNotifySigned = decode_body(body_bytes)?;
+    ensure_canonical_body(&signed, body_bytes)?;
+    if signed.sender_devices.len() > MAX_DEVICES_PER_OWNER {
+        return Err(DecodeError::Invalid(
+            "CidNotifyWithBlob.sender_devices exceeds MAX_DEVICES_PER_OWNER",
+        ));
+    }
+    if !signed.sender_devices.contains(&signed.signing_device_hash) {
+        return Err(DecodeError::Invalid(
+            "CidNotifyWithBlob.signing_device_hash must be in sender_devices",
+        ));
+    }
+    Ok(DmPacket::CidNotifyWithBlob {
+        signed,
+        signature,
+        signed_bytes: body_bytes.to_vec(),
+        storage_blob: storage_blob.to_vec(),
+    })
 }
 
 /// Decode a CBOR body, rejecting any trailing bytes after the first valid
@@ -1423,6 +1546,66 @@ mod tests {
         let _decoded = decode_packet(&canonical_wire).expect(
             "canonical-body wire packet must decode (canonical-body check is the only \
              new gate in this test)",
+        );
+    }
+
+    #[test]
+    fn dm_packet_cidnotify_with_blob_round_trip() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let device_hash = DeviceIdentityHash([0x11; 16]);
+        let signed = DmCidNotifySigned {
+            space_id: SpaceId([0x77; 16]),
+            message_cid: ContentId::from_bytes([0xab; 32]),
+            sender_owner_addr: OwnerAddr([0xA1; 16]),
+            sender_devices: vec![device_hash],
+            signing_device_hash: device_hash,
+        };
+        let storage_blob = vec![0xCDu8; 4096];
+        let packet =
+            build_signed_cidnotify_with_blob(signed.clone(), &signing_key, storage_blob.clone())
+                .expect("build with-blob packet");
+        let wire = encode_packet(&packet).expect("encode");
+        assert_eq!(wire[0], 0x04, "discriminant byte is 0x04");
+        let decoded = decode_packet(&wire).expect("decode");
+        match decoded {
+            DmPacket::CidNotifyWithBlob {
+                signed: d_signed,
+                storage_blob: d_blob,
+                ..
+            } => {
+                assert_eq!(d_signed, signed, "signed body round-trips");
+                assert_eq!(d_blob, storage_blob, "storage_blob round-trips");
+            }
+            other => panic!("expected CidNotifyWithBlob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dm_packet_cidnotify_with_blob_empty_blob_rejected() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let device_hash = DeviceIdentityHash([0x11; 16]);
+        let signed = DmCidNotifySigned {
+            space_id: SpaceId([0x77; 16]),
+            message_cid: ContentId::from_bytes([0xab; 32]),
+            sender_owner_addr: OwnerAddr([0xA1; 16]),
+            sender_devices: vec![device_hash],
+            signing_device_hash: device_hash,
+        };
+        let packet = build_signed_cidnotify_with_blob(signed, &signing_key, Vec::new()).unwrap();
+        let wire = encode_packet(&packet).unwrap();
+        let err = decode_packet(&wire).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Invalid(m) if m.contains("storage_blob must be non-empty")),
+            "an empty inline blob must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn dm_packet_cidnotify_with_blob_truncated_rejected() {
+        let err = decode_packet(&[0x04, 0x00, 0x00]).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::TooShortForSignature),
+            "got {err:?}"
         );
     }
 }

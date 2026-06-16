@@ -460,6 +460,15 @@ pub(crate) async fn ingest_dm_packet(
                 "tunnel DM packet is an Ack (not handled on the tunnel ingest path)".into(),
             );
         }
+        // ZEB-484 Task 1: the wire variant + codec exist, but the receive path
+        // that handles the inline blob is wired by a LATER task. Until then,
+        // reject it explicitly (the drain logs + drops) rather than silently
+        // mishandle it — never panic the drain.
+        crate::dm_envelope::DmPacket::CidNotifyWithBlob { .. } => {
+            return Err(
+                "tunnel DM packet is a CidNotifyWithBlob (inline-blob ingest not yet wired)".into(),
+            );
+        }
     };
 
     // 2. Admission under the owner-state lock — the SAME verification a
