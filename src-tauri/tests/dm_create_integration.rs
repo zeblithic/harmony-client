@@ -104,7 +104,7 @@ async fn add_space_dm_kind_generates_content_key_and_dispatches_invite() {
         "alice",
     );
 
-    let (space_id, fanout, was_merge) = add_space_dm_inner(
+    let (space_id, fanout) = add_space_dm_inner(
         &mut state,
         &alice_signing_key,
         &alice_identity_pub,
@@ -118,7 +118,11 @@ async fn add_space_dm_kind_generates_content_key_and_dispatches_invite() {
         None,
     )
     .expect("add_space_dm_inner must succeed");
-    assert!(!was_merge, "first creation must not be a merge");
+    // A fresh create returns `Some(fanout)`; `None` would mean a dedupe-merge.
+    assert!(
+        fanout.is_some(),
+        "first creation must not be a merge (returns Some fanout)"
+    );
 
     // Space is in CRDT.
     let space = state.spaces.get(&space_id).expect("space inserted");
@@ -180,7 +184,7 @@ async fn add_space_group_dm_with_15_recipients_succeeds() {
     // total members, exactly at the cap.
     let recipients: Vec<OwnerAddr> = (0..15u8).map(|i| OwnerAddr([0x10 + i; 16])).collect();
 
-    let (space_id, _fanout, _was_merge) = add_space_dm_inner(
+    let (space_id, _fanout) = add_space_dm_inner(
         &mut state,
         &alice_signing_key,
         &alice_identity_pub,
@@ -336,7 +340,7 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
     );
 
     // First create — Inserted.
-    let (first_id, first_fanout, first_merge) = add_space_dm_inner(
+    let (first_id, first_fanout) = add_space_dm_inner(
         &mut state,
         &alice_signing_key,
         &alice_identity_pub,
@@ -350,7 +354,7 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
         None,
     )
     .expect("first create must succeed");
-    assert!(!first_merge, "first create must not be a merge");
+    // `Some(fanout)` IS the not-a-merge signal (a merge returns `None`).
     let (_first_wire, first_recipients) = first_fanout.expect("first create returns Some(fanout)");
     assert_eq!(
         first_recipients,
@@ -365,7 +369,7 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
     // load-bearing assertion is "second_id IS the live entry in
     // state.spaces", not "second_id == first_id" (which only holds
     // when the second mint loses the tie-break).
-    let (second_id, second_fanout, second_merge) = add_space_dm_inner(
+    let (second_id, second_fanout) = add_space_dm_inner(
         &mut state,
         &alice_signing_key,
         &alice_identity_pub,
@@ -379,15 +383,16 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
         None,
     )
     .expect("second create must succeed (dedupe path)");
-    assert!(second_merge, "second create must be a merge (dedupe)");
     assert!(
         state.spaces.contains_key(&second_id),
         "second create returns a canonical SpaceId that's live in state.spaces \
          (NOT a stale loser id whose entry was dropped by the dedupe merge)"
     );
+    // `None` fanout IS the merge signal: the dedupe path must NOT re-dispatch
+    // a DmInvite (the existing Space was already invited at original creation).
     assert!(
         second_fanout.is_none(),
-        "second create must NOT re-dispatch DmInvite (existing was already invited)"
+        "second create must be a merge (dedupe) → no fanout"
     );
 
     // Post-condition: state.spaces has exactly one DM Space for this

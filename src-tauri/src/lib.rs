@@ -10166,7 +10166,7 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
 ///      `send_dm`. Best-effort: a recipient with no cached tunnel contact
 ///      is skipped at the caller (durability is ZEB-483's deposit rung).
 ///
-/// Returns `(canonical_space_id, fanout, was_merge)`:
+/// Returns `(canonical_space_id, fanout)`:
 ///   - `canonical_space_id` is the SpaceId after CRDT canonicalization.
 ///     If `apply_space_with_canonicalization` merged the freshly-minted
 ///     Space into an existing one with the same dedupe key (sorted
@@ -10175,14 +10175,13 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
 ///     readback would otherwise miss a real winner.
 ///   - `fanout` is `Some((invite_wire, recipients))` on a fresh create —
 ///     the signed `DmInvite` wire bytes + the recipient OWNERS the caller
-///     routes them to over the tunnel. It is `None` when `was_merge ==
-///     true` because the existing Space's invites were already sent at
-///     original creation; re-firing would just produce duplicate-invite
-///     handling on the recipient.
-///   - `was_merge` lets the caller skip the tunnel fan-out on a strongly
-///     typed signal (a fresh Space with zero recipient tunnel contacts
-///     still returns `Some(fanout)` — those two cases have different
-///     semantics than a dedupe-merge `None`).
+///     routes them to over the tunnel. It is `None` ONLY on a dedupe-merge,
+///     because the existing Space's invites were already sent at original
+///     creation; re-firing would just produce duplicate-invite handling on
+///     the recipient. `None` is therefore the merge signal — the caller
+///     skips the tunnel fan-out exactly when `fanout.is_none()`. A fresh
+///     Space with zero recipient tunnel contacts still returns
+///     `Some((invite_wire, recipients))` (distinct from a merge `None`).
 ///
 /// The pure-function shape lets integration tests exercise the
 /// validation + Space-construction + invite-build logic without
@@ -10211,8 +10210,9 @@ pub fn add_space_dm_inner(
         // merged into an existing one (already invited at original creation).
         // `Some((invite_wire, recipients))` on a fresh create — the caller
         // routes `invite_wire` over the iroh tunnel to each recipient owner.
+        // A merge is signalled by `None` alone; there is no separate flag
+        // (Greptile: `fanout.is_none()` already carries `was_merge`).
         Option<(Vec<u8>, Vec<crate::owner_state_types::OwnerAddr>)>,
-        bool,
     ),
     String,
 > {
@@ -10377,12 +10377,12 @@ pub fn add_space_dm_inner(
 
     // Short-circuit on merge: nothing to dispatch (existing Space
     // already invited everyone at original creation). Returning
-    // `was_merge=true` (and `fanout=None`) lets the outer command skip
-    // the tunnel send on a more strongly typed signal than "sends is
-    // empty" (which would conflate the merge case with the legitimate
-    // "no recipient devices known yet" case).
+    // `fanout=None` lets the outer command skip the tunnel send on a more
+    // strongly typed signal than "sends is empty" (which would conflate the
+    // merge case with the legitimate "no recipient devices known yet" case,
+    // which returns `Some((wire, []))`).
     if was_merge {
-        return Ok((canonical_space_id, None, true));
+        return Ok((canonical_space_id, None));
     }
 
     // ── 7. Build + sign the DmInvite. Our own devices come from
@@ -10429,7 +10429,7 @@ pub fn add_space_dm_inner(
     //       recipient owner → its cached DeviceTunnelContact(s) → tunnel
     //       NodeId and fires `send_dm`. (Was a per-device
     //       `UnicastSendRequest` Vec for the removed Reticulum carrier.)
-    Ok((canonical_space_id, Some((invite_wire, recipients)), false))
+    Ok((canonical_space_id, Some((invite_wire, recipients))))
 }
 
 /// ZEB-228 Phase 4 — Create a new Space.
@@ -10556,13 +10556,13 @@ pub(crate) async fn add_space_impl(
     // We borrow signing_key + our_signing_device_hash from DmOutbox so
     // we don't double-store identity-derived material on NodeState.
     //
-    // `was_merge` from the inner function tells us whether
+    // A `None` `fanout` from the inner function tells us
     // apply_space_with_canonicalization collapsed our minted Space into
     // an existing one with the same dedupe key. In that case `space_id`
     // is the EXISTING (canonical winner) id — guaranteed live in
-    // state.spaces — and `fanout` is `None` (the existing Space was
-    // already invited at original creation).
-    let (space_id, fanout, _was_merge, new_hlc) = {
+    // state.spaces — and the existing Space was already invited at
+    // original creation, so there is nothing to fan out.
+    let (space_id, fanout, new_hlc) = {
         let outbox_g = dm_outbox.lock().await;
         let mut state_g = crdt_state.lock().await;
         let mut tracker_g = hlc_tracker.lock().await;
@@ -10576,7 +10576,7 @@ pub(crate) async fn add_space_impl(
         // dedupe-merge). We route it over the iroh tunnel AFTER this build-lock
         // block releases (the tunnel `send_dm` must not run under the
         // owner-state locks).
-        let (canonical_id, fanout, was_merge) = add_space_dm_inner(
+        let (canonical_id, fanout) = add_space_dm_inner(
             &mut state_g,
             signing_key,
             &identity_pub_64,
@@ -10620,7 +10620,7 @@ pub(crate) async fn add_space_impl(
             tracker_g.insert(device_id.clone(), stamped.clone());
         }
 
-        (canonical_id, fanout, was_merge, stamped)
+        (canonical_id, fanout, stamped)
     };
     let _ = new_hlc; // borrowed only to pin the tracker update timing
 

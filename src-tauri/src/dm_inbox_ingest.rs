@@ -1724,6 +1724,62 @@ mod tests {
         );
     }
 
+    /// Greptile P2: a `DmPacket::Ack` arriving on the tunnel ingest path is
+    /// explicitly rejected (Acks are not handled here) — the error names the
+    /// "Ack" type and NEITHER the inbox NOR the event sink is touched. The
+    /// rejection arm is a bare `return Err(...)` on the variant match; this test
+    /// pins it so a future change that starts accepting Acks on this path can't
+    /// land untested.
+    #[tokio::test]
+    async fn ingest_dm_packet_rejects_an_ack_packet() {
+        let fx = build_dm_ingest_fixture(b"hi").await;
+
+        // A structurally-valid Ack — `decode_packet` requires `signing_device_hash
+        // ∈ ack_from_devices`. The ingest Ack arm rejects on the variant match
+        // BEFORE any signature verification, so an all-zero signature is fine
+        // and the peer_node_id is irrelevant (`[0u8; 32]`).
+        let device_hash = crate::owner_state_types::DeviceIdentityHash([0x01; 16]);
+        let signed = crate::dm_envelope::DmAckSigned {
+            space_id: SpaceId([0x55; 16]),
+            message_cid: ContentId::from_bytes([0xab; 32]),
+            ack_from_owner_addr: OwnerAddr([0xA1; 16]),
+            ack_from_devices: vec![device_hash],
+            signing_device_hash: device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let packet = crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Ack {
+            signed,
+            signature: [0u8; 64],
+            signed_bytes,
+        })
+        .expect("a well-formed Ack must encode");
+
+        let err = ingest_dm_packet(
+            &fx.crdt_state,
+            &fx.content_store,
+            &fx.sink,
+            fx.bob,
+            &fx.bob_device_id,
+            [0u8; 32],
+            &packet,
+        )
+        .await
+        .expect_err("an Ack on the tunnel ingest path must be rejected");
+        assert!(
+            err.contains("Ack"),
+            "the rejection must name the Ack packet type, got: {err}"
+        );
+
+        assert!(
+            fx.crdt_state.lock().await.inbox.is_empty(),
+            "a rejected Ack must not touch the inbox"
+        );
+        assert!(
+            fx.sink_handle.frames().is_empty(),
+            "a rejected Ack must not emit"
+        );
+    }
+
     /// CodeAnt F1 (TOCTOU): admission is checked under the lock, the lock is
     /// dropped for the slow CAS fetch, and the Space/membership are then
     /// re-checked under a SECOND lock before decrypt + apply. If the sender
