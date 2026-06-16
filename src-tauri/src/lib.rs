@@ -10155,31 +10155,30 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
 ///      Reticulum transport (empty participants — populated lazily as
 ///      announces flow), `created_at`/`updated_at` from a fresh HLC.
 ///   4. Apply locally via `apply_space_with_canonicalization`.
-///   5. Build a signed `DmInvite` packet and emit one
-///      `UnicastSendRequest` per device in each recipient's
-///      `OwnerDeviceCache` entry. Best-effort: a recipient with no
-///      cached devices yields zero outbound packets — Phase 3b's
-///      handle_invite-on-first-send_dm path still recovers because the
-///      sender's outbox loop will fan out the missing invite when the
-///      first message ships.
+///   5. Build a signed `DmInvite` packet (the body is identical per
+///      recipient) and return it for the caller to route over the iroh
+///      tunnel (ZEB-482). The caller resolves each recipient owner → its
+///      cached `DeviceTunnelContact`(s) → tunnel NodeId and fires
+///      `send_dm`. Best-effort: a recipient with no cached tunnel contact
+///      is skipped at the caller (durability is ZEB-483's deposit rung).
 ///
-/// Returns `(canonical_space_id, send_requests, was_merge)`:
+/// Returns `(canonical_space_id, fanout, was_merge)`:
 ///   - `canonical_space_id` is the SpaceId after CRDT canonicalization.
 ///     If `apply_space_with_canonicalization` merged the freshly-minted
 ///     Space into an existing one with the same dedupe key (sorted
 ///     members), this is the EXISTING Space's id, not the minted one
 ///     that just got dropped — the outer command's `state.spaces.get(&id)`
 ///     readback would otherwise miss a real winner.
-///   - `send_requests` is the list of DmInvite UnicastSendRequests.
-///     Empty when `was_merge == true` because the existing Space's
-///     invites were already sent at original creation time; sending
-///     duplicates here would just generate redundant network traffic
-///     and (for the recipient) noisy duplicate-invite handling.
-///   - `was_merge` lets the caller skip the dispatch loop without
-///     re-checking the sends vec emptiness for the duplicate-create
-///     case (a fresh Space with zero recipients in OwnerDeviceCache
-///     also produces an empty sends list — those two empties have
-///     different semantics).
+///   - `fanout` is `Some((invite_wire, recipients))` on a fresh create —
+///     the signed `DmInvite` wire bytes + the recipient OWNERS the caller
+///     routes them to over the tunnel. It is `None` when `was_merge ==
+///     true` because the existing Space's invites were already sent at
+///     original creation; re-firing would just produce duplicate-invite
+///     handling on the recipient.
+///   - `was_merge` lets the caller skip the tunnel fan-out on a strongly
+///     typed signal (a fresh Space with zero recipient tunnel contacts
+///     still returns `Some(fanout)` — those two cases have different
+///     semantics than a dedupe-merge `None`).
 ///
 /// The pure-function shape lets integration tests exercise the
 /// validation + Space-construction + invite-build logic without
@@ -10200,7 +10199,11 @@ pub fn add_space_dm_inner(
 ) -> Result<
     (
         crate::owner_state_types::SpaceId,
-        Vec<crate::dm_outbox::UnicastSendRequest>,
+        // ZEB-482: invite fan-out for the tunnel send. `None` when the Space
+        // merged into an existing one (already invited at original creation).
+        // `Some((invite_wire, recipients))` on a fresh create — the caller
+        // routes `invite_wire` over the iroh tunnel to each recipient owner.
+        Option<(Vec<u8>, Vec<crate::owner_state_types::OwnerAddr>)>,
         bool,
     ),
     String,
@@ -10366,12 +10369,12 @@ pub fn add_space_dm_inner(
 
     // Short-circuit on merge: nothing to dispatch (existing Space
     // already invited everyone at original creation). Returning
-    // `was_merge=true` lets the outer command skip the dispatch loop
-    // on a more strongly typed signal than "sends is empty" (which
-    // would conflate the merge case with the legitimate "no recipient
-    // devices known yet" case).
+    // `was_merge=true` (and `fanout=None`) lets the outer command skip
+    // the tunnel send on a more strongly typed signal than "sends is
+    // empty" (which would conflate the merge case with the legitimate
+    // "no recipient devices known yet" case).
     if was_merge {
-        return Ok((canonical_space_id, Vec::new(), true));
+        return Ok((canonical_space_id, None, true));
     }
 
     // ── 7. Build + sign the DmInvite. Our own devices come from
@@ -10411,30 +10414,18 @@ pub fn add_space_dm_inner(
     let invite_wire = crate::dm_envelope::encode_packet(&invite_packet)
         .map_err(|e| format!("encode_packet: {e}"))?;
 
-    // ── 8. One UnicastSendRequest per non-self recipient device. ─────
-    // Note: we hold a borrow of `state.owner_device_cache` here, which
-    // is fine because the `apply_space_with_canonicalization` write
-    // above already returned.
-    let mut sends: Vec<crate::dm_outbox::UnicastSendRequest> = Vec::new();
-    for r in &recipients {
-        let entry = match state.owner_device_cache.devices.get(r) {
-            Some(e) => e,
-            None => continue, // recipient unknown — outbox loop on first send_dm recovers
-        };
-        // DORMANT (ZEB-474 → ZEB-473/Move 1a): Reticulum carrier removed;
-        // these DmInvite packets reach the pinned core's SendUnicastToDevice
-        // handler and are dropped. Off-LAN Space-membership invites already
-        // failed to deliver; Move 1a rewires this onto the iroh tunnel.
-        for device in &entry.devices {
-            let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
-            sends.push(crate::dm_outbox::UnicastSendRequest {
-                destination_hash: dest_hash,
-                packet: invite_wire.clone(),
-            });
-        }
-    }
-
-    Ok((canonical_space_id, sends, false))
+    // ── 8. ZEB-482: return the invite fan-out (the signed wire bytes +
+    //       the recipient owners) for the caller to route over the iroh
+    //       tunnel AFTER the owner-state write lock is released. The invite
+    //       body is identical per recipient; the caller resolves each
+    //       recipient owner → its cached DeviceTunnelContact(s) → tunnel
+    //       NodeId and fires `send_dm`. (Was a per-device
+    //       `UnicastSendRequest` Vec for the removed Reticulum carrier.)
+    Ok((
+        canonical_space_id,
+        Some((invite_wire, recipients)),
+        false,
+    ))
 }
 
 /// ZEB-228 Phase 4 — Create a new Space.
@@ -10529,6 +10520,7 @@ pub(crate) async fn add_space_impl(
         device_id,
         self_owner,
         identity_pub_64,
+        tunnel_manager,
         snapshot_generation,
     ) = {
         let g = state
@@ -10542,6 +10534,11 @@ pub(crate) async fn add_space_impl(
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.dm_identity_pub_64
                 .ok_or("dm_identity_pub_64 missing (start_node didn't capture it?)")?,
+            // ZEB-482: the PQ tunnel manager (ZEB-473). `None` on a deposit-only
+            // node (no bound iroh endpoint) — the invite tunnel-send is then a
+            // no-op; the Space is still applied locally (ZEB-483 adds the
+            // deposit rung for offline/cross-WAN bootstrap parity).
+            g.tunnel_manager.clone(),
             g.generation,
         )
     };
@@ -10559,9 +10556,9 @@ pub(crate) async fn add_space_impl(
     // apply_space_with_canonicalization collapsed our minted Space into
     // an existing one with the same dedupe key. In that case `space_id`
     // is the EXISTING (canonical winner) id — guaranteed live in
-    // state.spaces — and `sends` is empty (the existing Space was
+    // state.spaces — and `fanout` is `None` (the existing Space was
     // already invited at original creation).
-    let (space_id, _was_merge, new_hlc) = {
+    let (space_id, fanout, _was_merge, new_hlc) = {
         let outbox_g = dm_outbox.lock().await;
         let mut state_g = crdt_state.lock().await;
         let mut tracker_g = hlc_tracker.lock().await;
@@ -10570,12 +10567,12 @@ pub(crate) async fn add_space_impl(
         let signing_key = outbox_g.signing_key.as_ref();
         let our_signing_device_hash = outbox_g.our_signing_device_hash;
 
-        // ZEB-473 (Move 1a): `add_space_dm_inner` still builds the DmInvite
-        // `sends` Vec, but the Reticulum unicast carrier that consumed it has
-        // been removed (harmony#280). Discard it here; recipients receive the
-        // Space via CRDT state-root sync and the outbox loop's first send_dm.
-        // Re-wiring the invite fan-out onto the iroh tunnel is a later move.
-        let (canonical_id, _sends, was_merge) = add_space_dm_inner(
+        // ZEB-482 (Move 1b): `add_space_dm_inner` returns the invite fan-out
+        // (`Some((invite_wire, recipients))` on a fresh create, `None` on a
+        // dedupe-merge). We route it over the iroh tunnel AFTER this build-lock
+        // block releases (the tunnel `send_dm` must not run under the
+        // owner-state locks).
+        let (canonical_id, fanout, was_merge) = add_space_dm_inner(
             &mut state_g,
             signing_key,
             &identity_pub_64,
@@ -10619,7 +10616,7 @@ pub(crate) async fn add_space_impl(
             tracker_g.insert(device_id.clone(), stamped.clone());
         }
 
-        (canonical_id, was_merge, stamped)
+        (canonical_id, fanout, was_merge, stamped)
     };
     let _ = new_hlc; // borrowed only to pin the tracker update timing
 
@@ -10658,15 +10655,210 @@ pub(crate) async fn add_space_impl(
         }
     }
 
-    // ZEB-473 (Move 1a): the DmInvite unicast dispatch was removed along with
-    // the Reticulum carrier (harmony#280). The minted Space reaches recipients
-    // via CRDT state-root sync, and the outbox loop's first send_dm into the
-    // Space rebuilds + ships its own DmInvite — so dropping the eager fan-out
-    // here changes nothing observable. The post-stop detachment guard above is
-    // retained (it still gates committing a Space minted against a detached
-    // crdt_state). Re-wiring the invite onto the iroh tunnel is a later move.
+    // ZEB-482 (Move 1b): route the signed DmInvite over the PQ iroh tunnel to
+    // each recipient owner's reachable device(s). This runs AFTER the build-lock
+    // block released (dm_outbox/crdt_state/hlc_tracker locks dropped) and AFTER
+    // the post-stop detachment guard committed the Space to a live node — so we
+    // never advertise a Space the sender lost on restart. The short read lock
+    // below resolves each recipient's cached DeviceTunnelContact(s); `send_dm`
+    // does NOT await (it locks the session map internally + lazily dials), so
+    // holding the `crdt_state` read lock across the fan-out is safe — but it
+    // must NOT span any other `.await`.
+    //
+    // On a deposit-only node (`tunnel_manager: None`) this is skipped entirely:
+    // the Space is already applied locally; the invite's offline/cross-WAN
+    // durability rung is ZEB-483. On a dedupe-merge (`fanout: None`) there is
+    // nothing to send (the existing Space was invited at original creation).
+    if let (Some(mgr), Some((invite_wire, recipients))) = (tunnel_manager.as_ref(), fanout) {
+        let state_g = crdt_state.lock().await;
+        for recipient in &recipients {
+            crate::iroh_tunnel_dm_transport::send_packet_to_owner_tunnels(
+                &state_g,
+                mgr,
+                *recipient,
+                &invite_wire,
+            );
+        }
+    }
 
     Ok(hex::encode(space_id.0))
+}
+
+/// ZEB-482 (Move 1b): the DmInvite send re-wire — `add_space_impl` routes the
+/// freshly-built invite over the iroh tunnel to each recipient owner's reachable
+/// device, and a deposit-only node (`tunnel_manager: None`) creates the Space
+/// locally but routes nothing.
+#[cfg(test)]
+mod add_space_tunnel_routing_tests {
+    use super::*;
+    use crate::owner_state_types::{
+        DeviceIdentityHash, DeviceTunnelContact, Hlc, OwnerAddr, OwnerDeviceEntry,
+    };
+    use crate::tunnel_manager::{node_id_from_dsa_pubkey, TunnelManager};
+    use std::collections::BTreeMap;
+    use std::sync::Arc as StdArc;
+
+    /// A `TunnelManager` over a real loopback iroh endpoint (cheap; never dials).
+    async fn test_manager() -> StdArc<TunnelManager> {
+        let endpoint = {
+            let sk = iroh::SecretKey::generate();
+            crate::iroh_endpoint::IrohEndpoint::new_with_secret(sk)
+                .await
+                .expect("bind loopback iroh endpoint")
+        };
+        let local_pq = StdArc::new(harmony_identity::PqPrivateIdentity::generate(
+            &mut rand::rngs::OsRng,
+        ));
+        let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
+        StdArc::new(TunnelManager::new(endpoint, local_pq, ingest_tx))
+    }
+
+    /// Build a `NodeState` wired with the DM handles `add_space_impl` snapshots
+    /// (dm_outbox, crdt_state, hlc_tracker, dm_device_id, dm_self_owner,
+    /// dm_identity_pub_64), an optional `tunnel_manager`, and the recipient's
+    /// cached `DeviceTunnelContact`. Returns the wired NodeState + the recipient
+    /// owner + the recipient's derived tunnel NodeId.
+    async fn wire_node_state(
+        tunnel_manager: Option<StdArc<TunnelManager>>,
+        recipient_contact: Option<DeviceTunnelContact>,
+    ) -> (NodeState, OwnerAddr, [u8; 32]) {
+        // Self (Alice) identity: a single PrivateIdentity drives the signing key,
+        // identity_pub, and device hash so the built invite is internally
+        // consistent (decode-able as a valid DmInvite).
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let self_device = DeviceIdentityHash(public.address_hash);
+        let self_owner = OwnerAddr([0xAA; 16]);
+        let private_bytes = private.to_private_bytes();
+        let ed_seed: [u8; 32] = private_bytes[32..64].try_into().unwrap();
+        let signing_key = StdArc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+
+        // DmOutbox via new_synthetic (its cert is a separate DM-layer fixture).
+        let test_owner = crate::community_membership::mint_test_owner(0xC7);
+        let community_sk = StdArc::new(ed25519_dalek::SigningKey::from_bytes(
+            &test_owner.device_key.to_bytes(),
+        ));
+        let dm_outbox = StdArc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                "alice-dev".into(),
+                self_owner,
+                self_device,
+                StdArc::clone(&signing_key),
+                StdArc::new(harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32])),
+                community_sk,
+                test_owner.cert,
+            ),
+        ));
+
+        // Recipient (Bob): cached with a single device + (optional) tunnel contact.
+        let recipient = OwnerAddr([0xB0; 16]);
+        let dsa_pubkey = vec![0x07u8; 1952];
+        let recipient_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+        let contact = recipient_contact.unwrap_or(DeviceTunnelContact {
+            iroh_node_id: [0x09; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: dsa_pubkey,
+            pq_kem_pubkey: vec![0x08u8; 1184],
+        });
+        let mut owner_state = crate::owner_state_crdt::OwnerState::default();
+        owner_state.owner_device_cache.devices.insert(
+            recipient,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0x33; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+                device_tunnel_contacts: vec![Some(contact)],
+            },
+        );
+        let crdt_state = StdArc::new(tokio::sync::Mutex::new(owner_state));
+        let hlc_tracker = StdArc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+
+        let mut node = NodeState::default();
+        node.dm_outbox = Some(dm_outbox);
+        node.crdt_state = Some(crdt_state);
+        node.hlc_tracker = Some(hlc_tracker);
+        node.dm_device_id = Some("alice-dev".into());
+        node.dm_self_owner = Some(self_owner);
+        node.dm_identity_pub_64 = Some(identity_pub);
+        node.tunnel_manager = tunnel_manager;
+
+        (node, recipient, recipient_node_id)
+    }
+
+    /// A DM create with a `Some(tunnel_manager)` and a recipient holding a
+    /// `DeviceTunnelContact` routes the signed `DmInvite` to the recipient's
+    /// `blake3(pq_dsa)` NodeId; the routed bytes decode to a `DmPacket::Invite`
+    /// whose `space_id` matches the created Space.
+    #[tokio::test]
+    async fn add_space_routes_dm_invite_over_the_tunnel() {
+        let mgr = test_manager().await;
+        let (node, recipient, recipient_node_id) =
+            wire_node_state(Some(StdArc::clone(&mgr)), None).await;
+        let state = std::sync::Mutex::new(node);
+
+        let space_id_hex = add_space_impl(
+            &state,
+            "dm".into(),
+            "DM with Bob".into(),
+            Some(vec![hex::encode(recipient.0)]),
+        )
+        .await
+        .expect("add_space must succeed");
+        let space_bytes: [u8; 16] = hex::decode(&space_id_hex).unwrap().try_into().unwrap();
+        let created_space_id = crate::owner_state_types::SpaceId(space_bytes);
+
+        // The recipient's tunnel session received exactly one packet: the invite.
+        let pending = mgr
+            .test_pending_packets(&recipient_node_id)
+            .expect("the invite must route to the recipient's tunnel NodeId");
+        assert_eq!(pending.len(), 1, "exactly one DmInvite routed");
+        match crate::dm_envelope::decode_packet(&pending[0]).expect("routed bytes decode") {
+            crate::dm_envelope::DmPacket::Invite { signed, .. } => {
+                assert_eq!(
+                    signed.space_id, created_space_id,
+                    "the routed invite is for the just-created Space"
+                );
+                assert!(signed.members.contains(&recipient));
+            }
+            other => panic!("expected DmPacket::Invite, got {other:?}"),
+        }
+    }
+
+    /// A deposit-only node (`tunnel_manager: None`) creates the Space locally
+    /// (the returned id is live in `crdt_state.spaces`) but routes nothing —
+    /// the invite's durability is ZEB-483's deposit rung.
+    #[tokio::test]
+    async fn add_space_deposit_only_node_applies_space_but_routes_nothing() {
+        let (node, recipient, _recipient_node_id) = wire_node_state(None, None).await;
+        let crdt_state = node.crdt_state.clone().unwrap();
+        let state = std::sync::Mutex::new(node);
+
+        let space_id_hex = add_space_impl(
+            &state,
+            "dm".into(),
+            "DM with Bob".into(),
+            Some(vec![hex::encode(recipient.0)]),
+        )
+        .await
+        .expect("add_space must succeed even with no tunnel manager");
+        let space_bytes: [u8; 16] = hex::decode(&space_id_hex).unwrap().try_into().unwrap();
+        let created_space_id = crate::owner_state_types::SpaceId(space_bytes);
+
+        // The Space is applied locally despite no tunnel send.
+        assert!(
+            crdt_state
+                .lock()
+                .await
+                .spaces
+                .contains_key(&created_space_id),
+            "the Space must be applied locally on a deposit-only node"
+        );
+    }
 }
 
 /// Return the hex-encoded node address (derived from the Ed25519 identity).
