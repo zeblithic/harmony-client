@@ -599,6 +599,15 @@ pub async fn handle_deposit_core(
     // hash to the packet's message_cid under the DM send path's exact
     // for_book flags).
     let payload = decode_deposit_payload(&plaintext).map_err(|_| DepositReject::BadPayload)?;
+    // ZEB-483 — size-bound the piggybacked DmInvite before any further work. The
+    // butler treats it opaquely (sealed end-to-end, applied+verified on recover);
+    // this cap bars a malicious sender from inflating butler storage via the
+    // invite field. The CidNotify + blob validation below is unchanged.
+    if let Some(inv) = payload.invite_packet.as_ref() {
+        if inv.len() > crate::butler_deposit::MAX_DEPOSIT_INVITE_BYTES {
+            return Err(DepositReject::BadPayload);
+        }
+    }
     let packet = decode_packet(&payload.cidnotify_packet).map_err(|_| DepositReject::BadPayload)?;
     let (signed, signature, signed_bytes) = match packet {
         DmPacket::CidNotify {
@@ -668,7 +677,7 @@ pub async fn handle_deposit_core(
         sender_owner: frame.sender_owner,
         cidnotify_packet: payload.cidnotify_packet,
         storage_blob: payload.storage_blob,
-        invite_packet: None,
+        invite_packet: payload.invite_packet,
         deposited_at: ctx.mint_hlc().await,
         deposited_by: ctx.device_id(),
         ingested_by: BTreeSet::new(),
@@ -841,7 +850,9 @@ impl IrohButlerDepositAcceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::butler_deposit::{encode_deposit_payload, DepositPayload, BUTLER_DEPOSIT_SEAL_INFO};
+    use crate::butler_deposit::{
+        encode_deposit_payload, DepositPayload, BUTLER_DEPOSIT_SEAL_INFO, MAX_DEPOSIT_INVITE_BYTES,
+    };
     use crate::community_membership::{mint_test_owner, TestOwner};
     use crate::dm_envelope::{build_signed_cidnotify, encode_packet, DmCidNotifySigned};
     use crate::dm_signing::{
@@ -953,6 +964,51 @@ mod tests {
             cidnotify_packet: cidnotify_packet.clone(),
             storage_blob: storage_blob.clone(),
             invite_packet: None,
+        };
+        let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
+        let sealed = seal_payload_bytes(&payload_bytes);
+        let sig = sign_frame(&BUTLER_OWNER, &sealed, &so.device_key);
+        let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
+        Fixture {
+            frame: DepositFrame {
+                recipient_owner: BUTLER_OWNER,
+                sender_owner: so.owner.0,
+                sender_enrollment_cert: cert_bytes,
+                sig,
+                sealed_blob: sealed,
+            },
+            sender_owner: so.owner.0,
+            sender_master: master_from_cert(&so.cert),
+            space_id,
+            message_cid,
+            cidnotify_packet,
+            storage_blob,
+            dm_device_hash,
+            identity_pub,
+        }
+    }
+
+    /// Same as [`valid_fixture`] but the sealed `DepositPayload` carries an
+    /// `invite_packet` (ZEB-483). The CidNotify + storage blob are identical, so
+    /// the acceptor's existing validation path is exercised unchanged.
+    fn valid_fixture_with_invite(invite_packet: Option<Vec<u8>>) -> Fixture {
+        let so = sender();
+        let space_id = SpaceId([0x77; 16]);
+        let storage_blob = b"encrypted-dm-storage-blob-bytes".to_vec();
+        let message_cid = ContentId::for_book(
+            &storage_blob,
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid for blob");
+        let (cidnotify_packet, identity_pub, dm_device_hash) =
+            build_cidnotify(so.owner, space_id, message_cid);
+        let payload = DepositPayload {
+            cidnotify_packet: cidnotify_packet.clone(),
+            storage_blob: storage_blob.clone(),
+            invite_packet,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1139,6 +1195,41 @@ mod tests {
             deposited_by: "filler".into(),
             ingested_by: BTreeSet::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn deposit_carries_invite_packet_into_persisted_entry() {
+        let invite = vec![0xABu8; 200];
+        let f = valid_fixture_with_invite(Some(invite.clone()));
+        let ctx = TestCtx::for_fixture(&f);
+
+        handle_deposit_core(&f.frame, &ctx).await.expect("accepted");
+
+        let key = DmInboxDoc::key(&f.space_id.0, &f.message_cid.to_bytes());
+        let store = ctx.store.lock().unwrap();
+        let entry = store.get(&key).expect("persisted");
+        assert_eq!(
+            entry.invite_packet,
+            Some(invite),
+            "invite carried through verbatim"
+        );
+        assert_eq!(
+            entry.cidnotify_packet, f.cidnotify_packet,
+            "CidNotify validation/persist unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_with_oversized_invite_is_rejected() {
+        let f = valid_fixture_with_invite(Some(vec![0u8; MAX_DEPOSIT_INVITE_BYTES + 1]));
+        let ctx = TestCtx::for_fixture(&f);
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("must reject");
+        assert!(
+            matches!(err, DepositReject::BadPayload),
+            "oversized invite => BadPayload, got {err:?}"
+        );
     }
 
     #[tokio::test]
