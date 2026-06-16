@@ -7195,6 +7195,11 @@ pub async fn start_node_inner(
                                                     &community_signing_key_arc,
                                                 ),
                                             ],
+                                            // ZEB-483: this node's own OwnerAddr (the
+                                            // deposit recipient) — bootstraps the DM
+                                            // Space from a relay-held deposited invite
+                                            // on recover (apply_deposited_invite).
+                                            self_owner,
                                             crdt_state: std::sync::Arc::clone(&crdt_state),
                                             content_store: std::sync::Arc::clone(&content_store),
                                             sink: app.clone(),
