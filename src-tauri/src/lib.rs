@@ -6934,18 +6934,48 @@ pub async fn start_node_inner(
                         //    without it there is no tunnel transport (and DMs
                         //    stay deposit-only, exactly the butler rung's gate).
                         if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
-                            // The ingest seam (Task 9 swaps the consumer): the
-                            // tunnel loops push each received DM payload onto
-                            // `tunnel_ingest_tx`; the drain below logs + drops.
+                            // The ingest seam (ZEB-473 Task 9): the tunnel loops
+                            // push each received DM payload onto
+                            // `tunnel_ingest_tx`; the drain below runs each one
+                            // through the REAL verify/decrypt/apply/emit pipeline
+                            // (`ingest_dm_packet`) — the SAME receive-path helpers
+                            // a deposit-delivered DM uses, so a tunnel copy and a
+                            // deposit copy of the same DM dedup in the inbox CRDT
+                            // and deliver one `dm-received` to the UI. A bad packet
+                            // (verify/decrypt failure, unknown sender, non-member,
+                            // CAS miss) is logged at warn and dropped — it must
+                            // never crash the drain (the deposit rung is the
+                            // durability backstop).
                             let (tunnel_ingest_tx, mut tunnel_ingest_rx) =
                                 tokio::sync::mpsc::channel::<crate::tunnel_manager::InboundDm>(256);
+                            let drain_crdt_state = std::sync::Arc::clone(&crdt_state);
+                            let drain_content_store = std::sync::Arc::clone(&content_store);
+                            let drain_sink = app.clone();
+                            let drain_device_id = device_id.clone();
                             tokio::spawn(async move {
                                 while let Some(dm) = tunnel_ingest_rx.recv().await {
-                                    tracing::info!(
-                                        peer = %hex::encode(dm.peer_node_id),
-                                        payload_len = dm.payload.len(),
-                                        "tunnel DM received (ingest wired in ZEB-473 Task 9)"
-                                    );
+                                    match crate::dm_inbox_ingest::ingest_dm_packet(
+                                        &drain_crdt_state,
+                                        &drain_content_store,
+                                        &drain_sink,
+                                        &drain_device_id,
+                                        &dm.payload,
+                                    )
+                                    .await
+                                    {
+                                        Ok(emitted) => tracing::debug!(
+                                            peer = %hex::encode(dm.peer_node_id),
+                                            emitted,
+                                            "ZEB-473: tunnel DM ingested"
+                                        ),
+                                        Err(reason) => tracing::warn!(
+                                            peer = %hex::encode(dm.peer_node_id),
+                                            payload_len = dm.payload.len(),
+                                            %reason,
+                                            "ZEB-473: tunnel DM rejected; dropping \
+                                             (deposit rung covers durability)"
+                                        ),
+                                    }
                                 }
                             });
 

@@ -798,4 +798,176 @@ mod tests {
     ) {
         mgr.test_send_over_handle(peer_node_id, packet);
     }
+
+    // ── ZEB-473 Task 9: tunnel → drain → ingest, end to end ──────────────────
+    //
+    // A REAL loopback PQ tunnel (initiator → responder) carries one
+    // `FrameTag::Dm` frame whose payload is a REAL sealed+signed CidNotify
+    // packet. The responder's ingest channel feeds the PRODUCTION drain body
+    // (`dm_inbox_ingest::ingest_dm_packet` against the receiver's state — the
+    // SAME call `start_node`'s boot drain makes). We assert the tunnel-delivered
+    // DM lands in the inbox CRDT and fires exactly one `dm-received` event —
+    // i.e. the inbound tunnel path delivers a DM identically to the deposit path.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tunnel_delivered_dm_ingests_end_to_end() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), tunnel_ingest_inner())
+            .await
+            .expect("tunnel→ingest end-to-end must complete within 30s");
+    }
+
+    async fn tunnel_ingest_inner() {
+        use crate::dm_inbox_ingest::ingest_dm_packet;
+        use crate::dm_inbox_ingest::test_fixture::build_dm_ingest_fixture;
+        use iroh::{EndpointAddr, TransportAddr};
+
+        // Receive-side (Bob) fixture + the real signed packet Alice carries.
+        let fx = build_dm_ingest_fixture(b"tunnel-delivered DM body").await;
+
+        let initiator_pq = Arc::new(harmony_identity::PqPrivateIdentity::generate(
+            &mut rand::rngs::OsRng,
+        ));
+        let responder_pq = Arc::new(harmony_identity::PqPrivateIdentity::generate(
+            &mut rand::rngs::OsRng,
+        ));
+
+        let ep_a = loopback_endpoint([0x31; 32]).await;
+        let ep_b = loopback_endpoint([0x32; 32]).await;
+        let ep_b_addr = EndpointAddr::from_parts(
+            ep_b.id(),
+            ep_b.bound_sockets().into_iter().map(TransportAddr::Ip),
+        );
+
+        // Responder-side TunnelManager + ingest channel.
+        let (resp_ingest_tx, mut resp_ingest_rx) = mpsc::channel::<InboundDm>(8);
+        let resp_mgr = Arc::new(TunnelManager::new(
+            crate::iroh_endpoint::IrohEndpoint::from_endpoint_for_test(ep_b.clone()),
+            Arc::clone(&responder_pq),
+            resp_ingest_tx.clone(),
+        ));
+
+        // The PRODUCTION drain: each InboundDm runs through `ingest_dm_packet`
+        // against Bob's state — exactly the boot wiring in `start_node`.
+        let drain_state = Arc::clone(&fx.crdt_state);
+        let drain_cas = Arc::clone(&fx.content_store);
+        let drain_sink = Arc::clone(&fx.sink);
+        let drain_device = fx.bob_device_id.clone();
+        let drain = tokio::spawn(async move {
+            while let Some(dm) = resp_ingest_rx.recv().await {
+                let _ = ingest_dm_packet(
+                    &drain_state,
+                    &drain_cas,
+                    &drain_sink,
+                    &drain_device,
+                    &dm.payload,
+                )
+                .await;
+            }
+        });
+
+        // Spawn the production responder driver on the accepted connection.
+        let resp_pq = Arc::clone(&responder_pq);
+        let resp_mgr_task = Arc::clone(&resp_mgr);
+        let resp_ingest_task = resp_ingest_tx.clone();
+        let ep_b_accept = ep_b.clone();
+        let responder = tokio::spawn(async move {
+            let incoming = ep_b_accept
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("connection established");
+            run_tunnel_responder(incoming, resp_pq, resp_mgr_task, resp_ingest_task).await;
+        });
+
+        // Initiator: dial + handshake to Active, then run the production loop.
+        let conn = ep_a
+            .connect(ep_b_addr, crate::iroh_endpoint::alpn::HARMONY_TUNNEL_V1)
+            .await
+            .expect("connect");
+        let (mut send_stream, mut recv_stream) = conn.open_bi().await.expect("open_bi");
+        let mut rng = rand::rngs::OsRng;
+        let (mut init_session, init_actions) =
+            harmony_tunnel::session::TunnelSession::new_initiator(
+                &mut rng,
+                &initiator_pq,
+                responder_pq.public_identity(),
+                millis_since_start(),
+            )
+            .expect("new_initiator");
+        for action in init_actions {
+            if let TunnelAction::OutboundBytes { data } = action {
+                write_length_prefixed(&mut send_stream, &data)
+                    .await
+                    .expect("write TunnelInit");
+            }
+        }
+        let accept_bytes = read_length_prefixed(&mut recv_stream, HANDSHAKE_MAX_MESSAGE)
+            .await
+            .expect("read TunnelAccept");
+        init_session
+            .handle_event(TunnelEvent::InboundBytes {
+                data: accept_bytes,
+                now_ms: millis_since_start(),
+            })
+            .expect("handle TunnelAccept");
+        assert_eq!(init_session.state(), TunnelState::Active);
+
+        let (init_cmd_tx, init_cmd_rx) = mpsc::channel::<TunnelCommand>(8);
+        let (init_ingest_tx, _init_ingest_rx) = mpsc::channel::<InboundDm>(8);
+        let resp_node_id =
+            node_id_from_dsa_pubkey(&responder_pq.public_identity().verifying_key.as_bytes());
+        let initiator_loop = tokio::spawn(async move {
+            run_tunnel_loop(
+                init_session,
+                send_stream,
+                recv_stream,
+                resp_node_id,
+                init_ingest_tx,
+                init_cmd_rx,
+            )
+            .await;
+        });
+
+        // Carry Alice's real signed packet over the tunnel as a Dm frame.
+        init_cmd_tx
+            .send(TunnelCommand::SendDm(fx.packet.clone()))
+            .await
+            .expect("queue SendDm");
+
+        // The drain ingests it: the inbox entry appears (poll on the CRDT).
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id: fx.space_id,
+            message_cid: fx.message_cid,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let has_entry = fx.crdt_state.lock().await.inbox.contains_key(&inbox_key);
+            if has_entry {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tunnel-delivered DM did not reach the inbox in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // ...and exactly one dm-received event fired (the shared UI event).
+        let dm_emits = fx
+            .sink_handle
+            .frames()
+            .iter()
+            .filter(|(n, _)| n == crate::dm_outbox::DM_RECEIVED_EVENT)
+            .count();
+        assert_eq!(dm_emits, 1, "tunnel DM delivers exactly one dm-received");
+
+        // Teardown.
+        drop(init_cmd_tx);
+        let _ = initiator_loop.await;
+        drop(resp_ingest_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), responder).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), drain).await;
+    }
 }
