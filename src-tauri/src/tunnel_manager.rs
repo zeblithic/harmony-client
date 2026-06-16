@@ -288,14 +288,38 @@ impl TunnelManager {
                 .lock()
                 .expect("tunnel sessions mutex poisoned");
             // Double-check: an inbound dial may have raced in while we computed.
+            // Redirect our seed DMs onto that survivor, like `drain_pending_into`.
             if let Some(existing) = sessions.get_mut(&peer_node_id) {
-                for p in pending.drain(..) {
-                    match existing.state {
-                        TunnelHandleState::Active => {
-                            let _ = existing.cmd_tx.try_send(TunnelCommand::SendDm(p));
+                // A live `Active` survivor takes the seeds over its cmd channel;
+                // `Full` is an acceptable best-effort drop (matches `send_dm`'s
+                // Active path — tearing a healthy tunnel down on transient
+                // backpressure is worse), but a `Closed` survivor means its loop
+                // already died — keep those packets and re-dial rather than
+                // silently lose the live attempt (CodeAnt). Non-Active survivors
+                // just buffer on their own pending.
+                let redial_seed: Vec<Vec<u8>> = if existing.state == TunnelHandleState::Active {
+                    let mut unsent = Vec::new();
+                    for p in pending.drain(..) {
+                        if let Err(mpsc::error::TrySendError::Closed(TunnelCommand::SendDm(p))) =
+                            existing.cmd_tx.try_send(TunnelCommand::SendDm(p))
+                        {
+                            unsent.push(p);
                         }
-                        _ => push_pending(&mut existing.pending, p),
                     }
+                    unsent
+                } else {
+                    for p in pending.drain(..) {
+                        push_pending(&mut existing.pending, p);
+                    }
+                    Vec::new()
+                };
+                if !redial_seed.is_empty() {
+                    // Survivor's loop was dead — drop it and re-dial with the
+                    // unsent seeds (the gate re-applies, so this can't recreate a
+                    // simultaneous-dial collision).
+                    sessions.remove(&peer_node_id);
+                    drop(sessions);
+                    self.dial_or_await(peer_node_id, contact, redial_seed);
                 }
                 return;
             }
@@ -1156,6 +1180,49 @@ mod tests {
             drained,
             vec![b"p1".to_vec(), b"p2".to_vec()],
             "the awaiting handle's pending DMs are redirected onto the inbound survivor"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn await_inbound_double_check_redials_when_racing_survivor_is_closed() {
+        // ZEB-485 (CodeAnt): if an inbound dial raced in but its loop is already
+        // Closed (rx dropped), spawn_await_inbound's double-check must NOT
+        // silently drop the seeded DM — it re-dials, seeding the unsent packet.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00); // higher self => the await branch.
+
+        // Pre-insert a DEAD Active handle (cmd_rx dropped => try_send => Closed).
+        let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
+        drop(cmd_rx);
+        {
+            let mut sessions = mgr.sessions.lock().unwrap();
+            sessions.insert(
+                peer,
+                TunnelHandle {
+                    cmd_tx,
+                    state: TunnelHandleState::Active,
+                    role: TunnelRole::Responder,
+                    epoch: 0,
+                    pending: VecDeque::new(),
+                },
+            );
+        }
+
+        let contact = DeviceTunnelContact {
+            iroh_node_id: peer,
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1; 1952],
+            pq_kem_pubkey: vec![2; 1184],
+        };
+        // Drive the double-check directly with a seed.
+        mgr.spawn_await_inbound(peer, &contact, vec![b"seed".to_vec()]);
+
+        // The dead survivor was evicted and the seed re-dialed: we are higher,
+        // so the re-dial routes back to a fresh AwaitingInbound still carrying it.
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, _, p)| (s, p)),
+            Some((TunnelHandleState::AwaitingInbound, 1)),
+            "a Closed racing survivor must re-dial+seed, not silently drop"
         );
     }
 }

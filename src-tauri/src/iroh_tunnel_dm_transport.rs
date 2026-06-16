@@ -44,6 +44,15 @@ use crate::tunnel_manager::{node_id_from_dsa_pubkey, TunnelManager};
 /// this, `send` falls back to a bare `CidNotify` and the deposit rung carries it.
 pub(crate) const INLINE_BLOB_MAX: usize = 1_572_864; // 1.5 MiB
 
+/// ZEB-485 (CodeAnt): cap on concurrent in-flight tunnel send tasks. `send`
+/// SPAWNS the CAS-backed packet build + `send_dm` (to avoid the `get_local`
+/// event-loop re-entrancy deadlock), so a large outbox-backlog drain would
+/// otherwise spawn one unbounded detached task per DM, piling work onto CAS /
+/// the event loop. Beyond this many concurrent attempts, `send` SHEDS the
+/// best-effort tunnel attempt onto the always-firing deposit rung instead of
+/// spawning more — bounding both task count and memory under burst.
+const MAX_CONCURRENT_TUNNEL_SENDS: usize = 64;
+
 /// Resolve a recipient owner's reachable per-device tunnel targets:
 /// `(NodeId = blake3(pq_dsa_pubkey), contact)` for each bound device that
 /// advertised a [`DeviceTunnelContact`](crate::owner_state_types::DeviceTunnelContact).
@@ -119,6 +128,11 @@ pub struct IrohTunnelDmTransport {
     /// ZEB-484: the local CAS, read on `send` to inline the encrypted DM blob
     /// over the tunnel for live delivery (when it fits `INLINE_BLOB_MAX`).
     cas: Arc<dyn ContentStore>,
+    /// ZEB-485 (CodeAnt): bounds concurrent in-flight tunnel send tasks. See
+    /// [`MAX_CONCURRENT_TUNNEL_SENDS`] — a `try_acquire` gate in `send` sheds the
+    /// best-effort tunnel attempt onto the deposit rung once saturated rather
+    /// than spawning unbounded background work during an outbox-backlog drain.
+    tunnel_send_sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl IrohTunnelDmTransport {
@@ -130,6 +144,29 @@ impl IrohTunnelDmTransport {
         our_signing_device_hash: DeviceIdentityHash,
         cas: Arc<dyn ContentStore>,
     ) -> Self {
+        Self::with_tunnel_send_cap(
+            mgr,
+            crdt_state,
+            signing_key,
+            self_owner,
+            our_signing_device_hash,
+            cas,
+            MAX_CONCURRENT_TUNNEL_SENDS,
+        )
+    }
+
+    /// Construct with an explicit concurrent-tunnel-send cap. `new` uses
+    /// [`MAX_CONCURRENT_TUNNEL_SENDS`]; tests use this to exercise the
+    /// shed-when-saturated path with a small (or zero) cap.
+    fn with_tunnel_send_cap(
+        mgr: Arc<TunnelManager>,
+        crdt_state: Arc<tokio::sync::Mutex<OwnerState>>,
+        signing_key: Arc<ed25519_dalek::SigningKey>,
+        self_owner: OwnerAddr,
+        our_signing_device_hash: DeviceIdentityHash,
+        cas: Arc<dyn ContentStore>,
+        tunnel_send_cap: usize,
+    ) -> Self {
         Self {
             mgr,
             crdt_state,
@@ -137,6 +174,7 @@ impl IrohTunnelDmTransport {
             self_owner,
             our_signing_device_hash,
             cas,
+            tunnel_send_sem: Arc::new(tokio::sync::Semaphore::new(tunnel_send_cap)),
         }
     }
 
@@ -201,45 +239,67 @@ impl DmTransport for IrohTunnelDmTransport {
     ) -> Result<(), TransportError> {
         let targets = self.resolve_tunnel_targets(recipient).await;
 
+        // ZEB-485 (CodeAnt): cap concurrent in-flight tunnel sends. The spawned
+        // build+send below is detached (required — see the deadlock note), so an
+        // outbox-backlog drain would otherwise be one unbounded task per DM.
+        // Acquire a permit up front; if the cap is saturated, SHED this
+        // best-effort tunnel attempt — the deposit rung below still carries
+        // durability — rather than pile more work onto CAS / the event loop.
         if !targets.is_empty() {
-            let signed = crate::dm_envelope::DmCidNotifySigned {
-                space_id: entry.space_id,
-                message_cid: entry.message_cid,
-                sender_owner_addr: self.self_owner,
-                sender_devices: vec![self.our_signing_device_hash],
-                signing_device_hash: self.our_signing_device_hash,
-            };
-            // ZEB-485: SPAWN the blob build + tunnel `send_dm`, do NOT await it
-            // inline. `build_tunnel_dm_packet` reads the local CAS via
-            // `CasOp::GetLocal`, which is serviced by the SAME event loop that
-            // drives this outbox drain inline (its timer tick does
-            // `drain_lifted(...).await`). Awaiting `get_local` here deadlocks:
-            // the loop is blocked on the drain and can never reply to its own
-            // `GetLocal`. Spawning frees the loop to service `GetLocal`; we
-            // return `Transient` immediately and the deposit rung carries
-            // durability regardless. (Resolving targets above only locks
-            // `crdt_state` — not the CasOp bridge — so it stays inline.)
-            let mgr = std::sync::Arc::clone(&self.mgr);
-            let cas = std::sync::Arc::clone(&self.cas);
-            let signing_key = std::sync::Arc::clone(&self.signing_key);
-            let message_cid = entry.message_cid;
-            tokio::spawn(async move {
-                // ZEB-484: inline the encrypted blob when it fits; else bare CidNotify.
-                match build_tunnel_dm_packet(&cas, &signed, &signing_key, message_cid).await {
-                    Ok(packet) => {
-                        for (node_id, contact) in &targets {
-                            mgr.send_dm(*node_id, contact, packet.clone());
+            match Arc::clone(&self.tunnel_send_sem).try_acquire_owned() {
+                Ok(permit) => {
+                    let signed = crate::dm_envelope::DmCidNotifySigned {
+                        space_id: entry.space_id,
+                        message_cid: entry.message_cid,
+                        sender_owner_addr: self.self_owner,
+                        sender_devices: vec![self.our_signing_device_hash],
+                        signing_device_hash: self.our_signing_device_hash,
+                    };
+                    // ZEB-485: SPAWN the blob build + tunnel `send_dm`, do NOT
+                    // await it inline. `build_tunnel_dm_packet` reads the local
+                    // CAS via `CasOp::GetLocal`, which is serviced by the SAME
+                    // event loop that drives this outbox drain inline (its timer
+                    // tick does `drain_lifted(...).await`). Awaiting `get_local`
+                    // here deadlocks: the loop is blocked on the drain and can
+                    // never reply to its own `GetLocal`. Spawning frees the loop
+                    // to service `GetLocal`; we return `Transient` immediately and
+                    // the deposit rung carries durability regardless. (Resolving
+                    // targets above only locks `crdt_state` — not the CasOp bridge
+                    // — so it stays inline.)
+                    let mgr = std::sync::Arc::clone(&self.mgr);
+                    let cas = std::sync::Arc::clone(&self.cas);
+                    let signing_key = std::sync::Arc::clone(&self.signing_key);
+                    let message_cid = entry.message_cid;
+                    tokio::spawn(async move {
+                        // Hold the permit for the task's lifetime; releasing it on
+                        // completion lets the next backlogged DM attempt the tunnel.
+                        let _permit = permit;
+                        // ZEB-484: inline the encrypted blob when it fits; else bare CidNotify.
+                        match build_tunnel_dm_packet(&cas, &signed, &signing_key, message_cid).await
+                        {
+                            Ok(packet) => {
+                                for (node_id, contact) in &targets {
+                                    mgr.send_dm(*node_id, contact, packet.clone());
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    recipient = ?recipient,
+                                    error = %e,
+                                    "ZEB-484: tunnel DM packet build failed; deposit rung still covers this DM"
+                                );
+                            }
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            recipient = ?recipient,
-                            error = %e,
-                            "ZEB-484: tunnel DM packet build failed; deposit rung still covers this DM"
-                        );
-                    }
+                    });
                 }
-            });
+                Err(_) => {
+                    tracing::debug!(
+                        recipient = ?recipient,
+                        cap = MAX_CONCURRENT_TUNNEL_SENDS,
+                        "ZEB-485: tunnel send shed (concurrency cap reached); deposit rung carries this DM"
+                    );
+                }
+            }
         }
 
         // ALWAYS return Transient (never Ok): the tunnel is a parallel
@@ -684,6 +744,77 @@ mod tests {
                 crate::dm_envelope::DmPacket::CidNotify { .. }
             ),
             "an oversize blob must fall back to a bare CidNotify"
+        );
+    }
+
+    /// ZEB-485 (CodeAnt): when the concurrent-tunnel-send cap is saturated, `send`
+    /// SHEDS the best-effort tunnel attempt (no spawn, nothing routed to the
+    /// manager) and still returns Transient so the deposit rung carries the DM.
+    #[tokio::test]
+    async fn send_sheds_tunnel_attempt_when_concurrency_cap_saturated() {
+        let mgr = test_manager().await;
+
+        let recipient = OwnerAddr([0x11; 16]);
+        let dsa_pubkey = vec![0x07u8; 32];
+        let contact = DeviceTunnelContact {
+            iroh_node_id: [0x09; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: dsa_pubkey.clone(),
+            pq_kem_pubkey: vec![0x08u8; 32],
+        };
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+
+        let mut owner_state = OwnerState::default();
+        owner_state.owner_device_cache.devices.insert(
+            recipient,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0x33; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+                device_tunnel_contacts: vec![Some(contact)],
+            },
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+        // Cap = 0 => the very first tunnel attempt is shed onto the deposit rung.
+        let transport = IrohTunnelDmTransport::with_tunnel_send_cap(
+            Arc::clone(&mgr),
+            state,
+            Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])),
+            OwnerAddr([0xff; 16]),
+            DeviceIdentityHash([0xaa; 16]),
+            Arc::new(crate::content_store::InMemoryStub::default()),
+            0,
+        );
+
+        let space = SpaceId([0xcc; 16]);
+        let cid = ContentId::from_bytes([0xee; 32]);
+        let entry = synthetic_outbox_entry(space, cid, recipient);
+
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
+
+        // Always-deposit invariant holds even when the tunnel attempt is shed.
+        let err = transport
+            .send(&entry, recipient, Vec::new())
+            .await
+            .expect_err("must return Transient (always-deposit) even when shed");
+        assert!(
+            matches!(err, TransportError::Transient(_)),
+            "must be Transient so the deposit rung fires, got {err:?}"
+        );
+
+        // Nothing was spawned, so nothing routes to the manager. Negative wait:
+        // a shed attempt never routes, so a short timeout that observes no packet
+        // is the assertion — it can only false-pass, never false-fail under load.
+        let routed =
+            tokio::time::timeout(std::time::Duration::from_millis(50), cmd_rx.recv()).await;
+        assert!(
+            routed.is_err(),
+            "a saturated cap must shed the tunnel attempt (no packet routed)"
         );
     }
 }
