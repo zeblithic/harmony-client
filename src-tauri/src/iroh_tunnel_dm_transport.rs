@@ -36,6 +36,54 @@ use crate::owner_state_crdt::OwnerState;
 use crate::owner_state_types::{DeviceIdentityHash, OutboxEntry, OwnerAddr};
 use crate::tunnel_manager::{node_id_from_dsa_pubkey, TunnelManager};
 
+/// Resolve a recipient owner's reachable per-device tunnel targets:
+/// `(NodeId = blake3(pq_dsa_pubkey), contact)` for each bound device that
+/// advertised a [`DeviceTunnelContact`](crate::owner_state_types::DeviceTunnelContact).
+/// Devices with no contact yet (`None`) are skipped — the tunnel can't reach
+/// them, and the deposit rung covers them.
+///
+/// Pure over the passed `&OwnerState` (no lock taken here); the caller holds
+/// (or has snapshotted out of) the owner-state lock and must NOT hold it across
+/// any subsequent `send_dm` `.await` — `send_dm` itself does not await, so a
+/// short read lock spanning the resolve+send pair is fine.
+pub(crate) fn resolve_owner_tunnel_targets(
+    state: &OwnerState,
+    recipient: OwnerAddr,
+) -> Vec<([u8; 32], crate::owner_state_types::DeviceTunnelContact)> {
+    let Some(entry) = state.owner_device_cache.devices.get(&recipient) else {
+        return Vec::new();
+    };
+    entry
+        .device_tunnel_contacts
+        .iter()
+        .filter_map(|maybe| maybe.as_ref())
+        .map(|contact| {
+            let node_id = node_id_from_dsa_pubkey(&contact.pq_dsa_pubkey);
+            (node_id, contact.clone())
+        })
+        .collect()
+}
+
+/// ZEB-482: fire `packet` (any pre-built `DmPacket` wire bytes — e.g. a signed
+/// `DmInvite`) to every reachable tunnel device of `recipient`, best-effort.
+///
+/// Resolves from the passed `&OwnerState` (the caller holds the owner-state
+/// read lock) and routes through [`TunnelManager::send_dm`], which is itself
+/// non-awaiting (it locks the session map internally and lazily dials). Holding
+/// the `crdt_state` read lock across these calls is therefore safe — but the
+/// caller must NOT hold it across any other `.await`. Devices with no tunnel
+/// contact are skipped (durability is the deposit rung's job — ZEB-483).
+pub(crate) fn send_packet_to_owner_tunnels(
+    state: &OwnerState,
+    mgr: &Arc<TunnelManager>,
+    recipient: OwnerAddr,
+    packet: &[u8],
+) {
+    for (node_id, contact) in resolve_owner_tunnel_targets(state, recipient) {
+        mgr.send_dm(node_id, &contact, packet.to_vec());
+    }
+}
+
 /// Production DM transport that carries each DM through the PQ tunnel while the
 /// outbox's deposit rung continues to guarantee durability. See module docs.
 pub struct IrohTunnelDmTransport {
@@ -87,18 +135,7 @@ impl IrohTunnelDmTransport {
         recipient: OwnerAddr,
     ) -> Vec<([u8; 32], crate::owner_state_types::DeviceTunnelContact)> {
         let state = self.crdt_state.lock().await;
-        let Some(entry) = state.owner_device_cache.devices.get(&recipient) else {
-            return Vec::new();
-        };
-        entry
-            .device_tunnel_contacts
-            .iter()
-            .filter_map(|maybe| maybe.as_ref())
-            .map(|contact| {
-                let node_id = node_id_from_dsa_pubkey(&contact.pq_dsa_pubkey);
-                (node_id, contact.clone())
-            })
-            .collect()
+        resolve_owner_tunnel_targets(&state, recipient)
     }
 }
 
@@ -285,6 +322,65 @@ mod tests {
         );
 
         // And no spurious session for any other NodeId.
+        assert!(
+            mgr.test_pending_packets(&[0x00; 32]).is_none(),
+            "no session for an unrelated NodeId"
+        );
+    }
+
+    /// ZEB-482: the shared `send_packet_to_owner_tunnels` helper routes
+    /// arbitrary pre-built packet bytes (here a synthetic DmInvite payload) to
+    /// the recipient's reachable tunnel device — `blake3(pq_dsa)` NodeId carries
+    /// exactly those bytes. This is the send half of the invite carrier; it
+    /// reuses the SAME resolver `IrohTunnelDmTransport::send` uses.
+    #[tokio::test]
+    async fn send_packet_to_owner_tunnels_routes_arbitrary_bytes_to_resolved_device() {
+        let mgr = test_manager().await;
+
+        let recipient = OwnerAddr([0x55; 16]);
+        // Realistic valid key sizes (ML-DSA-65 pub 1952B / ML-KEM-768 pub
+        // 1184B), the same sizes `DeviceTunnelContact::has_valid_key_sizes`
+        // accepts at the friend handshake.
+        let dsa_pubkey = vec![0x07u8; 1952];
+        let contact = DeviceTunnelContact {
+            iroh_node_id: [0x09; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: dsa_pubkey.clone(),
+            pq_kem_pubkey: vec![0x08u8; 1184],
+        };
+        assert!(
+            contact.has_valid_key_sizes(),
+            "fixture contact must use valid PQ key sizes"
+        );
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+
+        let mut owner_state = OwnerState::default();
+        owner_state.owner_device_cache.devices.insert(
+            recipient,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0x33; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+                device_tunnel_contacts: vec![Some(contact)],
+            },
+        );
+
+        // The helper reads the passed &OwnerState directly (no lock taken here).
+        let payload = b"arbitrary DmInvite wire bytes".to_vec();
+        send_packet_to_owner_tunnels(&owner_state, &mgr, recipient, &payload);
+
+        let pending = mgr
+            .test_pending_packets(&expected_node_id)
+            .expect("helper must register a session for the derived NodeId");
+        assert_eq!(pending.len(), 1, "exactly one packet routed to the tunnel");
+        assert_eq!(pending[0], payload, "routed bytes must be the passed packet");
+
+        // An unknown recipient routes nothing (no panic, no spurious session).
+        send_packet_to_owner_tunnels(&owner_state, &mgr, OwnerAddr([0xEE; 16]), &payload);
         assert!(
             mgr.test_pending_packets(&[0x00; 32]).is_none(),
             "no session for an unrelated NodeId"
