@@ -20,6 +20,17 @@ pub struct DmInboxEntry {
     /// The CAS storage blob ([ver][nonce][ct][tag]).
     #[serde(rename = "pl", with = "serde_bytes")]
     pub storage_blob: Vec<u8>,
+    /// ZEB-483: optional signed DmInvite packet bytes, carried through from the
+    /// sealed `DepositPayload` by the butler acceptor. Applied on recover to
+    /// bootstrap the DM Space before CidNotify admission. `None` for non-DM /
+    /// legacy deposits.
+    #[serde(
+        rename = "iv",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub invite_packet: Option<Vec<u8>>,
     #[serde(rename = "da")]
     pub deposited_at: Hlc,
     /// SP1 device_id (64-hex).
@@ -65,6 +76,36 @@ impl DmInboxDoc {
                 Some(l) => {
                     let before = l.ingested_by.len();
                     l.ingested_by.extend(r.ingested_by);
+                    // ZEB-483 (CodeRabbit): reconcile the optional bootstrap
+                    // invite. Same-key replicas can legitimately differ
+                    // (`None` vs `Some`) — a pre-ZEB-483 entry merged against a
+                    // sibling that re-deposited carrying the invite, or
+                    // retry-timing skew. Promote `None → Some` so bootstrap
+                    // bytes are never lost, and flag `changed` so the promotion
+                    // nudges ingestion (an entry that previously rejected with
+                    // `SpaceNotFound` can now bootstrap its Space). A `Some ≠
+                    // Some` divergence is not expected in the common case (the
+                    // invite is a deterministic rebuild of a stable Space
+                    // record), but it CAN arise — e.g. a re-deposit after a
+                    // content-key rotation or member change, or a multi-device
+                    // sender signing the rebuilt invite with different keys. Both
+                    // copies bootstrap the same Space, so keep the local one
+                    // (first-writer-wins, consistent with the deposit-metadata
+                    // rule below) and warn rather than churn.
+                    let mut invite_promoted = false;
+                    match (&l.invite_packet, &r.invite_packet) {
+                        (None, Some(inv)) => {
+                            l.invite_packet = Some(inv.clone());
+                            invite_promoted = true;
+                        }
+                        (Some(a), Some(b)) if a != b => {
+                            tracing::warn!(
+                                key = %k,
+                                "dm_inbox merge: conflicting invite_packet for same entry key; keeping local"
+                            );
+                        }
+                        _ => {}
+                    }
                     // Keep earliest deposit metadata (first-writer-wins):
                     // only when the local entry is strictly newer does the
                     // remote's earlier deposit replace it.
@@ -72,7 +113,7 @@ impl DmInboxDoc {
                         l.deposited_at = r.deposited_at;
                         l.deposited_by = r.deposited_by;
                     }
-                    changed |= l.ingested_by.len() != before;
+                    changed |= l.ingested_by.len() != before || invite_promoted;
                 }
             }
         }
@@ -99,6 +140,7 @@ mod tests {
             sender_owner: [7u8; 16],
             cidnotify_packet: vec![1, 2, 3],
             storage_blob: vec![4, 5, 6],
+            invite_packet: None,
             deposited_at: at,
             deposited_by: by.into(),
             ingested_by: ig.iter().map(|s| s.to_string()).collect(),
@@ -221,6 +263,44 @@ mod tests {
         );
         let out = a.merge_from(fresh);
         assert!(out.changed, "new entry must flag changed");
+    }
+
+    /// ZEB-483 (CodeRabbit): a same-key merge must promote a missing bootstrap
+    /// invite (`None → Some`) and flag `changed` so ingestion is re-nudged — an
+    /// entry that previously rejected with `SpaceNotFound` can now bootstrap its
+    /// Space once a sibling supplies the invite.
+    #[test]
+    fn merge_promotes_invite_none_to_some_and_flags_changed() {
+        let mut local = DmInboxDoc::default();
+        local
+            .entries
+            .insert(key(), entry(hlc(1, "A"), "dev-a", &[]));
+        assert!(local.entries[&key()].invite_packet.is_none());
+
+        // Remote replica of the SAME entry that carries the invite.
+        let mut remote = DmInboxDoc::default();
+        let mut with_invite = entry(hlc(1, "A"), "dev-a", &[]);
+        with_invite.invite_packet = Some(vec![0xAA, 0xBB, 0xCC]);
+        remote.entries.insert(key(), with_invite);
+
+        let out = local.merge_from(remote);
+        assert!(
+            out.changed,
+            "invite promotion must flag changed (nudges ingest)"
+        );
+        assert_eq!(
+            local.entries[&key()].invite_packet.as_deref(),
+            Some(&[0xAA, 0xBB, 0xCC][..]),
+            "missing invite promoted from the sibling"
+        );
+
+        // Idempotent: a re-merge of the now-equal docs is a no-op, and an
+        // already-present invite is never overwritten / re-flagged.
+        let out = local.merge_from(local.clone());
+        assert!(
+            !out.changed,
+            "re-merge with the invite already present is a no-op"
+        );
     }
 
     #[test]

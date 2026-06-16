@@ -365,6 +365,22 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
                 // caps are BYPASSED — the entry is already stored, so a
                 // redelivery after a lost ack re-acks idempotently even at
                 // a full inbox. Falls through to the flush below (D7).
+                //
+                // ZEB-483 (CodeAnt): ONE exception to insert-once — heal a
+                // stored entry that lacks the bootstrap invite. A pre-ZEB-483
+                // entry (or any deposit that landed before the sender attached
+                // the invite) carries `invite_packet: None`; a later redelivery
+                // that DOES carry the invite must upgrade it, or recovery stays
+                // un-bootstrappable (`SpaceNotFound`) forever. Promote `None →
+                // Some` only (never overwrite an existing invite); the flush
+                // below makes the upgrade durable + republishes it to the fleet.
+                if entry.invite_packet.is_some() {
+                    if let Some(stored) = doc.entries.get_mut(&key) {
+                        if stored.invite_packet.is_none() {
+                            stored.invite_packet = entry.invite_packet.clone();
+                        }
+                    }
+                }
                 DepositPersistVerdict::Duplicate
             } else {
                 // Caps INSIDE the doc-lock critical section: counting and
@@ -599,6 +615,15 @@ pub async fn handle_deposit_core(
     // hash to the packet's message_cid under the DM send path's exact
     // for_book flags).
     let payload = decode_deposit_payload(&plaintext).map_err(|_| DepositReject::BadPayload)?;
+    // ZEB-483 — size-bound the piggybacked DmInvite before any further work. The
+    // butler treats it opaquely (sealed end-to-end, applied+verified on recover);
+    // this cap bars a malicious sender from inflating butler storage via the
+    // invite field. The CidNotify + blob validation below is unchanged.
+    if let Some(inv) = payload.invite_packet.as_ref() {
+        if inv.len() > crate::butler_deposit::MAX_DEPOSIT_INVITE_BYTES {
+            return Err(DepositReject::BadPayload);
+        }
+    }
     let packet = decode_packet(&payload.cidnotify_packet).map_err(|_| DepositReject::BadPayload)?;
     let (signed, signature, signed_bytes) = match packet {
         DmPacket::CidNotify {
@@ -668,6 +693,7 @@ pub async fn handle_deposit_core(
         sender_owner: frame.sender_owner,
         cidnotify_packet: payload.cidnotify_packet,
         storage_blob: payload.storage_blob,
+        invite_packet: payload.invite_packet,
         deposited_at: ctx.mint_hlc().await,
         deposited_by: ctx.device_id(),
         ingested_by: BTreeSet::new(),
@@ -840,7 +866,9 @@ impl IrohButlerDepositAcceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::butler_deposit::{encode_deposit_payload, DepositPayload, BUTLER_DEPOSIT_SEAL_INFO};
+    use crate::butler_deposit::{
+        encode_deposit_payload, DepositPayload, BUTLER_DEPOSIT_SEAL_INFO, MAX_DEPOSIT_INVITE_BYTES,
+    };
     use crate::community_membership::{mint_test_owner, TestOwner};
     use crate::dm_envelope::{build_signed_cidnotify, encode_packet, DmCidNotifySigned};
     use crate::dm_signing::{
@@ -951,6 +979,52 @@ mod tests {
         let payload = DepositPayload {
             cidnotify_packet: cidnotify_packet.clone(),
             storage_blob: storage_blob.clone(),
+            invite_packet: None,
+        };
+        let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
+        let sealed = seal_payload_bytes(&payload_bytes);
+        let sig = sign_frame(&BUTLER_OWNER, &sealed, &so.device_key);
+        let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
+        Fixture {
+            frame: DepositFrame {
+                recipient_owner: BUTLER_OWNER,
+                sender_owner: so.owner.0,
+                sender_enrollment_cert: cert_bytes,
+                sig,
+                sealed_blob: sealed,
+            },
+            sender_owner: so.owner.0,
+            sender_master: master_from_cert(&so.cert),
+            space_id,
+            message_cid,
+            cidnotify_packet,
+            storage_blob,
+            dm_device_hash,
+            identity_pub,
+        }
+    }
+
+    /// Same as [`valid_fixture`] but the sealed `DepositPayload` carries an
+    /// `invite_packet` (ZEB-483). The CidNotify + storage blob are identical, so
+    /// the acceptor's existing validation path is exercised unchanged.
+    fn valid_fixture_with_invite(invite_packet: Option<Vec<u8>>) -> Fixture {
+        let so = sender();
+        let space_id = SpaceId([0x77; 16]);
+        let storage_blob = b"encrypted-dm-storage-blob-bytes".to_vec();
+        let message_cid = ContentId::for_book(
+            &storage_blob,
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid for blob");
+        let (cidnotify_packet, identity_pub, dm_device_hash) =
+            build_cidnotify(so.owner, space_id, message_cid);
+        let payload = DepositPayload {
+            cidnotify_packet: cidnotify_packet.clone(),
+            storage_blob: storage_blob.clone(),
+            invite_packet,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1103,6 +1177,16 @@ mod tests {
             }
             let mut store = self.store.lock().unwrap();
             if store.contains_key(&key) {
+                // Mirror the production None→Some invite upgrade (ZEB-483
+                // CodeAnt): a redeposit that carries the bootstrap invite heals a
+                // stored entry that lacked it; never overwrite an existing one.
+                if entry.invite_packet.is_some() {
+                    if let Some(stored) = store.get_mut(&key) {
+                        if stored.invite_packet.is_none() {
+                            stored.invite_packet = entry.invite_packet.clone();
+                        }
+                    }
+                }
                 self.push_event(format!("persist:{key}"));
                 return Ok(DepositPersistVerdict::Duplicate);
             }
@@ -1128,6 +1212,7 @@ mod tests {
             sender_owner,
             cidnotify_packet: Vec::new(),
             storage_blob: Vec::new(),
+            invite_packet: None,
             deposited_at: Hlc {
                 wall_ms: 1,
                 logical: 0,
@@ -1136,6 +1221,41 @@ mod tests {
             deposited_by: "filler".into(),
             ingested_by: BTreeSet::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn deposit_carries_invite_packet_into_persisted_entry() {
+        let invite = vec![0xABu8; 200];
+        let f = valid_fixture_with_invite(Some(invite.clone()));
+        let ctx = TestCtx::for_fixture(&f);
+
+        handle_deposit_core(&f.frame, &ctx).await.expect("accepted");
+
+        let key = DmInboxDoc::key(&f.space_id.0, &f.message_cid.to_bytes());
+        let store = ctx.store.lock().unwrap();
+        let entry = store.get(&key).expect("persisted");
+        assert_eq!(
+            entry.invite_packet,
+            Some(invite),
+            "invite carried through verbatim"
+        );
+        assert_eq!(
+            entry.cidnotify_packet, f.cidnotify_packet,
+            "CidNotify validation/persist unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_with_oversized_invite_is_rejected() {
+        let f = valid_fixture_with_invite(Some(vec![0u8; MAX_DEPOSIT_INVITE_BYTES + 1]));
+        let ctx = TestCtx::for_fixture(&f);
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("must reject");
+        assert!(
+            matches!(err, DepositReject::BadPayload),
+            "oversized invite => BadPayload, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1329,6 +1449,7 @@ mod tests {
         let payload = DepositPayload {
             cidnotify_packet: f.cidnotify_packet.clone(),
             storage_blob: f.storage_blob.clone(),
+            invite_packet: None,
         };
         let butler_vk = butler_device_sk().verifying_key().to_bytes();
         let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
@@ -1475,6 +1596,52 @@ mod tests {
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&swapped_blob, &ctx).await.unwrap_err();
         assert_eq!(err, DepositReject::BadSig);
+    }
+
+    /// ZEB-483 (CodeAnt): a redeposit upgrades a stored entry's MISSING bootstrap
+    /// invite (`None → Some`) — healing a pre-ZEB-483 entry whose recovery would
+    /// otherwise stay stuck at `SpaceNotFound` — but NEVER overwrites an invite
+    /// already present (the insert-once exception).
+    #[tokio::test]
+    async fn redeposit_upgrades_missing_invite_but_never_overwrites() {
+        let f = valid_fixture();
+        let ctx = TestCtx::for_fixture(&f);
+        let key = "space:cid".to_string();
+
+        // 1. First deposit lacks the invite (pre-ZEB-483 shape).
+        let e0 = filler_entry(f.sender_owner);
+        assert!(e0.invite_packet.is_none());
+        assert_eq!(
+            ctx.persist_entry(key.clone(), e0).await.unwrap(),
+            DepositPersistVerdict::Inserted
+        );
+        assert!(ctx.store.lock().unwrap()[&key].invite_packet.is_none());
+
+        // 2. Redeposit carries the invite → Duplicate, stored entry healed.
+        let mut e1 = filler_entry(f.sender_owner);
+        e1.invite_packet = Some(vec![0x11, 0x22]);
+        assert_eq!(
+            ctx.persist_entry(key.clone(), e1).await.unwrap(),
+            DepositPersistVerdict::Duplicate
+        );
+        assert_eq!(
+            ctx.store.lock().unwrap()[&key].invite_packet.as_deref(),
+            Some(&[0x11, 0x22][..]),
+            "missing invite upgraded on redeposit"
+        );
+
+        // 3. A later redeposit with a DIFFERENT invite must NOT overwrite.
+        let mut e2 = filler_entry(f.sender_owner);
+        e2.invite_packet = Some(vec![0x99]);
+        assert_eq!(
+            ctx.persist_entry(key.clone(), e2).await.unwrap(),
+            DepositPersistVerdict::Duplicate
+        );
+        assert_eq!(
+            ctx.store.lock().unwrap()[&key].invite_packet.as_deref(),
+            Some(&[0x11, 0x22][..]),
+            "existing invite never overwritten"
+        );
     }
 
     /// PR #221 round 1: caps are enforced at PERSIST level, atomically
@@ -1649,6 +1816,7 @@ mod tests {
         let frame = reframe(&DepositPayload {
             cidnotify_packet: tampered_packet,
             storage_blob: f.storage_blob.clone(),
+            invite_packet: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -1670,6 +1838,7 @@ mod tests {
         let frame = reframe(&DepositPayload {
             cidnotify_packet: mismatch_packet,
             storage_blob: f.storage_blob.clone(),
+            invite_packet: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -1693,6 +1862,7 @@ mod tests {
         let frame = reframe(&DepositPayload {
             cidnotify_packet: foreign_packet,
             storage_blob: f.storage_blob.clone(),
+            invite_packet: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();

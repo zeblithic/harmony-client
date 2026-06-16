@@ -528,6 +528,7 @@ impl ButlerDepositClient for InProcessButlerClient {
         let payload = DepositPayload {
             cidnotify_packet: req.cidnotify_packet.clone(),
             storage_blob,
+            invite_packet: req.invite_packet.clone(),
         };
         // The EXACT sender construction (Task 8) — sealed to the butler
         // device, signed by the cert-bound enrolled device key.

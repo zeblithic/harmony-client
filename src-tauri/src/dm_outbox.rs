@@ -1369,6 +1369,60 @@ impl DmOutbox {
         build_dm_packet(signed, &self.signing_key)
     }
 
+    /// ZEB-483: rebuild + sign the DmInvite wire bytes for a DM-Space deposit —
+    /// a `DmInviteSigned` reconstructed from the persisted `Space` record that is
+    /// admission-EQUIVALENT to the tunnel-carrier invite `add_space_dm_inner`
+    /// builds (lib.rs:10410), so a deposited copy bootstraps the same Space. It is
+    /// NOT byte-identical to the tunnel invite: `sender_devices` is a singleton of
+    /// this signing device (matching `build_cidnotify_packet_bytes`), not the
+    /// sender's full device list — benign, because the deposit-recover path
+    /// bootstraps ONLY the Space (it never refreshes the OwnerDeviceCache from a
+    /// deposited invite, see `apply_invite`'s `refresh_owner_device_cache`), and
+    /// the recipient already knows the sender's devices from the friend handshake.
+    ///
+    /// `Ok(Some)` for a healthy DM/GroupDm Space. `Ok(None)` for a genuinely
+    /// non-DM Space, OR a missing Space record — deposit the CidNotify alone. A
+    /// missing record is unreachable for a real DM outbox entry (the DM Space is
+    /// created and fleet-replicated alongside the entry, and "leave DM" sets
+    /// `left_at` rather than removing the record), and we can't classify a vanished
+    /// record as a DM, so we don't fail closed on it. For a DM/GroupDm Space that
+    /// EXISTS, the invite IS load-bearing for offline recovery, so an absent
+    /// `content_key` or a sign/encode failure returns `Err`: the caller then SKIPS
+    /// the deposit candidate and leaves the entry pending for retry (CodeRabbit)
+    /// rather than deposit a CidNotify an offline recipient would recover into
+    /// `SpaceNotFound`.
+    fn build_invite_packet_bytes(
+        &self,
+        state: &OwnerState,
+        space_id: &SpaceId,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let Some(space) = state.spaces.get(space_id) else {
+            return Ok(None);
+        };
+        if !matches!(space.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+            return Ok(None);
+        }
+        let content_key = space
+            .content_key
+            .clone()
+            .ok_or_else(|| format!("DM space {space_id:?} has no content_key"))?;
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id: space.id,
+            kind: space.kind,
+            members: space.members.clone(),
+            inviter: self.self_owner,
+            content_key,
+            sender_devices: vec![self.our_signing_device_hash],
+            created_at: space.created_at.clone(),
+            signing_device_hash: self.our_signing_device_hash,
+            inviter_identity_pub: self.private_identity.public_identity().to_public_bytes(),
+        };
+        crate::dm_envelope::build_signed_invite(signed, &self.signing_key)
+            .and_then(|p| crate::dm_envelope::encode_packet(&p))
+            .map(Some)
+            .map_err(|e| format!("invite rebuild failed: {e}"))
+    }
+
     /// Build + push one butler-deposit candidate for `(entry_id,
     /// recipient)` — shared by `drain_phase_c`'s Err-arm transient-failure
     /// rung (P1 Task 8) and its Ok-arm sent-but-never-acked rung (P2
@@ -1387,6 +1441,23 @@ impl DmOutbox {
         let Some(entry) = state.outbox.get(&entry_id) else {
             return;
         };
+        // ZEB-483 (CodeRabbit): build the bootstrap invite FIRST and treat a DM
+        // failure as fail-closed — skip the whole candidate so the entry stays
+        // pending for retry. Depositing the CidNotify without the invite would
+        // let a butler/relay ack mark the message delivered while an offline
+        // recipient recovers it straight into `SpaceNotFound`.
+        let invite_packet = match self.build_invite_packet_bytes(state, &entry.space_id) {
+            Ok(invite_packet) => invite_packet,
+            Err(err) => {
+                tracing::warn!(
+                    entry_id = ?entry_id,
+                    recipient = ?recipient,
+                    error = %err,
+                    "ZEB-483: DM invite rebuild failed; skipping deposit candidate (stays pending for retry)"
+                );
+                return;
+            }
+        };
         match self.build_cidnotify_packet_bytes(entry) {
             Ok(cidnotify_packet) => out.push(crate::butler_deposit::ButlerDepositRequest {
                 entry_id,
@@ -1394,6 +1465,7 @@ impl DmOutbox {
                 space_id: entry.space_id,
                 message_cid: entry.message_cid,
                 cidnotify_packet,
+                invite_packet,
                 now_ms,
             }),
             Err(err) => tracing::warn!(
@@ -1575,6 +1647,8 @@ impl DmOutbox {
             // existing (uncalled) behavior. The live tunnel ingest path
             // (`ingest_dm_packet`) passes `Some(owner)`.
             None,
+            // ZEB-483: dormant authenticated path — refresh the cache as before.
+            true,
         )
     }
 
@@ -1988,6 +2062,13 @@ pub(crate) fn apply_invite(
     // `handle_invite` method has no transport-peer context and passes `None`,
     // preserving its existing (uncalled) behavior.
     expected_inviter: Option<OwnerAddr>,
+    // ZEB-483 (CodeRabbit): whether to refresh the OwnerDeviceCache from the
+    // invite. `true` for the authenticated tunnel / dormant path (it legitimately
+    // learns the inviter's signing device). `false` for the deposit-recover path,
+    // which has already verified the sender against the pristine cache and must
+    // NOT let a sender-claimed device list regress that verified state — it
+    // bootstraps ONLY the Space.
+    refresh_owner_device_cache: bool,
 ) -> Result<DrainOutcome, DmReceiveError> {
     // SECURITY (CodeRabbit F1): bind the payload-controlled `signed.inviter` to
     // the authenticated tunnel peer BEFORE touching any trust state (cache or
@@ -2023,38 +2104,10 @@ pub(crate) fn apply_invite(
         signed.signing_device_hash,
     )?;
 
-    // Phase 3b auto-accept: write Space + cache + cached identity pub.
+    // Phase 3b auto-accept: write the Space, and — on the authenticated
+    // tunnel/dormant path only — refresh the OwnerDeviceCache.
     // (Phase 4 will replace this with a stage-pending-invite + UI prompt
     // path; follow-up ticket filed at PR-creation time per spec.)
-
-    // Build a parallel pubs vec: Some(inviter_identity_pub) at the signer's
-    // index, None everywhere else. The receiver knows the inviter's
-    // identity pub for the device that signed THIS invite, but has no pubs
-    // for the inviter's other devices yet — they remain pre-bootstrap
-    // until the next invite-equivalent flow.
-    let mut device_identity_pubs: Vec<Option<[u8; 64]>> = vec![None; signed.sender_devices.len()];
-    let signer_idx = signed
-        .sender_devices
-        .iter()
-        .position(|d| *d == signed.signing_device_hash)
-        .expect("sanity gate 2 already verified signing_device_hash ∈ sender_devices");
-    device_identity_pubs[signer_idx] = Some(signed.inviter_identity_pub);
-
-    // SECURITY: the OwnerDeviceCache LWW HLC must record when WE
-    // learned about these devices, NOT the timestamp the inviter
-    // claims they sent the invite. Using `signed.created_at` here
-    // would let an attacker forge a far-future HLC (e.g.,
-    // wall_ms = u64::MAX / 2) on a single malicious invite,
-    // pinning the local cache and rejecting every legitimate
-    // future update from the same owner as `StaleHlc` — a
-    // denial-of-updates attack. Mirror the pattern that
-    // `handle_cidnotify_lifted` Phase A already uses (local wall clock
-    // + our device_id).
-    let learned_at = Hlc {
-        wall_ms: wall_now_ms,
-        logical: 0,
-        device_id: device_id.to_string(),
-    };
 
     // Build the Space from the invite. Mirror what add_space's DM/group-DM
     // handling will produce (Phase 4 will produce these on the SEND side
@@ -2091,26 +2144,148 @@ pub(crate) fn apply_invite(
         return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
     }
 
-    // SECURITY (CodeRabbit F2): only write the OwnerDeviceCache AFTER the Space
-    // apply succeeds. A malformed/rejected invite must not alter trust state, so
-    // the cache mutation is sequenced behind the Space's invariant check. The
-    // cache update does NOT feed the Space apply (they are independent), so this
-    // reordering is purely a "commit cache last" guard with no behavioral change
-    // on the happy path.
-    let cache_outcome = state.apply_owner_device_update(
-        signed.inviter,
-        signed.sender_devices,
-        device_identity_pubs,
-        // ZEB-473: no tunnel contacts on this DM-receive cache refresh
-        // (populated only on the friend handshake, Task 5).
-        Vec::new(),
-        learned_at,
-    );
-    if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
-        return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
+    // ZEB-483 (CodeRabbit): the OwnerDeviceCache refresh is gated. The
+    // authenticated tunnel / dormant path (`refresh_owner_device_cache = true`)
+    // legitimately learns the inviter's signing device from the invite. The
+    // deposit-recover path passes `false`: it has ALREADY verified the sender
+    // against the PRISTINE cache (which is authoritative — see
+    // `verify_cidnotify_sender_binding`), and applying the invite's singleton,
+    // sender-claimed `sender_devices` at a fresh local HLC would let a stale or
+    // replayed deposited invite SHRINK / regress that verified device set
+    // (`apply_owner_device_update` is LWW-by-`learned_at` and REPLACES, not
+    // unions, the device list). Deposit recovery therefore bootstraps ONLY the
+    // Space; the verified CidNotify path owns all cache mutation.
+    if refresh_owner_device_cache {
+        // Build a parallel pubs vec: Some(inviter_identity_pub) at the signer's
+        // index, None everywhere else. The receiver knows the inviter's
+        // identity pub for the device that signed THIS invite, but has no pubs
+        // for the inviter's other devices yet — they remain pre-bootstrap
+        // until the next invite-equivalent flow.
+        let mut device_identity_pubs: Vec<Option<[u8; 64]>> =
+            vec![None; signed.sender_devices.len()];
+        let signer_idx = signed
+            .sender_devices
+            .iter()
+            .position(|d| *d == signed.signing_device_hash)
+            .expect("sanity gate 2 already verified signing_device_hash ∈ sender_devices");
+        device_identity_pubs[signer_idx] = Some(signed.inviter_identity_pub);
+
+        // SECURITY: the OwnerDeviceCache LWW HLC must record when WE
+        // learned about these devices, NOT the timestamp the inviter
+        // claims they sent the invite. Using `signed.created_at` here
+        // would let an attacker forge a far-future HLC (e.g.,
+        // wall_ms = u64::MAX / 2) on a single malicious invite,
+        // pinning the local cache and rejecting every legitimate
+        // future update from the same owner as `StaleHlc` — a
+        // denial-of-updates attack. Mirror the pattern that
+        // `handle_cidnotify_lifted` Phase A already uses (local wall clock
+        // + our device_id).
+        let learned_at = Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        };
+
+        // SECURITY (CodeRabbit F2): only write the OwnerDeviceCache AFTER the
+        // Space apply succeeds (above). A malformed/rejected invite must not
+        // alter trust state, so the cache mutation is sequenced behind the
+        // Space's invariant check.
+        let cache_outcome = state.apply_owner_device_update(
+            signed.inviter,
+            signed.sender_devices,
+            device_identity_pubs,
+            // ZEB-473: no tunnel contacts on this DM-receive cache refresh
+            // (populated only on the friend handshake, Task 5).
+            Vec::new(),
+            learned_at,
+        );
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
+            return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
+        }
     }
 
     Ok(DrainOutcome::default())
+}
+
+/// ZEB-483: apply a deposited DmInvite (if present) to bootstrap ONLY the DM
+/// Space, on the deposit-recover path (no authenticated tunnel peer).
+///
+/// SECURITY (CodeRabbit, Critical): the caller MUST already have verified the
+/// co-deposited CidNotify's signer against the PRISTINE `OwnerDeviceCache` (via
+/// [`verify_cidnotify_sender_binding`]) and pass the VERIFIED results here —
+/// `expected_inviter` / `expected_space_id` / `expected_signing_device_hash` /
+/// `expected_identity_pub`. Every trust-bearing field of the decoded invite is
+/// pinned to those verified values BEFORE any state mutation, so the invite can
+/// only ever bootstrap the exact Space the verified sender is notifying about —
+/// it can neither introduce a new `device → owner → pub` binding nor target a
+/// different Space. It bootstraps ONLY the Space: `apply_invite` is called with
+/// `refresh_owner_device_cache = false`, so the deposit-recover path never
+/// mutates the `OwnerDeviceCache` (the verified CidNotify path owns that). A
+/// forged, non-DM, or mismatched invite is rejected before it touches any state.
+/// Size-bounded; fail-closed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_deposited_invite(
+    state: &mut OwnerState,
+    self_owner: OwnerAddr,
+    device_id: &str,
+    invite_packet: &[u8],
+    expected_inviter: OwnerAddr,
+    expected_space_id: SpaceId,
+    expected_signing_device_hash: DeviceIdentityHash,
+    expected_identity_pub: [u8; 64],
+    wall_now_ms: u64,
+) -> Result<(), String> {
+    if invite_packet.len() > crate::butler_deposit::MAX_DEPOSIT_INVITE_BYTES {
+        return Err(format!(
+            "deposited invite too large: {} bytes",
+            invite_packet.len()
+        ));
+    }
+    let packet = crate::dm_envelope::decode_packet(invite_packet)
+        .map_err(|e| format!("decode invite: {e}"))?;
+    let crate::dm_envelope::DmPacket::Invite {
+        signed,
+        signature,
+        signed_bytes,
+    } = packet
+    else {
+        return Err("deposited invite_packet is not an Invite".into());
+    };
+    // SpaceKind is enforced at the EARLIEST point: `decode_packet` above rejects
+    // any DmInvite whose `kind` is not Dm/GroupDm (a payload invariant), so a
+    // non-DM invite never decodes and can never reach `apply_invite` to build a
+    // Space — no separate downstream SpaceKind gate is needed here (CodeRabbit
+    // round 3; the `verify_cidnotify_space` kind check is the redundant backstop).
+    // Pin every trust-bearing invite field to the independently-verified
+    // CidNotify sender BEFORE any mutation (CodeRabbit Critical). `inviter` is
+    // additionally enforced inside `apply_invite` via `Some(expected_inviter)`.
+    if signed.space_id != expected_space_id {
+        return Err("deposited invite space_id does not match verified CidNotify".into());
+    }
+    if signed.signing_device_hash != expected_signing_device_hash {
+        return Err("deposited invite signer does not match verified CidNotify signer".into());
+    }
+    if signed.inviter_identity_pub != expected_identity_pub {
+        return Err(
+            "deposited invite identity_pub does not match verified CidNotify signer".into(),
+        );
+    }
+    apply_invite(
+        state,
+        self_owner,
+        device_id,
+        signed,
+        signature,
+        &signed_bytes,
+        wall_now_ms,
+        Some(expected_inviter),
+        // ZEB-483 (CodeRabbit): deposit-recover bootstraps ONLY the Space. The
+        // sender was already verified against the pristine cache, so this invite
+        // must NOT mutate authenticated device-cache state.
+        false,
+    )
+    .map(|_| ())
+    .map_err(|e| format!("apply_invite: {e:?}"))
 }
 
 /// ZEB-233: lock-lifted drain entrypoint for production.
@@ -2658,6 +2833,33 @@ pub(crate) fn verify_cidnotify_admission(
     signature: &[u8; 64],
     signed_bytes: &[u8],
 ) -> Result<(crate::owner_state_types::Space, OwnerAddr, [u8; 64]), DmReceiveError> {
+    let (resolved_owner, identity_pub) =
+        verify_cidnotify_sender_binding(state, signed, signature, signed_bytes)?;
+    let space = verify_cidnotify_space(state, signed, resolved_owner)?;
+    Ok((space, resolved_owner, identity_pub))
+}
+
+/// Sender-binding prefix of [`verify_cidnotify_admission`] (steps 1–4): resolve
+/// and cryptographically authenticate the CidNotify's signer against the
+/// `OwnerDeviceCache` **as it currently exists**, returning the tuple
+/// `(resolved_owner, identity_pub)`.
+///
+/// SECURITY (ZEB-483, CodeRabbit): the deposit-recover path MUST call this
+/// against the PRISTINE cache — BEFORE any deposited `DmInvite` mutates trust
+/// state. `apply_invite` seeds the `device → owner → identity_pub` rows that
+/// `lookup_pubkey_for_device` / `resolve_signed_origin_owner` read here; if the
+/// invite ran first, a forged CidNotify would "verify" against cache the
+/// untrusted invite just wrote (circular trust — an attacker seeds their own
+/// device under a victim owner, then the notify resolves to the victim). On the
+/// legitimate offline-DM path the sender is an existing friend whose devices are
+/// already cached, so this resolves without help from the invite; the invite is
+/// then only permitted to bootstrap the missing Space, never device trust.
+pub(crate) fn verify_cidnotify_sender_binding(
+    state: &OwnerState,
+    signed: &crate::dm_envelope::DmCidNotifySigned,
+    signature: &[u8; 64],
+    signed_bytes: &[u8],
+) -> Result<(OwnerAddr, [u8; 64]), DmReceiveError> {
     let identity_pub =
         lookup_pubkey_for_device(&state.owner_device_cache, signed.signing_device_hash)
             .ok_or(DmReceiveError::UnknownSigningKey)?;
@@ -2672,6 +2874,19 @@ pub(crate) fn verify_cidnotify_admission(
     if signed.sender_owner_addr != resolved_owner {
         return Err(DmReceiveError::OwnerFieldMismatch);
     }
+    Ok((resolved_owner, identity_pub))
+}
+
+/// Space-binding suffix of [`verify_cidnotify_admission`] (steps 5–7): look up
+/// the target Space, gate its kind (`Dm | GroupDm`), and confirm the
+/// already-resolved sender is a member. Split out so the deposit-recover path
+/// can bootstrap the Space from a deposited invite BETWEEN sender-binding and
+/// this check (ZEB-483) without re-reading the cache.
+pub(crate) fn verify_cidnotify_space(
+    state: &OwnerState,
+    signed: &crate::dm_envelope::DmCidNotifySigned,
+    resolved_owner: OwnerAddr,
+) -> Result<crate::owner_state_types::Space, DmReceiveError> {
     let space = state
         .spaces
         .get(&signed.space_id)
@@ -2683,7 +2898,7 @@ pub(crate) fn verify_cidnotify_admission(
     if !space.members.contains(&resolved_owner) {
         return Err(DmReceiveError::SenderNotInSpaceMembers);
     }
-    Ok((space, resolved_owner, identity_pub))
+    Ok(space)
 }
 
 /// Phase C decrypt + sender binding for an inbound DM storage blob,
@@ -3763,6 +3978,126 @@ mod tests {
             mock.calls().len(),
             1,
             "deposit must be attempted at most once per backoff window"
+        );
+    }
+
+    /// ZEB-483: a DM-space deposit request carries a piggybacked signed
+    /// DmInvite that a FRESH recipient state can apply (signature + admission
+    /// gates pass) to bootstrap the DM Space from the deposit rung.
+    #[tokio::test]
+    async fn deposit_candidate_attaches_signed_invite_for_dm_space() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Failed("butlers unreachable".into()));
+        // deposit_rung_fixture installs a DM Space for the entry; ensure it has
+        // a content_key + both members so the invite rebuild has its inputs.
+        // The entry's space_id is SpaceId([1u8; 16]) (entry_with_age), so the
+        // DM space must share that id.
+        let space_id = SpaceId([1u8; 16]);
+        install_space(&mut state, make_dm_space(1, vec![o.self_owner, bob]));
+
+        // Drive two transient failures to trip the deposit rung (the first never
+        // deposits, the second does — matches the existing rung tests).
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+            .await;
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+            .await;
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1, "deposit rung fires once");
+        let invite_bytes = calls[0]
+            .invite_packet
+            .as_ref()
+            .expect("DM-space deposit must carry a piggybacked invite");
+
+        // The invite decodes to a DmPacket::Invite for the same Space, inviter == sender.
+        let packet = crate::dm_envelope::decode_packet(invite_bytes).expect("decode invite");
+        let crate::dm_envelope::DmPacket::Invite {
+            signed,
+            signature,
+            signed_bytes,
+        } = packet
+        else {
+            panic!("expected Invite");
+        };
+        assert_eq!(signed.space_id, space_id);
+        assert_eq!(signed.inviter, o.self_owner);
+        assert!(signed.members.contains(&o.self_owner) && signed.members.contains(&bob));
+
+        // And a FRESH recipient state applies it (signature + admission gates pass).
+        let mut rx = OwnerState::default();
+        let outcome = crate::dm_outbox::apply_invite(
+            &mut rx,
+            bob,       // recipient self
+            "bob-dev", // recipient device id
+            signed,
+            signature,
+            &signed_bytes,
+            20_000,
+            Some(o.self_owner), // expected inviter
+            true,               // full apply (Space + cache) on a fresh recipient
+        );
+        assert!(
+            outcome.is_ok(),
+            "rebuilt invite must apply on a fresh recipient: {outcome:?}"
+        );
+        assert!(
+            rx.spaces.contains_key(&space_id),
+            "Space bootstrapped from the deposited invite"
+        );
+    }
+
+    /// ZEB-483: a non-DM (Community) space yields no piggybacked invite.
+    #[tokio::test]
+    async fn deposit_candidate_omits_invite_for_non_dm_space() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Failed("x".into()));
+        // Replace the space with a community (non-DM) space sharing the entry's
+        // id. Insert directly into `state.spaces` rather than via `install_space`
+        // — a Community space requires the full epoch/admin invariant set that
+        // `apply_space_with_canonicalization` validates on insert, none of which
+        // matters here: this test only exercises `build_invite_packet_bytes`'s
+        // `SpaceKind` guard, which short-circuits before reading any other field.
+        let mut community = make_dm_space(1, vec![o.self_owner, bob]);
+        community.kind = SpaceKind::Community;
+        community.content_key = None;
+        state.spaces.insert(community.id, community);
+
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+            .await;
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+            .await;
+
+        assert_eq!(
+            mock.calls()[0].invite_packet,
+            None,
+            "non-DM deposit carries no invite"
+        );
+    }
+
+    /// ZEB-483 (CodeRabbit): a DM-space invite rebuild FAILURE is fail-closed —
+    /// the whole deposit candidate is skipped so the entry stays pending for
+    /// retry, rather than depositing a CidNotify an offline recipient would
+    /// recover into `SpaceNotFound`. Modelled by a DM Space missing its
+    /// `content_key` (inserted directly to bypass the invariant that would
+    /// normally reject such a Space).
+    #[tokio::test]
+    async fn deposit_candidate_skipped_when_dm_invite_rebuild_fails() {
+        let (mut state, transport, mut o, mock, entry_id, bob) =
+            deposit_rung_fixture(DepositRungOutcome::Failed("x".into()));
+        // A DM Space at the entry's id but with NO content_key → invite rebuild
+        // returns Err → the candidate must be skipped entirely.
+        let mut broken = make_dm_space(1, vec![o.self_owner, bob]);
+        broken.content_key = None;
+        state.spaces.insert(broken.id, broken);
+
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 10_000)
+            .await;
+        let _ = drain_with_transient_failure(&mut o, &mut state, &transport, entry_id, bob, 15_000)
+            .await;
+
+        assert!(
+            mock.calls().is_empty(),
+            "DM invite rebuild failure skips the deposit candidate (no CidNotify deposited)"
         );
     }
 
@@ -5350,6 +5685,7 @@ mod tests {
             &body_bytes,
             200,
             None,
+            true, // F2 guard: cache write is sequenced after the Space apply (which rejects first)
         )
         .unwrap_err();
         assert!(

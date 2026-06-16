@@ -367,6 +367,11 @@ pub struct ProdRelayIngestCtx {
     /// device). `open_and_ingest` tries each against the sealed blob; in
     /// practice a single device holds one key.
     pub device_x25519_privs: Vec<Zeroizing<[u8; 32]>>,
+    /// ZEB-483: this node's own `OwnerAddr` (the deposit recipient). Threaded
+    /// into `apply_deposited_invite`'s `apply_invite` recipient-membership gate
+    /// when bootstrapping the DM Space from a relay-held deposited invite on
+    /// recover (mirrors `ProdDmInboxIngestCtx::self_owner`).
+    pub self_owner: crate::owner_state_types::OwnerAddr,
     /// The runtime owner-state CRDT (`NodeState`'s `crdt_state` Arc) — admission
     /// (`verify_cidnotify_admission`) + `apply_inbox` happen under this lock.
     pub crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
@@ -420,14 +425,39 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
         //    the durable insert are atomic, matching the direct path.
         let (resolved_owner, payload_msg, newly_inserted, received_at, space_id, message_cid) = {
             let mut state = self.crdt_state.lock().await;
-            let (space, resolved_owner, _identity_pub) =
-                crate::dm_outbox::verify_cidnotify_admission(
-                    &state,
-                    &signed,
-                    &signature,
-                    &signed_bytes,
-                )
-                .map_err(|e| format!("verify_cidnotify_admission: {e:?}"))?;
+            // ZEB-483 (CodeRabbit Critical): verify the CidNotify's signer
+            // against the PRISTINE OwnerDeviceCache FIRST, then let any deposited
+            // invite bootstrap ONLY the missing DM Space — pinned to that
+            // verified sender. Applying the invite first would let it seed the
+            // `device → owner → pub` rows the admission then reads, so a forged
+            // invite + notify could verify against cache the untrusted invite
+            // just wrote (circular trust). On the legitimate offline path the
+            // sender is an existing co-member/friend whose device is already
+            // cached here, so it resolves WITHOUT the invite; the invite supplies
+            // only the Space. `?` leaves the blob unacked so the relay drain
+            // retries (fail-closed).
+            let (resolved_owner, identity_pub) = crate::dm_outbox::verify_cidnotify_sender_binding(
+                &state,
+                &signed,
+                &signature,
+                &signed_bytes,
+            )
+            .map_err(|e| format!("verify_cidnotify_sender_binding: {e:?}"))?;
+            if let Some(inv) = payload.invite_packet.as_ref() {
+                crate::dm_outbox::apply_deposited_invite(
+                    &mut state,
+                    self.self_owner,
+                    &self.device_id,
+                    inv,
+                    resolved_owner,
+                    signed.space_id,
+                    signed.signing_device_hash,
+                    identity_pub,
+                    now_epoch_ms(),
+                )?;
+            }
+            let space = crate::dm_outbox::verify_cidnotify_space(&state, &signed, resolved_owner)
+                .map_err(|e| format!("verify_cidnotify_space: {e:?}"))?;
 
             // 4. Blob ↔ packet binding: the recovered storage blob must hash to
             //    the packet's message_cid under the DM send path's flags.
@@ -738,6 +768,7 @@ impl crate::community_relay::CommunityRelayDepositClient for ProdCommunityRelayD
         let payload = DepositPayload {
             cidnotify_packet: req.cidnotify_packet.clone(),
             storage_blob,
+            invite_packet: req.invite_packet.clone(),
         };
 
         // 4. Fan out: the FIRST relay that acks ≥1 sealed copy wins. For each
@@ -1613,6 +1644,7 @@ mod tests {
             space_id: SpaceId([0xDD; 16]),
             message_cid: cid,
             cidnotify_packet: vec![0x01, 0x02, 0x03],
+            invite_packet: None,
             now_ms: TEST_NOW,
         }
     }
@@ -1978,5 +2010,349 @@ mod tests {
             2,
             "both device-target copies deposited to the first acking relay"
         );
+    }
+
+    // =================================================================
+    // ZEB-483 Task 5: ProdRelayIngestCtx::ingest_recovered applies a
+    // piggybacked DmInvite to bootstrap the DM Space BEFORE CidNotify
+    // admission, mirroring the butler recover path
+    // (dm_inbox_ingest::deposited_invite_bootstraps_space_then_cidnotify_admits).
+    // The relay ctx holds the full unsealed DepositPayload, so the invite is
+    // `payload.invite_packet` (not an entry field).
+    // =================================================================
+
+    /// A built recover fixture: a `DepositPayload` (CidNotify + blob + invite)
+    /// for a DM Space the recipient (Bob) has NOT bootstrapped, plus the prod
+    /// ingest ctx over Bob's fresh state. Alice is the sender/inviter. The blob
+    /// is encrypted under the SAME member set + content_key the invite carries,
+    /// so once the invite bootstraps the Space its recomputed AAD + content_key
+    /// decrypt it (DM-Space AAD = DedupeKey::SortedMembers, SpaceId-independent).
+    struct RelayRecoverInviteFixture {
+        prod_ctx: ProdRelayIngestCtx,
+        crdt_state: Arc<tokio::sync::Mutex<OwnerState>>,
+        payload: DepositPayload,
+        space_id: SpaceId,
+        sink: std::sync::Arc<crate::node_event_sink::RecordingSink>,
+        // Inputs needed to forge a mismatched-inviter invite for the negative test.
+        bob: OwnerAddr,
+        created_at: Hlc,
+        content_key: crate::owner_state_types::DmContentKey,
+    }
+
+    impl RelayRecoverInviteFixture {
+        /// Number of `dm-received` frames the recording sink saw.
+        fn emitted_dm_received(&self) -> usize {
+            self.sink
+                .frames()
+                .into_iter()
+                .filter(|(ev, _)| ev == crate::dm_outbox::DM_RECEIVED_EVENT)
+                .count()
+        }
+
+        /// A clone of the payload whose invite is re-signed with an inviter that
+        /// is NOT the CidNotify's sender (a third, validly-signing owner).
+        /// `apply_deposited_invite` binds the invite's `inviter` to the
+        /// CidNotify's `sender_owner_addr` (Alice), so this must fail-closed.
+        fn payload_with_mismatched_inviter(&self) -> DepositPayload {
+            let private_charlie = harmony_identity::PrivateIdentity::from_seed(&[0xC3; 32]);
+            let charlie_pub = private_charlie.public_identity();
+            let charlie_identity_pub = charlie_pub.to_public_bytes();
+            let charlie = OwnerAddr([0xC3; 16]);
+            let charlie_device_hash =
+                crate::owner_state_types::DeviceIdentityHash(charlie_pub.address_hash);
+
+            let mut members = vec![charlie, self.bob];
+            members.sort();
+            let signed = crate::dm_envelope::DmInviteSigned {
+                space_id: self.space_id,
+                kind: SpaceKind::Dm,
+                members,
+                inviter: charlie,
+                content_key: self.content_key.clone(),
+                sender_devices: vec![charlie_device_hash],
+                created_at: self.created_at.clone(),
+                signing_device_hash: charlie_device_hash,
+                inviter_identity_pub: charlie_identity_pub,
+            };
+            let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+            let signature = private_charlie.sign(&signed_bytes);
+            let invite_wire =
+                crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Invite {
+                    signed,
+                    signature,
+                    signed_bytes,
+                })
+                .unwrap();
+            let mut payload = self.payload.clone();
+            payload.invite_packet = Some(invite_wire);
+            payload
+        }
+    }
+
+    fn relay_ingest_fixture_without_space_with_invite(
+        pre_cache_sender: bool,
+    ) -> RelayRecoverInviteFixture {
+        use crate::owner_state_types::{ContentId, DmContentKey, Space};
+
+        let alice = OwnerAddr([0xA1; 16]);
+        let bob = OwnerAddr([0xB0; 16]);
+        let space_id = SpaceId([0x5A; 16]);
+        let content_key = DmContentKey::new([0x42u8; 32]);
+        let body = b"recovered over the relay rung".to_vec();
+
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let alice_pub = private_alice.public_identity();
+        let alice_identity_pub = alice_pub.to_public_bytes();
+        let alice_device_hash =
+            crate::owner_state_types::DeviceIdentityHash(alice_pub.address_hash);
+
+        let mut members = vec![alice, bob];
+        members.sort();
+        let created_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+
+        // (1) Encrypt the DM blob under a transient Space whose members match the
+        //     ones the invite carries — `compute_aad` for a DM Space is keyed on
+        //     the SORTED member set only (DedupeKey::SortedMembers), so the Space
+        //     the invite later bootstraps recomputes the identical AAD and the
+        //     same `content_key` decrypts it. SpaceId/name are AAD-irrelevant.
+        let aad_space = Space {
+            id: space_id,
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Alice".into(),
+            transport: None,
+            members: members.clone(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: created_at.clone(),
+            updated_at: created_at.clone(),
+            content_key: Some(content_key.clone()),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+        let msg_payload = crate::dm_envelope::MessagePayload {
+            body: body.clone(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let aad = crate::dm_crypto::compute_aad(&aad_space).unwrap();
+        let storage_blob =
+            crate::dm_crypto::encrypt_dm_message(&content_key, &aad, &msg_payload).unwrap();
+        let message_cid = ContentId::for_book(
+            &storage_blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // (2) Signed CidNotify from Alice for this blob.
+        let cn_signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let cn_signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&cn_signed).unwrap();
+        let cn_signature = private_alice.sign(&cn_signed_bytes);
+        let cidnotify_packet =
+            crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::CidNotify {
+                signed: cn_signed,
+                signature: cn_signature,
+                signed_bytes: cn_signed_bytes,
+            })
+            .unwrap();
+
+        // (3) Signed DmInvite from Alice carrying the SAME content_key + member
+        //     set — this is what bootstraps the Space + caches Alice's device.
+        let inv_signed = crate::dm_envelope::DmInviteSigned {
+            space_id,
+            kind: SpaceKind::Dm,
+            members: members.clone(),
+            inviter: alice,
+            content_key: content_key.clone(),
+            sender_devices: vec![alice_device_hash],
+            created_at: created_at.clone(),
+            signing_device_hash: alice_device_hash,
+            inviter_identity_pub: alice_identity_pub,
+        };
+        let inv_signed_bytes =
+            crate::owner_state_crypto::canonical_cbor_encode(&inv_signed).unwrap();
+        let inv_signature = private_alice.sign(&inv_signed_bytes);
+        let invite_wire =
+            crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Invite {
+                signed: inv_signed,
+                signature: inv_signature,
+                signed_bytes: inv_signed_bytes,
+            })
+            .unwrap();
+
+        let payload = DepositPayload {
+            cidnotify_packet,
+            storage_blob,
+            invite_packet: Some(invite_wire),
+        };
+
+        // Bob's state: NO Space (offline-at-create). Alice's signing device is
+        // pre-cached IFF `pre_cache_sender` — the legitimate path (Alice is an
+        // existing co-member/friend) resolves the signer from this PRISTINE cache
+        // BEFORE the invite runs, and the invite bootstraps only the missing
+        // Space. Without the pre-cache, sender-binding rejects fail-closed
+        // (ZEB-483 / CodeRabbit Critical: the invite can no longer seed trust).
+        let mut bob_state = OwnerState::default();
+        if pre_cache_sender {
+            bob_state.apply_owner_device_update(
+                alice,
+                vec![alice_device_hash],
+                vec![Some(alice_identity_pub)],
+                vec![None],
+                Hlc {
+                    wall_ms: 50,
+                    logical: 0,
+                    device_id: "bob-device-64hex".into(),
+                },
+            );
+        }
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(bob_state));
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            Arc::new(Arc::clone(&sink_handle));
+
+        let prod_ctx = ProdRelayIngestCtx {
+            device_id: "bob-device-64hex".into(),
+            device_x25519_privs: vec![],
+            self_owner: bob,
+            crdt_state: Arc::clone(&crdt_state),
+            content_store,
+            sink,
+        };
+
+        RelayRecoverInviteFixture {
+            prod_ctx,
+            crdt_state,
+            payload,
+            space_id,
+            sink: sink_handle,
+            bob,
+            created_at,
+            content_key,
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_recovered_invite_bootstraps_space_then_delivers() {
+        // Legitimate path: Alice is an existing co-member/friend (pre-cached);
+        // only the Space is missing, and the relay-held invite bootstraps it.
+        let fx = relay_ingest_fixture_without_space_with_invite(true);
+
+        // Sanity: the Space is absent pre-recover → a plain CidNotify ingest
+        // would fail with SpaceNotFound.
+        {
+            let st = fx.crdt_state.lock().await;
+            assert!(
+                !st.spaces.contains_key(&fx.space_id),
+                "space absent pre-recover"
+            );
+        }
+
+        fx.prod_ctx
+            .ingest_recovered(fx.payload.clone())
+            .await
+            .expect("invite bootstraps space, notify admits, blob delivers");
+
+        let st = fx.crdt_state.lock().await;
+        assert!(
+            st.spaces.contains_key(&fx.space_id),
+            "Space bootstrapped from the relay-held invite"
+        );
+        drop(st);
+        assert_eq!(
+            fx.emitted_dm_received(),
+            1,
+            "dm-received emitted exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_recovered_invite_wrong_inviter_rejected() {
+        let fx = relay_ingest_fixture_without_space_with_invite(true);
+        let payload = fx.payload_with_mismatched_inviter();
+        let err = fx
+            .prod_ctx
+            .ingest_recovered(payload)
+            .await
+            .expect_err("mismatched inviter must fail-closed");
+        // Pinned to the verified CidNotify signer → rejects at the signer-binding
+        // check (or, defense-in-depth, inside apply_invite).
+        assert!(
+            err.contains("does not match verified CidNotify")
+                || err.contains("apply_invite")
+                || err.contains("InviterMismatch"),
+            "got {err}"
+        );
+        let st = fx.crdt_state.lock().await;
+        assert!(
+            !st.spaces.contains_key(&fx.space_id),
+            "no Space bootstrapped on reject"
+        );
+        drop(st);
+        assert_eq!(fx.emitted_dm_received(), 0, "no delivery on reject");
+    }
+
+    /// ZEB-483 CodeRabbit Critical regression (relay rung): a relay-held invite
+    /// from a sender whose signing device is NOT already cached must be rejected
+    /// before it can seed trust. Pre-fix the invite seeded `device → owner → pub`
+    /// and the co-deposited CidNotify "verified" against that just-written cache
+    /// (circular trust). Post-fix: sender-binding against the pristine cache
+    /// rejects fail-closed — no Space, no cache poison, no delivery.
+    #[tokio::test]
+    async fn ingest_recovered_invite_from_uncached_sender_rejected_no_poison() {
+        let fx = relay_ingest_fixture_without_space_with_invite(false);
+        let alice = OwnerAddr([0xA1; 16]);
+
+        let err = fx
+            .prod_ctx
+            .ingest_recovered(fx.payload.clone())
+            .await
+            .expect_err("uncached sender must fail-closed (no trust bootstrap)");
+        assert!(
+            err.contains("verify_cidnotify_sender_binding")
+                || err.contains("UnknownSigningKey")
+                || err.contains("UnknownSigningDevice"),
+            "must reject at sender-binding against the pristine cache, got {err}"
+        );
+
+        let st = fx.crdt_state.lock().await;
+        assert!(
+            !st.spaces.contains_key(&fx.space_id),
+            "no Space bootstrapped from an unverified sender's invite"
+        );
+        assert!(
+            !st.owner_device_cache.devices.contains_key(&alice),
+            "device cache NOT poisoned with the claimed sender's mapping"
+        );
+        drop(st);
+        assert_eq!(fx.emitted_dm_received(), 0, "no delivery on reject");
     }
 }

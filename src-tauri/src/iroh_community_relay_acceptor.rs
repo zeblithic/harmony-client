@@ -1057,6 +1057,7 @@ mod tests {
         let payload = DepositPayload {
             cidnotify_packet: cidnotify_bytes,
             storage_blob,
+            invite_packet: None,
         };
 
         let cert_bytes = harmony_owner::cbor::to_canonical(&s.cert).expect("encode cert");

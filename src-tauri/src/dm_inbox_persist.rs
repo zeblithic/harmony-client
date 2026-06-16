@@ -240,6 +240,7 @@ mod tests {
             sender_owner: [7u8; 16],
             cidnotify_packet: vec![1, 2, 3],
             storage_blob: vec![4, 5, 6],
+            invite_packet: None,
             deposited_at: Hlc {
                 wall_ms: 1,
                 logical: 0,
