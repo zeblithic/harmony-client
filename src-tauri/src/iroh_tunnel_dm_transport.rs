@@ -284,18 +284,24 @@ mod tests {
     /// task runs. The recipient NodeId is pre-registered as an Active handle (via
     /// `register_inbound`) so `send_dm` routes over `cmd_tx` — NOT a lazy dial
     /// whose fast failure to the synthetic contact would evict the pending before
-    /// we observe it. Drain the next routed `SendDm` payload, polling until the
-    /// spawn delivers it. Panics on timeout.
+    /// we observe it. Await the next routed `SendDm` payload under a generous
+    /// timeout — parking on `recv()` yields to the spawned task, which is more
+    /// robust than a fixed busy-poll budget that could trip under CI scheduling
+    /// load. Panics on timeout.
     async fn wait_for_routed(
         cmd_rx: &mut tokio::sync::mpsc::Receiver<crate::tunnel_manager::TunnelCommand>,
     ) -> Vec<u8> {
-        for _ in 0..200 {
-            if let Ok(crate::tunnel_manager::TunnelCommand::SendDm(p)) = cmd_rx.try_recv() {
-                return p;
+        let routed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match cmd_rx.recv().await {
+                    Some(crate::tunnel_manager::TunnelCommand::SendDm(p)) => return p,
+                    Some(_) => continue,
+                    None => panic!("tunnel command channel closed before routing a packet"),
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        panic!("spawned tunnel send_dm never routed a packet");
+        })
+        .await;
+        routed.expect("spawned tunnel send_dm never routed a packet within timeout")
     }
 
     fn synthetic_outbox_entry(space: SpaceId, cid: ContentId, recipient: OwnerAddr) -> OutboxEntry {

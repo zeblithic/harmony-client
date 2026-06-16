@@ -141,6 +141,25 @@ impl TunnelManager {
         }
     }
 
+    /// Test-only constructor that pins `self_node_id` to a chosen value. The
+    /// dial-vs-await election (and `keep_new`) turn on the numeric ordering of
+    /// `self_node_id` against the peer's, so pinning it lets tests place
+    /// themselves deterministically above/below a sentinel peer — instead of
+    /// leaning on the 2^-256 improbability that a randomly hashed self collides
+    /// with an all-0x00/all-0xFF peer.
+    #[cfg(test)]
+    pub(crate) fn new_with_self_node_id(
+        endpoint: IrohEndpoint,
+        local_pq: Arc<PqPrivateIdentity>,
+        ingest_tx: mpsc::Sender<InboundDm>,
+        self_node_id: [u8; 32],
+    ) -> Self {
+        Self {
+            self_node_id,
+            ..Self::new(endpoint, local_pq, ingest_tx)
+        }
+    }
+
     /// Allocate a fresh monotonic session epoch (see [`TunnelHandle::epoch`]).
     fn alloc_epoch(&self) -> u64 {
         self.next_epoch
@@ -646,9 +665,9 @@ fn close_handle(mut handle: TunnelHandle) {
 mod tests {
     use super::*;
 
-    fn test_manager() -> (Arc<TunnelManager>, mpsc::Receiver<InboundDm>) {
-        // A manager needs an iroh endpoint; bind a real loopback one (cheap,
-        // and these tests never dial). Use a fresh PQ identity for self.
+    // A manager needs an iroh endpoint; bind a real loopback one (cheap, and
+    // these tests never dial). Use a fresh PQ identity for self.
+    fn test_endpoint_and_pq() -> (IrohEndpoint, Arc<PqPrivateIdentity>) {
         let endpoint = futures::executor::block_on(async {
             let sk = iroh::SecretKey::generate();
             crate::iroh_endpoint::IrohEndpoint::new_with_secret(sk)
@@ -656,9 +675,33 @@ mod tests {
                 .expect("bind loopback iroh endpoint")
         });
         let local_pq = Arc::new(PqPrivateIdentity::generate(&mut rand::rngs::OsRng));
+        (endpoint, local_pq)
+    }
+
+    fn test_manager() -> (Arc<TunnelManager>, mpsc::Receiver<InboundDm>) {
+        let (endpoint, local_pq) = test_endpoint_and_pq();
         let (ingest_tx, ingest_rx) = mpsc::channel(16);
         (
             Arc::new(TunnelManager::new(endpoint, local_pq, ingest_tx)),
+            ingest_rx,
+        )
+    }
+
+    // ZEB-485: a manager with `self_node_id` pinned to a known value, so the
+    // dial-vs-await election against a sentinel peer is deterministic rather
+    // than relying on a random hashed self never colliding with the sentinel.
+    fn test_manager_with_self(
+        self_node_id: [u8; 32],
+    ) -> (Arc<TunnelManager>, mpsc::Receiver<InboundDm>) {
+        let (endpoint, local_pq) = test_endpoint_and_pq();
+        let (ingest_tx, ingest_rx) = mpsc::channel(16);
+        (
+            Arc::new(TunnelManager::new_with_self_node_id(
+                endpoint,
+                local_pq,
+                ingest_tx,
+                self_node_id,
+            )),
             ingest_rx,
         )
     }
@@ -816,9 +859,9 @@ mod tests {
     /// pending — not drop it (the prior code seeded `vec![]`).
     #[tokio::test(flavor = "current_thread")]
     async fn send_dm_active_closed_seeds_failed_packet_into_redial() {
-        let (mgr, _ingest_rx) = test_manager();
-        // ZEB-485: peer 0xFF is >= our (hashed) self, so we are the LOWER NodeId
-        // and the redial takes the dial branch (not the higher-peer await branch).
+        // ZEB-485: self pinned to 0x80 and peer 0xFF > self, so we are the LOWER
+        // NodeId and the redial takes the dial branch (not the await branch).
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
         let peer = fixed_node_id(0xFF);
 
         // Install an Active handle whose cmd_rx is dropped → try_send → Closed.
@@ -964,8 +1007,8 @@ mod tests {
         // ZEB-485: when WE are the lower NodeId, send_dm to an unknown peer dials
         // right away (a Dialing/Initiator handle appears synchronously — the
         // spawned dial task can't run before this sync assert on current_thread).
-        let (mgr, _ingest_rx) = test_manager();
-        let peer = fixed_node_id(0xFF); // always >= our (hashed) self => we are lower.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0xFF); // peer 0xFF > self 0x80 => we are lower.
         let contact = DeviceTunnelContact {
             iroh_node_id: peer,
             home_relay_url: None,
@@ -984,8 +1027,8 @@ mod tests {
     async fn send_dm_higher_self_awaits_inbound() {
         // ZEB-485: when WE are the higher NodeId, send_dm buffers in an
         // AwaitingInbound handle instead of dialing.
-        let (mgr, _ingest_rx) = test_manager();
-        let peer = fixed_node_id(0x00); // always <= our (hashed) self => we are higher.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00); // peer 0x00 < self 0x80 => we are higher.
         let contact = DeviceTunnelContact {
             iroh_node_id: peer,
             home_relay_url: None,
@@ -1003,8 +1046,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn await_inbound_falls_back_to_dial_after_delay() {
         // ZEB-485: if no inbound arrives, the higher peer dials after the delay.
-        let (mgr, _ingest_rx) = test_manager();
-        let peer = fixed_node_id(0x00); // we are higher => we await first.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00); // peer 0x00 < self 0x80 => we await first.
         let contact = DeviceTunnelContact {
             iroh_node_id: peer,
             home_relay_url: None,
@@ -1042,8 +1085,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn await_inbound_fallback_is_noop_when_inbound_arrives_first() {
         // ZEB-485: an inbound dial that lands before the delay cancels the fallback.
-        let (mgr, _ingest_rx) = test_manager();
-        let peer = fixed_node_id(0x00); // we are higher => we await.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00); // peer 0x00 < self 0x80 => we await.
         let contact = DeviceTunnelContact {
             iroh_node_id: peer,
             home_relay_url: None,
@@ -1077,8 +1120,8 @@ mod tests {
         // AwaitingInbound, register_inbound keeps the inbound and redirects our
         // buffered DMs onto it. AwaitingInbound is tagged role=Initiator, so the
         // existing keep_new/drain_pending_into path covers it with NO change.
-        let (mgr, _ingest_rx) = test_manager();
-        let peer = fixed_node_id(0x00); // peer <= self => keep_new(peer, self) == true.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00); // peer 0x00 <= self 0x80 => keep_new(peer, self) == true.
 
         // Install an AwaitingInbound handle holding two buffered DMs. Its cmd_tx is
         // dead (rx dropped) — the drain targets the SURVIVOR (the new inbound), not
