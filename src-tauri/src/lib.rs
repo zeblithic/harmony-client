@@ -4187,6 +4187,10 @@ pub async fn start_node_inner(
                         dyn crate::dm_inbox_ingest::DmInboxIngestCtx,
                     > = std::sync::Arc::new(crate::dm_inbox_ingest::ProdDmInboxIngestCtx {
                         device_id: device_id.clone(),
+                        // ZEB-483: this node's own OwnerAddr — the deposit
+                        // recipient, needed to bootstrap the DM Space from a
+                        // deposited invite on recover (apply_deposited_invite).
+                        self_owner,
                         crdt_state: std::sync::Arc::clone(&crdt_state),
                         content_store: std::sync::Arc::clone(&content_store),
                         sink: app.clone(),

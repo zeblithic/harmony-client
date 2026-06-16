@@ -664,6 +664,10 @@ pub(crate) async fn ingest_dm_packet(
 pub struct ProdDmInboxIngestCtx {
     /// This device's SP1 device id (64-hex of the device ed25519 verify key).
     pub device_id: String,
+    /// ZEB-483: this node's own `OwnerAddr` (the deposit recipient). Threaded
+    /// into `apply_deposited_invite`'s `apply_invite` recipient-membership gate
+    /// when bootstrapping the DM Space from a deposited invite on recover.
+    pub self_owner: OwnerAddr,
     /// The runtime owner-state CRDT (`NodeState`'s `crdt_state` Arc).
     pub crdt_state: Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
     /// The shared CAS handle (`RuntimeContentStore` in production).
@@ -721,7 +725,24 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         //    owner-state lock (signature, owner resolution, Space lookup,
         //    SpaceKind gate, membership).
         let (space, resolved_owner) = {
-            let state = self.crdt_state.lock().await;
+            let mut state = self.crdt_state.lock().await;
+            // ZEB-483: if the deposit piggybacked a signed DmInvite, apply it
+            // FIRST to bootstrap the DM Space (and cache the inviter's device)
+            // so the CidNotify admits instead of `SpaceNotFound`. The invite's
+            // inviter is bound to the CidNotify's claimed `sender_owner_addr`;
+            // the admission call below then cryptographically pins that claimed
+            // sender to the device that signed the notify, so a forged invite
+            // never yields a live delivery (fail-closed).
+            if let Some(inv) = entry.invite_packet.as_ref() {
+                crate::dm_outbox::apply_deposited_invite(
+                    &mut state,
+                    self.self_owner,
+                    &self.self_device_id(),
+                    inv,
+                    signed.sender_owner_addr,
+                    self.now_ms(),
+                )?;
+            }
             let (space, resolved_owner, _identity_pub) =
                 crate::dm_outbox::verify_cidnotify_admission(
                     &state,
@@ -2157,6 +2178,290 @@ mod tests {
     // the loopback iroh handshake harness; it reuses `build_dm_ingest_fixture`
     // via the `pub(crate)` re-export below so the receive-side fixture is not
     // duplicated.
+
+    // ── ZEB-483: recover-side deposited-invite bootstrap (butler/fleet rung) ──
+
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{DmContentKey, Space, SpaceKind};
+
+    /// A `ProdDmInboxIngestCtx` over a fresh Bob state that does NOT have the DM
+    /// Space pre-installed (simulating offline-at-create), plus a `DmInboxEntry`
+    /// whose `invite_packet` carries the signed bootstrap invite and whose
+    /// `cidnotify_packet`/`storage_blob` are signed/encrypted by the SAME sender
+    /// (Alice) under the SAME `content_key` carried in the invite.
+    struct RecoverInviteFixture {
+        prod_ctx: ProdDmInboxIngestCtx,
+        crdt_state: Arc<Mutex<OwnerState>>,
+        entry: DmInboxEntry,
+        space_id: SpaceId,
+        expected_body: Vec<u8>,
+        // Inputs needed to forge a mismatched-inviter invite for the negative test.
+        bob: OwnerAddr,
+        created_at: Hlc,
+        // The DM content key carried by the (valid) invite; reused so the forged
+        // invite is structurally identical except for its inviter binding.
+        content_key: DmContentKey,
+    }
+
+    impl RecoverInviteFixture {
+        fn crdt_state_for_test(&self) -> &Arc<Mutex<OwnerState>> {
+            &self.crdt_state
+        }
+
+        /// A clone of the entry whose invite is re-signed with an inviter that is
+        /// NOT the CidNotify's sender (a third owner). `apply_deposited_invite`
+        /// binds the invite's `inviter` to the CidNotify's `sender_owner_addr`
+        /// (Alice), so this must fail-closed with `InviterMismatch`.
+        fn entry_with_mismatched_inviter(&self) -> DmInboxEntry {
+            // A third owner whose identity actually signs the forged invite (so
+            // the Ed25519 signature itself is valid — only the inviter-binding
+            // gate must reject it).
+            let private_charlie = harmony_identity::PrivateIdentity::from_seed(&[0xC3; 32]);
+            let charlie_pub = private_charlie.public_identity();
+            let charlie_identity_pub = charlie_pub.to_public_bytes();
+            let charlie = OwnerAddr([0xC3; 16]);
+            let charlie_device_hash =
+                crate::owner_state_types::DeviceIdentityHash(charlie_pub.address_hash);
+
+            // members must include the (forged) inviter + self so only the
+            // inviter-binding gate is exercised, not the membership gates.
+            let mut members = vec![charlie, self.bob];
+            members.sort();
+            let signed = crate::dm_envelope::DmInviteSigned {
+                space_id: self.space_id,
+                kind: SpaceKind::Dm,
+                members,
+                inviter: charlie,
+                content_key: self.content_key.clone(),
+                sender_devices: vec![charlie_device_hash],
+                created_at: self.created_at.clone(),
+                signing_device_hash: charlie_device_hash,
+                inviter_identity_pub: charlie_identity_pub,
+            };
+            let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+            let signature = private_charlie.sign(&signed_bytes);
+            let invite_wire =
+                crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Invite {
+                    signed,
+                    signature,
+                    signed_bytes,
+                })
+                .unwrap();
+            let mut entry = self.entry.clone();
+            entry.invite_packet = Some(invite_wire);
+            entry
+        }
+    }
+
+    /// Build the recover fixture: a deposited entry (CidNotify + blob + invite)
+    /// for a DM Space Bob has NOT yet bootstrapped. Alice is the sender/inviter.
+    /// Bob's `owner_device_cache` does NOT pre-cache Alice's device — the invite
+    /// must seed it before admission's `lookup_pubkey_for_device` can resolve.
+    fn build_dm_ingest_fixture_without_space_with_invite() -> RecoverInviteFixture {
+        let alice = OwnerAddr([0xA1; 16]);
+        let bob = OwnerAddr([0xB0; 16]);
+        let space_id = SpaceId([0x5A; 16]);
+        let content_key = DmContentKey::new([0x42u8; 32]);
+        let body = b"recovered over the deposit rung".to_vec();
+
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let alice_pub = private_alice.public_identity();
+        let alice_identity_pub = alice_pub.to_public_bytes();
+        let alice_device_hash =
+            crate::owner_state_types::DeviceIdentityHash(alice_pub.address_hash);
+
+        let mut members = vec![alice, bob];
+        members.sort();
+        let created_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+
+        // (1) Encrypt the DM blob under a transient Space whose members match the
+        //     ones the invite carries — `compute_aad` for a DM Space is keyed on
+        //     the SORTED member set only (DedupeKey::SortedMembers), so the Space
+        //     the invite later bootstraps recomputes the identical AAD and the
+        //     same `content_key` decrypts it. SpaceId/name are AAD-irrelevant.
+        let aad_space = Space {
+            id: space_id,
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Alice".into(),
+            transport: None,
+            members: members.clone(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: created_at.clone(),
+            updated_at: created_at.clone(),
+            content_key: Some(content_key.clone()),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+        let payload = crate::dm_envelope::MessagePayload {
+            body: body.clone(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let aad = crate::dm_crypto::compute_aad(&aad_space).unwrap();
+        let storage_blob =
+            crate::dm_crypto::encrypt_dm_message(&content_key, &aad, &payload).unwrap();
+        let message_cid = ContentId::for_book(
+            &storage_blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // (2) Signed CidNotify from Alice for this blob.
+        let cn_signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let cn_signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&cn_signed).unwrap();
+        let cn_signature = private_alice.sign(&cn_signed_bytes);
+        let cidnotify_packet =
+            crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::CidNotify {
+                signed: cn_signed,
+                signature: cn_signature,
+                signed_bytes: cn_signed_bytes,
+            })
+            .unwrap();
+
+        // (3) Signed DmInvite from Alice carrying the SAME content_key + member
+        //     set — this is what bootstraps the Space + caches Alice's device.
+        let inv_signed = crate::dm_envelope::DmInviteSigned {
+            space_id,
+            kind: SpaceKind::Dm,
+            members: members.clone(),
+            inviter: alice,
+            content_key: content_key.clone(),
+            sender_devices: vec![alice_device_hash],
+            created_at: created_at.clone(),
+            signing_device_hash: alice_device_hash,
+            inviter_identity_pub: alice_identity_pub,
+        };
+        let inv_signed_bytes =
+            crate::owner_state_crypto::canonical_cbor_encode(&inv_signed).unwrap();
+        let inv_signature = private_alice.sign(&inv_signed_bytes);
+        let invite_wire =
+            crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Invite {
+                signed: inv_signed,
+                signature: inv_signature,
+                signed_bytes: inv_signed_bytes,
+            })
+            .unwrap();
+
+        let entry = DmInboxEntry {
+            sender_owner: alice.0,
+            cidnotify_packet,
+            storage_blob,
+            invite_packet: Some(invite_wire),
+            deposited_at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "butler-device".into(),
+            },
+            deposited_by: "butler-device".into(),
+            ingested_by: BTreeSet::new(),
+        };
+
+        // Bob's state: fresh, NO Space, NO Alice device cached — the invite must
+        // seed both before admission resolves the signing device.
+        let crdt_state = Arc::new(Mutex::new(OwnerState::default()));
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            Arc::new(Arc::clone(&sink_handle));
+
+        let prod_ctx = ProdDmInboxIngestCtx {
+            device_id: "bob-device-64hex".into(),
+            self_owner: bob,
+            crdt_state: Arc::clone(&crdt_state),
+            content_store,
+            sink,
+            enrolled: BTreeSet::new(),
+        };
+
+        RecoverInviteFixture {
+            prod_ctx,
+            crdt_state,
+            entry,
+            space_id,
+            expected_body: body,
+            bob,
+            created_at,
+            content_key,
+        }
+    }
+
+    #[tokio::test]
+    async fn deposited_invite_bootstraps_space_then_cidnotify_admits() {
+        let fx = build_dm_ingest_fixture_without_space_with_invite();
+
+        // Sanity: the Space is absent pre-recover → a plain CidNotify ingest
+        // would fail with SpaceNotFound.
+        {
+            let st = fx.crdt_state_for_test().lock().await;
+            assert!(
+                !st.spaces.contains_key(&fx.space_id),
+                "space absent pre-recover"
+            );
+        }
+
+        let verified = fx
+            .prod_ctx
+            .verify(&fx.entry)
+            .await
+            .expect("invite bootstraps space, notify admits");
+        assert_eq!(verified.space_id, fx.space_id);
+        assert_eq!(verified.body, fx.expected_body);
+
+        let st = fx.crdt_state_for_test().lock().await;
+        assert!(
+            st.spaces.contains_key(&fx.space_id),
+            "Space bootstrapped from the deposited invite"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposited_invite_with_wrong_inviter_is_rejected_and_space_absent() {
+        let fx = build_dm_ingest_fixture_without_space_with_invite();
+        let entry = fx.entry_with_mismatched_inviter();
+        let err = fx
+            .prod_ctx
+            .verify(&entry)
+            .await
+            .expect_err("mismatched inviter must fail-closed");
+        assert!(
+            err.contains("apply_invite") || err.contains("InviterMismatch"),
+            "got {err}"
+        );
+        let st = fx.crdt_state_for_test().lock().await;
+        assert!(
+            !st.spaces.contains_key(&fx.space_id),
+            "no Space bootstrapped on reject"
+        );
+    }
 }
 
 /// ZEB-473 Task 9: receive-side test fixture for the inbound-tunnel-DM ingest,

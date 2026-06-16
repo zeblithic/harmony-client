@@ -2148,6 +2148,51 @@ pub(crate) fn apply_invite(
     Ok(DrainOutcome::default())
 }
 
+/// ZEB-483: apply a deposited DmInvite (if present) to bootstrap the DM Space
+/// before CidNotify admission, on the deposit-recover path (no authenticated
+/// tunnel peer). Binds the invite's inviter to the CidNotify's claimed
+/// `sender_owner_addr`; the caller's subsequent `verify_cidnotify_admission`
+/// cryptographically pins that claimed sender to the resolved device owner, so a
+/// forged invite that doesn't match the verified sender never admits (the Space
+/// it bootstraps stays inert). Size-bounded; fail-closed.
+pub(crate) fn apply_deposited_invite(
+    state: &mut OwnerState,
+    self_owner: OwnerAddr,
+    device_id: &str,
+    invite_packet: &[u8],
+    expected_inviter: OwnerAddr,
+    wall_now_ms: u64,
+) -> Result<(), String> {
+    if invite_packet.len() > crate::butler_deposit::MAX_DEPOSIT_INVITE_BYTES {
+        return Err(format!(
+            "deposited invite too large: {} bytes",
+            invite_packet.len()
+        ));
+    }
+    let packet = crate::dm_envelope::decode_packet(invite_packet)
+        .map_err(|e| format!("decode invite: {e}"))?;
+    let crate::dm_envelope::DmPacket::Invite {
+        signed,
+        signature,
+        signed_bytes,
+    } = packet
+    else {
+        return Err("deposited invite_packet is not an Invite".into());
+    };
+    apply_invite(
+        state,
+        self_owner,
+        device_id,
+        signed,
+        signature,
+        &signed_bytes,
+        wall_now_ms,
+        Some(expected_inviter),
+    )
+    .map(|_| ())
+    .map_err(|e| format!("apply_invite: {e:?}"))
+}
+
 /// ZEB-233: lock-lifted drain entrypoint for production.
 ///
 /// Three-phase structure mirroring `handle_cidnotify_lifted` (ZEB-241):
