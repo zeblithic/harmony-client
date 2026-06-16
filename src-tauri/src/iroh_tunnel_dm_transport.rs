@@ -67,19 +67,24 @@ pub(crate) fn resolve_owner_tunnel_targets(
 /// ZEB-482: fire `packet` (any pre-built `DmPacket` wire bytes — e.g. a signed
 /// `DmInvite`) to every reachable tunnel device of `recipient`, best-effort.
 ///
-/// Resolves from the passed `&OwnerState` (the caller holds the owner-state
-/// read lock) and routes through [`TunnelManager::send_dm`], which is itself
-/// non-awaiting (it locks the session map internally and lazily dials). Holding
-/// the `crdt_state` read lock across these calls is therefore safe — but the
-/// caller must NOT hold it across any other `.await`. Devices with no tunnel
-/// contact are skipped (durability is the deposit rung's job — ZEB-483).
-pub(crate) fn send_packet_to_owner_tunnels(
-    state: &OwnerState,
+/// Takes a SHORT `crdt_state` read lock to resolve the recipient's tunnel
+/// targets, RELEASES it, and only then routes through [`TunnelManager::send_dm`]
+/// (which locks the session map internally + lazily dials). Owner-state is never
+/// held across the tunnel work — mirroring
+/// [`IrohTunnelDmTransport::resolve_tunnel_targets`] — so a DM-space-creation
+/// fan-out can't stall unrelated CRDT reads/writes (Qodo). Devices with no
+/// tunnel contact are skipped (durability is the deposit rung's job — ZEB-483).
+pub(crate) async fn send_packet_to_owner_tunnels(
+    crdt_state: &Arc<tokio::sync::Mutex<OwnerState>>,
     mgr: &Arc<TunnelManager>,
     recipient: OwnerAddr,
     packet: &[u8],
 ) {
-    for (node_id, contact) in resolve_owner_tunnel_targets(state, recipient) {
+    let targets = {
+        let state = crdt_state.lock().await;
+        resolve_owner_tunnel_targets(&state, recipient)
+    };
+    for (node_id, contact) in targets {
         mgr.send_dm(node_id, &contact, packet.to_vec());
     }
 }
@@ -369,9 +374,11 @@ mod tests {
             },
         );
 
-        // The helper reads the passed &OwnerState directly (no lock taken here).
+        // The helper takes a short crdt_state lock internally to resolve, then
+        // releases it before send_dm.
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
         let payload = b"arbitrary DmInvite wire bytes".to_vec();
-        send_packet_to_owner_tunnels(&owner_state, &mgr, recipient, &payload);
+        send_packet_to_owner_tunnels(&crdt_state, &mgr, recipient, &payload).await;
 
         let pending = mgr
             .test_pending_packets(&expected_node_id)
@@ -383,7 +390,7 @@ mod tests {
         );
 
         // An unknown recipient routes nothing (no panic, no spurious session).
-        send_packet_to_owner_tunnels(&owner_state, &mgr, OwnerAddr([0xEE; 16]), &payload);
+        send_packet_to_owner_tunnels(&crdt_state, &mgr, OwnerAddr([0xEE; 16]), &payload).await;
         assert!(
             mgr.test_pending_packets(&[0x00; 32]).is_none(),
             "no session for an unrelated NodeId"

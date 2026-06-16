@@ -10659,25 +10659,25 @@ pub(crate) async fn add_space_impl(
     // each recipient owner's reachable device(s). This runs AFTER the build-lock
     // block released (dm_outbox/crdt_state/hlc_tracker locks dropped) and AFTER
     // the post-stop detachment guard committed the Space to a live node — so we
-    // never advertise a Space the sender lost on restart. The short read lock
-    // below resolves each recipient's cached DeviceTunnelContact(s); `send_dm`
-    // does NOT await (it locks the session map internally + lazily dials), so
-    // holding the `crdt_state` read lock across the fan-out is safe — but it
-    // must NOT span any other `.await`.
+    // never advertise a Space the sender lost on restart. `send_packet_to_owner_tunnels`
+    // takes a SHORT `crdt_state` lock to resolve each recipient's cached
+    // DeviceTunnelContact(s) and RELEASES it before `send_dm`, so the owner-state
+    // lock is never held across the tunnel fan-out (Qodo: no stalling unrelated
+    // CRDT reads/writes during DM-space creation).
     //
     // On a deposit-only node (`tunnel_manager: None`) this is skipped entirely:
     // the Space is already applied locally; the invite's offline/cross-WAN
     // durability rung is ZEB-483. On a dedupe-merge (`fanout: None`) there is
     // nothing to send (the existing Space was invited at original creation).
     if let (Some(mgr), Some((invite_wire, recipients))) = (tunnel_manager.as_ref(), fanout) {
-        let state_g = crdt_state.lock().await;
         for recipient in &recipients {
             crate::iroh_tunnel_dm_transport::send_packet_to_owner_tunnels(
-                &state_g,
+                &crdt_state,
                 mgr,
                 *recipient,
                 &invite_wire,
-            );
+            )
+            .await;
         }
     }
 
