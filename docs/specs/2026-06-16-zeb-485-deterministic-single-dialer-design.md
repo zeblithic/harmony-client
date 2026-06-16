@@ -51,19 +51,24 @@ first-contact reliability beyond this collision (ZEB-330 class) is out of scope.
 
 ## Design
 
-### The rule (in `send_dm`, the no-session `None` arm)
+### The rule (a `dial_or_await` gate at every dial-initiation site)
 
-Compare our own NodeId to the peer's (reusing the same ordering as the existing
-`keep_new` lower-wins dedup):
+Today `send_dm` calls `spawn_dial` from three places: the no-session `None` arm (initial
+dial), the `Closing` arm (redial after a dedup-loser teardown), and the `Active`→`Closed`
+arm (redial after the loop died). Route **all three** through one gate, `dial_or_await`,
+so the who-dials rule applies regardless of what triggered the dial — otherwise a
+post-teardown redial could re-create the collision. The gate compares our own NodeId to
+the peer's (reusing the same ordering as the existing `keep_new` lower-wins dedup):
 
 - **`self_node_id < peer_node_id` (we are the lower NodeId):** we are the designated
-  dialer → `spawn_dial(peer, contact, [packet])` immediately (today's behavior).
+  dialer → `spawn_dial(peer, contact, seed_pending)` immediately (today's behavior).
 - **`self_node_id > peer_node_id` (we are the higher NodeId):** do **not** dial. Buffer
-  the DM and wait to *accept* the lower peer's inbound dial. Arm a **fallback dial**:
+  the DM(s) and wait to *accept* the lower peer's inbound dial. Arm a **fallback dial**:
   if no inbound tunnel has registered within `FALLBACK_DIAL_DELAY = 1s`, dial anyway.
 
 NodeIds are `blake3` of the ML-DSA pubkey; equality is impossible for distinct peers, so
-there is no tie case.
+there is no tie case. The `Active` (live tunnel) and `Dialing`/`AwaitingInbound` (buffer)
+arms of `send_dm` are unchanged — the gate only governs *fresh dial initiation*.
 
 ### New handle state: `AwaitingInbound`
 
