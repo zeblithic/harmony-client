@@ -76,7 +76,7 @@
 - [ ] **Step 1:** Add `pub const HARMONY_TUNNEL_V1: &[u8] = b"harmony/tunnel/v1";` to `mod alpn` (matches the `harmony/<x>/v1` family).
 - [ ] **Step 2:** Add `alpn::HARMONY_TUNNEL_V1` to **both** `.alpns(vec![…])` bind lists (`:122` and `:375` — the reconciliation flagged two; missing either silently drops inbound tunnel ALPN).
 - [ ] **Step 3:** Extend the ALPN-value assertion test (`:406-412`) to pin the new constant.
-- [ ] **Step 4: Gate** (`cargo nextest run -p <client crate> -E 'test(alpn)'` + fmt/clippy). Commit: `ZEB-473: client HARMONY_TUNNEL_V1 ALPN + bind list`.
+- [ ] **Step 4: Gate** (`cargo nextest run --locked -p <client crate> --all-targets --features test-fixtures -E 'test(alpn)'` + fmt/clippy). Commit: `ZEB-473: client HARMONY_TUNNEL_V1 ALPN + bind list`.
 
 ---
 
@@ -89,7 +89,7 @@
 - [ ] **Step 3:** Extend the **manual `Deserialize` impl** for `OwnerDeviceEntry` to read the new vec and re-normalize it length-parallel to `devices` jointly with `device_identity_pubs` (same sort/merge/truncate path; missing → `None`).
 - [ ] **Step 4:** Add the `device_tunnel_contacts: Vec<Option<DeviceTunnelContact>>` parameter to `apply_owner_device_update` (`owner_state_crdt.rs:600`); `resize(devices.len(), None)` (mirror `:616`) and carry it through the zip+sort+walk-merge (`:639-660`) as a third parallel element; on conflict prefer the non-`None`/newer per existing `learned_at` HLC rule (no `InvariantFail` for contacts — they are routing hints, last-writer-wins by HLC).
 - [ ] **Step 5:** Update the two callers minimally to pass an empty/parallel vec for now: `iroh_friend_acceptor.rs:1014`, `lib.rs:39183` (real population in Task 5).
-- [ ] **Step 6: Gate** (new test passes + `cargo nextest run -p <crate> -E 'test(owner_device)'`, fmt/clippy). Commit: `ZEB-473: persist per-device tunnel contact on OwnerDeviceEntry`.
+- [ ] **Step 6: Gate** (new test passes + `cargo nextest run --locked -p <crate> --all-targets --features test-fixtures -E 'test(owner_device)'`, fmt/clippy). Commit: `ZEB-473: persist per-device tunnel contact on OwnerDeviceEntry`.
 
 ---
 
@@ -103,7 +103,7 @@
 - [ ] **Step 2:** Generalize `friend_devices_digest` (`:469`) to `contact_digest(devices, pubs, iroh_node_id, home_relay_url, pq_dsa_pubkey, pq_kem_pubkey) -> [u8;32]` (SHA-256 over canonical CBOR of an extended `Bundle`). Update both build sites (request build in `lib.rs` send path; accept build `iroh_friend_acceptor.rs:1040`) and all verify sites (`:898`, `:946`, `lib.rs:39499`, `:41749`) to pass the reachability/PQ fields. Keep the field marked `#[serde(default)]` on the wire (unchanged) — only the *digest preimage* now covers them.
 - [ ] **Step 3:** In `process_friend_request` (`:1012-1025`) build a `DeviceTunnelContact` from `req.{iroh_node_id, home_relay_url, pq_dsa_pubkey, pq_kem_pubkey}` for the sender's single device and pass it (parallel-indexed) into `apply_owner_device_update`. Do the same on the accept-receive path: add a `device_tunnel_contacts` param to `apply_handshaked_friend` (`lib.rs:39165`) and populate it at both call sites (`:39559`, `:41799`). Anti-forgery rule unchanged (local HLC, skip-on-empty).
 - [ ] **Step 4:** Regenerate `wire_format_zeb370_fixtures.rs` hex pins (`:81/:82/:86-87`) and the `friend_token_roundtrip_integration.rs` expectations — the sig bytes change (new preimage) and the reachability fields are now populated. Regeneration is intentional + reviewed (flag-day); document in the commit.
-- [ ] **Step 5: Gate** (`cargo nextest run -p <crate> -E 'test(friend) + test(wire_format_zeb370)'`, fmt/clippy, `--all-targets`). Commit: `ZEB-473: persist + sign peer reachability/PQ on friend handshake (contact_digest)`.
+- [ ] **Step 5: Gate** (`cargo nextest run --locked -p <crate> --all-targets --features test-fixtures -E 'test(friend) + test(wire_format_zeb370)'`, fmt/clippy). Commit: `ZEB-473: persist + sign peer reachability/PQ on friend handshake (contact_digest)`.
 
 ---
 
@@ -117,7 +117,7 @@
 - [ ] **Step 4:** accept-loop (`:356`): add `else if alpn_used == alpn::HARMONY_TUNNEL_V1 { if let Some(a)=mgr.tunnel_acceptor.get().cloned() { tokio::spawn(async move { a.handle_connection(conn).await }); } else { conn.close(...) } }` before the else-drop (`:503`), mirroring the butler arm (`:447-463`).
 - [ ] **Step 5:** install at boot (`lib.rs:~6879`, same block as butler) once `pq` (Task 2) + `TunnelManager` (Task 7) exist. (Ordering note: Task 7 lands the manager; this install line may be stubbed here and completed in Task 7/8 — keep the acceptor constructible with a manager handle.)
 - [ ] **Step 6 (test):** in-process two-session handshake test (`new_initiator` ↔ `run_tunnel_responder` over an in-memory/duplex stream or a loopback iroh pair) exchanging one `Dm` frame → `DmReceived` with byte-identical payload.
-- [ ] **Step 7: Gate** (`cargo nextest run -p <crate> -E 'test(tunnel)'`, fmt/clippy). Commit: `ZEB-473: client tunnel responder + acceptor install`.
+- [ ] **Step 7: Gate** (`cargo nextest run --locked -p <crate> --all-targets --features test-fixtures -E 'test(tunnel)'`, fmt/clippy). Commit: `ZEB-473: client tunnel responder + acceptor install`.
 
 ---
 
@@ -158,7 +158,7 @@
 
 - [ ] **Step 1:** Define the ingest callback the tunnel responder/initiator loops call on `DmReceived{payload}`: decode the packet → `verify_cidnotify_admission(state, signed, sig, bytes)` → `decrypt_and_bind_dm_blob(space, blob, owner)` → `apply_inbox(entry)` → emit `dm-received` via `dm_received_event_payload`. This is the **same** sequence as the deposit ingest (`dm_inbox_ingest.rs`); factor a shared `pub(crate) async fn ingest_dm_packet(ctx, packet_bytes)` both the tunnel path and (optionally) the deposit path call, to avoid drift. Do **not** resurrect `handle_cidnotify_lifted` (caller-less).
 - [ ] **Step 2 (integration test):** acceptor responder loop end-to-end (two in-process sessions) → one `Dm` frame → ingest path emits a `dm-received` for a decryptable test DM. `IrohTunnelDmTransport.send` routes a built packet to the manager and the responder ingests it.
-- [ ] **Step 3: Gate** (`cargo nextest run -p <crate> -E 'test(dm) + test(tunnel)'` + full `--all-targets`). Commit: `ZEB-473: wire inbound tunnel DM into existing verify/decrypt/ingest`.
+- [ ] **Step 3: Gate** (`cargo nextest run --locked -p <crate> --all-targets --features test-fixtures -E 'test(dm) + test(tunnel)'`). Commit: `ZEB-473: wire inbound tunnel DM into existing verify/decrypt/ingest`.
 
 ---
 

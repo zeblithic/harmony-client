@@ -319,6 +319,23 @@ pub const MAX_PRIOR_CONTENT_KEYS: usize = 16;
 /// See ZEB-216 §"OwnerDeviceCache".
 pub const MAX_DEVICES_PER_OWNER: usize = 32;
 
+/// Canonical exact byte-length of an ML-DSA-65 public key (the
+/// `pq_dsa_pubkey` carried by a [`DeviceTunnelContact`]). Defined ONCE here
+/// and referenced by every tunnel-contact validation site (ZEB-473). The
+/// upstream `harmony_tunnel`/`harmony_identity` value (1952) is a private
+/// `const` not re-exported across the public surface, so we pin it locally.
+pub const ML_DSA_65_PUBKEY_LEN: usize = 1952;
+
+/// Canonical exact byte-length of an ML-KEM-768 public (encapsulation) key
+/// (the `pq_kem_pubkey` carried by a [`DeviceTunnelContact`]). See
+/// [`ML_DSA_65_PUBKEY_LEN`].
+pub const ML_KEM_768_PUBKEY_LEN: usize = 1184;
+
+/// Maximum accepted byte-length of a tunnel contact's `home_relay_url`. A
+/// relay URL longer than this is treated as malformed/abusive and rejected,
+/// keeping replicated owner-state payloads bounded.
+pub const MAX_TUNNEL_RELAY_URL_LEN: usize = 2048;
+
 /// 32-byte symmetric content key for DM/group-DM ChaCha20-Poly1305
 /// encryption. Wire format: bstr(32). In-memory: zeroized on drop
 /// (custom Drop via ZeroizeOnDrop derive). Debug redacts the bytes
@@ -453,9 +470,10 @@ pub struct OwnerDeviceCache {
 /// peer's iroh node id, relay, or rotated PQ keys), so the CRDT merge rule is
 /// last-writer-wins by the entry's `learned_at` HLC — never an InvariantFail.
 ///
-/// Populated on friend handshake by a later ZEB-473 task; today both CRDT
-/// callers pass an empty/parallel vec, so this field is always `None` on the
-/// wire until then.
+/// Populated on friend handshake (ZEB-473): `peer_handshake_contact` derives a
+/// contact from the signed reachability + PQ keys a peer advertises, and the
+/// dialer-side handshake apply persists it parallel to the device. A device
+/// known-by-hash but not yet handshaked still carries `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceTunnelContact {
     /// The peer device's iroh `EndpointId` (32-byte ed25519 public key the
@@ -487,6 +505,25 @@ pub struct DeviceTunnelContact {
         deserialize_with = "deserialize_vec_from_bstr"
     )]
     pub pq_kem_pubkey: Vec<u8>,
+}
+
+impl DeviceTunnelContact {
+    /// Structural validity gate (ZEB-473): a contact is only dialable — and
+    /// only worth persisting/replicating — when both PQ public keys are exactly
+    /// their canonical FIPS sizes ([`ML_DSA_65_PUBKEY_LEN`] /
+    /// [`ML_KEM_768_PUBKEY_LEN`]) and any advertised relay URL is within
+    /// [`MAX_TUNNEL_RELAY_URL_LEN`]. Defined ONCE here so the handshake-derive,
+    /// CRDT-apply, and deserialize gates can't drift. Does NOT validate the
+    /// `iroh_node_id` non-zero / dial-target rule — that's `peer_handshake_contact`'s
+    /// concern (a zero node id is a legitimately-absent contact, not a malformed one).
+    pub fn has_valid_key_sizes(&self) -> bool {
+        self.pq_dsa_pubkey.len() == ML_DSA_65_PUBKEY_LEN
+            && self.pq_kem_pubkey.len() == ML_KEM_768_PUBKEY_LEN
+            && self
+                .home_relay_url
+                .as_ref()
+                .is_none_or(|u| u.len() <= MAX_TUNNEL_RELAY_URL_LEN)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -995,6 +1032,23 @@ where
                          legitimate peers always send canonical (capped) form",
                         MAX_DEVICES_PER_OWNER
                     )));
+                }
+                // CR11 (ZEB-473): the element count is capped above, but each
+                // `DeviceTunnelContact` carries unbounded `pq_dsa_pubkey` /
+                // `pq_kem_pubkey` byte strings. A malicious owner-state blob
+                // could otherwise force huge per-key allocations. The PQ keys
+                // have FIXED canonical sizes, so anything larger is malformed —
+                // reject so it can never poison downstream tunnel code. (Short
+                // keys are tolerated here; the apply-time gate enforces exact
+                // sizes — deser just bounds allocation.)
+                if let Some(ref c) = item {
+                    if c.pq_dsa_pubkey.len() > ML_DSA_65_PUBKEY_LEN
+                        || c.pq_kem_pubkey.len() > ML_KEM_768_PUBKEY_LEN
+                    {
+                        return Err(A::Error::custom(
+                            "DeviceTunnelContact PQ key material exceeds its canonical size cap",
+                        ));
+                    }
                 }
                 out.push(item);
             }
@@ -1543,6 +1597,62 @@ mod newtype_tests {
         into_writer(&d, &mut bytes).unwrap();
         let recovered: DeviceIdentityHash = from_reader(&bytes[..]).unwrap();
         assert_eq!(d, recovered);
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_tunnel_contact_pq_key() {
+        // CR11 (ZEB-473): a malicious owner-state blob carrying a
+        // `DeviceTunnelContact` with a PQ key LARGER than its canonical size
+        // must be rejected at deserialize time so it can't force a huge
+        // allocation / poison downstream tunnel code. A correctly-sized contact
+        // round-trips; an oversized one fails.
+        use ciborium::{from_reader, into_writer};
+
+        let device = DeviceIdentityHash([0x11; 16]);
+        let ok_contact = DeviceTunnelContact {
+            iroh_node_id: [0x22; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![0x33; ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![0x44; ML_KEM_768_PUBKEY_LEN],
+        };
+        let good = OwnerDeviceEntry {
+            devices: vec![device],
+            device_identity_pubs: vec![None],
+            learned_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            device_tunnel_contacts: vec![Some(ok_contact.clone())],
+        };
+        let mut good_bytes = Vec::new();
+        into_writer(&good, &mut good_bytes).unwrap();
+        let recovered: OwnerDeviceEntry = from_reader(&good_bytes[..]).unwrap();
+        assert_eq!(recovered.device_tunnel_contacts, vec![Some(ok_contact)]);
+
+        // Now an oversized ML-DSA key (one byte past the canonical size).
+        let bad = OwnerDeviceEntry {
+            devices: vec![device],
+            device_identity_pubs: vec![None],
+            learned_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            device_tunnel_contacts: vec![Some(DeviceTunnelContact {
+                iroh_node_id: [0x22; 32],
+                home_relay_url: None,
+                pq_dsa_pubkey: vec![0x33; ML_DSA_65_PUBKEY_LEN + 1],
+                pq_kem_pubkey: vec![0x44; ML_KEM_768_PUBKEY_LEN],
+            })],
+        };
+        let mut bad_bytes = Vec::new();
+        into_writer(&bad, &mut bad_bytes).unwrap();
+        let err = from_reader::<OwnerDeviceEntry, _>(&bad_bytes[..]);
+        assert!(
+            err.is_err(),
+            "an oversized PQ key must fail deserialization, got Ok"
+        );
     }
 }
 

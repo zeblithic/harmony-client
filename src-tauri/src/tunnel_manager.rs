@@ -82,6 +82,10 @@ struct TunnelHandle {
     cmd_tx: mpsc::Sender<TunnelCommand>,
     state: TunnelHandleState,
     role: TunnelRole,
+    /// Monotonic session identity. A new dial/inbound-register that replaces an
+    /// entry for the same peer gets a FRESH epoch, so a dead loop can evict ONLY
+    /// its own session (`note_closed` matches on this), never an ABA replacement.
+    epoch: u64,
     /// DMs buffered while `Dialing`; flushed in order on `Active`.
     pending: VecDeque<Vec<u8>>,
 }
@@ -89,6 +93,8 @@ struct TunnelHandle {
 /// Per-peer PQ tunnel session map + lifecycle.
 pub struct TunnelManager {
     sessions: Mutex<HashMap<[u8; 32], TunnelHandle>>,
+    /// Monotonic source of per-session [`TunnelHandle::epoch`] values.
+    next_epoch: std::sync::atomic::AtomicU64,
     endpoint: IrohEndpoint,
     local_pq: Arc<PqPrivateIdentity>,
     ingest_tx: mpsc::Sender<InboundDm>,
@@ -114,11 +120,18 @@ impl TunnelManager {
             node_id_from_dsa_pubkey(&local_pq.public_identity().verifying_key.as_bytes());
         Self {
             sessions: Mutex::new(HashMap::new()),
+            next_epoch: std::sync::atomic::AtomicU64::new(0),
             endpoint,
             local_pq,
             ingest_tx,
             self_node_id,
         }
+    }
+
+    /// Allocate a fresh monotonic session epoch (see [`TunnelHandle::epoch`]).
+    fn alloc_epoch(&self) -> u64 {
+        self.next_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Our own tunnel NodeId (`blake3(our ML-DSA pubkey)`).
@@ -165,9 +178,17 @@ impl TunnelManager {
                                 self.spawn_dial(peer_node_id, contact, vec![packet]);
                             }
                             mpsc::error::TrySendError::Closed(_) => {
-                                // Not reachable (we only ever try_send SendDm
-                                // here), but redial without a seed rather than
-                                // panic if the variant ever changes.
+                                // G3 (ZEB-473): invariant violation — we only
+                                // ever `try_send(SendDm)` here, so the inner
+                                // command can only be `SendDm`. Surface it
+                                // LOUDLY rather than silently dropping the
+                                // packet; still redial (without a seed) rather
+                                // than panic on a networking hot path if the
+                                // command variant ever changes.
+                                tracing::error!(
+                                    "ZEB-473: tunnel send_dm hit a non-SendDm Closed variant — \
+                                     bookkeeping invariant violated; redialing without seed"
+                                );
                                 sessions.remove(&peer_node_id);
                                 drop(sessions);
                                 self.spawn_dial(peer_node_id, contact, vec![]);
@@ -208,6 +229,7 @@ impl TunnelManager {
         for p in seed_pending {
             push_pending(&mut pending, p);
         }
+        let epoch = self.alloc_epoch();
         {
             let mut sessions = self
                 .sessions
@@ -235,6 +257,7 @@ impl TunnelManager {
                     cmd_tx,
                     state: TunnelHandleState::Dialing,
                     role: TunnelRole::Initiator,
+                    epoch,
                     pending,
                 },
             );
@@ -252,6 +275,7 @@ impl TunnelManager {
                 local_pq,
                 peer_node_id,
                 mgr,
+                epoch,
                 ingest_tx,
                 cmd_rx,
             )
@@ -266,12 +290,14 @@ impl TunnelManager {
     /// this peer, the survivor is the tunnel whose INITIATOR NodeId is
     /// numerically lower. The loser's `cmd_tx`/handle is closed; any `pending`
     /// is redirected to the survivor.
-    pub fn register_inbound(&self, peer_node_id: [u8; 32]) -> mpsc::Receiver<TunnelCommand> {
+    pub fn register_inbound(&self, peer_node_id: [u8; 32]) -> (mpsc::Receiver<TunnelCommand>, u64) {
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
+        let epoch = self.alloc_epoch();
         let new_handle = TunnelHandle {
             cmd_tx,
             state: TunnelHandleState::Active,
             role: TunnelRole::Responder,
+            epoch,
             pending: VecDeque::new(),
         };
 
@@ -314,7 +340,25 @@ impl TunnelManager {
                 }
             }
         }
-        cmd_rx
+        (cmd_rx, epoch)
+    }
+
+    /// Called by a per-tunnel loop at EVERY exit path. Evicts the session for
+    /// `peer_node_id` ONLY when the current entry is still THIS dead session
+    /// (matched by `epoch`), so a newer session that replaced it (dedup / redial
+    /// for the same peer) is never clobbered — the ABA guard. Without this, dead
+    /// entries accumulate in `sessions` under peer churn (unbounded retention).
+    /// CR12 (ZEB-473).
+    pub fn note_closed(&self, peer_node_id: [u8; 32], epoch: u64) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("tunnel sessions mutex poisoned");
+        if let Some(handle) = sessions.get(&peer_node_id) {
+            if handle.epoch == epoch {
+                sessions.remove(&peer_node_id);
+            }
+        }
     }
 
     /// Called by the initiator loop once its handshake reaches Active. Flips the
@@ -342,11 +386,18 @@ impl TunnelManager {
                 // caller can drop it. Nothing to do here.
                 return;
             }
-            // Our dial wins: we never overwrote the responder handle (the
-            // initiator never called register_inbound), so this branch only
-            // fires if some future path inserts a responder under our key — keep
-            // simple: don't clobber, just return.
-            return;
+            // G1 (ZEB-473): "our dial wins over a responder handle in our slot"
+            // is UNREACHABLE today — the initiator never calls `register_inbound`,
+            // so a Responder handle never sits under our key when our own dial
+            // completes. The old code silently `return`ed here, which would have
+            // ORPHANED our just-completed initiator task (its loop would run with
+            // no manager handle) if the invariant ever broke. Make it loud so a
+            // future regression that lands a responder under our key is caught
+            // immediately rather than leaking a running loop.
+            unreachable!(
+                "note_active: a Responder handle won dedup against our own completing dial — \
+                 the initiator never registers an inbound session, so this is an invariant break"
+            );
         }
 
         // Normal path: our own Dialing initiator handle. Flip to Active + flush.
@@ -528,6 +579,7 @@ mod tests {
                     cmd_tx,
                     state: TunnelHandleState::Dialing,
                     role: TunnelRole::Initiator,
+                    epoch: 0,
                     pending: VecDeque::from(vec![
                         b"dm-1".to_vec(),
                         b"dm-2".to_vec(),
@@ -575,6 +627,7 @@ mod tests {
                     cmd_tx,
                     state: TunnelHandleState::Dialing,
                     role: TunnelRole::Initiator,
+                    epoch: 0,
                     pending: VecDeque::new(),
                 },
             );
@@ -615,6 +668,7 @@ mod tests {
                     cmd_tx,
                     state: TunnelHandleState::Active,
                     role: TunnelRole::Initiator,
+                    epoch: 0,
                     pending: VecDeque::new(),
                 },
             );
@@ -669,6 +723,7 @@ mod tests {
                     cmd_tx,
                     state: TunnelHandleState::Active,
                     role: TunnelRole::Initiator,
+                    epoch: 0,
                     pending: VecDeque::new(),
                 },
             );
@@ -697,5 +752,46 @@ mod tests {
         let dsa = id.public_identity().verifying_key.as_bytes();
         let derived = node_id_from_dsa_pubkey(&dsa);
         assert_eq!(derived, *blake3::hash(&dsa).as_bytes());
+    }
+
+    /// CR12 (ZEB-473): a loop's `note_closed` evicts its OWN session but must
+    /// NOT evict a replacement session installed for the same peer (the ABA
+    /// case). The epoch guard is what distinguishes them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_closed_evicts_own_session_but_not_a_replacement() {
+        let (mgr, _ingest_rx) = test_manager();
+        let peer = fixed_node_id(0x21);
+
+        // Register an inbound session → epoch1. Its session is present.
+        let (_rx1, epoch1) = mgr.register_inbound(peer);
+        assert!(
+            mgr.handle_snapshot(&peer).is_some(),
+            "the registered session must be present"
+        );
+
+        // note_closed with the matching epoch evicts it.
+        mgr.note_closed(peer, epoch1);
+        assert!(
+            mgr.handle_snapshot(&peer).is_none(),
+            "a loop must evict its own (epoch-matched) session on exit"
+        );
+
+        // ABA: a NEW session for the same peer (epoch2) replaces the slot, then
+        // the OLD loop (epoch1) belatedly calls note_closed. The replacement
+        // must survive.
+        let (_rx2, epoch2) = mgr.register_inbound(peer);
+        assert_ne!(epoch1, epoch2, "a fresh session must get a fresh epoch");
+        mgr.note_closed(peer, epoch1);
+        assert!(
+            mgr.handle_snapshot(&peer).is_some(),
+            "a stale loop's note_closed must NOT evict the replacement session (ABA guard)"
+        );
+
+        // The replacement's own note_closed (epoch2) does evict it.
+        mgr.note_closed(peer, epoch2);
+        assert!(
+            mgr.handle_snapshot(&peer).is_none(),
+            "the replacement evicts itself on its own exit"
+        );
     }
 }

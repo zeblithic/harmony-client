@@ -330,10 +330,12 @@ async fn s2_friend_graph_and_dm_send() {
     // CAS-stored + queued on the outbox). With ZEB-461 Tasks 5-7 the recipient's
     // devices now resolve from `OwnerDeviceCache` (handshake-populated), so the send
     // gets a real destination instead of "no known devices". Delivery is still
-    // characterized, not hard-asserted: the per-device unicast rides the Reticulum
-    // path that can't route co-located and is being replaced by a DM-over-iroh
-    // carrier (PQ `harmony-tunnel` repurpose, tracked separately). The bounded poll
-    // keeps the scenario fast + honest rather than hanging on the pending carrier.
+    // characterized, not hard-asserted: ZEB-473 Move 1a carries DMs over the live
+    // PQ `harmony-tunnel` (always-deposit + attempt-tunnel), but co-located
+    // delivery in this pkarr harness still hinges on the deposit path and the
+    // DM-space carrier wiring (the receiver can still drop a packet whose Space
+    // hasn't merged yet — SpaceNotFound). The bounded poll keeps the scenario
+    // fast + honest rather than hanging on that gap.
     send_dm(&alice, &a_space, b"hello-from-alice", "text/plain")
         .await
         .expect("alice's send_dm is accepted by the engine (CAS-stored + queued)");

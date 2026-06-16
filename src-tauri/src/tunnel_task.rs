@@ -91,14 +91,17 @@ pub async fn run_tunnel_responder(
     // reuse the bidirectional tunnel. The manager applies lower-NodeId collision
     // dedup: if it already holds a session for this peer, the loser is closed
     // and this `cmd_rx` may be dropped immediately — `run_tunnel_loop` then
-    // exits cleanly on the first `recv()` returning `None`.
-    let cmd_rx = mgr.register_inbound(peer_node_id);
+    // exits cleanly on the first `recv()` returning `None`. The returned `epoch`
+    // identifies THIS session so loop-exit evicts only our own entry (CR12).
+    let (cmd_rx, epoch) = mgr.register_inbound(peer_node_id);
 
     run_tunnel_loop(
         session,
         send_stream,
         recv_stream,
         peer_node_id,
+        Arc::clone(&mgr),
+        epoch,
         ingest_tx,
         cmd_rx,
     )
@@ -156,12 +159,14 @@ async fn responder_handshake(
 /// completes the PQ handshake, then enters `run_tunnel_loop`. On a successful
 /// handshake the manager handle for `peer_node_id` is flipped to Active and its
 /// `pending` queue flushed (driven inside `run_tunnel_loop`'s dispatch).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tunnel_initiator(
     endpoint: IrohEndpoint,
     contact: DeviceTunnelContact,
     local_pq: Arc<PqPrivateIdentity>,
     peer_node_id: [u8; 32],
     mgr: Arc<TunnelManager>,
+    epoch: u64,
     ingest_tx: mpsc::Sender<InboundDm>,
     cmd_rx: mpsc::Receiver<TunnelCommand>,
 ) {
@@ -197,6 +202,8 @@ pub async fn run_tunnel_initiator(
         send_stream,
         recv_stream,
         peer_node_id,
+        Arc::clone(&mgr),
+        epoch,
         ingest_tx,
         cmd_rx,
     )
@@ -299,11 +306,14 @@ pub(crate) fn peer_pq_identity(contact: &DeviceTunnelContact) -> Result<PqIdenti
 /// codec buffers partial reads internally, so dropping the read future mid-frame
 /// (when `select!` fires another arm) does not discard consumed bytes — the next
 /// `.next()` resumes from the buffered position.
+#[allow(clippy::too_many_arguments)]
 async fn run_tunnel_loop(
     mut session: TunnelSession,
     mut send_stream: SendStream,
     recv_stream: RecvStream,
     peer_node_id: [u8; 32],
+    mgr: Arc<TunnelManager>,
+    epoch: u64,
     ingest_tx: mpsc::Sender<InboundDm>,
     mut cmd_rx: mpsc::Receiver<TunnelCommand>,
 ) {
@@ -396,53 +406,71 @@ async fn run_tunnel_loop(
         }
     }
 
-    // Loop exit = session over. Drop the manager's handle so a later DM re-dials.
-    // Best-effort: the send half is finished here; the recv half drops with
-    // `framed`.
+    // Loop exit = session over. Best-effort: the send half is finished here; the
+    // recv half drops with `framed`.
     let _ = send_stream.finish();
+    // CR12: evict THIS session from the manager so dead entries don't accumulate
+    // under peer churn. `note_closed` is epoch-guarded: it removes only if the
+    // current entry is still this same (now-dead) session, never an ABA
+    // replacement that a redial/dedup installed for the same peer.
+    mgr.note_closed(peer_node_id, epoch);
 }
 
 /// Two-pass dispatch of `TunnelAction`s.
 ///
 /// Pass 1 writes every `OutboundBytes` to the bi-stream (length-prefixed) and
-/// returns `false` on the first terminal `Error`/`Closed`. Pass 2 forwards
-/// `DmReceived` payloads to the ingest seam. Returns `true` to continue the
-/// loop, `false` to exit.
+/// RECORDS (without acting on) the first terminal `Error`/`Closed`. Pass 2
+/// forwards EVERY `DmReceived` payload to the ingest seam — even when this
+/// batch also carries a terminal action — and only THEN does the recorded
+/// terminal decision take effect. Returns `true` to continue the loop, `false`
+/// to exit.
+///
+/// G2 (ZEB-473): the terminal bail must NOT gate `DmReceived` forwarding. The
+/// `TunnelSession` state machine can legitimately emit `[DmReceived(x), Error]`
+/// in a single `poll` (the DM's bytes were already processed); dropping `x`
+/// because an `Error` followed it in the same batch would silently lose a
+/// fully-received DM. So we drain all `DmReceived` first, then honor the bail.
 ///
 /// `TunnelSession` guarantees `OutboundBytes` precede `Error`/`Closed`, so a
-/// terminal action never strands a trailing frame.
+/// terminal action never strands a trailing frame. An outbound WRITE error,
+/// however, is itself a hard stop: there is no point forwarding further bytes
+/// onto a broken stream, but we still drain any already-received DMs first.
 async fn dispatch_tunnel_actions(
     actions: &[TunnelAction],
     send_stream: &mut SendStream,
     peer_node_id: [u8; 32],
     ingest_tx: &mpsc::Sender<InboundDm>,
 ) -> bool {
-    // Pass 1: write all outbound bytes; bail on terminal actions.
+    // Pass 1: write all outbound bytes; RECORD (don't act on) terminal actions
+    // and write failures so Pass 2 can still drain inbound DMs first.
+    let mut terminal = false;
     for action in actions {
         match action {
             TunnelAction::OutboundBytes { data } => {
                 if let Err(e) = write_length_prefixed(send_stream, data).await {
                     tracing::debug!(err = %e, "ZEB-473: tunnel write error; closing");
-                    return false;
+                    terminal = true;
+                    break;
                 }
             }
             TunnelAction::Error { reason } => {
                 tracing::debug!(%reason, "ZEB-473: tunnel session error; closing");
-                return false;
+                terminal = true;
             }
             TunnelAction::Closed => {
                 tracing::debug!("ZEB-473: tunnel session closed");
-                return false;
+                terminal = true;
             }
             _ => {}
         }
     }
 
-    // Pass 2: forward DM payloads to the ingest seam. HandshakeComplete on the
-    // initiator/responder is already handled before entering the loop (responder
-    // registers in the manager; initiator reaches Active in the handshake fn);
-    // we ignore it here. Zenoh/Replication frames are not expected on a DM
-    // tunnel and are dropped (logged) rather than routed.
+    // Pass 2: forward DM payloads to the ingest seam — ALWAYS, even on a
+    // terminal batch, so a DmReceived that arrived alongside an Error isn't
+    // dropped. HandshakeComplete on the initiator/responder is already handled
+    // before entering the loop (responder registers in the manager; initiator
+    // reaches Active in the handshake fn); we ignore it here. Zenoh/Replication
+    // frames are not expected on a DM tunnel and are dropped (logged).
     for action in actions {
         match action {
             TunnelAction::DmReceived { payload } => {
@@ -463,7 +491,9 @@ async fn dispatch_tunnel_actions(
             _ => {}
         }
     }
-    true
+
+    // Now honor the recorded terminal decision (after inbound DMs were drained).
+    !terminal
 }
 
 // ── Wire helpers (4-byte big-endian length prefix) ──────────────────────────
@@ -730,12 +760,20 @@ mod tests {
         let (init_ingest_tx, mut init_ingest_rx) = mpsc::channel::<InboundDm>(8);
         let resp_node_id =
             node_id_from_dsa_pubkey(&responder_pq.public_identity().verifying_key.as_bytes());
+        // Initiator-side manager so `run_tunnel_loop` can `note_closed` on exit.
+        let init_mgr = Arc::new(TunnelManager::new(
+            crate::iroh_endpoint::IrohEndpoint::from_endpoint_for_test(ep_a.clone()),
+            Arc::clone(&initiator_pq),
+            init_ingest_tx.clone(),
+        ));
         let initiator_loop = tokio::spawn(async move {
             run_tunnel_loop(
                 init_session,
                 send_stream,
                 recv_stream,
                 resp_node_id,
+                init_mgr,
+                0,
                 init_ingest_tx,
                 init_cmd_rx,
             )
@@ -918,12 +956,20 @@ mod tests {
         let (init_ingest_tx, _init_ingest_rx) = mpsc::channel::<InboundDm>(8);
         let resp_node_id =
             node_id_from_dsa_pubkey(&responder_pq.public_identity().verifying_key.as_bytes());
+        // Initiator-side manager so `run_tunnel_loop` can `note_closed` on exit.
+        let init_mgr = Arc::new(TunnelManager::new(
+            crate::iroh_endpoint::IrohEndpoint::from_endpoint_for_test(ep_a.clone()),
+            Arc::clone(&initiator_pq),
+            init_ingest_tx.clone(),
+        ));
         let initiator_loop = tokio::spawn(async move {
             run_tunnel_loop(
                 init_session,
                 send_stream,
                 recv_stream,
                 resp_node_id,
+                init_mgr,
+                0,
                 init_ingest_tx,
                 init_cmd_rx,
             )
@@ -969,5 +1015,76 @@ mod tests {
         drop(resp_ingest_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), responder).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), drain).await;
+    }
+
+    /// G2 (ZEB-473): a `DmReceived` that arrives in the SAME batch as a terminal
+    /// `Error` must STILL be forwarded to the ingest seam before the dispatch
+    /// returns `false` (loop-exit). The prior two-pass code bailed in Pass 1 and
+    /// skipped Pass 2 entirely, silently dropping a fully-received DM.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dm_received_before_error_in_same_batch_is_still_forwarded() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+
+        // A real loopback bi-stream gives us a live `SendStream` to satisfy the
+        // signature; this test only drives the dispatch's action handling.
+        let ep_a = loopback_endpoint([0x31; 32]).await;
+        let ep_b = loopback_endpoint([0x32; 32]).await;
+        let ep_b_id = ep_b.id();
+        let ep_b_addr = iroh::EndpointAddr::from_parts(
+            ep_b_id,
+            ep_b.bound_sockets()
+                .into_iter()
+                .map(iroh::TransportAddr::Ip),
+        );
+        // Keep the responder side alive so the stream stays open.
+        let ep_b_accept = ep_b.clone();
+        let acceptor = tokio::spawn(async move {
+            if let Some(incoming) = ep_b_accept.accept().await {
+                let _conn = incoming.await;
+                // Hold the connection open until the test drops the dialer.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+        let conn = ep_a
+            .connect(ep_b_addr, crate::iroh_endpoint::alpn::HARMONY_TUNNEL_V1)
+            .await
+            .expect("connect");
+        let (mut send_stream, _recv_stream) = conn.open_bi().await.expect("open_bi");
+
+        let peer_node_id = [0xAB; 32];
+        let (ingest_tx, mut ingest_rx) = mpsc::channel::<InboundDm>(8);
+
+        // The load-bearing batch: a received DM FOLLOWED by a terminal Error.
+        let dm_payload = b"the-dm-that-must-not-be-dropped".to_vec();
+        let actions = vec![
+            TunnelAction::DmReceived {
+                payload: dm_payload.clone(),
+            },
+            TunnelAction::Error {
+                reason: "peer closed right after delivering a DM".to_string(),
+            },
+        ];
+
+        let keep_going =
+            dispatch_tunnel_actions(&actions, &mut send_stream, peer_node_id, &ingest_tx).await;
+
+        // The dispatch reports loop-exit (terminal Error honored)...
+        assert!(
+            !keep_going,
+            "a terminal Error in the batch must still exit the loop"
+        );
+        // ...but the DM was forwarded to ingest FIRST (not dropped).
+        let got = ingest_rx
+            .try_recv()
+            .expect("the DmReceived must reach ingest even though an Error followed it");
+        assert_eq!(got.peer_node_id, peer_node_id);
+        assert_eq!(got.payload, dm_payload);
+        assert!(
+            ingest_rx.try_recv().is_err(),
+            "exactly one DM should have been forwarded"
+        );
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), acceptor).await;
     }
 }

@@ -66,7 +66,7 @@ So the wire already carries everything a dialer needs; PR-B persists it and cons
 
 ### 4.1 Outbound (send a DM to a friend)
 
-```
+```text
 app sends DM
   → DM outbox builds sealed+signed packet  [unchanged: build_signed_cidnotify/encode_packet]
   → IrohTunnelDmTransport::send(entry, recipient, _destinations)   [NEW DmTransport impl]
@@ -81,7 +81,7 @@ app sends DM
 
 ### 4.2 Inbound (receive a DM)
 
-```
+```text
 peer dials our persistent endpoint with HARMONY_TUNNEL_V1
   → accept loop routes ALPN → late-installed tunnel acceptor (run_responder analogue)
        TunnelSession::new_responder → handshake → Active
@@ -145,7 +145,7 @@ pub struct DeviceTunnelContact {
 
 A new `TunnelManager` (on `IrohZenohLinkManager` or standalone, `Arc`-shared), keyed by **peer NodeId**:
 
-```
+```text
 sessions: Mutex<HashMap<NodeId, TunnelHandle>>
 TunnelHandle { cmd_tx, state: Dialing|Active|Closing, role: Initiator|Responder, pending: VecDeque<Vec<u8>> }
 ```

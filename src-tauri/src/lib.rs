@@ -2671,9 +2671,10 @@ pub async fn start_node_inner(
     // ZEB-473 (Move 1a): the ZEB-227 Path B outbound DM unicast channel
     // (`unicast_send_tx`/`unicast_send_rx`) was removed along with the
     // dormant Reticulum carrier and the core's `SendUnicastToDevice` event
-    // (harmony#280). DM/invite delivery is via CRDT state-root sync + butler
-    // deposit; re-wiring an outbound DM path onto the iroh tunnel is a later
-    // move in this epic.
+    // (harmony#280). DMs now ride the live iroh PQ tunnel transport when iroh
+    // is bound (always-deposit + attempt-tunnel) and still deposit via butler +
+    // CRDT state-root sync for durability. The cross-owner INVITE carrier
+    // remains a later move in this epic.
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
@@ -6994,15 +6995,30 @@ pub async fn start_node_inner(
                                     tunnel_ingest_tx,
                                 ),
                             );
-                            if link_mgr.install_tunnel_acceptor(tunnel_acceptor).is_err() {
-                                tracing::warn!(
-                                    "ZEB-473: tunnel acceptor already installed on iroh \
-                                     link manager — keeping the prior instance"
-                                );
+                            // CR7 (ZEB-473): only publish the manager onto
+                            // NodeState (which later swaps the DM outbox to
+                            // tunnel mode) when the acceptor actually installs.
+                            // If install fails (one is already present), the
+                            // prior acceptor stays wired to a DIFFERENT manager;
+                            // publishing THIS one would split the live acceptor
+                            // from the manager used for outbound sends. Honor the
+                            // fallback contract: stay on the deposit-only DM
+                            // transport.
+                            match link_mgr.install_tunnel_acceptor(tunnel_acceptor) {
+                                Ok(()) => {
+                                    // Share the manager onto NodeState so the
+                                    // Task 8 DmTransport can route outbound DMs
+                                    // through it (wired to the installed acceptor).
+                                    tunnel_manager_for_state = Some(tunnel_manager);
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "ZEB-473: tunnel acceptor already installed on iroh \
+                                         link manager — leaving tunnel transport disabled \
+                                         (deposit-only DM path retained)"
+                                    );
+                                }
                             }
-                            // Share the manager onto NodeState so the Task 8
-                            // DmTransport can route outbound DMs through it.
-                            tunnel_manager_for_state = Some(tunnel_manager);
                         }
 
                         // ZEB-418 SP2 P1 Task 8: build the production
@@ -7871,9 +7887,12 @@ pub async fn start_node_inner(
                             // along with the Reticulum unicast receive path in core
                             // #280 — `NodeRuntime` no longer exposes that method, and
                             // there is no `SendUnicastToDevice`/`UnicastReceived` flow
-                            // for it to feed. Inbound DM delivery is via butler deposit
-                            // + CRDT state-root sync; re-wiring an inbound DM path onto
-                            // the iroh tunnel is a later move in this epic.
+                            // for it to feed. Inbound DMs now arrive over the live iroh
+                            // PQ tunnel (accepted by the tunnel acceptor + drained
+                            // through the real ingest pipeline above) AND via butler
+                            // deposit + CRDT state-root sync for durability. The
+                            // cross-owner INVITE carrier remains a later move in this
+                            // epic.
 
                             event_loop::run(
                                 runtime,
@@ -39435,7 +39454,9 @@ pub async fn connectivity_link_friend_iroh_inner(
     // node's self-values when present; ship the EMPTY bundle when `None` (tests /
     // pre-identity). The digest is computed from the SAME (devices, pubs) placed
     // on the wire, so the request signature stays consistent with the bundle a
-    // peer re-digests on receipt. Reachability + PQ keys are unsigned hints.
+    // peer re-digests on receipt. ZEB-473 §6.3: reachability + PQ keys are now
+    // folded into `contact_digest`, so the signature BINDS them (downgrade /
+    // tamper protection) — they are signed, not unsigned hints.
     let req_bundle = crate::dm_tunnel_contact::self_request_bundle(self_reachability.as_ref());
     let req_devices_digest = crate::iroh_friend_acceptor::contact_digest(
         &req_bundle.sender_devices,
@@ -41704,8 +41725,10 @@ pub async fn connectivity_add_friend_by_key_inner(
     let (self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
     // ZEB-461 Task 6: fill the device bundle + reachability + PQ keys from this
     // node's self-values when present; ship the EMPTY bundle when `None`. The
-    // digest is computed from the SAME (devices, pubs) placed on the wire so the
-    // request signature stays consistent. Reachability + PQ keys are unsigned.
+    // digest is computed from the SAME contact material placed on the wire so the
+    // request signature stays consistent — and ZEB-473 §6.3 folds reachability +
+    // PQ keys into `contact_digest`, so the signature BINDS devices, pubs,
+    // reachability, AND PQ keys (downgrade / tamper protection).
     let req_bundle = crate::dm_tunnel_contact::self_request_bundle(self_reachability.as_ref());
     let req_devices_digest = crate::iroh_friend_acceptor::contact_digest(
         &req_bundle.sender_devices,
@@ -42175,11 +42198,13 @@ mod friend_ipc_tests {
         let state = tokio::sync::Mutex::new(OwnerState::default());
         let (addr, entry) = friend_entry(0x33, FriendStatus::Active, 10);
         // ZEB-473 Task 5: a single SIGNED tunnel contact, parallel to device 0.
+        // CR9: correctly-sized PQ keys so the contact passes the apply-time
+        // key-size validation gate (a wrong-size contact is now rejected).
         let contact = crate::owner_state_types::DeviceTunnelContact {
             iroh_node_id: [0x7c; 32],
             home_relay_url: Some("https://relay.example/".into()),
-            pq_dsa_pubkey: vec![1, 2, 3],
-            pq_kem_pubkey: vec![4, 5, 6],
+            pq_dsa_pubkey: vec![1u8; crate::owner_state_types::ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![4u8; crate::owner_state_types::ML_KEM_768_PUBKEY_LEN],
         };
         apply_handshaked_friend(
             &state,

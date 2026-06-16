@@ -592,18 +592,36 @@ mod tests {
         let private_b = harmony_identity::PrivateIdentity::from_seed(&[0xb2; 32]);
         let public_b = private_b.public_identity();
         let hash_b = DeviceIdentityHash(public_b.address_hash);
-        // Pre-sort so the post-apply order is deterministic for the
-        // assertions below (apply sorts ascending by hash).
-        let (sorted_hashes, sorted_pubs) = if hash_a < hash_b {
-            (vec![hash_a, hash_b], vec![Some(pub_a), None])
+        // OD3 (ZEB-473): also seed a NON-empty tunnel contact (correctly-sized
+        // PQ keys so the apply-time key-size gate accepts it), parallel to the
+        // pubs vec, so the round-trip catches a regression that drops
+        // `device_tunnel_contacts` on save/load. Pre-sort all three vecs so the
+        // post-apply order is deterministic for the assertions below (apply sorts
+        // ascending by hash).
+        let contact_a = crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [0xa1; 32],
+            home_relay_url: Some("https://relay.example/a".into()),
+            pq_dsa_pubkey: vec![0x11; crate::owner_state_types::ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![0x22; crate::owner_state_types::ML_KEM_768_PUBKEY_LEN],
+        };
+        let (sorted_hashes, sorted_pubs, sorted_contacts) = if hash_a < hash_b {
+            (
+                vec![hash_a, hash_b],
+                vec![Some(pub_a), None],
+                vec![Some(contact_a.clone()), None],
+            )
         } else {
-            (vec![hash_b, hash_a], vec![None, Some(pub_a)])
+            (
+                vec![hash_b, hash_a],
+                vec![None, Some(pub_a)],
+                vec![None, Some(contact_a.clone())],
+            )
         };
         state.apply_owner_device_update(
             OwnerAddr([2; 16]),
             sorted_hashes.clone(),
             sorted_pubs.clone(),
-            vec![],
+            sorted_contacts.clone(),
             hlc(1),
         );
 
@@ -655,6 +673,12 @@ mod tests {
         assert_eq!(
             cache_entry.device_identity_pubs, sorted_pubs,
             "device_identity_pubs parallel vec must persist with Some + None preserved",
+        );
+        // OD3: the tunnel-contact parallel vec must ALSO survive save/load with
+        // its Some + None shape preserved (regression-of-omission guard).
+        assert_eq!(
+            cache_entry.device_tunnel_contacts, sorted_contacts,
+            "device_tunnel_contacts parallel vec must persist with Some + None preserved",
         );
     }
 

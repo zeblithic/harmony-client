@@ -1783,6 +1783,18 @@ impl DmOutbox {
                     return;
                 }
             };
+            // OD1 (ZEB-473): re-verify the SpaceKind gate too. A Space-kind
+            // change during the TOCTOU window (Phase B's slow CAS fetch) would
+            // otherwise bypass the Phase A admission gate, letting a DM apply to
+            // a Space that is no longer Dm/GroupDm. Symmetric with the re-check
+            // in `dm_inbox_ingest::ingest_dm_packet`.
+            if !matches!(space_c.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+                tracing::warn!(
+                    error = ?DmReceiveError::SpaceKindMismatch,
+                    "handle_cidnotify_lifted Phase C: dropping packet (Space kind changed in TOCTOU window)"
+                );
+                return;
+            }
             if !space_c.members.contains(&resolved_owner) {
                 tracing::warn!(
                     error = ?DmReceiveError::SenderNotInSpaceMembers,
@@ -8062,16 +8074,18 @@ mod tests {
         );
     }
 
-    /// ZEB-473 Task 8 — always-deposit invariant for the LIVE tunnel carrier:
-    /// with `IrohTunnelDmTransport` installed (replacing the deposit-only
-    /// interim) and a butler deposit client acking, a DM STILL routes through
-    /// the deposit rung and delivers — no durability regression. The tunnel
-    /// transport returns the SAME `Transient` contract, so the rung fires on
-    /// the second drain pass exactly as before. (Here the transport's own
-    /// resolution cache is empty, so it routes nothing to the tunnel — the
-    /// point is that the deposit rung fires regardless of tunnel outcome.)
+    /// ZEB-473 Task 8 / CR4 — always-deposit invariant for the LIVE tunnel
+    /// carrier with the CONTACT-PRESENT path exercised: Bob has a cached,
+    /// correctly-sized `DeviceTunnelContact`, so the transport actually resolves
+    /// a tunnel target and fires `send_dm`. Even so, the transport returns the
+    /// SAME `Transient` contract, so the deposit rung STILL fires on the second
+    /// drain pass and the DM delivers — no durability regression. (Previously
+    /// this test passed `OwnerState::default()`, covering only the resolver-miss
+    /// path; CR4 seeds the contact so the contact-present rung is covered too.)
     #[tokio::test]
     async fn tunnel_transport_still_routes_dm_to_deposit_rung_and_delivers_on_ack() {
+        use crate::owner_state_types::{DeviceTunnelContact, OwnerDeviceEntry};
+
         let alice = OwnerAddr([0xaa; 16]);
         let bob = OwnerAddr([0xbb; 16]);
         let entry = entry_with_age(7, vec![bob], 1_000);
@@ -8100,9 +8114,32 @@ mod tests {
         let mgr = Arc::new(crate::tunnel_manager::TunnelManager::new(
             endpoint, local_pq, ingest_tx,
         ));
+
+        // CR4: seed Bob's cached tunnel contact into the transport's resolution
+        // state so the CONTACT-PRESENT tunnel attempt is exercised (not just the
+        // resolver-miss path). Correctly-sized PQ keys so it's a valid contact.
+        let mut resolver_state = OwnerState::default();
+        resolver_state.owner_device_cache.devices.insert(
+            bob,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0xb0; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "bob".into(),
+                },
+                device_tunnel_contacts: vec![Some(DeviceTunnelContact {
+                    iroh_node_id: [0xb1; 32],
+                    home_relay_url: None,
+                    pq_dsa_pubkey: vec![0xb2; crate::owner_state_types::ML_DSA_65_PUBKEY_LEN],
+                    pq_kem_pubkey: vec![0xb3; crate::owner_state_types::ML_KEM_768_PUBKEY_LEN],
+                })],
+            },
+        );
         let transport = crate::iroh_tunnel_dm_transport::IrohTunnelDmTransport::new(
             mgr,
-            Arc::new(tokio::sync::Mutex::new(OwnerState::default())),
+            Arc::new(tokio::sync::Mutex::new(resolver_state)),
             Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])),
             alice,
             DeviceIdentityHash([0xaa; 16]),

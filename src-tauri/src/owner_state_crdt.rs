@@ -734,6 +734,21 @@ impl OwnerState {
             sanitized_contacts.push(t);
         }
 
+        // CR9 (ZEB-473): reject any tunnel contact whose PQ key sizes are wrong
+        // or whose relay URL is oversized BEFORE the LWW insertion. A
+        // malformed/handshake-derived contact must never enter replicated CRDT
+        // state (it would only fail dials forever + bloat owner-state payloads).
+        // Symmetric with `peer_handshake_contact`'s admission gate.
+        for contact in sanitized_contacts.iter().flatten() {
+            if !contact.has_valid_key_sizes() {
+                return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                    "owner_device_entry for {:?} has a tunnel contact with invalid PQ key \
+                     sizes or an oversized relay URL",
+                    addr
+                )));
+            }
+        }
+
         // LWW guard.
         if let Some(existing) = self.owner_device_cache.devices.get(&addr) {
             if existing.learned_at.is_strictly_newer_than(&learned_at) {
@@ -3643,11 +3658,14 @@ mod owner_device_cache_tests {
     // ----- ZEB-473: per-device tunnel-contact parallel vec -----
 
     fn tunnel_contact(seed: u8) -> crate::owner_state_types::DeviceTunnelContact {
+        use crate::owner_state_types::{ML_DSA_65_PUBKEY_LEN, ML_KEM_768_PUBKEY_LEN};
+        // CR9: correctly-sized PQ keys so the contact passes the apply-time
+        // key-size validation gate (a wrong-size contact is now rejected).
         crate::owner_state_types::DeviceTunnelContact {
             iroh_node_id: [seed; 32],
             home_relay_url: Some(format!("https://relay.example/{seed}")),
-            pq_dsa_pubkey: vec![seed; 7],
-            pq_kem_pubkey: vec![seed.wrapping_add(1); 9],
+            pq_dsa_pubkey: vec![seed; ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![seed.wrapping_add(1); ML_KEM_768_PUBKEY_LEN],
         }
     }
 
@@ -3705,6 +3723,46 @@ mod owner_device_cache_tests {
         let entry = state.owner_device_cache.devices.get(&owner).unwrap();
         assert_eq!(entry.device_tunnel_contacts.len(), 1);
         assert_eq!(entry.device_tunnel_contacts[0], Some(tunnel_contact(0x10)));
+    }
+
+    #[test]
+    fn apply_owner_device_update_rejects_tunnel_contact_with_invalid_key_sizes() {
+        // CR9 (ZEB-473): a tunnel contact with wrong-size PQ keys (the legacy
+        // 7/9-byte fake) must be REJECTED at apply time, never entering the
+        // CRDT — and the whole update is rejected, not silently sanitized.
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([0x33; 16]);
+        let (h_a, _p_a) = matching_device_pair(0xe1);
+        let devices = vec![h_a];
+        let bad_contact = crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [0x55; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![0x55; 7], // wrong size (was the old fixture size)
+            pq_kem_pubkey: vec![0x56; 9], // wrong size
+        };
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let outcome = state.apply_owner_device_update(
+            owner,
+            devices,
+            vec![],
+            vec![Some(bad_contact)],
+            learned_at,
+        );
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+            ),
+            "a wrong-size PQ tunnel contact must be rejected, got {outcome:?}"
+        );
+        assert!(
+            !state.owner_device_cache.devices.contains_key(&owner),
+            "the rejected update must not have mutated the CRDT"
+        );
     }
 
     #[test]

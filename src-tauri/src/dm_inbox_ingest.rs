@@ -397,6 +397,26 @@ pub(crate) async fn ingest_dm_packet(
         Err(_) => return Err("CAS fetch: 500ms timeout".into()),
     };
 
+    // 3b. Blob ↔ packet binding: the fetched storage blob MUST hash to the
+    //     packet's signed `message_cid` under the DM send path's flags. The CAS
+    //     `get` is keyed by `message_cid`, but a poisoned local CAS (or a
+    //     backend returning mismatched bytes) could hand back a blob whose CID
+    //     differs from the signed one — then the inbox entry would be keyed by
+    //     the signed CID while the emitted/decrypted body came from a different
+    //     blob. Recompute + compare BEFORE decrypt. Mirrors the deposited-ingest
+    //     verifier's binding check (CR3, ZEB-473).
+    let computed_cid = harmony_content::cid::ContentId::for_book(
+        &blob,
+        harmony_content::cid::ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("CAS fetch: for_book: {e:?}"))?;
+    if computed_cid != signed.message_cid {
+        return Err("CAS fetch: blob CID does not match message_cid".into());
+    }
+
     // 4. Re-lock + TOCTOU re-check + decrypt + apply — the direct path's
     //    Phase C (`handle_cidnotify_lifted`), held under ONE lock acquisition.
     //    The `space` snapshot taken in step 2 is now stale: during the slow CAS
@@ -1345,6 +1365,65 @@ mod tests {
         assert!(
             fx.sink_handle.frames().is_empty(),
             "a re-check-rejected DM must not emit dm-received"
+        );
+    }
+
+    /// CR3 (ZEB-473): a content store that returns bytes whose CID does NOT
+    /// match the signed `message_cid` must cause ingest to Err with a
+    /// "CID does not match" message, with NO inbox mutation and NO emit — the
+    /// blob↔packet binding check rejects a poisoned/mismatched CAS blob before
+    /// it can be keyed under the signed CID and decrypted.
+    #[tokio::test]
+    async fn ingest_dm_packet_rejects_blob_whose_cid_mismatches_signed_cid() {
+        use crate::content_store::{ContentStore, ContentStoreError, InMemoryStub};
+        use harmony_content::cid::ContentId as Cid;
+        use std::sync::Arc as StdArc;
+
+        /// Returns DIFFERENT bytes than were stored under `message_cid`,
+        /// simulating a poisoned local CAS (or a backend serving the wrong
+        /// blob). The returned bytes hash to a different CID.
+        struct MismatchOnGetStore {
+            inner: InMemoryStub,
+        }
+        #[async_trait]
+        impl ContentStore for MismatchOnGetStore {
+            async fn put(&self, cid: Cid, blob: Vec<u8>) -> Result<(), ContentStoreError> {
+                self.inner.put(cid, blob).await
+            }
+            async fn get(&self, _cid: &Cid) -> Result<Option<Vec<u8>>, ContentStoreError> {
+                // Hand back bytes that do NOT hash to the requested CID.
+                Ok(Some(
+                    b"poisoned bytes that do not hash to message_cid".to_vec(),
+                ))
+            }
+        }
+
+        let fx = build_dm_ingest_fixture(b"original body").await;
+        let poisoned_store: StdArc<dyn ContentStore> = StdArc::new(MismatchOnGetStore {
+            inner: InMemoryStub::default(),
+        });
+
+        let err = ingest_dm_packet(
+            &fx.crdt_state,
+            &poisoned_store,
+            &fx.sink,
+            &fx.bob_device_id,
+            &fx.packet,
+        )
+        .await
+        .expect_err("a CAS blob whose CID != signed message_cid must be rejected");
+        assert!(
+            err.contains("CID does not match"),
+            "rejection must come from the blob↔CID binding check (got: {err})"
+        );
+
+        assert!(
+            fx.crdt_state.lock().await.inbox.is_empty(),
+            "a CID-mismatch-rejected DM must not touch the inbox"
+        );
+        assert!(
+            fx.sink_handle.frames().is_empty(),
+            "a CID-mismatch-rejected DM must not emit dm-received"
         );
     }
 
