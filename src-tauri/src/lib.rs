@@ -6953,12 +6953,17 @@ pub async fn start_node_inner(
                             let drain_content_store = std::sync::Arc::clone(&content_store);
                             let drain_sink = app.clone();
                             let drain_device_id = device_id.clone();
+                            // ZEB-482: the same self OwnerAddr `dm_self_owner`
+                            // carries — needed so the invite-ingest arm can run
+                            // sanity gate 3 (self_owner ∈ members).
+                            let drain_self_owner = self_owner;
                             tokio::spawn(async move {
                                 while let Some(dm) = tunnel_ingest_rx.recv().await {
                                     match crate::dm_inbox_ingest::ingest_dm_packet(
                                         &drain_crdt_state,
                                         &drain_content_store,
                                         &drain_sink,
+                                        drain_self_owner,
                                         &drain_device_id,
                                         &dm.payload,
                                     )
