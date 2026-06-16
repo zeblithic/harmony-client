@@ -67,6 +67,7 @@ fn cache_party(
         OwnerDeviceEntry {
             devices: vec![device],
             device_identity_pubs: vec![Some(identity_pub)],
+            device_tunnel_contacts: vec![None],
             learned_at: Hlc {
                 wall_ms: learned_at_ms,
                 logical: 0,

@@ -11,7 +11,7 @@ use crate::owner_state_types::DeviceIdentityHash;
 /// The local node's own single-device bundle for the friend handshake.
 ///
 /// Returns the parallel `(devices, identity_pubs)` vecs that go into the
-/// `FriendLinkRequest` / `FriendLinkAccepted` (and into `friend_devices_digest`,
+/// `FriendLinkRequest` / `FriendLinkAccepted` (and into `contact_digest`,
 /// which the handshake signature binds). `identity_pub_64` is the canonical
 /// `X25519_pub(32) || Ed25519_pub(32)` combined identity public-bytes value.
 ///
@@ -38,10 +38,10 @@ pub fn self_device_bundle(
     }
 }
 
-/// The self-side values a `FriendLinkRequest` carries (ZEB-461): the SIGNED
-/// device bundle (`sender_devices` + `device_identity_pubs`, bound into the
-/// handshake signature via `friend_devices_digest`) plus the UNSIGNED iroh
-/// reachability + PQ routing hints.
+/// The self-side values a `FriendLinkRequest` carries (ZEB-461/473): the device
+/// bundle (`sender_devices` + `device_identity_pubs`) plus the iroh reachability +
+/// PQ keys. ZEB-473 §6.3: ALL of these are now SIGNED — every field is folded into
+/// `contact_digest`, which the handshake signature binds.
 pub struct SelfRequestBundle {
     pub sender_devices: Vec<DeviceIdentityHash>,
     pub device_identity_pubs: Vec<Option<[u8; 64]>>,
@@ -84,6 +84,49 @@ pub fn self_request_bundle(
             pq_kem_pubkey: vec![],
         },
     }
+}
+
+/// ZEB-473 Task 5: build a peer's [`DeviceTunnelContact`] from the reachability +
+/// PQ keys it advertised over the friend handshake, or `None` when it advertised
+/// nothing dialable.
+///
+/// A contact is only meaningful — and only worth persisting — when the peer gave
+/// us a non-zero iroh `node_id` (the dial target) AND both PQ public keys: the
+/// ML-DSA key (to authenticate the PQ tunnel handshake) and the ML-KEM key (for
+/// the ML-KEM key agreement that establishes the tunnel). A peer that omits any
+/// of the three cannot be tunnel-dialed, so we return `None` rather than
+/// fabricating a half-populated contact that would always fail the handshake.
+/// Returning `None` (vs a partial contact) is what lets the CRDT skip-on-empty
+/// rule fire: a contactless/older peer never LWW-clobbers a previously-known-good
+/// contact for that device.
+///
+/// These fields are now SIGNED into the handshake (the `contact_digest` preimage,
+/// §6.3), so a value reaching here has already passed signature verification —
+/// this helper only decides "present enough to dial?", never trusts an unsigned
+/// hint.
+pub fn peer_handshake_contact(
+    iroh_node_id: [u8; 32],
+    home_relay_url: Option<String>,
+    pq_dsa_pubkey: Vec<u8>,
+    pq_kem_pubkey: Vec<u8>,
+) -> Option<crate::owner_state_types::DeviceTunnelContact> {
+    // A zero node id is a legitimately-absent (undialable) contact → None.
+    if iroh_node_id == [0u8; 32] {
+        return None;
+    }
+    let contact = crate::owner_state_types::DeviceTunnelContact {
+        iroh_node_id,
+        home_relay_url,
+        pq_dsa_pubkey,
+        pq_kem_pubkey,
+    };
+    // Reject malformed/oversized signed inputs (exact PQ key sizes + bounded
+    // relay URL) BEFORE they can enter replicated CRDT state, where they would
+    // repeatedly fail dial attempts and bloat owner-state payloads. ZEB-473.
+    if !contact.has_valid_key_sizes() {
+        return None;
+    }
+    Some(contact)
 }
 
 #[cfg(test)]
@@ -152,5 +195,78 @@ mod tests {
         assert!(n.home_relay_url.is_none());
         assert!(n.pq_dsa_pubkey.is_empty());
         assert!(n.pq_kem_pubkey.is_empty());
+    }
+
+    /// CodeAnt/Qodo F3 + CR5 (ZEB-473): a contact is only dialable with a
+    /// non-zero node id AND both PQ keys at their EXACT canonical sizes (ML-DSA
+    /// for handshake auth, ML-KEM for key agreement). Any missing/wrong-size
+    /// field → `None` so an undialable/malformed contact never LWW-clobbers a
+    /// previously-known-good one nor bloats replicated owner-state.
+    #[test]
+    fn peer_handshake_contact_requires_node_id_and_both_pq_keys() {
+        use crate::owner_state_types::{ML_DSA_65_PUBKEY_LEN, ML_KEM_768_PUBKEY_LEN};
+        let node = [7u8; 32];
+        let dsa = vec![1u8; ML_DSA_65_PUBKEY_LEN];
+        let kem = vec![2u8; ML_KEM_768_PUBKEY_LEN];
+
+        // Happy path: all three present + correctly sized → Some.
+        let c = peer_handshake_contact(node, None, dsa.clone(), kem.clone())
+            .expect("a fully-populated, correctly-sized contact must be Some");
+        assert_eq!(c.iroh_node_id, node);
+        assert_eq!(c.pq_dsa_pubkey, dsa);
+        assert_eq!(c.pq_kem_pubkey, kem);
+
+        // Zero node id → None.
+        assert!(peer_handshake_contact([0u8; 32], None, dsa.clone(), kem.clone()).is_none());
+        // Empty DSA → None.
+        assert!(peer_handshake_contact(node, None, vec![], kem.clone()).is_none());
+        // Empty KEM → None (the F3 regression: was previously Some).
+        assert!(
+            peer_handshake_contact(node, None, dsa.clone(), vec![]).is_none(),
+            "an empty ML-KEM key must skip the contact (undialable)"
+        );
+    }
+
+    /// CR5 (ZEB-473): wrong-but-non-empty PQ key sizes and an oversized relay
+    /// URL must all be rejected (`None`), so only canonically-sized contacts
+    /// reach CRDT state.
+    #[test]
+    fn peer_handshake_contact_rejects_wrong_key_sizes_and_long_relay() {
+        use crate::owner_state_types::{
+            MAX_TUNNEL_RELAY_URL_LEN, ML_DSA_65_PUBKEY_LEN, ML_KEM_768_PUBKEY_LEN,
+        };
+        let node = [7u8; 32];
+        let dsa = vec![1u8; ML_DSA_65_PUBKEY_LEN];
+        let kem = vec![2u8; ML_KEM_768_PUBKEY_LEN];
+
+        // DSA one byte short → None.
+        assert!(
+            peer_handshake_contact(node, None, vec![1u8; ML_DSA_65_PUBKEY_LEN - 1], kem.clone())
+                .is_none(),
+            "an under-sized ML-DSA key must be rejected"
+        );
+        // KEM one byte long → None.
+        assert!(
+            peer_handshake_contact(
+                node,
+                None,
+                dsa.clone(),
+                vec![2u8; ML_KEM_768_PUBKEY_LEN + 1]
+            )
+            .is_none(),
+            "an over-sized ML-KEM key must be rejected"
+        );
+        // Oversized relay URL → None.
+        let long_relay = "h".repeat(MAX_TUNNEL_RELAY_URL_LEN + 1);
+        assert!(
+            peer_handshake_contact(node, Some(long_relay), dsa.clone(), kem.clone()).is_none(),
+            "an oversized home_relay_url must be rejected"
+        );
+        // A relay URL at exactly the cap is accepted.
+        let max_relay = "h".repeat(MAX_TUNNEL_RELAY_URL_LEN);
+        assert!(
+            peer_handshake_contact(node, Some(max_relay), dsa, kem).is_some(),
+            "a relay URL at exactly the cap must be accepted"
+        );
     }
 }

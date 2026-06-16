@@ -304,6 +304,200 @@ pub async fn run_dm_inbox_ingest_sweeper(
     // recv() == None: every nudge sender dropped (engine shutdown).
 }
 
+/// ZEB-473 (DM-over-iroh, Move 1a) Task 9: ingest ONE inbound DM packet
+/// delivered live over the PQ tunnel, through the SAME verify → decrypt →
+/// `apply_inbox` → `dm-received` sequence a deposit-delivered DM takes.
+///
+/// The tunnel carries only the sealed+signed CidNotify packet (NOT the
+/// storage blob), exactly like the legacy direct receive path: the blob is
+/// fetched from CAS by `signed.message_cid`. This is the load-bearing
+/// difference from the butler/deposit ingest ([`ingest_pending`]), whose
+/// blob is carried inline in the dm-inbox doc entry. The two paths therefore
+/// share the *free* receive-path helpers (`verify_cidnotify_admission`,
+/// `decrypt_and_bind_dm_blob`, `apply_inbox`, `dm_received_event_payload`)
+/// but not a single ingest body — see the Task 9 plan note. Keeping this in
+/// terms of those shared helpers is what keeps the trust path identical and
+/// non-drifting across the two carriers.
+///
+/// Pipeline (mirrors `DmOutbox::handle_cidnotify_lifted`, minus the
+/// device-cache refresh + ack fan-out, which the tunnel carrier does not
+/// owe — the cache is populated on the friend handshake, Task 5, and the
+/// read-ack was removed with Reticulum):
+///   1. `dm_envelope::decode_packet` → must be `DmPacket::CidNotify`;
+///   2. under the owner-state lock: `verify_cidnotify_admission` (pubkey
+///      lookup, signature, owner resolution + match, Space lookup, ZEB-275
+///      SpaceKind gate, membership);
+///   3. CAS fetch the storage blob by `signed.message_cid` (500ms timeout,
+///      matching the direct path's Phase B);
+///   4. `decrypt_and_bind_dm_blob` (AAD, content_key + prior-keys fallback,
+///      sender-impersonation defense);
+///   5. `apply_inbox` (idempotent on `(space_id, message_cid)` — the tunnel
+///      copy dedups against any deposit copy of the same DM);
+///   6. emit `dm-received` (the shared event name + payload builder) ONLY on
+///      `ApplyOutcome::Inserted`, exactly the direct path's atomic-emit gate.
+///
+/// Returns `Ok(true)` when a NEW message was applied + emitted, `Ok(false)`
+/// when the DM deduped (already in the inbox — direct/deposit arrival or a
+/// duplicate tunnel frame; consumed without re-emitting), and `Err(reason)`
+/// for any rejection (bad packet, unknown/forged sender, non-member, CAS
+/// miss, decrypt failure). The caller (the tunnel drain) logs `Err` at warn
+/// and drops the packet — a bad tunnel DM must never crash the drain, and
+/// the deposit rung is the durability backstop for anything that should have
+/// arrived.
+pub(crate) async fn ingest_dm_packet(
+    crdt_state: &Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
+    content_store: &Arc<dyn crate::content_store::ContentStore>,
+    sink: &Arc<dyn crate::node_event_sink::NodeEventSink>,
+    device_id: &str,
+    packet_bytes: &[u8],
+) -> Result<bool, String> {
+    // 1. Decode — the tunnel only ever carries CidNotify DM packets.
+    let packet = crate::dm_envelope::decode_packet(packet_bytes)
+        .map_err(|e| format!("decode_packet: {e}"))?;
+    let crate::dm_envelope::DmPacket::CidNotify {
+        signed,
+        signature,
+        signed_bytes,
+    } = packet
+    else {
+        return Err("tunnel DM packet is not a CidNotify".into());
+    };
+
+    // 2. Admission under the owner-state lock — the SAME verification a
+    //    direct/deposit arrival runs. We only carry `resolved_owner` past the
+    //    lock: the Space snapshot here is intentionally DROPPED rather than
+    //    reused, because the slow CAS fetch below opens a TOCTOU window. The
+    //    fresh Space (and its current content_key) is re-fetched + re-validated
+    //    under a second lock in step 4 (Phase C), mirroring the direct path.
+    let resolved_owner = {
+        let state = crdt_state.lock().await;
+        let (_space, resolved_owner, _identity_pub) = crate::dm_outbox::verify_cidnotify_admission(
+            &state,
+            &signed,
+            &signature,
+            &signed_bytes,
+        )
+        .map_err(|e| format!("verify_cidnotify_admission: {e:?}"))?;
+        resolved_owner
+    };
+
+    // 3. CAS fetch the storage blob by the packet's message_cid (the tunnel
+    //    carries only the packet; the blob must already be locally available
+    //    via the SAME CAS the deposit/community-relay path populates). 500ms
+    //    timeout, matching the direct path's Phase B.
+    let blob = match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        content_store.get(&signed.message_cid),
+    )
+    .await
+    {
+        Ok(Ok(Some(bytes))) => bytes,
+        Ok(Ok(None)) => return Err("CAS fetch: blob not found for message_cid".into()),
+        Ok(Err(e)) => return Err(format!("CAS fetch: {e:?}")),
+        Err(_) => return Err("CAS fetch: 500ms timeout".into()),
+    };
+
+    // 3b. Blob ↔ packet binding: the fetched storage blob MUST hash to the
+    //     packet's signed `message_cid` under the DM send path's flags. The CAS
+    //     `get` is keyed by `message_cid`, but a poisoned local CAS (or a
+    //     backend returning mismatched bytes) could hand back a blob whose CID
+    //     differs from the signed one — then the inbox entry would be keyed by
+    //     the signed CID while the emitted/decrypted body came from a different
+    //     blob. Recompute + compare BEFORE decrypt. Mirrors the deposited-ingest
+    //     verifier's binding check (CR3, ZEB-473).
+    let computed_cid = harmony_content::cid::ContentId::for_book(
+        &blob,
+        harmony_content::cid::ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("CAS fetch: for_book: {e:?}"))?;
+    if computed_cid != signed.message_cid {
+        return Err("CAS fetch: blob CID does not match message_cid".into());
+    }
+
+    // 4. Re-lock + TOCTOU re-check + decrypt + apply — the direct path's
+    //    Phase C (`handle_cidnotify_lifted`), held under ONE lock acquisition.
+    //    The `space` snapshot taken in step 2 is now stale: during the slow CAS
+    //    fetch the Space could have been deleted, the sender could have lost
+    //    membership (a GroupDm kick), or the `content_key` could have rotated.
+    //    Re-fetch the Space from `OwnerState.spaces` by id and re-verify the
+    //    SpaceKind gate + membership before decrypting — otherwise a tunnel DM
+    //    from a now-revoked member (or against a deleted/rotated Space) could
+    //    still be decrypted + applied, diverging from the direct path's trust.
+    //    On a failed re-check we reject (Err → drain logs + drops): the deposit
+    //    rung is the durability backstop for anything that should have arrived.
+    //    `received_at` is this device's wall clock (the tunnel has no deposit
+    //    timestamp); `from` is the resolved sender owner.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let inbox_entry = InboxEntry {
+        space_id: signed.space_id,
+        message_cid: signed.message_cid,
+        from: resolved_owner,
+        received_at: Hlc {
+            wall_ms: now_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        },
+    };
+    let (payload, newly_inserted) = {
+        let mut state = crdt_state.lock().await;
+
+        // TOCTOU re-check: re-fetch the Space (it may have been deleted), then
+        // re-verify the SpaceKind gate + membership against the FRESH state —
+        // mirroring `handle_cidnotify_lifted` Phase C.
+        let space_c = state
+            .spaces
+            .get(&signed.space_id)
+            .cloned()
+            .ok_or_else(|| "TOCTOU re-check: Space deleted during CAS fetch".to_string())?;
+        if !matches!(
+            space_c.kind,
+            crate::owner_state_types::SpaceKind::Dm | crate::owner_state_types::SpaceKind::GroupDm
+        ) {
+            return Err("TOCTOU re-check: Space kind no longer DM/GroupDm".into());
+        }
+        if !space_c.members.contains(&resolved_owner) {
+            return Err("TOCTOU re-check: sender lost membership during CAS fetch".into());
+        }
+
+        // Decrypt with the FRESH space (+ its current content_key / prior keys),
+        // so a rotation that landed during the CAS fetch is reflected here.
+        let payload = crate::dm_outbox::decrypt_and_bind_dm_blob(&space_c, &blob, resolved_owner)
+            .map_err(|e| format!("decrypt_and_bind_dm_blob: {e:?}"))?;
+
+        let newly_inserted = match state.apply_inbox(inbox_entry.clone()) {
+            crate::owner_state_crdt::ApplyOutcome::Inserted => true,
+            crate::owner_state_crdt::ApplyOutcome::Merged { .. } => false,
+            crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+                return Err(format!("apply_inbox rejected: {reason:?}"));
+            }
+        };
+        (payload, newly_inserted)
+    };
+
+    // 6. Emit the SAME dm-received event the direct/deposit paths emit, gated
+    //    on Inserted so a deduped tunnel copy never re-emits.
+    if newly_inserted {
+        let rm = ReceivedMessage {
+            inbox_entry,
+            body: payload.body,
+            mime_type: payload.mime_type,
+            sent_at: payload.sent_at,
+        };
+        crate::node_event_sink::emit_ser(
+            sink.as_ref(),
+            crate::dm_outbox::DM_RECEIVED_EVENT,
+            &crate::dm_outbox::dm_received_event_payload(&rm),
+        );
+    }
+    Ok(newly_inserted)
+}
+
 /// Production [`DmInboxIngestCtx`] over real `start_node` handles (ZEB-418
 /// P1 Task 7). Each method implements its trait doc's production contract
 /// verbatim:
@@ -976,5 +1170,418 @@ mod tests {
             applied_before,
             "no duplicate ingestion/emit for a resurrected entry"
         );
+    }
+
+    // ── ZEB-473 Task 9: inbound tunnel DM ingest (`ingest_dm_packet`) ─────────
+
+    use super::test_fixture::build_dm_ingest_fixture;
+
+    /// `ingest_dm_packet` over a known-good real packet runs the full
+    /// verify→decrypt→apply_inbox→emit pipeline: the inbox gets the entry and
+    /// the SAME `dm-received` event the deposit/direct paths emit fires once.
+    #[tokio::test]
+    async fn ingest_dm_packet_applies_inbox_and_emits_dm_received() {
+        let fx = build_dm_ingest_fixture(b"hello over the tunnel").await;
+
+        let emitted = ingest_dm_packet(
+            &fx.crdt_state,
+            &fx.content_store,
+            &fx.sink,
+            &fx.bob_device_id,
+            &fx.packet,
+        )
+        .await
+        .expect("known-good packet must ingest");
+        assert!(emitted, "a newly-applied DM emits dm-received");
+
+        // Inbox CRDT carries the entry, keyed by InboxKey(space_id,
+        // message_cid), from Alice.
+        let key = crate::owner_state_types::InboxKey {
+            space_id: fx.space_id,
+            message_cid: fx.message_cid,
+        };
+        let state = fx.crdt_state.lock().await;
+        let entry = state
+            .inbox
+            .get(&key)
+            .expect("inbox must contain the ingested DM");
+        assert_eq!(entry.from, fx.alice);
+        drop(state);
+
+        // The shared dm-received event fired exactly once with the decrypted body.
+        let frames = fx.sink_handle.frames();
+        let dm_frames: Vec<_> = frames
+            .iter()
+            .filter(|(name, _)| name == crate::dm_outbox::DM_RECEIVED_EVENT)
+            .collect();
+        assert_eq!(dm_frames.len(), 1, "exactly one dm-received");
+        assert_eq!(
+            dm_frames[0].1["body"],
+            serde_json::Value::String(hex::encode(b"hello over the tunnel")),
+            "payload carries the decrypted body (hex)"
+        );
+
+        // Idempotency: a duplicate tunnel frame (same CID) dedups — Ok(false),
+        // no second emit.
+        let again = ingest_dm_packet(
+            &fx.crdt_state,
+            &fx.content_store,
+            &fx.sink,
+            &fx.bob_device_id,
+            &fx.packet,
+        )
+        .await
+        .expect("duplicate packet is not an error");
+        assert!(!again, "a duplicate DM dedups (no re-emit)");
+        assert_eq!(
+            fx.sink_handle
+                .frames()
+                .iter()
+                .filter(|(n, _)| n == crate::dm_outbox::DM_RECEIVED_EVENT)
+                .count(),
+            1,
+            "duplicate must not re-emit dm-received"
+        );
+    }
+
+    /// A bad packet (corrupted bytes / unknown sender) is rejected as `Err`
+    /// with NO inbox mutation and NO emit — the drain logs+drops it.
+    #[tokio::test]
+    async fn ingest_dm_packet_rejects_bad_packet_without_side_effects() {
+        let fx = build_dm_ingest_fixture(b"hi").await;
+
+        // Flip a byte inside the signed body so the signature no longer verifies
+        // (still a structurally-decodable CidNotify, so it reaches the admission
+        // signature check and fails there).
+        let mut tampered = fx.packet.clone();
+        let mid = tampered.len() / 2;
+        tampered[mid] ^= 0xFF;
+
+        let err = ingest_dm_packet(
+            &fx.crdt_state,
+            &fx.content_store,
+            &fx.sink,
+            &fx.bob_device_id,
+            &tampered,
+        )
+        .await
+        .expect_err("a tampered packet must be rejected");
+        assert!(!err.is_empty());
+
+        assert!(
+            fx.crdt_state.lock().await.inbox.is_empty(),
+            "a rejected packet must not touch the inbox"
+        );
+        assert!(
+            fx.sink_handle.frames().is_empty(),
+            "a rejected packet must not emit"
+        );
+    }
+
+    /// CodeAnt F1 (TOCTOU): admission is checked under the lock, the lock is
+    /// dropped for the slow CAS fetch, and the Space/membership are then
+    /// re-checked under a SECOND lock before decrypt + apply. If the sender
+    /// loses membership DURING the fetch window, the Phase-C re-check must
+    /// REJECT the DM — exactly like the direct path's `handle_cidnotify_lifted`.
+    ///
+    /// This test lands the revocation precisely in the TOCTOU window: a
+    /// content-store wrapper revokes Alice's membership as a side-effect of the
+    /// CAS `get()` (i.e. after admission passed, before the re-check runs). The
+    /// blob is still returned, so the ONLY thing that can stop the apply is the
+    /// Phase-C re-check — proving it exists and fires (not admission).
+    #[tokio::test]
+    async fn ingest_dm_packet_rejects_when_sender_loses_membership_mid_fetch() {
+        use crate::content_store::{ContentStore, ContentStoreError, InMemoryStub};
+        use harmony_content::cid::ContentId as Cid;
+        use std::sync::Arc as StdArc;
+
+        /// Returns the blob normally, but as a side-effect (simulating the kick
+        /// racing in during the slow fetch) removes Alice from the Space's
+        /// members. The mutation lands strictly between admission and the
+        /// Phase-C re-check.
+        struct RevokeOnGetStore {
+            inner: InMemoryStub,
+            crdt_state: StdArc<Mutex<crate::owner_state_crdt::OwnerState>>,
+            space_id: SpaceId,
+            victim: OwnerAddr,
+        }
+        #[async_trait]
+        impl ContentStore for RevokeOnGetStore {
+            async fn put(&self, cid: Cid, blob: Vec<u8>) -> Result<(), ContentStoreError> {
+                self.inner.put(cid, blob).await
+            }
+            async fn get(&self, cid: &Cid) -> Result<Option<Vec<u8>>, ContentStoreError> {
+                // Revoke membership in the fetch window (the TOCTOU race).
+                {
+                    let mut state = self.crdt_state.lock().await;
+                    if let Some(space) = state.spaces.get_mut(&self.space_id) {
+                        space.members.retain(|m| *m != self.victim);
+                    }
+                }
+                self.inner.get(cid).await
+            }
+        }
+
+        let fx = build_dm_ingest_fixture(b"revoked mid-fetch").await;
+        // Re-stage the blob into the racing store (admission needs the Space
+        // still intact at admission time, which the fixture provides).
+        let inner = InMemoryStub::default();
+        inner
+            .put(
+                fx.message_cid,
+                fx.content_store
+                    .get(&fx.message_cid)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let racing_store: StdArc<dyn ContentStore> = StdArc::new(RevokeOnGetStore {
+            inner,
+            crdt_state: fx.crdt_state.clone(),
+            space_id: fx.space_id,
+            victim: fx.alice,
+        });
+
+        let err = ingest_dm_packet(
+            &fx.crdt_state,
+            &racing_store,
+            &fx.sink,
+            &fx.bob_device_id,
+            &fx.packet,
+        )
+        .await
+        .expect_err("a sender kicked mid-fetch must be rejected by the Phase-C re-check");
+        assert!(
+            err.contains("membership"),
+            "rejection must come from the Phase-C membership re-check (got: {err})"
+        );
+
+        assert!(
+            fx.crdt_state.lock().await.inbox.is_empty(),
+            "a re-check-rejected DM must not touch the inbox"
+        );
+        assert!(
+            fx.sink_handle.frames().is_empty(),
+            "a re-check-rejected DM must not emit dm-received"
+        );
+    }
+
+    /// CR3 (ZEB-473): a content store that returns bytes whose CID does NOT
+    /// match the signed `message_cid` must cause ingest to Err with a
+    /// "CID does not match" message, with NO inbox mutation and NO emit — the
+    /// blob↔packet binding check rejects a poisoned/mismatched CAS blob before
+    /// it can be keyed under the signed CID and decrypted.
+    #[tokio::test]
+    async fn ingest_dm_packet_rejects_blob_whose_cid_mismatches_signed_cid() {
+        use crate::content_store::{ContentStore, ContentStoreError, InMemoryStub};
+        use harmony_content::cid::ContentId as Cid;
+        use std::sync::Arc as StdArc;
+
+        /// Returns DIFFERENT bytes than were stored under `message_cid`,
+        /// simulating a poisoned local CAS (or a backend serving the wrong
+        /// blob). The returned bytes hash to a different CID.
+        struct MismatchOnGetStore {
+            inner: InMemoryStub,
+        }
+        #[async_trait]
+        impl ContentStore for MismatchOnGetStore {
+            async fn put(&self, cid: Cid, blob: Vec<u8>) -> Result<(), ContentStoreError> {
+                self.inner.put(cid, blob).await
+            }
+            async fn get(&self, _cid: &Cid) -> Result<Option<Vec<u8>>, ContentStoreError> {
+                // Hand back bytes that do NOT hash to the requested CID.
+                Ok(Some(
+                    b"poisoned bytes that do not hash to message_cid".to_vec(),
+                ))
+            }
+        }
+
+        let fx = build_dm_ingest_fixture(b"original body").await;
+        let poisoned_store: StdArc<dyn ContentStore> = StdArc::new(MismatchOnGetStore {
+            inner: InMemoryStub::default(),
+        });
+
+        let err = ingest_dm_packet(
+            &fx.crdt_state,
+            &poisoned_store,
+            &fx.sink,
+            &fx.bob_device_id,
+            &fx.packet,
+        )
+        .await
+        .expect_err("a CAS blob whose CID != signed message_cid must be rejected");
+        assert!(
+            err.contains("CID does not match"),
+            "rejection must come from the blob↔CID binding check (got: {err})"
+        );
+
+        assert!(
+            fx.crdt_state.lock().await.inbox.is_empty(),
+            "a CID-mismatch-rejected DM must not touch the inbox"
+        );
+        assert!(
+            fx.sink_handle.frames().is_empty(),
+            "a CID-mismatch-rejected DM must not emit dm-received"
+        );
+    }
+
+    // The end-to-end tunnel→drain→ingest assertion lives in `tunnel_task`'s
+    // test module (`tunnel_delivered_dm_ingests_end_to_end`), which already owns
+    // the loopback iroh handshake harness; it reuses `build_dm_ingest_fixture`
+    // via the `pub(crate)` re-export below so the receive-side fixture is not
+    // duplicated.
+}
+
+/// ZEB-473 Task 9: receive-side test fixture for the inbound-tunnel-DM ingest,
+/// reused by the end-to-end loopback test in `tunnel_task`'s test module.
+/// `pub(crate)` + `cfg(test)` so it crosses the module boundary without leaking
+/// into production builds.
+#[cfg(test)]
+pub(crate) mod test_fixture {
+    use super::*;
+    use crate::content_store::{ContentStore, InMemoryStub};
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{DmContentKey, Space, SpaceKind};
+    use std::sync::Arc as StdArc;
+
+    /// The receive-side handles `ingest_dm_packet` consumes plus the real signed
+    /// packet a sender (Alice) carries over the tunnel.
+    pub(crate) struct DmIngestFixture {
+        pub crdt_state: StdArc<Mutex<OwnerState>>,
+        pub content_store: StdArc<dyn ContentStore>,
+        pub sink_handle: StdArc<crate::node_event_sink::RecordingSink>,
+        pub sink: StdArc<dyn crate::node_event_sink::NodeEventSink>,
+        pub bob_device_id: String,
+        pub packet: Vec<u8>,
+        pub space_id: SpaceId,
+        pub message_cid: ContentId,
+        pub alice: OwnerAddr,
+    }
+
+    /// Bob (self) shares a DM Space with Alice, has Alice's signing device
+    /// cached, and the encrypted DM blob is CAS-put. Mirrors `dm_outbox`'s
+    /// `build_cidnotify_fixture` (kept local because that one is private to
+    /// `dm_outbox`).
+    pub(crate) async fn build_dm_ingest_fixture(body: &[u8]) -> DmIngestFixture {
+        let alice = OwnerAddr([0xA1; 16]);
+        let bob = OwnerAddr([0xB0; 16]);
+        let space_id = SpaceId([0x5A; 16]);
+        let content_key = DmContentKey::new([0x42u8; 32]);
+
+        let mut state = OwnerState::default();
+
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let alice_pub_id = private_alice.public_identity();
+        let alice_identity_pub = alice_pub_id.to_public_bytes();
+        let alice_device_hash =
+            crate::owner_state_types::DeviceIdentityHash(alice_pub_id.address_hash);
+        state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![Some(alice_identity_pub)],
+            vec![],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        );
+
+        let mut members = [alice, bob];
+        members.sort();
+        let space = Space {
+            id: space_id,
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Alice".into(),
+            transport: None,
+            members: members.to_vec(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            content_key: Some(content_key.clone()),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+        assert!(matches!(
+            state.apply_space_with_canonicalization(space.clone()),
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+        ));
+
+        let payload = crate::dm_envelope::MessagePayload {
+            body: body.to_vec(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let aad = crate::dm_crypto::compute_aad(&space).unwrap();
+        let blob = crate::dm_crypto::encrypt_dm_message(&content_key, &aad, &payload).unwrap();
+        let message_cid = harmony_content::cid::ContentId::for_book(
+            &blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cas = InMemoryStub::default();
+        cas.put(message_cid, blob).await.unwrap();
+
+        // Sign with Alice's identity (the SAME Ed25519 key whose pubkey is the
+        // second half of the cached `identity_pub`), then frame to wire bytes.
+        let signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+        let dm_packet = crate::dm_envelope::DmPacket::CidNotify {
+            signed,
+            signature,
+            signed_bytes,
+        };
+        let packet = crate::dm_envelope::encode_packet(&dm_packet).unwrap();
+
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: StdArc<dyn crate::node_event_sink::NodeEventSink> =
+            StdArc::new(StdArc::clone(&sink_handle));
+
+        DmIngestFixture {
+            crdt_state: StdArc::new(Mutex::new(state)),
+            content_store: StdArc::new(cas),
+            sink_handle,
+            sink,
+            bob_device_id: "bob-device-64hex".into(),
+            packet,
+            space_id,
+            message_cid,
+            alice,
+        }
     }
 }

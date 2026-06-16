@@ -179,6 +179,8 @@ pub mod iroh_endpoint;
 pub mod iroh_friend_acceptor;
 pub mod iroh_invite_acceptor;
 pub mod iroh_pex_acceptor;
+pub mod iroh_tunnel_acceptor;
+pub mod iroh_tunnel_dm_transport;
 pub mod library_directory;
 pub mod mail;
 pub mod mail_sync;
@@ -227,6 +229,11 @@ pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
 pub mod state_snapshot;
+// ZEB-473 (DM-over-iroh, Move 1a): the per-peer PQ tunnel session map
+// (TunnelManager) + per-connection async driver (tunnel_task: responder
+// acceptor + initiator dialer over the persistent iroh endpoint).
+pub mod tunnel_manager;
+pub mod tunnel_task;
 pub mod vine_feed_cache;
 pub mod voice;
 pub mod voice_crypto;
@@ -738,12 +745,6 @@ pub struct NodeState {
     /// `send_dm` calls early-reject. Cleared (None'd) in symmetry
     /// with `dm_send_inflight`.
     dm_send_stopping: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// ZEB-227 Path B: outbound DM unicast channel sender.
-    /// `RuntimeUnicastTransport` (Task 6) holds a clone; `event_loop` drains
-    /// the receiver and forwards each `UnicastSendRequest` as
-    /// `RuntimeEvent::SendUnicastToDevice`. Cleared on stop_node so a
-    /// restart's transport doesn't carry a stale sender.
-    unicast_send_tx: Option<tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
     /// ZEB-228 Phase 4: 64-byte combined `identity_pub` for our local
     /// device (X25519_pub(32) || Ed25519_pub(32) per
     /// `harmony_identity::Identity::to_public_bytes()`). Captured in
@@ -759,6 +760,24 @@ pub struct NodeState {
     /// cleared on stop_node to mirror its lifecycle. Unsigned routing hints.
     dm_local_dsa_pubkey: Option<Vec<u8>>,
     dm_local_kem_pubkey: Option<Vec<u8>>,
+    /// ZEB-473 (Move 1a): this node's own PQ *private* identity (ML-DSA-65
+    /// signing + ML-KEM-768 decapsulation secret keys), retained past boot so
+    /// the upcoming tunnel acceptor / dialer can pass it as the self-input to
+    /// `TunnelSession::new_responder` / `new_initiator`. Captured in
+    /// `start_node` from `identity::load_or_generate` (the same `pq` whose
+    /// public half backs `dm_local_dsa_pubkey` / `dm_local_kem_pubkey` above)
+    /// and `Arc`-wrapped so it can be shared across tokio tasks without
+    /// re-reading the on-disk identity. Cleared on stop_node to mirror the
+    /// public stashes' lifecycle, so a stale identity's secret keys never
+    /// outlive an identity switch. No live consumer yet (Task 2 retains only).
+    dm_pq_identity: Option<std::sync::Arc<harmony_identity::PqPrivateIdentity>>,
+    /// ZEB-473 (DM-over-iroh, Move 1a): the per-peer PQ tunnel session map.
+    /// Built at boot (when the iroh endpoint bound + the PQ identity is in hand)
+    /// and shared here so the Task 8 `IrohTunnelDmTransport` can route outbound
+    /// DMs through it (`tunnel_manager.send_dm(...)`). `None` when iroh bind
+    /// failed (no tunnel transport — DMs stay deposit-only). Cleared on stop_node
+    /// so a stale identity's live tunnels never outlive an identity switch.
+    tunnel_manager: Option<std::sync::Arc<crate::tunnel_manager::TunnelManager>>,
     /// ZEB-217 Sub-C Phase 3 Task 9: sender used by IPC handlers
     /// (`create_community`, `redeem_invite`) to dispatch a
     /// `CommunityAdapterRequest` into the event loop, where it's
@@ -1416,10 +1435,11 @@ impl Default for NodeState {
             content_store: None,
             dm_send_inflight: None,
             dm_send_stopping: None,
-            unicast_send_tx: None,
             dm_identity_pub_64: None,
             dm_local_dsa_pubkey: None,
             dm_local_kem_pubkey: None,
+            dm_pq_identity: None,
+            tunnel_manager: None,
             community_adapter_request_tx: None,
             // ZEB-434 D6: stays None until start_node wires the
             // transport-epoch watch.
@@ -1812,7 +1832,6 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         dm_device_id,
         dm_self_owner,
         content_store,
-        unicast_send_tx,
         dm_send_inflight,
         dm_send_stopping,
     ) = {
@@ -1855,7 +1874,6 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
             guard.dm_device_id.take(),
             guard.dm_self_owner.take(),
             guard.content_store.take(),
-            guard.unicast_send_tx.take(),
             // ZEB-234: take fence handles so we can set the stopping flag
             // and drain in-flight send_dm calls outside the lock scope.
             guard.dm_send_inflight.take(),
@@ -1870,6 +1888,14 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // stale identity's keys never leak into a new identity's handshakes.
         let _ = guard.dm_local_dsa_pubkey.take();
         let _ = guard.dm_local_kem_pubkey.take();
+        // ZEB-473 (Move 1a) Task 2: drop our retained PQ private identity so a
+        // stale identity's secret keys never outlive an identity switch
+        // (zeroized on the Arc's final drop). Mirrors the public stashes.
+        let _ = guard.dm_pq_identity.take();
+        // ZEB-473 (Move 1a): drop the tunnel session map so a stale identity's
+        // live tunnels (and their cmd channels) are torn down on stop; a new
+        // identity rebuilds a fresh manager at boot.
+        let _ = guard.tunnel_manager.take();
         // ZEB-371: drop the owner KeyTree so a restart (or identity switch)
         // re-derives a fresh one from the new master seed rather than sealing
         // friend secrets under the prior identity's keys.
@@ -2130,11 +2156,6 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // either way; the explicit binding is just for documentation).
     let _ = dm_self_owner;
     drop(content_store);
-    // ZEB-227 Path B: drop the outbound unicast sender so any clone held
-    // by the now-shutting-down RuntimeUnicastTransport (Task 11) sees its
-    // last reference reach the close threshold. The event_loop's receiver
-    // gets None on its next .recv() and the select arm de-registers.
-    drop(unicast_send_tx);
     // ZEB-270 Phase 3 Task 4C: shut down per-(community, channel) log
     // engines BEFORE the per-community state engines. The channel-log
     // engine's verify-on-receive path resolves identity + state-at-HLC
@@ -2647,22 +2668,13 @@ pub async fn start_node_inner(
     // GetOrFetch uses a second-mpsc-hop re-entry pattern that briefly
     // doubles the queue depth. See spec §"Risks: cas_op_tx capacity".
     let (cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel::<crate::content_store::CasOp>(8);
-    // ZEB-227 Path B: outbound DM unicast channel. Sized at 256 to absorb
-    // realistic group-DM fan-out spikes: a single send_dm to a group can
-    // emit up to 16 members × 4 devices = 64 UnicastSendRequests, and
-    // overlapping batches from concurrent send_dm + handle_cidnotify_lifted ack
-    // fan-out can stack on top. 256 is "doubled-and-then-some" of that
-    // single-send bound — production try_send call sites
-    // (RuntimeUnicastTransport::send + handle_cidnotify_lifted ack fan-out)
-    // surface Transient on full so back-pressure NEVER causes deadlock
-    // even if the cap is exceeded; the larger cap just keeps that
-    // recovery path off the hot path. Sender clone is lifted onto
-    // NodeState so Task 11 can reach it when instantiating
-    // RuntimeUnicastTransport; receiver is consumed by event_loop::run's
-    // new select! arm (forwards each request as
-    // RuntimeEvent::SendUnicastToDevice into NodeRuntime).
-    let (unicast_send_tx, unicast_send_rx) =
-        tokio::sync::mpsc::channel::<crate::dm_outbox::UnicastSendRequest>(256);
+    // ZEB-473 (Move 1a): the ZEB-227 Path B outbound DM unicast channel
+    // (`unicast_send_tx`/`unicast_send_rx`) was removed along with the
+    // dormant Reticulum carrier and the core's `SendUnicastToDevice` event
+    // (harmony#280). DMs now ride the live iroh PQ tunnel transport when iroh
+    // is bound (always-deposit + attempt-tunnel) and still deposit via butler +
+    // CRDT state-root sync for durability. The cross-owner INVITE carrier
+    // remains a later move in this epic.
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
@@ -2792,7 +2804,6 @@ pub async fn start_node_inner(
         old_dm_device_id,
         old_dm_self_owner,
         old_content_store,
-        old_unicast_send_tx,
     ) = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         // ZEB-234: take fence handles before releasing the lock so any
@@ -2832,9 +2843,6 @@ pub async fn start_node_inner(
             guard.dm_device_id.take(),
             guard.dm_self_owner.take(),
             guard.content_store.take(),
-            // ZEB-227 Path B: take + drop the previous identity's outbound
-            // unicast sender so the new generation gets a fresh channel.
-            guard.unicast_send_tx.take(),
         );
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
@@ -2848,6 +2856,12 @@ pub async fn start_node_inner(
         // ZEB-461: clear the local PQ pubkeys alongside the identity pub.
         let _ = guard.dm_local_dsa_pubkey.take();
         let _ = guard.dm_local_kem_pubkey.take();
+        // ZEB-473 (Move 1a) Task 2: drop our retained PQ private identity so a
+        // stale identity's secret keys never outlive an identity switch.
+        let _ = guard.dm_pq_identity.take();
+        // ZEB-473 (Move 1a): drop the tunnel session map so a stale identity's
+        // live tunnels are torn down on stop.
+        let _ = guard.tunnel_manager.take();
         // ZEB-217 Sub-C Phase 3 Task 9: clear the previous adapter-
         // request sender so it doesn't outlive the previous event
         // loop. The new event loop is constructed below with a fresh
@@ -2971,10 +2985,6 @@ pub async fn start_node_inner(
     // clippy::dropping_copy_types.
     let _ = old_dm_self_owner;
     drop(old_content_store);
-    // ZEB-227 Path B: drop the previous identity's outbound unicast sender
-    // so the new generation's RuntimeUnicastTransport (Task 11) sees no
-    // stale clones outside the new NodeState.
-    drop(old_unicast_send_tx);
     // ZEB-270 Phase 3 Task 4.5: explicitly await the previous channel-
     // log registry's shutdown BEFORE the per-community state engines
     // tear down. The channel-log engine's verify-on-receive path
@@ -3064,7 +3074,14 @@ pub async fn start_node_inner(
         // config and before `pq_pub` is dropped.
         let dm_local_dsa_pubkey_owned: Vec<u8> = local_dsa_pubkey.to_vec();
         let dm_local_kem_pubkey_owned: Vec<u8> = local_kem_pubkey.to_vec();
-        drop(pq);
+        // ZEB-473 (Move 1a) Task 2: retain the PQ *private* identity past boot
+        // instead of dropping it. The public stashes above are already captured
+        // from `pq.public_identity()`; now `Arc`-wrap the private identity so
+        // the upcoming tunnel acceptor / dialer (later ZEB-473 tasks) can use
+        // it as the self-input to `TunnelSession::new_responder` /
+        // `new_initiator`. Stashed on NodeState (`dm_pq_identity`) below,
+        // alongside the public pubkeys. No live consumer yet — retention only.
+        let pq_identity = std::sync::Arc::new(pq);
 
         // ZEB-228 Phase 4: capture our 64-byte combined identity_pub
         // (X25519_pub(32) || Ed25519_pub(32) per
@@ -3075,11 +3092,17 @@ pub async fn start_node_inner(
         // OwnerDeviceCache entry for us.
         let identity_pub_64: [u8; 64] = ed25519.public_identity().to_public_bytes();
 
-        let reticulum_identity_bytes = Some(zeroize::Zeroizing::new(ed25519.to_private_bytes()));
+        // ZEB-473 (Move 1a): `NodeConfig.reticulum_identity_bytes` was removed
+        // from the pinned core (harmony#280) along with the Reticulum unicast
+        // carrier. This local seed snapshot survives because it still backs two
+        // live consumers below: the receive-side counter-sign `PrivateIdentity`
+        // (built immediately, before `ed25519` is dropped) and the outbox
+        // signing seed (re-sourced from `private_identity_arc` further down).
+        let ed25519_private_bytes = zeroize::Zeroizing::new(ed25519.to_private_bytes());
         // ZEB-262 Phase 4 Task 2: snapshot a second `PrivateIdentity` instance
-        // BEFORE the local `ed25519` binding is dropped. The Reticulum/Ed25519
-        // identity is the same material we'll later use on the receive-side
-        // counter-sign path (`handle_invite` →
+        // BEFORE the local `ed25519` binding is dropped. The Ed25519 identity is
+        // the same material we'll later use on the receive-side counter-sign
+        // path (`handle_invite` →
         // `community_membership::attach_countersig_with_identity`); plumbing
         // it through `DmOutbox` lets the inbound CommunityInvite handler grab
         // a reference under the dm_outbox lock without re-reading the
@@ -3092,13 +3115,8 @@ pub async fn start_node_inner(
         // Ed25519 secret → same `Identity` (verified by
         // `dm_outbox_holds_private_identity_for_countersign`).
         let private_identity_arc = std::sync::Arc::new(
-            harmony_identity::PrivateIdentity::from_private_bytes(
-                reticulum_identity_bytes
-                    .as_ref()
-                    .expect("populated above")
-                    .as_slice(),
-            )
-            .expect("private bytes round-trip"),
+            harmony_identity::PrivateIdentity::from_private_bytes(ed25519_private_bytes.as_slice())
+                .expect("private bytes round-trip"),
         );
         drop(ed25519);
 
@@ -3554,6 +3572,14 @@ pub async fn start_node_inner(
         let mut iroh_link_mgr_for_handshake: Option<
             std::sync::Arc<crate::zenoh_iroh_transport::IrohZenohLinkManager>,
         > = None;
+        // ZEB-473 (DM-over-iroh, Move 1a): the per-peer PQ tunnel session map,
+        // constructed in the acceptor-install block below (once `pq_identity` +
+        // the iroh endpoint + link manager are available) and stored on
+        // NodeState so the Task 8 `DmTransport` can reach it. `None` when iroh
+        // bind failed (no tunnel transport) — exactly like the deposit rung.
+        let mut tunnel_manager_for_state: Option<
+            std::sync::Arc<crate::tunnel_manager::TunnelManager>,
+        > = None;
         // ZEB-321 Phase 1 PR #157 round 4 (Greptile P1): JoinHandle of
         // the iroh accept loop. Captured here (not dropped via
         // `inspect()` inside event_loop as before) so `clear_iroh_handles`
@@ -3793,17 +3819,19 @@ pub async fn start_node_inner(
                     // in dm_signing.rs).
                     // Wrap in Zeroizing — the signing seed must be scrubbed
                     // when this scope ends, mirroring how
-                    // reticulum_identity_bytes is held above (line 772).
+                    // `ed25519_private_bytes` is held above.
                     // Without this the 32-byte stack copy would persist in
                     // freed stack memory until overwritten.
+                    //
+                    // ZEB-473 (Move 1a): re-sourced from the local
+                    // `ed25519_private_bytes` snapshot (was the removed
+                    // `NodeConfig.reticulum_identity_bytes` field). Bit-identical
+                    // material — the snapshot is `ed25519.to_private_bytes()`,
+                    // captured before `ed25519` was dropped — so the outbox
+                    // signing key is unchanged.
                     let ed25519_seed = zeroize::Zeroizing::new(
-                        <[u8; 32]>::try_from(
-                            &reticulum_identity_bytes
-                                .as_ref()
-                                .expect("reticulum_identity_bytes populated above")
-                                [32..64],
-                        )
-                        .expect("64 - 32 == 32"),
+                        <[u8; 32]>::try_from(&ed25519_private_bytes[32..64])
+                            .expect("64 - 32 == 32"),
                     );
                     let signing_key_arc =
                         std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed25519_seed));
@@ -3820,13 +3848,17 @@ pub async fn start_node_inner(
                             own_enrollment_cert,
                         ),
                     ));
-                    // ZEB-474 (Move 2): the Reticulum unicast carrier is
-                    // removed. DM delivery is deposit-only in the interim —
-                    // DepositOnlyDmTransport::send signals Transient, which
-                    // steers every DM into the outbox's butler/community-relay
-                    // deposit rung (carried to the recipient over iroh).
-                    // Move 1a (ZEB-473) swaps in IrohTunnelDmTransport here.
-                    let transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
+                    // ZEB-474 (Move 2) → ZEB-473 (Move 1a): the deposit-only
+                    // interim default. `DepositOnlyDmTransport::send` signals
+                    // Transient, steering every DM into the outbox's
+                    // butler/community-relay deposit rung. This is REPLACED
+                    // below (just before the NodeState lift-out, once the
+                    // `TunnelManager` exists) with `IrohTunnelDmTransport` when
+                    // the iroh endpoint bound — but kept as the fallback when
+                    // there is no tunnel transport this session, in which case
+                    // DMs remain deposit-only exactly as before. Both return
+                    // Transient → the always-deposit invariant holds either way.
+                    let mut transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
                         std::sync::Arc::new(crate::dm_outbox::DepositOnlyDmTransport);
 
                     let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
@@ -6891,6 +6923,104 @@ pub async fn start_node_inner(
                             );
                         }
 
+                        // ── ZEB-473 (DM-over-iroh, Move 1a) Task 6/7: build the
+                        //    per-peer PQ tunnel session map (TunnelManager),
+                        //    spawn the placeholder inbound-DM drain (Task 9
+                        //    replaces it with the real verify/decrypt/ingest),
+                        //    and late-install the tunnel acceptor on the iroh
+                        //    link manager (same late-install seam as the butler
+                        //    acceptor; the accept loop closes pre-install
+                        //    `harmony/tunnel/v1` connections gracefully until
+                        //    this set lands). Gated on a bound iroh endpoint —
+                        //    without it there is no tunnel transport (and DMs
+                        //    stay deposit-only, exactly the butler rung's gate).
+                        if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
+                            // The ingest seam (ZEB-473 Task 9): the tunnel loops
+                            // push each received DM payload onto
+                            // `tunnel_ingest_tx`; the drain below runs each one
+                            // through the REAL verify/decrypt/apply/emit pipeline
+                            // (`ingest_dm_packet`) — the SAME receive-path helpers
+                            // a deposit-delivered DM uses, so a tunnel copy and a
+                            // deposit copy of the same DM dedup in the inbox CRDT
+                            // and deliver one `dm-received` to the UI. A bad packet
+                            // (verify/decrypt failure, unknown sender, non-member,
+                            // CAS miss) is logged at warn and dropped — it must
+                            // never crash the drain (the deposit rung is the
+                            // durability backstop).
+                            let (tunnel_ingest_tx, mut tunnel_ingest_rx) =
+                                tokio::sync::mpsc::channel::<crate::tunnel_manager::InboundDm>(256);
+                            let drain_crdt_state = std::sync::Arc::clone(&crdt_state);
+                            let drain_content_store = std::sync::Arc::clone(&content_store);
+                            let drain_sink = app.clone();
+                            let drain_device_id = device_id.clone();
+                            tokio::spawn(async move {
+                                while let Some(dm) = tunnel_ingest_rx.recv().await {
+                                    match crate::dm_inbox_ingest::ingest_dm_packet(
+                                        &drain_crdt_state,
+                                        &drain_content_store,
+                                        &drain_sink,
+                                        &drain_device_id,
+                                        &dm.payload,
+                                    )
+                                    .await
+                                    {
+                                        Ok(emitted) => tracing::debug!(
+                                            peer = %hex::encode(dm.peer_node_id),
+                                            emitted,
+                                            "ZEB-473: tunnel DM ingested"
+                                        ),
+                                        Err(reason) => tracing::warn!(
+                                            peer = %hex::encode(dm.peer_node_id),
+                                            payload_len = dm.payload.len(),
+                                            %reason,
+                                            "ZEB-473: tunnel DM rejected; dropping \
+                                             (deposit rung covers durability)"
+                                        ),
+                                    }
+                                }
+                            });
+
+                            let tunnel_manager =
+                                std::sync::Arc::new(crate::tunnel_manager::TunnelManager::new(
+                                    (**ep_arc).clone(),
+                                    std::sync::Arc::clone(&pq_identity),
+                                    tunnel_ingest_tx.clone(),
+                                ));
+                            let tunnel_acceptor: std::sync::Arc<
+                                dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
+                            > = std::sync::Arc::new(
+                                crate::iroh_tunnel_acceptor::IrohTunnelAcceptor::new(
+                                    std::sync::Arc::clone(&pq_identity),
+                                    std::sync::Arc::clone(&tunnel_manager),
+                                    tunnel_ingest_tx,
+                                ),
+                            );
+                            // CR7 (ZEB-473): only publish the manager onto
+                            // NodeState (which later swaps the DM outbox to
+                            // tunnel mode) when the acceptor actually installs.
+                            // If install fails (one is already present), the
+                            // prior acceptor stays wired to a DIFFERENT manager;
+                            // publishing THIS one would split the live acceptor
+                            // from the manager used for outbound sends. Honor the
+                            // fallback contract: stay on the deposit-only DM
+                            // transport.
+                            match link_mgr.install_tunnel_acceptor(tunnel_acceptor) {
+                                Ok(()) => {
+                                    // Share the manager onto NodeState so the
+                                    // Task 8 DmTransport can route outbound DMs
+                                    // through it (wired to the installed acceptor).
+                                    tunnel_manager_for_state = Some(tunnel_manager);
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "ZEB-473: tunnel acceptor already installed on iroh \
+                                         link manager — leaving tunnel transport disabled \
+                                         (deposit-only DM path retained)"
+                                    );
+                                }
+                            }
+                        }
+
                         // ZEB-418 SP2 P1 Task 8: build the production
                         // sender-side butler deposit client and inject it
                         // into the DmOutbox so the drain's deposit rung can
@@ -7413,6 +7543,30 @@ pub async fn start_node_inner(
                         );
                     }
 
+                    // ── ZEB-473 (DM-over-iroh, Move 1a) Task 8: swap the
+                    //    deposit-only default for the live PQ-tunnel carrier
+                    //    once the `TunnelManager` exists (it's built in the
+                    //    iroh-endpoint-gated acceptor-install block above). When
+                    //    the iroh endpoint did NOT bind this session,
+                    //    `tunnel_manager_for_state` is None and `transport`
+                    //    stays `DepositOnlyDmTransport` → DMs remain
+                    //    deposit-only, exactly the same gate the butler rung
+                    //    uses. Both transports return Transient, so the
+                    //    always-deposit invariant holds in either branch — the
+                    //    tunnel is purely a parallel liveness attempt layered on
+                    //    top of the unchanged deposit rung (spec §5.7).
+                    if let Some(tunnel_mgr) = tunnel_manager_for_state.as_ref() {
+                        transport = std::sync::Arc::new(
+                            crate::iroh_tunnel_dm_transport::IrohTunnelDmTransport::new(
+                                std::sync::Arc::clone(tunnel_mgr),
+                                std::sync::Arc::clone(&crdt_state),
+                                signing_key_arc.clone(),
+                                self_owner,
+                                our_signing_device_hash,
+                            ),
+                        );
+                    }
+
                     // Lift the per-identity handles out for NodeState
                     // assignment below.
                     device_id_for_state = Some(device_id);
@@ -7458,7 +7612,6 @@ pub async fn start_node_inner(
             local_pq_identity_hash,
             local_dsa_pubkey,
             local_kem_pubkey,
-            reticulum_identity_bytes,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -7726,41 +7879,20 @@ pub async fn start_node_inner(
                             .build()
                             .expect("failed to create tokio runtime for harmony-runtime");
                         rt.block_on(async move {
-                            let (mut runtime, startup_actions) =
+                            let (runtime, startup_actions) =
                                 NodeRuntime::new(config, MemoryBookStore::new());
 
-                            // ZEB-227 Path B: register our DM destination so inbound
-                            // packets to it surface as RuntimeAction::UnicastReceived.
-                            // Without this registration, every inbound DmInvite /
-                            // DmCidNotify / DmAck would drop in the runtime as
-                            // NoLocalDestination before reaching
-                            // dm_outbox::handle_unicast.
-                            //
-                            // Our DM destination hash is computed from our local
-                            // Reticulum identity hash via the same
-                            // SHA256(SHA256("harmony.dm")[:10] || identity)[:16]
-                            // scheme that DmOutbox::drain uses to resolve outbound
-                            // destinations from OwnerDeviceCache (so a peer's
-                            // outbound dest_hash for us == our registered
-                            // dest_hash for ourselves).
-                            //
-                            // Unconditional: every node has a Reticulum identity
-                            // (loaded above via identity::load_or_generate, before
-                            // owner-loading). DMs themselves only flow once the owner
-                            // identity is loaded (which gates DmOutbox /
-                            // RuntimeUnicastTransport construction above), but the
-                            // raw destination registration is harmless when no owner
-                            // is loaded — it just means inbound packets surface but
-                            // event_loop's UnicastReceived arm has no DmOutbox to
-                            // dispatch to (and logs the drop).
-                            let our_identity_hash = runtime.local_identity_hash();
-                            let our_dm_dest =
-                                crate::dm_signing::compute_dm_destination_hash(our_identity_hash);
-                            runtime.register_local_destination(our_dm_dest);
-                            tracing::info!(
-                                dm_dest = hex::encode(our_dm_dest),
-                                "registered DM destination for inbound DmInvite/DmCidNotify/DmAck"
-                            );
+                            // ZEB-473 (Move 1a): the ZEB-227 Path B DM-destination
+                            // registration (`register_local_destination`) was removed
+                            // along with the Reticulum unicast receive path in core
+                            // #280 — `NodeRuntime` no longer exposes that method, and
+                            // there is no `SendUnicastToDevice`/`UnicastReceived` flow
+                            // for it to feed. Inbound DMs now arrive over the live iroh
+                            // PQ tunnel (accepted by the tunnel acceptor + drained
+                            // through the real ingest pipeline above) AND via butler
+                            // deposit + CRDT state-root sync for durability. The
+                            // cross-owner INVITE carrier remains a later move in this
+                            // epic.
 
                             event_loop::run(
                                 runtime,
@@ -7792,7 +7924,6 @@ pub async fn start_node_inner(
                                 dm_outbox_for_loop,
                                 dm_transport_for_loop,
                                 crdt_state_for_loop,
-                                Some(unicast_send_rx),
                                 community_adapter_requests_for_loop,
                                 community_adapter_request_rx,
                                 voting_log_adapter_request_rx,
@@ -7889,12 +8020,6 @@ pub async fn start_node_inner(
                         guard.dm_send_stopping = Some(std::sync::Arc::new(
                             std::sync::atomic::AtomicBool::new(false),
                         ));
-                        // ZEB-227 Path B: store the outbound unicast sender so
-                        // Task 11's RuntimeUnicastTransport instantiation in
-                        // start_node can clone it. The receiver was moved into
-                        // event_loop above; the sender remains unused-by-production
-                        // until Task 11 wires it to the real transport.
-                        guard.unicast_send_tx = Some(unicast_send_tx.clone());
                         // ZEB-228 Phase 4: store our 64-byte combined identity_pub
                         // so add_space can ship it as the bootstrap pubkey on
                         // outbound DmInvite packets. Captured above before the
@@ -7906,6 +8031,18 @@ pub async fn start_node_inner(
                         // identity bytes were moved into the runtime config.
                         guard.dm_local_dsa_pubkey = Some(dm_local_dsa_pubkey_owned);
                         guard.dm_local_kem_pubkey = Some(dm_local_kem_pubkey_owned);
+                        // ZEB-473 (Move 1a) Task 2: stash our own PQ private
+                        // identity (Arc-wrapped above, sibling of the public
+                        // pubkeys) so later tunnel acceptor / dialer tasks can
+                        // grab it as the self-input without re-reading the
+                        // on-disk identity. Cleared on stop alongside the
+                        // public stashes.
+                        guard.dm_pq_identity = Some(pq_identity);
+                        // ZEB-473 (Move 1a): store the per-peer PQ tunnel session
+                        // map (built in the acceptor-install block above, or
+                        // `None` if iroh bind failed) so the Task 8 DmTransport
+                        // can route outbound DMs through it.
+                        guard.tunnel_manager = tunnel_manager_for_state;
                         // ZEB-217 Sub-C Phase 3 Task 9: store the adapter-
                         // request sender so create_community / Phase 4
                         // redeem_invite can dispatch on-demand
@@ -10386,7 +10523,6 @@ pub(crate) async fn add_space_impl(
         hlc_tracker,
         device_id,
         self_owner,
-        unicast_send_tx,
         identity_pub_64,
         snapshot_generation,
     ) = {
@@ -10399,7 +10535,6 @@ pub(crate) async fn add_space_impl(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.unicast_send_tx.clone().ok_or("unicast_send_tx missing")?,
             g.dm_identity_pub_64
                 .ok_or("dm_identity_pub_64 missing (start_node didn't capture it?)")?,
             g.generation,
@@ -10421,7 +10556,7 @@ pub(crate) async fn add_space_impl(
     // is the EXISTING (canonical winner) id — guaranteed live in
     // state.spaces — and `sends` is empty (the existing Space was
     // already invited at original creation).
-    let (space_id, sends, was_merge, new_hlc) = {
+    let (space_id, _was_merge, new_hlc) = {
         let outbox_g = dm_outbox.lock().await;
         let mut state_g = crdt_state.lock().await;
         let mut tracker_g = hlc_tracker.lock().await;
@@ -10430,7 +10565,12 @@ pub(crate) async fn add_space_impl(
         let signing_key = outbox_g.signing_key.as_ref();
         let our_signing_device_hash = outbox_g.our_signing_device_hash;
 
-        let (canonical_id, sends, was_merge) = add_space_dm_inner(
+        // ZEB-473 (Move 1a): `add_space_dm_inner` still builds the DmInvite
+        // `sends` Vec, but the Reticulum unicast carrier that consumed it has
+        // been removed (harmony#280). Discard it here; recipients receive the
+        // Space via CRDT state-root sync and the outbox loop's first send_dm.
+        // Re-wiring the invite fan-out onto the iroh tunnel is a later move.
+        let (canonical_id, _sends, was_merge) = add_space_dm_inner(
             &mut state_g,
             signing_key,
             &identity_pub_64,
@@ -10474,7 +10614,7 @@ pub(crate) async fn add_space_impl(
             tracker_g.insert(device_id.clone(), stamped.clone());
         }
 
-        (canonical_id, sends, was_merge, stamped)
+        (canonical_id, was_merge, stamped)
     };
     let _ = new_hlc; // borrowed only to pin the tracker update timing
 
@@ -10513,27 +10653,13 @@ pub(crate) async fn add_space_impl(
         }
     }
 
-    // Dispatch invites only when our minted Space actually became the
-    // live entry (or extended one with same id). When `was_merge==true`
-    // the existing Space's invites were already dispatched at original
-    // creation; firing them again here would just generate redundant
-    // network traffic + noisy duplicate-invite handling on the
-    // recipient side. `sends` is also empty in that case (defense in
-    // depth — the inner function guarantees this), but the explicit
-    // flag check makes the semantics unambiguous.
-    if !was_merge {
-        // Best-effort try_send — a full channel surfaces as a dropped
-        // invite, recovered by the outbox loop's first send_dm into
-        // this Space (which builds + ships its own DmInvite).
-        for req in sends {
-            if let Err(e) = unicast_send_tx.try_send(req) {
-                tracing::warn!(
-                    error = %e,
-                    "add_space: dropped DmInvite dispatch (channel full); outbox retry on first send_dm will recover"
-                );
-            }
-        }
-    }
+    // ZEB-473 (Move 1a): the DmInvite unicast dispatch was removed along with
+    // the Reticulum carrier (harmony#280). The minted Space reaches recipients
+    // via CRDT state-root sync, and the outbox loop's first send_dm into the
+    // Space rebuilds + ships its own DmInvite — so dropping the eager fan-out
+    // here changes nothing observable. The post-stop detachment guard above is
+    // retained (it still gates committing a Space minted against a detached
+    // crdt_state). Re-wiring the invite onto the iroh tunnel is a later move.
 
     Ok(hex::encode(space_id.0))
 }
@@ -21471,7 +21597,6 @@ pub async fn redeem_invite_inner<F>(
     // NodeState-held clone; tests that don't exercise catch-up pass
     // `None` (driver then parks permanently once satisfied).
     transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
-    unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     fence_check: F,
@@ -21491,7 +21616,6 @@ where
         community_registry,
         community_adapter_tx,
         transport_epoch_rx,
-        unicast_send_tx,
         dm_outbox,
         channel_log_registry,
         fence_check,
@@ -21529,7 +21653,6 @@ pub async fn redeem_invite_inner_with_overrides<F>(
     // NodeState-held clone; tests that don't exercise catch-up pass
     // `None` (driver then parks permanently once satisfied).
     transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
-    unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     fence_check: F,
@@ -21540,9 +21663,11 @@ pub async fn redeem_invite_inner_with_overrides<F>(
     identity_dir: Option<std::path::PathBuf>,
     // ZEB-474 (Move 2): the `allow_no_reticulum_destinations` fast-fail was
     // removed — invite redemption always proceeds via iroh (Zenoh CRDT sync /
-    // iroh handshake). The `destinations.is_empty()` guard is gone; the
-    // dormant PendingJoin unicast fan-out (Site 3) still routes through
-    // `unicast_send_tx` and will be rewired in Move 1a (ZEB-473).
+    // iroh handshake). The `destinations.is_empty()` guard is gone.
+    //
+    // ZEB-473 (Move 1a): the dormant PendingJoin unicast fan-out was removed
+    // with the Reticulum carrier (harmony#280); redemption delivery is via CRDT
+    // state-root sync. Re-wiring onto the iroh tunnel is a later move.
     //
     // ZEB-325 Phase 2c option A: pre-minted artifacts + pre-delivered
     // counter-sign event. See `RedeemInviteOverrides` docs.
@@ -21922,7 +22047,12 @@ where
                 return Err(format!("build_signed_invite_packet: {e}"));
             }
         };
-        let wire = match crate::community_invite::encode_packet(&packet) {
+        // ZEB-473 (Move 1a): the encoded `_wire` packet was previously consumed
+        // by the dormant Reticulum unicast fan-out (now removed). The build +
+        // encode is retained as a validation step (a malformed PendingJoin still
+        // early-errors with rollback), but the bytes are no longer sent — the
+        // PendingJoin reaches the admin via the engine's state-root publisher.
+        let _wire = match crate::community_invite::encode_packet(&packet) {
             Ok(w) => w,
             Err(e) => {
                 let _ = community_registry
@@ -21935,9 +22065,7 @@ where
 
         // ZEB-254: insert PendingJoin into local engine FIRST so the
         // engine's state-root publisher picks it up — the wire path
-        // (Zenoh CRDT) is the durable channel; the unicast below is
-        // just the fast-path optimization for when an admin device is
-        // online at this moment.
+        // (Zenoh CRDT) is the durable channel.
         match engine_arc
             .insert_local_event(minted.bootstrap_join.clone())
             .await
@@ -22093,32 +22221,21 @@ where
                      proceeding via CRDT sync (ZEB-474: Reticulum carrier removed)"
                 );
             } else {
-                // DORMANT (ZEB-474 → ZEB-473/Move 1a): best-effort unicast
-                // fan-out of the PendingJoin to the inviter's devices. The
-                // Reticulum carrier is gone, so these try_sends reach the
-                // dormant SendUnicastToDevice bridge and are dropped at the
-                // core. Redemption delivery is now via CRDT state-root sync
-                // (the oneshot await at step 7d below, which on timeout
-                // explicitly does NOT roll back). A failed fan-out must
-                // therefore NOT roll back either — doing so would wrongly
-                // fail a redemption that succeeds over CRDT whenever a stale
-                // OwnerDeviceCache yields non-empty-but-unsendable
-                // destinations. This matches the empty-destinations branch
-                // above, which already proceeds via CRDT. Move 1a rewires
-                // this fan-out onto the iroh tunnel.
-                for destination_hash in &destinations {
-                    if let Err(e) = unicast_send_tx.try_send(crate::dm_outbox::UnicastSendRequest {
-                        destination_hash: *destination_hash,
-                        packet: wire.clone(),
-                    }) {
-                        tracing::debug!(
-                            error = %e,
-                            destination_hash = %hex::encode(destination_hash),
-                            "redeem_invite dormant unicast fan-out try_send failed \
-                             (non-fatal; redemption proceeds via CRDT sync)"
-                        );
-                    }
-                }
+                // ZEB-473 (Move 1a): the dormant Reticulum unicast fan-out of
+                // the PendingJoin to the inviter's devices has been removed —
+                // the carrier was deleted in harmony#280, so those try_sends
+                // reached the dropped `SendUnicastToDevice` bridge and went
+                // nowhere. Redemption delivery is via CRDT state-root sync (the
+                // oneshot await at step 7d below, which on timeout explicitly
+                // does NOT roll back), exactly as the empty-destinations branch
+                // above already proceeds. Move 1+ rewires delivery onto the iroh
+                // tunnel; `destinations` is still resolved/logged for diagnostics.
+                tracing::debug!(
+                    inviter = %hex::encode(inviter_addr.0),
+                    destinations = destinations.len(),
+                    "redeem_invite_inner: resolved unicast destinations but the \
+                     Reticulum carrier is removed (ZEB-473); proceeding via CRDT sync"
+                );
             }
         } // end: else { … } from R6 pre_delivered_countersign guard
 
@@ -22518,7 +22635,6 @@ pub(crate) async fn redeem_invite_impl(
         community_registry,
         community_adapter_tx,
         transport_epoch_rx,
-        unicast_send_tx,
         channel_log_registry,
         dm_outbox,
         snapshot_generation,
@@ -22540,7 +22656,6 @@ pub(crate) async fn redeem_invite_impl(
             // receiver degrades to a non-re-arming fetch driver rather
             // than failing the IPC.
             g.transport_epoch_rx.clone(),
-            g.unicast_send_tx.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
@@ -22603,7 +22718,6 @@ pub(crate) async fn redeem_invite_impl(
         community_registry,
         community_adapter_tx,
         transport_epoch_rx,
-        unicast_send_tx,
         dm_outbox,
         channel_log_registry,
         fence_check,
@@ -22720,7 +22834,6 @@ async fn join_open_community_inner<F>(
     // NodeState-held clone; tests that don't exercise catch-up pass
     // `None` (driver then parks permanently once satisfied).
     transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
-    unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     fence_check: F,
@@ -22744,7 +22857,6 @@ where
         community_registry,
         community_adapter_tx,
         transport_epoch_rx,
-        unicast_send_tx,
         dm_outbox,
         channel_log_registry,
         fence_check,
@@ -22790,7 +22902,6 @@ pub(crate) async fn join_open_community_impl(
         community_registry,
         community_adapter_tx,
         transport_epoch_rx,
-        unicast_send_tx,
         channel_log_registry,
         dm_outbox,
         snapshot_generation,
@@ -22813,7 +22924,6 @@ pub(crate) async fn join_open_community_impl(
             // receiver degrades to a non-re-arming fetch driver rather
             // than failing the IPC.
             g.transport_epoch_rx.clone(),
-            g.unicast_send_tx.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
@@ -22867,7 +22977,6 @@ pub(crate) async fn join_open_community_impl(
         community_registry,
         community_adapter_tx,
         transport_epoch_rx,
-        unicast_send_tx,
         dm_outbox,
         channel_log_registry,
         fence_check,
@@ -22916,7 +23025,7 @@ mod redeem_invite_inner_tests {
     use crate::community_invite::CommunityInvitePayload;
     use crate::community_state_sync::{CommunityRegistryConfig, CommunitySyncRegistry};
     use crate::content_store::{ContentStore, RuntimeContentStore};
-    use crate::dm_outbox::{DmOutbox, UnicastSendRequest};
+    use crate::dm_outbox::DmOutbox;
     use crate::owner_state_crdt::OwnerState;
     use crate::owner_state_types::{DeviceIdentityHash, EpochKey, Hlc, OwnerAddr, SpaceId};
     use harmony_identity::PrivateIdentity;
@@ -22937,7 +23046,6 @@ mod redeem_invite_inner_tests {
         pub(super) community_registry: std::sync::Arc<CommunitySyncRegistry>,
         pub(super) community_adapter_tx:
             tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
-        pub(super) unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
         pub(super) dm_outbox: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
         pub(super) channel_log_registry: std::sync::Arc<ChannelLogRegistry>,
         // ZEB-436: tempdir root (== the registry's identity_dir) so the
@@ -22947,7 +23055,6 @@ mod redeem_invite_inner_tests {
         // Held alive so channels don't report Closed.
         _community_adapter_rx:
             tokio::sync::mpsc::Receiver<crate::event_loop::CommunityAdapterRequest>,
-        _unicast_rx: tokio::sync::mpsc::Receiver<UnicastSendRequest>,
         _channel_log_adapter_rx:
             tokio::sync::mpsc::UnboundedReceiver<crate::event_loop::ChannelLogAdapterRequest>,
         _tmp: tempfile::TempDir,
@@ -22966,8 +23073,10 @@ mod redeem_invite_inner_tests {
     ///   sender + receiver kept alive). No Zenoh drainer runs — harmless
     ///   since no spawns reach `spawn_inner_now` during an OPEN redeem
     ///   (remote Zenoh events don't arrive in unit tests).
-    /// - `unicast_send_tx` receiver is kept alive so try_send doesn't see
-    ///   Closed (needed by the INVITE-ONLY branch; unused on the OPEN path).
+    ///
+    /// ZEB-473 (Move 1a): the `unicast_send_tx` channel was removed from
+    /// `redeem_invite_inner` along with the Reticulum carrier, so the fixture
+    /// no longer constructs one.
     pub(super) async fn build_redeem_invite_test_fixture() -> RedeemInviteTestFixture {
         let tmp = tempfile::TempDir::new().expect("tempdir");
 
@@ -23034,7 +23143,6 @@ mod redeem_invite_inner_tests {
 
         let (community_adapter_tx, _community_adapter_rx) =
             mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
-        let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
 
         // ZEB-339: use new_synthetic because the DmOutbox cert is a separate
         // DM-layer fixture that intentionally doesn't match self_owner (which
@@ -23086,12 +23194,10 @@ mod redeem_invite_inner_tests {
             enrollment_cert: fixture_enrollment_cert,
             community_registry,
             community_adapter_tx,
-            unicast_send_tx,
             dm_outbox,
             channel_log_registry,
             identity_dir: tmp.path().to_path_buf(),
             _community_adapter_rx,
-            _unicast_rx,
             _channel_log_adapter_rx,
             _tmp: tmp,
         }
@@ -23158,7 +23264,6 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
@@ -23323,7 +23428,6 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
@@ -23449,7 +23553,6 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
@@ -23556,7 +23659,6 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
@@ -23804,7 +23906,6 @@ mod zeb436_orphan_adoption_tests {
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
             move || {
@@ -24046,7 +24147,6 @@ mod zeb436_orphan_adoption_tests {
         joiner_cert: harmony_owner::certs::EnrollmentCert,
         community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
         community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
-        unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
         dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
         channel_log_registry:
             std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
@@ -24058,7 +24158,6 @@ mod zeb436_orphan_adoption_tests {
         // Held alive so channels don't report Closed.
         _community_adapter_rx:
             tokio::sync::mpsc::Receiver<crate::event_loop::CommunityAdapterRequest>,
-        _unicast_rx: tokio::sync::mpsc::Receiver<crate::dm_outbox::UnicastSendRequest>,
         _channel_log_adapter_rx:
             tokio::sync::mpsc::UnboundedReceiver<crate::event_loop::ChannelLogAdapterRequest>,
         _tmp: tempfile::TempDir,
@@ -24083,7 +24182,7 @@ mod zeb436_orphan_adoption_tests {
         };
         use crate::community_state_sync::{CommunityRegistryConfig, CommunitySyncRegistry};
         use crate::content_store::{ContentStore, RuntimeContentStore};
-        use crate::dm_outbox::{DmOutbox, UnicastSendRequest};
+        use crate::dm_outbox::DmOutbox;
         use crate::owner_state_types::{DeviceIdentityHash, Hlc};
         use tokio::sync::mpsc;
 
@@ -24158,7 +24257,6 @@ mod zeb436_orphan_adoption_tests {
 
         let (community_adapter_tx, _community_adapter_rx) =
             mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
-        let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
 
         let dm_owner = crate::community_membership::mint_test_owner(0xE3);
         let dm_signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
@@ -24316,14 +24414,12 @@ mod zeb436_orphan_adoption_tests {
             joiner_cert: joiner_owner.cert.clone(),
             community_registry,
             community_adapter_tx,
-            unicast_send_tx,
             dm_outbox,
             channel_log_registry,
             invite_url,
             crdt_state,
             hlc_tracker,
             _community_adapter_rx,
-            _unicast_rx,
             _channel_log_adapter_rx,
             _tmp: tmp,
         }
@@ -24353,7 +24449,6 @@ mod zeb436_orphan_adoption_tests {
             std::sync::Arc::clone(&rig.community_registry),
             rig.community_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            rig.unicast_send_tx.clone(),
             std::sync::Arc::clone(&rig.dm_outbox),
             std::sync::Arc::clone(&rig.channel_log_registry),
             || Ok(()),
@@ -24432,7 +24527,6 @@ mod zeb436_orphan_adoption_tests {
             std::sync::Arc::clone(&rig.community_registry),
             rig.community_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            rig.unicast_send_tx.clone(),
             std::sync::Arc::clone(&rig.dm_outbox),
             std::sync::Arc::clone(&rig.channel_log_registry),
             None, // sync_engine: fence warn path (pre-start_node shape)
@@ -24501,7 +24595,6 @@ mod zeb436_orphan_adoption_tests {
             std::sync::Arc::clone(&rig.community_registry),
             rig.community_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            rig.unicast_send_tx.clone(),
             std::sync::Arc::clone(&rig.dm_outbox),
             std::sync::Arc::clone(&rig.channel_log_registry),
             || Ok(()),
@@ -24640,7 +24733,6 @@ mod join_open_community_tests {
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             None, // ZEB-434: no transport-epoch watch in this test
-            fixture.unicast_send_tx.clone(),
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
@@ -37858,7 +37950,6 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         community_registry,
         community_adapter_tx,
         transport_epoch_rx,
-        unicast_send_tx,
         channel_log_registry,
         dm_outbox,
         iroh_endpoint,
@@ -37881,7 +37972,6 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
             // sync_engine: a missing receiver degrades to a
             // non-re-arming fetch driver, not a hard failure).
             g.transport_epoch_rx.clone(),
-            g.unicast_send_tx.clone(),
             g.channel_log_registry.clone(),
             g.dm_outbox.clone(),
             g.iroh_endpoint.clone(),
@@ -37904,7 +37994,6 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         Some(self_owner),
         Some(community_registry),
         Some(community_adapter_tx),
-        Some(unicast_send_tx),
         Some(channel_log_registry),
         Some(dm_outbox),
     ) = (
@@ -37914,7 +38003,6 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         self_owner,
         community_registry,
         community_adapter_tx,
-        unicast_send_tx,
         channel_log_registry,
         dm_outbox,
     )
@@ -38015,7 +38103,6 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         community_registry,
         community_adapter_tx,
         transport_epoch_rx,
-        unicast_send_tx,
         dm_outbox,
         channel_log_registry,
         sync_engine,
@@ -38311,7 +38398,6 @@ pub async fn connectivity_redeem_invite_iroh_inner<F>(
     // NodeState-held clone; tests that don't exercise catch-up pass
     // `None` (driver then parks permanently once satisfied).
     transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
-    unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     // ZEB-427: owner-state SyncEngine handle for the durable-on-commit
@@ -38411,7 +38497,6 @@ where
             // transport-epoch watch the handshake path threads through
             // (short-circuit returns, so the move is fine).
             transport_epoch_rx,
-            unicast_send_tx,
             dm_outbox,
             channel_log_registry,
             fence_check,
@@ -38994,7 +39079,6 @@ where
         community_registry,
         community_adapter_tx,
         transport_epoch_rx,
-        unicast_send_tx,
         dm_outbox,
         channel_log_registry,
         fence_check,
@@ -39162,12 +39246,19 @@ fn build_self_handshake_reachability(
 /// `learned_at` is this node's local HLC (anti-forgery: never the peer's claimed
 /// time). An empty `sender_devices` is skipped so a peer that advertised nothing
 /// never LWW-clobbers a previously-known-good cache entry.
+#[allow(clippy::too_many_arguments)]
 async fn apply_handshaked_friend(
     crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
     addr: crate::owner_state_types::OwnerAddr,
     entry: crate::friend_graph::FriendEntry,
     sender_devices: Vec<crate::owner_state_types::DeviceIdentityHash>,
     device_identity_pubs: Vec<Option<[u8; 64]>>,
+    // ZEB-473 Task 5: the peer's per-device tunnel reachability/PQ contacts,
+    // parallel-indexed to `sender_devices` (built from the SIGNED accept fields by
+    // the caller). `apply_owner_device_update` re-aligns these to the sorted
+    // device list. `None` elements are skip-on-empty (never clobber a known
+    // contact).
+    device_tunnel_contacts: Vec<Option<crate::owner_state_types::DeviceTunnelContact>>,
     learned_at: crate::owner_state_types::Hlc,
 ) -> Result<(), String> {
     let mut state = crdt_state.lock().await;
@@ -39179,8 +39270,14 @@ async fn apply_handshaked_friend(
         }
     }
     if !sender_devices.is_empty() {
-        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) =
-            state.apply_owner_device_update(addr, sender_devices, device_identity_pubs, learned_at)
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = state
+            .apply_owner_device_update(
+                addr,
+                sender_devices,
+                device_identity_pubs,
+                device_tunnel_contacts,
+                learned_at,
+            )
         {
             return Err(format!("device-cache apply rejected: {reason:?}"));
         }
@@ -39357,11 +39454,17 @@ pub async fn connectivity_link_friend_iroh_inner(
     // node's self-values when present; ship the EMPTY bundle when `None` (tests /
     // pre-identity). The digest is computed from the SAME (devices, pubs) placed
     // on the wire, so the request signature stays consistent with the bundle a
-    // peer re-digests on receipt. Reachability + PQ keys are unsigned hints.
+    // peer re-digests on receipt. ZEB-473 §6.3: reachability + PQ keys are now
+    // folded into `contact_digest`, so the signature BINDS them (downgrade /
+    // tamper protection) — they are signed, not unsigned hints.
     let req_bundle = crate::dm_tunnel_contact::self_request_bundle(self_reachability.as_ref());
-    let req_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+    let req_devices_digest = crate::iroh_friend_acceptor::contact_digest(
         &req_bundle.sender_devices,
         &req_bundle.device_identity_pubs,
+        &req_bundle.iroh_node_id,
+        req_bundle.home_relay_url.as_deref(),
+        &req_bundle.pq_dsa_pubkey,
+        &req_bundle.pq_kem_pubkey,
     );
     let req_sig = self_device2_signing_key
         .sign(&friend_request_sig_preimage(
@@ -39494,11 +39597,16 @@ pub async fn connectivity_link_friend_iroh_inner(
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
-    // ZEB-461: bind the accepter's device-bundle digest (computed from the bundle
-    // the accept carries) into the verified accept preimage.
-    let accept_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+    // ZEB-461/473: bind the accepter's contact digest (device bundle +
+    // reachability + PQ keys, all carried in the accept) into the verified
+    // accept preimage.
+    let accept_devices_digest = crate::iroh_friend_acceptor::contact_digest(
         &accepted.sender_devices,
         &accepted.device_identity_pubs,
+        &accepted.iroh_node_id,
+        accepted.home_relay_url.as_deref(),
+        &accepted.pq_dsa_pubkey,
+        &accepted.pq_kem_pubkey,
     );
     accept_vk
         .verify_strict(
@@ -39556,12 +39664,22 @@ pub async fn connectivity_link_friend_iroh_inner(
     // ZEB-461 Task 7: learn the inviter's advertised devices (carried in the
     // accept) so the DM outbox can route to this friend even without a shared
     // community. Shared helper keeps this in lockstep with the add-by-key path.
+    // ZEB-473 Task 5: persist the inviter's SIGNED iroh reachability + PQ keys for
+    // the DM tunnel (single contact, parallel to device 0; `None` if they
+    // advertised nothing dialable — skip-on-empty).
+    let inviter_contacts = vec![crate::dm_tunnel_contact::peer_handshake_contact(
+        accepted.iroh_node_id,
+        accepted.home_relay_url.clone(),
+        accepted.pq_dsa_pubkey.clone(),
+        accepted.pq_kem_pubkey.clone(),
+    )];
     apply_handshaked_friend(
         &crdt_state,
         payload.inviter_addr,
         entry,
         accepted.sender_devices.clone(),
         accepted.device_identity_pubs.clone(),
+        inviter_contacts,
         learned_at,
     )
     .await?;
@@ -41607,12 +41725,18 @@ pub async fn connectivity_add_friend_by_key_inner(
     let (self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
     // ZEB-461 Task 6: fill the device bundle + reachability + PQ keys from this
     // node's self-values when present; ship the EMPTY bundle when `None`. The
-    // digest is computed from the SAME (devices, pubs) placed on the wire so the
-    // request signature stays consistent. Reachability + PQ keys are unsigned.
+    // digest is computed from the SAME contact material placed on the wire so the
+    // request signature stays consistent — and ZEB-473 §6.3 folds reachability +
+    // PQ keys into `contact_digest`, so the signature BINDS devices, pubs,
+    // reachability, AND PQ keys (downgrade / tamper protection).
     let req_bundle = crate::dm_tunnel_contact::self_request_bundle(self_reachability.as_ref());
-    let req_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+    let req_devices_digest = crate::iroh_friend_acceptor::contact_digest(
         &req_bundle.sender_devices,
         &req_bundle.device_identity_pubs,
+        &req_bundle.iroh_node_id,
+        req_bundle.home_relay_url.as_deref(),
+        &req_bundle.pq_dsa_pubkey,
+        &req_bundle.pq_kem_pubkey,
     );
     let req_sig = self_device2_signing_key
         .sign(&friend_request_sig_preimage(
@@ -41744,10 +41868,15 @@ pub async fn connectivity_add_friend_by_key_inner(
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
-    // ZEB-461: bind the accepter's device-bundle digest into the verified preimage.
-    let accept_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+    // ZEB-461/473: bind the accepter's contact digest (device bundle +
+    // reachability + PQ keys) into the verified preimage.
+    let accept_devices_digest = crate::iroh_friend_acceptor::contact_digest(
         &accepted.sender_devices,
         &accepted.device_identity_pubs,
+        &accepted.iroh_node_id,
+        accepted.home_relay_url.as_deref(),
+        &accepted.pq_dsa_pubkey,
+        &accepted.pq_kem_pubkey,
     );
     accept_vk
         .verify_strict(
@@ -41800,12 +41929,21 @@ pub async fn connectivity_add_friend_by_key_inner(
     // the DM outbox can route to this key-introduced friend even without a shared
     // community. Shared helper keeps this in lockstep with the token path —
     // Greptile P1 on #269 found this path previously dropped the device update.
+    // ZEB-473 Task 5: persist the target's SIGNED iroh reachability + PQ keys
+    // (single contact parallel to device 0; `None` if nothing dialable).
+    let target_contacts = vec![crate::dm_tunnel_contact::peer_handshake_contact(
+        accepted.iroh_node_id,
+        accepted.home_relay_url.clone(),
+        accepted.pq_dsa_pubkey.clone(),
+        accepted.pq_kem_pubkey.clone(),
+    )];
     apply_handshaked_friend(
         &crdt_state,
         target_addr_master,
         entry,
         accepted.sender_devices.clone(),
         accepted.device_identity_pubs.clone(),
+        target_contacts,
         learned_at,
     )
     .await?;
@@ -42059,9 +42197,26 @@ mod friend_ipc_tests {
         // helper; Greptile P1 on #269 was the add-by-key path skipping it.
         let state = tokio::sync::Mutex::new(OwnerState::default());
         let (addr, entry) = friend_entry(0x33, FriendStatus::Active, 10);
-        apply_handshaked_friend(&state, addr, entry, devices.clone(), pubs.clone(), hlc(10))
-            .await
-            .expect("apply must succeed");
+        // ZEB-473 Task 5: a single SIGNED tunnel contact, parallel to device 0.
+        // CR9: correctly-sized PQ keys so the contact passes the apply-time
+        // key-size validation gate (a wrong-size contact is now rejected).
+        let contact = crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [0x7c; 32],
+            home_relay_url: Some("https://relay.example/".into()),
+            pq_dsa_pubkey: vec![1u8; crate::owner_state_types::ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![4u8; crate::owner_state_types::ML_KEM_768_PUBKEY_LEN],
+        };
+        apply_handshaked_friend(
+            &state,
+            addr,
+            entry,
+            devices.clone(),
+            pubs.clone(),
+            vec![Some(contact.clone())],
+            hlc(10),
+        )
+        .await
+        .expect("apply must succeed");
         {
             let s = state.lock().await;
             assert!(
@@ -42079,13 +42234,19 @@ mod friend_ipc_tests {
                 cache.devices, devices,
                 "cache must learn the accepted bundle"
             );
+            // The signed tunnel contact must be persisted parallel to its device.
+            assert_eq!(
+                cache.device_tunnel_contacts,
+                vec![Some(contact)],
+                "the signed tunnel contact must persist parallel to device 0"
+            );
         }
 
         // Empty bundle → friend still applied, cache untouched (skip-on-empty so
         // an advertised-nothing peer can't LWW-clobber a known-good entry).
         let state2 = tokio::sync::Mutex::new(OwnerState::default());
         let (addr2, entry2) = friend_entry(0x44, FriendStatus::Active, 10);
-        apply_handshaked_friend(&state2, addr2, entry2, vec![], vec![], hlc(10))
+        apply_handshaked_friend(&state2, addr2, entry2, vec![], vec![], vec![], hlc(10))
             .await
             .expect("apply must succeed with an empty bundle");
         {
@@ -47483,12 +47644,13 @@ mod start_node_race_tests {
             dm_self_owner: None,
             owner_keytree: None,
             content_store: None,
-            unicast_send_tx: None,
             dm_send_inflight: None,
             dm_send_stopping: None,
             dm_identity_pub_64: None,
             dm_local_dsa_pubkey: None,
             dm_local_kem_pubkey: None,
+            dm_pq_identity: None,
+            tunnel_manager: None,
             community_adapter_request_tx: None,
             transport_epoch_rx: None,
             voting_log_adapter_request_tx: None,

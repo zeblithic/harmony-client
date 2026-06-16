@@ -319,6 +319,23 @@ pub const MAX_PRIOR_CONTENT_KEYS: usize = 16;
 /// See ZEB-216 §"OwnerDeviceCache".
 pub const MAX_DEVICES_PER_OWNER: usize = 32;
 
+/// Canonical exact byte-length of an ML-DSA-65 public key (the
+/// `pq_dsa_pubkey` carried by a [`DeviceTunnelContact`]). Defined ONCE here
+/// and referenced by every tunnel-contact validation site (ZEB-473). The
+/// upstream `harmony_tunnel`/`harmony_identity` value (1952) is a private
+/// `const` not re-exported across the public surface, so we pin it locally.
+pub const ML_DSA_65_PUBKEY_LEN: usize = 1952;
+
+/// Canonical exact byte-length of an ML-KEM-768 public (encapsulation) key
+/// (the `pq_kem_pubkey` carried by a [`DeviceTunnelContact`]). See
+/// [`ML_DSA_65_PUBKEY_LEN`].
+pub const ML_KEM_768_PUBKEY_LEN: usize = 1184;
+
+/// Maximum accepted byte-length of a tunnel contact's `home_relay_url`. A
+/// relay URL longer than this is treated as malformed/abusive and rejected,
+/// keeping replicated owner-state payloads bounded.
+pub const MAX_TUNNEL_RELAY_URL_LEN: usize = 2048;
+
 /// 32-byte symmetric content key for DM/group-DM ChaCha20-Poly1305
 /// encryption. Wire format: bstr(32). In-memory: zeroized on drop
 /// (custom Drop via ZeroizeOnDrop derive). Debug redacts the bytes
@@ -441,6 +458,74 @@ pub struct OwnerDeviceCache {
     pub devices: BTreeMap<OwnerAddr, OwnerDeviceEntry>,
 }
 
+/// Per-device tunnel reachability + post-quantum public keys for a
+/// friend's bound device (ZEB-473 / DM-over-iroh Move 1a). Parallel-indexed
+/// onto `OwnerDeviceEntry.device_tunnel_contacts` — element i is the contact
+/// for `OwnerDeviceEntry.devices[i]` when present, or `None` when the device
+/// is known-by-hash but its reachability/PQ keys haven't been propagated yet.
+///
+/// This is a routing hint, NOT an identity authority: the per-device pubs in
+/// `device_identity_pubs` remain the signature-verification source of truth.
+/// Unlike `device_identity_pubs`, contacts legitimately change over time (a
+/// peer's iroh node id, relay, or rotated PQ keys), so the CRDT merge rule is
+/// last-writer-wins by the entry's `learned_at` HLC — never an InvariantFail.
+///
+/// Populated on friend handshake (ZEB-473): `peer_handshake_contact` derives a
+/// contact from the signed reachability + PQ keys a peer advertises, and the
+/// dialer-side handshake apply persists it parallel to the device. A device
+/// known-by-hash but not yet handshaked still carries `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceTunnelContact {
+    /// The peer device's iroh `EndpointId` (32-byte ed25519 public key the
+    /// QUIC endpoint is keyed on) — the dial target for the PQ tunnel.
+    #[serde(
+        rename = "n",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub iroh_node_id: [u8; 32],
+
+    /// The peer's home relay URL, if advertised (iroh relay hole-punch
+    /// fallback). `None` when the peer didn't advertise one (direct-only).
+    #[serde(rename = "r")]
+    pub home_relay_url: Option<String>,
+
+    /// ML-DSA-65 signature public key (post-quantum tunnel handshake auth).
+    #[serde(
+        rename = "d",
+        serialize_with = "serialize_vec_as_bstr",
+        deserialize_with = "deserialize_vec_from_bstr"
+    )]
+    pub pq_dsa_pubkey: Vec<u8>,
+
+    /// ML-KEM-768 key-encapsulation public key (post-quantum tunnel KEX).
+    #[serde(
+        rename = "k",
+        serialize_with = "serialize_vec_as_bstr",
+        deserialize_with = "deserialize_vec_from_bstr"
+    )]
+    pub pq_kem_pubkey: Vec<u8>,
+}
+
+impl DeviceTunnelContact {
+    /// Structural validity gate (ZEB-473): a contact is only dialable — and
+    /// only worth persisting/replicating — when both PQ public keys are exactly
+    /// their canonical FIPS sizes ([`ML_DSA_65_PUBKEY_LEN`] /
+    /// [`ML_KEM_768_PUBKEY_LEN`]) and any advertised relay URL is within
+    /// [`MAX_TUNNEL_RELAY_URL_LEN`]. Defined ONCE here so the handshake-derive,
+    /// CRDT-apply, and deserialize gates can't drift. Does NOT validate the
+    /// `iroh_node_id` non-zero / dial-target rule — that's `peer_handshake_contact`'s
+    /// concern (a zero node id is a legitimately-absent contact, not a malformed one).
+    pub fn has_valid_key_sizes(&self) -> bool {
+        self.pq_dsa_pubkey.len() == ML_DSA_65_PUBKEY_LEN
+            && self.pq_kem_pubkey.len() == ML_KEM_768_PUBKEY_LEN
+            && self
+                .home_relay_url
+                .as_ref()
+                .is_none_or(|u| u.len() <= MAX_TUNNEL_RELAY_URL_LEN)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OwnerDeviceEntry {
     /// Sorted ascending lex, deduped, capped at MAX_DEVICES_PER_OWNER.
@@ -496,6 +581,21 @@ pub struct OwnerDeviceEntry {
     /// HLC of when this entry was learned. LWW key for merge.
     #[serde(rename = "l")]
     pub learned_at: Hlc,
+
+    /// Per-device tunnel reachability + PQ keys (ZEB-473). Parallel to
+    /// `devices` — element i is the `DeviceTunnelContact` for `devices[i]`
+    /// when present, or `None` when the device is known-by-hash but its
+    /// reachability/PQ keys haven't been propagated yet. Held parallel
+    /// through the manual `Deserialize` impl JOINTLY with `device_identity_pubs`.
+    ///
+    /// `#[serde(default)]`: pre-ZEB-473 snapshots wrote no `t` field; the
+    /// manual `Deserialize` impl treats a missing or empty `t` as
+    /// `vec![None; devices.len()]` so the parallel-vec invariant holds
+    /// in-memory regardless of wire shape. Merge rule is last-writer-wins
+    /// by `learned_at` (a routing hint, not an identity authority — see
+    /// `DeviceTunnelContact`); a `None` never overwrites a `Some`.
+    #[serde(default, rename = "t")]
+    pub device_tunnel_contacts: Vec<Option<DeviceTunnelContact>>,
 }
 
 /// Pass-through Serialize for `OwnerDeviceEntry::devices`. Required only
@@ -546,6 +646,8 @@ impl<'de> Deserialize<'de> for OwnerDeviceEntry {
             P,
             #[serde(rename = "l")]
             L,
+            #[serde(rename = "t")]
+            T,
             #[serde(other)]
             Other,
         }
@@ -566,6 +668,7 @@ impl<'de> Deserialize<'de> for OwnerDeviceEntry {
                 let mut devices: Option<Vec<DeviceIdentityHash>> = None;
                 let mut pubs: Option<Vec<Option<[u8; 64]>>> = None;
                 let mut learned_at: Option<Hlc> = None;
+                let mut contacts: Option<Vec<Option<DeviceTunnelContact>>> = None;
 
                 while let Some(field) = map.next_key::<Field>()? {
                     match field {
@@ -590,6 +693,15 @@ impl<'de> Deserialize<'de> for OwnerDeviceEntry {
                             }
                             learned_at = Some(map.next_value()?);
                         }
+                        Field::T => {
+                            if contacts.is_some() {
+                                return Err(A::Error::duplicate_field("t"));
+                            }
+                            // Cap-bounded raw reader (no sort/dedup — the
+                            // join below carries contacts parallel through
+                            // sort/merge jointly with devices+pubs).
+                            contacts = Some(map.next_value_seed(RawTunnelContactsSeed)?);
+                        }
                         Field::Other => {
                             // Unknown field — drain its value and ignore.
                             // Matches `#[derive(Deserialize)]`'s default
@@ -602,16 +714,26 @@ impl<'de> Deserialize<'de> for OwnerDeviceEntry {
                 let devices = devices.ok_or_else(|| A::Error::missing_field("v"))?;
                 let mut pubs = pubs.unwrap_or_default();
                 let learned_at = learned_at.ok_or_else(|| A::Error::missing_field("l"))?;
+                // ZEB-473: `t` is `#[serde(default)]`; pre-ZEB-473 snapshots
+                // wrote no `t` field at all, so a missing/short vec is the
+                // common case (→ pad to None below).
+                let mut contacts = contacts.unwrap_or_default();
 
                 // Pre-Phase-3b snapshots wrote no `p` field at all (or wrote
                 // `p == []`); pad to devices.len() so the parallel-vec
                 // invariant holds before the join below. If `p.len() >
                 // devices.len()` (malformed peer), truncate — devices is
-                // the source of truth for length.
+                // the source of truth for length. Same parity rule for the
+                // ZEB-473 `t` (device_tunnel_contacts) vec.
                 if pubs.len() < devices.len() {
                     pubs.resize(devices.len(), None);
                 } else if pubs.len() > devices.len() {
                     pubs.truncate(devices.len());
+                }
+                if contacts.len() < devices.len() {
+                    contacts.resize(devices.len(), None);
+                } else if contacts.len() > devices.len() {
+                    contacts.truncate(devices.len());
                 }
 
                 // Cap-reject BEFORE zip — cheap, mirrors the per-element
@@ -630,34 +752,61 @@ impl<'de> Deserialize<'de> for OwnerDeviceEntry {
                 }
 
                 // Zip + sort BY HASH (preserves parallel-vec correspondence)
-                // + merge duplicate-hash entries with the same rule as
-                // `apply_owner_device_update`:
+                // + merge duplicate-hash entries, carrying the ZEB-473
+                // tunnel contact as a third parallel element.
+                //
+                // identity-pub merge (unchanged):
                 //   both None → None
                 //   exactly one Some → keep the Some
                 //   both Some equal → keep one
                 //   both Some different → reject (real invariant fail).
-                let mut zipped: Vec<(DeviceIdentityHash, Option<[u8; 64]>)> =
-                    devices.into_iter().zip(pubs).collect();
-                zipped.sort_by_key(|(d, _)| *d);
+                //
+                // tunnel-contact merge (ZEB-473): contacts are routing
+                // hints that legitimately change, so there is NO invariant
+                // fail — a `None` never overwrites a `Some`, and two
+                // differing `Some`s collapse to the LAST one seen (within a
+                // single entry there is no per-element HLC; the CRDT-apply
+                // path applies the true LWW-by-`learned_at` rule).
+                let mut zipped: Vec<(
+                    DeviceIdentityHash,
+                    Option<[u8; 64]>,
+                    Option<DeviceTunnelContact>,
+                )> = devices
+                    .into_iter()
+                    .zip(pubs)
+                    .zip(contacts)
+                    .map(|((d, p), t)| (d, p, t))
+                    .collect();
+                zipped.sort_by_key(|(d, _, _)| *d);
 
-                let mut merged: Vec<(DeviceIdentityHash, Option<[u8; 64]>)> =
-                    Vec::with_capacity(zipped.len());
-                for (d, p) in zipped {
+                let mut merged: Vec<(
+                    DeviceIdentityHash,
+                    Option<[u8; 64]>,
+                    Option<DeviceTunnelContact>,
+                )> = Vec::with_capacity(zipped.len());
+                for (d, p, t) in zipped {
                     match merged.last_mut() {
-                        Some((prev_d, prev_p)) if *prev_d == d => match (*prev_p, p) {
-                            (None, None) => {}
-                            (None, Some(_)) => *prev_p = p,
-                            (Some(_), None) => {}
-                            (Some(a), Some(b)) if a == b => {}
-                            (Some(_), Some(_)) => {
-                                return Err(A::Error::custom(format!(
-                                    "OwnerDeviceEntry has conflicting identity pubs \
-                                     for device {:?}",
-                                    d
-                                )));
+                        Some((prev_d, prev_p, prev_t)) if *prev_d == d => {
+                            match (*prev_p, p) {
+                                (None, None) => {}
+                                (None, Some(_)) => *prev_p = p,
+                                (Some(_), None) => {}
+                                (Some(a), Some(b)) if a == b => {}
+                                (Some(_), Some(_)) => {
+                                    return Err(A::Error::custom(format!(
+                                        "OwnerDeviceEntry has conflicting identity pubs \
+                                         for device {:?}",
+                                        d
+                                    )));
+                                }
                             }
-                        },
-                        _ => merged.push((d, p)),
+                            // Contact: None never overwrites Some; otherwise
+                            // last-Some-wins. No reject (LWW, not authority).
+                            if t.is_some() {
+                                *prev_t = t;
+                            }
+                        }
+                        _ => merged.push((d, p, t)),
                     }
                 }
                 merged.truncate(MAX_DEVICES_PER_OWNER);
@@ -672,7 +821,7 @@ impl<'de> Deserialize<'de> for OwnerDeviceEntry {
                 // Reject at deserialize time so the bad state never enters
                 // the in-memory cache. Mirrors the parallel check in
                 // `apply_owner_device_update`.
-                for (d, p) in merged.iter() {
+                for (d, p, _t) in merged.iter() {
                     if let Some(pub_bytes) = p {
                         match crate::dm_signing::derive_device_hash_from_identity_pub(pub_bytes) {
                             Some(derived) if derived == *d => {}
@@ -694,13 +843,20 @@ impl<'de> Deserialize<'de> for OwnerDeviceEntry {
                     }
                 }
 
-                let (sanitized_devices, sanitized_pubs): (Vec<_>, Vec<_>) =
-                    merged.into_iter().unzip();
+                let mut sanitized_devices = Vec::with_capacity(merged.len());
+                let mut sanitized_pubs = Vec::with_capacity(merged.len());
+                let mut sanitized_contacts = Vec::with_capacity(merged.len());
+                for (d, p, t) in merged {
+                    sanitized_devices.push(d);
+                    sanitized_pubs.push(p);
+                    sanitized_contacts.push(t);
+                }
 
                 Ok(OwnerDeviceEntry {
                     devices: sanitized_devices,
                     device_identity_pubs: sanitized_pubs,
                     learned_at,
+                    device_tunnel_contacts: sanitized_contacts,
                 })
             }
         }
@@ -720,6 +876,13 @@ impl<'de> Deserialize<'de> for OwnerDeviceEntry {
             type Value = Vec<Option<[u8; 64]>>;
             fn deserialize<De: Deserializer<'de>>(self, d: De) -> Result<Self::Value, De::Error> {
                 deserialize_device_identity_pubs(d)
+            }
+        }
+        struct RawTunnelContactsSeed;
+        impl<'de> serde::de::DeserializeSeed<'de> for RawTunnelContactsSeed {
+            type Value = Vec<Option<DeviceTunnelContact>>;
+            fn deserialize<De: Deserializer<'de>>(self, d: De) -> Result<Self::Value, De::Error> {
+                deserialize_raw_tunnel_contacts(d)
             }
         }
 
@@ -804,6 +967,91 @@ where
             // OwnerDeviceEntry sorts+dedups jointly with the parallel
             // `device_identity_pubs` vec. Sorting independently here
             // would leave the two vecs misaligned (the original bug).
+            Ok(out)
+        }
+    }
+
+    d.deserialize_seq(CapVisitor)
+}
+
+/// Deserialize a `Vec<Option<DeviceTunnelContact>>` for
+/// `OwnerDeviceEntry::device_tunnel_contacts` (ZEB-473) with cap-rejection
+/// but WITHOUT sort/dedup — the struct-level `Deserialize` impl on
+/// `OwnerDeviceEntry` owns sort/merge because it must be performed jointly
+/// with `devices` and `device_identity_pubs` to preserve the parallel-vec
+/// correspondence (sorting any vec independently leaves them misaligned).
+///
+/// Mirrors `deserialize_raw_device_identities`'s cap behavior: rejects
+/// up-front via `size_hint`, pre-allocates `min(cap, hint)`, refuses the
+/// (cap+1)-th element. Each element is a standard `Option<DeviceTunnelContact>`
+/// (CBOR null → `None`, a map → `Some`), decoded via the type's derived
+/// `Deserialize`.
+fn deserialize_raw_tunnel_contacts<'de, D>(
+    d: D,
+) -> Result<Vec<Option<DeviceTunnelContact>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{Error, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct CapVisitor;
+
+    impl<'de> Visitor<'de> for CapVisitor {
+        type Value = Vec<Option<DeviceTunnelContact>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "an array of at most {} optional DeviceTunnelContact entries",
+                MAX_DEVICES_PER_OWNER
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if let Some(n) = seq.size_hint() {
+                if n > MAX_DEVICES_PER_OWNER {
+                    return Err(A::Error::custom(format!(
+                        "device_tunnel_contacts array length {} exceeds MAX_DEVICES_PER_OWNER ({})",
+                        n, MAX_DEVICES_PER_OWNER
+                    )));
+                }
+            }
+            let initial_cap = seq
+                .size_hint()
+                .unwrap_or(MAX_DEVICES_PER_OWNER)
+                .min(MAX_DEVICES_PER_OWNER);
+            let mut out: Vec<Option<DeviceTunnelContact>> = Vec::with_capacity(initial_cap);
+            while let Some(item) = seq.next_element::<Option<DeviceTunnelContact>>()? {
+                if out.len() >= MAX_DEVICES_PER_OWNER {
+                    return Err(A::Error::custom(format!(
+                        "device_tunnel_contacts array exceeds MAX_DEVICES_PER_OWNER ({}); \
+                         legitimate peers always send canonical (capped) form",
+                        MAX_DEVICES_PER_OWNER
+                    )));
+                }
+                // CR11 (ZEB-473): the element count is capped above, but each
+                // `DeviceTunnelContact` carries unbounded `pq_dsa_pubkey` /
+                // `pq_kem_pubkey` byte strings. A malicious owner-state blob
+                // could otherwise force huge per-key allocations. The PQ keys
+                // have FIXED canonical sizes, so anything larger is malformed —
+                // reject so it can never poison downstream tunnel code. (Short
+                // keys are tolerated here; the apply-time gate enforces exact
+                // sizes — deser just bounds allocation.)
+                if let Some(ref c) = item {
+                    if c.pq_dsa_pubkey.len() > ML_DSA_65_PUBKEY_LEN
+                        || c.pq_kem_pubkey.len() > ML_KEM_768_PUBKEY_LEN
+                    {
+                        return Err(A::Error::custom(
+                            "DeviceTunnelContact PQ key material exceeds its canonical size cap",
+                        ));
+                    }
+                }
+                out.push(item);
+            }
             Ok(out)
         }
     }
@@ -1349,6 +1597,62 @@ mod newtype_tests {
         into_writer(&d, &mut bytes).unwrap();
         let recovered: DeviceIdentityHash = from_reader(&bytes[..]).unwrap();
         assert_eq!(d, recovered);
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_tunnel_contact_pq_key() {
+        // CR11 (ZEB-473): a malicious owner-state blob carrying a
+        // `DeviceTunnelContact` with a PQ key LARGER than its canonical size
+        // must be rejected at deserialize time so it can't force a huge
+        // allocation / poison downstream tunnel code. A correctly-sized contact
+        // round-trips; an oversized one fails.
+        use ciborium::{from_reader, into_writer};
+
+        let device = DeviceIdentityHash([0x11; 16]);
+        let ok_contact = DeviceTunnelContact {
+            iroh_node_id: [0x22; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![0x33; ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![0x44; ML_KEM_768_PUBKEY_LEN],
+        };
+        let good = OwnerDeviceEntry {
+            devices: vec![device],
+            device_identity_pubs: vec![None],
+            learned_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            device_tunnel_contacts: vec![Some(ok_contact.clone())],
+        };
+        let mut good_bytes = Vec::new();
+        into_writer(&good, &mut good_bytes).unwrap();
+        let recovered: OwnerDeviceEntry = from_reader(&good_bytes[..]).unwrap();
+        assert_eq!(recovered.device_tunnel_contacts, vec![Some(ok_contact)]);
+
+        // Now an oversized ML-DSA key (one byte past the canonical size).
+        let bad = OwnerDeviceEntry {
+            devices: vec![device],
+            device_identity_pubs: vec![None],
+            learned_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            device_tunnel_contacts: vec![Some(DeviceTunnelContact {
+                iroh_node_id: [0x22; 32],
+                home_relay_url: None,
+                pq_dsa_pubkey: vec![0x33; ML_DSA_65_PUBKEY_LEN + 1],
+                pq_kem_pubkey: vec![0x44; ML_KEM_768_PUBKEY_LEN],
+            })],
+        };
+        let mut bad_bytes = Vec::new();
+        into_writer(&bad, &mut bad_bytes).unwrap();
+        let err = from_reader::<OwnerDeviceEntry, _>(&bad_bytes[..]);
+        assert!(
+            err.is_err(),
+            "an oversized PQ key must fail deserialization, got Ok"
+        );
     }
 }
 
@@ -3973,6 +4277,7 @@ mod owner_device_entry_deserialize_tests {
                 logical: 0,
                 device_id: "d".into(),
             },
+            device_tunnel_contacts: vec![None],
         };
         let bytes = crate::owner_state_crypto::canonical_cbor_encode(&entry).unwrap();
         let recovered: OwnerDeviceEntry =
@@ -4003,6 +4308,7 @@ mod owner_device_entry_deserialize_tests {
                 logical: 0,
                 device_id: "d".into(),
             },
+            device_tunnel_contacts: vec![None; devices.len()],
         };
         let bytes = crate::owner_state_crypto::canonical_cbor_encode(&entry).unwrap();
         let recovered: OwnerDeviceEntry =

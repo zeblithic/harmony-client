@@ -257,10 +257,7 @@ impl DmTransport for RuntimeUnicastTransport {
             sender_devices: vec![self.our_signing_device_hash],
             signing_device_hash: self.our_signing_device_hash,
         };
-        let packet = crate::dm_envelope::build_signed_cidnotify(signed, &self.signing_key)
-            .map_err(|e| TransportError::Permanent(format!("build_signed_cidnotify: {e}")))?;
-        let wire = crate::dm_envelope::encode_packet(&packet)
-            .map_err(|e| TransportError::Permanent(format!("encode_packet: {e}")))?;
+        let wire = build_dm_packet(signed, &self.signing_key).map_err(TransportError::Permanent)?;
 
         for destination_hash in destinations {
             // Use try_send (not send().await) because this transport runs
@@ -321,6 +318,28 @@ impl DmTransport for DepositOnlyDmTransport {
                 .to_string(),
         ))
     }
+}
+
+/// Build the sealed+signed DM wire bytes for a `DmCidNotifySigned` —
+/// `build_signed_cidnotify` (sign with the Reticulum device signing key)
+/// → `encode_packet` (canonical-CBOR framing). ZEB-473 Task 8 factored this
+/// out of the deposit path (`DmOutbox::build_cidnotify_packet_bytes`) so the
+/// live tunnel carrier (`IrohTunnelDmTransport`) produces byte-identical
+/// packets — the recipient's verify/decrypt/ingest pipeline sees exactly
+/// what a deposit arrival would carry, and CRDT-inbox dedup collapses the
+/// deposit copy with the tunnel copy.
+///
+/// Encode is effectively infallible (fixed-shape struct over canonical CBOR),
+/// but both inner calls are fallible, so this returns `Result<_, String>`
+/// (matching the deposit path's existing error propagation) rather than
+/// panicking.
+pub(crate) fn build_dm_packet(
+    signed: crate::dm_envelope::DmCidNotifySigned,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<Vec<u8>, String> {
+    let packet = crate::dm_envelope::build_signed_cidnotify(signed, signing_key)
+        .map_err(|e| format!("build_signed_cidnotify: {e}"))?;
+    crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1334,9 +1353,7 @@ impl DmOutbox {
             sender_devices: vec![self.our_signing_device_hash],
             signing_device_hash: self.our_signing_device_hash,
         };
-        let packet = crate::dm_envelope::build_signed_cidnotify(signed, &self.signing_key)
-            .map_err(|e| format!("build_signed_cidnotify: {e}"))?;
-        crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
+        build_dm_packet(signed, &self.signing_key)
     }
 
     /// Build + push one butler-deposit candidate for `(entry_id,
@@ -1576,6 +1593,9 @@ impl DmOutbox {
             signed.inviter,
             signed.sender_devices.clone(),
             device_identity_pubs,
+            // ZEB-473: no tunnel contacts on this DM-receive cache refresh
+            // (populated only on the friend handshake, Task 5).
+            Vec::new(),
             learned_at,
         );
         if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
@@ -1643,7 +1663,6 @@ impl DmOutbox {
         outbox_arc: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
         state_arc: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
         cas: std::sync::Arc<dyn ContentStore>,
-        unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
         app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
         signed: crate::dm_envelope::DmCidNotifySigned,
         signature: [u8; 64],
@@ -1704,6 +1723,9 @@ impl DmOutbox {
                 resolved_owner,
                 signed.sender_devices.clone(),
                 updated_pubs,
+                // ZEB-473: no tunnel contacts on this DM-receive cache
+                // refresh (populated only on the friend handshake, Task 5).
+                Vec::new(),
                 Hlc {
                     wall_ms: wall_now_ms,
                     logical: 0,
@@ -1761,6 +1783,18 @@ impl DmOutbox {
                     return;
                 }
             };
+            // OD1 (ZEB-473): re-verify the SpaceKind gate too. A Space-kind
+            // change during the TOCTOU window (Phase B's slow CAS fetch) would
+            // otherwise bypass the Phase A admission gate, letting a DM apply to
+            // a Space that is no longer Dm/GroupDm. Symmetric with the re-check
+            // in `dm_inbox_ingest::ingest_dm_packet`.
+            if !matches!(space_c.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+                tracing::warn!(
+                    error = ?DmReceiveError::SpaceKindMismatch,
+                    "handle_cidnotify_lifted Phase C: dropping packet (Space kind changed in TOCTOU window)"
+                );
+                return;
+            }
             if !space_c.members.contains(&resolved_owner) {
                 tracing::warn!(
                     error = ?DmReceiveError::SenderNotInSpaceMembers,
@@ -1814,71 +1848,14 @@ impl DmOutbox {
                     });
             }
 
-            // Build + try_send acks (cheap — non-blocking).
-            let our_ack_devices = state_g
-                .owner_device_cache
-                .devices
-                .get(&outbox_g.self_owner)
-                .map(|e| e.devices.clone())
-                .filter(|devs| devs.contains(&outbox_g.our_signing_device_hash))
-                .unwrap_or_else(|| vec![outbox_g.our_signing_device_hash]);
-            let ack_signed = crate::dm_envelope::DmAckSigned {
-                space_id: signed.space_id,
-                message_cid: signed.message_cid,
-                ack_from_owner_addr: outbox_g.self_owner,
-                ack_from_devices: our_ack_devices,
-                signing_device_hash: outbox_g.our_signing_device_hash,
-            };
-            // Ack pipeline: build + encode + try_send. Failures here
-            // do NOT abort — apply_inbox already mutated state, and
-            // skipping the post-lock IPC emit would diverge UI from
-            // persisted state. Match the existing channel-pressure
-            // pattern below: log + continue. Sender retransmits the
-            // CidNotify which produces a fresh ack opportunity.
-            let ack_wire_opt =
-                match crate::dm_envelope::build_signed_ack(ack_signed, &outbox_g.signing_key) {
-                    Ok(packet) => match crate::dm_envelope::encode_packet(&packet) {
-                        Ok(w) => Some(w),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = ?DmReceiveError::Decode(format!("encode_packet ack: {e}")),
-                                "handle_cidnotify_lifted Phase C: ack encode failed; \
-                                 continuing to dm-received emit so UI stays in sync \
-                                 with persisted inbox; sender will retransmit CidNotify"
-                            );
-                            None
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            error = ?DmReceiveError::Decode(format!("build_signed_ack: {e}")),
-                            "handle_cidnotify_lifted Phase C: ack build failed; \
-                             continuing to dm-received emit so UI stays in sync \
-                             with persisted inbox; sender will retransmit CidNotify"
-                        );
-                        None
-                    }
-                };
-            // DORMANT (ZEB-474 → ZEB-473/Move 1a): the Reticulum unicast
-            // carrier is removed; these ack packets reach the pinned core's
-            // SendUnicastToDevice handler and are dropped (no worse than
-            // today — off-LAN acks already dropped). Move 1a rewires this
-            // fan-out onto the iroh tunnel. Delivery confirmation in the
-            // interim comes from the butler-deposit ack, not this read-ack.
-            if let Some(ack_wire) = ack_wire_opt {
-                for device in &signed.sender_devices {
-                    let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
-                    if let Err(e) = unicast_send_tx.try_send(UnicastSendRequest {
-                        destination_hash: dest_hash,
-                        packet: ack_wire.clone(),
-                    }) {
-                        tracing::warn!(
-                            error = ?e,
-                            "handle_cidnotify_lifted Phase C: ack fan-out dropped due to channel pressure; sender will retransmit CidNotify"
-                        );
-                    }
-                }
-            }
+            // ZEB-473 (Move 1a): the read-ack unicast fan-out (build DmAckSigned
+            // + try_send one per `signed.sender_devices`) was removed along with
+            // the Reticulum carrier (harmony#280). Those ack packets reached the
+            // dropped `SendUnicastToDevice` bridge and went nowhere, so removing
+            // the build+fan-out changes nothing observable. Delivery confirmation
+            // already comes from the butler-deposit ack, not this read-ack; the
+            // dm-received IPC emit below keeps the UI in sync. Re-wiring the
+            // read-ack onto the iroh tunnel is a later move.
 
             drain_outcome
         }; // locks dropped here
@@ -2009,6 +1986,9 @@ impl DmOutbox {
             resolved_owner,
             signed.ack_from_devices.clone(),
             updated_pubs,
+            // ZEB-473: no tunnel contacts on this DM-ack cache refresh
+            // (populated only on the friend handshake, Task 5).
+            Vec::new(),
             Hlc {
                 wall_ms: wall_now_ms,
                 logical: 0,
@@ -3196,6 +3176,7 @@ mod tests {
             OwnerDeviceEntry {
                 devices: vec![DeviceIdentityHash([0xa1; 16])],
                 device_identity_pubs: vec![Some([0x11; 64])],
+                device_tunnel_contacts: vec![None],
                 learned_at: Hlc {
                     wall_ms: 1,
                     logical: 0,
@@ -3229,6 +3210,7 @@ mod tests {
             OwnerDeviceEntry {
                 devices: vec![shared],
                 device_identity_pubs: vec![Some([0x11; 64])],
+                device_tunnel_contacts: vec![None],
                 learned_at: Hlc {
                     wall_ms: 1,
                     logical: 0,
@@ -3241,6 +3223,7 @@ mod tests {
             OwnerDeviceEntry {
                 devices: vec![shared], // same hash claimed by a different owner
                 device_identity_pubs: vec![Some([0x22; 64])],
+                device_tunnel_contacts: vec![None],
                 learned_at: Hlc {
                     wall_ms: 1,
                     logical: 0,
@@ -4367,16 +4350,19 @@ mod tests {
         let bob_entry = OwnerDeviceEntry {
             devices: vec![bob_dev],
             device_identity_pubs: vec![Some([0xbb; 64])],
+            device_tunnel_contacts: vec![None],
             learned_at: learned_at.clone(),
         };
         let carol_old_entry = OwnerDeviceEntry {
             devices: vec![carol_dev_old],
             device_identity_pubs: vec![Some([0xc1; 64])],
+            device_tunnel_contacts: vec![None],
             learned_at: learned_at.clone(),
         };
         let carol_new_entry = OwnerDeviceEntry {
             devices: vec![carol_dev_new],
             device_identity_pubs: vec![Some([0xc2; 64])],
+            device_tunnel_contacts: vec![None],
             learned_at,
         };
 
@@ -5248,6 +5234,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![Some(alice_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -5357,8 +5344,11 @@ mod tests {
     /// returned errors / outcomes now inspect post-call state directly:
     /// - `state.inbox.contains_key(...)` for InboxEntry presence
     /// - `state.owner_device_cache.devices.get(...)` for cache state
-    /// - the `rx` channel for ack fan-out (drained from caller after this
-    ///   helper returns)
+    ///
+    /// ZEB-473 (Move 1a): the read-ack unicast fan-out was removed with the
+    /// Reticulum carrier, so `handle_cidnotify_lifted` no longer emits acks.
+    /// The `_tx` param is retained only so callers can keep a paired `rx` to
+    /// assert that NO ack fires; it is intentionally not forwarded to the fn.
     ///
     /// `&mut outbox` and `&mut state` are returned as the unwrapped owned
     /// values so callers can assign back: `let (outbox, state) = run(...)`.
@@ -5367,7 +5357,7 @@ mod tests {
         outbox: DmOutbox,
         state: OwnerState,
         cas: std::sync::Arc<dyn ContentStore>,
-        tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        _tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
         signed: crate::dm_envelope::DmCidNotifySigned,
         signature: [u8; 64],
         signed_bytes: Vec<u8>,
@@ -5382,7 +5372,6 @@ mod tests {
             std::sync::Arc::clone(&outbox_arc),
             std::sync::Arc::clone(&state_arc),
             cas,
-            tx,
             app,
             signed,
             signature,
@@ -5452,31 +5441,23 @@ mod tests {
         let entry = state.inbox.get(&inbox_key).unwrap();
         assert_eq!(entry.from, alice);
 
-        // One UnicastSendRequest emitted per sender device (one device
-        // here, so exactly one).
-        let req = rx.try_recv().expect("ack must have been pushed");
-        assert!(!req.packet.is_empty(), "ack packet bytes must be non-empty");
-        assert!(rx.try_recv().is_err(), "exactly one ack expected");
-        // Ack packet decodes as DmAck with our signing_device_hash.
-        let ack = crate::dm_envelope::decode_packet(&req.packet).unwrap();
-        match ack {
-            crate::dm_envelope::DmPacket::Ack { signed: ack, .. } => {
-                assert_eq!(ack.space_id, space_id);
-                assert_eq!(ack.message_cid, message_cid);
-                assert_eq!(ack.ack_from_owner_addr, bob);
-            }
-            other => panic!("expected DmAck, got {other:?}"),
-        }
+        // ZEB-473 (Move 1a): the read-ack unicast fan-out was removed with the
+        // Reticulum carrier (harmony#280) — `handle_cidnotify_lifted` no longer
+        // emits a DmAck. The InboxEntry write above is the load-bearing receive
+        // contract; delivery confirmation comes from the butler-deposit ack.
+        assert!(
+            rx.try_recv().is_err(),
+            "no read-ack must fire (Reticulum carrier removed, ZEB-473)"
+        );
     }
 
     #[tokio::test]
     async fn handle_unicast_cidnotify_duplicate_no_dm_received_emit() {
         // Atomic-emit semantics: a duplicate notify (same composite key)
         // MUST NOT re-emit dm-received. apply_inbox returns NoOp/Merged
-        // on the second call → newly_received stays empty. (The first
-        // call's full-ack-fan-out behavior is exercised by the happy-path
-        // test above; this test only checks the second-call
-        // empty-newly_received contract.)
+        // on the second call → newly_received stays empty. (This test only
+        // checks the second-call empty-newly_received contract; the read-ack
+        // fan-out was removed in ZEB-473 with the Reticulum carrier.)
         let alice = OwnerAddr([0x01; 16]);
         let bob = OwnerAddr([0x02; 16]);
         let space_id = SpaceId([7; 16]);
@@ -5519,9 +5500,9 @@ mod tests {
             .expect("first call must populate inbox")
             .clone();
         assert_eq!(first_entry.received_at.wall_ms, 500);
-        // Drain the ack the first call emitted so we can check the second
-        // call's emit count cleanly.
-        let _ = rx.try_recv();
+        // ZEB-473 (Move 1a): no read-ack fires anymore (Reticulum carrier
+        // removed); the channel is empty after the first call.
+        assert!(rx.try_recv().is_err(), "no read-ack must fire (ZEB-473)");
 
         // Second call — same packet bytes, different wall_now_ms (600).
         // apply_inbox returns Merged/NoOp (composite key already exists),
@@ -5575,6 +5556,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![Some(alice_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -5776,6 +5758,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![None], // pre-bootstrap: hash known, pub not yet learned
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -5878,6 +5861,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![Some(alice_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -6014,6 +5998,7 @@ mod tests {
             bob,
             vec![bob_device_hash],
             vec![Some(bob_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -6135,6 +6120,7 @@ mod tests {
             mallory,
             vec![mallory_device_hash],
             vec![Some(mallory_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 60,
                 logical: 0,
@@ -7009,7 +6995,7 @@ mod tests {
         let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
 
         let outbox = make_outbox_synthetic("bob-dev", bob);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
 
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
@@ -7020,7 +7006,6 @@ mod tests {
             std::sync::Arc::clone(&outbox_arc),
             std::sync::Arc::clone(&state_arc),
             std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
-            tx,
             app,
             signed,
             signature,
@@ -7058,8 +7043,9 @@ mod tests {
             .unwrap_or_else(|_| panic!("state Arc has lingering refs"))
             .into_inner();
 
-        // Phase C must have decrypted via prior-keys fallback,
-        // installed the InboxEntry, and fanned out one ack.
+        // Phase C must have decrypted via prior-keys fallback and
+        // installed the InboxEntry. ZEB-473 (Move 1a): the read-ack
+        // fan-out was removed with the Reticulum carrier, so no ack fires.
         let inbox_key = crate::owner_state_types::InboxKey {
             space_id,
             message_cid,
@@ -7070,8 +7056,10 @@ mod tests {
         );
         let entry = state.inbox.get(&inbox_key).unwrap();
         assert_eq!(entry.from, alice);
-        let req = rx.try_recv().expect("ack must have fanned out");
-        assert!(!req.packet.is_empty(), "ack packet must be non-empty");
+        assert!(
+            rx.try_recv().is_err(),
+            "no read-ack must fire (Reticulum carrier removed, ZEB-473)"
+        );
     }
 
     #[tokio::test]
@@ -7116,7 +7104,7 @@ mod tests {
         let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
 
         let outbox = make_outbox_synthetic("bob-dev", bob);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
         let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
@@ -7126,7 +7114,6 @@ mod tests {
             std::sync::Arc::clone(&outbox_arc),
             std::sync::Arc::clone(&state_arc),
             std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
-            tx,
             app,
             signed,
             signature,
@@ -7205,6 +7192,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![Some(alice_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -7286,7 +7274,7 @@ mod tests {
         let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
 
         let outbox = make_outbox_synthetic("bob-dev", bob);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
         let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
@@ -7296,7 +7284,6 @@ mod tests {
             std::sync::Arc::clone(&outbox_arc),
             std::sync::Arc::clone(&state_arc),
             std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
-            tx,
             app,
             signed,
             signature,
@@ -7410,6 +7397,7 @@ mod tests {
             alice,
             vec![alice_device_hash],
             vec![Some(alice_identity_pub)],
+            vec![],
             Hlc {
                 wall_ms: 50,
                 logical: 0,
@@ -7483,7 +7471,7 @@ mod tests {
             get_call_count: std::sync::atomic::AtomicUsize::new(0),
         });
         let outbox = make_outbox_synthetic("bob-dev", bob);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
         let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
@@ -7496,7 +7484,6 @@ mod tests {
             std::sync::Arc::clone(&outbox_arc),
             std::sync::Arc::clone(&state_arc),
             std::sync::Arc::clone(&cas) as std::sync::Arc<dyn ContentStore>,
-            tx,
             app,
             signed,
             signature,
@@ -8085,6 +8072,104 @@ mod tests {
             matches!(stored.delivery_status, DeliveryStatus::Complete),
             "sole recipient acked via butler -> Complete"
         );
+    }
+
+    /// ZEB-473 Task 8 / CR4 — always-deposit invariant for the LIVE tunnel
+    /// carrier with the CONTACT-PRESENT path exercised: Bob has a cached,
+    /// correctly-sized `DeviceTunnelContact`, so the transport actually resolves
+    /// a tunnel target and fires `send_dm`. Even so, the transport returns the
+    /// SAME `Transient` contract, so the deposit rung STILL fires on the second
+    /// drain pass and the DM delivers — no durability regression. (Previously
+    /// this test passed `OwnerState::default()`, covering only the resolver-miss
+    /// path; CR4 seeds the contact so the contact-present rung is covered too.)
+    #[tokio::test]
+    async fn tunnel_transport_still_routes_dm_to_deposit_rung_and_delivers_on_ack() {
+        use crate::owner_state_types::{DeviceTunnelContact, OwnerDeviceEntry};
+
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        let entry_id = entry.id;
+        let space_id = SpaceId([1u8; 16]);
+        let message_cid = ContentId::from_bytes([3u8; 32]);
+
+        let mut state = OwnerState::default();
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = make_outbox_synthetic("dev", alice);
+        let mock = MockDepositClient::returning(crate::butler_deposit::DepositRungOutcome::Acked);
+        o.set_butler_deposit_client(mock.clone());
+
+        // Build the live tunnel transport over a real loopback iroh endpoint.
+        let endpoint = {
+            let sk = iroh::SecretKey::generate();
+            crate::iroh_endpoint::IrohEndpoint::new_with_secret(sk)
+                .await
+                .expect("bind loopback iroh endpoint")
+        };
+        let local_pq = Arc::new(harmony_identity::PqPrivateIdentity::generate(
+            &mut rand::rngs::OsRng,
+        ));
+        let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
+        let mgr = Arc::new(crate::tunnel_manager::TunnelManager::new(
+            endpoint, local_pq, ingest_tx,
+        ));
+
+        // CR4: seed Bob's cached tunnel contact into the transport's resolution
+        // state so the CONTACT-PRESENT tunnel attempt is exercised (not just the
+        // resolver-miss path). Correctly-sized PQ keys so it's a valid contact.
+        let mut resolver_state = OwnerState::default();
+        resolver_state.owner_device_cache.devices.insert(
+            bob,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0xb0; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "bob".into(),
+                },
+                device_tunnel_contacts: vec![Some(DeviceTunnelContact {
+                    iroh_node_id: [0xb1; 32],
+                    home_relay_url: None,
+                    pq_dsa_pubkey: vec![0xb2; crate::owner_state_types::ML_DSA_65_PUBKEY_LEN],
+                    pq_kem_pubkey: vec![0xb3; crate::owner_state_types::ML_KEM_768_PUBKEY_LEN],
+                })],
+            },
+        );
+        let transport = crate::iroh_tunnel_dm_transport::IrohTunnelDmTransport::new(
+            mgr,
+            Arc::new(tokio::sync::Mutex::new(resolver_state)),
+            Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])),
+            alice,
+            DeviceIdentityHash([0xaa; 16]),
+        );
+
+        // Tick 1 (t=10_000): first Transient → no prior AttemptState → no rung.
+        let outcome1 = o.drain(&mut state, &transport, 10_000).await;
+        assert!(
+            mock.calls().is_empty(),
+            "first transient must not fire deposit rung (no prior AttemptState)"
+        );
+        assert!(outcome1.newly_delivered.is_empty());
+
+        // Tick 2 (backoff window elapsed): second Transient → rung fires → ack.
+        let outcome2 = o.drain(&mut state, &transport, 15_000).await;
+        assert_eq!(
+            mock.calls().len(),
+            1,
+            "deposit rung must fire exactly once on tick 2 even with the live tunnel transport"
+        );
+        assert_eq!(mock.calls()[0].entry_id, entry_id);
+        assert_eq!(mock.calls()[0].recipient_owner, bob);
+        assert_eq!(
+            outcome2.newly_delivered,
+            vec![(space_id, message_cid, bob)],
+            "butler ack must surface (no durability regression from the tunnel carrier)"
+        );
+        let stored = state.outbox.get(&entry_id).expect("entry still present");
+        assert!(stored.delivered_to.contains(&bob), "bob marked delivered");
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
     }
 
     /// With `DepositOnlyDmTransport` and NO deposit client installed, the

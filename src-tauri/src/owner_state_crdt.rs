@@ -602,18 +602,22 @@ impl OwnerState {
         addr: OwnerAddr,
         devices: Vec<DeviceIdentityHash>,
         device_identity_pubs: Vec<Option<[u8; 64]>>,
+        device_tunnel_contacts: Vec<Option<crate::owner_state_types::DeviceTunnelContact>>,
         learned_at: Hlc,
     ) -> ApplyOutcome {
         // Sanitize: the on-the-wire vec might be unsorted / duplicated /
         // oversized. Sort+dedup `devices` while maintaining the parallel-
-        // vec correspondence with `device_identity_pubs`.
+        // vec correspondence with `device_identity_pubs` AND (ZEB-473)
+        // `device_tunnel_contacts`.
         //
-        // Pad/truncate device_identity_pubs to match devices.len() FIRST so
-        // the zip is well-formed even if the caller passed a mismatched-
-        // length pubs vec (Phase 1/2 callers pass `vec![]`; defensive
-        // sanitization is cheap).
+        // Pad/truncate the parallel vecs to match devices.len() FIRST so
+        // the zip is well-formed even if the caller passed mismatched-
+        // length vecs (most callers pass `vec![]` for one or both;
+        // defensive sanitization is cheap).
         let mut pubs = device_identity_pubs;
         pubs.resize(devices.len(), None);
+        let mut contacts = device_tunnel_contacts;
+        contacts.resize(devices.len(), None);
 
         // Zip into Vec<(DeviceIdentityHash, Option<[u8; 64]>)>, sort by
         // .0, then walk-and-merge consecutive entries with the same hash.
@@ -636,15 +640,32 @@ impl OwnerState {
         //     `DeviceIdentityHash` is either malicious or a bug in their
         //     bootstrap path; either way, silently picking one would leak
         //     a TOCTOU into signature verification.
-        let mut zipped: Vec<(DeviceIdentityHash, Option<[u8; 64]>)> =
-            devices.into_iter().zip(pubs).collect();
-        zipped.sort_by_key(|(d, _)| *d);
+        //
+        // ZEB-473: `device_tunnel_contacts` rides as a THIRD parallel
+        // element through the same sort+merge. Its merge rule differs from
+        // pubs: a tunnel contact is a routing hint that legitimately changes
+        // (rotated iroh node id / relay / PQ keys), so there is NO
+        // InvariantFail — a `None` never overwrites a `Some`, and two
+        // differing `Some`s collapse to the LAST one seen (within a single
+        // update there is no per-element HLC; the existing-vs-new merge below
+        // applies the true LWW-by-`learned_at` rule across updates).
+        type DevTriple = (
+            DeviceIdentityHash,
+            Option<[u8; 64]>,
+            Option<crate::owner_state_types::DeviceTunnelContact>,
+        );
+        let mut zipped: Vec<DevTriple> = devices
+            .into_iter()
+            .zip(pubs)
+            .zip(contacts)
+            .map(|((d, p), t)| (d, p, t))
+            .collect();
+        zipped.sort_by_key(|(d, _, _)| *d);
 
-        let mut merged: Vec<(DeviceIdentityHash, Option<[u8; 64]>)> =
-            Vec::with_capacity(zipped.len());
-        for (d, p) in zipped {
+        let mut merged: Vec<DevTriple> = Vec::with_capacity(zipped.len());
+        for (d, p, t) in zipped {
             match merged.last_mut() {
-                Some((prev_d, prev_p)) if *prev_d == d => {
+                Some((prev_d, prev_p, prev_t)) if *prev_d == d => {
                     // Merge into the existing entry per the rules above.
                     match (*prev_p, p) {
                         (None, None) => {}
@@ -661,8 +682,13 @@ impl OwnerState {
                             ));
                         }
                     }
+                    // Contact: None never overwrites Some; otherwise
+                    // last-Some-wins. No reject (LWW, not authority).
+                    if t.is_some() {
+                        *prev_t = t;
+                    }
                 }
-                _ => merged.push((d, p)),
+                _ => merged.push((d, p, t)),
             }
         }
         merged.truncate(MAX_DEVICES_PER_OWNER);
@@ -677,7 +703,7 @@ impl OwnerState {
         // apply time. `derive_device_hash_from_identity_pub` returns
         // `None` for a structurally-invalid pub (malformed X25519 /
         // Ed25519 split) — also reject as InvariantFail.
-        for (d, p) in merged.iter() {
+        for (d, p, _t) in merged.iter() {
             if let Some(pub_bytes) = p {
                 match crate::dm_signing::derive_device_hash_from_identity_pub(pub_bytes) {
                     Some(derived) if derived == *d => {}
@@ -699,7 +725,29 @@ impl OwnerState {
             }
         }
 
-        let (sanitized_devices, sanitized_pubs): (Vec<_>, Vec<_>) = merged.into_iter().unzip();
+        let mut sanitized_devices = Vec::with_capacity(merged.len());
+        let mut sanitized_pubs = Vec::with_capacity(merged.len());
+        let mut sanitized_contacts = Vec::with_capacity(merged.len());
+        for (d, p, t) in merged {
+            sanitized_devices.push(d);
+            sanitized_pubs.push(p);
+            sanitized_contacts.push(t);
+        }
+
+        // CR9 (ZEB-473): reject any tunnel contact whose PQ key sizes are wrong
+        // or whose relay URL is oversized BEFORE the LWW insertion. A
+        // malformed/handshake-derived contact must never enter replicated CRDT
+        // state (it would only fail dials forever + bloat owner-state payloads).
+        // Symmetric with `peer_handshake_contact`'s admission gate.
+        for contact in sanitized_contacts.iter().flatten() {
+            if !contact.has_valid_key_sizes() {
+                return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                    "owner_device_entry for {:?} has a tunnel contact with invalid PQ key \
+                     sizes or an oversized relay URL",
+                    addr
+                )));
+            }
+        }
 
         // LWW guard.
         if let Some(existing) = self.owner_device_cache.devices.get(&addr) {
@@ -710,9 +758,9 @@ impl OwnerState {
                 });
             }
             if existing.learned_at == learned_at {
-                // Equal HLC — only idempotent if the payload (devices AND
-                // pubs) matches. Two replicas concurrently issuing
-                // different payloads under the same HLC would otherwise
+                // Equal HLC — only idempotent if the payload (devices, pubs
+                // AND tunnel contacts) matches. Two replicas concurrently
+                // issuing different payloads under the same HLC would otherwise
                 // diverge silently.
                 //
                 // Note on equal-HLC + None-from-existing-Some: at equal
@@ -722,16 +770,25 @@ impl OwnerState {
                 // same HLC would mean the same source emitted two
                 // different payloads under the same HLC, which is a
                 // non-deterministic-source invariant fail. Reject. The
-                // pub-preserve merge below applies only when new HLC
-                // is strictly newer.
+                // pub-preserve / contact-preserve merges below apply only
+                // when the new HLC is strictly newer.
+                //
+                // ZEB-473: `device_tunnel_contacts` is included here too.
+                // Without it, two replicas could accept different contacts
+                // under the same `learned_at` — each treating the other's
+                // entry as an idempotent replay — and stably diverge on the
+                // PQ tunnel routing hint, breaking CRDT convergence for the
+                // new payload the same way diverging devices/pubs would.
                 if existing.devices == sanitized_devices
                     && existing.device_identity_pubs == sanitized_pubs
+                    && existing.device_tunnel_contacts == sanitized_contacts
                 {
                     return ApplyOutcome::Merged { old_id: None };
                 }
                 return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
                     "owner_device_entry for {:?} diverges at identical learned_at \
-                     (concurrent updates with same HLC but different devices or pubs)",
+                     (concurrent updates with same HLC but different devices, pubs, or \
+                     tunnel contacts)",
                     addr
                 )));
             }
@@ -785,6 +842,36 @@ impl OwnerState {
                 sanitized_pubs.clone()
             };
 
+        // ZEB-473: per-device tunnel-contact LWW across updates. At this
+        // point the new entry has STRICTLY NEWER `learned_at` (equal/older
+        // HLC returned early above), so the new contact wins — EXCEPT a
+        // `None` never erases a previously-known `Some` (a peer that learned
+        // a device but hasn't yet propagated its reachability/PQ keys, e.g.
+        // an older client, would otherwise clobber a good contact on every
+        // gossip). Unlike pubs there is NO conflict reject: a differing
+        // `Some` is a legitimately-rotated routing hint and last-(newer-HLC)-
+        // writer wins.
+        let merged_contacts: Vec<Option<crate::owner_state_types::DeviceTunnelContact>> =
+            if let Some(existing) = self.owner_device_cache.devices.get(&addr) {
+                let mut out = Vec::with_capacity(sanitized_devices.len());
+                for (d, new_t) in sanitized_devices.iter().zip(sanitized_contacts.iter()) {
+                    let merged = match existing.devices.binary_search(d) {
+                        Ok(idx) => match (&existing.device_tunnel_contacts[idx], new_t) {
+                            // None never overwrites a known contact.
+                            (Some(c), None) => Some(c.clone()),
+                            // Otherwise the newer-HLC entry's value wins.
+                            _ => new_t.clone(),
+                        },
+                        // Device hash is new to the cache — take the new value.
+                        Err(_) => new_t.clone(),
+                    };
+                    out.push(merged);
+                }
+                out
+            } else {
+                sanitized_contacts.clone()
+            };
+
         let was_present = self.owner_device_cache.devices.contains_key(&addr);
         self.owner_device_cache.devices.insert(
             addr,
@@ -792,6 +879,7 @@ impl OwnerState {
                 devices: sanitized_devices,
                 device_identity_pubs: merged_pubs,
                 learned_at,
+                device_tunnel_contacts: merged_contacts,
             },
         );
         if was_present {
@@ -3130,8 +3218,13 @@ mod owner_device_cache_tests {
             device_id: "d".into(),
         };
 
-        let outcome =
-            state.apply_owner_device_update(owner, devices.clone(), pubs.clone(), learned_at);
+        let outcome = state.apply_owner_device_update(
+            owner,
+            devices.clone(),
+            pubs.clone(),
+            vec![],
+            learned_at,
+        );
         assert!(matches!(outcome, ApplyOutcome::Inserted));
 
         let entry = state.owner_device_cache.devices.get(&owner).unwrap();
@@ -3173,7 +3266,7 @@ mod owner_device_cache_tests {
             device_id: "d".into(),
         };
 
-        state.apply_owner_device_update(owner, devices, pubs, learned_at);
+        state.apply_owner_device_update(owner, devices, pubs, vec![], learned_at);
         let entry = state.owner_device_cache.devices.get(&owner).unwrap();
 
         // Sorted ascending by hash, merged to 3 unique devices.
@@ -3201,8 +3294,13 @@ mod owner_device_cache_tests {
             device_id: "d".into(),
         };
 
-        let outcome =
-            state.apply_owner_device_update(owner, vec![d1, d1], vec![None, Some(p)], learned_at);
+        let outcome = state.apply_owner_device_update(
+            owner,
+            vec![d1, d1],
+            vec![None, Some(p)],
+            vec![],
+            learned_at,
+        );
         assert!(matches!(outcome, ApplyOutcome::Inserted));
         let entry = state.owner_device_cache.devices.get(&owner).unwrap();
         assert_eq!(entry.devices, vec![d1]);
@@ -3228,8 +3326,13 @@ mod owner_device_cache_tests {
             device_id: "d".into(),
         };
 
-        let outcome =
-            state.apply_owner_device_update(owner, vec![d1, d1], vec![Some(p), None], learned_at);
+        let outcome = state.apply_owner_device_update(
+            owner,
+            vec![d1, d1],
+            vec![Some(p), None],
+            vec![],
+            learned_at,
+        );
         assert!(matches!(outcome, ApplyOutcome::Inserted));
         let entry = state.owner_device_cache.devices.get(&owner).unwrap();
         assert_eq!(entry.devices, vec![d1]);
@@ -3257,6 +3360,7 @@ mod owner_device_cache_tests {
             owner,
             vec![d1, d1],
             vec![Some(p_a), Some(p_b)],
+            vec![],
             learned_at,
         );
         match outcome {
@@ -3306,6 +3410,7 @@ mod owner_device_cache_tests {
             owner,
             vec![mismatched_hash],
             vec![Some(real_pub)],
+            vec![],
             learned_at,
         );
         match outcome {
@@ -3340,6 +3445,7 @@ mod owner_device_cache_tests {
             owner,
             vec![device_hash],
             vec![Some(identity_pub)],
+            vec![],
             learned_at,
         );
         assert!(
@@ -3368,6 +3474,7 @@ mod owner_device_cache_tests {
             owner,
             vec![d1],
             vec![Some(p1)],
+            vec![],
             Hlc {
                 wall_ms: 10,
                 logical: 0,
@@ -3381,6 +3488,7 @@ mod owner_device_cache_tests {
             owner,
             vec![d1],
             vec![None],
+            vec![],
             Hlc {
                 wall_ms: 20,
                 logical: 0,
@@ -3418,6 +3526,7 @@ mod owner_device_cache_tests {
             owner,
             vec![d1],
             vec![None],
+            vec![],
             Hlc {
                 wall_ms: 10,
                 logical: 0,
@@ -3431,6 +3540,7 @@ mod owner_device_cache_tests {
             owner,
             vec![d1],
             vec![Some(p1)],
+            vec![],
             Hlc {
                 wall_ms: 20,
                 logical: 0,
@@ -3491,6 +3601,7 @@ mod owner_device_cache_tests {
             owner,
             vec![d1],
             vec![Some(p1)],
+            vec![],
             Hlc {
                 wall_ms: 10,
                 logical: 0,
@@ -3505,6 +3616,7 @@ mod owner_device_cache_tests {
             owner,
             vec![d1],
             vec![Some(p1)],
+            vec![],
             Hlc {
                 wall_ms: 20,
                 logical: 0,
@@ -3538,9 +3650,217 @@ mod owner_device_cache_tests {
         // Phase 1/2 helper: pass empty pubs vec (apply resizes to
         // None-padded internally). Phase 3b's parallel-vec semantics are
         // exercised by the dedicated tests in this same module.
-        let outcome = state.apply_owner_device_update(addr, devices, vec![], learned_at);
+        let outcome = state.apply_owner_device_update(addr, devices, vec![], vec![], learned_at);
         *cache = state.owner_device_cache;
         outcome
+    }
+
+    // ----- ZEB-473: per-device tunnel-contact parallel vec -----
+
+    fn tunnel_contact(seed: u8) -> crate::owner_state_types::DeviceTunnelContact {
+        use crate::owner_state_types::{ML_DSA_65_PUBKEY_LEN, ML_KEM_768_PUBKEY_LEN};
+        // CR9: correctly-sized PQ keys so the contact passes the apply-time
+        // key-size validation gate (a wrong-size contact is now rejected).
+        crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [seed; 32],
+            home_relay_url: Some(format!("https://relay.example/{seed}")),
+            pq_dsa_pubkey: vec![seed; ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![seed.wrapping_add(1); ML_KEM_768_PUBKEY_LEN],
+        }
+    }
+
+    #[test]
+    fn apply_owner_device_update_pads_short_tunnel_contacts_to_parity() {
+        // A `device_tunnel_contacts` vec SHORTER than `devices` must be
+        // padded with `None` to `devices.len()` (parity rule), and a
+        // supplied contact must land on its parallel index. We pre-sort the
+        // input so the post-apply order is canonical (the sort/merge path is
+        // covered by the pubs tests in this module).
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([7; 16]);
+        let (h_a, _p_a) = matching_device_pair(0xb1);
+        let (h_b, _p_b) = matching_device_pair(0xb2);
+        let (lo, hi) = if h_a < h_b { (h_a, h_b) } else { (h_b, h_a) };
+        let devices = vec![lo, hi];
+        let contact = tunnel_contact(0x55);
+        // Mismatched (short) length: only index 0 has a contact.
+        let contacts = vec![Some(contact.clone())];
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+
+        let outcome =
+            state.apply_owner_device_update(owner, devices.clone(), vec![], contacts, learned_at);
+        assert!(matches!(outcome, ApplyOutcome::Inserted));
+
+        let entry = state.owner_device_cache.devices.get(&owner).unwrap();
+        // Parity: contacts vec length == devices length, padded with None.
+        assert_eq!(entry.device_tunnel_contacts.len(), entry.devices.len());
+        assert_eq!(entry.device_tunnel_contacts.len(), 2);
+        // Index 0 round-trips the supplied contact; index 1 padded to None.
+        assert_eq!(entry.device_tunnel_contacts[0], Some(contact));
+        assert_eq!(entry.device_tunnel_contacts[1], None);
+    }
+
+    #[test]
+    fn apply_owner_device_update_truncates_long_tunnel_contacts_to_parity() {
+        // A `device_tunnel_contacts` vec LONGER than `devices` must be
+        // truncated to `devices.len()` (devices is the source of truth).
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([8; 16]);
+        let (h_a, _p_a) = matching_device_pair(0xc1);
+        let devices = vec![h_a];
+        let contacts = vec![Some(tunnel_contact(0x10)), Some(tunnel_contact(0x11))];
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+
+        state.apply_owner_device_update(owner, devices, vec![], contacts, learned_at);
+        let entry = state.owner_device_cache.devices.get(&owner).unwrap();
+        assert_eq!(entry.device_tunnel_contacts.len(), 1);
+        assert_eq!(entry.device_tunnel_contacts[0], Some(tunnel_contact(0x10)));
+    }
+
+    #[test]
+    fn apply_owner_device_update_rejects_tunnel_contact_with_invalid_key_sizes() {
+        // CR9 (ZEB-473): a tunnel contact with wrong-size PQ keys (the legacy
+        // 7/9-byte fake) must be REJECTED at apply time, never entering the
+        // CRDT — and the whole update is rejected, not silently sanitized.
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([0x33; 16]);
+        let (h_a, _p_a) = matching_device_pair(0xe1);
+        let devices = vec![h_a];
+        let bad_contact = crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [0x55; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![0x55; 7], // wrong size (was the old fixture size)
+            pq_kem_pubkey: vec![0x56; 9], // wrong size
+        };
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let outcome = state.apply_owner_device_update(
+            owner,
+            devices,
+            vec![],
+            vec![Some(bad_contact)],
+            learned_at,
+        );
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+            ),
+            "a wrong-size PQ tunnel contact must be rejected, got {outcome:?}"
+        );
+        assert!(
+            !state.owner_device_cache.devices.contains_key(&owner),
+            "the rejected update must not have mutated the CRDT"
+        );
+    }
+
+    #[test]
+    fn owner_device_entry_with_tunnel_contact_survives_cbor_roundtrip() {
+        // The manual Deserialize impl keeps `device_tunnel_contacts`
+        // parallel-indexed through the sort/merge, so a populated contact
+        // round-trips through CBOR.
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([9; 16]);
+        let (h_a, p_a) = matching_device_pair(0xd1);
+        let devices = vec![h_a];
+        let pubs = vec![Some(p_a)];
+        let contact = tunnel_contact(0x77);
+        let contacts = vec![Some(contact.clone())];
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        state.apply_owner_device_update(owner, devices, pubs, contacts, learned_at);
+        let entry = state
+            .owner_device_cache
+            .devices
+            .get(&owner)
+            .unwrap()
+            .clone();
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&entry, &mut bytes).unwrap();
+        let recovered: crate::owner_state_types::OwnerDeviceEntry =
+            ciborium::from_reader(&bytes[..]).unwrap();
+
+        assert_eq!(recovered, entry);
+        assert_eq!(recovered.device_tunnel_contacts.len(), 1);
+        assert_eq!(recovered.device_tunnel_contacts[0], Some(contact));
+    }
+
+    /// CodeAnt F5: equal-HLC idempotence must consider `device_tunnel_contacts`.
+    /// Two replicas issuing the SAME `learned_at` but DIFFERENT contacts would
+    /// otherwise each treat the other's entry as an idempotent replay and stably
+    /// diverge on the PQ tunnel routing hint. The equal-HLC guard must reject
+    /// the divergence (the same way diverging devices/pubs are rejected), and
+    /// must accept an identical-payload replay as idempotent.
+    #[test]
+    fn apply_owner_device_update_equal_hlc_diverging_contacts_rejected() {
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([0x77; 16]);
+        let (h_a, p_a) = matching_device_pair(0xe1);
+        let devices = vec![h_a];
+        let pubs = vec![Some(p_a)];
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "dev-a".into(),
+        };
+
+        // Seed with contact_v1.
+        let out1 = state.apply_owner_device_update(
+            owner,
+            devices.clone(),
+            pubs.clone(),
+            vec![Some(tunnel_contact(0x01))],
+            learned_at.clone(),
+        );
+        assert!(matches!(out1, ApplyOutcome::Inserted));
+
+        // Same HLC, same devices+pubs, but a DIFFERENT contact → must REJECT
+        // (would otherwise be a silent replica divergence).
+        let out_diverge = state.apply_owner_device_update(
+            owner,
+            devices.clone(),
+            pubs.clone(),
+            vec![Some(tunnel_contact(0x02))],
+            learned_at.clone(),
+        );
+        assert!(
+            matches!(
+                out_diverge,
+                ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+            ),
+            "equal-HLC with diverging tunnel contacts must be rejected, got {out_diverge:?}"
+        );
+        // The cache still holds contact_v1 (the reject did not mutate state).
+        let entry = state.owner_device_cache.devices.get(&owner).unwrap();
+        assert_eq!(entry.device_tunnel_contacts[0], Some(tunnel_contact(0x01)));
+
+        // Same HLC + IDENTICAL contact → idempotent replay (Merged), not reject.
+        let out_replay = state.apply_owner_device_update(
+            owner,
+            devices,
+            pubs,
+            vec![Some(tunnel_contact(0x01))],
+            learned_at,
+        );
+        assert!(
+            matches!(out_replay, ApplyOutcome::Merged { .. }),
+            "equal-HLC identical-contact replay must be idempotent, got {out_replay:?}"
+        );
     }
 }
 

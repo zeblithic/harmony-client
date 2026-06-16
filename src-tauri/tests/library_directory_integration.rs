@@ -636,7 +636,7 @@ async fn click_to_join_redeem_invite_smoke() {
         CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
     };
     use harmony_app::content_store::{ContentStore, RuntimeContentStore};
-    use harmony_app::dm_outbox::{DmOutbox, UnicastSendRequest};
+    use harmony_app::dm_outbox::DmOutbox;
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::owner_state_types::{DeviceIdentityHash, EpochKey, SpaceKind};
     use harmony_identity::PrivateIdentity;
@@ -828,7 +828,6 @@ async fn click_to_join_redeem_invite_smoke() {
 
     let (community_adapter_tx, _community_adapter_rx) =
         mpsc::channel::<harmony_app::event_loop::CommunityAdapterRequest>(16);
-    let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
 
     // ZEB-339: use joiner's real owner material (seed 0xBB) for community
     // signing so DmOutbox::new's debug_assert passes (cert.owner_id == joiner_owner).
@@ -883,7 +882,6 @@ async fn click_to_join_redeem_invite_smoke() {
         Arc::clone(&community_registry),
         community_adapter_tx,
         None, // ZEB-434: no transport-epoch watch in this test
-        unicast_send_tx,
         Arc::clone(&dm_outbox),
         Arc::clone(&channel_log_registry),
         || Ok(()),

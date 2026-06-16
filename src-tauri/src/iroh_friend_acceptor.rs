@@ -332,9 +332,10 @@ pub struct FriendLinkRequest {
     /// `devices_digest`. Encoded like `OwnerDeviceEntry.device_identity_pubs`.
     #[serde(rename = "p", default, with = "vec_opt_bstr64")]
     pub device_identity_pubs: Vec<Option<[u8; 64]>>,
-    /// ZEB-461: the requester's iroh `NodeId` (routing hint for the cross-WAN DM
-    /// tunnel). A routing hint only (a wrong value just fails the tunnel, no
-    /// compromise), so it is NOT signed. Stored as a CBOR bstr(32).
+    /// ZEB-461: the requester's iroh `NodeId` (the cross-WAN DM tunnel dial
+    /// target). ZEB-473 §6.3: SIGNED — bound into the `contact_digest` preimage so
+    /// an active MITM can't redirect the tunnel. `#[serde(default)]` on the wire
+    /// (back-compat); only the digest covers it. Stored as a CBOR bstr(32).
     #[serde(
         rename = "i",
         default,
@@ -342,17 +343,18 @@ pub struct FriendLinkRequest {
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
     pub iroh_node_id: [u8; 32],
-    /// ZEB-461: the requester's home-relay URL (routing hint; unsigned). `None`
-    /// when no relay is configured.
+    /// ZEB-461: the requester's home-relay URL. ZEB-473 §6.3: SIGNED (in
+    /// `contact_digest`). `None` when no relay is configured.
     #[serde(rename = "r", default)]
     pub home_relay_url: Option<String>,
     /// ZEB-461: the requester's post-quantum DSA public key for the tunnel.
-    /// Routing/key material consumed by later tasks; unsigned (a wrong value just
-    /// fails the tunnel handshake). Encoded as a CBOR bstr.
+    /// ZEB-473 §6.3: SIGNED (in `contact_digest`) so a PQ downgrade is detectable.
+    /// Encoded as a CBOR bstr.
     #[serde(rename = "q", default, with = "serde_bytes")]
     pub pq_dsa_pubkey: Vec<u8>,
     /// ZEB-461: the requester's post-quantum KEM public key for the tunnel.
-    /// Unsigned, same rationale as `pq_dsa_pubkey`. Encoded as a CBOR bstr.
+    /// ZEB-473 §6.3: SIGNED (in `contact_digest`), same rationale as
+    /// `pq_dsa_pubkey`. Encoded as a CBOR bstr.
     #[serde(rename = "k", default, with = "serde_bytes")]
     pub pq_kem_pubkey: Vec<u8>,
 }
@@ -414,7 +416,8 @@ pub struct FriendLinkAccepted {
     /// `sig` via `devices_digest`.
     #[serde(rename = "p", default, with = "vec_opt_bstr64")]
     pub device_identity_pubs: Vec<Option<[u8; 64]>>,
-    /// ZEB-461: the accepter's iroh `NodeId` (unsigned routing hint). bstr(32).
+    /// ZEB-461: the accepter's iroh `NodeId`. ZEB-473 §6.3: SIGNED (in
+    /// `contact_digest`). bstr(32).
     #[serde(
         rename = "i",
         default,
@@ -422,13 +425,15 @@ pub struct FriendLinkAccepted {
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
     pub iroh_node_id: [u8; 32],
-    /// ZEB-461: the accepter's home-relay URL (unsigned routing hint).
+    /// ZEB-461: the accepter's home-relay URL. ZEB-473 §6.3: SIGNED.
     #[serde(rename = "r", default)]
     pub home_relay_url: Option<String>,
-    /// ZEB-461: the accepter's post-quantum DSA public key (unsigned). bstr.
+    /// ZEB-461: the accepter's post-quantum DSA public key. ZEB-473 §6.3: SIGNED.
+    /// bstr.
     #[serde(rename = "q", default, with = "serde_bytes")]
     pub pq_dsa_pubkey: Vec<u8>,
-    /// ZEB-461: the accepter's post-quantum KEM public key (unsigned). bstr.
+    /// ZEB-461: the accepter's post-quantum KEM public key. ZEB-473 §6.3: SIGNED.
+    /// bstr.
     #[serde(rename = "k", default, with = "serde_bytes")]
     pub pq_kem_pubkey: Vec<u8>,
 }
@@ -458,31 +463,61 @@ pub enum FriendLinkResponse {
     Pending,
 }
 
-/// ZEB-461: SHA-256 digest of the canonical CBOR encoding of the device bundle
-/// tuple `(sender_devices, device_identity_pubs)`. Bound into the friend
-/// request/accept signatures so a peer cannot have its claimed device list (or
-/// the parallel identity pubs) swapped in flight — mirroring how
-/// `DmInviteSigned` carries `sender_devices` inside its signed body. The two
-/// vecs are parallel-indexed, so both go into the digest. `device_identity_pubs`
-/// is encoded via the same bstr(64)/null shape used on the wire (see
-/// [`vec_opt_bstr64`]) so the digest is stable regardless of serde array limits.
-pub fn friend_devices_digest(
+/// ZEB-473: SHA-256 digest of the canonical CBOR encoding of the friend-contact
+/// bundle — the device list, its parallel identity pubs, AND the peer's iroh
+/// reachability + post-quantum keys. Bound into the friend request/accept
+/// signatures so an active MITM cannot have ANY of these swapped in flight
+/// (decision §6.3: the reachability + PQ keys are SIGNED, not unsigned routing
+/// hints, so a downgrade of the PQ tunnel is detectable).
+///
+/// Field order is fixed and deterministic:
+/// `(devices, pubs, iroh_node_id, home_relay_url, pq_dsa_pubkey, pq_kem_pubkey)`.
+/// `device_identity_pubs` is encoded via the same bstr(64)/null shape used on the
+/// wire (see [`vec_opt_bstr64`]) so the digest is stable regardless of serde
+/// array limits; the byte arrays / vecs are wrapped via `serde_bytes` so they
+/// encode as CBOR bstrs (not N-element arrays). The whole tuple is digested in
+/// ONE place so every build + verify site is byte-for-byte identical.
+///
+/// ZEB-461 history: this was `friend_devices_digest` over only `(devices, pubs)`;
+/// ZEB-473 extended the preimage to cover the four reachability/PQ fields, which
+/// were previously unsigned routing hints.
+#[allow(clippy::too_many_arguments)]
+pub fn contact_digest(
     devices: &[DeviceIdentityHash],
     pubs: &[Option<[u8; 64]>],
+    iroh_node_id: &[u8; 32],
+    home_relay_url: Option<&str>,
+    pq_dsa_pubkey: &[u8],
+    pq_kem_pubkey: &[u8],
 ) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
     // A tiny wrapper so the pubs vec encodes via vec_opt_bstr64 (bstr(64)/null)
-    // inside the tuple — keeping the digest input identical to the wire bytes.
+    // and the byte fields encode as CBOR bstrs — keeping the digest input
+    // identical to the wire bytes. Field order is fixed (see doc).
     #[derive(Serialize)]
     struct Bundle<'a> {
         devices: &'a [DeviceIdentityHash],
         #[serde(with = "vec_opt_bstr64")]
         pubs: &'a [Option<[u8; 64]>],
+        iroh_node_id: &'a serde_bytes::Bytes,
+        home_relay_url: Option<&'a str>,
+        pq_dsa_pubkey: &'a serde_bytes::Bytes,
+        pq_kem_pubkey: &'a serde_bytes::Bytes,
     }
     let mut buf = Vec::new();
-    ciborium::into_writer(&Bundle { devices, pubs }, &mut buf)
-        .expect("friend device bundle always encodes");
+    ciborium::into_writer(
+        &Bundle {
+            devices,
+            pubs,
+            iroh_node_id: serde_bytes::Bytes::new(iroh_node_id),
+            home_relay_url,
+            pq_dsa_pubkey: serde_bytes::Bytes::new(pq_dsa_pubkey),
+            pq_kem_pubkey: serde_bytes::Bytes::new(pq_kem_pubkey),
+        },
+        &mut buf,
+    )
+    .expect("friend contact bundle always encodes");
     let mut hasher = Sha256::new();
     hasher.update(&buf);
     hasher.finalize().into()
@@ -493,11 +528,11 @@ pub fn friend_devices_digest(
 /// "ship the empty bundle" (tests / pre-identity); `Some` fills the real values.
 ///
 /// The device bundle is DERIVED from `identity_pub_64` via
-/// [`crate::dm_tunnel_contact::self_device_bundle`] and is SIGNED (its
-/// `friend_devices_digest` is bound into the handshake signature). Reachability
-/// (`iroh_node_id`, `home_relay_url`) and the PQ keys (`pq_dsa_pubkey`,
-/// `pq_kem_pubkey`) are UNSIGNED routing hints — a wrong value just fails the
-/// tunnel, so they are deliberately NOT part of the digest.
+/// [`crate::dm_tunnel_contact::self_device_bundle`]. ZEB-473 §6.3: the
+/// reachability (`iroh_node_id`, `home_relay_url`) and PQ keys (`pq_dsa_pubkey`,
+/// `pq_kem_pubkey`) are now SIGNED alongside the device bundle — all six fields
+/// are folded into [`contact_digest`], which the handshake signature binds — so an
+/// active MITM cannot silently downgrade the PQ tunnel by rewriting them.
 #[derive(Clone)]
 pub struct SelfHandshakeReachability {
     pub identity_pub_64: [u8; 64],
@@ -514,8 +549,9 @@ pub struct SelfHandshakeReachability {
 /// device produces. ZEB-371: the signature binds the requester's ephemeral
 /// X25519 public key (so an attacker can't swap the rendezvous key) and the
 /// optional token. ZEB-461: it also binds `devices_digest` (the requester's
-/// device bundle) so the bundle can't be tampered. The reachability + PQ keys
-/// are unsigned routing hints (a wrong value just fails the tunnel).
+/// device bundle) so the bundle can't be tampered. ZEB-473 §6.3: `devices_digest`
+/// is now the six-field [`contact_digest`], so the requester's iroh reachability +
+/// PQ keys are signed too (MITM-evident).
 pub fn friend_request_sig_preimage(
     from_addr: OwnerAddr,
     token_sig: Option<&[u8; 64]>,
@@ -895,7 +931,14 @@ pub fn authenticate_friend_request(
     let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)?;
     let vk = VerifyingKey::from_bytes(&device_key)
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
-    let devices_digest = friend_devices_digest(&req.sender_devices, &req.device_identity_pubs);
+    let devices_digest = contact_digest(
+        &req.sender_devices,
+        &req.device_identity_pubs,
+        &req.iroh_node_id,
+        req.home_relay_url.as_deref(),
+        &req.pq_dsa_pubkey,
+        &req.pq_kem_pubkey,
+    );
     let preimage = friend_request_sig_preimage(
         req.from_addr,
         req.token_sig.as_ref(),
@@ -943,7 +986,14 @@ pub fn process_friend_request(
     // digest computed from the bundle the request carries).
     let vk = VerifyingKey::from_bytes(&device_key)
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
-    let req_devices_digest = friend_devices_digest(&req.sender_devices, &req.device_identity_pubs);
+    let req_devices_digest = contact_digest(
+        &req.sender_devices,
+        &req.device_identity_pubs,
+        &req.iroh_node_id,
+        req.home_relay_url.as_deref(),
+        &req.pq_dsa_pubkey,
+        &req.pq_kem_pubkey,
+    );
     let preimage = friend_request_sig_preimage(
         req.from_addr,
         req.token_sig.as_ref(),
@@ -1010,11 +1060,33 @@ pub fn process_friend_request(
     // means "peer advertised nothing": older client, or a failed self-bind →
     // None path — NOT "peer has zero devices").
     if !req.sender_devices.is_empty() {
+        // ZEB-473 Task 5: persist the requester's iroh reachability + PQ keys so
+        // the DM tunnel can later dial them. The sender advertises a SINGLE device
+        // (alpha nodes are single-device — `self_device_bundle` emits exactly one),
+        // so this builds a single-element `device_tunnel_contacts` parallel-indexed
+        // to device 0; `apply_owner_device_update` re-aligns it to the sorted device
+        // list. `None` (don't fabricate a contact) when the peer advertised no
+        // reachability — same skip-on-empty rationale as the device bundle, so an
+        // older/contactless peer never LWW-clobbers a previously-known contact.
+        //
+        // SINGLE-DEVICE ASSUMPTION: if a future multi-device sender advertises
+        // `sender_devices.len() > 1`, the apply path pads the contact vec with
+        // `None` (no crash), but the lone contact lands on device index 0, which
+        // may not be the device that sent this handshake. Per-device tunnel-contact
+        // placement for multi-device senders is a deliberate follow-up; alpha does
+        // not exercise it.
+        let device_tunnel_contacts = vec![crate::dm_tunnel_contact::peer_handshake_contact(
+            req.iroh_node_id,
+            req.home_relay_url.clone(),
+            req.pq_dsa_pubkey.clone(),
+            req.pq_kem_pubkey.clone(),
+        )];
         if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = state
             .apply_owner_device_update(
                 req.from_addr,
                 req.sender_devices.clone(),
                 req.device_identity_pubs.clone(),
+                device_tunnel_contacts,
                 learned_at,
             )
         {
@@ -1026,26 +1098,21 @@ pub fn process_friend_request(
 
     // 6. Build + sign the mutual accept reply. The accept sig binds to the same
     // token_sig as the request it answers (domain-separated from the request),
-    // this side's ephemeral X25519 public, and (ZEB-461) this side's device-
-    // bundle digest. ZEB-461 Task 6: when `self_reachability` is `Some`, fill the
+    // this side's ephemeral X25519 public, and (ZEB-461/473) this side's
+    // contact digest. ZEB-461 Task 6: when `self_reachability` is `Some`, fill the
     // REAL self device bundle + reachability + PQ keys; when `None` (tests /
-    // pre-identity) ship the EMPTY bundle exactly as before. Either way the
-    // digest is computed from the SAME (devices, pubs) placed on the wire, so the
-    // signature stays consistent with the bundle a peer re-digests on receipt.
+    // pre-identity) ship the EMPTY bundle exactly as before. ZEB-473 §6.3: the
+    // reachability + PQ keys are now SIGNED (folded into the digest), so they must
+    // be computed BEFORE the digest. Either way the digest is computed from the
+    // SAME six fields placed on the wire, so the signature stays consistent with
+    // what a peer re-digests on receipt.
     let (accept_devices, accept_device_pubs): (Vec<DeviceIdentityHash>, Vec<Option<[u8; 64]>>) =
         match self_reachability {
             Some(r) => crate::dm_tunnel_contact::self_device_bundle(r.identity_pub_64),
             None => (vec![], vec![]),
         };
-    let accept_devices_digest = friend_devices_digest(&accept_devices, &accept_device_pubs);
-    let accept_preimage = friend_accept_sig_preimage(
-        self_owner,
-        req.token_sig.as_ref(),
-        &self_eph_pub,
-        &accept_devices_digest,
-    );
-    let sig = self_device2.sign(&accept_preimage).to_bytes();
-    // Unsigned routing hints: real values when `Some`, empty/zero/None when not.
+    // Reachability + PQ keys (signed via the digest below): real values when
+    // `Some`, empty/zero/None when not.
     let (iroh_node_id, home_relay_url, pq_dsa_pubkey, pq_kem_pubkey) = match self_reachability {
         Some(r) => (
             r.iroh_node_id,
@@ -1055,6 +1122,21 @@ pub fn process_friend_request(
         ),
         None => ([0u8; 32], None, vec![], vec![]),
     };
+    let accept_devices_digest = contact_digest(
+        &accept_devices,
+        &accept_device_pubs,
+        &iroh_node_id,
+        home_relay_url.as_deref(),
+        &pq_dsa_pubkey,
+        &pq_kem_pubkey,
+    );
+    let accept_preimage = friend_accept_sig_preimage(
+        self_owner,
+        req.token_sig.as_ref(),
+        &self_eph_pub,
+        &accept_devices_digest,
+    );
+    let sig = self_device2.sign(&accept_preimage).to_bytes();
     Ok(FriendLinkAccepted {
         from_addr: self_owner,
         display: self_display,
@@ -1752,7 +1834,7 @@ mod tests {
         // authenticates. Tests that need a populated bundle re-sign explicitly.
         let devices: Vec<DeviceIdentityHash> = vec![];
         let device_pubs: Vec<Option<[u8; 64]>> = vec![];
-        let devices_digest = friend_devices_digest(&devices, &device_pubs);
+        let devices_digest = contact_digest(&devices, &device_pubs, &[0u8; 32], None, &[], &[]);
         let preimage =
             friend_request_sig_preimage(owner.owner, Some(&token_sig), &eph_pub, &devices_digest);
         let sig = owner.device_key.sign(&preimage).to_bytes();
@@ -2112,7 +2194,14 @@ mod tests {
             verify_enrolled_device(&req.enrollment, req.from_addr, 0).expect("valid cert");
         assert_eq!(resolved, device_key);
         let vk = VerifyingKey::from_bytes(&resolved).expect("vk");
-        let devices_digest = friend_devices_digest(&req.sender_devices, &req.device_identity_pubs);
+        let devices_digest = contact_digest(
+            &req.sender_devices,
+            &req.device_identity_pubs,
+            &req.iroh_node_id,
+            req.home_relay_url.as_deref(),
+            &req.pq_dsa_pubkey,
+            &req.pq_kem_pubkey,
+        );
         let preimage = friend_request_sig_preimage(
             req.from_addr,
             req.token_sig.as_ref(),
@@ -2157,18 +2246,210 @@ mod tests {
         );
     }
 
-    /// ZEB-461: the device-bundle digest must change when either the device list
-    /// or the parallel identity pubs change — so a peer can't have its bundle
-    /// swapped without invalidating the signature.
+    /// ZEB-461/473: the contact digest must change when ANY of its six inputs
+    /// change — the device list, the parallel identity pubs, OR (ZEB-473) the iroh
+    /// node id / home relay / PQ DSA pub / PQ KEM pub — so a peer can't have its
+    /// bundle OR its reachability/PQ keys swapped without invalidating the sig.
     #[test]
-    fn devices_digest_binds_bundle() {
-        let d0 = friend_devices_digest(&[], &[]);
-        let d1 = friend_devices_digest(&[DeviceIdentityHash([1; 16])], &[None]);
-        let d2 = friend_devices_digest(&[DeviceIdentityHash([2; 16])], &[None]);
-        let d3 = friend_devices_digest(&[DeviceIdentityHash([1; 16])], &[Some([9; 64])]);
-        assert_ne!(d0, d1, "empty vs non-empty bundle must differ");
-        assert_ne!(d1, d2, "a different device hash must change the digest");
-        assert_ne!(d1, d3, "a different identity pub must change the digest");
+    fn contact_digest_binds_all_fields() {
+        let dev = [DeviceIdentityHash([1; 16])];
+        let base = contact_digest(&dev, &[None], &[0u8; 32], None, &[], &[]);
+        // Device list + identity pubs (ZEB-461).
+        let d_empty = contact_digest(&[], &[], &[0u8; 32], None, &[], &[]);
+        let d_dev2 = contact_digest(
+            &[DeviceIdentityHash([2; 16])],
+            &[None],
+            &[0u8; 32],
+            None,
+            &[],
+            &[],
+        );
+        let d_pub = contact_digest(&dev, &[Some([9; 64])], &[0u8; 32], None, &[], &[]);
+        // Reachability + PQ keys (ZEB-473 — newly signed).
+        let d_node = contact_digest(&dev, &[None], &[7u8; 32], None, &[], &[]);
+        let d_relay = contact_digest(&dev, &[None], &[0u8; 32], Some("https://r/"), &[], &[]);
+        let d_dsa = contact_digest(&dev, &[None], &[0u8; 32], None, &[1, 2, 3], &[]);
+        let d_kem = contact_digest(&dev, &[None], &[0u8; 32], None, &[], &[4, 5, 6]);
+        assert_ne!(base, d_empty, "empty vs non-empty bundle must differ");
+        assert_ne!(
+            base, d_dev2,
+            "a different device hash must change the digest"
+        );
+        assert_ne!(
+            base, d_pub,
+            "a different identity pub must change the digest"
+        );
+        assert_ne!(
+            base, d_node,
+            "a different iroh node id must change the digest"
+        );
+        assert_ne!(
+            base, d_relay,
+            "a different home relay must change the digest"
+        );
+        assert_ne!(base, d_dsa, "a different PQ DSA pub must change the digest");
+        assert_ne!(base, d_kem, "a different PQ KEM pub must change the digest");
+    }
+
+    /// ZEB-473 §6.3 (the headline security guarantee): an active MITM that
+    /// rewrites ANY of the four reachability/PQ fields on a signed
+    /// `FriendLinkRequest` must break verification — the fields are SIGNED into the
+    /// `contact_digest` preimage now, not unsigned routing hints, so a silent PQ
+    /// downgrade is detectable. The untampered message verifies; each single-field
+    /// tamper fails.
+    #[test]
+    fn signed_request_reachability_fields_are_tamper_evident() {
+        let owner = mint_test_owner(0x73);
+        let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+        let id = harmony_identity::PrivateIdentity::from_seed(&[0x73; 32]);
+        let pub64 = id.public_identity().to_public_bytes();
+        let (devices, pubs) = crate::dm_tunnel_contact::self_device_bundle(pub64);
+        // Build the SIGNED request over the full six-field digest, with all four
+        // reachability/PQ fields populated.
+        let iroh_node_id = [0x11; 32];
+        let home_relay_url = Some("https://relay.example/".to_string());
+        let pq_dsa_pubkey = vec![0xaa; 32];
+        let pq_kem_pubkey = vec![0xbb; 16];
+        let digest = contact_digest(
+            &devices,
+            &pubs,
+            &iroh_node_id,
+            home_relay_url.as_deref(),
+            &pq_dsa_pubkey,
+            &pq_kem_pubkey,
+        );
+        let preimage = friend_request_sig_preimage(owner.owner, None, &eph_pub, &digest);
+        let sig = owner.device_key.sign(&preimage).to_bytes();
+        let req = FriendLinkRequest {
+            from_addr: owner.owner,
+            display: None,
+            token_sig: None,
+            eph_x25519_pub: eph_pub,
+            enrollment: owner.cert,
+            sig,
+            sender_devices: devices,
+            device_identity_pubs: pubs,
+            iroh_node_id,
+            home_relay_url,
+            pq_dsa_pubkey,
+            pq_kem_pubkey,
+        };
+        // Untampered: BOTH verify paths accept.
+        authenticate_friend_request(&req, 0).expect("untampered request authenticates");
+
+        // Tamper iroh_node_id.
+        let mut t = req.clone();
+        t.iroh_node_id[0] ^= 0xFF;
+        assert!(
+            matches!(
+                authenticate_friend_request(&t, 0),
+                Err(FriendHandshakeError::SignatureInvalid)
+            ),
+            "tampering iroh_node_id must fail verification"
+        );
+        // Tamper home_relay_url.
+        let mut t = req.clone();
+        t.home_relay_url = Some("https://evil.example/".to_string());
+        assert!(
+            matches!(
+                authenticate_friend_request(&t, 0),
+                Err(FriendHandshakeError::SignatureInvalid)
+            ),
+            "tampering home_relay_url must fail verification"
+        );
+        // Tamper pq_dsa_pubkey (the PQ-downgrade vector §6.3).
+        let mut t = req.clone();
+        t.pq_dsa_pubkey[0] ^= 0xFF;
+        assert!(
+            matches!(
+                authenticate_friend_request(&t, 0),
+                Err(FriendHandshakeError::SignatureInvalid)
+            ),
+            "tampering pq_dsa_pubkey must fail verification"
+        );
+        // Tamper pq_kem_pubkey.
+        let mut t = req.clone();
+        t.pq_kem_pubkey[0] ^= 0xFF;
+        assert!(
+            matches!(
+                authenticate_friend_request(&t, 0),
+                Err(FriendHandshakeError::SignatureInvalid)
+            ),
+            "tampering pq_kem_pubkey must fail verification"
+        );
+    }
+
+    /// ZEB-473 §6.3, accept side: the same tamper-evidence on a signed
+    /// `FriendLinkAccepted`. A `process_friend_request`-produced accept carries
+    /// real signed reachability; verifying it via the accept preimage must fail if
+    /// any reachability/PQ field is rewritten in flight.
+    #[test]
+    fn signed_accept_reachability_fields_are_tamper_evident() {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        // Self-side material that ends up SIGNED into the accept.
+        let me = mint_test_owner(0x74);
+        let id = harmony_identity::PrivateIdentity::from_seed(&[0x74; 32]);
+        let pub64 = id.public_identity().to_public_bytes();
+        let reach = SelfHandshakeReachability {
+            identity_pub_64: pub64,
+            iroh_node_id: [0x22; 32],
+            home_relay_url: Some("https://relay.example/accept".to_string()),
+            pq_dsa_pubkey: vec![0xcc; 32],
+            pq_kem_pubkey: vec![0xdd; 16],
+        };
+        let req = signed_request_no_token(0x75);
+        let kt = crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        let accepted = process_friend_request(
+            &mut state,
+            test_hlc(1),
+            &req,
+            me.owner,
+            None,
+            &me.cert,
+            &me.device_key,
+            &kt,
+            0,
+            Some(&reach),
+        )
+        .expect("processed");
+        // The accept must actually carry the signed reachability (not empty).
+        assert_eq!(accepted.iroh_node_id, [0x22; 32]);
+        assert!(!accepted.pq_dsa_pubkey.is_empty());
+
+        // Closure re-runs the accept-verify path (same six-field digest the dialer
+        // computes) over a possibly-tampered accept.
+        let verify = |acc: &FriendLinkAccepted| -> bool {
+            let device_key = verify_enrolled_device(&acc.enrollment, acc.from_addr, 0)
+                .expect("self cert verifies");
+            let vk = VerifyingKey::from_bytes(&device_key).expect("vk");
+            let digest = contact_digest(
+                &acc.sender_devices,
+                &acc.device_identity_pubs,
+                &acc.iroh_node_id,
+                acc.home_relay_url.as_deref(),
+                &acc.pq_dsa_pubkey,
+                &acc.pq_kem_pubkey,
+            );
+            let preimage =
+                friend_accept_sig_preimage(acc.from_addr, None, &acc.eph_x25519_pub, &digest);
+            vk.verify_strict(&preimage, &Signature::from_bytes(&acc.sig))
+                .is_ok()
+        };
+        assert!(verify(&accepted), "untampered accept verifies");
+
+        let mut t = accepted.clone();
+        t.iroh_node_id[0] ^= 0xFF;
+        assert!(!verify(&t), "tampering accept iroh_node_id must fail");
+        let mut t = accepted.clone();
+        t.home_relay_url = Some("https://evil.example/".to_string());
+        assert!(!verify(&t), "tampering accept home_relay_url must fail");
+        let mut t = accepted.clone();
+        t.pq_dsa_pubkey[0] ^= 0xFF;
+        assert!(!verify(&t), "tampering accept pq_dsa_pubkey must fail");
+        let mut t = accepted.clone();
+        t.pq_kem_pubkey[0] ^= 0xFF;
+        assert!(!verify(&t), "tampering accept pq_kem_pubkey must fail");
     }
 
     #[test]
@@ -2240,8 +2521,14 @@ mod tests {
         let vk = VerifyingKey::from_bytes(&self_device_key).expect("vk");
         // The accept binds the accepter's own (randomly-generated) ephemeral key
         // + (ZEB-461) its device-bundle digest, both read back off the accept.
-        let accept_digest =
-            friend_devices_digest(&accepted.sender_devices, &accepted.device_identity_pubs);
+        let accept_digest = contact_digest(
+            &accepted.sender_devices,
+            &accepted.device_identity_pubs,
+            &accepted.iroh_node_id,
+            accepted.home_relay_url.as_deref(),
+            &accepted.pq_dsa_pubkey,
+            &accepted.pq_kem_pubkey,
+        );
         let accept_preimage = friend_accept_sig_preimage(
             accepted.from_addr,
             Some(&token_sig),
@@ -2261,7 +2548,7 @@ mod tests {
         let requester = mint_test_owner(0x61);
         let token_sig = [0x5a; 64];
         let (req_eph_sk, req_eph_pub) = generate_ephemeral();
-        let req_devices_digest = friend_devices_digest(&[], &[]);
+        let req_devices_digest = contact_digest(&[], &[], &[0u8; 32], None, &[], &[]);
         let preimage = friend_request_sig_preimage(
             requester.owner,
             Some(&token_sig),
@@ -2358,7 +2645,7 @@ mod tests {
         let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
         // Sign with the imposter's owner addr in the preimage so the request is
         // internally consistent except for the cert↔from_addr binding.
-        let devices_digest = friend_devices_digest(&[], &[]);
+        let devices_digest = contact_digest(&[], &[], &[0u8; 32], None, &[], &[]);
         let preimage = friend_request_sig_preimage(
             imposter.owner,
             Some(&token_sig),
@@ -2724,7 +3011,7 @@ mod tests {
     fn signed_request_no_token(owner_seed: u8) -> FriendLinkRequest {
         let owner = mint_test_owner(owner_seed);
         let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
-        let devices_digest = friend_devices_digest(&[], &[]);
+        let devices_digest = contact_digest(&[], &[], &[0u8; 32], None, &[], &[]);
         let preimage = friend_request_sig_preimage(owner.owner, None, &eph_pub, &devices_digest);
         let sig = owner.device_key.sign(&preimage).to_bytes();
         FriendLinkRequest {
@@ -2756,7 +3043,7 @@ mod tests {
         let id = harmony_identity::PrivateIdentity::from_seed(&[owner_seed; 32]);
         let pub64 = id.public_identity().to_public_bytes();
         let (devices, pubs) = crate::dm_tunnel_contact::self_device_bundle(pub64);
-        let devices_digest = friend_devices_digest(&devices, &pubs);
+        let devices_digest = contact_digest(&devices, &pubs, &[0u8; 32], None, &[], &[]);
         let preimage = friend_request_sig_preimage(owner.owner, None, &eph_pub, &devices_digest);
         let sig = owner.device_key.sign(&preimage).to_bytes();
         let req = FriendLinkRequest {

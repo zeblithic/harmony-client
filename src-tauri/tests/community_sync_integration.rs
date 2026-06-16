@@ -2616,7 +2616,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
     };
     use harmony_app::content_store::{ContentStore, RuntimeContentStore};
-    use harmony_app::dm_outbox::{DmOutbox, UnicastSendRequest};
+    use harmony_app::dm_outbox::DmOutbox;
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::owner_state_persist::canonicalize;
     use harmony_app::owner_state_types::{DeviceIdentityHash, EpochKey};
@@ -2822,12 +2822,10 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     let crdt_state = Arc::new(Mutex::new(OwnerState::default()));
     let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
 
-    // Unicast send channel — keep the receiver alive so try_send doesn't
-    // immediately fail Closed (we want the timeout path, not the
-    // unicast-error path). The receiver is unbuffered for this test;
-    // the packet sits there forever, the oneshot never fires, and the
-    // 300ms timeout drives us to the rollback branch.
-    let (unicast_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(64);
+    // ZEB-473 (Move 1a): the unicast send channel was removed from
+    // `redeem_invite_inner` with the Reticulum carrier. The oneshot still never
+    // fires here (no countersign arrives), so the timeout path is driven the
+    // same way; this test's rollback assertion is unaffected.
 
     // Adapter request channel — kept alive so the spawn-side dispatch
     // doesn't fail Closed. (We don't need the event_loop on the other
@@ -2899,7 +2897,6 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         Arc::clone(&registry),
         adapter_tx,
         None, // ZEB-434: no transport-epoch watch in this test
-        unicast_tx,
         Arc::clone(&dm_outbox),
         channel_log_registry,
         || Ok(()),

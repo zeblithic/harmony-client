@@ -678,12 +678,6 @@ pub async fn run(
     dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
     dm_transport: Option<std::sync::Arc<dyn crate::dm_outbox::DmTransport>>,
     crdt_state: Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
-    // ZEB-227 Path B: outbound DM unicast receiver. None when no owner
-    // identity is loaded (mirrors the dm_outbox/dm_transport/crdt_state
-    // shape). The select! arm uses std::future::pending() to make the
-    // None case effectively skipped without polling overhead. `mut` is
-    // required because the arm calls `.as_mut()` on the Option.
-    mut unicast_send_rx: Option<mpsc::Receiver<crate::dm_outbox::UnicastSendRequest>>,
     // ZEB-217 Sub-C Phase 2 Task 13: per-community state-CRDT Zenoh
     // adapter requests. `start_node` scans owner-state for joined
     // communities, spawns one engine per community via
@@ -3394,29 +3388,6 @@ pub async fn run(
                         }
                     }
                 }
-            }
-
-            // ── ZEB-227 Path B: outbound DM unicast → NodeRuntime ────────────
-            // RuntimeUnicastTransport (Task 6, dispatched per send_dm) pushes one
-            // UnicastSendRequest per recipient device hash into this channel; we
-            // forward each as a RuntimeEvent::SendUnicastToDevice into NodeRuntime,
-            // which queues into pending_unicast_sends and resolves on next tick
-            // against the path table (per ZEB-226's defer-then-drop semantics).
-            //
-            // The arm is gated by Optional rx — None is the inactive shape (no
-            // owner identity loaded), and the std::future::pending() shim makes
-            // the arm effectively skipped without polling overhead.
-            Some(req) = async {
-                match unicast_send_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                runtime.push_event(RuntimeEvent::SendUnicastToDevice {
-                    destination_hash: req.destination_hash,
-                    packet: req.packet,
-                });
-                should_tick = true;
             }
 
             // ── Content-verb requests (pin/unpin/burn/snapshot) ────

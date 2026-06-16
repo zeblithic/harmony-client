@@ -81,6 +81,12 @@ pub mod alpn {
     /// late-installed `IrohCommunityRelayPullAcceptor`.
     pub const HARMONY_COMMUNITY_RELAY_PULL_V1: &[u8] =
         crate::community_relay::COMMUNITY_RELAY_PULL_ALPN;
+    /// ZEB-473 (Move 1a): post-quantum DM tunnel protocol — the `harmony-tunnel`
+    /// PQ session carrying `FrameTag::Dm` bodies over iroh QUIC. Routed by the
+    /// accept loop to the late-installed tunnel acceptor (see
+    /// `IrohZenohLinkManager::install_tunnel_acceptor`); connections arriving
+    /// before install are closed (the sender's deposit fallback covers it).
+    pub const HARMONY_TUNNEL_V1: &[u8] = b"harmony/tunnel/v1";
 }
 
 /// OS keychain coordinates for the persistent iroh `SecretKey`.
@@ -128,6 +134,7 @@ impl IrohEndpoint {
                 alpn::HARMONY_BUTLER_DEPOSIT_V1.to_vec(),
                 alpn::HARMONY_COMMUNITY_RELAY_DEPOSIT_V1.to_vec(),
                 alpn::HARMONY_COMMUNITY_RELAY_PULL_V1.to_vec(),
+                alpn::HARMONY_TUNNEL_V1.to_vec(),
             ])
             .bind()
             .await
@@ -381,6 +388,7 @@ mod tests {
                 alpn::HARMONY_BUTLER_DEPOSIT_V1.to_vec(),
                 alpn::HARMONY_COMMUNITY_RELAY_DEPOSIT_V1.to_vec(),
                 alpn::HARMONY_COMMUNITY_RELAY_PULL_V1.to_vec(),
+                alpn::HARMONY_TUNNEL_V1.to_vec(),
             ])
             .relay_mode(RelayMode::Disabled)
             .bind()
@@ -412,5 +420,6 @@ mod tests {
             alpn::HARMONY_BUTLER_DEPOSIT_V1,
             b"harmony/butler-deposit/v1"
         );
+        assert_eq!(alpn::HARMONY_TUNNEL_V1, b"harmony/tunnel/v1");
     }
 }

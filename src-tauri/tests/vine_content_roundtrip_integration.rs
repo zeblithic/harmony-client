@@ -63,7 +63,6 @@ fn make_node_config() -> NodeConfig {
         local_pq_identity_hash: [0u8; 16],
         local_dsa_pubkey: vec![],
         local_kem_pubkey: vec![],
-        reticulum_identity_bytes: None,
         inference_gguf_cid: None,
         inference_tokenizer_cid: None,
         engram_manifest_cid: None,
@@ -218,7 +217,6 @@ fn spawn_event_loop(
                     None,       // dm_outbox — DM outbox not exercised in this test
                     None,       // dm_transport — DM outbox not exercised in this test
                     None,       // crdt_state — DM outbox not exercised in this test
-                    None,       // unicast_send_rx — DM transport not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
                     {
                         let (_tx, rx) = tokio::sync::mpsc::channel::<

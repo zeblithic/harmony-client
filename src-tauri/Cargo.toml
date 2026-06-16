@@ -61,6 +61,12 @@ flume = "0.11"
 # multi-thread runtime), "macros" (tokio::select! in the shutdown path),
 # "signal" (ctrl-c / SIGTERM handling in wait_for_exit_signal).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+# ZEB-473 (DM-over-iroh, Move 1a): the tunnel session loop reads length-prefixed
+# frames off the iroh bi-stream inside a `tokio::select!`; `FramedRead` +
+# `LengthDelimitedCodec` buffers partial reads internally so a cancelled read
+# future (when another select arm fires) does not discard consumed bytes. Already
+# in the lock transitively (iroh/zenoh); a direct entry makes the codec importable.
+tokio-util = { version = "0.7", features = ["codec"] }
 tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-os = "2"
@@ -88,19 +94,24 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # targeted invites). identity_hash() excludes encryption keys, so no
 # owner/device ids change. Descendant of the previous pin 1ccf42bf.
 # Cross-repo agreement is pinned by tests in dm_signing.rs (ZEB-372 Phase 2).
-harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
-harmony-identity = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
-harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
-harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
-harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
-harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
-harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1", features = ["recovery"] }
+harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "8b870ae05449e710a54fd03421dadfc582d26c6a" }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", rev = "8b870ae05449e710a54fd03421dadfc582d26c6a" }
+harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "8b870ae05449e710a54fd03421dadfc582d26c6a" }
+harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "8b870ae05449e710a54fd03421dadfc582d26c6a" }
+harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "8b870ae05449e710a54fd03421dadfc582d26c6a" }
+harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "8b870ae05449e710a54fd03421dadfc582d26c6a" }
+harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "8b870ae05449e710a54fd03421dadfc582d26c6a", features = ["recovery"] }
 # ZEB-323 Phase 2b: pkarr-based discovery policies. Now pinned to the same
 # workspace-wide rev as the crates above (was 2aaf403b, ZEB-380 PR1 — see
 # git history for the RelayPool/health + real-wire-format provenance).
 # test-fixtures feature is activated only for the dev-dependency below
 # so MockPkarrRelay is excluded from release binaries (round-1 review fix).
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1" }
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "8b870ae05449e710a54fd03421dadfc582d26c6a" }
+# ZEB-473 (DM-over-iroh, Move 1a): harmony-tunnel is the PQ iroh tunnel crate
+# that Move 1 rewires the dormant DM unicast fan-out onto. Pinned to the same
+# workspace-wide rev as the crates above. Imported here in Task 1 so later
+# tasks can wire it; this task only bumps the pin + clears dead Reticulum refs.
+harmony-tunnel = { git = "https://github.com/zeblithic/harmony.git", rev = "8b870ae05449e710a54fd03421dadfc582d26c6a" }
 # ZEB-380: relay-URL validation (scheme + host checks) in pkarr_settings.rs.
 # Already in the lock transitively (reqwest/iroh); a direct entry just makes it importable.
 url = "2"
@@ -190,7 +201,7 @@ tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util", "io-util"] }
 # Activate test-fixtures feature for harmony-pkarr in dev/test builds only,
 # so MockPkarrRelay (an axum HTTP server) is excluded from release binaries.
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "c982079980c378aa80aab6da5ed32d14e07471a1", features = ["test-fixtures"] }
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "8b870ae05449e710a54fd03421dadfc582d26c6a", features = ["test-fixtures"] }
 
 # ZEB-156: harmony-runtime (pinned 04449d60 above) provides the narrow
 # `NodeRuntime::remove_content` + `StorageTier::remove` delegates this

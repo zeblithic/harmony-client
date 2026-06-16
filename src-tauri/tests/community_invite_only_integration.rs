@@ -41,7 +41,7 @@ use harmony_app::community_state_sync::{
     CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
-use harmony_app::dm_outbox::{DmOutbox, UnicastSendRequest};
+use harmony_app::dm_outbox::DmOutbox;
 use harmony_app::dm_signing::{ed25519_pub_to_x25519, seal_to_owner};
 use harmony_app::event_loop::CommunityAdapterRequest;
 use harmony_app::owner_state_crdt::OwnerState;
@@ -248,6 +248,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         OwnerDeviceEntry {
             devices: vec![DeviceIdentityHash(alice.identity.address_hash)],
             device_identity_pubs: vec![Some(alice_pub)],
+            device_tunnel_contacts: vec![None],
             learned_at: Hlc {
                 wall_ms: 50_000,
                 logical: 0,
@@ -262,7 +263,9 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     // (it takes &Arc<Mutex<OwnerState>>). Empty default state suffices —
     // handle_unicast doesn't read owner-state on the receive side; the
     // arg is plumbed for future expansion.
-    let crdt_a = Arc::new(TokioMutex::new(OwnerState::default()));
+    // ZEB-473 (Move 1a): previously consumed by the now-removed Bob-unicast →
+    // Alice-handle_unicast forwarder; kept (prefixed) for documentation.
+    let _crdt_a = Arc::new(TokioMutex::new(OwnerState::default()));
 
     // ZEB-339: supply synthetic community_signing_key + enrollment_cert per
     // outbox. Use new_synthetic because alice_addr/bob_addr are Reticulum-
@@ -282,7 +285,9 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     let bob_enrollment_invite = bob_test_owner_invite.cert;
     // Alice's dm_outbox carries the PrivateIdentity that handle_unicast
     // grabs to verify the InviteToken sig + countersign Bob's Join.
-    let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
+    // ZEB-473 (Move 1a): consumed only by the now-removed unicast forwarder;
+    // kept (prefixed) so the dual-identity setup stays documented.
+    let _alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
         "alice-dev".into(),
         alice_addr,
         DeviceIdentityHash(alice.identity.address_hash),
@@ -418,33 +423,11 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     })
     .expect("encode URL");
 
-    // Forwarder #2: drain Bob's outbound unicast → Alice's
-    // handle_unicast. The forwarder strips destination_hash (we
-    // already know the packet is for Alice in this test fixture; real
-    // production routes via Reticulum's identity-hash-keyed link
-    // layer).
-    let (bob_unicast_tx, mut bob_unicast_rx) = mpsc::channel::<UnicastSendRequest>(8);
-    let registry_a_for_fwd = Arc::clone(&registry_a);
-    let alice_dm_for_fwd = Arc::clone(&alice_dm_outbox);
-    let crdt_a_for_fwd = Arc::clone(&crdt_a);
-    tokio::spawn(async move {
-        while let Some(req) = bob_unicast_rx.recv().await {
-            // None app handle: tests skip Tauri event emission;
-            // handle_unicast logs the rejection reason at warn level
-            // (the test asserts on the engine-level Inserted outcome
-            // instead).
-            let _ = community_invite::handle_unicast::<()>(
-                &registry_a_for_fwd,
-                &alice_dm_for_fwd,
-                &crdt_a_for_fwd,
-                req.packet,
-                None,
-                // ZEB-367: no case-A pkarr publisher in this test harness.
-                None,
-            )
-            .await;
-        }
-    });
+    // ZEB-473 (Move 1a): the Bob-outbound-unicast → Alice-handle_unicast
+    // forwarder was removed with the Reticulum carrier. `redeem_invite_inner`
+    // no longer fans a PendingJoin unicast packet out; Bob's PendingJoin reaches
+    // Alice via the CRDT state-root publish forwarder wired below (Bob's
+    // publisher_rx → Alice's sub_tx), which is the production delivery path.
 
     // ZEB-260 (Case A FIXED): admin's signed bootstrap is now plumbed
     // through the invite URL (CommunityInvitePayload.admin_bootstrap +
@@ -524,7 +507,6 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         Arc::clone(&registry_b),
         bob_adapter_tx,
         None, // ZEB-434: no transport-epoch watch in this test
-        bob_unicast_tx,
         Arc::clone(&bob_dm_outbox),
         bob_channel_log_registry,
         || Ok(()),
