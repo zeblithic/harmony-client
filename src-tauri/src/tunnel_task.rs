@@ -182,12 +182,13 @@ pub async fn run_tunnel_initiator(
             tracing::debug!(%reason, "ZEB-473: outbound tunnel handshake failed");
             // Tell the manager the dial failed so it can drop the Dialing handle
             // (the pending DMs fall back to the always-deposit durability path).
-            mgr.note_dial_failed(peer_node_id);
+            // Pass our epoch so a newer session that replaced us isn't evicted.
+            mgr.note_dial_failed(peer_node_id, epoch);
             return;
         }
         Err(_) => {
             tracing::debug!("ZEB-473: outbound tunnel handshake timed out");
-            mgr.note_dial_failed(peer_node_id);
+            mgr.note_dial_failed(peer_node_id, epoch);
             return;
         }
     };

@@ -596,17 +596,21 @@ impl TunnelManager {
     }
 
     /// Called by the initiator loop when a dial fails (handshake error/timeout).
-    /// Removes the `Dialing` handle so a later DM re-dials. Pending DMs are
+    /// Removes our `Dialing` handle so a later DM re-dials — but ONLY when the
+    /// current entry is still THIS dial (matched by `epoch`), exactly like
+    /// [`note_closed`](Self::note_closed)'s ABA guard. A newer session that
+    /// replaced it (dedup / redial) is never clobbered — including a fresh
+    /// `AwaitingInbound` handle, which is tagged `role=Initiator, state≠Active`
+    /// and so matched the old role/state heuristic, letting a stale dial task
+    /// silently evict a valid new session (Greptile, ZEB-485). Pending DMs are
     /// dropped (the always-deposit path covers durability).
-    pub fn note_dial_failed(&self, peer_node_id: [u8; 32]) {
+    pub fn note_dial_failed(&self, peer_node_id: [u8; 32], epoch: u64) {
         let mut sessions = self
             .sessions
             .lock()
             .expect("tunnel sessions mutex poisoned");
         if let Some(handle) = sessions.get(&peer_node_id) {
-            // Only remove if it's still OUR dialing handle — a responder session
-            // may have replaced it (dedup) in the meantime.
-            if handle.role == TunnelRole::Initiator && handle.state != TunnelHandleState::Active {
+            if handle.epoch == epoch {
                 sessions.remove(&peer_node_id);
             }
         }
@@ -1223,6 +1227,47 @@ mod tests {
             mgr.handle_snapshot(&peer).map(|(s, _, p)| (s, p)),
             Some((TunnelHandleState::AwaitingInbound, 1)),
             "a Closed racing survivor must re-dial+seed, not silently drop"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_dial_failed_only_evicts_its_own_epoch() {
+        // ZEB-485 (Greptile): a STALE dial task's note_dial_failed must not evict a
+        // newer session that replaced it for the same peer — including a fresh
+        // AwaitingInbound (role=Initiator, state!=Active, which matched the old
+        // role/state heuristic). Same ABA guard as note_closed.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00);
+
+        // The "new" valid session: a fresh AwaitingInbound at epoch 7.
+        let (cmd_tx, _cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
+        {
+            let mut sessions = mgr.sessions.lock().unwrap();
+            sessions.insert(
+                peer,
+                TunnelHandle {
+                    cmd_tx,
+                    state: TunnelHandleState::AwaitingInbound,
+                    role: TunnelRole::Initiator,
+                    epoch: 7,
+                    pending: VecDeque::new(),
+                },
+            );
+        }
+
+        // A stale dial task (epoch 3) reports failure — must be a no-op.
+        mgr.note_dial_failed(peer, 3);
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, _, _)| s),
+            Some(TunnelHandleState::AwaitingInbound),
+            "stale-epoch note_dial_failed must not evict the newer session"
+        );
+
+        // The matching-epoch dial failure DOES evict its own handle.
+        mgr.note_dial_failed(peer, 7);
+        assert!(
+            mgr.handle_snapshot(&peer).is_none(),
+            "matching-epoch note_dial_failed evicts its own handle"
         );
     }
 }
