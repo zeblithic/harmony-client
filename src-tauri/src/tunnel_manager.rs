@@ -35,6 +35,14 @@ const CMD_CHANNEL_CAP: usize = 64;
 /// path, so dropping the live attempt is graceful).
 const MAX_PENDING_PER_PEER: usize = 64;
 
+/// ZEB-485: how long the higher-NodeId peer waits to ACCEPT the lower peer's
+/// inbound dial before dialing itself. The lower peer dials immediately, so an
+/// inbound normally lands in tens of ms; this only fires when the lower peer
+/// has nothing to send (so isn't dialing). Short enough for responsive
+/// liveness, long enough that a normal inbound cancels it. Durability is
+/// covered by the always-deposit rung during the wait.
+const FALLBACK_DIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A decrypted inbound DM payload handed off to the ingest seam.
 ///
 /// The tunnel loops push one of these per `TunnelAction::DmReceived`. The boot
@@ -74,6 +82,11 @@ pub enum TunnelHandleState {
     Active,
     /// Being torn down (dedup loser / explicit close).
     Closing,
+    /// ZEB-485: higher-NodeId peer is buffering DMs and waiting to ACCEPT the
+    /// lower peer's inbound dial (the single-dialer rule). A fallback timer
+    /// promotes this to `Dialing` if no inbound arrives within
+    /// `FALLBACK_DIAL_DELAY`. Like `Dialing`, DMs queue in `pending`.
+    AwaitingInbound,
 }
 
 /// The manager's handle to one live (or dialing) tunnel.
@@ -128,6 +141,25 @@ impl TunnelManager {
         }
     }
 
+    /// Test-only constructor that pins `self_node_id` to a chosen value. The
+    /// dial-vs-await election (and `keep_new`) turn on the numeric ordering of
+    /// `self_node_id` against the peer's, so pinning it lets tests place
+    /// themselves deterministically above/below a sentinel peer — instead of
+    /// leaning on the 2^-256 improbability that a randomly hashed self collides
+    /// with an all-0x00/all-0xFF peer.
+    #[cfg(test)]
+    pub(crate) fn new_with_self_node_id(
+        endpoint: IrohEndpoint,
+        local_pq: Arc<PqPrivateIdentity>,
+        ingest_tx: mpsc::Sender<InboundDm>,
+        self_node_id: [u8; 32],
+    ) -> Self {
+        Self {
+            self_node_id,
+            ..Self::new(endpoint, local_pq, ingest_tx)
+        }
+    }
+
     /// Allocate a fresh monotonic session epoch (see [`TunnelHandle::epoch`]).
     fn alloc_epoch(&self) -> u64 {
         self.next_epoch
@@ -175,7 +207,7 @@ impl TunnelManager {
                             mpsc::error::TrySendError::Closed(TunnelCommand::SendDm(packet)) => {
                                 sessions.remove(&peer_node_id);
                                 drop(sessions);
-                                self.spawn_dial(peer_node_id, contact, vec![packet]);
+                                self.dial_or_await(peer_node_id, contact, vec![packet]);
                             }
                             mpsc::error::TrySendError::Closed(_) => {
                                 // G3 (ZEB-473): invariant violation — we only
@@ -191,12 +223,12 @@ impl TunnelManager {
                                 );
                                 sessions.remove(&peer_node_id);
                                 drop(sessions);
-                                self.spawn_dial(peer_node_id, contact, vec![]);
+                                self.dial_or_await(peer_node_id, contact, vec![]);
                             }
                         }
                     }
                 }
-                TunnelHandleState::Dialing => {
+                TunnelHandleState::Dialing | TunnelHandleState::AwaitingInbound => {
                     push_pending(&mut handle.pending, packet);
                 }
                 TunnelHandleState::Closing => {
@@ -205,14 +237,137 @@ impl TunnelManager {
                     // the old entry and re-dial.
                     sessions.remove(&peer_node_id);
                     drop(sessions);
-                    self.spawn_dial(peer_node_id, contact, vec![packet]);
+                    self.dial_or_await(peer_node_id, contact, vec![packet]);
                 }
             },
             None => {
                 drop(sessions);
-                self.spawn_dial(peer_node_id, contact, vec![packet]);
+                self.dial_or_await(peer_node_id, contact, vec![packet]);
             }
         }
+    }
+
+    /// ZEB-485 single-dialer gate. The LOWER NodeId is the sole dialer; the
+    /// higher NodeId buffers `seed_pending` and waits to accept the lower
+    /// peer's inbound dial. Routes EVERY fresh dial-initiation (initial dial +
+    /// both redial paths) so a redial can't re-create the simultaneous-dial
+    /// collision either.
+    fn dial_or_await(
+        self: &Arc<Self>,
+        peer_node_id: [u8; 32],
+        contact: &DeviceTunnelContact,
+        seed_pending: Vec<Vec<u8>>,
+    ) {
+        if self.self_node_id < peer_node_id {
+            self.spawn_dial(peer_node_id, contact, seed_pending);
+        } else {
+            self.spawn_await_inbound(peer_node_id, contact, seed_pending);
+        }
+    }
+
+    /// Insert an `AwaitingInbound` handle holding `seed_pending`, wait for the
+    /// lower peer's inbound dial, and arm a fallback dial: if no inbound has
+    /// registered within `FALLBACK_DIAL_DELAY`, promote to a real dial (the
+    /// lower peer isn't dialing). The retained `cmd_rx` is handed to
+    /// `run_tunnel_initiator` only if the fallback fires.
+    fn spawn_await_inbound(
+        self: &Arc<Self>,
+        peer_node_id: [u8; 32],
+        contact: &DeviceTunnelContact,
+        seed_pending: Vec<Vec<u8>>,
+    ) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
+        let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+        for p in seed_pending {
+            push_pending(&mut pending, p);
+        }
+        let epoch = self.alloc_epoch();
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .expect("tunnel sessions mutex poisoned");
+            // Double-check: an inbound dial may have raced in while we computed.
+            // Redirect our seed DMs onto that survivor, like `drain_pending_into`.
+            if let Some(existing) = sessions.get_mut(&peer_node_id) {
+                // A live `Active` survivor takes the seeds over its cmd channel;
+                // `Full` is an acceptable best-effort drop (matches `send_dm`'s
+                // Active path — tearing a healthy tunnel down on transient
+                // backpressure is worse), but a `Closed` survivor means its loop
+                // already died — keep those packets and re-dial rather than
+                // silently lose the live attempt (CodeAnt). Non-Active survivors
+                // just buffer on their own pending.
+                let redial_seed: Vec<Vec<u8>> = if existing.state == TunnelHandleState::Active {
+                    let mut unsent = Vec::new();
+                    for p in pending.drain(..) {
+                        if let Err(mpsc::error::TrySendError::Closed(TunnelCommand::SendDm(p))) =
+                            existing.cmd_tx.try_send(TunnelCommand::SendDm(p))
+                        {
+                            unsent.push(p);
+                        }
+                    }
+                    unsent
+                } else {
+                    for p in pending.drain(..) {
+                        push_pending(&mut existing.pending, p);
+                    }
+                    Vec::new()
+                };
+                if !redial_seed.is_empty() {
+                    // Survivor's loop was dead — drop it and re-dial with the
+                    // unsent seeds (the gate re-applies, so this can't recreate a
+                    // simultaneous-dial collision).
+                    sessions.remove(&peer_node_id);
+                    drop(sessions);
+                    self.dial_or_await(peer_node_id, contact, redial_seed);
+                }
+                return;
+            }
+            sessions.insert(
+                peer_node_id,
+                TunnelHandle {
+                    cmd_tx,
+                    state: TunnelHandleState::AwaitingInbound,
+                    role: TunnelRole::Initiator,
+                    epoch,
+                    pending,
+                },
+            );
+        }
+
+        // Arm the fallback dial.
+        let mgr = Arc::clone(self);
+        let endpoint = self.endpoint.clone();
+        let local_pq = Arc::clone(&self.local_pq);
+        let ingest_tx = self.ingest_tx.clone();
+        let contact = contact.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(FALLBACK_DIAL_DELAY).await;
+            // Promote to a real dial ONLY if still awaiting under our epoch (an
+            // inbound that landed first replaced the handle / bumped the epoch).
+            {
+                let mut sessions = mgr.sessions.lock().expect("tunnel sessions mutex poisoned");
+                match sessions.get_mut(&peer_node_id) {
+                    Some(h)
+                        if h.state == TunnelHandleState::AwaitingInbound && h.epoch == epoch =>
+                    {
+                        h.state = TunnelHandleState::Dialing;
+                    }
+                    _ => return, // inbound arrived / evicted / replaced — done.
+                }
+            }
+            crate::tunnel_task::run_tunnel_initiator(
+                endpoint,
+                contact,
+                local_pq,
+                peer_node_id,
+                mgr,
+                epoch,
+                ingest_tx,
+                cmd_rx,
+            )
+            .await;
+        });
     }
 
     /// Insert a `Dialing` handle and spawn the initiator loop. `seed_pending`
@@ -441,17 +596,21 @@ impl TunnelManager {
     }
 
     /// Called by the initiator loop when a dial fails (handshake error/timeout).
-    /// Removes the `Dialing` handle so a later DM re-dials. Pending DMs are
+    /// Removes our `Dialing` handle so a later DM re-dials — but ONLY when the
+    /// current entry is still THIS dial (matched by `epoch`), exactly like
+    /// [`note_closed`](Self::note_closed)'s ABA guard. A newer session that
+    /// replaced it (dedup / redial) is never clobbered — including a fresh
+    /// `AwaitingInbound` handle, which is tagged `role=Initiator, state≠Active`
+    /// and so matched the old role/state heuristic, letting a stale dial task
+    /// silently evict a valid new session (Greptile, ZEB-485). Pending DMs are
     /// dropped (the always-deposit path covers durability).
-    pub fn note_dial_failed(&self, peer_node_id: [u8; 32]) {
+    pub fn note_dial_failed(&self, peer_node_id: [u8; 32], epoch: u64) {
         let mut sessions = self
             .sessions
             .lock()
             .expect("tunnel sessions mutex poisoned");
         if let Some(handle) = sessions.get(&peer_node_id) {
-            // Only remove if it's still OUR dialing handle — a responder session
-            // may have replaced it (dedup) in the meantime.
-            if handle.role == TunnelRole::Initiator && handle.state != TunnelHandleState::Active {
+            if handle.epoch == epoch {
                 sessions.remove(&peer_node_id);
             }
         }
@@ -534,9 +693,9 @@ fn close_handle(mut handle: TunnelHandle) {
 mod tests {
     use super::*;
 
-    fn test_manager() -> (Arc<TunnelManager>, mpsc::Receiver<InboundDm>) {
-        // A manager needs an iroh endpoint; bind a real loopback one (cheap,
-        // and these tests never dial). Use a fresh PQ identity for self.
+    // A manager needs an iroh endpoint; bind a real loopback one (cheap, and
+    // these tests never dial). Use a fresh PQ identity for self.
+    fn test_endpoint_and_pq() -> (IrohEndpoint, Arc<PqPrivateIdentity>) {
         let endpoint = futures::executor::block_on(async {
             let sk = iroh::SecretKey::generate();
             crate::iroh_endpoint::IrohEndpoint::new_with_secret(sk)
@@ -544,9 +703,33 @@ mod tests {
                 .expect("bind loopback iroh endpoint")
         });
         let local_pq = Arc::new(PqPrivateIdentity::generate(&mut rand::rngs::OsRng));
+        (endpoint, local_pq)
+    }
+
+    fn test_manager() -> (Arc<TunnelManager>, mpsc::Receiver<InboundDm>) {
+        let (endpoint, local_pq) = test_endpoint_and_pq();
         let (ingest_tx, ingest_rx) = mpsc::channel(16);
         (
             Arc::new(TunnelManager::new(endpoint, local_pq, ingest_tx)),
+            ingest_rx,
+        )
+    }
+
+    // ZEB-485: a manager with `self_node_id` pinned to a known value, so the
+    // dial-vs-await election against a sentinel peer is deterministic rather
+    // than relying on a random hashed self never colliding with the sentinel.
+    fn test_manager_with_self(
+        self_node_id: [u8; 32],
+    ) -> (Arc<TunnelManager>, mpsc::Receiver<InboundDm>) {
+        let (endpoint, local_pq) = test_endpoint_and_pq();
+        let (ingest_tx, ingest_rx) = mpsc::channel(16);
+        (
+            Arc::new(TunnelManager::new_with_self_node_id(
+                endpoint,
+                local_pq,
+                ingest_tx,
+                self_node_id,
+            )),
             ingest_rx,
         )
     }
@@ -704,8 +887,10 @@ mod tests {
     /// pending — not drop it (the prior code seeded `vec![]`).
     #[tokio::test(flavor = "current_thread")]
     async fn send_dm_active_closed_seeds_failed_packet_into_redial() {
-        let (mgr, _ingest_rx) = test_manager();
-        let peer = fixed_node_id(0x11);
+        // ZEB-485: self pinned to 0x80 and peer 0xFF > self, so we are the LOWER
+        // NodeId and the redial takes the dial branch (not the await branch).
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0xFF);
 
         // Install an Active handle whose cmd_rx is dropped → try_send → Closed.
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
@@ -725,7 +910,7 @@ mod tests {
         }
 
         let contact = DeviceTunnelContact {
-            iroh_node_id: fixed_node_id(0x11),
+            iroh_node_id: fixed_node_id(0xFF),
             home_relay_url: None,
             pq_dsa_pubkey: vec![1; 1952],
             pq_kem_pubkey: vec![2; 1184],
@@ -842,6 +1027,247 @@ mod tests {
         assert!(
             mgr.handle_snapshot(&peer).is_none(),
             "the replacement evicts itself on its own exit"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_dm_lower_self_dials_immediately() {
+        // ZEB-485: when WE are the lower NodeId, send_dm to an unknown peer dials
+        // right away (a Dialing/Initiator handle appears synchronously — the
+        // spawned dial task can't run before this sync assert on current_thread).
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0xFF); // peer 0xFF > self 0x80 => we are lower.
+        let contact = DeviceTunnelContact {
+            iroh_node_id: peer,
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1; 1952],
+            pq_kem_pubkey: vec![2; 1184],
+        };
+        mgr.send_dm(peer, &contact, b"hi".to_vec());
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, r, _)| (s, r)),
+            Some((TunnelHandleState::Dialing, TunnelRole::Initiator)),
+            "lower-NodeId self must dial immediately"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_dm_higher_self_awaits_inbound() {
+        // ZEB-485: when WE are the higher NodeId, send_dm buffers in an
+        // AwaitingInbound handle instead of dialing.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00); // peer 0x00 < self 0x80 => we are higher.
+        let contact = DeviceTunnelContact {
+            iroh_node_id: peer,
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1; 1952],
+            pq_kem_pubkey: vec![2; 1184],
+        };
+        mgr.send_dm(peer, &contact, b"hi".to_vec());
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, _, p)| (s, p)),
+            Some((TunnelHandleState::AwaitingInbound, 1)),
+            "higher-NodeId self must buffer + await the inbound dial"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn await_inbound_falls_back_to_dial_after_delay() {
+        // ZEB-485: if no inbound arrives, the higher peer dials after the delay.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00); // peer 0x00 < self 0x80 => we await first.
+        let contact = DeviceTunnelContact {
+            iroh_node_id: peer,
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1; 1952],
+            pq_kem_pubkey: vec![2; 1184],
+        };
+        mgr.send_dm(peer, &contact, b"hi".to_vec());
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, _, _)| s),
+            Some(TunnelHandleState::AwaitingInbound),
+            "starts in AwaitingInbound"
+        );
+
+        // Before the delay elapses, still awaiting.
+        tokio::time::advance(FALLBACK_DIAL_DELAY / 2).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, _, _)| s),
+            Some(TunnelHandleState::AwaitingInbound),
+            "still awaiting before the fallback delay"
+        );
+
+        // After the delay, the fallback fired: the handle is no longer awaiting
+        // (it promoted to Dialing; the background dial to the bogus contact may
+        // then fail and evict it — either way it left AwaitingInbound).
+        tokio::time::advance(FALLBACK_DIAL_DELAY).await;
+        tokio::task::yield_now().await;
+        assert_ne!(
+            mgr.handle_snapshot(&peer).map(|(s, _, _)| s),
+            Some(TunnelHandleState::AwaitingInbound),
+            "fallback dial must have fired after the delay"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn await_inbound_fallback_is_noop_when_inbound_arrives_first() {
+        // ZEB-485: an inbound dial that lands before the delay cancels the fallback.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00); // peer 0x00 < self 0x80 => we await.
+        let contact = DeviceTunnelContact {
+            iroh_node_id: peer,
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1; 1952],
+            pq_kem_pubkey: vec![2; 1184],
+        };
+        mgr.send_dm(peer, &contact, b"hi".to_vec());
+
+        // The lower peer's inbound dial lands: keep_new(peer<=self)=true keeps the
+        // inbound Responder session and drains our buffered DM onto it.
+        let _rx = mgr.register_inbound(peer);
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, r, _)| (s, r)),
+            Some((TunnelHandleState::Active, TunnelRole::Responder)),
+            "inbound replaced the awaiting handle"
+        );
+
+        // Advancing past the delay must NOT promote anything (no second dial).
+        tokio::time::advance(FALLBACK_DIAL_DELAY * 2).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, r, _)| (s, r)),
+            Some((TunnelHandleState::Active, TunnelRole::Responder)),
+            "fallback must be a no-op once an inbound session exists"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn register_inbound_drains_awaiting_inbound_pending() {
+        // ZEB-485: when the lower peer's inbound dial lands while we (higher) are
+        // AwaitingInbound, register_inbound keeps the inbound and redirects our
+        // buffered DMs onto it. AwaitingInbound is tagged role=Initiator, so the
+        // existing keep_new/drain_pending_into path covers it with NO change.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00); // peer 0x00 <= self 0x80 => keep_new(peer, self) == true.
+
+        // Install an AwaitingInbound handle holding two buffered DMs. Its cmd_tx is
+        // dead (rx dropped) — the drain targets the SURVIVOR (the new inbound), not
+        // this handle, so that is fine.
+        let (cmd_tx, _dead_rx) = mpsc::channel(CMD_CHANNEL_CAP);
+        {
+            let mut sessions = mgr.sessions.lock().unwrap();
+            sessions.insert(
+                peer,
+                TunnelHandle {
+                    cmd_tx,
+                    state: TunnelHandleState::AwaitingInbound,
+                    role: TunnelRole::Initiator,
+                    epoch: 0,
+                    pending: VecDeque::from(vec![b"p1".to_vec(), b"p2".to_vec()]),
+                },
+            );
+        }
+
+        let (mut cmd_rx, _epoch) = mgr.register_inbound(peer);
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, r, _)| (s, r)),
+            Some((TunnelHandleState::Active, TunnelRole::Responder)),
+            "the inbound survivor replaces the awaiting handle"
+        );
+
+        let mut drained = Vec::new();
+        while let Ok(TunnelCommand::SendDm(p)) = cmd_rx.try_recv() {
+            drained.push(p);
+        }
+        assert_eq!(
+            drained,
+            vec![b"p1".to_vec(), b"p2".to_vec()],
+            "the awaiting handle's pending DMs are redirected onto the inbound survivor"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn await_inbound_double_check_redials_when_racing_survivor_is_closed() {
+        // ZEB-485 (CodeAnt): if an inbound dial raced in but its loop is already
+        // Closed (rx dropped), spawn_await_inbound's double-check must NOT
+        // silently drop the seeded DM — it re-dials, seeding the unsent packet.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00); // higher self => the await branch.
+
+        // Pre-insert a DEAD Active handle (cmd_rx dropped => try_send => Closed).
+        let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
+        drop(cmd_rx);
+        {
+            let mut sessions = mgr.sessions.lock().unwrap();
+            sessions.insert(
+                peer,
+                TunnelHandle {
+                    cmd_tx,
+                    state: TunnelHandleState::Active,
+                    role: TunnelRole::Responder,
+                    epoch: 0,
+                    pending: VecDeque::new(),
+                },
+            );
+        }
+
+        let contact = DeviceTunnelContact {
+            iroh_node_id: peer,
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1; 1952],
+            pq_kem_pubkey: vec![2; 1184],
+        };
+        // Drive the double-check directly with a seed.
+        mgr.spawn_await_inbound(peer, &contact, vec![b"seed".to_vec()]);
+
+        // The dead survivor was evicted and the seed re-dialed: we are higher,
+        // so the re-dial routes back to a fresh AwaitingInbound still carrying it.
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, _, p)| (s, p)),
+            Some((TunnelHandleState::AwaitingInbound, 1)),
+            "a Closed racing survivor must re-dial+seed, not silently drop"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_dial_failed_only_evicts_its_own_epoch() {
+        // ZEB-485 (Greptile): a STALE dial task's note_dial_failed must not evict a
+        // newer session that replaced it for the same peer — including a fresh
+        // AwaitingInbound (role=Initiator, state!=Active, which matched the old
+        // role/state heuristic). Same ABA guard as note_closed.
+        let (mgr, _ingest_rx) = test_manager_with_self(fixed_node_id(0x80));
+        let peer = fixed_node_id(0x00);
+
+        // The "new" valid session: a fresh AwaitingInbound at epoch 7.
+        let (cmd_tx, _cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
+        {
+            let mut sessions = mgr.sessions.lock().unwrap();
+            sessions.insert(
+                peer,
+                TunnelHandle {
+                    cmd_tx,
+                    state: TunnelHandleState::AwaitingInbound,
+                    role: TunnelRole::Initiator,
+                    epoch: 7,
+                    pending: VecDeque::new(),
+                },
+            );
+        }
+
+        // A stale dial task (epoch 3) reports failure — must be a no-op.
+        mgr.note_dial_failed(peer, 3);
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, _, _)| s),
+            Some(TunnelHandleState::AwaitingInbound),
+            "stale-epoch note_dial_failed must not evict the newer session"
+        );
+
+        // The matching-epoch dial failure DOES evict its own handle.
+        mgr.note_dial_failed(peer, 7);
+        assert!(
+            mgr.handle_snapshot(&peer).is_none(),
+            "matching-epoch note_dial_failed evicts its own handle"
         );
     }
 }
