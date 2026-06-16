@@ -726,31 +726,39 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         //    SpaceKind gate, membership).
         let (space, resolved_owner) = {
             let mut state = self.crdt_state.lock().await;
-            // ZEB-483: if the deposit piggybacked a signed DmInvite, apply it
-            // FIRST to bootstrap the DM Space (and cache the inviter's device)
-            // so the CidNotify admits instead of `SpaceNotFound`. The invite's
-            // inviter is bound to the CidNotify's claimed `sender_owner_addr`;
-            // the admission call below then cryptographically pins that claimed
-            // sender to the device that signed the notify, so a forged invite
-            // never yields a live delivery (fail-closed).
+            // ZEB-483 (CodeRabbit Critical): verify the CidNotify's signer
+            // against the PRISTINE OwnerDeviceCache FIRST, then let any deposited
+            // invite bootstrap ONLY the missing DM Space — pinned to that
+            // verified sender. Applying the invite first would let it seed the
+            // `device → owner → pub` rows the admission then reads, so a forged
+            // invite + notify could verify against cache the untrusted invite
+            // just wrote (circular trust). On the legitimate offline path the
+            // sender is an existing friend whose device is already cached here,
+            // so it resolves WITHOUT the invite; the invite supplies only the
+            // Space. `?` leaves the entry pending so a later sibling-doc merge or
+            // state catch-up retries (fail-closed).
+            let (resolved_owner, identity_pub) = crate::dm_outbox::verify_cidnotify_sender_binding(
+                &state,
+                &signed,
+                &signature,
+                &signed_bytes,
+            )
+            .map_err(|e| format!("verify_cidnotify_sender_binding: {e:?}"))?;
             if let Some(inv) = entry.invite_packet.as_ref() {
                 crate::dm_outbox::apply_deposited_invite(
                     &mut state,
                     self.self_owner,
                     &self.self_device_id(),
                     inv,
-                    signed.sender_owner_addr,
+                    resolved_owner,
+                    signed.space_id,
+                    signed.signing_device_hash,
+                    identity_pub,
                     self.now_ms(),
                 )?;
             }
-            let (space, resolved_owner, _identity_pub) =
-                crate::dm_outbox::verify_cidnotify_admission(
-                    &state,
-                    &signed,
-                    &signature,
-                    &signed_bytes,
-                )
-                .map_err(|e| format!("verify_cidnotify_admission: {e:?}"))?;
+            let space = crate::dm_outbox::verify_cidnotify_space(&state, &signed, resolved_owner)
+                .map_err(|e| format!("verify_cidnotify_space: {e:?}"))?;
             (space, resolved_owner)
         };
         // 4. Blob ↔ packet binding: the deposited storage blob must hash to
@@ -2209,9 +2217,10 @@ mod tests {
         }
 
         /// A clone of the entry whose invite is re-signed with an inviter that is
-        /// NOT the CidNotify's sender (a third owner). `apply_deposited_invite`
-        /// binds the invite's `inviter` to the CidNotify's `sender_owner_addr`
-        /// (Alice), so this must fail-closed with `InviterMismatch`.
+        /// NOT the CidNotify's sender (a third owner, Charlie). `apply_deposited_invite`
+        /// pins every trust-bearing invite field to the VERIFIED CidNotify sender
+        /// (Alice) before any mutation, so this fails-closed at the signer-binding
+        /// check (`signing_device_hash` mismatch) — strictly before `apply_invite`.
         fn entry_with_mismatched_inviter(&self) -> DmInboxEntry {
             // A third owner whose identity actually signs the forged invite (so
             // the Ed25519 signature itself is valid — only the inviter-binding
@@ -2255,9 +2264,18 @@ mod tests {
 
     /// Build the recover fixture: a deposited entry (CidNotify + blob + invite)
     /// for a DM Space Bob has NOT yet bootstrapped. Alice is the sender/inviter.
-    /// Bob's `owner_device_cache` does NOT pre-cache Alice's device — the invite
-    /// must seed it before admission's `lookup_pubkey_for_device` can resolve.
-    fn build_dm_ingest_fixture_without_space_with_invite() -> RecoverInviteFixture {
+    ///
+    /// `pre_cache_sender` models the trust precondition (ZEB-483 / CodeRabbit
+    /// Critical): on the legitimate offline-DM path Alice is an EXISTING friend,
+    /// so Bob's `owner_device_cache` already maps Alice's signing device → owner
+    /// → identity pub (from the friend handshake) and ONLY the Space is missing —
+    /// the invite bootstraps just that. Pass `false` to model an UNCACHED sender
+    /// (a stranger, or a forged claim that a co-member/friend deposits): the
+    /// recover path MUST then reject fail-closed at sender-binding rather than
+    /// let the untrusted invite seed `device → owner → pub` trust from nothing.
+    fn build_dm_ingest_fixture_without_space_with_invite(
+        pre_cache_sender: bool,
+    ) -> RecoverInviteFixture {
         let alice = OwnerAddr([0xA1; 16]);
         let bob = OwnerAddr([0xB0; 16]);
         let space_id = SpaceId([0x5A; 16]);
@@ -2384,9 +2402,26 @@ mod tests {
             ingested_by: BTreeSet::new(),
         };
 
-        // Bob's state: fresh, NO Space, NO Alice device cached — the invite must
-        // seed both before admission resolves the signing device.
-        let crdt_state = Arc::new(Mutex::new(OwnerState::default()));
+        // Bob's state: NO Space (offline-at-create). Alice's signing device is
+        // pre-cached IFF `pre_cache_sender` — the legitimate path resolves the
+        // signer from this PRISTINE cache BEFORE the invite runs, and the invite
+        // then bootstraps only the missing Space. Without the pre-cache,
+        // sender-binding rejects (the invite can no longer seed device trust).
+        let mut bob_state = OwnerState::default();
+        if pre_cache_sender {
+            bob_state.apply_owner_device_update(
+                alice,
+                vec![alice_device_hash],
+                vec![Some(alice_identity_pub)],
+                vec![None],
+                Hlc {
+                    wall_ms: 50,
+                    logical: 0,
+                    device_id: "bob-device-64hex".into(),
+                },
+            );
+        }
+        let crdt_state = Arc::new(Mutex::new(bob_state));
         let content_store: Arc<dyn crate::content_store::ContentStore> =
             Arc::new(crate::content_store::InMemoryStub::default());
         let sink_handle = crate::node_event_sink::RecordingSink::new();
@@ -2416,7 +2451,9 @@ mod tests {
 
     #[tokio::test]
     async fn deposited_invite_bootstraps_space_then_cidnotify_admits() {
-        let fx = build_dm_ingest_fixture_without_space_with_invite();
+        // Legitimate offline-DM path: Alice is an existing friend (pre-cached);
+        // only the Space is missing, and the deposited invite bootstraps it.
+        let fx = build_dm_ingest_fixture_without_space_with_invite(true);
 
         // Sanity: the Space is absent pre-recover → a plain CidNotify ingest
         // would fail with SpaceNotFound.
@@ -2445,21 +2482,63 @@ mod tests {
 
     #[tokio::test]
     async fn deposited_invite_with_wrong_inviter_is_rejected_and_space_absent() {
-        let fx = build_dm_ingest_fixture_without_space_with_invite();
+        let fx = build_dm_ingest_fixture_without_space_with_invite(true);
         let entry = fx.entry_with_mismatched_inviter();
         let err = fx
             .prod_ctx
             .verify(&entry)
             .await
             .expect_err("mismatched inviter must fail-closed");
+        // Pinned to the verified CidNotify signer, so it rejects at the
+        // signer-binding check (or, defense-in-depth, inside apply_invite).
         assert!(
-            err.contains("apply_invite") || err.contains("InviterMismatch"),
+            err.contains("does not match verified CidNotify")
+                || err.contains("apply_invite")
+                || err.contains("InviterMismatch"),
             "got {err}"
         );
         let st = fx.crdt_state_for_test().lock().await;
         assert!(
             !st.spaces.contains_key(&fx.space_id),
             "no Space bootstrapped on reject"
+        );
+    }
+
+    /// ZEB-483 CodeRabbit Critical regression: a deposited invite from a sender
+    /// whose signing device is NOT already cached (a stranger, or a forged claim
+    /// a malicious co-member/friend deposits) MUST be rejected before it can seed
+    /// trust. Pre-fix, the invite seeded `device → owner → pub` and the
+    /// co-deposited CidNotify then "verified" against that just-written cache
+    /// (circular trust) — admitting a spoofed DM AND poisoning the device cache.
+    /// Post-fix, sender-binding runs against the pristine cache first and rejects
+    /// fail-closed: no Space, no cache mutation.
+    #[tokio::test]
+    async fn deposited_invite_from_uncached_sender_is_rejected_no_cache_poison() {
+        // Same self-consistent invite + CidNotify (both validly signed by the
+        // claimed sender's key), but the sender is NOT pre-cached.
+        let fx = build_dm_ingest_fixture_without_space_with_invite(false);
+        let alice = OwnerAddr([0xA1; 16]);
+
+        let err = fx
+            .prod_ctx
+            .verify(&fx.entry)
+            .await
+            .expect_err("uncached sender must fail-closed (no trust bootstrap)");
+        assert!(
+            err.contains("verify_cidnotify_sender_binding")
+                || err.contains("UnknownSigningKey")
+                || err.contains("UnknownSigningDevice"),
+            "must reject at sender-binding against the pristine cache, got {err}"
+        );
+
+        let st = fx.crdt_state_for_test().lock().await;
+        assert!(
+            !st.spaces.contains_key(&fx.space_id),
+            "no Space bootstrapped from an unverified sender's invite"
+        );
+        assert!(
+            !st.owner_device_cache.devices.contains_key(&alice),
+            "device cache NOT poisoned with the claimed sender's mapping"
         );
     }
 }

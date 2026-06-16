@@ -425,33 +425,39 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
         //    the durable insert are atomic, matching the direct path.
         let (resolved_owner, payload_msg, newly_inserted, received_at, space_id, message_cid) = {
             let mut state = self.crdt_state.lock().await;
-            // ZEB-483: if the deposit piggybacked a signed DmInvite, apply it
-            // FIRST to bootstrap the DM Space (and cache the inviter's device)
-            // so the CidNotify admits instead of `SpaceNotFound`/
-            // `UnknownSigningKey`. The invite's inviter is bound to the
-            // CidNotify's claimed `sender_owner_addr`; the admission call below
-            // then cryptographically pins that claimed sender to the device that
-            // signed the notify, so a forged invite never yields a live delivery
-            // (fail-closed; `?` leaves the blob unacked so the relay drain
-            // retries).
+            // ZEB-483 (CodeRabbit Critical): verify the CidNotify's signer
+            // against the PRISTINE OwnerDeviceCache FIRST, then let any deposited
+            // invite bootstrap ONLY the missing DM Space — pinned to that
+            // verified sender. Applying the invite first would let it seed the
+            // `device → owner → pub` rows the admission then reads, so a forged
+            // invite + notify could verify against cache the untrusted invite
+            // just wrote (circular trust). On the legitimate offline path the
+            // sender is an existing co-member/friend whose device is already
+            // cached here, so it resolves WITHOUT the invite; the invite supplies
+            // only the Space. `?` leaves the blob unacked so the relay drain
+            // retries (fail-closed).
+            let (resolved_owner, identity_pub) = crate::dm_outbox::verify_cidnotify_sender_binding(
+                &state,
+                &signed,
+                &signature,
+                &signed_bytes,
+            )
+            .map_err(|e| format!("verify_cidnotify_sender_binding: {e:?}"))?;
             if let Some(inv) = payload.invite_packet.as_ref() {
                 crate::dm_outbox::apply_deposited_invite(
                     &mut state,
                     self.self_owner,
                     &self.device_id,
                     inv,
-                    signed.sender_owner_addr,
+                    resolved_owner,
+                    signed.space_id,
+                    signed.signing_device_hash,
+                    identity_pub,
                     now_epoch_ms(),
                 )?;
             }
-            let (space, resolved_owner, _identity_pub) =
-                crate::dm_outbox::verify_cidnotify_admission(
-                    &state,
-                    &signed,
-                    &signature,
-                    &signed_bytes,
-                )
-                .map_err(|e| format!("verify_cidnotify_admission: {e:?}"))?;
+            let space = crate::dm_outbox::verify_cidnotify_space(&state, &signed, resolved_owner)
+                .map_err(|e| format!("verify_cidnotify_space: {e:?}"))?;
 
             // 4. Blob ↔ packet binding: the recovered storage blob must hash to
             //    the packet's message_cid under the DM send path's flags.
@@ -2083,7 +2089,9 @@ mod tests {
         }
     }
 
-    fn relay_ingest_fixture_without_space_with_invite() -> RelayRecoverInviteFixture {
+    fn relay_ingest_fixture_without_space_with_invite(
+        pre_cache_sender: bool,
+    ) -> RelayRecoverInviteFixture {
         use crate::owner_state_types::{ContentId, DmContentKey, Space};
 
         let alice = OwnerAddr([0xA1; 16]);
@@ -2204,9 +2212,27 @@ mod tests {
             invite_packet: Some(invite_wire),
         };
 
-        // Bob's state: fresh, NO Space, NO Alice device cached — the invite must
-        // seed both before admission resolves the signing device.
-        let crdt_state = Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+        // Bob's state: NO Space (offline-at-create). Alice's signing device is
+        // pre-cached IFF `pre_cache_sender` — the legitimate path (Alice is an
+        // existing co-member/friend) resolves the signer from this PRISTINE cache
+        // BEFORE the invite runs, and the invite bootstraps only the missing
+        // Space. Without the pre-cache, sender-binding rejects fail-closed
+        // (ZEB-483 / CodeRabbit Critical: the invite can no longer seed trust).
+        let mut bob_state = OwnerState::default();
+        if pre_cache_sender {
+            bob_state.apply_owner_device_update(
+                alice,
+                vec![alice_device_hash],
+                vec![Some(alice_identity_pub)],
+                vec![None],
+                Hlc {
+                    wall_ms: 50,
+                    logical: 0,
+                    device_id: "bob-device-64hex".into(),
+                },
+            );
+        }
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(bob_state));
         let content_store: Arc<dyn crate::content_store::ContentStore> =
             Arc::new(crate::content_store::InMemoryStub::default());
         let sink_handle = crate::node_event_sink::RecordingSink::new();
@@ -2236,7 +2262,9 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_recovered_invite_bootstraps_space_then_delivers() {
-        let fx = relay_ingest_fixture_without_space_with_invite();
+        // Legitimate path: Alice is an existing co-member/friend (pre-cached);
+        // only the Space is missing, and the relay-held invite bootstraps it.
+        let fx = relay_ingest_fixture_without_space_with_invite(true);
 
         // Sanity: the Space is absent pre-recover → a plain CidNotify ingest
         // would fail with SpaceNotFound.
@@ -2268,21 +2296,61 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_recovered_invite_wrong_inviter_rejected() {
-        let fx = relay_ingest_fixture_without_space_with_invite();
+        let fx = relay_ingest_fixture_without_space_with_invite(true);
         let payload = fx.payload_with_mismatched_inviter();
         let err = fx
             .prod_ctx
             .ingest_recovered(payload)
             .await
             .expect_err("mismatched inviter must fail-closed");
+        // Pinned to the verified CidNotify signer → rejects at the signer-binding
+        // check (or, defense-in-depth, inside apply_invite).
         assert!(
-            err.contains("apply_invite") || err.contains("InviterMismatch"),
+            err.contains("does not match verified CidNotify")
+                || err.contains("apply_invite")
+                || err.contains("InviterMismatch"),
             "got {err}"
         );
         let st = fx.crdt_state.lock().await;
         assert!(
             !st.spaces.contains_key(&fx.space_id),
             "no Space bootstrapped on reject"
+        );
+        drop(st);
+        assert_eq!(fx.emitted_dm_received(), 0, "no delivery on reject");
+    }
+
+    /// ZEB-483 CodeRabbit Critical regression (relay rung): a relay-held invite
+    /// from a sender whose signing device is NOT already cached must be rejected
+    /// before it can seed trust. Pre-fix the invite seeded `device → owner → pub`
+    /// and the co-deposited CidNotify "verified" against that just-written cache
+    /// (circular trust). Post-fix: sender-binding against the pristine cache
+    /// rejects fail-closed — no Space, no cache poison, no delivery.
+    #[tokio::test]
+    async fn ingest_recovered_invite_from_uncached_sender_rejected_no_poison() {
+        let fx = relay_ingest_fixture_without_space_with_invite(false);
+        let alice = OwnerAddr([0xA1; 16]);
+
+        let err = fx
+            .prod_ctx
+            .ingest_recovered(fx.payload.clone())
+            .await
+            .expect_err("uncached sender must fail-closed (no trust bootstrap)");
+        assert!(
+            err.contains("verify_cidnotify_sender_binding")
+                || err.contains("UnknownSigningKey")
+                || err.contains("UnknownSigningDevice"),
+            "must reject at sender-binding against the pristine cache, got {err}"
+        );
+
+        let st = fx.crdt_state.lock().await;
+        assert!(
+            !st.spaces.contains_key(&fx.space_id),
+            "no Space bootstrapped from an unverified sender's invite"
+        );
+        assert!(
+            !st.owner_device_cache.devices.contains_key(&alice),
+            "device cache NOT poisoned with the claimed sender's mapping"
         );
         drop(st);
         assert_eq!(fx.emitted_dm_received(), 0, "no delivery on reject");

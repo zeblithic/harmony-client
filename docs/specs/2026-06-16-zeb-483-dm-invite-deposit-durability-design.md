@@ -47,7 +47,7 @@ One level up, the **sealed** `DepositPayload { cidnotify_packet, storage_blob }`
 
 ## Architecture
 
-```
+```text
 SEND (sender, tunnel down → deposit rung fires)
   dm_outbox::push_deposit_candidate (dm_outbox.rs:1379)
     ├─ build_cidnotify_packet_bytes(entry)         [existing]

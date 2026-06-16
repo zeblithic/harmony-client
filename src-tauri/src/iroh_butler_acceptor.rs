@@ -365,6 +365,22 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
                 // caps are BYPASSED — the entry is already stored, so a
                 // redelivery after a lost ack re-acks idempotently even at
                 // a full inbox. Falls through to the flush below (D7).
+                //
+                // ZEB-483 (CodeAnt): ONE exception to insert-once — heal a
+                // stored entry that lacks the bootstrap invite. A pre-ZEB-483
+                // entry (or any deposit that landed before the sender attached
+                // the invite) carries `invite_packet: None`; a later redelivery
+                // that DOES carry the invite must upgrade it, or recovery stays
+                // un-bootstrappable (`SpaceNotFound`) forever. Promote `None →
+                // Some` only (never overwrite an existing invite); the flush
+                // below makes the upgrade durable + republishes it to the fleet.
+                if entry.invite_packet.is_some() {
+                    if let Some(stored) = doc.entries.get_mut(&key) {
+                        if stored.invite_packet.is_none() {
+                            stored.invite_packet = entry.invite_packet.clone();
+                        }
+                    }
+                }
                 DepositPersistVerdict::Duplicate
             } else {
                 // Caps INSIDE the doc-lock critical section: counting and
@@ -1161,6 +1177,16 @@ mod tests {
             }
             let mut store = self.store.lock().unwrap();
             if store.contains_key(&key) {
+                // Mirror the production None→Some invite upgrade (ZEB-483
+                // CodeAnt): a redeposit that carries the bootstrap invite heals a
+                // stored entry that lacked it; never overwrite an existing one.
+                if entry.invite_packet.is_some() {
+                    if let Some(stored) = store.get_mut(&key) {
+                        if stored.invite_packet.is_none() {
+                            stored.invite_packet = entry.invite_packet.clone();
+                        }
+                    }
+                }
                 self.push_event(format!("persist:{key}"));
                 return Ok(DepositPersistVerdict::Duplicate);
             }
@@ -1570,6 +1596,52 @@ mod tests {
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&swapped_blob, &ctx).await.unwrap_err();
         assert_eq!(err, DepositReject::BadSig);
+    }
+
+    /// ZEB-483 (CodeAnt): a redeposit upgrades a stored entry's MISSING bootstrap
+    /// invite (`None → Some`) — healing a pre-ZEB-483 entry whose recovery would
+    /// otherwise stay stuck at `SpaceNotFound` — but NEVER overwrites an invite
+    /// already present (the insert-once exception).
+    #[tokio::test]
+    async fn redeposit_upgrades_missing_invite_but_never_overwrites() {
+        let f = valid_fixture();
+        let ctx = TestCtx::for_fixture(&f);
+        let key = "space:cid".to_string();
+
+        // 1. First deposit lacks the invite (pre-ZEB-483 shape).
+        let e0 = filler_entry(f.sender_owner);
+        assert!(e0.invite_packet.is_none());
+        assert_eq!(
+            ctx.persist_entry(key.clone(), e0).await.unwrap(),
+            DepositPersistVerdict::Inserted
+        );
+        assert!(ctx.store.lock().unwrap()[&key].invite_packet.is_none());
+
+        // 2. Redeposit carries the invite → Duplicate, stored entry healed.
+        let mut e1 = filler_entry(f.sender_owner);
+        e1.invite_packet = Some(vec![0x11, 0x22]);
+        assert_eq!(
+            ctx.persist_entry(key.clone(), e1).await.unwrap(),
+            DepositPersistVerdict::Duplicate
+        );
+        assert_eq!(
+            ctx.store.lock().unwrap()[&key].invite_packet.as_deref(),
+            Some(&[0x11, 0x22][..]),
+            "missing invite upgraded on redeposit"
+        );
+
+        // 3. A later redeposit with a DIFFERENT invite must NOT overwrite.
+        let mut e2 = filler_entry(f.sender_owner);
+        e2.invite_packet = Some(vec![0x99]);
+        assert_eq!(
+            ctx.persist_entry(key.clone(), e2).await.unwrap(),
+            DepositPersistVerdict::Duplicate
+        );
+        assert_eq!(
+            ctx.store.lock().unwrap()[&key].invite_packet.as_deref(),
+            Some(&[0x11, 0x22][..]),
+            "existing invite never overwritten"
+        );
     }
 
     /// PR #221 round 1: caps are enforced at PERSIST level, atomically
