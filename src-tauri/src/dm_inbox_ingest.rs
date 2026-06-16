@@ -363,51 +363,50 @@ pub(crate) async fn ingest_dm_packet(
     // 1. Decode + dispatch on the DmPacket variant (ZEB-482). The tunnel
     //    carries a discriminated `DmPacket`; today only `Invite` (DM-Space
     //    bootstrap) and `CidNotify` (the encrypted-blob notification) ride it.
-    let (signed, signature, signed_bytes) =
-        match crate::dm_envelope::decode_packet(packet_bytes)
-            .map_err(|e| format!("decode_packet: {e}"))?
-        {
-            // ZEB-482: a DM-Space invite — auto-accept it (write the Space +
-            // cache the inviter) via the SAME trust gates the (dormant) outbox
-            // `handle_invite` applies. Invites carry no `dm-received`, so this
-            // returns `Ok(false)` without emitting. The Space MUST land before
-            // the first CidNotify for this Space is admitted (SpaceNotFound
-            // otherwise); the tunnel's in-order FIFO guarantees that ordering
-            // because the invite is enqueued at Space-creation, the CidNotify
-            // only at message-send.
-            crate::dm_envelope::DmPacket::Invite {
+    let (signed, signature, signed_bytes) = match crate::dm_envelope::decode_packet(packet_bytes)
+        .map_err(|e| format!("decode_packet: {e}"))?
+    {
+        // ZEB-482: a DM-Space invite — auto-accept it (write the Space +
+        // cache the inviter) via the SAME trust gates the (dormant) outbox
+        // `handle_invite` applies. Invites carry no `dm-received`, so this
+        // returns `Ok(false)` without emitting. The Space MUST land before
+        // the first CidNotify for this Space is admitted (SpaceNotFound
+        // otherwise); the tunnel's in-order FIFO guarantees that ordering
+        // because the invite is enqueued at Space-creation, the CidNotify
+        // only at message-send.
+        crate::dm_envelope::DmPacket::Invite {
+            signed,
+            signature,
+            signed_bytes,
+        } => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let mut state = crdt_state.lock().await;
+            crate::dm_outbox::apply_invite(
+                &mut state,
+                self_owner,
+                device_id,
                 signed,
                 signature,
-                signed_bytes,
-            } => {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                let mut state = crdt_state.lock().await;
-                crate::dm_outbox::apply_invite(
-                    &mut state,
-                    self_owner,
-                    device_id,
-                    signed,
-                    signature,
-                    &signed_bytes,
-                    now_ms,
-                )
-                .map_err(|e| format!("apply_invite: {e:?}"))?;
-                return Ok(false);
-            }
-            crate::dm_envelope::DmPacket::CidNotify {
-                signed,
-                signature,
-                signed_bytes,
-            } => (signed, signature, signed_bytes),
-            crate::dm_envelope::DmPacket::Ack { .. } => {
-                return Err(
-                    "tunnel DM packet is an Ack (not handled on the tunnel ingest path)".into(),
-                );
-            }
-        };
+                &signed_bytes,
+                now_ms,
+            )
+            .map_err(|e| format!("apply_invite: {e:?}"))?;
+            return Ok(false);
+        }
+        crate::dm_envelope::DmPacket::CidNotify {
+            signed,
+            signature,
+            signed_bytes,
+        } => (signed, signature, signed_bytes),
+        crate::dm_envelope::DmPacket::Ack { .. } => {
+            return Err(
+                "tunnel DM packet is an Ack (not handled on the tunnel ingest path)".into(),
+            );
+        }
+    };
 
     // 2. Admission under the owner-state lock — the SAME verification a
     //    direct/deposit arrival runs. We only carry `resolved_owner` past the
@@ -1304,9 +1303,7 @@ mod tests {
         // must bootstrap it.
         let bob = OwnerAddr([0xB0; 16]);
         let space_id = SpaceId([0x77; 16]);
-        let state = std::sync::Arc::new(Mutex::new(
-            crate::owner_state_crdt::OwnerState::default(),
-        ));
+        let state = std::sync::Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
         let content_store: Arc<dyn crate::content_store::ContentStore> =
             std::sync::Arc::new(crate::content_store::InMemoryStub::default());
         let sink_handle = crate::node_event_sink::RecordingSink::new();
@@ -1338,8 +1335,7 @@ mod tests {
             signing_device_hash: alice_device_hash,
             inviter_identity_pub: alice_identity_pub,
         };
-        let signed_bytes =
-            crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private_alice.sign(&signed_bytes);
         let packet = crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Invite {
             signed,

@@ -377,7 +377,10 @@ mod tests {
             .test_pending_packets(&expected_node_id)
             .expect("helper must register a session for the derived NodeId");
         assert_eq!(pending.len(), 1, "exactly one packet routed to the tunnel");
-        assert_eq!(pending[0], payload, "routed bytes must be the passed packet");
+        assert_eq!(
+            pending[0], payload,
+            "routed bytes must be the passed packet"
+        );
 
         // An unknown recipient routes nothing (no panic, no spurious session).
         send_packet_to_owner_tunnels(&owner_state, &mgr, OwnerAddr([0xEE; 16]), &payload);

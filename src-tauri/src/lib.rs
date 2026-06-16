@@ -10184,6 +10184,10 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
 /// validation + Space-construction + invite-build logic without
 /// standing up a tauri::State<NodeState>.
 #[allow(clippy::too_many_arguments)]
+// The `Option<(Vec<u8>, Vec<OwnerAddr>)>` fan-out element is the natural
+// invite-carrier shape (signed wire bytes + recipient owners); a named alias
+// would obscure more than it clarifies for this single internal seam.
+#[allow(clippy::type_complexity)]
 pub fn add_space_dm_inner(
     state: &mut crate::owner_state_crdt::OwnerState,
     signing_key: &ed25519_dalek::SigningKey,
@@ -10421,11 +10425,7 @@ pub fn add_space_dm_inner(
     //       recipient owner → its cached DeviceTunnelContact(s) → tunnel
     //       NodeId and fires `send_dm`. (Was a per-device
     //       `UnicastSendRequest` Vec for the removed Reticulum carrier.)
-    Ok((
-        canonical_space_id,
-        Some((invite_wire, recipients)),
-        false,
-    ))
+    Ok((canonical_space_id, Some((invite_wire, recipients)), false))
 }
 
 /// ZEB-228 Phase 4 — Create a new Space.
@@ -10778,14 +10778,16 @@ mod add_space_tunnel_routing_tests {
         let crdt_state = StdArc::new(tokio::sync::Mutex::new(owner_state));
         let hlc_tracker = StdArc::new(tokio::sync::Mutex::new(BTreeMap::new()));
 
-        let mut node = NodeState::default();
-        node.dm_outbox = Some(dm_outbox);
-        node.crdt_state = Some(crdt_state);
-        node.hlc_tracker = Some(hlc_tracker);
-        node.dm_device_id = Some("alice-dev".into());
-        node.dm_self_owner = Some(self_owner);
-        node.dm_identity_pub_64 = Some(identity_pub);
-        node.tunnel_manager = tunnel_manager;
+        let node = NodeState {
+            dm_outbox: Some(dm_outbox),
+            crdt_state: Some(crdt_state),
+            hlc_tracker: Some(hlc_tracker),
+            dm_device_id: Some("alice-dev".into()),
+            dm_self_owner: Some(self_owner),
+            dm_identity_pub_64: Some(identity_pub),
+            tunnel_manager,
+            ..NodeState::default()
+        };
 
         (node, recipient, recipient_node_id)
     }

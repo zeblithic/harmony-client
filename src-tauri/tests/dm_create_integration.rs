@@ -351,8 +351,7 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
     )
     .expect("first create must succeed");
     assert!(!first_merge, "first create must not be a merge");
-    let (_first_wire, first_recipients) =
-        first_fanout.expect("first create returns Some(fanout)");
+    let (_first_wire, first_recipients) = first_fanout.expect("first create returns Some(fanout)");
     assert_eq!(
         first_recipients,
         vec![bob_owner],
