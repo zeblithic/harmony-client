@@ -39081,12 +39081,19 @@ fn build_self_handshake_reachability(
 /// `learned_at` is this node's local HLC (anti-forgery: never the peer's claimed
 /// time). An empty `sender_devices` is skipped so a peer that advertised nothing
 /// never LWW-clobbers a previously-known-good cache entry.
+#[allow(clippy::too_many_arguments)]
 async fn apply_handshaked_friend(
     crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
     addr: crate::owner_state_types::OwnerAddr,
     entry: crate::friend_graph::FriendEntry,
     sender_devices: Vec<crate::owner_state_types::DeviceIdentityHash>,
     device_identity_pubs: Vec<Option<[u8; 64]>>,
+    // ZEB-473 Task 5: the peer's per-device tunnel reachability/PQ contacts,
+    // parallel-indexed to `sender_devices` (built from the SIGNED accept fields by
+    // the caller). `apply_owner_device_update` re-aligns these to the sorted
+    // device list. `None` elements are skip-on-empty (never clobber a known
+    // contact).
+    device_tunnel_contacts: Vec<Option<crate::owner_state_types::DeviceTunnelContact>>,
     learned_at: crate::owner_state_types::Hlc,
 ) -> Result<(), String> {
     let mut state = crdt_state.lock().await;
@@ -39103,8 +39110,7 @@ async fn apply_handshaked_friend(
                 addr,
                 sender_devices,
                 device_identity_pubs,
-                // ZEB-473 Task 4: tunnel contacts populated in Task 5.
-                Vec::new(),
+                device_tunnel_contacts,
                 learned_at,
             )
         {
@@ -39285,9 +39291,13 @@ pub async fn connectivity_link_friend_iroh_inner(
     // on the wire, so the request signature stays consistent with the bundle a
     // peer re-digests on receipt. Reachability + PQ keys are unsigned hints.
     let req_bundle = crate::dm_tunnel_contact::self_request_bundle(self_reachability.as_ref());
-    let req_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+    let req_devices_digest = crate::iroh_friend_acceptor::contact_digest(
         &req_bundle.sender_devices,
         &req_bundle.device_identity_pubs,
+        &req_bundle.iroh_node_id,
+        req_bundle.home_relay_url.as_deref(),
+        &req_bundle.pq_dsa_pubkey,
+        &req_bundle.pq_kem_pubkey,
     );
     let req_sig = self_device2_signing_key
         .sign(&friend_request_sig_preimage(
@@ -39420,11 +39430,16 @@ pub async fn connectivity_link_friend_iroh_inner(
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
-    // ZEB-461: bind the accepter's device-bundle digest (computed from the bundle
-    // the accept carries) into the verified accept preimage.
-    let accept_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+    // ZEB-461/473: bind the accepter's contact digest (device bundle +
+    // reachability + PQ keys, all carried in the accept) into the verified
+    // accept preimage.
+    let accept_devices_digest = crate::iroh_friend_acceptor::contact_digest(
         &accepted.sender_devices,
         &accepted.device_identity_pubs,
+        &accepted.iroh_node_id,
+        accepted.home_relay_url.as_deref(),
+        &accepted.pq_dsa_pubkey,
+        &accepted.pq_kem_pubkey,
     );
     accept_vk
         .verify_strict(
@@ -39482,12 +39497,22 @@ pub async fn connectivity_link_friend_iroh_inner(
     // ZEB-461 Task 7: learn the inviter's advertised devices (carried in the
     // accept) so the DM outbox can route to this friend even without a shared
     // community. Shared helper keeps this in lockstep with the add-by-key path.
+    // ZEB-473 Task 5: persist the inviter's SIGNED iroh reachability + PQ keys for
+    // the DM tunnel (single contact, parallel to device 0; `None` if they
+    // advertised nothing dialable — skip-on-empty).
+    let inviter_contacts = vec![crate::dm_tunnel_contact::peer_handshake_contact(
+        accepted.iroh_node_id,
+        accepted.home_relay_url.clone(),
+        accepted.pq_dsa_pubkey.clone(),
+        accepted.pq_kem_pubkey.clone(),
+    )];
     apply_handshaked_friend(
         &crdt_state,
         payload.inviter_addr,
         entry,
         accepted.sender_devices.clone(),
         accepted.device_identity_pubs.clone(),
+        inviter_contacts,
         learned_at,
     )
     .await?;
@@ -41536,9 +41561,13 @@ pub async fn connectivity_add_friend_by_key_inner(
     // digest is computed from the SAME (devices, pubs) placed on the wire so the
     // request signature stays consistent. Reachability + PQ keys are unsigned.
     let req_bundle = crate::dm_tunnel_contact::self_request_bundle(self_reachability.as_ref());
-    let req_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+    let req_devices_digest = crate::iroh_friend_acceptor::contact_digest(
         &req_bundle.sender_devices,
         &req_bundle.device_identity_pubs,
+        &req_bundle.iroh_node_id,
+        req_bundle.home_relay_url.as_deref(),
+        &req_bundle.pq_dsa_pubkey,
+        &req_bundle.pq_kem_pubkey,
     );
     let req_sig = self_device2_signing_key
         .sign(&friend_request_sig_preimage(
@@ -41670,10 +41699,15 @@ pub async fn connectivity_add_friend_by_key_inner(
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
     let accept_vk =
         VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
-    // ZEB-461: bind the accepter's device-bundle digest into the verified preimage.
-    let accept_devices_digest = crate::iroh_friend_acceptor::friend_devices_digest(
+    // ZEB-461/473: bind the accepter's contact digest (device bundle +
+    // reachability + PQ keys) into the verified preimage.
+    let accept_devices_digest = crate::iroh_friend_acceptor::contact_digest(
         &accepted.sender_devices,
         &accepted.device_identity_pubs,
+        &accepted.iroh_node_id,
+        accepted.home_relay_url.as_deref(),
+        &accepted.pq_dsa_pubkey,
+        &accepted.pq_kem_pubkey,
     );
     accept_vk
         .verify_strict(
@@ -41726,12 +41760,21 @@ pub async fn connectivity_add_friend_by_key_inner(
     // the DM outbox can route to this key-introduced friend even without a shared
     // community. Shared helper keeps this in lockstep with the token path —
     // Greptile P1 on #269 found this path previously dropped the device update.
+    // ZEB-473 Task 5: persist the target's SIGNED iroh reachability + PQ keys
+    // (single contact parallel to device 0; `None` if nothing dialable).
+    let target_contacts = vec![crate::dm_tunnel_contact::peer_handshake_contact(
+        accepted.iroh_node_id,
+        accepted.home_relay_url.clone(),
+        accepted.pq_dsa_pubkey.clone(),
+        accepted.pq_kem_pubkey.clone(),
+    )];
     apply_handshaked_friend(
         &crdt_state,
         target_addr_master,
         entry,
         accepted.sender_devices.clone(),
         accepted.device_identity_pubs.clone(),
+        target_contacts,
         learned_at,
     )
     .await?;
@@ -41985,9 +42028,24 @@ mod friend_ipc_tests {
         // helper; Greptile P1 on #269 was the add-by-key path skipping it.
         let state = tokio::sync::Mutex::new(OwnerState::default());
         let (addr, entry) = friend_entry(0x33, FriendStatus::Active, 10);
-        apply_handshaked_friend(&state, addr, entry, devices.clone(), pubs.clone(), hlc(10))
-            .await
-            .expect("apply must succeed");
+        // ZEB-473 Task 5: a single SIGNED tunnel contact, parallel to device 0.
+        let contact = crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [0x7c; 32],
+            home_relay_url: Some("https://relay.example/".into()),
+            pq_dsa_pubkey: vec![1, 2, 3],
+            pq_kem_pubkey: vec![4, 5, 6],
+        };
+        apply_handshaked_friend(
+            &state,
+            addr,
+            entry,
+            devices.clone(),
+            pubs.clone(),
+            vec![Some(contact.clone())],
+            hlc(10),
+        )
+        .await
+        .expect("apply must succeed");
         {
             let s = state.lock().await;
             assert!(
@@ -42005,13 +42063,19 @@ mod friend_ipc_tests {
                 cache.devices, devices,
                 "cache must learn the accepted bundle"
             );
+            // The signed tunnel contact must be persisted parallel to its device.
+            assert_eq!(
+                cache.device_tunnel_contacts,
+                vec![Some(contact)],
+                "the signed tunnel contact must persist parallel to device 0"
+            );
         }
 
         // Empty bundle → friend still applied, cache untouched (skip-on-empty so
         // an advertised-nothing peer can't LWW-clobber a known-good entry).
         let state2 = tokio::sync::Mutex::new(OwnerState::default());
         let (addr2, entry2) = friend_entry(0x44, FriendStatus::Active, 10);
-        apply_handshaked_friend(&state2, addr2, entry2, vec![], vec![], hlc(10))
+        apply_handshaked_friend(&state2, addr2, entry2, vec![], vec![], vec![], hlc(10))
             .await
             .expect("apply must succeed with an empty bundle");
         {

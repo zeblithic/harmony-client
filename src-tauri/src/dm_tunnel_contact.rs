@@ -11,7 +11,7 @@ use crate::owner_state_types::DeviceIdentityHash;
 /// The local node's own single-device bundle for the friend handshake.
 ///
 /// Returns the parallel `(devices, identity_pubs)` vecs that go into the
-/// `FriendLinkRequest` / `FriendLinkAccepted` (and into `friend_devices_digest`,
+/// `FriendLinkRequest` / `FriendLinkAccepted` (and into `contact_digest`,
 /// which the handshake signature binds). `identity_pub_64` is the canonical
 /// `X25519_pub(32) || Ed25519_pub(32)` combined identity public-bytes value.
 ///
@@ -38,10 +38,10 @@ pub fn self_device_bundle(
     }
 }
 
-/// The self-side values a `FriendLinkRequest` carries (ZEB-461): the SIGNED
-/// device bundle (`sender_devices` + `device_identity_pubs`, bound into the
-/// handshake signature via `friend_devices_digest`) plus the UNSIGNED iroh
-/// reachability + PQ routing hints.
+/// The self-side values a `FriendLinkRequest` carries (ZEB-461/473): the device
+/// bundle (`sender_devices` + `device_identity_pubs`) plus the iroh reachability +
+/// PQ keys. ZEB-473 §6.3: ALL of these are now SIGNED — every field is folded into
+/// `contact_digest`, which the handshake signature binds.
 pub struct SelfRequestBundle {
     pub sender_devices: Vec<DeviceIdentityHash>,
     pub device_identity_pubs: Vec<Option<[u8; 64]>>,
@@ -84,6 +84,39 @@ pub fn self_request_bundle(
             pq_kem_pubkey: vec![],
         },
     }
+}
+
+/// ZEB-473 Task 5: build a peer's [`DeviceTunnelContact`] from the reachability +
+/// PQ keys it advertised over the friend handshake, or `None` when it advertised
+/// nothing dialable.
+///
+/// A contact is only meaningful — and only worth persisting — when the peer gave
+/// us BOTH a non-zero iroh `node_id` (the dial target) and a non-empty PQ DSA
+/// public key (needed to authenticate the PQ tunnel handshake). A peer that omits
+/// either cannot be tunnel-dialed, so we return `None` rather than fabricating a
+/// half-populated contact. Returning `None` (vs an all-zero contact) is what lets
+/// the CRDT skip-on-empty rule fire: a contactless/older peer never LWW-clobbers
+/// a previously-known-good contact for that device.
+///
+/// These fields are now SIGNED into the handshake (the `contact_digest` preimage,
+/// §6.3), so a value reaching here has already passed signature verification —
+/// this helper only decides "present enough to dial?", never trusts an unsigned
+/// hint.
+pub fn peer_handshake_contact(
+    iroh_node_id: [u8; 32],
+    home_relay_url: Option<String>,
+    pq_dsa_pubkey: Vec<u8>,
+    pq_kem_pubkey: Vec<u8>,
+) -> Option<crate::owner_state_types::DeviceTunnelContact> {
+    if iroh_node_id == [0u8; 32] || pq_dsa_pubkey.is_empty() {
+        return None;
+    }
+    Some(crate::owner_state_types::DeviceTunnelContact {
+        iroh_node_id,
+        home_relay_url,
+        pq_dsa_pubkey,
+        pq_kem_pubkey,
+    })
 }
 
 #[cfg(test)]
