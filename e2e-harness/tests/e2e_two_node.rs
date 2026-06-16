@@ -241,22 +241,19 @@ async fn s1_invite_join_roster_convergence() {
 // id-equality; it asserts the (correct) inequality-at-creation and reads tolerant
 // of whichever id the thread settles under (`read_dm_plaintext_any`).
 //
-// DM DELIVERY: two layers, one now fixed (ZEB-461 Tasks 5-7), one still pending.
-// DM unicast resolves `OwnerAddr → device destinations` via `OwnerDeviceCache`.
-// BEFORE ZEB-461 that cache was populated only by Reticulum announce propagation,
-// which the harness disables (`HARMONY_RETICULUM_PORT=0`, mandatory so two
-// co-located nodes don't collide on the fixed LAN broadcast port) — so the cache
-// stayed empty and `send_dm` retried forever with "no known devices for recipient".
-// ZEB-461 Tasks 5-7 fix THAT layer: the iroh friend handshake now carries + learns
-// each side's device bundle into `OwnerDeviceCache`, so `resolve_destinations`
-// resolves the peer's devices with NO Reticulum socket. The remaining layer is the
-// DM transport itself: per-device unicast still rides the Reticulum path
-// (`SendUnicastToDevice`), which can't route co-located and is being deprecated in
-// favour of a DM-over-iroh carrier (repurposing the PQ `harmony-tunnel` session;
-// ZEB-473 — see docs/analysis/2026-06-14-transport-00-SYNTHESIS.md). So
-// below we hard-assert the parts that work end-to-end (friendship active both ways +
-// DM-space creation + `send_dm` accepted/resolved) and *characterize* (not assert)
-// byte round-trip, which lights up once the DM-over-iroh carrier lands.
+// DM DELIVERY (status after ZEB-473 / DM-over-iroh Move 1a, Tasks 1-9):
+// DM unicast resolves `OwnerAddr → device destinations` via `OwnerDeviceCache`,
+// now populated by the iroh friend handshake (ZEB-461 Tasks 5-7) with NO Reticulum
+// socket (the harness disables it: `HARMONY_RETICULUM_PORT=0`, mandatory so two
+// co-located nodes don't collide on the fixed LAN broadcast port). The live DM
+// byte carrier is the PQ `harmony-tunnel` (`IrohTunnelDmTransport` + inbound
+// `ingest_dm_packet`), installed in `serve`. This scenario hard-asserts the
+// parts that genuinely work end-to-end co-located (friendship active both ways +
+// DM-space creation + `send_dm` accepted) and CHARACTERIZES (logs, does not gate)
+// the byte round-trip. The full byte-delivery hard-assert lives in the separate,
+// `#[ignore]`'d `s2_dm_delivery_over_tunnel_hard_assert` below, which documents the
+// exact remaining co-located gap empirically (the DM Space invite no longer has a
+// cross-owner carrier — see that test's ignore note).
 // ─────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s2_friend_graph_and_dm_send() {
@@ -377,10 +374,13 @@ async fn s2_friend_graph_and_dm_send() {
 
     eprintln!(
         "S2 DM delivery: alice→bob={delivered_a_to_b} bob→alice={delivered_b_to_a} \
-         (both expected FALSE in this harness: OwnerDeviceCache IS now populated via \
-         the friend handshake — ZEB-461 reachability primitive — but there is still no \
-         live DM byte carrier in the client; byte-delivery awaits the DM-over-iroh \
-         tunnel, ZEB-473. See DM DELIVERY GAP note + report)"
+         (both currently FALSE co-located: the PQ tunnel DOES establish + deliver the \
+         signed CidNotify packet between the two nodes — Tasks 1-9 — but the receiver \
+         rejects it at `verify_cidnotify_admission: SpaceNotFound` because the DM Space \
+         (random per-owner SpaceId + per-Space content_key) has no cross-owner carrier: \
+         the DmInvite that propagated it rode Reticulum unicast, removed in harmony#280, \
+         and re-wiring it onto the tunnel is a later move. See \
+         `s2_dm_delivery_over_tunnel_hard_assert`'s ignore note for the full diagnosis.)"
     );
 
     // Hard scenario result = the parts that genuinely work end-to-end:
@@ -389,6 +389,140 @@ async fn s2_friend_graph_and_dm_send() {
     //   • both sides created a DM space with the verified id semantics,
     //   • both `send_dm` IPCs were accepted by the engine.
     // DM byte-delivery is characterized above but not gated on (documented gap).
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S2 (hard-assert): live 1:1 DM byte-delivery over the PQ tunnel (ZEB-473).
+//
+// Two co-located headless nodes friend each other, Alice sends a DM, and Bob MUST
+// receive the DM byte — asserted BOTH ways: the `dm-received` WS event fires on Bob
+// AND the plaintext lands in Bob's DM thread. This is the exact assertion that fails
+// pre-carrier; it gates the DM-over-iroh path end-to-end co-located.
+//
+// ── WHY THIS IS `#[ignore]`'d (precise, empirically captured 2026-06-15) ──────
+// Running this test against the Tasks-1-9 binary reveals the PQ tunnel path works
+// up to — but not through — DM-Space admission. Both node stderr logs show, for
+// every DM, in BOTH directions:
+//
+//   ZEB-473: tunnel DM rejected; dropping (deposit rung covers durability)
+//       peer=<peer-node-id> payload_len=184
+//       reason=verify_cidnotify_admission: SpaceNotFound
+//
+// So co-located, end-to-end:
+//   ✓ the per-device PQ tunnel DIALS + HANDSHAKES between the two nodes,
+//   ✓ `IrohTunnelDmTransport` builds the signed CidNotify and routes it,
+//   ✓ the inbound tunnel loop DELIVERS the 184-byte packet to the peer,
+//   ✓ the drain runs it through `ingest_dm_packet` → `verify_cidnotify_admission`,
+//   ✗ which REJECTS it: `SpaceNotFound`. (The CAS blob fetch — the other suspected
+//     gap — is never even reached.)
+//
+// Root cause (NOT a ZEB-473 regression — an upstream carrier gap ZEB-473 exposes):
+// a DM Space is minted with a RANDOM per-owner `SpaceId` AND a per-Space random
+// `content_key` (`add_space_dm_inner`). For Bob to admit + decrypt Alice's DM he
+// must hold the SAME Space (same id, same content_key) Alice signed/encrypted
+// under. That Space reaches a recipient via the DmInvite, which used to ride the
+// Reticulum unicast carrier — REMOVED in harmony#280 (`add_space` now discards the
+// `sends` Vec; see lib.rs `add_space_impl`, the "ZEB-473 (Move 1a)" note). The
+// only remaining Space carrier is owner-state-root CRDT sync, which is keyed per
+// owner KeyTree — it replicates a Space across one owner's OWN devices, NOT across
+// two different friend owners. So co-located there is currently NO cross-owner DM-
+// Space carrier: even if SpaceIds matched, the differing content_keys would fail
+// decrypt. Re-wiring the DmInvite fan-out onto the iroh tunnel is an explicit
+// "later move" (lib.rs add_space_impl + add_space_dm_inner ZEB-474 notes), out of
+// ZEB-473 Move 1a scope.
+//
+// This test is therefore kept as a HARD ASSERT (it is NOT weakened to pass) and is
+// `#[ignore]`'d so it documents the exact remaining gap and flips green for free
+// the moment the DM-Space carrier lands. Run it explicitly with:
+//   cargo nextest run --features e2e -E 'test(s2_dm_delivery_over_tunnel_hard_assert)' \
+//       --run-ignored all
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ZEB-473: tunnel delivers the signed CidNotify co-located, but the DM \
+            Space (random per-owner SpaceId + content_key) has no cross-owner carrier \
+            (DmInvite rode Reticulum, removed in harmony#280; re-wiring onto the tunnel \
+            is a later move) → receiver rejects every tunnel DM at \
+            verify_cidnotify_admission: SpaceNotFound. Un-ignore once the DM-Space \
+            invite carrier lands."]
+async fn s2_dm_delivery_over_tunnel_hard_assert() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let (mut run, ah, bh, alice, bob) = two_minted_nodes("s2-hard").await;
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    // Subscribe to Bob's event stream BEFORE the send so we never miss the
+    // `dm-received` frame (the WS forwards every frame from connect onward).
+    let (mut bob_events, _bob_ev_task) = bob.events().await.expect("subscribe bob events");
+
+    // Friend handshake = cross-node iroh first-contact (racy ~75-90s; retry until
+    // Ok, surfacing the real error on timeout instead of a bare deadline).
+    let token = generate_friend_token(&alice).await.expect("friend token");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut last_err = String::from("(no redeem attempt completed before the deadline)");
+    loop {
+        if std::time::Instant::now() >= deadline {
+            panic!("bob never redeemed alice's friend token within 120s; last error: {last_err}");
+        }
+        match redeem_friend_token(&bob, &token).await {
+            Ok(_) => break,
+            Err(e) => last_err = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Friendship Active both ways (token consent auto-accepts; the accept loop is
+    // belt-and-braces). This is the DM-picker graph (ZEB-431) + the handshake that
+    // populates each side's `OwnerDeviceCache` with the peer's tunnel contact.
+    poll_until(Duration::from_secs(120), || async {
+        accept_pending_from(&alice, &bob_owner).await?;
+        Ok(friend_is_active(&alice, &bob_owner).await?.then_some(()))
+    })
+    .await
+    .expect("alice has bob as active friend");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(friend_is_active(&bob, &alice_owner).await?.then_some(()))
+    })
+    .await
+    .expect("bob has alice as active friend");
+
+    // Alice creates the DM space and sends a DM. (Bob also creates his own DM space
+    // so both candidate ids are readable; the live thread settles under whichever
+    // id wins the cross-node merge.)
+    let a_space = add_dm_space(&alice, "s2-hard-dm", &bob_owner)
+        .await
+        .expect("alice dm space");
+    let b_space = add_dm_space(&bob, "s2-hard-dm", &alice_owner)
+        .await
+        .expect("bob dm space");
+    let candidates: Vec<&str> = vec![a_space.as_str(), b_space.as_str()];
+
+    let body: &[u8] = b"hard-assert-dm-over-tunnel";
+    send_dm(&alice, &a_space, body, "text/plain")
+        .await
+        .expect("alice's send_dm accepted by the engine (CAS-stored + queued)");
+
+    // HARD ASSERT #1: the `dm-received` WS event fires on Bob carrying this body.
+    // The shared `dm-received` payload serializes `body` as lowercase hex.
+    let want_body_hex = hex::encode(body);
+    e2e_harness::await_event(&mut bob_events, Duration::from_secs(60), |f| {
+        f.event == "dm-received"
+            && f.payload.get("body").and_then(|b| b.as_str()) == Some(want_body_hex.as_str())
+    })
+    .await
+    .expect("bob MUST receive a `dm-received` event for the DM over the PQ tunnel");
+
+    // HARD ASSERT #2: the plaintext lands in Bob's DM thread (read-back).
+    poll_until(Duration::from_secs(30), || async {
+        let msgs = read_dm_plaintext_any(&bob, &candidates).await?;
+        Ok(msgs.iter().any(|(_, b)| b == body).then_some(()))
+    })
+    .await
+    .expect("bob's DM thread MUST contain the delivered DM plaintext");
+
     run.mark_success();
     drop((alice, bob, ah, bh));
 }

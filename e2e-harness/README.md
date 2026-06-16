@@ -38,7 +38,8 @@ machine** (two co-located nodes):
 | Scenario | What it proves | Status |
 |---|---|---|
 | `s1_invite_join_roster_convergence` | invite → iroh first-contact join → roster converges both ways | ✅ pass |
-| `s2_friend_graph_and_dm_send` | friend-token iroh handshake → friendship `active` both ways (ZEB-431 DM-picker graph) + `send_dm` accepted. (1:1 DM byte-**delivery** is characterized, not asserted — co-located gap ZEB-461.) | ✅ pass |
+| `s2_friend_graph_and_dm_send` | friend-token iroh handshake → friendship `active` both ways (ZEB-431 DM-picker graph) + `send_dm` accepted. (1:1 DM byte-**delivery** is characterized, not asserted here — see the hard-assert row.) | ✅ pass |
+| `s2_dm_delivery_over_tunnel_hard_assert` | live 1:1 DM byte-delivery over the PQ tunnel (ZEB-473): Alice→Bob DM MUST fire `dm-received` + land in Bob's thread. | ⏸️ `#[ignore]` — tunnel delivers the signed CidNotify co-located, but the DM Space (random per-owner `SpaceId` + `content_key`) has no cross-owner carrier (DmInvite rode Reticulum, removed in harmony#280; re-wiring onto the tunnel is a later move) → receiver rejects every tunnel DM at `verify_cidnotify_admission: SpaceNotFound`. Un-ignore once the DM-Space invite carrier lands. |
 | `s3_offline_channel_reconnect_catchup` | channel created while peer offline → reconnect catch-up (ZEB-434) | ✅ pass |
 | `s4_restart_durability` | single-node community survives a restart (ZEB-393) | ✅ pass |
 
@@ -50,7 +51,15 @@ checked `c.get("id")` while the DTOs are camelCase (`channelId` / `spaceId`), so
 they always timed out and *looked* like a sync failure. With the keys corrected
 and the ZEB-462 (B) membership-CRDT durability fix on main (#253), both pass
 reliably (S3 proven 3/3). The one remaining co-located gap is **1:1 DM
-byte-delivery** (ZEB-461, characterized not asserted). **Cross-WAN** reachability
+byte-delivery**: after ZEB-473 (DM-over-iroh Move 1a) the PQ tunnel establishes +
+delivers the signed CidNotify packet between two co-located nodes, but the receiver
+rejects it at `verify_cidnotify_admission: SpaceNotFound` — the DM Space (random
+per-owner `SpaceId` + per-Space `content_key`) currently has no cross-owner carrier
+(its DmInvite rode the Reticulum unicast removed in harmony#280; re-wiring it onto
+the tunnel is a later move). The hard-assert test
+`s2_dm_delivery_over_tunnel_hard_assert` is kept as a real assertion and `#[ignore]`'d
+with that exact diagnosis; it flips green for free once the DM-Space carrier lands.
+**Cross-WAN** reachability
 (two real machines / LANs) is still only exercised by the cross-machine playbook
 (`docs/playbooks/e2e-two-agent-suite.md`, ZEB-444) — a co-located pass does not
 prove cross-WAN re-peering.
