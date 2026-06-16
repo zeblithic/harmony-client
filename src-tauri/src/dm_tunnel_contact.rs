@@ -91,12 +91,14 @@ pub fn self_request_bundle(
 /// nothing dialable.
 ///
 /// A contact is only meaningful — and only worth persisting — when the peer gave
-/// us BOTH a non-zero iroh `node_id` (the dial target) and a non-empty PQ DSA
-/// public key (needed to authenticate the PQ tunnel handshake). A peer that omits
-/// either cannot be tunnel-dialed, so we return `None` rather than fabricating a
-/// half-populated contact. Returning `None` (vs an all-zero contact) is what lets
-/// the CRDT skip-on-empty rule fire: a contactless/older peer never LWW-clobbers
-/// a previously-known-good contact for that device.
+/// us a non-zero iroh `node_id` (the dial target) AND both PQ public keys: the
+/// ML-DSA key (to authenticate the PQ tunnel handshake) and the ML-KEM key (for
+/// the ML-KEM key agreement that establishes the tunnel). A peer that omits any
+/// of the three cannot be tunnel-dialed, so we return `None` rather than
+/// fabricating a half-populated contact that would always fail the handshake.
+/// Returning `None` (vs a partial contact) is what lets the CRDT skip-on-empty
+/// rule fire: a contactless/older peer never LWW-clobbers a previously-known-good
+/// contact for that device.
 ///
 /// These fields are now SIGNED into the handshake (the `contact_digest` preimage,
 /// §6.3), so a value reaching here has already passed signature verification —
@@ -108,7 +110,7 @@ pub fn peer_handshake_contact(
     pq_dsa_pubkey: Vec<u8>,
     pq_kem_pubkey: Vec<u8>,
 ) -> Option<crate::owner_state_types::DeviceTunnelContact> {
-    if iroh_node_id == [0u8; 32] || pq_dsa_pubkey.is_empty() {
+    if iroh_node_id == [0u8; 32] || pq_dsa_pubkey.is_empty() || pq_kem_pubkey.is_empty() {
         return None;
     }
     Some(crate::owner_state_types::DeviceTunnelContact {
@@ -185,5 +187,33 @@ mod tests {
         assert!(n.home_relay_url.is_none());
         assert!(n.pq_dsa_pubkey.is_empty());
         assert!(n.pq_kem_pubkey.is_empty());
+    }
+
+    /// CodeAnt/Qodo F3: a contact is only dialable with a non-zero node id AND
+    /// both PQ keys (ML-DSA for handshake auth, ML-KEM for key agreement). Any
+    /// missing field → `None` so an undialable contact never LWW-clobbers a
+    /// previously-known-good one.
+    #[test]
+    fn peer_handshake_contact_requires_node_id_and_both_pq_keys() {
+        let node = [7u8; 32];
+        let dsa = vec![1u8; 8];
+        let kem = vec![2u8; 8];
+
+        // Happy path: all three present → Some.
+        let c = peer_handshake_contact(node, None, dsa.clone(), kem.clone())
+            .expect("a fully-populated contact must be Some");
+        assert_eq!(c.iroh_node_id, node);
+        assert_eq!(c.pq_dsa_pubkey, dsa);
+        assert_eq!(c.pq_kem_pubkey, kem);
+
+        // Zero node id → None.
+        assert!(peer_handshake_contact([0u8; 32], None, dsa.clone(), kem.clone()).is_none());
+        // Empty DSA → None.
+        assert!(peer_handshake_contact(node, None, vec![], kem.clone()).is_none());
+        // Empty KEM → None (the F3 regression: was previously Some).
+        assert!(
+            peer_handshake_contact(node, None, dsa.clone(), vec![]).is_none(),
+            "an empty ML-KEM key must skip the contact (undialable)"
+        );
     }
 }

@@ -743,9 +743,9 @@ impl OwnerState {
                 });
             }
             if existing.learned_at == learned_at {
-                // Equal HLC — only idempotent if the payload (devices AND
-                // pubs) matches. Two replicas concurrently issuing
-                // different payloads under the same HLC would otherwise
+                // Equal HLC — only idempotent if the payload (devices, pubs
+                // AND tunnel contacts) matches. Two replicas concurrently
+                // issuing different payloads under the same HLC would otherwise
                 // diverge silently.
                 //
                 // Note on equal-HLC + None-from-existing-Some: at equal
@@ -755,16 +755,25 @@ impl OwnerState {
                 // same HLC would mean the same source emitted two
                 // different payloads under the same HLC, which is a
                 // non-deterministic-source invariant fail. Reject. The
-                // pub-preserve merge below applies only when new HLC
-                // is strictly newer.
+                // pub-preserve / contact-preserve merges below apply only
+                // when the new HLC is strictly newer.
+                //
+                // ZEB-473: `device_tunnel_contacts` is included here too.
+                // Without it, two replicas could accept different contacts
+                // under the same `learned_at` — each treating the other's
+                // entry as an idempotent replay — and stably diverge on the
+                // PQ tunnel routing hint, breaking CRDT convergence for the
+                // new payload the same way diverging devices/pubs would.
                 if existing.devices == sanitized_devices
                     && existing.device_identity_pubs == sanitized_pubs
+                    && existing.device_tunnel_contacts == sanitized_contacts
                 {
                     return ApplyOutcome::Merged { old_id: None };
                 }
                 return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
                     "owner_device_entry for {:?} diverges at identical learned_at \
-                     (concurrent updates with same HLC but different devices or pubs)",
+                     (concurrent updates with same HLC but different devices, pubs, or \
+                     tunnel contacts)",
                     addr
                 )));
             }
@@ -3731,6 +3740,69 @@ mod owner_device_cache_tests {
         assert_eq!(recovered, entry);
         assert_eq!(recovered.device_tunnel_contacts.len(), 1);
         assert_eq!(recovered.device_tunnel_contacts[0], Some(contact));
+    }
+
+    /// CodeAnt F5: equal-HLC idempotence must consider `device_tunnel_contacts`.
+    /// Two replicas issuing the SAME `learned_at` but DIFFERENT contacts would
+    /// otherwise each treat the other's entry as an idempotent replay and stably
+    /// diverge on the PQ tunnel routing hint. The equal-HLC guard must reject
+    /// the divergence (the same way diverging devices/pubs are rejected), and
+    /// must accept an identical-payload replay as idempotent.
+    #[test]
+    fn apply_owner_device_update_equal_hlc_diverging_contacts_rejected() {
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([0x77; 16]);
+        let (h_a, p_a) = matching_device_pair(0xe1);
+        let devices = vec![h_a];
+        let pubs = vec![Some(p_a)];
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "dev-a".into(),
+        };
+
+        // Seed with contact_v1.
+        let out1 = state.apply_owner_device_update(
+            owner,
+            devices.clone(),
+            pubs.clone(),
+            vec![Some(tunnel_contact(0x01))],
+            learned_at.clone(),
+        );
+        assert!(matches!(out1, ApplyOutcome::Inserted));
+
+        // Same HLC, same devices+pubs, but a DIFFERENT contact → must REJECT
+        // (would otherwise be a silent replica divergence).
+        let out_diverge = state.apply_owner_device_update(
+            owner,
+            devices.clone(),
+            pubs.clone(),
+            vec![Some(tunnel_contact(0x02))],
+            learned_at.clone(),
+        );
+        assert!(
+            matches!(
+                out_diverge,
+                ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+            ),
+            "equal-HLC with diverging tunnel contacts must be rejected, got {out_diverge:?}"
+        );
+        // The cache still holds contact_v1 (the reject did not mutate state).
+        let entry = state.owner_device_cache.devices.get(&owner).unwrap();
+        assert_eq!(entry.device_tunnel_contacts[0], Some(tunnel_contact(0x01)));
+
+        // Same HLC + IDENTICAL contact → idempotent replay (Merged), not reject.
+        let out_replay = state.apply_owner_device_update(
+            owner,
+            devices,
+            pubs,
+            vec![Some(tunnel_contact(0x01))],
+            learned_at,
+        );
+        assert!(
+            matches!(out_replay, ApplyOutcome::Merged { .. }),
+            "equal-HLC identical-contact replay must be idempotent, got {out_replay:?}"
+        );
     }
 }
 

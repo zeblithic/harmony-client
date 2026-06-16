@@ -364,18 +364,21 @@ pub(crate) async fn ingest_dm_packet(
     };
 
     // 2. Admission under the owner-state lock — the SAME verification a
-    //    direct/deposit arrival runs. Snapshot the Space + resolved owner
-    //    out, then drop the lock before the slow CAS fetch.
-    let (space, resolved_owner) = {
+    //    direct/deposit arrival runs. We only carry `resolved_owner` past the
+    //    lock: the Space snapshot here is intentionally DROPPED rather than
+    //    reused, because the slow CAS fetch below opens a TOCTOU window. The
+    //    fresh Space (and its current content_key) is re-fetched + re-validated
+    //    under a second lock in step 4 (Phase C), mirroring the direct path.
+    let resolved_owner = {
         let state = crdt_state.lock().await;
-        let (space, resolved_owner, _identity_pub) = crate::dm_outbox::verify_cidnotify_admission(
+        let (_space, resolved_owner, _identity_pub) = crate::dm_outbox::verify_cidnotify_admission(
             &state,
             &signed,
             &signature,
             &signed_bytes,
         )
         .map_err(|e| format!("verify_cidnotify_admission: {e:?}"))?;
-        (space, resolved_owner)
+        resolved_owner
     };
 
     // 3. CAS fetch the storage blob by the packet's message_cid (the tunnel
@@ -394,13 +397,19 @@ pub(crate) async fn ingest_dm_packet(
         Err(_) => return Err("CAS fetch: 500ms timeout".into()),
     };
 
-    // 4. Decrypt + sender binding — the direct path's Phase C, shared helper.
-    let payload = crate::dm_outbox::decrypt_and_bind_dm_blob(&space, &blob, resolved_owner)
-        .map_err(|e| format!("decrypt_and_bind_dm_blob: {e:?}"))?;
-
-    // 5. apply_inbox — idempotent on (space_id, message_cid). `received_at`
-    //    is this device's wall clock (the tunnel has no deposit timestamp);
-    //    `from` is the resolved sender owner.
+    // 4. Re-lock + TOCTOU re-check + decrypt + apply — the direct path's
+    //    Phase C (`handle_cidnotify_lifted`), held under ONE lock acquisition.
+    //    The `space` snapshot taken in step 2 is now stale: during the slow CAS
+    //    fetch the Space could have been deleted, the sender could have lost
+    //    membership (a GroupDm kick), or the `content_key` could have rotated.
+    //    Re-fetch the Space from `OwnerState.spaces` by id and re-verify the
+    //    SpaceKind gate + membership before decrypting — otherwise a tunnel DM
+    //    from a now-revoked member (or against a deleted/rotated Space) could
+    //    still be decrypted + applied, diverging from the direct path's trust.
+    //    On a failed re-check we reject (Err → drain logs + drops): the deposit
+    //    rung is the durability backstop for anything that should have arrived.
+    //    `received_at` is this device's wall clock (the tunnel has no deposit
+    //    timestamp); `from` is the resolved sender owner.
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -415,15 +424,40 @@ pub(crate) async fn ingest_dm_packet(
             device_id: device_id.to_string(),
         },
     };
-    let newly_inserted = {
+    let (payload, newly_inserted) = {
         let mut state = crdt_state.lock().await;
-        match state.apply_inbox(inbox_entry.clone()) {
+
+        // TOCTOU re-check: re-fetch the Space (it may have been deleted), then
+        // re-verify the SpaceKind gate + membership against the FRESH state —
+        // mirroring `handle_cidnotify_lifted` Phase C.
+        let space_c = state
+            .spaces
+            .get(&signed.space_id)
+            .cloned()
+            .ok_or_else(|| "TOCTOU re-check: Space deleted during CAS fetch".to_string())?;
+        if !matches!(
+            space_c.kind,
+            crate::owner_state_types::SpaceKind::Dm | crate::owner_state_types::SpaceKind::GroupDm
+        ) {
+            return Err("TOCTOU re-check: Space kind no longer DM/GroupDm".into());
+        }
+        if !space_c.members.contains(&resolved_owner) {
+            return Err("TOCTOU re-check: sender lost membership during CAS fetch".into());
+        }
+
+        // Decrypt with the FRESH space (+ its current content_key / prior keys),
+        // so a rotation that landed during the CAS fetch is reflected here.
+        let payload = crate::dm_outbox::decrypt_and_bind_dm_blob(&space_c, &blob, resolved_owner)
+            .map_err(|e| format!("decrypt_and_bind_dm_blob: {e:?}"))?;
+
+        let newly_inserted = match state.apply_inbox(inbox_entry.clone()) {
             crate::owner_state_crdt::ApplyOutcome::Inserted => true,
             crate::owner_state_crdt::ApplyOutcome::Merged { .. } => false,
             crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
                 return Err(format!("apply_inbox rejected: {reason:?}"));
             }
-        }
+        };
+        (payload, newly_inserted)
     };
 
     // 6. Emit the SAME dm-received event the direct/deposit paths emit, gated
@@ -1221,6 +1255,96 @@ mod tests {
         assert!(
             fx.sink_handle.frames().is_empty(),
             "a rejected packet must not emit"
+        );
+    }
+
+    /// CodeAnt F1 (TOCTOU): admission is checked under the lock, the lock is
+    /// dropped for the slow CAS fetch, and the Space/membership are then
+    /// re-checked under a SECOND lock before decrypt + apply. If the sender
+    /// loses membership DURING the fetch window, the Phase-C re-check must
+    /// REJECT the DM — exactly like the direct path's `handle_cidnotify_lifted`.
+    ///
+    /// This test lands the revocation precisely in the TOCTOU window: a
+    /// content-store wrapper revokes Alice's membership as a side-effect of the
+    /// CAS `get()` (i.e. after admission passed, before the re-check runs). The
+    /// blob is still returned, so the ONLY thing that can stop the apply is the
+    /// Phase-C re-check — proving it exists and fires (not admission).
+    #[tokio::test]
+    async fn ingest_dm_packet_rejects_when_sender_loses_membership_mid_fetch() {
+        use crate::content_store::{ContentStore, ContentStoreError, InMemoryStub};
+        use harmony_content::cid::ContentId as Cid;
+        use std::sync::Arc as StdArc;
+
+        /// Returns the blob normally, but as a side-effect (simulating the kick
+        /// racing in during the slow fetch) removes Alice from the Space's
+        /// members. The mutation lands strictly between admission and the
+        /// Phase-C re-check.
+        struct RevokeOnGetStore {
+            inner: InMemoryStub,
+            crdt_state: StdArc<Mutex<crate::owner_state_crdt::OwnerState>>,
+            space_id: SpaceId,
+            victim: OwnerAddr,
+        }
+        #[async_trait]
+        impl ContentStore for RevokeOnGetStore {
+            async fn put(&self, cid: Cid, blob: Vec<u8>) -> Result<(), ContentStoreError> {
+                self.inner.put(cid, blob).await
+            }
+            async fn get(&self, cid: &Cid) -> Result<Option<Vec<u8>>, ContentStoreError> {
+                // Revoke membership in the fetch window (the TOCTOU race).
+                {
+                    let mut state = self.crdt_state.lock().await;
+                    if let Some(space) = state.spaces.get_mut(&self.space_id) {
+                        space.members.retain(|m| *m != self.victim);
+                    }
+                }
+                self.inner.get(cid).await
+            }
+        }
+
+        let fx = build_dm_ingest_fixture(b"revoked mid-fetch").await;
+        // Re-stage the blob into the racing store (admission needs the Space
+        // still intact at admission time, which the fixture provides).
+        let inner = InMemoryStub::default();
+        inner
+            .put(
+                fx.message_cid,
+                fx.content_store
+                    .get(&fx.message_cid)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let racing_store: StdArc<dyn ContentStore> = StdArc::new(RevokeOnGetStore {
+            inner,
+            crdt_state: fx.crdt_state.clone(),
+            space_id: fx.space_id,
+            victim: fx.alice,
+        });
+
+        let err = ingest_dm_packet(
+            &fx.crdt_state,
+            &racing_store,
+            &fx.sink,
+            &fx.bob_device_id,
+            &fx.packet,
+        )
+        .await
+        .expect_err("a sender kicked mid-fetch must be rejected by the Phase-C re-check");
+        assert!(
+            err.contains("membership"),
+            "rejection must come from the Phase-C membership re-check (got: {err})"
+        );
+
+        assert!(
+            fx.crdt_state.lock().await.inbox.is_empty(),
+            "a re-check-rejected DM must not touch the inbox"
+        );
+        assert!(
+            fx.sink_handle.frames().is_empty(),
+            "a re-check-rejected DM must not emit dm-received"
         );
     }
 

@@ -144,16 +144,35 @@ impl TunnelManager {
         match sessions.get_mut(&peer_node_id) {
             Some(handle) => match handle.state {
                 TunnelHandleState::Active => {
-                    // Try the live tunnel; if the loop has gone away
-                    // (`try_send` errors), fall back to a fresh dial.
-                    if handle
-                        .cmd_tx
-                        .try_send(TunnelCommand::SendDm(packet))
-                        .is_err()
-                    {
-                        sessions.remove(&peer_node_id);
-                        drop(sessions);
-                        self.spawn_dial(peer_node_id, contact, vec![]);
+                    // Try the live tunnel. Distinguish the two try_send errors:
+                    //   * `Full` — the loop is alive but its command channel is
+                    //     backpressured. KEEP the active session; do NOT redial.
+                    //     Dropping this single best-effort live attempt is
+                    //     acceptable (the deposit rung covers durability), and
+                    //     tearing down a healthy tunnel on transient backpressure
+                    //     would be far worse.
+                    //   * `Closed` — the loop has gone away (rx dropped). Remove
+                    //     the dead session and re-dial, SEEDING the failed packet
+                    //     into the new dial's pending so it isn't lost.
+                    if let Err(e) = handle.cmd_tx.try_send(TunnelCommand::SendDm(packet)) {
+                        match e {
+                            mpsc::error::TrySendError::Full(_) => {
+                                // Live tunnel, just backpressured — keep it.
+                            }
+                            mpsc::error::TrySendError::Closed(TunnelCommand::SendDm(packet)) => {
+                                sessions.remove(&peer_node_id);
+                                drop(sessions);
+                                self.spawn_dial(peer_node_id, contact, vec![packet]);
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                // Not reachable (we only ever try_send SendDm
+                                // here), but redial without a seed rather than
+                                // panic if the variant ever changes.
+                                sessions.remove(&peer_node_id);
+                                drop(sessions);
+                                self.spawn_dial(peer_node_id, contact, vec![]);
+                            }
+                        }
                     }
                 }
                 TunnelHandleState::Dialing => {
@@ -573,6 +592,102 @@ mod tests {
         assert_eq!(
             mgr.handle_snapshot(&peer).map(|(s, _, p)| (s, p)),
             Some((TunnelHandleState::Dialing, 1))
+        );
+    }
+
+    /// CodeAnt/Qodo F2 (packet loss on reconnect): when an Active handle's
+    /// `cmd_tx` is CLOSED (the loop died), `send_dm` must remove the dead
+    /// session and re-dial WITH the failed packet seeded into the new dial's
+    /// pending — not drop it (the prior code seeded `vec![]`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_dm_active_closed_seeds_failed_packet_into_redial() {
+        let (mgr, _ingest_rx) = test_manager();
+        let peer = fixed_node_id(0x11);
+
+        // Install an Active handle whose cmd_rx is dropped → try_send → Closed.
+        let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
+        drop(cmd_rx);
+        {
+            let mut sessions = mgr.sessions.lock().unwrap();
+            sessions.insert(
+                peer,
+                TunnelHandle {
+                    cmd_tx,
+                    state: TunnelHandleState::Active,
+                    role: TunnelRole::Initiator,
+                    pending: VecDeque::new(),
+                },
+            );
+        }
+
+        let contact = DeviceTunnelContact {
+            iroh_node_id: fixed_node_id(0x11),
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1; 1952],
+            pq_kem_pubkey: vec![2; 1184],
+        };
+        mgr.send_dm(peer, &contact, b"must-not-lose".to_vec());
+
+        // The dead session was replaced by a fresh Dialing handle that carries
+        // the failed packet in its pending queue (background dial never
+        // connects — the test contact is unreachable — so it stays buffered).
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, _, _)| s),
+            Some(TunnelHandleState::Dialing),
+            "a closed Active handle must be replaced by a fresh dial"
+        );
+        assert_eq!(
+            mgr.test_pending_packets(&peer),
+            Some(vec![b"must-not-lose".to_vec()]),
+            "the failed packet must be SEEDED into the redial, not dropped"
+        );
+    }
+
+    /// CodeAnt/Qodo F2 companion: when an Active handle's `cmd_tx` is FULL (the
+    /// loop is alive, just backpressured), `send_dm` must KEEP the active
+    /// session and NOT re-dial. Dropping this single best-effort live attempt
+    /// is acceptable; tearing down a healthy tunnel on transient backpressure
+    /// is not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_dm_active_full_keeps_session_no_redial() {
+        let (mgr, _ingest_rx) = test_manager();
+        let peer = fixed_node_id(0x12);
+
+        // Install an Active handle, then SATURATE its cmd_tx so the next
+        // try_send returns Full (keep the rx alive so it's Full, not Closed).
+        let (cmd_tx, _cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
+        for _ in 0..CMD_CHANNEL_CAP {
+            cmd_tx
+                .try_send(TunnelCommand::SendDm(b"fill".to_vec()))
+                .expect("prime the channel to capacity");
+        }
+        {
+            let mut sessions = mgr.sessions.lock().unwrap();
+            sessions.insert(
+                peer,
+                TunnelHandle {
+                    cmd_tx,
+                    state: TunnelHandleState::Active,
+                    role: TunnelRole::Initiator,
+                    pending: VecDeque::new(),
+                },
+            );
+        }
+
+        let contact = DeviceTunnelContact {
+            iroh_node_id: fixed_node_id(0x12),
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1; 1952],
+            pq_kem_pubkey: vec![2; 1184],
+        };
+        mgr.send_dm(peer, &contact, b"backpressured".to_vec());
+
+        // Session stays Active (not torn down, not re-dialed) and its pending
+        // queue is untouched (the Full attempt is dropped, not buffered/redialed).
+        assert_eq!(
+            mgr.handle_snapshot(&peer).map(|(s, _, p)| (s, p)),
+            Some((TunnelHandleState::Active, 0)),
+            "a Full (backpressured) live tunnel must be kept, not redialed"
         );
     }
 

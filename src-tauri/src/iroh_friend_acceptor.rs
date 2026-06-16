@@ -1062,11 +1062,19 @@ pub fn process_friend_request(
     if !req.sender_devices.is_empty() {
         // ZEB-473 Task 5: persist the requester's iroh reachability + PQ keys so
         // the DM tunnel can later dial them. The sender advertises a SINGLE device
-        // (alpha nodes are single-device), so the contact is parallel-indexed to
-        // device 0; `apply_owner_device_update` re-aligns it to the sorted device
+        // (alpha nodes are single-device — `self_device_bundle` emits exactly one),
+        // so this builds a single-element `device_tunnel_contacts` parallel-indexed
+        // to device 0; `apply_owner_device_update` re-aligns it to the sorted device
         // list. `None` (don't fabricate a contact) when the peer advertised no
         // reachability — same skip-on-empty rationale as the device bundle, so an
         // older/contactless peer never LWW-clobbers a previously-known contact.
+        //
+        // SINGLE-DEVICE ASSUMPTION: if a future multi-device sender advertises
+        // `sender_devices.len() > 1`, the apply path pads the contact vec with
+        // `None` (no crash), but the lone contact lands on device index 0, which
+        // may not be the device that sent this handshake. Per-device tunnel-contact
+        // placement for multi-device senders is a deliberate follow-up; alpha does
+        // not exercise it.
         let device_tunnel_contacts = vec![crate::dm_tunnel_contact::peer_handshake_contact(
             req.iroh_node_id,
             req.home_relay_url.clone(),
