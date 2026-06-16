@@ -2218,9 +2218,10 @@ pub(crate) fn apply_invite(
 /// pinned to those verified values BEFORE any state mutation, so the invite can
 /// only ever bootstrap the exact Space the verified sender is notifying about —
 /// it can neither introduce a new `device → owner → pub` binding nor target a
-/// different Space. (`apply_invite`'s own `apply_owner_device_update` then
-/// merely re-asserts the already-cached singleton device — a verified no-op.) A
-/// forged or mismatched invite is rejected before it touches the cache or Space.
+/// different Space. It bootstraps ONLY the Space: `apply_invite` is called with
+/// `refresh_owner_device_cache = false`, so the deposit-recover path never
+/// mutates the `OwnerDeviceCache` (the verified CidNotify path owns that). A
+/// forged, non-DM, or mismatched invite is rejected before it touches any state.
 /// Size-bounded; fail-closed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_deposited_invite(
@@ -2250,6 +2251,11 @@ pub(crate) fn apply_deposited_invite(
     else {
         return Err("deposited invite_packet is not an Invite".into());
     };
+    // SpaceKind is enforced at the EARLIEST point: `decode_packet` above rejects
+    // any DmInvite whose `kind` is not Dm/GroupDm (a payload invariant), so a
+    // non-DM invite never decodes and can never reach `apply_invite` to build a
+    // Space — no separate downstream SpaceKind gate is needed here (CodeRabbit
+    // round 3; the `verify_cidnotify_space` kind check is the redundant backstop).
     // Pin every trust-bearing invite field to the independently-verified
     // CidNotify sender BEFORE any mutation (CodeRabbit Critical). `inviter` is
     // additionally enforced inside `apply_invite` via `Some(expected_inviter)`.

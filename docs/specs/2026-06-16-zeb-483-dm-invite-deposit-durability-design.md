@@ -66,14 +66,26 @@ BUTLER ACCEPTOR (recipient's always-on device)
     ├─ size-bound payload.invite_packet                                    [NEW]
     └─ persist DmInboxEntry { …, invite_packet }                          [NEW field]
 
-RECOVER (recipient comes online)
+RECOVER (recipient comes online) — sender-binding-FIRST (hardened, see note below)
   Butler/fleet: ingest_pending (dm_inbox_ingest.rs:129) → DmInboxIngestCtx::verify (:97)
-     if entry.invite_packet.is_some(): apply_invite(inviter == entry.sender_owner)   [NEW]
-     then verify_cidnotify_admission  → now admits (Space bootstrapped)
-  Relay:       ingest_recovered(payload) (community_relay_prod.rs:386)
-     if payload.invite_packet.is_some(): apply_invite(inviter == cidnotify.sender_owner_addr) [NEW]
-     then the same CidNotify ingest
+     1. verify_cidnotify_sender_binding  → resolve+auth signer vs PRISTINE cache
+     2. if entry.invite_packet.is_some(): apply_deposited_invite (pinned to verified  [NEW]
+        sender; bootstraps ONLY the Space; refresh_owner_device_cache = false)
+     3. verify_cidnotify_space           → now admits (Space bootstrapped)
+  Relay:       ingest_recovered(payload) (community_relay_prod.rs:386) — same 3 steps
 ```
+
+> **⚠️ Hardened during PR review (CodeRabbit).** The original design (and the
+> `apply_invite(inviter == sender_owner_addr)` sketches above / in §5) applied the
+> deposited invite *before* `verify_cidnotify_admission`, binding it to the
+> CidNotify's *claimed* sender. That was circular: `apply_invite` writes the
+> `OwnerDeviceCache` rows `verify_cidnotify_admission` reads, so a forged invite +
+> CidNotify could self-verify. The shipped flow is sender-binding-FIRST against the
+> **pristine** cache, then `apply_deposited_invite` pinned to that *verified*
+> sender (`space_id` / `signing_device_hash` / `inviter_identity_pub`; the
+> DM/GroupDm kind is enforced at packet decode) bootstrapping **only** the Space
+> (never the device cache), then `verify_cidnotify_space`. The merged code is
+> authoritative.
 
 ---
 

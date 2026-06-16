@@ -2262,6 +2262,43 @@ mod tests {
             entry.invite_packet = Some(invite_wire);
             entry
         }
+
+        /// A clone of the entry whose invite is re-signed by the SAME verified
+        /// sender (Alice) and matches every pinned field, but carries a NON-DM
+        /// `kind`. It must be rejected by `apply_deposited_invite`'s up-front
+        /// SpaceKind gate — before `apply_invite` builds any Space.
+        fn entry_with_non_dm_invite(&self) -> DmInboxEntry {
+            let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+            let alice_pub = private_alice.public_identity();
+            let alice = OwnerAddr([0xA1; 16]);
+            let alice_device_hash =
+                crate::owner_state_types::DeviceIdentityHash(alice_pub.address_hash);
+            let mut members = vec![alice, self.bob];
+            members.sort();
+            let signed = crate::dm_envelope::DmInviteSigned {
+                space_id: self.space_id,
+                kind: SpaceKind::Community, // non-DM → must be rejected up front
+                members,
+                inviter: alice,
+                content_key: self.content_key.clone(),
+                sender_devices: vec![alice_device_hash],
+                created_at: self.created_at.clone(),
+                signing_device_hash: alice_device_hash,
+                inviter_identity_pub: alice_pub.to_public_bytes(),
+            };
+            let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+            let signature = private_alice.sign(&signed_bytes);
+            let invite_wire =
+                crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Invite {
+                    signed,
+                    signature,
+                    signed_bytes,
+                })
+                .unwrap();
+            let mut entry = self.entry.clone();
+            entry.invite_packet = Some(invite_wire);
+            entry
+        }
     }
 
     /// Build the recover fixture: a deposited entry (CidNotify + blob + invite)
@@ -2541,6 +2578,31 @@ mod tests {
         assert!(
             !st.owner_device_cache.devices.contains_key(&alice),
             "device cache NOT poisoned with the claimed sender's mapping"
+        );
+    }
+
+    /// ZEB-483 CodeRabbit (round 3): a deposited invite carrying a NON-DM `kind`
+    /// must never bootstrap a Space. The SpaceKind invariant is enforced at the
+    /// earliest point — `decode_packet` rejects a DmInvite whose kind isn't
+    /// Dm/GroupDm — so the invite never decodes and `apply_invite` is never
+    /// reached. This pins that fail-closed guarantee.
+    #[tokio::test]
+    async fn deposited_invite_with_non_dm_kind_is_rejected() {
+        let fx = build_dm_ingest_fixture_without_space_with_invite(true);
+        let entry = fx.entry_with_non_dm_invite();
+        let err = fx
+            .prod_ctx
+            .verify(&entry)
+            .await
+            .expect_err("non-DM deposited invite must be rejected");
+        assert!(
+            err.contains("kind must be Dm or GroupDm"),
+            "must reject at decode (SpaceKind payload invariant), got {err}"
+        );
+        let st = fx.crdt_state_for_test().lock().await;
+        assert!(
+            !st.spaces.contains_key(&fx.space_id),
+            "no Space bootstrapped from a non-DM invite"
         );
     }
 }
