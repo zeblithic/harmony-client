@@ -7572,6 +7572,7 @@ pub async fn start_node_inner(
                                 signing_key_arc.clone(),
                                 self_owner,
                                 our_signing_device_hash,
+                                std::sync::Arc::clone(&content_store),
                             ),
                         );
                     }

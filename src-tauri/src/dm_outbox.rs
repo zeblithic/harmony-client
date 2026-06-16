@@ -342,6 +342,19 @@ pub(crate) fn build_dm_packet(
     crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
 }
 
+/// ZEB-484: build a `CidNotifyWithBlob` wire packet — the signed CidNotify plus
+/// the encrypted `storage_blob` inline. Parallel to `build_dm_packet`.
+pub(crate) fn build_dm_packet_with_blob(
+    signed: crate::dm_envelope::DmCidNotifySigned,
+    signing_key: &ed25519_dalek::SigningKey,
+    storage_blob: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let packet =
+        crate::dm_envelope::build_signed_cidnotify_with_blob(signed, signing_key, storage_blob)
+            .map_err(|e| format!("build_signed_cidnotify_with_blob: {e}"))?;
+    crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AttemptState {
     last_attempt_wall_ms: u64,
@@ -8309,6 +8322,7 @@ mod tests {
             Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])),
             alice,
             DeviceIdentityHash([0xaa; 16]),
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
         );
 
         // Tick 1 (t=10_000): first Transient → no prior AttemptState → no rung.
