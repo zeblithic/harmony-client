@@ -1370,9 +1370,13 @@ impl DmOutbox {
     }
 
     /// ZEB-483: rebuild + sign the DmInvite wire bytes for a DM-Space deposit —
-    /// the SAME `DmInviteSigned` `add_space_dm_inner` builds for the tunnel
-    /// carrier (lib.rs:10410), reconstructed from the persisted `Space` record so
-    /// a deposited invite bootstraps the Space exactly like a tunnel arrival.
+    /// a `DmInviteSigned` reconstructed from the persisted `Space` record that is
+    /// admission-EQUIVALENT to the tunnel-carrier invite `add_space_dm_inner`
+    /// builds (lib.rs:10410), so a deposited copy bootstraps the same Space. It is
+    /// NOT byte-identical to the tunnel invite: `sender_devices` is a singleton of
+    /// this signing device (matching `build_cidnotify_packet_bytes`), not the
+    /// sender's full device list — benign, since the co-deposited CidNotify
+    /// already drives the recipient's OwnerDeviceCache to that singleton.
     /// Returns `None` for non-DM Spaces, a missing Space record, or a Space with
     /// no content_key (the CidNotify still deposits without it).
     fn build_invite_packet_bytes(&self, state: &OwnerState, space_id: &SpaceId) -> Option<Vec<u8>> {

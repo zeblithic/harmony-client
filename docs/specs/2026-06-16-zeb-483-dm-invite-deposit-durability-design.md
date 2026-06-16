@@ -94,16 +94,19 @@ All three are canonical-CBOR structs; a new trailing `Option<Vec<u8>>` with `#[s
 Add a sibling helper:
 
 ```rust
-/// Rebuild the signed DmInvite wire bytes for a DM Space deposit — the
-/// IDENTICAL DmInviteSigned that add_space_dm_inner built for the tunnel
-/// carrier (lib.rs:10410-10424), reconstructed from the persisted Space
-/// record so a deposited copy bootstraps the Space byte-for-byte like a
-/// tunnel arrival. Returns None for non-DM Spaces or if the Space record
-/// is missing (skip the invite; the CidNotify still deposits).
+/// Rebuild the signed DmInvite wire bytes for a DM Space deposit — a
+/// DmInviteSigned reconstructed from the persisted Space record that is
+/// admission-EQUIVALENT to the tunnel-carrier invite add_space_dm_inner
+/// builds (lib.rs:10410-10424), so a deposited copy bootstraps the same
+/// Space. NOT byte-identical: sender_devices is a singleton of the signing
+/// device (matching build_cidnotify_packet_bytes), not the full device list
+/// — benign, since the co-deposited CidNotify already drives the recipient's
+/// OwnerDeviceCache to that singleton. Returns None for non-DM Spaces or a
+/// missing Space record (skip the invite; the CidNotify still deposits).
 fn build_invite_packet_bytes(&self, state: &OwnerState, entry: &OutboxEntry) -> Option<Vec<u8>>
 ```
 
-It reads the Space record (`state.spaces.get(&entry.space_id)`) for the fields the invite carries (space kind, member set, `content_key`, inviter = `self.self_owner`), constructs the `DmInviteSigned`, and signs via `dm_envelope::build_signed_invite` + `encode_packet` (mirroring `build_dm_packet` `:336`). An implementation-verification step in the plan asserts byte-parity (or admission-equivalence) with the `add_space_dm_inner` invite so a deposited invite and a tunnel invite bootstrap the same Space.
+It reads the Space record (`state.spaces.get(&entry.space_id)`) for the fields the invite carries (space kind, member set, `content_key`, inviter = `self.self_owner`), constructs the `DmInviteSigned`, and signs via `dm_envelope::build_signed_invite` + `encode_packet` (mirroring `build_dm_packet` `:336`). The plan asserts **admission-equivalence** with the `add_space_dm_inner` invite (a fresh recipient applies the rebuilt invite and bootstraps the same Space) — not byte-parity, since the deposited invite carries a singleton `sender_devices` rather than the tunnel invite's full device list (benign; the co-deposited CidNotify already drives the cache to that singleton).
 
 `push_deposit_candidate` sets `ButlerDepositRequest.invite_packet = self.build_invite_packet_bytes(state, entry)`.
 
