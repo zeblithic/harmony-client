@@ -257,7 +257,7 @@ struct RepublishOwnerCardArgs {
 
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (42 commands). Every handler calls
+/// Build the curated v1 RPC surface (46 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
