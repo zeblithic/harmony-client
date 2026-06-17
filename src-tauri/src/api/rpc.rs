@@ -217,6 +217,14 @@ struct GetRelayHeldArgs {
     community_id_hex: Option<String>,
 }
 
+/// ZEB-489: butler-pin control arg shape. `deviceId` omitted/null → clear.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetButlerPinArgs {
+    #[serde(default)]
+    device_id: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayNameArgs {
@@ -257,7 +265,7 @@ struct RepublishOwnerCardArgs {
 
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (46 commands). Every handler calls
+/// Build the curated v1 RPC surface (49 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
@@ -466,6 +474,26 @@ pub fn build_registry() -> RpcRegistry {
         "get_relay_held",
         GetRelayHeldArgs,
         |state, _sink, a| async move { crate::get_relay_held_impl(state, a.community_id_hex).await }
+    );
+
+    // Butler rung (ZEB-489).
+    rpc!(
+        m,
+        "set_butler_pin",
+        SetButlerPinArgs,
+        |state, _sink, a| async move { crate::set_butler_pin_impl(state, a.device_id).await }
+    );
+    rpc!(
+        m,
+        "get_butler_pin",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::get_butler_pin_impl(state).await }
+    );
+    rpc!(
+        m,
+        "get_butler_held",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::get_butler_held_impl(state).await }
     );
 
     // Connectivity.
@@ -860,6 +888,10 @@ mod tests {
             "set_community_relay_opt_in",
             "get_community_relay_status",
             "get_relay_held",
+            // butler rung (ZEB-489)
+            "set_butler_pin",
+            "get_butler_pin",
+            "get_butler_held",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_list_peer_reachability",
