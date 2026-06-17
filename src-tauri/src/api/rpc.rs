@@ -191,6 +191,16 @@ struct ReadDmThreadArgs {
     before_hlc: Option<u64>,
 }
 
+/// ZEB-487: relay opt-in control. Note the existing `CommunityIdArgs` uses
+/// `community_id`; the relay-rung RPCs key on `community_id_hex`, so they take
+/// their own `…HexArgs` shapes.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetCommunityRelayOptInArgs {
+    community_id_hex: String,
+    opted_in: bool,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayNameArgs {
@@ -415,6 +425,16 @@ pub fn build_registry() -> RpcRegistry {
         ReadDmThreadArgs,
         |state, _sink, a| async move {
             crate::read_dm_thread_impl(state, a.space_id, a.limit, a.before_hlc).await
+        }
+    );
+
+    // Relay rung (ZEB-487).
+    rpc!(
+        m,
+        "set_community_relay_opt_in",
+        SetCommunityRelayOptInArgs,
+        |state, _sink, a| async move {
+            crate::set_community_relay_opt_in_impl(state, a.community_id_hex, a.opted_in).await
         }
     );
 
@@ -806,6 +826,8 @@ mod tests {
             "add_space",
             "send_dm",
             "read_dm_thread",
+            // relay rung (ZEB-487)
+            "set_community_relay_opt_in",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_list_peer_reachability",

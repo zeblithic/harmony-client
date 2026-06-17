@@ -43936,17 +43936,18 @@ pub(crate) async fn set_community_relay_opt_in_inner(
     Ok(())
 }
 
-/// ZEB-458 P4 Phase B (D43): IPC to opt this owner's fleet in (or out) of
-/// volunteering as a community relay for `community_id_hex`. Writes through the
-/// relay-optin fleet-sync doc (LWW-correct stamp), notifies + flushes the
-/// engine so siblings learn the change, and wakes the community-relay announce
-/// publisher (a harmless no-op until T11b spawns it). Flush errors are
-/// log-warn only — the dirty latch retries on the next cycle.
-#[tauri::command]
-async fn set_community_relay_opt_in(
+/// ZEB-458 P4 / ZEB-487: NodeState-level core of `set_community_relay_opt_in`,
+/// shared by the GUI Tauri command and the headless RPC. Opts this owner's fleet
+/// in (or out) of volunteering as a community relay for `community_id_hex`:
+/// snapshots the relay-optin handles, writes through the relay-optin fleet-sync
+/// doc (LWW-correct stamp) via `_inner`, notifies + flushes the engine so
+/// siblings learn the change, and wakes the community-relay announce publisher
+/// (a harmless no-op until T11b spawns it). Flush errors are log-warn only — the
+/// dirty latch retries on the next cycle.
+pub(crate) async fn set_community_relay_opt_in_impl(
+    state: &Mutex<NodeState>,
     community_id_hex: String,
     opted_in: bool,
-    state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
     // Snapshot the handles needed from NodeState, then drop the lock before the
     // async doc-lock acquisition (mirrors set_butler_pin).
@@ -43997,6 +43998,18 @@ async fn set_community_relay_opt_in(
         force.notify_one();
     }
     Ok(())
+}
+
+/// ZEB-458 P4 Phase B (D43): IPC to opt this owner's fleet in (or out) of
+/// volunteering as a community relay for `community_id_hex`. Thin wrapper over
+/// `set_community_relay_opt_in_impl`.
+#[tauri::command]
+async fn set_community_relay_opt_in(
+    community_id_hex: String,
+    opted_in: bool,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    set_community_relay_opt_in_impl(state.inner(), community_id_hex, opted_in).await
 }
 
 /// ZEB-458 P4 Phase B (D43): read-only IPC reporting whether this owner's fleet
