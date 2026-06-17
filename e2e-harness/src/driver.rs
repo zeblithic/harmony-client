@@ -518,6 +518,79 @@ pub fn assert_sas_match(inviter_sas: &str, joiner_sas: &str) -> anyhow::Result<(
     Ok(())
 }
 
+/// ZEB-490: inviter side — load owner_state + master_seed, enter Discovering.
+pub async fn start_inviter_pairing(node: &NodeHandle, display_name: &str) -> anyhow::Result<()> {
+    node.rpc(
+        "start_inviter_pairing",
+        json!({ "displayName": display_name }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// ZEB-490: joiner side — generate a fresh ed25519 signing key, enter Discovering.
+pub async fn start_joiner_pairing(node: &NodeHandle, display_name: &str) -> anyhow::Result<()> {
+    node.rpc(
+        "start_joiner_pairing",
+        json!({ "displayName": display_name }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// ZEB-490: select the discovered peer by its session id (mutual — BOTH sides
+/// must select each other before either advances to Handshaking).
+pub async fn select_pairing_peer(node: &NodeHandle, peer_session_id: &str) -> anyhow::Result<()> {
+    node.rpc(
+        "select_pairing_peer",
+        json!({ "peerSessionId": peer_session_id }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// ZEB-490: confirm the SAS — exchanges the encrypted Confirm; the inviter then
+/// signs the EnrollmentCert.
+pub async fn confirm_pairing_sas(node: &NodeHandle) -> anyhow::Result<()> {
+    node.rpc("confirm_pairing_sas", json!({})).await.map(|_| ())
+}
+
+/// ZEB-490: snapshot the current PairingState ({ kind, ...fields }, camelCase).
+pub async fn get_pairing_state(node: &NodeHandle) -> anyhow::Result<Value> {
+    node.rpc("get_pairing_state", json!({})).await
+}
+
+/// ZEB-490: abort an in-progress pairing.
+pub async fn cancel_pairing(node: &NodeHandle) -> anyhow::Result<()> {
+    node.rpc("cancel_pairing", json!({})).await.map(|_| ())
+}
+
+/// ZEB-490: pin/clear a fleet device as butler. `device_id` is the 64-hex
+/// ed25519 verify key (the enrolled-set id), NOT the 32-hex identity hash.
+pub async fn set_butler_pin(node: &NodeHandle, device_id: Option<&str>) -> anyhow::Result<()> {
+    node.rpc("set_butler_pin", json!({ "deviceId": device_id }))
+        .await
+        .map(|_| ())
+}
+
+/// ZEB-490: read this fleet's butler pin status ({ pinnedDeviceId, pinnedAtMs }).
+pub async fn get_butler_pin(node: &NodeHandle) -> anyhow::Result<Value> {
+    node.rpc("get_butler_pin", json!({})).await
+}
+
+/// ZEB-490: list the butler-held dm-inbox entries on this node. A missing/non-
+/// array `held` is a broken response CONTRACT (surface it), mirroring
+/// `get_relay_held`, so a characterize fallback can't read a broken response as
+/// "nothing held".
+pub async fn get_butler_held(node: &NodeHandle) -> anyhow::Result<Vec<Value>> {
+    let v = node.rpc("get_butler_held", json!({})).await?;
+    let held = v
+        .get("held")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("get_butler_held response missing 'held' array: {v}"))?;
+    Ok(held.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::assert_sas_match;
