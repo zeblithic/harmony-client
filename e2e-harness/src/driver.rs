@@ -591,21 +591,40 @@ pub async fn get_butler_held(node: &NodeHandle) -> anyhow::Result<Vec<Value>> {
     Ok(held.clone())
 }
 
+/// ZEB-490: detect a terminal `Failed` pairing state so a poll fails fast with
+/// the reason instead of silently timing out (Qodo). Returns the reason string
+/// when `kind == "failed"`.
+fn pairing_failed_reason(st: &Value) -> Option<String> {
+    if st.get("kind").and_then(Value::as_str) == Some("failed") {
+        Some(
+            st.get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("(no reason)")
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 /// ZEB-490: drive the real ZEB-446 SAS pairing handshake between two local
 /// nodes until the joiner is enrolled into the inviter's fleet. Returns the
 /// joiner's 64-hex ed25519 verify key — the device id `set_butler_pin` expects.
 ///
 /// Mutual-selection contract (state_machine `maybe_advance_to_handshake`
 /// requires `sent_select && received_select`): both sides SelectPeer each other.
-/// Each `poll_until` gets the full `deadline` budget independently (matches the
-/// existing per-step budgeting in s6). Returns `Err` on any timeout so the
-/// caller's boundary-1 characterize fallback can fire instead of panicking.
+/// `deadline` is an OVERALL budget: each phase polls only the time remaining
+/// until `Instant::now() + deadline`, so worst-case runtime is `deadline`, not a
+/// multiple of it (Qodo). Each poll also fails fast on a `Failed` state (with the
+/// reason), and returns `Err` on timeout so the caller's boundary-1 characterize
+/// fallback can fire instead of panicking.
 pub async fn pair_into_fleet(
     inviter: &NodeHandle,
     joiner: &NodeHandle,
     display: &str,
     deadline: Duration,
 ) -> anyhow::Result<String> {
+    let end = Instant::now() + deadline;
     start_inviter_pairing(inviter, &format!("{display}-P")).await?;
     start_joiner_pairing(joiner, &format!("{display}-B2")).await?;
 
@@ -613,45 +632,74 @@ pub async fn pair_into_fleet(
     // ed25519 verify key (the pin device id). Both sides keep broadcasting
     // DISCOVER until they SelectPeer, so polling them sequentially here (before
     // any select) still lets both discover each other.
-    let (joiner_session, joiner_vk) = poll_until(deadline, || async {
-        let st = get_pairing_state(inviter).await?;
-        if st.get("kind").and_then(Value::as_str) != Some("discovered") {
-            return Ok(None);
-        }
-        let Some(peer) = st
-            .get("peers")
-            .and_then(Value::as_array)
-            .and_then(|ps| {
-                ps.iter()
-                    .find(|p| p.get("role").and_then(Value::as_str) == Some("joiner"))
-            })
-            .cloned()
-        else {
-            return Ok(None);
-        };
-        match (
-            peer.get("sessionId").and_then(Value::as_str),
-            peer.get("joinerEd25519VerifyHex").and_then(Value::as_str),
-        ) {
-            (Some(sid), Some(vk)) => Ok(Some((sid.to_string(), vk.to_string()))),
-            _ => Ok(None),
-        }
-    })
-    .await?;
+    let (joiner_session, joiner_vk) =
+        poll_until(end.saturating_duration_since(Instant::now()), || async {
+            let st = get_pairing_state(inviter).await?;
+            if let Some(reason) = pairing_failed_reason(&st) {
+                anyhow::bail!("inviter pairing failed: {reason}");
+            }
+            if st.get("kind").and_then(Value::as_str) != Some("discovered") {
+                return Ok(None);
+            }
+            // Exactly one joiner is expected in the isolated 2-node scenario; >1
+            // means a contaminated LAN (another concurrent pairing), where a
+            // role-only pick would be nondeterministic (CodeAnt) — bail instead.
+            let joiners: Vec<&Value> = st
+                .get("peers")
+                .and_then(Value::as_array)
+                .map(|ps| {
+                    ps.iter()
+                        .filter(|p| p.get("role").and_then(Value::as_str) == Some("joiner"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if joiners.len() > 1 {
+                anyhow::bail!(
+                    "ambiguous pairing discovery: {} joiner peers",
+                    joiners.len()
+                );
+            }
+            let Some(peer) = joiners.first() else {
+                return Ok(None);
+            };
+            match (
+                peer.get("sessionId").and_then(Value::as_str),
+                peer.get("joinerEd25519VerifyHex").and_then(Value::as_str),
+            ) {
+                (Some(sid), Some(vk)) => Ok(Some((sid.to_string(), vk.to_string()))),
+                _ => Ok(None),
+            }
+        })
+        .await?;
 
     // Joiner discovers the inviter; capture the inviter's session id.
-    let inviter_session = poll_until(deadline, || async {
+    let inviter_session = poll_until(end.saturating_duration_since(Instant::now()), || async {
         let st = get_pairing_state(joiner).await?;
+        if let Some(reason) = pairing_failed_reason(&st) {
+            anyhow::bail!("joiner pairing failed: {reason}");
+        }
         if st.get("kind").and_then(Value::as_str) != Some("discovered") {
             return Ok(None);
         }
-        Ok(st
+        // Exactly one inviter is expected (see the joiner-side note above);
+        // >1 means a contaminated LAN — bail rather than pick nondeterministically.
+        let inviters: Vec<&Value> = st
             .get("peers")
             .and_then(Value::as_array)
-            .and_then(|ps| {
+            .map(|ps| {
                 ps.iter()
-                    .find(|p| p.get("role").and_then(Value::as_str) == Some("inviter"))
+                    .filter(|p| p.get("role").and_then(Value::as_str) == Some("inviter"))
+                    .collect()
             })
+            .unwrap_or_default();
+        if inviters.len() > 1 {
+            anyhow::bail!(
+                "ambiguous pairing discovery: {} inviter peers",
+                inviters.len()
+            );
+        }
+        Ok(inviters
+            .first()
             .and_then(|p| p.get("sessionId").and_then(Value::as_str))
             .map(str::to_string))
     })
@@ -662,8 +710,10 @@ pub async fn pair_into_fleet(
     select_pairing_peer(joiner, &inviter_session).await?;
 
     // Both derive SAS; assert the codes match (the real security property).
-    let inviter_sas = poll_pairing_sas(inviter, deadline).await?;
-    let joiner_sas = poll_pairing_sas(joiner, deadline).await?;
+    let inviter_sas =
+        poll_pairing_sas(inviter, end.saturating_duration_since(Instant::now())).await?;
+    let joiner_sas =
+        poll_pairing_sas(joiner, end.saturating_duration_since(Instant::now())).await?;
     assert_sas_match(&inviter_sas, &joiner_sas)?;
 
     // Both confirm; the inviter signs the EnrollmentCert.
@@ -671,16 +721,20 @@ pub async fn pair_into_fleet(
     confirm_pairing_sas(joiner).await?;
 
     // Both reach Complete (joiner now enrolled in the inviter's fleet).
-    poll_pairing_complete(inviter, deadline).await?;
-    poll_pairing_complete(joiner, deadline).await?;
+    poll_pairing_complete(inviter, end.saturating_duration_since(Instant::now())).await?;
+    poll_pairing_complete(joiner, end.saturating_duration_since(Instant::now())).await?;
 
     Ok(joiner_vk)
 }
 
 /// Poll a node until it is `Handshaking`, returning its 6-digit `sasDigits`.
-async fn poll_pairing_sas(node: &NodeHandle, deadline: Duration) -> anyhow::Result<String> {
-    poll_until(deadline, || async {
+/// Fails fast on a `Failed` state. `timeout` is the remaining overall budget.
+async fn poll_pairing_sas(node: &NodeHandle, timeout: Duration) -> anyhow::Result<String> {
+    poll_until(timeout, || async {
         let st = get_pairing_state(node).await?;
+        if let Some(reason) = pairing_failed_reason(&st) {
+            anyhow::bail!("pairing failed: {reason}");
+        }
         if st.get("kind").and_then(Value::as_str) != Some("handshaking") {
             return Ok(None);
         }
@@ -692,10 +746,14 @@ async fn poll_pairing_sas(node: &NodeHandle, deadline: Duration) -> anyhow::Resu
     .await
 }
 
-/// Poll a node until it reaches `Complete` (enrollment finished).
-async fn poll_pairing_complete(node: &NodeHandle, deadline: Duration) -> anyhow::Result<()> {
-    poll_until(deadline, || async {
+/// Poll a node until it reaches `Complete` (enrollment finished). Fails fast on
+/// a `Failed` state. `timeout` is the remaining overall budget.
+async fn poll_pairing_complete(node: &NodeHandle, timeout: Duration) -> anyhow::Result<()> {
+    poll_until(timeout, || async {
         let st = get_pairing_state(node).await?;
+        if let Some(reason) = pairing_failed_reason(&st) {
+            anyhow::bail!("pairing failed: {reason}");
+        }
         Ok((st.get("kind").and_then(Value::as_str) == Some("complete")).then_some(()))
     })
     .await
