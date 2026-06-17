@@ -361,11 +361,12 @@ const KEYCHAIN_OWNER_SERVICE: &str = "harmony.owner";
 const KEYCHAIN_DEVICE_SK: &str = "device_signing_key";
 const KEYCHAIN_MASTER_SEED: &str = "master_seed";
 const OWNER_STATE_FILENAME: &str = "owner_state.cbor";
+/// Encrypted-file fallback for the distributed fleet KeyTree material on a
+/// cert-only enrolled device (ZEB-492). Variable-length HRMI `v0x02` envelope
+/// (NOT the 32-byte `EncryptedFileStore` format the `*_secret` helpers use).
+const FLEET_KEYTREE_FILENAME: &str = "fleet_keytree.enc";
 
 /// Returned by `load_owner_state` when a persisted identity is found.
-// Debug is derived so test assertions can use `.expect_err()` / `.expect()`.
-// OwnerState: Debug (derived), SigningKey: Debug (manual impl in ed25519-dalek).
-#[derive(Debug)]
 pub struct LoadedOwnerState {
     pub state: OwnerState,
     pub device_signing_key: SigningKey,
@@ -375,6 +376,33 @@ pub struct LoadedOwnerState {
     /// Wrapped in `Zeroizing` so the seed is wiped on drop — matches the
     /// token cache's `Zeroizing<[u8; 32]>` discipline.
     pub master_seed: Option<Zeroizing<[u8; 32]>>,
+    /// Distributed fleet KeyTree (ZEB-492). `Some` on a cert-only enrolled device
+    /// given the KeyTree at pairing; `None` on the minting device + pre-ZEB-492 devices.
+    pub fleet_keytree: Option<crate::owner_state_crypto::FleetKeyMaterial>,
+}
+
+// Manual Debug so test assertions can use `.expect()` / `.expect_err()` WITHOUT
+// printing key material: `FleetKeyMaterial` has no `Debug` by design (it would
+// leak the KeyTree key bytes), and the master seed is likewise redacted to
+// presence-only. `OwnerState`/`SigningKey` are non-secret here.
+impl std::fmt::Debug for LoadedOwnerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedOwnerState")
+            .field("state", &self.state)
+            .field("device_signing_key", &self.device_signing_key)
+            .field(
+                "master_seed",
+                &self.master_seed.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "fleet_keytree",
+                &self
+                    .fleet_keytree
+                    .as_ref()
+                    .map(|m| format!("<redacted epoch={}>", m.epoch)),
+            )
+            .finish()
+    }
 }
 
 /// Load the persisted OwnerState if present. Returns `Ok(None)` for the
@@ -421,10 +449,21 @@ pub fn load_owner_state(
         "master_seed.enc",
     )?;
 
+    let fleet_keytree = match load_fleet_keytree(&keychain, identity_dir)? {
+        Some(bytes) => Some(
+            ciborium::from_reader::<crate::owner_state_crypto::FleetKeyMaterial, _>(
+                bytes.as_slice(),
+            )
+            .map_err(|e| format!("decode fleet_keytree: {e}"))?,
+        ),
+        None => None,
+    };
+
     Ok(Some(LoadedOwnerState {
         state,
         device_signing_key,
         master_seed,
+        fleet_keytree,
     }))
 }
 
@@ -946,6 +985,79 @@ fn clear_secret(
     }
 }
 
+// ── Distributed fleet KeyTree persistence (ZEB-492) ────────────────────────
+//
+// The fleet KeyTree material (CBOR of `FleetKeyMaterial`, ~161 bytes) is
+// VARIABLE-LENGTH, so it cannot use the 32-byte `*_secret` helpers above.
+// These mirror their keychain-preferred + encrypted-file-fallback structure
+// but operate on the variable-length `SecretVault::fleet_keytree` field and the
+// HRMI `v0x02` envelope (`identity::encrypt_vault_bytes` /
+// `decrypt_vault_bytes`) instead of `EncryptedFileStore` (which is 32-byte).
+
+/// Persist the distributed fleet KeyTree `material` (CBOR of `FleetKeyMaterial`)
+/// for a cert-only enrolled device. Keychain-vault-preferred, falling back to a
+/// variable-length encrypted file (`HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`).
+// Only test-reachable until the ZEB-492 pairing handler calls it (Task 3); the
+// load side is already live via `load_owner_state`.
+#[allow(dead_code)]
+fn save_fleet_keytree(
+    keychain: &Option<KeychainStore>,
+    identity_dir: &Path,
+    material: &[u8],
+) -> Result<(), String> {
+    if keychain.is_some() {
+        match crate::identity::vault_save_fleet_keytree(material) {
+            Ok(true) => return Ok(()),
+            // No keychain vault item (keychain-less seed) — fall through to file.
+            Ok(false) => {}
+            Err(e) => tracing::warn!("vault fleet-keytree write: {e}; falling through to file"),
+        }
+    }
+    let passphrase = crate::identity::resolve_passphrase_env()
+        .map_err(|e| format!("fleet-keytree fallback: {e}"))?
+        .ok_or_else(|| {
+            "HARMONY_PASSPHRASE not set; cannot encrypt fleet_keytree.enc".to_string()
+        })?;
+    let blob = crate::identity::encrypt_vault_bytes(
+        secrecy::ExposeSecret::expose_secret(&passphrase).as_bytes(),
+        material,
+    );
+    let path = identity_dir.join(FLEET_KEYTREE_FILENAME);
+    write_atomic_0600(&path, &blob).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Load the distributed fleet KeyTree material for a cert-only enrolled device.
+/// `Ok(None)` on the minting device + pre-ZEB-492 devices (neither the vault nor
+/// the encrypted file carries it). Keychain-vault-preferred, falling back to the
+/// variable-length encrypted file. The returned buffer is `Zeroizing`.
+fn load_fleet_keytree(
+    keychain: &Option<KeychainStore>,
+    identity_dir: &Path,
+) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+    if keychain.is_some() {
+        match crate::identity::vault_load_fleet_keytree() {
+            Ok(Some(v)) => return Ok(Some(v)),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("vault fleet-keytree read: {e}; trying file fallback"),
+        }
+    }
+    let path = identity_dir.join(FLEET_KEYTREE_FILENAME);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let passphrase = crate::identity::resolve_passphrase_env()
+        .map_err(|e| format!("fleet-keytree fallback: {e}"))?
+        .ok_or_else(|| "fleet_keytree.enc present but HARMONY_PASSPHRASE not set".to_string())?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let plaintext = crate::identity::decrypt_vault_bytes(
+        secrecy::ExposeSecret::expose_secret(&passphrase).as_bytes(),
+        &bytes,
+    )
+    .map_err(|e| format!("decrypt {}: {e}", path.display()))?;
+    Ok(Some(plaintext))
+}
+
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
@@ -970,6 +1082,30 @@ mod persistence_tests {
         fn drop(&mut self) {
             std::env::remove_var(self.name);
         }
+    }
+
+    #[test]
+    #[serial]
+    fn fleet_keytree_save_load_round_trips_via_encrypted_file() {
+        // keychain: None forces the variable-length encrypted-file fallback (no
+        // real keychain reached — ZEB-428). EnvVarGuard + #[serial] keep the
+        // HARMONY_PASSPHRASE mutation from racing other persistence tests.
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pass-zeb492");
+        let dir = tempdir().unwrap();
+        let material = vec![0xABu8; 161];
+        save_fleet_keytree(&None, dir.path(), &material).expect("save");
+        let loaded = load_fleet_keytree(&None, dir.path()).expect("load");
+        assert_eq!(loaded.as_deref().map(Vec::as_slice), Some(&material[..]));
+    }
+
+    #[test]
+    #[serial]
+    fn fleet_keytree_absent_loads_none() {
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pass-zeb492b");
+        let dir = tempdir().unwrap();
+        assert!(load_fleet_keytree(&None, dir.path())
+            .expect("load")
+            .is_none());
     }
 
     #[test]

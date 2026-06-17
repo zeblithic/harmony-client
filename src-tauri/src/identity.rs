@@ -436,6 +436,12 @@ pub(crate) struct SecretVault {
     /// cert-only joiner model). Distinct from `seed` (the node seed).
     #[serde(default)]
     owner_master_seed: Option<[u8; 32]>,
+    /// Distributed fleet KeyTree material (CBOR of `FleetKeyMaterial`) for a
+    /// cert-only enrolled device (ZEB-492). `None` on the minting device (it
+    /// re-derives from `owner_master_seed`) and on devices paired before ZEB-492.
+    /// Variable-length, so NOT a 32-byte `VaultSlot`.
+    #[serde(default)]
+    fleet_keytree: Option<Vec<u8>>,
 }
 
 impl SecretVault {
@@ -447,6 +453,7 @@ impl SecretVault {
             iroh_secret_key: None,
             device_signing_key: None,
             owner_master_seed: None,
+            fleet_keytree: None,
         }
     }
 
@@ -469,6 +476,18 @@ impl SecretVault {
             VaultSlot::Device => self.device_signing_key = key,
             VaultSlot::OwnerMasterSeed => self.owner_master_seed = key,
         }
+    }
+
+    /// The distributed fleet KeyTree material (CBOR of `FleetKeyMaterial`),
+    /// if present. Variable-length, so it is NOT a 32-byte `VaultSlot` — see
+    /// the field docs (ZEB-492).
+    fn fleet_keytree(&self) -> Option<&[u8]> {
+        self.fleet_keytree.as_deref()
+    }
+
+    /// Set (or clear) the distributed fleet KeyTree material.
+    fn set_fleet_keytree(&mut self, material: Option<Vec<u8>>) {
+        self.fleet_keytree = material;
     }
 
     /// Serialize to CBOR. The returned buffer holds secret material and is wrapped
@@ -506,10 +525,29 @@ mod vault_tests {
             iroh_secret_key: Some([9u8; 32]),
             device_signing_key: None,
             owner_master_seed: Some([8u8; 32]),
+            fleet_keytree: None,
         };
         let cbor = v.to_cbor().expect("encode");
         let back = SecretVault::from_cbor(&cbor).expect("decode");
         assert!(v == back, "vault must round-trip through CBOR unchanged");
+    }
+
+    #[test]
+    fn vault_carries_fleet_keytree() {
+        let mut v = SecretVault::from_seed([7u8; BLOB_LEN]);
+        assert!(v.fleet_keytree().is_none());
+        v.set_fleet_keytree(Some(vec![1, 2, 3, 4, 5]));
+        let cbor = v.to_cbor().expect("encode");
+        let back = SecretVault::from_cbor(&cbor).expect("decode");
+        assert_eq!(back.fleet_keytree(), Some(&[1, 2, 3, 4, 5][..]));
+    }
+
+    #[test]
+    fn vault_without_fleet_keytree_decodes_to_none() {
+        let v = SecretVault::from_seed([1u8; BLOB_LEN]);
+        let cbor = v.to_cbor().unwrap();
+        let back = SecretVault::from_cbor(&cbor).unwrap();
+        assert!(back.fleet_keytree().is_none());
     }
 
     #[test]
@@ -568,6 +606,7 @@ mod vault_tests {
             iroh_secret_key: Some([5u8; 32]),
             device_signing_key: Some([6u8; 32]),
             owner_master_seed: Some([8u8; 32]),
+            fleet_keytree: None,
         };
         kc.save_vault(&vault).expect("save");
         let back = kc.load_vault().expect("load").expect("present");
@@ -678,6 +717,7 @@ mod vault_tests {
             iroh_secret_key: Some([2u8; 32]),
             device_signing_key: Some([3u8; 32]),
             owner_master_seed: Some([4u8; 32]),
+            fleet_keytree: None,
         };
         store.save_vault(&vault).expect("save");
         let back = store.load_vault().expect("load").expect("present");
@@ -1053,6 +1093,39 @@ mod vault_tests {
     }
 
     #[test]
+    fn fleet_keytree_vault_round_trips_via_store() {
+        // Variable-length sibling of the 32-byte slot accessors: save -> Ok(true),
+        // load -> Some(material), clear -> load returns None.
+        let store = KeychainStore::new_mock();
+        store
+            .save_vault(&SecretVault::from_seed([1u8; BLOB_LEN]))
+            .unwrap();
+
+        // ~161-byte material (CBOR of FleetKeyMaterial is variable-length).
+        let material = vec![0xCDu8; 161];
+        assert!(vault_save_fleet_keytree_with_store(&store, &material).unwrap());
+        // Other fields are preserved (read-modify-write).
+        assert_eq!(store.load_vault().unwrap().unwrap().seed, [1u8; BLOB_LEN]);
+
+        let loaded = vault_load_fleet_keytree_with_store(&store).unwrap();
+        assert_eq!(loaded.as_deref().map(Vec::as_slice), Some(&material[..]));
+
+        vault_clear_fleet_keytree_with_store(&store).unwrap();
+        assert!(vault_load_fleet_keytree_with_store(&store)
+            .unwrap()
+            .is_none());
+        // Idempotent second clear.
+        vault_clear_fleet_keytree_with_store(&store).unwrap();
+
+        // No vault item -> Ok(false) so the caller falls back to its own store.
+        let empty = KeychainStore::new_mock();
+        assert!(!vault_save_fleet_keytree_with_store(&empty, &material).unwrap());
+        assert!(vault_load_fleet_keytree_with_store(&empty)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn clear_slot_clears_vault_and_legacy_idempotently() {
         let store = KeychainStore::new_mock();
         let mut v = SecretVault::from_seed([1u8; BLOB_LEN]);
@@ -1270,6 +1343,30 @@ fn decrypt_v2_plaintext(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<Vec
         |_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string(),
     )?);
     Ok(plaintext)
+}
+
+/// Encrypt arbitrary key-material bytes into the HRMI `v0x02` variable-length
+/// envelope, for the owner-state fleet-KeyTree encrypted-file fallback
+/// (ZEB-492). Thin `pub(crate)` wrapper over [`encrypt_vault`] so the
+/// owner-state layer reuses the exact production envelope rather than
+/// reimplementing crypto.
+// The write side (`owner_state::save_fleet_keytree`) is only test-reachable
+// until the ZEB-492 pairing handler wires it in (Task 3); the read side
+// (`decrypt_vault_bytes`) is already live via `load_owner_state`.
+#[allow(dead_code)]
+pub(crate) fn encrypt_vault_bytes(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    encrypt_vault(passphrase, plaintext)
+}
+
+/// Decrypt an HRMI `v0x02` variable-length envelope produced by
+/// [`encrypt_vault_bytes`] back to its plaintext. Thin `pub(crate)` wrapper
+/// over [`decrypt_v2_plaintext`]; the returned buffer holds key material and is
+/// `Zeroizing`.
+pub(crate) fn decrypt_vault_bytes(
+    passphrase: &[u8],
+    bytes: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    decrypt_v2_plaintext(passphrase, bytes)
 }
 
 // ── App-local key accessors (ZEB-363 consolidation) ─────────────────────
@@ -1660,6 +1757,96 @@ fn vault_clear_slot_with_store(
     Ok(())
 }
 
+// ── Distributed fleet KeyTree (variable-length vault item, ZEB-492) ──────
+//
+// Siblings of the 32-byte `vault_*_slot` accessors above, operating on the
+// variable-length `SecretVault::fleet_keytree` field (CBOR of
+// `FleetKeyMaterial`, ~161 bytes) instead of a fixed slot. They mirror the
+// same store-resolution shape but take NO `legacy: &keyring::Entry`: the
+// fleet KeyTree slot is brand-new (ZEB-492), so there is no pre-consolidation
+// per-item entry to fold in or delete.
+
+/// Read the distributed fleet KeyTree material from the keychain vault.
+/// `Ok(None)` when there is no vault item, or the vault has no fleet KeyTree.
+/// The returned buffer holds key material and is wrapped in `Zeroizing`.
+pub fn vault_load_fleet_keytree() -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+    vault_load_fleet_keytree_with_store(&KeychainStore::new()?)
+}
+
+fn vault_load_fleet_keytree_with_store(
+    store: &KeychainStore,
+) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+    let _vault_guard = vault_rmw_guard();
+    let vault = match store.load_vault() {
+        Ok(Some(v)) => v,
+        // No vault item — nothing to read. (No legacy fallback: this slot is new.)
+        Ok(None) => return Ok(None),
+        // Unreadable vault (corrupt / unknown-version): leave it intact and report
+        // absent, mirroring the slot accessors which never overwrite a corrupt item.
+        Err(e) => {
+            tracing::warn!(
+                "keychain vault unreadable ({e}); treating the fleet KeyTree as absent and \
+                 leaving the vault intact"
+            );
+            return Ok(None);
+        }
+    };
+    Ok(vault.fleet_keytree().map(|b| Zeroizing::new(b.to_vec())))
+}
+
+/// Write the distributed fleet KeyTree material into the keychain vault
+/// (read-modify-write, preserving every other field). Returns `Ok(false)`
+/// when there is no keychain vault item to write into, so the caller can fall
+/// back to its own (encrypted-file) store — identical contract to
+/// [`vault_save_slot`].
+pub fn vault_save_fleet_keytree(material: &[u8]) -> Result<bool, String> {
+    vault_save_fleet_keytree_with_store(&KeychainStore::new()?, material)
+}
+
+fn vault_save_fleet_keytree_with_store(
+    store: &KeychainStore,
+    material: &[u8],
+) -> Result<bool, String> {
+    let _vault_guard = vault_rmw_guard();
+    let Some(mut vault) = store.load_vault()? else {
+        return Ok(false);
+    };
+    vault.set_fleet_keytree(Some(material.to_vec()));
+    store.save_vault(&vault)?;
+    // No read-back assertion: like `vault_save_slot_with_store`, this site takes
+    // no subsequent destructive action on the strength of the write, so there is
+    // nothing to confirm before. Do NOT copy without re-adding the read-back if a
+    // new call site deletes another copy after this returns.
+    Ok(true)
+}
+
+/// Clear the distributed fleet KeyTree material in the keychain vault (if a
+/// vault item exists). Idempotent.
+pub fn vault_clear_fleet_keytree() -> Result<(), String> {
+    vault_clear_fleet_keytree_with_store(&KeychainStore::new()?)
+}
+
+fn vault_clear_fleet_keytree_with_store(store: &KeychainStore) -> Result<(), String> {
+    let _vault_guard = vault_rmw_guard();
+    match store.load_vault() {
+        Ok(Some(mut vault)) => {
+            if vault.fleet_keytree().is_some() {
+                vault.set_fleet_keytree(None);
+                store.save_vault(&vault)?;
+            }
+        }
+        Ok(None) => {}
+        // Unreadable vault: leave it intact (can't selectively clear one field
+        // without risking an overwrite of the whole corrupt item; it can't
+        // resurrect the material on load anyway since the read fails the same way).
+        Err(e) => tracing::warn!(
+            "keychain vault unreadable ({e}); leaving it intact rather than clearing the \
+             fleet KeyTree"
+        ),
+    }
+    Ok(())
+}
+
 // ── KeyStore trait ──────────────────────────────────────────────────────
 
 /// Common interface for identity storage backends.
@@ -2009,7 +2196,11 @@ impl EncryptedFileStore {
 ///
 /// Precedence: `HARMONY_PASSPHRASE` (direct) wins over `HARMONY_PASSPHRASE_FILE`
 /// when both are set; a warning is logged.
-fn resolve_passphrase_env() -> Result<Option<SecretString>, String> {
+///
+/// `pub(crate)` so the owner-state variable-length fleet-KeyTree fallback
+/// (ZEB-492) resolves the passphrase through the SAME logic the
+/// `EncryptedFileStore` 32-byte fallback uses — the two must never diverge.
+pub(crate) fn resolve_passphrase_env() -> Result<Option<SecretString>, String> {
     let direct = std::env::var("HARMONY_PASSPHRASE").ok();
     let file_path = std::env::var("HARMONY_PASSPHRASE_FILE").ok();
 
