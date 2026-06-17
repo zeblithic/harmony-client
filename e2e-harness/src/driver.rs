@@ -505,3 +505,34 @@ pub async fn unsubscribe_member_card(
     .await
     .map(|_| ())
 }
+
+// ── Pairing (ZEB-446) + butler rung (ZEB-489) helpers — ZEB-490 ──────────────
+
+/// ZEB-490: assert two pairing nodes derived the SAME 6-digit SAS — the real
+/// SAS security property. A mismatch is a genuine bug (NOT a characterize case),
+/// so this returns a hard `Err` the scenario surfaces rather than swallowing.
+pub fn assert_sas_match(inviter_sas: &str, joiner_sas: &str) -> anyhow::Result<()> {
+    if inviter_sas != joiner_sas {
+        anyhow::bail!("SAS mismatch: inviter={inviter_sas} joiner={joiner_sas}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assert_sas_match;
+
+    #[test]
+    fn assert_sas_match_ok_when_equal() {
+        assert!(assert_sas_match("012845", "012845").is_ok());
+    }
+
+    #[test]
+    fn assert_sas_match_err_when_differ() {
+        let e = assert_sas_match("012845", "999999").unwrap_err();
+        assert!(
+            e.to_string().contains("SAS mismatch"),
+            "error should name the mismatch, got: {e}"
+        );
+    }
+}
