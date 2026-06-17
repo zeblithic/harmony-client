@@ -268,6 +268,50 @@ pub async fn read_dm_plaintext_any(
     Ok(Vec::new())
 }
 
+// ── Relay rung (ZEB-487) — community sealed-relay deposit→recover ────────────
+
+/// ZEB-487: opt this node in/out of relaying for a community.
+pub async fn set_relay_opt_in(
+    node: &NodeHandle,
+    community_id: &str,
+    opted_in: bool,
+) -> anyhow::Result<()> {
+    node.rpc(
+        "set_community_relay_opt_in",
+        json!({ "communityIdHex": community_id, "optedIn": opted_in }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// ZEB-487: read whether this node is opted in to relaying for a community.
+pub async fn get_relay_opt_in(node: &NodeHandle, community_id: &str) -> anyhow::Result<bool> {
+    let v = node
+        .rpc(
+            "get_community_relay_status",
+            json!({ "communityIdHex": community_id }),
+        )
+        .await?;
+    Ok(v.as_bool().unwrap_or(false))
+}
+
+/// ZEB-487: list the relay-held deposit entries on this node (routing metadata
+/// only; the held blobs are sealed). `community_id = None` returns all.
+pub async fn get_relay_held(
+    node: &NodeHandle,
+    community_id: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    let args = match community_id {
+        Some(c) => json!({ "communityIdHex": c }),
+        None => json!({}),
+    };
+    let v = node.rpc("get_relay_held", args).await?;
+    Ok(v.get("held")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
 pub async fn create_channel(
     node: &NodeHandle,
     community_id: &str,
