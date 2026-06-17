@@ -52,7 +52,7 @@ succeed than s6's zenoh-relay deposit did.
 
 `PairingState` (`src-tauri/src/pairing/types.rs`, serde `tag="kind"`, camelCase):
 
-```
+```text
 Idle
 Discovering      { role, ephemeralPubkeyHex, sessionId }
 Discovered       { peers: [DiscoveredPeer] }
@@ -98,7 +98,7 @@ Thin async wrappers (each one `node.rpc("<cmd>", json!({…}))`):
 
 Orchestrator:
 
-```
+```rust
 pub async fn pair_into_fleet(
     inviter: &NodeHandle,   // P — already-minted owner
     joiner:  &NodeHandle,   // B2 — fresh, unminted

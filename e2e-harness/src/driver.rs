@@ -508,10 +508,17 @@ pub async fn unsubscribe_member_card(
 
 // ── Pairing (ZEB-446) + butler rung (ZEB-489) helpers — ZEB-490 ──────────────
 
-/// ZEB-490: assert two pairing nodes derived the SAME 6-digit SAS — the real
-/// SAS security property. A mismatch is a genuine bug (NOT a characterize case),
-/// so this returns a hard `Err` the scenario surfaces rather than swallowing.
+/// ZEB-490: assert two pairing nodes derived the SAME well-formed SAS — the real
+/// SAS security property. The SAS is exactly 6 ASCII digits; a malformed value on
+/// either side (wrong length / non-digit) is itself a bug, so validate shape
+/// before comparing equality (CodeRabbit) — otherwise two equally-malformed
+/// values would falsely pass. Returns a hard `Err` the scenario surfaces.
 pub fn assert_sas_match(inviter_sas: &str, joiner_sas: &str) -> anyhow::Result<()> {
+    for (who, sas) in [("inviter", inviter_sas), ("joiner", joiner_sas)] {
+        if sas.len() != 6 || !sas.bytes().all(|b| b.is_ascii_digit()) {
+            anyhow::bail!("malformed {who} SAS (expected 6 digits): {sas:?}");
+        }
+    }
     if inviter_sas != joiner_sas {
         anyhow::bail!("SAS mismatch: inviter={inviter_sas} joiner={joiner_sas}");
     }
@@ -738,10 +745,13 @@ async fn poll_pairing_sas(node: &NodeHandle, timeout: Duration) -> anyhow::Resul
         if st.get("kind").and_then(Value::as_str) != Some("handshaking") {
             return Ok(None);
         }
-        Ok(st
-            .get("sasDigits")
-            .and_then(Value::as_str)
-            .map(str::to_string))
+        // In `handshaking` the SAS MUST be present; a missing/non-string
+        // sasDigits is a schema regression — fail fast rather than spin to a
+        // timeout (CodeRabbit).
+        let sas = st.get("sasDigits").and_then(Value::as_str).ok_or_else(|| {
+            anyhow::anyhow!("handshaking state missing/non-string sasDigits (schema regression)")
+        })?;
+        Ok(Some(sas.to_string()))
     })
     .await
 }
@@ -775,5 +785,17 @@ mod tests {
             e.to_string().contains("SAS mismatch"),
             "error should name the mismatch, got: {e}"
         );
+    }
+
+    #[test]
+    fn assert_sas_match_err_when_malformed() {
+        // Equal but malformed (wrong length / non-digit) must NOT pass.
+        for (a, b) in [("12", "12"), ("01284a", "01284a"), ("", "")] {
+            let e = assert_sas_match(a, b).unwrap_err();
+            assert!(
+                e.to_string().contains("malformed"),
+                "malformed SAS should be rejected, got: {e}"
+            );
+        }
     }
 }

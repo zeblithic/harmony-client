@@ -1503,11 +1503,12 @@ async fn s7_butler_deposit_recover() {
         .rpc("get_owner_state", json!({}))
         .await
         .expect("get_owner_state");
+    // A missing/non-array `devices` is a schema/contract regression, not "no
+    // peers" — hard-fail rather than silently characterize (CodeRabbit).
     let devices = owner
         .get("devices")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .expect("get_owner_state response has a 'devices' array");
     let peer_devices: Vec<&Value> = devices
         .iter()
         .filter(|d| d.get("isThisDevice").and_then(Value::as_bool) == Some(false))
@@ -1519,13 +1520,16 @@ async fn s7_butler_deposit_recover() {
         b2_device
     );
 
-    let butler_vk = match peer_devices.first() {
-        Some(d) => d
+    let butler_vk = match peer_devices.as_slice() {
+        // Exactly one peer (B2) once the inviter's enrollment landed.
+        [d] => d
             .get("deviceVkHex")
             .and_then(Value::as_str)
             .expect("peer device exposes deviceVkHex")
             .to_string(),
-        None => {
+        // Intermittent inviter-persist gap (ZEB-491): B2's enrollment did not
+        // land on P — characterize boundary 0.
+        [] => {
             eprintln!(
                 "S7 FINDING (ZEB-491): after pairing + reboot, P's persisted \
                  enrolled set has no peer device — the headless inviter's pairing \
@@ -1537,6 +1541,11 @@ async fn s7_butler_deposit_recover() {
             drop((a, p, b2, a_home, p_home, b2_home));
             return;
         }
+        // Only B2 was paired into P's fleet, so >1 peer is an unexpected anomaly.
+        many => panic!(
+            "P's fleet has {} peer devices (expected exactly 1, B2)",
+            many.len()
+        ),
     };
 
     // --- Hard assertion: pin the peer device as butler and read it back.
