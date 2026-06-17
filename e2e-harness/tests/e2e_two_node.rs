@@ -1272,6 +1272,18 @@ async fn s6_relay_deposit_recover() {
         "r is opted in to relay C"
     );
 
+    // Prove the get_relay_held RPC contract works (a well-formed, empty result)
+    // BEFORE we depend on it for the HELD poll — so a broken response surfaces as
+    // a failure HERE rather than masquerading as "deposit never landed" in the
+    // characterize fallback (Qodo). r is opted in but has accepted nothing yet.
+    let pre_held = get_relay_held(&r, Some(&community_id))
+        .await
+        .expect("get_relay_held RPC contract works (returns a 'held' array)");
+    assert!(
+        pre_held.is_empty(),
+        "relay holds nothing before the offline send"
+    );
+
     // --- b goes OFFLINE (real SIGKILL). The DM Space does NOT exist on b yet.
     b.kill().await.expect("kill b");
 
@@ -1319,10 +1331,15 @@ async fn s6_relay_deposit_recover() {
     b = b.relaunch().await.expect("relaunch b");
 
     // --- ASSERTION 2 (RECV): a's plaintext shows up in b's thread post-reconnect.
-    //     Read tolerant of the a-side id (the space canonicalizes to min after the
-    //     deposited-invite merge).
+    //     b had no DM Space before going offline; apply_deposited_invite bootstraps
+    //     it PINNED to a's space_id (a_space), and b has no competing same-member
+    //     space to canonicalize against — so b reads under a_space. Use the
+    //     candidate-tolerant helper anyway (matches the other DM tests + tolerant of
+    //     UnknownSpace while the recovered thread settles).
     let recovered = poll_until(Duration::from_secs(90), || async {
-        let msgs = read_dm_plaintext(&b, &a_space).await.unwrap_or_default();
+        let msgs = read_dm_plaintext_any(&b, &[a_space.as_str()])
+            .await
+            .unwrap_or_default();
         Ok(msgs
             .iter()
             .any(|(_, body)| body == b"durable-hello")

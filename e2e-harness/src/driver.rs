@@ -306,10 +306,14 @@ pub async fn get_relay_held(
         None => json!({}),
     };
     let v = node.rpc("get_relay_held", args).await?;
-    Ok(v.get("held")
+    // A missing/non-array `held` is a broken response CONTRACT, not "no deposits":
+    // surface it as an error so s6's characterize fallback can't mask a broken
+    // get_relay_held by reading it as held=false (Qodo).
+    let held = v
+        .get("held")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default())
+        .ok_or_else(|| anyhow::anyhow!("get_relay_held response missing 'held' array: {v}"))?;
+    Ok(held.clone())
 }
 
 pub async fn create_channel(

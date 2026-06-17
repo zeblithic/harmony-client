@@ -44065,8 +44065,13 @@ pub(crate) async fn get_relay_held_impl(
             "get_relay_held: relay-hold not running (node not started)".to_string()
         })?
     };
-    let snapshot = doc.lock().await.clone();
-    let held = crate::relay_held_dto::map_relay_held(&snapshot, filter.as_ref());
+    // Map directly from the guard — do NOT clone the whole RelayHoldDoc, which
+    // would deep-copy every entry's sealed_blob (bytes the DTO mapper ignores).
+    // The map is sync (no .await while the lock is held), so the hold is brief.
+    let held = {
+        let guard = doc.lock().await;
+        crate::relay_held_dto::map_relay_held(&guard, filter.as_ref())
+    };
     Ok(crate::relay_held_dto::RelayHeldResponse { held })
 }
 
