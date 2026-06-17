@@ -1,0 +1,18 @@
+# Nextest config for the e2e-harness crate — see https://nexte.st/docs/configuration/
+#
+# These scenarios spawn REAL `harmony-app serve` nodes and drive them over the
+# live transport. First contact is racy + relay-dependent (~75-90s pkarr
+# propagation; relays warm up ~1-2 min after a node boots), and a single
+# scenario chains several such waits — the 3-node deposit->recover scenario
+# (`s6_relay_deposit_recover`) does two community joins + a friend handshake +
+# an offline send/deposit + a relaunch/recover, so its happy path runs several
+# minutes of wall-clock.
+#
+# nextest's built-in `slow-timeout` warns at 60s; without overriding it a long
+# scenario gets SIGTERM'd mid-run. Raise the period so the documented run
+# command (`cargo nextest run --features e2e`) lets these tests finish. We set a
+# generous period and DO NOT set `terminate-after`, so a genuinely wedged test
+# surfaces as a SLOW warning rather than a silent kill (the harness's own
+# per-poll deadlines bound each scenario, so a real hang still fails its poll).
+[profile.default]
+slow-timeout = { period = "120s" }
