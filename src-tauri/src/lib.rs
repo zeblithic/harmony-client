@@ -43944,10 +43944,15 @@ pub(crate) async fn get_butler_pin_impl(
     let (pinned_device_id, pinned_at_ms) = {
         let g = doc.lock().await;
         let pinned = g.pinned.clone();
-        // Report the stamp only when a butler is actually pinned — a never-set
-        // (or cleared) pin has a sentinel HLC whose wall_ms=0 would read as a
-        // bogus 1970 timestamp in the headless response (Qodo).
-        let at = pinned.as_ref().map(|_| g.pinned_at.wall_ms);
+        // Report the stamp only when a butler is actually pinned AND the HLC is a
+        // real (non-sentinel) value. A never-set/cleared pin has wall_ms=0, which
+        // would read as a bogus 1970 timestamp (Qodo). The explicit `!= 0` filter
+        // makes the suppression self-contained rather than relying on the
+        // implicit "pinned ⇒ non-zero stamp" invariant (CodeRabbit).
+        let at = pinned
+            .as_ref()
+            .map(|_| g.pinned_at.wall_ms)
+            .filter(|&ms| ms != 0);
         (pinned, at)
     };
     Ok(crate::butler_held_dto::ButlerPinStatus {
