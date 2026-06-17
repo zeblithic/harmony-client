@@ -1554,22 +1554,24 @@ mod tests {
 
         // Negative assertion: with the handoff un-acked, the inviter must NOT
         // reach Complete. We assert this by showing a bounded wait_for(Complete)
-        // TIMES OUT while the current state is still Enrolling.
+        // TIMES OUT while the current state is still Enrolling. Collapse the
+        // result to a bool immediately so the `watch::Ref` borrow it would
+        // otherwise hold doesn't outlive this statement.
         let mut inviter_state = inviter_handle.state_rx.clone();
-        let did_complete = timeout(
+        let reached_complete = timeout(
             Duration::from_millis(200),
             inviter_state.wait_for(|s| matches!(s, PairingState::Complete { .. })),
         )
-        .await;
+        .await
+        .is_ok();
+        let observed = inviter_handle.state_rx.borrow().clone();
         assert!(
-            did_complete.is_err(),
-            "inviter must NOT reach Complete before the persist ack; observed {:?}",
-            inviter_handle.state_rx.borrow().clone()
+            !reached_complete,
+            "inviter must NOT reach Complete before the persist ack; observed {observed:?}"
         );
         assert!(
-            matches!(&*inviter_handle.state_rx.borrow(), PairingState::Enrolling),
-            "inviter must dwell at Enrolling while the handoff is un-acked; got {:?}",
-            inviter_handle.state_rx.borrow().clone()
+            matches!(observed, PairingState::Enrolling),
+            "inviter must dwell at Enrolling while the handoff is un-acked; got {observed:?}"
         );
 
         // Now fire the durability ack — the inviter must advance to Complete.
@@ -1616,7 +1618,8 @@ mod tests {
         .await
         .expect("inviter reaches Failed after a persist-ack error");
 
-        match &*inviter_handle.state_rx.borrow() {
+        let observed = inviter_handle.state_rx.borrow().clone();
+        match observed {
             PairingState::Failed { reason } => assert!(
                 reason.contains("persist"),
                 "Failed reason must mention persist; got: {reason}"
