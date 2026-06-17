@@ -43912,13 +43912,22 @@ pub(crate) async fn set_butler_pin_impl(
     // re-read the current enrolled set from disk (keychain-free) and UNION it
     // with the boot snapshot — the union means a transient disk-read failure
     // degrades to the old behavior rather than rejecting a device the snapshot
-    // already knows about.
-    if let Some(dir) = identity_dir.as_deref() {
-        match crate::owner_state::read_enrolled_device_vk_hex(dir) {
-            Ok(live) => enrolled.extend(live),
-            Err(e) => tracing::warn!(
+    // already knows about. The read is synchronous file I/O, so it runs on the
+    // blocking pool to avoid stalling the async executor.
+    if let Some(dir) = identity_dir {
+        match tokio::task::spawn_blocking(move || {
+            crate::owner_state::read_enrolled_device_vk_hex(&dir)
+        })
+        .await
+        {
+            Ok(Ok(live)) => enrolled.extend(live),
+            Ok(Err(e)) => tracing::warn!(
                 error = %e,
                 "set_butler_pin: live enrolled-set read failed; falling back to boot snapshot"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "set_butler_pin: live enrolled-set read task panicked; falling back to boot snapshot"
             ),
         }
     }

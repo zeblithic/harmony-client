@@ -430,7 +430,10 @@ async fn drive_to_complete(
         .await
         .expect("inviter handoff arrives")
         .expect("handoff not None");
-    let _ = handoff.persisted_ack.send(Ok(()));
+    handoff
+        .persisted_ack
+        .send(Ok(()))
+        .expect("inviter SM's detached ack task must still hold the persist-ack receiver");
 
     let mut inviter_state = inviter_handle.state_rx.clone();
     timeout(Duration::from_secs(3), async {
