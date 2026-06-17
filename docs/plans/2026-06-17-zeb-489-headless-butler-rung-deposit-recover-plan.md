@@ -10,6 +10,8 @@
 
 **Spec:** `docs/specs/2026-06-17-headless-butler-rung-deposit-recover-tooling-design.md` (commit `5e44a416`).
 
+> **As-built note (deviation from Task 3/4 code blocks below):** `get_butler_pin` and `get_butler_held` shipped **headless-only** — just the `*_impl` functions, called directly by their RPC registrations. They have **no `#[tauri::command]` wrapper**, mirroring ZEB-487's `get_relay_held` (which is also headless-only and not in `generate_handler!`). The GUI reads butler status off `fleet_net_doc` directly, so a Tauri command would be unused dead-code under `-D warnings`. Only `set_butler_pin` keeps its `#[tauri::command]` wrapper (it is a pre-existing GUI command, already in `generate_handler!`). Ignore the `#[tauri::command] async fn get_butler_pin/get_butler_held` wrappers in the Task 3/4 snippets.
+
 **Gates (run from `src-tauri/`):**
 - `cargo fmt --all -- --check`
 - `cargo clippy --locked -p harmony-app --lib --features test-fixtures --no-deps -- -D warnings`
