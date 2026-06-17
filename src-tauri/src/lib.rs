@@ -3725,13 +3725,45 @@ pub async fn start_node_inner(
         // across restart cycles (Qodo finding).
         let mut iroh_publisher_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+        // ZEB-492: obtain the fleet KeyTree from EITHER the master seed (minting
+        // device — authoritative) OR the distributed material persisted at
+        // pairing (cert-only enrolled device). Neither -> no fleet engines
+        // (graceful fallback: pre-ZEB-492 paired devices, or material delivery
+        // failed). No seed-only capability lives in the engine block, so a
+        // cert-only device building engines here cannot mint/sign-certs/recover.
+        let fleet_kt: Option<std::sync::Arc<crate::owner_state_crypto::KeyTree>> =
+            match owner_loaded.as_ref() {
+                Some(loaded) => {
+                    if let Some(seed) = loaded.master_seed.as_ref() {
+                        Some(std::sync::Arc::new(
+                            crate::owner_state_crypto::KeyTree::derive(seed)
+                                .map_err(|e| format!("KeyTree::derive: {e}"))?,
+                        ))
+                    } else {
+                        // ZEB-492 (Qodo/CodeAnt round 1, FIX E): `from_fleet_material`
+                        // is now fallible (rejects corrupt/future-epoch material). A
+                        // rejection is a graceful no-fleet boot, NOT a hard boot
+                        // failure — keep the seed-first precedence and degrade like
+                        // the "no material at all" case rather than crashing.
+                        loaded.fleet_keytree.as_ref().and_then(|material| {
+                            match crate::owner_state_crypto::KeyTree::from_fleet_material(material) {
+                                Ok(kt) => Some(std::sync::Arc::new(kt)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "fleet KeyTree unusable ({e}); booting without fleet engines"
+                                    );
+                                    None
+                                }
+                            }
+                        })
+                    }
+                }
+                None => None,
+            };
+
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
-                if let Some(seed) = loaded.master_seed.as_ref() {
-                    let kt = std::sync::Arc::new(
-                        crate::owner_state_crypto::KeyTree::derive(seed)
-                            .map_err(|e| format!("KeyTree::derive: {e}"))?,
-                    );
+                if let Some(kt) = fleet_kt.clone() {
                     let device_id = loaded
                         .device_signing_key
                         .verifying_key()

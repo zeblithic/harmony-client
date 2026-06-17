@@ -116,6 +116,12 @@ pub enum EncryptedPayload {
         enrollment_cert_cbor_hex: String,
         owner_state_cbor_hex: String,
         joiner_advisory_display_name: String,
+        /// ZEB-492: CBOR-of-`FleetKeyMaterial`, hex-encoded — the owner's fleet
+        /// KeyTree sealed to the joiner so a cert-only device can build the
+        /// fleet engines and act as a butler. `#[serde(default)]` keeps the
+        /// payload backward/forward-compatible (pre-ZEB-492 inviters omit it).
+        #[serde(default)]
+        fleet_keytree_cbor_hex: Option<String>,
     },
 }
 

@@ -356,6 +356,7 @@ where
             state: owner_state,
             device_signing_key,
             master_seed: Some(master_seed),
+            fleet_keytree: None,
         };
         Ok(MintIpcResult {
             // Mint happens before the node restarts — fleet-net is not yet
@@ -749,6 +750,7 @@ mod tests {
             state,
             device_signing_key,
             master_seed: Some(master_seed),
+            fleet_keytree: None,
         };
 
         // ── (a) Build the view with no pin; take the joiner's device_vk_hex ─

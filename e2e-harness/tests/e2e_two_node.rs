@@ -1380,13 +1380,23 @@ async fn s6_relay_deposit_recover() {
 // deposit fans out to P's butler B2. P relaunches, fleet-merges with B2,
 // recovers the deposited invite + message.
 //
-// Layered characterize fallbacks at three racy co-located boundaries (the s6
+// Layered characterize fallbacks at the racy co-located boundaries (the s6
 // pattern): (1) pairing may not establish (Zenoh harmony/pairing/v2/lan/** is
 // the same transport class as the ZEB-466 gap); (2) the deposit may not land on
 // B2; (3) recovery may not complete. Every boundary that DOES establish becomes
 // a hard assertion. set_butler_pin + get_butler_pin are hard-asserted whenever
-// boundary 1 passes (the guaranteed-value core). The cross-WAN playbook
-// Scenario D3 is the authoritative proof; this is its co-located sibling.
+// boundary 1 passes (the guaranteed-value core).
+//
+// ZEB-492 promotes the butler-engine-readiness boundary (0b) to a HARD ASSERT:
+// the owner's fleet KeyTree is now sealed into the SAS pairing payload and
+// persisted on the cert-only joiner, so `start_node` rebuilds B2's dm-inbox /
+// butler engines from that material on relaunch. B2 therefore MUST be a working
+// butler (get_butler_held returns a clean empty array, no "dm-inbox not running"
+// 500) after pairing+relaunch — this scenario asserts that. The remaining
+// characterize boundaries (2 deposit-routing, 3 recovery) cover a SEPARATE
+// co-located sender->butler resolve/dial gap, not KeyTree distribution. The
+// cross-WAN playbook Scenario D3 is the authoritative proof of the full
+// deposit→recover path; this is its co-located sibling.
 // ─────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn s7_butler_deposit_recover() {
@@ -1560,43 +1570,50 @@ async fn s7_butler_deposit_recover() {
     );
     eprintln!("S7 PIN: P pinned B2 ({butler_vk}) as butler; get_butler_pin confirms.");
 
-    // --- B2 was spawned UNMINTED and only acquired its identity via pairing, so
-    //     its owner-dependent engines (dm-inbox / butler acceptor) never started
-    //     (get_butler_held would 500 with "dm-inbox not running"). Relaunch B2 so
-    //     it boots WITH its enrolled identity and can actually hold deposits;
-    //     it then fleet-syncs P's pin and learns it is the butler.
+    // --- B2 was spawned UNMINTED and only acquired its identity via pairing.
+    //     Pre-ZEB-492, its owner-dependent engines (dm-inbox / butler acceptor)
+    //     never started — `start_node` only built the fleet engines from a master
+    //     SEED, which a cert-only enrolled device does not have, so
+    //     get_butler_held would 500 with "dm-inbox not running" (the old
+    //     ZEB-491 characterize boundary). ZEB-492 changed this: the owner's fleet
+    //     KeyTree is now sealed into the SAS pairing payload, persisted on the
+    //     joiner (fleet_keytree.enc), and `start_node` rebuilds the fleet engines
+    //     from THAT persisted material on boot. So after this relaunch B2 boots
+    //     WITH its enrolled identity AND its dm-inbox engine, can actually hold
+    //     deposits, and fleet-syncs P's pin to learn it is the butler.
     b2 = b2
         .relaunch()
         .await
         .expect("relaunch b2 to start its dm-inbox/butler engines after pairing");
     eprintln!("S7 B2-RELAUNCH: butler B2 rebooted with its enrolled identity.");
 
-    // --- Boundary 0b (butler engine readiness) + get_butler_held contract proof.
-    //     Confirm B2 is a working butler (dm-inbox engine up) and the
-    //     get_butler_held response is well-formed, BEFORE depending on it for the
-    //     HELD poll. Distinguish two error classes (the CodeAnt concern): an
-    //     engine-not-running error is a known headless multi-device gap →
-    //     characterize; any other error (e.g. a malformed 'held' array / schema
-    //     regression) is a real bug → hard-fail rather than mask it.
-    match get_butler_held(&b2).await {
-        Ok(held) => assert!(held.is_empty(), "B2 holds nothing before the offline send"),
-        Err(e) if e.to_string().contains("not running") => {
-            // B2 was paired (not minted) and, on relaunch, boots but stops after
-            // owner-state load without constructing its owner-dependent engines
-            // (no dm-inbox / butler acceptor), so it cannot hold deposits
-            // headlessly. A headless multi-device gap (ZEB-491); characterize.
-            eprintln!(
-                "S7 FINDING (ZEB-491): butler B2 (paired, not minted) did not start \
-                 its dm-inbox/butler engine after relaunch ({e}), so it cannot hold \
-                 deposits headlessly. Skipping HELD/RECV/CLEARED; the cross-WAN \
-                 Scenario D3 is the authoritative proof."
-            );
-            run.mark_success();
-            drop((a, p, b2, a_home, p_home, b2_home));
-            return;
-        }
-        Err(e) => panic!("get_butler_held contract/RPC error (not an engine gap): {e}"),
-    }
+    // --- Boundary 0b (butler engine readiness) — HARD ASSERT (ZEB-492). A
+    //     cert-only paired device that rebuilds its fleet engines from the
+    //     persisted KeyTree MUST have a live dm-inbox engine after relaunch, so
+    //     get_butler_held returns a well-formed (empty) 'held' array rather than
+    //     500ing with "dm-inbox not running". Any error here is now a regression
+    //     of the ZEB-492 KeyTree-distribution feature (or a get_butler_held
+    //     contract/schema break) — fail loudly rather than characterize. This is
+    //     the boundary that gates the cert-only-B2-is-a-real-butler claim; the
+    //     downstream HELD/RECV boundaries below stay tolerant of the SEPARATE
+    //     co-located sender->butler deposit-routing gap (see boundary 2).
+    let pre_held = get_butler_held(&b2).await.unwrap_or_else(|e| {
+        panic!(
+            "ZEB-492 REGRESSION: butler B2 (cert-only, paired, relaunched) failed \
+                     get_butler_held ({e}). Its dm-inbox engine must boot from the persisted \
+                     fleet KeyTree — a 'not running' error means the KeyTree did not reach \
+                     start_node's engine builder; any other error is a get_butler_held \
+                     contract/schema break."
+        )
+    });
+    assert!(
+        pre_held.is_empty(),
+        "B2 holds nothing before the offline send"
+    );
+    eprintln!(
+        "S7 B2-BUTLER-READY: cert-only B2's dm-inbox engine is live post-relaunch \
+         (get_butler_held OK, empty) — ZEB-492 KeyTree distribution reached the engines."
+    );
 
     // --- P goes OFFLINE (real SIGKILL). The DM Space does NOT exist on P yet.
     p.kill().await.expect("kill p");
@@ -1627,11 +1644,24 @@ async fn s7_butler_deposit_recover() {
             // never landed → characterize) vs a get_butler_held RPC/contract
             // error (a real bug worth seeing), which `get_butler_held` returns
             // explicitly so it can't masquerade as held=false (Qodo / ZEB-487).
+            //
+            // NB (post-ZEB-492): B2's butler engine readiness is now HARD-asserted
+            // at boundary 0b above, so a timeout here is NOT an engine gap. It is
+            // the SEPARATE co-located sender->butler deposit-ROUTING gap: with P
+            // offline, A's outbox must resolve P's reachability record (in-memory
+            // CRDT cache or pkarr fallback) for a fresh butler-set advertisement to
+            // dial. Co-located that resolve returns no fresh set, so the deposit
+            // rung is skipped silently (DepositRungOutcome::SkippedNoFreshButlerSet)
+            // and A just keeps bumping its direct-send backoff — distinct from the
+            // KeyTree distribution this scenario now proves. The cross-WAN Scenario
+            // D3 is the authoritative proof of the full deposit path; file a finding
+            // ticket if it regresses there.
             eprintln!(
                 "S7 FINDING: butler deposit not observed on B2 within 90s co-located \
-                 ({e}). The sender may not resolve/dial P's butler co-located, or \
-                 DEPOSIT_NOACK_WINDOWS exceeded the budget. File a finding ticket; \
-                 confirm via the cross-WAN Scenario D3. Skipping RECV/CLEARED."
+                 ({e}). B2's butler engine is up (boundary 0b passed); the gap is the \
+                 co-located sender->butler deposit-routing resolve/dial (A finds no \
+                 fresh butler set for offline P -> rung skipped), NOT ZEB-492. Confirm \
+                 via the cross-WAN Scenario D3. Skipping RECV/CLEARED."
             );
             run.mark_success();
             drop((a, p, b2, a_home, p_home, b2_home));

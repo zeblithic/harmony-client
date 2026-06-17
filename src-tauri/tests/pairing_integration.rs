@@ -324,7 +324,8 @@ async fn end_to_end_persists_state_to_disk() {
     // OS keychain — see persist.rs for why the public wrappers can't be
     // used here.
     let new_device_id = joiner_result.our_device_id;
-    install_joiner_state_inner(joiner_dir.path(), joiner_result, None).expect("joiner persist");
+    install_joiner_state_inner(joiner_dir.path(), joiner_result, None, None)
+        .expect("joiner persist");
     install_inviter_state_inner(inviter_dir.path(), inviter_result, None, None)
         .expect("inviter persist");
 
