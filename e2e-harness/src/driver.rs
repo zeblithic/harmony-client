@@ -505,3 +505,297 @@ pub async fn unsubscribe_member_card(
     .await
     .map(|_| ())
 }
+
+// ── Pairing (ZEB-446) + butler rung (ZEB-489) helpers — ZEB-490 ──────────────
+
+/// ZEB-490: assert two pairing nodes derived the SAME well-formed SAS — the real
+/// SAS security property. The SAS is exactly 6 ASCII digits; a malformed value on
+/// either side (wrong length / non-digit) is itself a bug, so validate shape
+/// before comparing equality (CodeRabbit) — otherwise two equally-malformed
+/// values would falsely pass. Returns a hard `Err` the scenario surfaces.
+pub fn assert_sas_match(inviter_sas: &str, joiner_sas: &str) -> anyhow::Result<()> {
+    for (who, sas) in [("inviter", inviter_sas), ("joiner", joiner_sas)] {
+        if sas.len() != 6 || !sas.bytes().all(|b| b.is_ascii_digit()) {
+            anyhow::bail!("malformed {who} SAS (expected 6 digits): {sas:?}");
+        }
+    }
+    if inviter_sas != joiner_sas {
+        anyhow::bail!("SAS mismatch: inviter={inviter_sas} joiner={joiner_sas}");
+    }
+    Ok(())
+}
+
+/// ZEB-490: inviter side — load owner_state + master_seed, enter Discovering.
+pub async fn start_inviter_pairing(node: &NodeHandle, display_name: &str) -> anyhow::Result<()> {
+    node.rpc(
+        "start_inviter_pairing",
+        json!({ "displayName": display_name }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// ZEB-490: joiner side — generate a fresh ed25519 signing key, enter Discovering.
+pub async fn start_joiner_pairing(node: &NodeHandle, display_name: &str) -> anyhow::Result<()> {
+    node.rpc(
+        "start_joiner_pairing",
+        json!({ "displayName": display_name }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// ZEB-490: select the discovered peer by its session id (mutual — BOTH sides
+/// must select each other before either advances to Handshaking).
+pub async fn select_pairing_peer(node: &NodeHandle, peer_session_id: &str) -> anyhow::Result<()> {
+    node.rpc(
+        "select_pairing_peer",
+        json!({ "peerSessionId": peer_session_id }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// ZEB-490: confirm the SAS — exchanges the encrypted Confirm; the inviter then
+/// signs the EnrollmentCert.
+pub async fn confirm_pairing_sas(node: &NodeHandle) -> anyhow::Result<()> {
+    node.rpc("confirm_pairing_sas", json!({})).await.map(|_| ())
+}
+
+/// ZEB-490: snapshot the current PairingState ({ kind, ...fields }, camelCase).
+pub async fn get_pairing_state(node: &NodeHandle) -> anyhow::Result<Value> {
+    node.rpc("get_pairing_state", json!({})).await
+}
+
+/// ZEB-490: abort an in-progress pairing.
+pub async fn cancel_pairing(node: &NodeHandle) -> anyhow::Result<()> {
+    node.rpc("cancel_pairing", json!({})).await.map(|_| ())
+}
+
+/// ZEB-490: pin/clear a fleet device as butler. `device_id` is the 64-hex
+/// ed25519 verify key (the enrolled-set id), NOT the 32-hex identity hash.
+pub async fn set_butler_pin(node: &NodeHandle, device_id: Option<&str>) -> anyhow::Result<()> {
+    node.rpc("set_butler_pin", json!({ "deviceId": device_id }))
+        .await
+        .map(|_| ())
+}
+
+/// ZEB-490: read this fleet's butler pin status ({ pinnedDeviceId, pinnedAtMs }).
+pub async fn get_butler_pin(node: &NodeHandle) -> anyhow::Result<Value> {
+    node.rpc("get_butler_pin", json!({})).await
+}
+
+/// ZEB-490: list the butler-held dm-inbox entries on this node. A missing/non-
+/// array `held` is a broken response CONTRACT (surface it), mirroring
+/// `get_relay_held`, so a characterize fallback can't read a broken response as
+/// "nothing held".
+pub async fn get_butler_held(node: &NodeHandle) -> anyhow::Result<Vec<Value>> {
+    let v = node.rpc("get_butler_held", json!({})).await?;
+    let held = v
+        .get("held")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("get_butler_held response missing 'held' array: {v}"))?;
+    Ok(held.clone())
+}
+
+/// ZEB-490: detect a terminal `Failed` pairing state so a poll fails fast with
+/// the reason instead of silently timing out (Qodo). Returns the reason string
+/// when `kind == "failed"`.
+fn pairing_failed_reason(st: &Value) -> Option<String> {
+    if st.get("kind").and_then(Value::as_str) == Some("failed") {
+        Some(
+            st.get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("(no reason)")
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// ZEB-490: drive the real ZEB-446 SAS pairing handshake between two local
+/// nodes until the joiner is enrolled into the inviter's fleet. Returns the
+/// joiner's 64-hex ed25519 verify key — the device id `set_butler_pin` expects.
+///
+/// Mutual-selection contract (state_machine `maybe_advance_to_handshake`
+/// requires `sent_select && received_select`): both sides SelectPeer each other.
+/// `deadline` is an OVERALL budget: each phase polls only the time remaining
+/// until `Instant::now() + deadline`, so worst-case runtime is `deadline`, not a
+/// multiple of it (Qodo). Each poll also fails fast on a `Failed` state (with the
+/// reason), and returns `Err` on timeout so the caller's boundary-1 characterize
+/// fallback can fire instead of panicking.
+pub async fn pair_into_fleet(
+    inviter: &NodeHandle,
+    joiner: &NodeHandle,
+    display: &str,
+    deadline: Duration,
+) -> anyhow::Result<String> {
+    let end = Instant::now() + deadline;
+    start_inviter_pairing(inviter, &format!("{display}-P")).await?;
+    start_joiner_pairing(joiner, &format!("{display}-B2")).await?;
+
+    // Inviter discovers the joiner; capture the joiner's session id + its
+    // ed25519 verify key (the pin device id). Both sides keep broadcasting
+    // DISCOVER until they SelectPeer, so polling them sequentially here (before
+    // any select) still lets both discover each other.
+    let (joiner_session, joiner_vk) =
+        poll_until(end.saturating_duration_since(Instant::now()), || async {
+            let st = get_pairing_state(inviter).await?;
+            if let Some(reason) = pairing_failed_reason(&st) {
+                anyhow::bail!("inviter pairing failed: {reason}");
+            }
+            if st.get("kind").and_then(Value::as_str) != Some("discovered") {
+                return Ok(None);
+            }
+            // Exactly one joiner is expected in the isolated 2-node scenario; >1
+            // means a contaminated LAN (another concurrent pairing), where a
+            // role-only pick would be nondeterministic (CodeAnt) — bail instead.
+            let joiners: Vec<&Value> = st
+                .get("peers")
+                .and_then(Value::as_array)
+                .map(|ps| {
+                    ps.iter()
+                        .filter(|p| p.get("role").and_then(Value::as_str) == Some("joiner"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if joiners.len() > 1 {
+                anyhow::bail!(
+                    "ambiguous pairing discovery: {} joiner peers",
+                    joiners.len()
+                );
+            }
+            let Some(peer) = joiners.first() else {
+                return Ok(None);
+            };
+            match (
+                peer.get("sessionId").and_then(Value::as_str),
+                peer.get("joinerEd25519VerifyHex").and_then(Value::as_str),
+            ) {
+                (Some(sid), Some(vk)) => Ok(Some((sid.to_string(), vk.to_string()))),
+                _ => Ok(None),
+            }
+        })
+        .await?;
+
+    // Joiner discovers the inviter; capture the inviter's session id.
+    let inviter_session = poll_until(end.saturating_duration_since(Instant::now()), || async {
+        let st = get_pairing_state(joiner).await?;
+        if let Some(reason) = pairing_failed_reason(&st) {
+            anyhow::bail!("joiner pairing failed: {reason}");
+        }
+        if st.get("kind").and_then(Value::as_str) != Some("discovered") {
+            return Ok(None);
+        }
+        // Exactly one inviter is expected (see the joiner-side note above);
+        // >1 means a contaminated LAN — bail rather than pick nondeterministically.
+        let inviters: Vec<&Value> = st
+            .get("peers")
+            .and_then(Value::as_array)
+            .map(|ps| {
+                ps.iter()
+                    .filter(|p| p.get("role").and_then(Value::as_str) == Some("inviter"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if inviters.len() > 1 {
+            anyhow::bail!(
+                "ambiguous pairing discovery: {} inviter peers",
+                inviters.len()
+            );
+        }
+        Ok(inviters
+            .first()
+            .and_then(|p| p.get("sessionId").and_then(Value::as_str))
+            .map(str::to_string))
+    })
+    .await?;
+
+    // Mutual select.
+    select_pairing_peer(inviter, &joiner_session).await?;
+    select_pairing_peer(joiner, &inviter_session).await?;
+
+    // Both derive SAS; assert the codes match (the real security property).
+    let inviter_sas =
+        poll_pairing_sas(inviter, end.saturating_duration_since(Instant::now())).await?;
+    let joiner_sas =
+        poll_pairing_sas(joiner, end.saturating_duration_since(Instant::now())).await?;
+    assert_sas_match(&inviter_sas, &joiner_sas)?;
+
+    // Both confirm; the inviter signs the EnrollmentCert.
+    confirm_pairing_sas(inviter).await?;
+    confirm_pairing_sas(joiner).await?;
+
+    // Both reach Complete (joiner now enrolled in the inviter's fleet).
+    poll_pairing_complete(inviter, end.saturating_duration_since(Instant::now())).await?;
+    poll_pairing_complete(joiner, end.saturating_duration_since(Instant::now())).await?;
+
+    Ok(joiner_vk)
+}
+
+/// Poll a node until it is `Handshaking`, returning its 6-digit `sasDigits`.
+/// Fails fast on a `Failed` state. `timeout` is the remaining overall budget.
+async fn poll_pairing_sas(node: &NodeHandle, timeout: Duration) -> anyhow::Result<String> {
+    poll_until(timeout, || async {
+        let st = get_pairing_state(node).await?;
+        if let Some(reason) = pairing_failed_reason(&st) {
+            anyhow::bail!("pairing failed: {reason}");
+        }
+        if st.get("kind").and_then(Value::as_str) != Some("handshaking") {
+            return Ok(None);
+        }
+        // In `handshaking` the SAS MUST be present; a missing/non-string
+        // sasDigits is a schema regression — fail fast rather than spin to a
+        // timeout (CodeRabbit).
+        let sas = st.get("sasDigits").and_then(Value::as_str).ok_or_else(|| {
+            anyhow::anyhow!("handshaking state missing/non-string sasDigits (schema regression)")
+        })?;
+        Ok(Some(sas.to_string()))
+    })
+    .await
+}
+
+/// Poll a node until it reaches `Complete` (enrollment finished). Fails fast on
+/// a `Failed` state. `timeout` is the remaining overall budget.
+async fn poll_pairing_complete(node: &NodeHandle, timeout: Duration) -> anyhow::Result<()> {
+    poll_until(timeout, || async {
+        let st = get_pairing_state(node).await?;
+        if let Some(reason) = pairing_failed_reason(&st) {
+            anyhow::bail!("pairing failed: {reason}");
+        }
+        Ok((st.get("kind").and_then(Value::as_str) == Some("complete")).then_some(()))
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assert_sas_match;
+
+    #[test]
+    fn assert_sas_match_ok_when_equal() {
+        assert!(assert_sas_match("012845", "012845").is_ok());
+    }
+
+    #[test]
+    fn assert_sas_match_err_when_differ() {
+        let e = assert_sas_match("012845", "999999").unwrap_err();
+        assert!(
+            e.to_string().contains("SAS mismatch"),
+            "error should name the mismatch, got: {e}"
+        );
+    }
+
+    #[test]
+    fn assert_sas_match_err_when_malformed() {
+        // Equal but malformed (wrong length / non-digit) must NOT pass.
+        for (a, b) in [("12", "12"), ("01284a", "01284a"), ("", "")] {
+            let e = assert_sas_match(a, b).unwrap_err();
+            assert!(
+                e.to_string().contains("malformed"),
+                "malformed SAS should be rejected, got: {e}"
+            );
+        }
+    }
+}
