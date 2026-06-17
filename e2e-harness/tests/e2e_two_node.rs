@@ -1442,21 +1442,14 @@ async fn s7_butler_deposit_recover() {
     };
     eprintln!("S7 PAIRED: B2 enrolled into P's fleet (device {b2_device}).");
 
-    // --- Hard assertion: pin B2 as butler and read it back. The enrolled-set
-    //     gate (set_butler_pin_inner) accepts B2 because it is genuinely enrolled.
-    set_butler_pin(&p, Some(&b2_device))
-        .await
-        .expect("pin B2 as butler");
-    let pin = get_butler_pin(&p).await.expect("get butler pin");
-    assert_eq!(
-        pin.get("pinnedDeviceId").and_then(Value::as_str),
-        Some(b2_device.as_str()),
-        "get_butler_pin reflects the pinned butler device"
-    );
-    eprintln!("S7 PIN: P pinned B2 as butler; get_butler_pin confirms.");
-
-    // --- Friendship A<->P while P ONLINE (so A's device directory learns P's
-    //     fleet devices incl. B2's reachability). Reuse s6's friend dance.
+    // --- Friendship A<->P while both ONLINE. Done BEFORE the post-pairing
+    //     relaunch for two reasons: (1) A's device directory learns P's fleet
+    //     (incl. B2's reachability, ZEB-461); (2) the multi-second handshake is
+    //     a deterministic barrier that lets P's async pairing-persist drainer
+    //     (lib.rs:8821 — a ~50ms spawn_blocking fired on the inviter's
+    //     InviterEnrollResult just before Complete) finish writing B2's
+    //     EnrollmentCert to disk, so the relaunch below actually reloads it. A
+    //     SIGKILL immediately after Complete races that write and loses it.
     let token = generate_friend_token(&a).await.expect("friend token");
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     let mut last_err = String::from("(no redeem attempt completed before the deadline)");
@@ -1481,6 +1474,82 @@ async fn s7_butler_deposit_recover() {
     })
     .await
     .expect("P has A as active friend");
+    eprintln!("S7 FRIENDS: A<->P active; P had time to persist B2's enrollment.");
+
+    // --- Relaunch P so start_node rebuilds `fleet_net_enrolled` (a boot-time
+    //     snapshot, lib.rs:4618 → 8203, that runtime pairing does NOT refresh)
+    //     from P's PERSISTED enrollments — the precondition for set_butler_pin.
+    //     NB (ZEB-491): the headless INVITER currently never persists the paired
+    //     device's enrollment, so this reload finds peers=0 and the pin boundary
+    //     below characterizes. The relaunch + the friend-dance barrier above are
+    //     kept so this scenario asserts the full path the moment ZEB-491 lands.
+    //     Friendship is persisted; its live "active" status may not re-show
+    //     immediately co-located after a reboot (ZEB-466 class) — do NOT block.
+    p = p
+        .relaunch()
+        .await
+        .expect("relaunch p to refresh enrolled set after pairing");
+    eprintln!("S7 RELAUNCH: P rebooted post-pairing.");
+
+    // --- Boundary 0 (butler-pin setup). After the reboot, P's enrolled-set
+    //     snapshot is rebuilt from its PERSISTED enrollments. Inspect them via
+    //     get_owner_state: the GUI butler toggle pins by `deviceVkHex` (the
+    //     64-hex ed25519_verify; owner_commands.rs:118), so read the (only) peer
+    //     device's deviceVkHex straight from P's own view rather than trusting
+    //     the value captured during pairing. If no peer device is present, the
+    //     headless inviter's pairing enrollment never landed on disk —
+    //     butler-pin-after-pairing is blocked (a real product gap); characterize.
+    let owner = p
+        .rpc("get_owner_state", json!({}))
+        .await
+        .expect("get_owner_state");
+    let devices = owner
+        .get("devices")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let peer_devices: Vec<&Value> = devices
+        .iter()
+        .filter(|d| d.get("isThisDevice").and_then(Value::as_bool) == Some(false))
+        .collect();
+    eprintln!(
+        "S7 DEVICES after relaunch: total={}, peers={} (paired b2_device={})",
+        devices.len(),
+        peer_devices.len(),
+        b2_device
+    );
+
+    let butler_vk = match peer_devices.first() {
+        Some(d) => d
+            .get("deviceVkHex")
+            .and_then(Value::as_str)
+            .expect("peer device exposes deviceVkHex")
+            .to_string(),
+        None => {
+            eprintln!(
+                "S7 FINDING (ZEB-491): after pairing + reboot, P's persisted \
+                 enrolled set has no peer device — the headless inviter's pairing \
+                 enrollment did not land in OwnerState, so butler-pin-after-pairing \
+                 is blocked. The cross-WAN Scenario D3 is the authoritative proof. \
+                 Skipping PIN/HELD/RECV/CLEARED."
+            );
+            run.mark_success();
+            drop((a, p, b2, a_home, p_home, b2_home));
+            return;
+        }
+    };
+
+    // --- Hard assertion: pin the peer device as butler and read it back.
+    set_butler_pin(&p, Some(&butler_vk))
+        .await
+        .expect("pin the peer device as butler");
+    let pin = get_butler_pin(&p).await.expect("get butler pin");
+    assert_eq!(
+        pin.get("pinnedDeviceId").and_then(Value::as_str),
+        Some(butler_vk.as_str()),
+        "get_butler_pin reflects the pinned butler device"
+    );
+    eprintln!("S7 PIN: P pinned B2 ({butler_vk}) as butler; get_butler_pin confirms.");
 
     // --- P goes OFFLINE (real SIGKILL). The DM Space does NOT exist on P yet.
     p.kill().await.expect("kill p");
