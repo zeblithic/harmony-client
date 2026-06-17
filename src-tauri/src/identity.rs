@@ -1350,10 +1350,9 @@ fn decrypt_v2_plaintext(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<Vec
 /// (ZEB-492). Thin `pub(crate)` wrapper over [`encrypt_vault`] so the
 /// owner-state layer reuses the exact production envelope rather than
 /// reimplementing crypto.
-// The write side (`owner_state::save_fleet_keytree`) is only test-reachable
-// until the ZEB-492 pairing handler wires it in (Task 3); the read side
-// (`decrypt_vault_bytes`) is already live via `load_owner_state`.
-#[allow(dead_code)]
+///
+/// Live as of ZEB-492 Task 4 via the `owner_state::save_fleet_keytree`
+/// encrypted-file fallback, which the pairing install path now calls.
 pub(crate) fn encrypt_vault_bytes(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8> {
     encrypt_vault(passphrase, plaintext)
 }

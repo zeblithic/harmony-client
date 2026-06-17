@@ -55,6 +55,11 @@ pub struct JoinerEnrollResult {
     pub our_signing_key: SigningKey,
     pub owner_state: OwnerState,
     pub our_device_id: [u8; 16],
+    /// ZEB-492: distributed fleet KeyTree material, present when the inviter
+    /// sealed it into the ENROLL payload. `install_joiner_state` persists it so
+    /// this cert-only device can build the fleet engines on next boot. `None`
+    /// when paired with a pre-ZEB-492 inviter that didn't send it.
+    pub fleet_keytree: Option<crate::owner_state_crypto::FleetKeyMaterial>,
 }
 
 /// Output from the state machine for the Inviter side, when enrollment of a
@@ -781,10 +786,39 @@ async fn maybe_advance_to_enroll(
         });
         return;
     }
+    // ZEB-492: seal the fleet KeyTree to the enrolled (cert-only) device so it
+    // can build the fleet engines + act as a butler. `master_seed` is in scope
+    // here (cert signing above requires it); the joiner never receives the seed
+    // itself. The CBOR buffer holds raw key material → keep it `Zeroizing`.
+    // Rides the same SAS-sealed ENROLL payload as the cert + owner state.
+    let fleet_keytree_cbor_hex = match crate::owner_state_crypto::KeyTree::derive(master_seed) {
+        Ok(kt) => {
+            let mut buf = Zeroizing::new(Vec::new());
+            // epoch 0 is intentional: KeyTree rotation is out of scope for
+            // ZEB-492 (the tag reserves room for a future rotation, but
+            // `from_fleet_material` does not read epoch back yet).
+            match ciborium::into_writer(&kt.to_fleet_material(0), &mut *buf) {
+                Ok(()) => Some(hex::encode(&*buf)),
+                Err(e) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!("encode fleet keytree: {e}"),
+                    });
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            let _ = state_tx.send(PairingState::Failed {
+                reason: format!("derive fleet keytree: {e}"),
+            });
+            return;
+        }
+    };
     let payload = EncryptedPayload::Enroll {
         enrollment_cert_cbor_hex: hex::encode(&cert_cbor),
         owner_state_cbor_hex: hex::encode(&state_cbor),
         joiner_advisory_display_name: ctx.selected_peer_display_name.clone().unwrap_or_default(),
+        fleet_keytree_cbor_hex,
     };
     let mut pt = Vec::new();
     if let Err(e) = ciborium::into_writer(&payload, &mut pt) {
@@ -1134,6 +1168,7 @@ async fn on_encrypted_payload(
         EncryptedPayload::Enroll {
             enrollment_cert_cbor_hex,
             owner_state_cbor_hex,
+            fleet_keytree_cbor_hex,
             ..
         } => {
             // Joiner-side: install the cert and state.
@@ -1237,6 +1272,38 @@ async fn on_encrypted_payload(
                 return;
             }
 
+            // ZEB-492: decode the sealed fleet KeyTree material. It arrived
+            // inside the authenticated SAS channel (same envelope as the cert +
+            // owner state), so a malformed value is a protocol violation — hard-
+            // fail it exactly like the cert/state decode failures above, rather
+            // than silently dropping it (which would strand a cert-only device
+            // with no fleet engines and no signal that it should have had them).
+            let fleet_keytree = match fleet_keytree_cbor_hex {
+                Some(hexs) => {
+                    let bytes = match hex::decode(&hexs) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = state_tx.send(PairingState::Failed {
+                                reason: format!("fleet keytree hex: {e}"),
+                            });
+                            return;
+                        }
+                    };
+                    match ciborium::from_reader::<crate::owner_state_crypto::FleetKeyMaterial, _>(
+                        bytes.as_slice(),
+                    ) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            let _ = state_tx.send(PairingState::Failed {
+                                reason: format!("fleet keytree decode: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
+
             let our_sk = ctx.our_signing_key.take().expect("joiner has signing key");
             let our_device_id = our_pubkey.identity_hash();
             // See the Inviter side for rationale on send() error → Failed:
@@ -1248,6 +1315,7 @@ async fn on_encrypted_payload(
                     our_signing_key: our_sk,
                     owner_state,
                     our_device_id,
+                    fleet_keytree,
                 })
                 .await
             {

@@ -997,27 +997,42 @@ fn clear_secret(
 /// Persist the distributed fleet KeyTree `material` (CBOR of `FleetKeyMaterial`)
 /// for a cert-only enrolled device. Keychain-vault-preferred, falling back to a
 /// variable-length encrypted file (`HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`).
-// Only test-reachable until the ZEB-492 pairing handler calls it (Task 3); the
-// load side is already live via `load_owner_state`.
-#[allow(dead_code)]
-fn save_fleet_keytree(
+///
+/// Live as of ZEB-492 Task 4: `pairing::persist::install_joiner_state_inner`
+/// calls this when the inviter sealed fleet material into the ENROLL payload.
+pub(crate) fn save_fleet_keytree(
     keychain: &Option<KeychainStore>,
     identity_dir: &Path,
     material: &[u8],
 ) -> Result<(), String> {
+    // Mirror save_secret's error-preservation: if the keychain WRITE fails AND
+    // no encrypted-file fallback is configured, surface the original keychain
+    // error (locked / permission denied / etc) instead of the generic
+    // "HARMONY_PASSPHRASE not set" message — otherwise the caller reports the
+    // wrong remediation.
+    let mut keychain_err: Option<String> = None;
     if keychain.is_some() {
         match crate::identity::vault_save_fleet_keytree(material) {
             Ok(true) => return Ok(()),
             // No keychain vault item (keychain-less seed) — fall through to file.
             Ok(false) => {}
-            Err(e) => tracing::warn!("vault fleet-keytree write: {e}; falling through to file"),
+            Err(e) => {
+                let msg = format!("vault fleet-keytree write: {e}");
+                tracing::warn!("{msg}; falling through to file");
+                keychain_err = Some(msg);
+            }
         }
     }
-    let passphrase = crate::identity::resolve_passphrase_env()
+    let passphrase = match crate::identity::resolve_passphrase_env()
         .map_err(|e| format!("fleet-keytree fallback: {e}"))?
-        .ok_or_else(|| {
-            "HARMONY_PASSPHRASE not set; cannot encrypt fleet_keytree.enc".to_string()
-        })?;
+    {
+        Some(p) => p,
+        None => {
+            return Err(keychain_err.unwrap_or_else(|| {
+                "HARMONY_PASSPHRASE not set; cannot encrypt fleet_keytree.enc".to_string()
+            }));
+        }
+    };
     let blob = crate::identity::encrypt_vault_bytes(
         secrecy::ExposeSecret::expose_secret(&passphrase).as_bytes(),
         material,
@@ -1027,11 +1042,42 @@ fn save_fleet_keytree(
     Ok(())
 }
 
+/// Clear any persisted fleet KeyTree material from BOTH the keychain vault slot
+/// AND the encrypted-file fallback. Idempotent: absence is silent.
+///
+/// ZEB-492 carry-forward (Task-2 review): a re-pairing / re-adoption that
+/// carries NO fleet material must not leave a stale `fleet_keytree.enc` (or
+/// vault slot) from a prior identity masquerading as this device's KeyTree —
+/// mirrors how `save_owner_state_atomic` clears `master_seed` when `None`.
+/// Best-effort like `clear_secret`: a vault clear failure is captured and
+/// returned AFTER the file is removed, so at least one store ends up clean.
+pub(crate) fn clear_fleet_keytree(
+    keychain: &Option<KeychainStore>,
+    identity_dir: &Path,
+) -> Result<(), String> {
+    let mut keychain_err: Option<String> = None;
+    if keychain.is_some() {
+        if let Err(e) = crate::identity::vault_clear_fleet_keytree() {
+            keychain_err = Some(format!("vault fleet-keytree clear: {e}"));
+        }
+    }
+    let path = identity_dir.join(FLEET_KEYTREE_FILENAME);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("delete {}: {e}", path.display())),
+    }
+    match keychain_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// Load the distributed fleet KeyTree material for a cert-only enrolled device.
 /// `Ok(None)` on the minting device + pre-ZEB-492 devices (neither the vault nor
 /// the encrypted file carries it). Keychain-vault-preferred, falling back to the
 /// variable-length encrypted file. The returned buffer is `Zeroizing`.
-fn load_fleet_keytree(
+pub(crate) fn load_fleet_keytree(
     keychain: &Option<KeychainStore>,
     identity_dir: &Path,
 ) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
@@ -1106,6 +1152,25 @@ mod persistence_tests {
         assert!(load_fleet_keytree(&None, dir.path())
             .expect("load")
             .is_none());
+    }
+
+    /// ZEB-492 carry-forward #3: a corrupt `fleet_keytree.enc` (garbage, not a
+    /// valid v0x02 envelope) must surface as a clear Err — NOT a panic, and NOT
+    /// silently-None (which would strand a cert-only device with no fleet
+    /// engines while masking the on-disk corruption).
+    #[test]
+    #[serial]
+    fn fleet_keytree_corrupt_file_errors_not_panics() {
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pass-zeb492c");
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(FLEET_KEYTREE_FILENAME);
+        std::fs::write(&path, b"not a valid v0x02 envelope at all").unwrap();
+        let err = load_fleet_keytree(&None, dir.path())
+            .expect_err("corrupt fleet_keytree.enc must error");
+        assert!(
+            err.contains("decrypt") && err.contains(FLEET_KEYTREE_FILENAME),
+            "error must name the decrypt failure + file, got: {err}"
+        );
     }
 
     #[test]

@@ -27,7 +27,15 @@ use std::path::Path;
 /// global shared resource and would leak state across `#[tokio::test]`
 /// invocations even with per-test tempdirs.
 pub fn install_joiner_state(identity_dir: &Path, result: JoinerEnrollResult) -> Result<(), String> {
-    install_joiner_state_inner(identity_dir, result, KeychainStore::new().ok())
+    // `KeychainStore` is not `Clone`, so we acquire two handles: one consumed by
+    // `save_owner_state_atomic` (owner state + device key), one borrowed by the
+    // ZEB-492 fleet-keytree persist/clear that runs AFTER the atomic save.
+    install_joiner_state_inner(
+        identity_dir,
+        result,
+        KeychainStore::new().ok(),
+        KeychainStore::new().ok(),
+    )
 }
 
 /// Test seam for [`install_joiner_state`]: the public wrapper hard-codes
@@ -39,6 +47,7 @@ pub fn install_joiner_state_inner(
     identity_dir: &Path,
     result: JoinerEnrollResult,
     keychain: Option<KeychainStore>,
+    fleet_keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
     // ZEB-199: serialize against every other writer of owner_state.cbor +
     // its companion seed/key entries. Joiner does NOT merge — the result
@@ -56,6 +65,25 @@ pub fn install_joiner_state_inner(
         None, // no master_seed on Joiner — clears any stale prior seed
         keychain,
     )?;
+
+    // ZEB-492: persist the fleet KeyTree the inviter sealed to us so this
+    // cert-only device can build the fleet engines + act as a butler on next
+    // boot. Only after the owner state + device key are durable. When the
+    // inviter sent NO material (pre-ZEB-492 inviter), defensively CLEAR any
+    // stale `fleet_keytree.enc`/vault slot from a prior identity so it can't
+    // masquerade as this device's KeyTree (mirrors save_owner_state_atomic's
+    // master_seed == None clear).
+    match result.fleet_keytree.as_ref() {
+        Some(material) => {
+            let mut buf = zeroize::Zeroizing::new(Vec::new());
+            ciborium::into_writer(material, &mut *buf)
+                .map_err(|e| format!("encode fleet keytree for persist: {e}"))?;
+            crate::owner_state::save_fleet_keytree(&fleet_keychain, identity_dir, &buf)?;
+        }
+        None => {
+            crate::owner_state::clear_fleet_keytree(&fleet_keychain, identity_dir)?;
+        }
+    }
     Ok(())
 }
 
@@ -180,11 +208,12 @@ mod tests {
             our_signing_key: joiner_sk,
             owner_state: state,
             our_device_id: joiner_id,
+            fleet_keytree: None,
         };
         // Use the inner variant with `keychain: None` so the encrypted-file
         // fallback under `HARMONY_PASSPHRASE` is exercised — the production
         // wrapper would write to the developer's actual OS keychain.
-        install_joiner_state_inner(dir.path(), result, None).unwrap();
+        install_joiner_state_inner(dir.path(), result, None, None).unwrap();
 
         let cbor_path = dir.path().join("owner_state.cbor");
         assert!(cbor_path.exists(), "OwnerState cbor written");
@@ -199,6 +228,118 @@ mod tests {
         // The Joiner's device_sk.enc MUST exist (signing key persisted via fallback).
         let device_path = dir.path().join("device_sk.enc");
         assert!(device_path.exists(), "device_sk.enc written");
+
+        // ZEB-492: no fleet material was sent, so no fleet_keytree.enc.
+        assert!(
+            !dir.path().join("fleet_keytree.enc").exists(),
+            "fleet_keytree.enc must not exist when no material was sent"
+        );
+    }
+
+    /// ZEB-492: a joiner that received the inviter's sealed fleet KeyTree must
+    /// persist it on install, and a subsequent `load_fleet_keytree` must
+    /// reconstruct a KeyTree byte-identical to the inviter's — proven by
+    /// decrypting an entry the inviter wrote under the same KeyTree.
+    #[tokio::test]
+    #[serial]
+    async fn install_joiner_persists_fleet_keytree_and_decrypts_inviter_entry() {
+        use crate::owner_state_crypto::{decrypt_entry, encrypt_entry, space_lookup_key, KeyTree};
+
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "zeb492-persist-test");
+        let dir = tempdir().unwrap();
+
+        // Inviter side: derive a KeyTree from a seed, write an entry under it,
+        // and export the material the way the inviter seals it at pairing.
+        let seed = [0x5Au8; 32];
+        let kt = KeyTree::derive(&seed).unwrap();
+        let lk = space_lookup_key(&kt, b"dm-inbox-v1");
+        let ciphertext = encrypt_entry(&kt, &lk, b"butler payload").unwrap();
+        let material = kt.to_fleet_material(0);
+
+        // Build a JoinerEnrollResult carrying the material + persist it (keychain
+        // None → encrypted-file fallback under HARMONY_PASSPHRASE).
+        let MintResult { state, .. } = mint_owner(1_700_000_000).unwrap();
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+        let joiner_id =
+            PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes()).identity_hash();
+        let result = JoinerEnrollResult {
+            our_signing_key: joiner_sk,
+            owner_state: state,
+            our_device_id: joiner_id,
+            fleet_keytree: Some(material),
+        };
+        install_joiner_state_inner(dir.path(), result, None, None).unwrap();
+
+        // The encrypted file must be on disk.
+        assert!(
+            dir.path().join("fleet_keytree.enc").exists(),
+            "fleet_keytree.enc written on install"
+        );
+
+        // Reload the material, rebuild the KeyTree, and confirm it decrypts the
+        // inviter's entry — i.e. the joiner holds the IDENTICAL fleet keys.
+        let loaded = crate::owner_state::load_fleet_keytree(&None, dir.path())
+            .unwrap()
+            .expect("fleet keytree present after install");
+        let m: crate::owner_state_crypto::FleetKeyMaterial =
+            ciborium::from_reader(loaded.as_slice()).unwrap();
+        let kt2 = KeyTree::from_fleet_material(&m);
+        let lk2 = space_lookup_key(&kt2, b"dm-inbox-v1");
+        assert_eq!(
+            decrypt_entry(&kt2, &lk2, &ciphertext).unwrap(),
+            b"butler payload",
+            "reloaded fleet KeyTree decrypts the inviter's entry"
+        );
+    }
+
+    /// ZEB-492 stale-masquerade guard: a re-pairing that carries NO fleet
+    /// material must ACTIVELY REMOVE any `fleet_keytree.enc` a prior identity
+    /// left in the same identity_dir — otherwise the stale file would
+    /// masquerade as this device's KeyTree on next boot. This exercises the
+    /// `clear_fleet_keytree` path (the no-material install branch), which the
+    /// empty-dir test does not reach.
+    #[tokio::test]
+    #[serial]
+    async fn reinstall_without_material_clears_stale_fleet_keytree() {
+        use crate::owner_state_crypto::KeyTree;
+
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "zeb492-clear-test");
+        let dir = tempdir().unwrap();
+
+        let mk_result = |fleet_keytree| {
+            let MintResult { state, .. } = mint_owner(1_700_000_000).unwrap();
+            let joiner_sk = SigningKey::generate(&mut OsRng);
+            let joiner_id =
+                PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes()).identity_hash();
+            JoinerEnrollResult {
+                our_signing_key: joiner_sk,
+                owner_state: state,
+                our_device_id: joiner_id,
+                fleet_keytree,
+            }
+        };
+
+        // First install: WITH material → fleet_keytree.enc lands on disk.
+        let material = KeyTree::derive(&[0x11u8; 32]).unwrap().to_fleet_material(0);
+        install_joiner_state_inner(dir.path(), mk_result(Some(material)), None, None).unwrap();
+        assert!(
+            dir.path().join("fleet_keytree.enc").exists(),
+            "precondition: fleet_keytree.enc written by the WITH-material install"
+        );
+
+        // Second install into the SAME dir: WITHOUT material → the stale file
+        // must be cleared, and load must report None.
+        install_joiner_state_inner(dir.path(), mk_result(None), None, None).unwrap();
+        assert!(
+            !dir.path().join("fleet_keytree.enc").exists(),
+            "stale fleet_keytree.enc must be removed by the no-material install"
+        );
+        assert!(
+            crate::owner_state::load_fleet_keytree(&None, dir.path())
+                .unwrap()
+                .is_none(),
+            "load_fleet_keytree must return None after the stale file is cleared"
+        );
     }
 
     /// Inviter-side persistence (single-writer happy path): simulates the
