@@ -544,10 +544,42 @@ mod vault_tests {
 
     #[test]
     fn vault_without_fleet_keytree_decodes_to_none() {
-        let v = SecretVault::from_seed([1u8; BLOB_LEN]);
-        let cbor = v.to_cbor().unwrap();
-        let back = SecretVault::from_cbor(&cbor).unwrap();
-        assert!(back.fleet_keytree().is_none());
+        // Back-compat: a vault written by a pre-ZEB-492 build OMITS the
+        // `fleet_keytree` key entirely (the field didn't exist), and must decode
+        // via `#[serde(default)]` to `fleet_keytree == None`. Serializing a
+        // CURRENT `SecretVault` would always emit the key (as `null`), so it would
+        // pass even if `#[serde(default)]` were removed — useless as a regression
+        // guard. Encode a legacy struct shape mirroring the pre-field layout so
+        // the produced CBOR genuinely lacks the `fleet_keytree` key.
+        #[derive(Serialize)]
+        struct LegacySecretVault {
+            version: u8,
+            seed: [u8; BLOB_LEN],
+            iroh_secret_key: Option<[u8; 32]>,
+            device_signing_key: Option<[u8; 32]>,
+            owner_master_seed: Option<[u8; 32]>,
+            // NOTE: no `fleet_keytree` field — this mirrors the on-disk layout
+            // before ZEB-492 added it.
+        }
+
+        let legacy = LegacySecretVault {
+            version: VAULT_VERSION,
+            seed: [1u8; BLOB_LEN],
+            iroh_secret_key: Some([2u8; 32]),
+            device_signing_key: Some([3u8; 32]),
+            owner_master_seed: Some([4u8; 32]),
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&legacy, &mut cbor).expect("encode legacy vault");
+
+        let back = SecretVault::from_cbor(&cbor).expect("legacy vault decodes via serde default");
+        assert!(
+            back.fleet_keytree().is_none(),
+            "an omitted fleet_keytree key must default to None (serde-default back-compat)"
+        );
+        // Sanity: the pre-existing fields still decode (the legacy blob is otherwise intact).
+        assert_eq!(back.seed, [1u8; BLOB_LEN]);
+        assert_eq!(back.owner_master_seed, Some([4u8; 32]));
     }
 
     /// ZEB-492 (Qodo/CodeAnt round 1, FIX A): `decrypt_vault_bytes` is reachable
@@ -1163,6 +1195,35 @@ mod vault_tests {
         assert!(vault_load_fleet_keytree_with_store(&empty)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn fleet_keytree_clear_propagates_unreadable_vault_err() {
+        // An unreadable/locked vault must surface an Err from the clear, NOT a
+        // silent Ok(()) — otherwise `install_joiner_state_inner`'s None branch
+        // (which calls `clear_fleet_keytree(...)?` BEFORE committing owner_state)
+        // could commit owner_state while stale fleet material survives in a
+        // temporarily-locked keychain and later shadows fresh state. Mirrors the
+        // corrupt-vault seam used by `corrupt_vault_degrades_load_slot_to_legacy_item`.
+        let store = KeychainStore::new_mock();
+        let corrupt = [0xFFu8; 40];
+        store
+            .entry
+            .set_secret(&corrupt)
+            .expect("write corrupt vault");
+
+        vault_clear_fleet_keytree_with_store(&store)
+            .expect_err("clear must propagate the unreadable-vault error, not swallow it");
+
+        // The corrupt item is left intact (never overwritten by the clear path).
+        assert_eq!(
+            store
+                .entry
+                .get_secret()
+                .expect("corrupt vault still present"),
+            corrupt,
+            "the corrupt vault must not be overwritten by the clear path"
+        );
     }
 
     #[test]
@@ -1916,12 +1977,26 @@ fn vault_clear_fleet_keytree_with_store(store: &KeychainStore) -> Result<(), Str
         }
         Ok(None) => {}
         // Unreadable vault: leave it intact (can't selectively clear one field
-        // without risking an overwrite of the whole corrupt item; it can't
-        // resurrect the material on load anyway since the read fails the same way).
-        Err(e) => tracing::warn!(
-            "keychain vault unreadable ({e}); leaving it intact rather than clearing the \
-             fleet KeyTree"
-        ),
+        // without risking an overwrite of the whole corrupt item), but PROPAGATE
+        // the read error rather than reporting a successful clear. Unlike
+        // `vault_clear_slot_with_store` — which still clears the *legacy* per-item
+        // entry on this branch, so the slot's overall clear can succeed — the
+        // fleet KeyTree slot is brand-new (ZEB-492) and has NO legacy fallback, so
+        // an unreadable vault means the clear genuinely did NOT happen. The
+        // load-side (`vault_load_fleet_keytree_with_store`) likewise propagates
+        // this Err. Swallowing it here would let `install_joiner_state_inner`'s
+        // None branch (FIX D: `clear_fleet_keytree(...)?` runs BEFORE the
+        // owner_state commit) commit owner_state while stale fleet material
+        // survives in a temporarily-locked keychain — that material would then
+        // shadow fresh state once the keychain becomes readable. Returning Err
+        // aborts the install before any owner_state write.
+        Err(e) => {
+            tracing::warn!(
+                "keychain vault unreadable ({e}); leaving it intact and propagating the \
+                 fleet-keytree clear failure"
+            );
+            return Err(e);
+        }
     }
     Ok(())
 }

@@ -165,9 +165,16 @@ impl KeyTree {
 
     /// Export this KeyTree's key material for sealed distribution to an
     /// enrolled device. Only the seed-holding (inviter) device calls this.
-    pub fn to_fleet_material(&self, epoch: u32) -> FleetKeyMaterial {
+    ///
+    /// Stamps `epoch: 0` unconditionally — the only epoch the current KeyTree
+    /// derivation produces, and the only one `from_fleet_material` accepts
+    /// (ZEB-492 round 1, FIX E). Taking an `epoch` parameter was a footgun: a
+    /// caller could mint `epoch != 0` material that this same build's import side
+    /// immediately refuses. KeyTree rotation (a future, non-zero epoch) will
+    /// revisit this — see the ZEB-492 spec.
+    pub fn to_fleet_material(&self) -> FleetKeyMaterial {
         FleetKeyMaterial {
-            epoch,
+            epoch: 0,
             entry_aead: *self.entry_aead,
             root_aead: *self.root_aead,
             lookup: *self.lookup,
@@ -1080,7 +1087,7 @@ mod tests {
     fn fleet_material_round_trips_to_identical_keytree() {
         let seed = [0x42u8; 32];
         let kt = KeyTree::derive(&seed).unwrap();
-        let material = kt.to_fleet_material(0);
+        let material = kt.to_fleet_material();
         assert_eq!(material.epoch, 0);
         let kt2 = KeyTree::from_fleet_material(&material).unwrap();
         let lk1 = space_lookup_key(&kt, b"notes-v1");
@@ -1107,7 +1114,7 @@ mod tests {
     #[test]
     fn fleet_material_cbor_round_trips() {
         let kt = KeyTree::derive(&[7u8; 32]).unwrap();
-        let m = kt.to_fleet_material(0);
+        let m = kt.to_fleet_material();
         let mut buf = Vec::new();
         ciborium::into_writer(&m, &mut buf).unwrap();
         let back: FleetKeyMaterial = ciborium::from_reader(buf.as_slice()).unwrap();
@@ -1123,7 +1130,7 @@ mod tests {
         let kt_b = KeyTree::derive(&[2u8; 32]).unwrap();
         let lk = space_lookup_key(&kt_a, b"notes-v1");
         let ct = encrypt_entry(&kt_a, &lk, b"secret").unwrap();
-        let kt_b2 = KeyTree::from_fleet_material(&kt_b.to_fleet_material(0)).unwrap();
+        let kt_b2 = KeyTree::from_fleet_material(&kt_b.to_fleet_material()).unwrap();
         let lk_b = space_lookup_key(&kt_b2, b"notes-v1");
         assert!(decrypt_entry(&kt_b2, &lk_b, &ct).is_err());
     }
@@ -1135,7 +1142,12 @@ mod tests {
     #[test]
     fn fleet_material_unsupported_epoch_rejected() {
         let kt = KeyTree::derive(&[0x42u8; 32]).unwrap();
-        let material = kt.to_fleet_material(1);
+        // `to_fleet_material` only ever stamps epoch 0, so forge a future-epoch
+        // blob by overriding the `epoch` field on exported material — this is the
+        // only way a non-zero epoch can reach `from_fleet_material` (e.g. a future
+        // rotation-aware peer, or a corrupt/tampered blob).
+        let mut material = kt.to_fleet_material();
+        material.epoch = 1;
         assert_eq!(material.epoch, 1);
         // `KeyTree` deliberately has no `Debug` (key material), so `expect_err`
         // (which formats the Ok value) won't compile — match on the result.

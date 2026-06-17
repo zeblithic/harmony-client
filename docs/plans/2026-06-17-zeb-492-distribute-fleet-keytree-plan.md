@@ -46,9 +46,9 @@ Context: `KeyTree` (`owner_state_crypto.rs:120`) has 5 private `Zeroizing<[u8; 3
 fn fleet_material_round_trips_to_identical_keytree() {
     let seed = [0x42u8; 32];
     let kt = KeyTree::derive(&seed).unwrap();
-    let material = kt.to_fleet_material(0);
+    let material = kt.to_fleet_material();
     assert_eq!(material.epoch, 0);
-    let kt2 = KeyTree::from_fleet_material(&material);
+    let kt2 = KeyTree::from_fleet_material(&material).unwrap();
 
     // Same lookup key for a given space tag.
     let lk1 = space_lookup_key(&kt, b"notes-v1");
@@ -72,11 +72,11 @@ fn fleet_material_round_trips_to_identical_keytree() {
 #[test]
 fn fleet_material_cbor_round_trips() {
     let kt = KeyTree::derive(&[7u8; 32]).unwrap();
-    let m = kt.to_fleet_material(0);
+    let m = kt.to_fleet_material();
     let mut buf = Vec::new();
     ciborium::into_writer(&m, &mut buf).unwrap();
     let back: FleetKeyMaterial = ciborium::from_reader(buf.as_slice()).unwrap();
-    let kt_back = KeyTree::from_fleet_material(&back);
+    let kt_back = KeyTree::from_fleet_material(&back).unwrap();
     let lk = space_lookup_key(&kt, b"x");
     let ct = encrypt_entry(&kt, &lk, b"z").unwrap();
     assert_eq!(decrypt_entry(&kt_back, &lk, &ct).unwrap(), b"z");
@@ -88,9 +88,25 @@ fn fleet_material_from_different_seed_cannot_decrypt() {
     let kt_b = KeyTree::derive(&[2u8; 32]).unwrap();
     let lk = space_lookup_key(&kt_a, b"notes-v1");
     let ct = encrypt_entry(&kt_a, &lk, b"secret").unwrap();
-    let kt_b2 = KeyTree::from_fleet_material(&kt_b.to_fleet_material(0));
+    let kt_b2 = KeyTree::from_fleet_material(&kt_b.to_fleet_material()).unwrap();
     let lk_b = space_lookup_key(&kt_b2, b"notes-v1");
     assert!(decrypt_entry(&kt_b2, &lk_b, &ct).is_err());
+}
+
+#[test]
+fn fleet_material_unsupported_epoch_rejected() {
+    // Only epoch 0 is supported today (KeyTree rotation is out of scope). A
+    // future / corrupt epoch must be REJECTED at import, not silently rebuilt.
+    // `to_fleet_material` only ever stamps epoch 0, so forge a non-zero epoch by
+    // overriding the field on exported material.
+    let kt = KeyTree::derive(&[0x42u8; 32]).unwrap();
+    let mut material = kt.to_fleet_material();
+    material.epoch = 1;
+    match KeyTree::from_fleet_material(&material) {
+        Err(CryptoError::UnsupportedEpoch(1)) => {}
+        Err(other) => panic!("expected UnsupportedEpoch(1), got: {other}"),
+        Ok(_) => panic!("epoch 1 material must be rejected, not reconstructed"),
+    }
 }
 ```
 
@@ -126,9 +142,12 @@ pub struct FleetKeyMaterial {
 impl KeyTree {
     /// Export this KeyTree's key material for sealed distribution to an
     /// enrolled device. Only the seed-holding (inviter) device calls this.
-    pub fn to_fleet_material(&self, epoch: u32) -> FleetKeyMaterial {
+    /// Takes no `epoch` param: it stamps `epoch: 0` internally (the only epoch
+    /// the current derivation produces, and the only one `from_fleet_material`
+    /// accepts). A future KeyTree rotation will revisit this.
+    pub fn to_fleet_material(&self) -> FleetKeyMaterial {
         FleetKeyMaterial {
-            epoch,
+            epoch: 0,
             entry_aead: *self.entry_aead,
             root_aead: *self.root_aead,
             lookup: *self.lookup,
@@ -140,14 +159,21 @@ impl KeyTree {
     /// Reconstruct a KeyTree from distributed material (cert-only device, which
     /// has no master seed to re-derive from). Produces a KeyTree byte-identical
     /// to the originating seed-holder's.
-    pub fn from_fleet_material(m: &FleetKeyMaterial) -> Self {
-        Self {
+    ///
+    /// Fallible: rejects an unsupported `epoch` (anything `!= 0` today) with
+    /// `CryptoError::UnsupportedEpoch` so corrupt/future-version material can't
+    /// be silently accepted at the cert-only boot boundary.
+    pub fn from_fleet_material(m: &FleetKeyMaterial) -> Result<Self, CryptoError> {
+        if m.epoch != 0 {
+            return Err(CryptoError::UnsupportedEpoch(m.epoch));
+        }
+        Ok(Self {
             entry_aead: Zeroizing::new(m.entry_aead),
             root_aead: Zeroizing::new(m.root_aead),
             lookup: Zeroizing::new(m.lookup),
             nonce: Zeroizing::new(m.nonce),
             friend_aead: Zeroizing::new(m.friend_aead),
-        }
+        })
     }
 }
 ```
@@ -453,9 +479,18 @@ Context: the engine block is `let sync_engine_arc = if let Some(ref loaded) = ow
                                 .map_err(|e| format!("KeyTree::derive: {e}"))?,
                         ))
                     } else if let Some(material) = loaded.fleet_keytree.as_ref() {
-                        Some(std::sync::Arc::new(
-                            crate::owner_state_crypto::KeyTree::from_fleet_material(material),
-                        ))
+                        // `from_fleet_material` is fallible: a bad / unsupported-epoch
+                        // blob degrades to `None` (warn + boot with no fleet engines)
+                        // rather than hard-failing the whole boot.
+                        match crate::owner_state_crypto::KeyTree::from_fleet_material(material) {
+                            Ok(kt) => Some(std::sync::Arc::new(kt)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "ignoring unusable fleet material ({e}); no fleet engines"
+                                );
+                                None
+                            }
+                        }
                     } else {
                         None
                     }
@@ -544,7 +579,7 @@ Context: the inviter signs the cert (`state_machine.rs:747`, `master_seed` in sc
     let fleet_keytree_cbor_hex = match crate::owner_state_crypto::KeyTree::derive(master_seed) {
         Ok(kt) => {
             let mut buf = Vec::new();
-            match ciborium::into_writer(&kt.to_fleet_material(0), &mut buf) {
+            match ciborium::into_writer(&kt.to_fleet_material(), &mut buf) {
                 Ok(()) => Some(hex::encode(&buf)),
                 Err(e) => {
                     let _ = state_tx.send(PairingState::Failed {
@@ -634,7 +669,7 @@ fn install_joiner_persists_fleet_keytree_and_decrypts_inviter_entry() {
     let kt = KeyTree::derive(&seed).unwrap();
     let lk = space_lookup_key(&kt, b"dm-inbox-v1");
     let ciphertext = encrypt_entry(&kt, &lk, b"butler payload").unwrap();
-    let material = kt.to_fleet_material(0);
+    let material = kt.to_fleet_material();
 
     // Build a JoinerEnrollResult carrying the material + persist it (keychain None).
     let result = /* construct JoinerEnrollResult with a throwaway signing key,
@@ -647,7 +682,7 @@ fn install_joiner_persists_fleet_keytree_and_decrypts_inviter_entry() {
     let loaded = crate::owner_state::load_fleet_keytree(&None, dir.path()).unwrap().unwrap();
     let m: crate::owner_state_crypto::FleetKeyMaterial =
         ciborium::from_reader(loaded.as_slice()).unwrap();
-    let kt2 = KeyTree::from_fleet_material(&m);
+    let kt2 = KeyTree::from_fleet_material(&m).unwrap();
     let lk2 = space_lookup_key(&kt2, b"dm-inbox-v1");
     assert_eq!(decrypt_entry(&kt2, &lk2, &ciphertext).unwrap(), b"butler payload");
 
@@ -695,6 +730,7 @@ cd src-tauri && cargo build --bin harmony-app
 ```bash
 cd e2e-harness && cargo nextest run --features e2e -E 'test(s7_butler_deposit_recover)' --no-capture
 ```
+
 Expected: B2 now starts its dm-inbox engine (no "dm-inbox not running" 500). If it still 500s, STOP — the KeyTree isn't reaching the engines; debug Tasks 2-4 before changing the harness.
 
 - [ ] **Step 3: Replace the characterize-at-0b fallback with a hard assert.** In the `s7_butler_deposit_recover` test, remove the "FINDING (ZEB-491): ... Skipping HELD/RECV/CLEARED" early-return/characterize branch and instead drive + assert the deposit chain: butler B2 holds the deposit (`get_butler_held` returns the held item), the recipient recovers it, and the item reaches CLEARED. Use the existing assertion helpers/poll utilities in the harness (match the s6/relay-rung scenarios' HELD→RECV→CLEARED assertions; reuse their `poll_until`/`*_contains` patterns). **Use the DTO's camelCase keys** in any `poll_until`/`*_contains` (`channelId`/`spaceId`/etc.) — a guessed `id` key silently always-times-out (the ZEB-462-A lesson).
@@ -704,6 +740,7 @@ Expected: B2 now starts its dm-inbox engine (no "dm-inbox not running" 500). If 
 ```bash
 cd e2e-harness && for i in 1 2 3; do echo "### s7 run $i"; cargo nextest run --features e2e -E 'test(s7_butler_deposit_recover)' --no-capture || break; done
 ```
+
 Expected: 3/3 pass with the full HELD→RECV→CLEARED assert.
 
 - [ ] **Step 5: Commit**

@@ -65,12 +65,12 @@ pub struct FleetKeyMaterial {
 }
 ```
 
-- `KeyTree::to_fleet_material(&self, epoch: u32) -> FleetKeyMaterial` — export; only the seed-holder (inviter) calls it.
-- `KeyTree::from_fleet_material(m: &FleetKeyMaterial) -> KeyTree` — reconstruct a KeyTree from distributed material.
+- `KeyTree::to_fleet_material(&self) -> FleetKeyMaterial` — export; only the seed-holder (inviter) calls it. Takes no `epoch` param: it stamps `epoch: 0` internally (the only epoch the current derivation produces, and the only one `from_fleet_material` accepts). A future KeyTree rotation will revisit this.
+- `KeyTree::from_fleet_material(m: &FleetKeyMaterial) -> Result<KeyTree, CryptoError>` — reconstruct a KeyTree from distributed material. Fallible: rejects an unsupported `epoch` (anything `!= 0` today) with `CryptoError::UnsupportedEpoch` so corrupt/future-version material can't be silently accepted at the cert-only boot boundary.
 - No `Debug` impl on `FleetKeyMaterial`. Fields stay private except `epoch`; construction/extraction only via the two methods above.
 - `epoch` is `0` today (matches `HKDF_SALT = b"harmony-owner-state-v1-epoch-0"`).
 
-**Round-trip invariant:** `from_fleet_material(to_fleet_material(kt, e))` must produce a KeyTree that encrypts/decrypts byte-identically to `kt` (the keys are copied, not re-derived).
+**Round-trip invariant:** `from_fleet_material(to_fleet_material(kt)).unwrap()` must produce a KeyTree that encrypts/decrypts byte-identically to `kt` (the keys are copied, not re-derived).
 
 ### 2. Boot gate refactor (`lib.rs:3730`)
 
@@ -82,7 +82,17 @@ let kt: Option<Arc<KeyTree>> = if let Some(seed) = loaded.master_seed.as_ref() {
     Some(Arc::new(KeyTree::derive(seed).map_err(|e| format!("KeyTree::derive: {e}"))?))
 } else if let Some(material) = loaded.fleet_keytree.as_ref() {
     // Cert-only enrolled device given a fleet KeyTree at pairing.
-    Some(Arc::new(KeyTree::from_fleet_material(material)))
+    // `from_fleet_material` is fallible: a bad / unsupported-epoch blob (corrupt
+    // or from a future rotation this build can't interpret) degrades to `None`
+    // — warn + boot with no fleet engines, rather than hard-failing or building
+    // a KeyTree from material it can't interpret.
+    match KeyTree::from_fleet_material(material) {
+        Ok(kt) => Some(Arc::new(kt)),
+        Err(e) => {
+            tracing::warn!("ignoring unusable fleet material ({e}); booting with no fleet engines");
+            None
+        }
+    }
 } else {
     // Cert-only device that never received a KeyTree (e.g. paired before this
     // shipped, or delivery failed). Graceful fallback = today's behavior: no
@@ -100,7 +110,7 @@ The block body is unchanged; only how `kt` is obtained changes. The `seed` bindi
 ### 3. Pairing payload (`pairing/state_machine.rs`, `pairing/persist.rs`)
 
 - Extend `JoinerEnrollResult` with `fleet_keytree: Option<FleetKeyMaterial>`.
-- The inviter holds the seed at cert-signing time (`master_seed` is in scope at `state_machine.rs:747`). Immediately after signing, it derives `KeyTree::derive(master_seed)`, calls `to_fleet_material(0)`, and sets the field on the `JoinerEnrollResult` it assembles for the joiner.
+- The inviter holds the seed at cert-signing time (`master_seed` is in scope at `state_machine.rs:747`). Immediately after signing, it derives `KeyTree::derive(master_seed)`, calls `to_fleet_material()` (which stamps `epoch: 0`), and sets the field on the `JoinerEnrollResult` it assembles for the joiner.
 - The payload rides the **existing** transport: `JoinerEnrollResult` is sealed with XChaCha20-Poly1305 under the SAS-derived session key (`pairing/session.rs::encrypt`, key from `pairing/sas.rs`). This is the same channel that already carries the joiner's device signing key, so adding the KeyTree material introduces **no new transport trust assumption**.
 - The joiner's `on_encrypted_payload` already deserializes `JoinerEnrollResult` and calls `install_joiner_state`; the new field flows through unchanged at the wire layer.
 
@@ -120,7 +130,7 @@ The existing `load_secret`/`save_secret` path is **32-byte-only** (the consolida
 **Enrollment (inviter → joiner), one-directional:**
 
 1. Inviter (always a seed-holder — cert signing requires the seed) signs the EnrollmentCert at `state_machine.rs:747`.
-2. Inviter derives `KeyTree::derive(seed)`, exports `to_fleet_material(0)`, sets `JoinerEnrollResult.fleet_keytree`.
+2. Inviter derives `KeyTree::derive(seed)`, exports `to_fleet_material()` (stamps `epoch: 0`), sets `JoinerEnrollResult.fleet_keytree`.
 3. Inviter seals the `JoinerEnrollResult` under the SAS session key and sends it.
 4. Joiner decrypts, deserializes, and `install_joiner_state` persists owner state + device key (`master_seed = None`, unchanged) **and** the fleet KeyTree material into `VaultSlot::FleetKeytree`.
 

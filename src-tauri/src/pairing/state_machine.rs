@@ -794,10 +794,11 @@ async fn maybe_advance_to_enroll(
     let fleet_keytree_cbor_hex = match crate::owner_state_crypto::KeyTree::derive(master_seed) {
         Ok(kt) => {
             let mut buf = Zeroizing::new(Vec::new());
-            // epoch 0 is intentional: KeyTree rotation is out of scope for
-            // ZEB-492 (the tag reserves room for a future rotation, but
-            // `from_fleet_material` does not read epoch back yet).
-            match ciborium::into_writer(&kt.to_fleet_material(0), &mut *buf) {
+            // `to_fleet_material` stamps epoch 0 internally: KeyTree rotation is
+            // out of scope for ZEB-492 (the tag reserves room for a future
+            // rotation, which `from_fleet_material` will revisit), and minting any
+            // other epoch would produce material this build's import side rejects.
+            match ciborium::into_writer(&kt.to_fleet_material(), &mut *buf) {
                 Ok(()) => Some(hex::encode(&*buf)),
                 Err(e) => {
                     let _ = state_tx.send(PairingState::Failed {

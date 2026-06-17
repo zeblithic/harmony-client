@@ -264,7 +264,7 @@ mod tests {
         let kt = KeyTree::derive(&seed).unwrap();
         let lk = space_lookup_key(&kt, b"dm-inbox-v1");
         let ciphertext = encrypt_entry(&kt, &lk, b"butler payload").unwrap();
-        let material = kt.to_fleet_material(0);
+        let material = kt.to_fleet_material();
 
         // Build a JoinerEnrollResult carrying the material + persist it (keychain
         // None → encrypted-file fallback under HARMONY_PASSPHRASE).
@@ -330,7 +330,7 @@ mod tests {
         };
 
         // First install: WITH material → fleet_keytree.enc lands on disk.
-        let material = KeyTree::derive(&[0x11u8; 32]).unwrap().to_fleet_material(0);
+        let material = KeyTree::derive(&[0x11u8; 32]).unwrap().to_fleet_material();
         install_joiner_state_inner(dir.path(), mk_result(Some(material)), None, None).unwrap();
         assert!(
             dir.path().join("fleet_keytree.enc").exists(),

@@ -449,14 +449,23 @@ pub fn load_owner_state(
         "master_seed.enc",
     )?;
 
-    let fleet_keytree = match load_fleet_keytree(&keychain, identity_dir)? {
-        Some(bytes) => Some(
-            ciborium::from_reader::<crate::owner_state_crypto::FleetKeyMaterial, _>(
-                bytes.as_slice(),
-            )
-            .map_err(|e| format!("decode fleet_keytree: {e}"))?,
-        ),
-        None => None,
+    // ZEB-492 (Greptile finding): only a cert-only device (no master seed) uses
+    // distributed fleet material — the boot gate treats the seed as authoritative
+    // and ignores any stored material when a seed is present. So a seed-holder must
+    // NOT load it: a stale/corrupt fleet_keytree.enc, a locked keychain, or a
+    // missing HARMONY_PASSPHRASE must never block a seed-based boot.
+    let fleet_keytree = if master_seed.is_some() {
+        None
+    } else {
+        match load_fleet_keytree(&keychain, identity_dir)? {
+            Some(bytes) => Some(
+                ciborium::from_reader::<crate::owner_state_crypto::FleetKeyMaterial, _>(
+                    bytes.as_slice(),
+                )
+                .map_err(|e| format!("decode fleet_keytree: {e}"))?,
+            ),
+            None => None,
+        }
     };
 
     Ok(Some(LoadedOwnerState {
@@ -1235,6 +1244,49 @@ mod persistence_tests {
         assert!(
             err.contains("decrypt") && err.contains(FLEET_KEYTREE_FILENAME),
             "error must name the decrypt failure + file, got: {err}"
+        );
+    }
+
+    /// ZEB-492 (Greptile finding): a seed-holding device must boot even when a
+    /// corrupt `fleet_keytree.enc` is present on disk. The boot gate uses the
+    /// authoritative master seed and ignores distributed fleet material, so
+    /// `load_owner_state` must NOT attempt to load (and fail on) that material
+    /// when a seed is present. Realistic trigger: reuse a profile that once held
+    /// cert-only fleet material, then re-adopt it with a seed.
+    #[test]
+    #[serial]
+    fn seed_holder_boots_despite_corrupt_fleet_keytree() {
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "seed-corrupt-fleet-pp");
+        let dir = tempdir().unwrap();
+        let MintResult {
+            state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_222).unwrap();
+        // Construct a seed-holding owner identity on disk (master_seed present).
+        save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            Some(recovery_artifact.as_bytes()),
+            None,
+        )
+        .unwrap();
+
+        // Garbage fleet material: would surface an Err for a cert-only device
+        // (round-1 FIX B), but must be IGNORED for a seed-holder.
+        std::fs::write(dir.path().join(FLEET_KEYTREE_FILENAME), [0xFFu8; 20]).unwrap();
+
+        let loaded = load_owner_state(dir.path(), None)
+            .expect("seed-holder must boot despite corrupt fleet_keytree.enc")
+            .expect("must be Some");
+        assert!(
+            loaded.master_seed.is_some(),
+            "seed must be loaded (authoritative boot material)"
+        );
+        assert!(
+            loaded.fleet_keytree.is_none(),
+            "corrupt fleet material must NOT be loaded for a seed-holder"
         );
     }
 
