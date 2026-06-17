@@ -245,11 +245,18 @@ async fn run_state_machine(
             // ZEB-491: durability result for a pending inviter enrollment,
             // forwarded by the detached ack task in maybe_advance_to_enroll.
             // Transition only if we're STILL in the same inviter session that
-            // started the persist — a Cancel or a new pairing supersedes it,
-            // so a late ack cannot clobber a different session's state.
+            // started the persist AND still at `Enrolling` — a Cancel or a new
+            // pairing supersedes it, and (CodeRabbit) a late ack must not
+            // overwrite a terminal `Failed` (peer/wire abort) that fired while
+            // persistence was pending, now possible because the SM stays
+            // responsive during the wait. Preserves terminal-state precedence.
             done = persist_done_rx.recv() => {
                 if let Some((session_id, device_id_hex, outcome)) = done {
-                    if ctx.as_ref().is_some_and(|c| c.session_id == session_id && c.cert_sent) {
+                    let same_active_session = ctx
+                        .as_ref()
+                        .is_some_and(|c| c.session_id == session_id && c.cert_sent);
+                    let still_enrolling = matches!(&*state_tx.borrow(), PairingState::Enrolling);
+                    if same_active_session && still_enrolling {
                         match outcome {
                             Ok(()) => {
                                 let _ = state_tx.send(PairingState::Complete { device_id_hex });
