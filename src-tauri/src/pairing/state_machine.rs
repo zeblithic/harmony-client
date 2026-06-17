@@ -894,6 +894,10 @@ async fn maybe_advance_to_enroll(
     });
 }
 
+// ZEB-491: the inviter persist-ack forwarder adds an 8th param to this handler
+// chain. Bundling the senders into a context struct is a larger refactor than
+// this round warrants; matches the existing handler-chain pattern in event_loop.rs.
+#[allow(clippy::too_many_arguments)]
 async fn handle_wire_message(
     transport: &Arc<dyn PairingTransport>,
     state_tx: &watch::Sender<PairingState>,
@@ -1080,6 +1084,8 @@ async fn handle_wire_message(
     }
 }
 
+// ZEB-491: see handle_wire_message — the persist-ack forwarder adds an 8th param.
+#[allow(clippy::too_many_arguments)]
 async fn on_encrypted_payload(
     transport: &Arc<dyn PairingTransport>,
     state_tx: &watch::Sender<PairingState>,
