@@ -1142,7 +1142,19 @@ pub struct NodeState {
     /// ZEB-418 P2 Task 8: snapshot of enrolled device IDs (64-hex ed25519 vk)
     /// for `set_butler_pin` validation. Same derivation as `dm_inbox_enrolled`
     /// at start_node time.
+    ///
+    /// ZEB-491 (secondary): this is a BOOT-TIME snapshot — it does NOT see a
+    /// device that pairs in this session, so `set_butler_pin` reads the LIVE
+    /// enrolled set from `identity_dir` (below) and unions it with this snapshot
+    /// as a fallback. Kept as the safety net for the (rare) case where the disk
+    /// read fails.
     pub fleet_net_enrolled: Option<std::collections::BTreeSet<String>>,
+    /// ZEB-491 (secondary): the resolved identity directory for this node run,
+    /// stored so `set_butler_pin` can re-read the LIVE enrolled-device set from
+    /// `owner_state.cbor` (via `owner_state::read_enrolled_device_vk_hex`) rather
+    /// than relying solely on the boot-time `fleet_net_enrolled` snapshot. Set in
+    /// `start_node_inner` once the identity dir is resolved.
+    pub identity_dir: Option<std::path::PathBuf>,
     /// ZEB-418 P2: fire-and-forget routing-record republish trigger
     /// (re-stamps the self fleet-net row + re-registers identity/community/
     /// friend pkarr records). Stored so `set_butler_pin` can publish a pin
@@ -1552,6 +1564,7 @@ impl Default for NodeState {
             fleet_net_snapshot: None,
             fleet_net_device_id: None,
             fleet_net_enrolled: None,
+            identity_dir: None,
             routing_republish: None,
             // ZEB-321 Phase 1 Task 8: iroh handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
@@ -2034,6 +2047,7 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.fleet_net_snapshot = None;
         guard.fleet_net_device_id = None;
         guard.fleet_net_enrolled = None;
+        guard.identity_dir = None;
         // ZEB-418 P2: drop the republish trigger with the rest of the
         // fleet-net handles — it captures the pkarr publishers and the
         // fleet-net engine, all of which die with this stop.
@@ -8201,6 +8215,11 @@ pub async fn start_node_inner(
                         guard.fleet_net_snapshot = fleet_net_snapshot_opt.clone();
                         guard.fleet_net_device_id = fleet_net_device_id_opt.clone();
                         guard.fleet_net_enrolled = fleet_net_enrolled_opt.clone();
+                        // ZEB-491 (secondary): stash the identity dir so
+                        // set_butler_pin can re-read the LIVE enrolled set
+                        // (a device paired this session is absent from the
+                        // boot-time fleet_net_enrolled snapshot above).
+                        guard.identity_dir = Some(identity_dir.clone());
                         // ZEB-418 P2 (PR #222 round 1): store the routing-
                         // republish trigger so `set_butler_pin` can fire an
                         // immediate pkarr republish on a local pin write —
@@ -43852,7 +43871,8 @@ pub(crate) async fn set_butler_pin_impl(
         fleet_net_doc_arc,
         fleet_net_sync_arc,
         fleet_net_snapshot_arc,
-        enrolled,
+        mut enrolled,
+        identity_dir,
         self_device_id,
         routing_republish,
     ) = {
@@ -43871,6 +43891,7 @@ pub(crate) async fn set_butler_pin_impl(
             .clone()
             .ok_or_else(|| "set_butler_pin: fleet-net snapshot not available".to_string())?;
         let enrolled = g.fleet_net_enrolled.clone().unwrap_or_default();
+        let identity_dir = g.identity_dir.clone();
         let self_device_id = g.fleet_net_device_id.clone().unwrap_or_default();
         let routing_republish = g.routing_republish.clone();
         (
@@ -43878,10 +43899,29 @@ pub(crate) async fn set_butler_pin_impl(
             sync,
             snapshot,
             enrolled,
+            identity_dir,
             self_device_id,
             routing_republish,
         )
     };
+
+    // ZEB-491 (secondary): validate against the LIVE enrolled set, not just the
+    // boot-time `fleet_net_enrolled` snapshot. Runtime SAS pairing adds an
+    // enrollment to `owner_state.cbor` without refreshing that snapshot, so
+    // pinning a freshly-paired device used to wrongly fail until a restart. We
+    // re-read the current enrolled set from disk (keychain-free) and UNION it
+    // with the boot snapshot — the union means a transient disk-read failure
+    // degrades to the old behavior rather than rejecting a device the snapshot
+    // already knows about.
+    if let Some(dir) = identity_dir.as_deref() {
+        match crate::owner_state::read_enrolled_device_vk_hex(dir) {
+            Ok(live) => enrolled.extend(live),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "set_butler_pin: live enrolled-set read failed; falling back to boot snapshot"
+            ),
+        }
+    }
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -48083,6 +48123,7 @@ mod start_node_race_tests {
             fleet_net_snapshot: None,
             fleet_net_device_id: None,
             fleet_net_enrolled: None,
+            identity_dir: None,
             routing_republish: None,
             // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.
             iroh_endpoint: None,
@@ -50486,6 +50527,41 @@ mod butler_pin_tests {
         assert_eq!(
             guard.pinned_at.wall_ms, 100,
             "doc.pinned_at must not change"
+        );
+    }
+
+    /// ZEB-491 (secondary): a device enrolled AFTER boot must be pinnable
+    /// without a restart. `set_butler_pin_impl` now sources the enrolled set
+    /// LIVE from disk (unioned with the boot snapshot); this test pins the
+    /// acceptance at the validation seam by passing an enrolled set that
+    /// contains a device ABSENT from the original boot snapshot — `_inner`
+    /// must accept it (the old bug rejected it until a restart refreshed the
+    /// snapshot).
+    #[tokio::test]
+    async fn set_butler_pin_accepts_post_boot_device() {
+        let boot_device = "aa".repeat(32); // present at boot
+        let paired_device = "cc".repeat(32); // enrolled AFTER boot (this session)
+
+        // The boot snapshot ALONE would NOT contain `paired_device` — that was
+        // the bug. The live/union set passed here does, mirroring the real path.
+        let live_enrolled = enrolled_set(&[&boot_device, &paired_device]);
+        let doc = Arc::new(Mutex::new(FleetNetDoc::default()));
+
+        set_butler_pin_inner(
+            &doc,
+            &live_enrolled,
+            Some(paired_device.clone()),
+            "self-dev",
+            5000,
+        )
+        .await
+        .expect("freshly-paired (post-boot) device must be pinnable without restart");
+
+        let g = doc.lock().await;
+        assert_eq!(
+            g.pinned.as_deref(),
+            Some(paired_device.as_str()),
+            "pin must land on the post-boot device"
         );
     }
 
