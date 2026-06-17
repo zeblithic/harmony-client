@@ -1011,15 +1011,25 @@ pub(crate) fn save_fleet_keytree(
     // "HARMONY_PASSPHRASE not set" message — otherwise the caller reports the
     // wrong remediation.
     let mut keychain_err: Option<String> = None;
+    // True whenever we fall through to the encrypted file instead of landing the
+    // material in the keychain vault — either no vault item (`Ok(false)`) OR the
+    // vault write failed (`Err`). In BOTH states, `load_fleet_keytree` prefers
+    // the keychain vault over the file, so a stale vault value would SHADOW the
+    // fresh file we are about to write (e.g. re-pair with new material under a
+    // transient keychain-write failure). We best-effort clear the vault slot
+    // after a successful file write (below). Mirrors `save_secret`'s
+    // `fell_through_to_enc` intent (ZEB-492 Qodo/CodeAnt round 1, FIX C).
+    let mut fell_through_to_enc = false;
     if keychain.is_some() {
         match crate::identity::vault_save_fleet_keytree(material) {
             Ok(true) => return Ok(()),
             // No keychain vault item (keychain-less seed) — fall through to file.
-            Ok(false) => {}
+            Ok(false) => fell_through_to_enc = true,
             Err(e) => {
                 let msg = format!("vault fleet-keytree write: {e}");
                 tracing::warn!("{msg}; falling through to file");
                 keychain_err = Some(msg);
+                fell_through_to_enc = true;
             }
         }
     }
@@ -1039,6 +1049,21 @@ pub(crate) fn save_fleet_keytree(
     );
     let path = identity_dir.join(FLEET_KEYTREE_FILENAME);
     write_atomic_0600(&path, &blob).map_err(|e| format!("write {}: {e}", path.display()))?;
+    // The material now lives durably in the encrypted file. Since we fell through
+    // to it (no vault item, or an unreadable/failed-write one), best-effort CLEAR
+    // any stale keychain vault fleet-keytree slot so a later `load_fleet_keytree`
+    // (which prefers the vault) cannot return STALE material and ignore the fresh
+    // file. Only after the file write succeeds (no data loss on a failed write).
+    // Best-effort: a clear failure is logged, not fatal — on a locked keychain it
+    // can't clear, but it also can't read (vault_load_fleet_keytree propagates
+    // that Err), so the stale-shadow window is bounded by the keychain itself.
+    if fell_through_to_enc {
+        if let Err(e) = crate::identity::vault_clear_fleet_keytree() {
+            tracing::warn!(
+                "could not clear stale keychain fleet-keytree slot after encrypted-file save: {e}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1081,16 +1106,35 @@ pub(crate) fn load_fleet_keytree(
     keychain: &Option<KeychainStore>,
     identity_dir: &Path,
 ) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+    // Mirror load_secret's keychain-error preservation (ZEB-492 Qodo/CodeAnt
+    // round 1, FIX B): a locked/unreadable keychain must NOT be masked as
+    // "genuinely no material" — that would silently boot a cert-only device with
+    // no fleet engines. Capture the read error, try the file fallback, and
+    // surface the keychain error only if no file fallback is usable.
+    let mut keychain_err: Option<String> = None;
     if keychain.is_some() {
         match crate::identity::vault_load_fleet_keytree() {
             Ok(Some(v)) => return Ok(Some(v)),
+            // Genuine absence in the vault — fall through to the file.
             Ok(None) => {}
-            Err(e) => tracing::warn!("vault fleet-keytree read: {e}; trying file fallback"),
+            Err(e) => {
+                let msg = format!("vault fleet-keytree read: {e}");
+                tracing::warn!("{msg}; trying file fallback");
+                keychain_err = Some(msg);
+            }
         }
     }
     let path = identity_dir.join(FLEET_KEYTREE_FILENAME);
     if !path.exists() {
-        return Ok(None);
+        // No file fallback. If the keychain READ failed earlier (locked /
+        // permission denied / corrupt vault), surface it — otherwise the boot
+        // gate would misclassify an unreadable keychain as "no fleet material"
+        // and silently build no fleet engines. Genuine absence (Ok(None) from
+        // the vault + no file) still returns Ok(None).
+        return match keychain_err {
+            Some(e) => Err(e),
+            None => Ok(None),
+        };
     }
     let passphrase = crate::identity::resolve_passphrase_env()
         .map_err(|e| format!("fleet-keytree fallback: {e}"))?
@@ -1167,6 +1211,27 @@ mod persistence_tests {
         std::fs::write(&path, b"not a valid v0x02 envelope at all").unwrap();
         let err = load_fleet_keytree(&None, dir.path())
             .expect_err("corrupt fleet_keytree.enc must error");
+        assert!(
+            err.contains("decrypt") && err.contains(FLEET_KEYTREE_FILENAME),
+            "error must name the decrypt failure + file, got: {err}"
+        );
+    }
+
+    /// ZEB-492 (Qodo/CodeAnt round 1, FIX A): a TRUNCATED `fleet_keytree.enc`
+    /// (shorter than the envelope header) routed through `load_fleet_keytree`
+    /// must surface as an Err — NOT a panic. The prior corrupt-file test used a
+    /// long-enough buffer that failed at the AEAD step; this SHORT-input case
+    /// exercises the `MIN_LEN`/header out-of-bounds guard added to
+    /// `decrypt_vault_bytes`. 20 bytes is below the envelope minimum.
+    #[test]
+    #[serial]
+    fn fleet_keytree_short_file_errors_not_panics() {
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pass-zeb492d");
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(FLEET_KEYTREE_FILENAME);
+        std::fs::write(&path, [0u8; 20]).unwrap();
+        let err = load_fleet_keytree(&None, dir.path())
+            .expect_err("a 20-byte fleet_keytree.enc must error, not panic");
         assert!(
             err.contains("decrypt") && err.contains(FLEET_KEYTREE_FILENAME),
             "error must name the decrypt failure + file, got: {err}"

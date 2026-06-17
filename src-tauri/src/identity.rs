@@ -550,6 +550,46 @@ mod vault_tests {
         assert!(back.fleet_keytree().is_none());
     }
 
+    /// ZEB-492 (Qodo/CodeAnt round 1, FIX A): `decrypt_vault_bytes` is reachable
+    /// directly from the owner-state fleet-keytree file fallback, so a
+    /// truncated/garbage `fleet_keytree.enc` routed through it must return `Err`
+    /// — NOT panic out-of-bounds (which `decrypt_v2_plaintext`'s unchecked
+    /// `bytes[5]`/header indexing would do). 20 bytes is below `MIN_LEN`.
+    #[test]
+    fn decrypt_vault_bytes_short_input_errors_not_panics() {
+        let err = decrypt_vault_bytes(b"some-pass", &[0u8; 20])
+            .expect_err("a 20-byte buffer is below MIN_LEN and must error");
+        assert!(
+            err.contains("below the") && err.contains("minimum"),
+            "short input must surface the MIN_LEN guard, got: {err}"
+        );
+    }
+
+    /// Companion to the short-input guard: a buffer that clears `MIN_LEN` but
+    /// carries the wrong magic must also error (not reach the v2 decryptor with
+    /// a non-v0x02 layout).
+    #[test]
+    fn decrypt_vault_bytes_bad_magic_errors() {
+        let err =
+            decrypt_vault_bytes(b"some-pass", &[0u8; 128]).expect_err("wrong magic must error");
+        assert!(
+            err.contains("unrecognized format"),
+            "bad magic must surface the format guard, got: {err}"
+        );
+    }
+
+    /// A valid `encrypt_vault_bytes` envelope still round-trips through the
+    /// guarded `decrypt_vault_bytes` (the new pre-checks don't reject good
+    /// input).
+    #[test]
+    fn decrypt_vault_bytes_round_trips_valid_envelope() {
+        let pass = b"round-trip-pass";
+        let plaintext = vec![0xABu8; 161];
+        let blob = encrypt_vault_bytes(pass, &plaintext);
+        let back = decrypt_vault_bytes(pass, &blob).expect("decrypt valid envelope");
+        assert_eq!(back.as_slice(), plaintext.as_slice());
+    }
+
     #[test]
     fn seed_only_vault_exceeds_legacy_32_bytes() {
         // Legacy-item detection relies on: a raw seed is exactly 32 bytes, while
@@ -1358,13 +1398,44 @@ pub(crate) fn encrypt_vault_bytes(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8
 }
 
 /// Decrypt an HRMI `v0x02` variable-length envelope produced by
-/// [`encrypt_vault_bytes`] back to its plaintext. Thin `pub(crate)` wrapper
-/// over [`decrypt_v2_plaintext`]; the returned buffer holds key material and is
-/// `Zeroizing`.
+/// [`encrypt_vault_bytes`] back to its plaintext. The returned buffer holds key
+/// material and is `Zeroizing`.
+///
+/// `decrypt_v2_plaintext` indexes `bytes[5]` and fixed header offsets WITHOUT a
+/// length check — it relies on its in-module caller [`decrypt_vault`] having
+/// first done the `bytes.len() < MIN_LEN` guard + `ENC_MAGIC` + version checks.
+/// This wrapper is reachable directly from the owner-state fleet-keytree file
+/// fallback, so it MUST replay those same pre-checks itself; otherwise a
+/// truncated/garbage `fleet_keytree.enc` (e.g. 20 bytes) would PANIC
+/// (out-of-bounds) instead of returning an Err, crashing boot. Mirrors
+/// [`decrypt_vault`]'s guards exactly (same `MIN_LEN`/`ENC_MAGIC` constants and
+/// indistinguishable error messages).
 pub(crate) fn decrypt_vault_bytes(
     passphrase: &[u8],
     bytes: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, String> {
+    const MIN_LEN: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + TAG_LEN;
+    if bytes.len() < MIN_LEN {
+        return Err(format!(
+            "identity store is corrupt: {} bytes is below the {MIN_LEN}-byte minimum",
+            bytes.len()
+        ));
+    }
+    if &bytes[0..4] != ENC_MAGIC {
+        return Err(format!(
+            "identity store is in an unrecognized format (magic={:?}) — this build may be too old",
+            &bytes[0..4]
+        ));
+    }
+    // `encrypt_vault_bytes` only ever produces the v0x02 variable-length
+    // envelope, so reject anything else before delegating to the v2 decryptor
+    // (which assumes a v0x02 layout).
+    if bytes[4] != ENC_FORMAT_VERSION_V2 {
+        return Err(format!(
+            "identity store is in an unrecognized format (version={:#04x}) — this build may be too old",
+            bytes[4]
+        ));
+    }
     decrypt_v2_plaintext(passphrase, bytes)
 }
 
@@ -1766,7 +1837,14 @@ fn vault_clear_slot_with_store(
 // per-item entry to fold in or delete.
 
 /// Read the distributed fleet KeyTree material from the keychain vault.
-/// `Ok(None)` when there is no vault item, or the vault has no fleet KeyTree.
+/// `Ok(None)` ONLY for genuine absence — no vault item, or a vault item that
+/// carries no fleet KeyTree. An unreadable/locked vault propagates `Err` so the
+/// caller can distinguish "no material" from "couldn't read the keychain" and
+/// surface an actionable error rather than silently booting a cert-only device
+/// with no fleet engines (ZEB-492 Qodo/CodeAnt round 1, FIX B). Mirrors the
+/// error-surfacing contract of `load_secret`/`vault_load_slot` (the slot
+/// accessors degrade to a legacy item; this brand-new slot has none, so the
+/// only faithful "couldn't read" signal is to propagate the `Err`).
 /// The returned buffer holds key material and is wrapped in `Zeroizing`.
 pub fn vault_load_fleet_keytree() -> Result<Option<Zeroizing<Vec<u8>>>, String> {
     vault_load_fleet_keytree_with_store(&KeychainStore::new()?)
@@ -1778,18 +1856,20 @@ fn vault_load_fleet_keytree_with_store(
     let _vault_guard = vault_rmw_guard();
     let vault = match store.load_vault() {
         Ok(Some(v)) => v,
-        // No vault item — nothing to read. (No legacy fallback: this slot is new.)
+        // No vault item — genuine absence. (No legacy fallback: this slot is new.)
         Ok(None) => return Ok(None),
-        // Unreadable vault (corrupt / unknown-version): leave it intact and report
-        // absent, mirroring the slot accessors which never overwrite a corrupt item.
+        // Unreadable vault (corrupt / locked / unknown-version): leave it intact
+        // and PROPAGATE the error. Reporting `Ok(None)` here would be
+        // indistinguishable from genuine absence, so a locked keychain would let
+        // a cert-only device boot with no fleet engines and no signal. The caller
+        // (`owner_state::load_fleet_keytree`) captures this and only swallows it
+        // if the encrypted-file fallback also has nothing usable.
         Err(e) => {
-            tracing::warn!(
-                "keychain vault unreadable ({e}); treating the fleet KeyTree as absent and \
-                 leaving the vault intact"
-            );
-            return Ok(None);
+            tracing::warn!("keychain vault unreadable ({e}); leaving the vault intact");
+            return Err(e);
         }
     };
+    // Vault read fine but carries no fleet KeyTree → genuine absence.
     Ok(vault.fleet_keytree().map(|b| Zeroizing::new(b.to_vec())))
 }
 

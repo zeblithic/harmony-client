@@ -3740,10 +3740,21 @@ pub async fn start_node_inner(
                                 .map_err(|e| format!("KeyTree::derive: {e}"))?,
                         ))
                     } else {
-                        loaded.fleet_keytree.as_ref().map(|material| {
-                            std::sync::Arc::new(
-                                crate::owner_state_crypto::KeyTree::from_fleet_material(material),
-                            )
+                        // ZEB-492 (Qodo/CodeAnt round 1, FIX E): `from_fleet_material`
+                        // is now fallible (rejects corrupt/future-epoch material). A
+                        // rejection is a graceful no-fleet boot, NOT a hard boot
+                        // failure — keep the seed-first precedence and degrade like
+                        // the "no material at all" case rather than crashing.
+                        loaded.fleet_keytree.as_ref().and_then(|material| {
+                            match crate::owner_state_crypto::KeyTree::from_fleet_material(material) {
+                                Ok(kt) => Some(std::sync::Arc::new(kt)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "fleet KeyTree unusable ({e}); booting without fleet engines"
+                                    );
+                                    None
+                                }
+                            }
                         })
                     }
                 }

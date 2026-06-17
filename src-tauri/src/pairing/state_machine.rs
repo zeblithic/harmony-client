@@ -820,6 +820,12 @@ async fn maybe_advance_to_enroll(
         joiner_advisory_display_name: ctx.selected_peer_display_name.clone().unwrap_or_default(),
         fleet_keytree_cbor_hex,
     };
+    // ZEB-492 (Qodo/CodeAnt round 1, FIX F): the serialized payload `pt` holds
+    // the fleet KeyTree key material (hex of the `Zeroizing` CBOR buffer) in a
+    // plain `Vec<u8>`. Zeroize it once `session_encrypt` has consumed it so the
+    // raw key bytes don't linger in the heap after pairing. (The cert/owner_state
+    // hex in the same payload is the pre-existing pairing-plaintext posture,
+    // tracked separately; this wipe scrubs those bytes too as a bonus.)
     let mut pt = Vec::new();
     if let Err(e) = ciborium::into_writer(&payload, &mut pt) {
         let _ = state_tx.send(PairingState::Failed {
@@ -829,8 +835,14 @@ async fn maybe_advance_to_enroll(
     }
     let session_key = ctx.session_key.expect("session key after handshake");
     let (nonce, ct) = match session_encrypt(&session_key, &pt) {
-        Ok(p) => p,
+        Ok(p) => {
+            use zeroize::Zeroize;
+            pt.zeroize();
+            p
+        }
         Err(e) => {
+            use zeroize::Zeroize;
+            pt.zeroize();
             let _ = state_tx.send(PairingState::Failed {
                 reason: format!("encrypt enroll: {e}"),
             });
@@ -1065,7 +1077,10 @@ async fn handle_wire_message(
                     return;
                 }
             };
-            let pt = match session_decrypt(&session_key, &nonce, &ct) {
+            // ZEB-492 (Qodo/CodeAnt round 1, FIX F): the decrypted `pt` holds the
+            // inviter's sealed fleet KeyTree key material. Zeroize it once the CBOR
+            // decode has consumed it so the raw key bytes don't linger in the heap.
+            let mut pt = match session_decrypt(&session_key, &nonce, &ct) {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = state_tx.send(PairingState::Failed {
@@ -1075,8 +1090,14 @@ async fn handle_wire_message(
                 }
             };
             let payload: EncryptedPayload = match ciborium::from_reader(pt.as_slice()) {
-                Ok(p) => p,
+                Ok(p) => {
+                    use zeroize::Zeroize;
+                    pt.zeroize();
+                    p
+                }
                 Err(e) => {
+                    use zeroize::Zeroize;
+                    pt.zeroize();
                     let _ = state_tx.send(PairingState::Failed {
                         reason: format!("payload decode: {e}"),
                     });
@@ -1280,7 +1301,12 @@ async fn on_encrypted_payload(
             // with no fleet engines and no signal that it should have had them).
             let fleet_keytree = match fleet_keytree_cbor_hex {
                 Some(hexs) => {
-                    let bytes = match hex::decode(&hexs) {
+                    // ZEB-492 (Qodo/CodeAnt round 1, FIX F): the hex-decoded `bytes`
+                    // are the raw CBOR of the fleet KeyTree key material. Zeroize
+                    // them once the CBOR decode has consumed them (the decoded
+                    // `FleetKeyMaterial` is `ZeroizeOnDrop`, so the key bytes stay
+                    // protected from here on).
+                    let mut bytes = match hex::decode(&hexs) {
                         Ok(b) => b,
                         Err(e) => {
                             let _ = state_tx.send(PairingState::Failed {
@@ -1289,9 +1315,15 @@ async fn on_encrypted_payload(
                             return;
                         }
                     };
-                    match ciborium::from_reader::<crate::owner_state_crypto::FleetKeyMaterial, _>(
-                        bytes.as_slice(),
-                    ) {
+                    let decoded = ciborium::from_reader::<
+                        crate::owner_state_crypto::FleetKeyMaterial,
+                        _,
+                    >(bytes.as_slice());
+                    {
+                        use zeroize::Zeroize;
+                        bytes.zeroize();
+                    }
+                    match decoded {
                         Ok(m) => Some(m),
                         Err(e) => {
                             let _ = state_tx.send(PairingState::Failed {

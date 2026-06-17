@@ -94,6 +94,10 @@ pub enum CryptoError {
     Rng(String),
     #[error("Replay rejected: at HLC not strictly newer than last accepted from device {0}")]
     ReplayRejected(String),
+    #[error(
+        "unsupported fleet KeyTree epoch {0}: only epoch 0 is supported (rotation is out of scope)"
+    )]
+    UnsupportedEpoch(u32),
 }
 
 /// Salt versioning: bump `v1` if the encryption scheme itself changes;
@@ -175,14 +179,25 @@ impl KeyTree {
     /// Reconstruct a KeyTree from distributed material (cert-only device, which
     /// has no master seed to re-derive from). Produces a KeyTree byte-identical
     /// to the originating seed-holder's.
-    pub fn from_fleet_material(m: &FleetKeyMaterial) -> Self {
-        Self {
+    ///
+    /// Fallible (ZEB-492 Qodo/CodeAnt round 1, FIX E): rejects unsupported
+    /// material at the cert-only boot boundary so corrupt/future-version material
+    /// can't be silently accepted. Today only `epoch == 0` is supported (KeyTree
+    /// rotation is out of scope — see the ZEB-492 spec); a non-zero epoch returns
+    /// [`CryptoError::UnsupportedEpoch`] so the boot gate can fall back to no
+    /// fleet engines rather than building a KeyTree from material it can't
+    /// interpret.
+    pub fn from_fleet_material(m: &FleetKeyMaterial) -> Result<Self, CryptoError> {
+        if m.epoch != 0 {
+            return Err(CryptoError::UnsupportedEpoch(m.epoch));
+        }
+        Ok(Self {
             entry_aead: Zeroizing::new(m.entry_aead),
             root_aead: Zeroizing::new(m.root_aead),
             lookup: Zeroizing::new(m.lookup),
             nonce: Zeroizing::new(m.nonce),
             friend_aead: Zeroizing::new(m.friend_aead),
-        }
+        })
     }
 }
 
@@ -1067,7 +1082,7 @@ mod tests {
         let kt = KeyTree::derive(&seed).unwrap();
         let material = kt.to_fleet_material(0);
         assert_eq!(material.epoch, 0);
-        let kt2 = KeyTree::from_fleet_material(&material);
+        let kt2 = KeyTree::from_fleet_material(&material).unwrap();
         let lk1 = space_lookup_key(&kt, b"notes-v1");
         let lk2 = space_lookup_key(&kt2, b"notes-v1");
         assert_eq!(lk1.as_slice(), lk2.as_slice());
@@ -1096,7 +1111,7 @@ mod tests {
         let mut buf = Vec::new();
         ciborium::into_writer(&m, &mut buf).unwrap();
         let back: FleetKeyMaterial = ciborium::from_reader(buf.as_slice()).unwrap();
-        let kt_back = KeyTree::from_fleet_material(&back);
+        let kt_back = KeyTree::from_fleet_material(&back).unwrap();
         let lk = space_lookup_key(&kt, b"x");
         let ct = encrypt_entry(&kt, &lk, b"z").unwrap();
         assert_eq!(decrypt_entry(&kt_back, &lk, &ct).unwrap(), b"z");
@@ -1108,8 +1123,26 @@ mod tests {
         let kt_b = KeyTree::derive(&[2u8; 32]).unwrap();
         let lk = space_lookup_key(&kt_a, b"notes-v1");
         let ct = encrypt_entry(&kt_a, &lk, b"secret").unwrap();
-        let kt_b2 = KeyTree::from_fleet_material(&kt_b.to_fleet_material(0));
+        let kt_b2 = KeyTree::from_fleet_material(&kt_b.to_fleet_material(0)).unwrap();
         let lk_b = space_lookup_key(&kt_b2, b"notes-v1");
         assert!(decrypt_entry(&kt_b2, &lk_b, &ct).is_err());
+    }
+
+    /// ZEB-492 (Qodo/CodeAnt round 1, FIX E): material from an unsupported
+    /// (future) epoch must be REJECTED at the cert-only boot boundary, not
+    /// silently reconstructed. Only epoch 0 is supported today (rotation is out
+    /// of scope).
+    #[test]
+    fn fleet_material_unsupported_epoch_rejected() {
+        let kt = KeyTree::derive(&[0x42u8; 32]).unwrap();
+        let material = kt.to_fleet_material(1);
+        assert_eq!(material.epoch, 1);
+        // `KeyTree` deliberately has no `Debug` (key material), so `expect_err`
+        // (which formats the Ok value) won't compile — match on the result.
+        match KeyTree::from_fleet_material(&material) {
+            Err(CryptoError::UnsupportedEpoch(1)) => {}
+            Err(other) => panic!("expected UnsupportedEpoch(1), got: {other}"),
+            Ok(_) => panic!("epoch 1 material must be rejected, not reconstructed"),
+        }
     }
 }

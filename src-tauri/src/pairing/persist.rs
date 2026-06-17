@@ -58,21 +58,23 @@ pub fn install_joiner_state_inner(
         .lock()
         .unwrap_or_else(|p| p.into_inner());
 
-    crate::owner_state::save_owner_state_atomic(
-        identity_dir,
-        &result.owner_state,
-        &result.our_signing_key,
-        None, // no master_seed on Joiner — clears any stale prior seed
-        keychain,
-    )?;
-
-    // ZEB-492: persist the fleet KeyTree the inviter sealed to us so this
-    // cert-only device can build the fleet engines + act as a butler on next
-    // boot. Only after the owner state + device key are durable. When the
-    // inviter sent NO material (pre-ZEB-492 inviter), defensively CLEAR any
-    // stale `fleet_keytree.enc`/vault slot from a prior identity so it can't
-    // masquerade as this device's KeyTree (mirrors save_owner_state_atomic's
-    // master_seed == None clear).
+    // ZEB-492 (Qodo/CodeAnt round 1, FIX D): persist the fleet KeyTree FIRST,
+    // BEFORE the owner_state + device-key commit. The earlier order (owner_state
+    // first, fleet second) left a partial commit on a fleet-persist failure: the
+    // device booted "paired but with no fleet material." With the fleet block
+    // first:
+    //   - a fleet-persist failure aborts BEFORE any owner_state.cbor / device-key
+    //     write, leaving the device unchanged (clean abort); and
+    //   - an owner_state failure after the fleet write leaves at most a harmless
+    //     orphan `fleet_keytree.enc` — with no owner_state.cbor, `load_owner_state`
+    //     returns `None`, so the orphan is ignored and overwritten on the next
+    //     successful install.
+    // The inviter sealed this so the cert-only device can build the fleet engines
+    // + act as a butler on next boot. When the inviter sent NO material
+    // (pre-ZEB-492 inviter), defensively CLEAR any stale `fleet_keytree.enc`/vault
+    // slot from a prior identity so it can't masquerade as this device's KeyTree
+    // (mirrors save_owner_state_atomic's master_seed == None clear). Runs inside
+    // the held OWNER_STATE_WRITE_LOCK, same as the owner_state write below.
     match result.fleet_keytree.as_ref() {
         Some(material) => {
             let mut buf = zeroize::Zeroizing::new(Vec::new());
@@ -84,6 +86,14 @@ pub fn install_joiner_state_inner(
             crate::owner_state::clear_fleet_keytree(&fleet_keychain, identity_dir)?;
         }
     }
+
+    crate::owner_state::save_owner_state_atomic(
+        identity_dir,
+        &result.owner_state,
+        &result.our_signing_key,
+        None, // no master_seed on Joiner — clears any stale prior seed
+        keychain,
+    )?;
     Ok(())
 }
 
@@ -283,7 +293,7 @@ mod tests {
             .expect("fleet keytree present after install");
         let m: crate::owner_state_crypto::FleetKeyMaterial =
             ciborium::from_reader(loaded.as_slice()).unwrap();
-        let kt2 = KeyTree::from_fleet_material(&m);
+        let kt2 = KeyTree::from_fleet_material(&m).unwrap();
         let lk2 = space_lookup_key(&kt2, b"dm-inbox-v1");
         assert_eq!(
             decrypt_entry(&kt2, &lk2, &ciphertext).unwrap(),
