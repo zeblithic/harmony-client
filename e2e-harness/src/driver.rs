@@ -591,6 +591,116 @@ pub async fn get_butler_held(node: &NodeHandle) -> anyhow::Result<Vec<Value>> {
     Ok(held.clone())
 }
 
+/// ZEB-490: drive the real ZEB-446 SAS pairing handshake between two local
+/// nodes until the joiner is enrolled into the inviter's fleet. Returns the
+/// joiner's 64-hex ed25519 verify key — the device id `set_butler_pin` expects.
+///
+/// Mutual-selection contract (state_machine `maybe_advance_to_handshake`
+/// requires `sent_select && received_select`): both sides SelectPeer each other.
+/// Each `poll_until` gets the full `deadline` budget independently (matches the
+/// existing per-step budgeting in s6). Returns `Err` on any timeout so the
+/// caller's boundary-1 characterize fallback can fire instead of panicking.
+pub async fn pair_into_fleet(
+    inviter: &NodeHandle,
+    joiner: &NodeHandle,
+    display: &str,
+    deadline: Duration,
+) -> anyhow::Result<String> {
+    start_inviter_pairing(inviter, &format!("{display}-P")).await?;
+    start_joiner_pairing(joiner, &format!("{display}-B2")).await?;
+
+    // Inviter discovers the joiner; capture the joiner's session id + its
+    // ed25519 verify key (the pin device id). Both sides keep broadcasting
+    // DISCOVER until they SelectPeer, so polling them sequentially here (before
+    // any select) still lets both discover each other.
+    let (joiner_session, joiner_vk) = poll_until(deadline, || async {
+        let st = get_pairing_state(inviter).await?;
+        if st.get("kind").and_then(Value::as_str) != Some("discovered") {
+            return Ok(None);
+        }
+        let Some(peer) = st
+            .get("peers")
+            .and_then(Value::as_array)
+            .and_then(|ps| {
+                ps.iter()
+                    .find(|p| p.get("role").and_then(Value::as_str) == Some("joiner"))
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        match (
+            peer.get("sessionId").and_then(Value::as_str),
+            peer.get("joinerEd25519VerifyHex").and_then(Value::as_str),
+        ) {
+            (Some(sid), Some(vk)) => Ok(Some((sid.to_string(), vk.to_string()))),
+            _ => Ok(None),
+        }
+    })
+    .await?;
+
+    // Joiner discovers the inviter; capture the inviter's session id.
+    let inviter_session = poll_until(deadline, || async {
+        let st = get_pairing_state(joiner).await?;
+        if st.get("kind").and_then(Value::as_str) != Some("discovered") {
+            return Ok(None);
+        }
+        Ok(st
+            .get("peers")
+            .and_then(Value::as_array)
+            .and_then(|ps| {
+                ps.iter()
+                    .find(|p| p.get("role").and_then(Value::as_str) == Some("inviter"))
+            })
+            .and_then(|p| p.get("sessionId").and_then(Value::as_str))
+            .map(str::to_string))
+    })
+    .await?;
+
+    // Mutual select.
+    select_pairing_peer(inviter, &joiner_session).await?;
+    select_pairing_peer(joiner, &inviter_session).await?;
+
+    // Both derive SAS; assert the codes match (the real security property).
+    let inviter_sas = poll_pairing_sas(inviter, deadline).await?;
+    let joiner_sas = poll_pairing_sas(joiner, deadline).await?;
+    assert_sas_match(&inviter_sas, &joiner_sas)?;
+
+    // Both confirm; the inviter signs the EnrollmentCert.
+    confirm_pairing_sas(inviter).await?;
+    confirm_pairing_sas(joiner).await?;
+
+    // Both reach Complete (joiner now enrolled in the inviter's fleet).
+    poll_pairing_complete(inviter, deadline).await?;
+    poll_pairing_complete(joiner, deadline).await?;
+
+    Ok(joiner_vk)
+}
+
+/// Poll a node until it is `Handshaking`, returning its 6-digit `sasDigits`.
+async fn poll_pairing_sas(node: &NodeHandle, deadline: Duration) -> anyhow::Result<String> {
+    poll_until(deadline, || async {
+        let st = get_pairing_state(node).await?;
+        if st.get("kind").and_then(Value::as_str) != Some("handshaking") {
+            return Ok(None);
+        }
+        Ok(st
+            .get("sasDigits")
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    })
+    .await
+}
+
+/// Poll a node until it reaches `Complete` (enrollment finished).
+async fn poll_pairing_complete(node: &NodeHandle, deadline: Duration) -> anyhow::Result<()> {
+    poll_until(deadline, || async {
+        let st = get_pairing_state(node).await?;
+        Ok((st.get("kind").and_then(Value::as_str) == Some("complete")).then_some(()))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::assert_sas_match;
