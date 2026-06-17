@@ -23,12 +23,15 @@ pub struct ButlerHeldResponse {
     pub held: Vec<ButlerHeldEntryDto>,
 }
 
-/// ZEB-489: status of this fleet's pinned butler device.
+/// ZEB-489: status of this fleet's pinned butler device. `pinned_at_ms` is
+/// `Some` only when a butler is actually pinned — a never-set/cleared pin has a
+/// sentinel HLC (`wall_ms == 0`) that would otherwise read as a bogus 1970
+/// timestamp, so it is reported as `None` rather than `0`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ButlerPinStatus {
     pub pinned_device_id: Option<String>,
-    pub pinned_at_ms: u64,
+    pub pinned_at_ms: Option<u64>,
 }
 
 /// Map the butler dm-inbox doc into DTOs. Pure (no NodeState / no I/O) so it is
@@ -39,10 +42,13 @@ pub fn map_butler_held(doc: &DmInboxDoc) -> Vec<ButlerHeldEntryDto> {
         .map(|(key, e)| {
             // key = "{space_id_hex}:{message_cid_hex}" (DmInboxDoc::key). Both
             // halves are pure hex, so the FIRST ':' is the unambiguous separator.
+            // A key with no ':' can't arise from DmInboxDoc::key, but a corrupted
+            // replica could merge one in — surface the entry with EMPTY ids
+            // rather than mis-presenting the raw key as a space id (Qodo).
             let (space_id_hex, message_cid_hex) = key
                 .split_once(':')
                 .map(|(s, c)| (s.to_string(), c.to_string()))
-                .unwrap_or_else(|| (key.clone(), String::new()));
+                .unwrap_or_default();
             ButlerHeldEntryDto {
                 sender_owner_hex: hex::encode(e.sender_owner),
                 space_id_hex,
@@ -119,5 +125,19 @@ mod tests {
         assert!(d2.ingested_by_devices.is_empty());
 
         assert!(map_butler_held(&DmInboxDoc::default()).is_empty());
+    }
+
+    #[test]
+    fn malformed_key_without_colon_yields_empty_ids() {
+        let mut doc = DmInboxDoc::default();
+        doc.entries
+            .insert("no-colon-here".to_string(), entry(0x55, "butlerdev", &[]));
+        let held = map_butler_held(&doc);
+        assert_eq!(held.len(), 1);
+        // Surfaced (a held blob exists) but with clearly-empty ids rather than
+        // the raw key mis-presented as a space id.
+        assert_eq!(held[0].space_id_hex, "");
+        assert_eq!(held[0].message_cid_hex, "");
+        assert_eq!(held[0].sender_owner_hex, hex::encode([0x55u8; 16]));
     }
 }

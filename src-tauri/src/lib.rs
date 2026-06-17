@@ -43943,7 +43943,12 @@ pub(crate) async fn get_butler_pin_impl(
     };
     let (pinned_device_id, pinned_at_ms) = {
         let g = doc.lock().await;
-        (g.pinned.clone(), g.pinned_at.wall_ms)
+        let pinned = g.pinned.clone();
+        // Report the stamp only when a butler is actually pinned — a never-set
+        // (or cleared) pin has a sentinel HLC whose wall_ms=0 would read as a
+        // bogus 1970 timestamp in the headless response (Qodo).
+        let at = pinned.as_ref().map(|_| g.pinned_at.wall_ms);
+        (pinned, at)
     };
     Ok(crate::butler_held_dto::ButlerPinStatus {
         pinned_device_id,
