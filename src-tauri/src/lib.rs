@@ -8821,25 +8821,40 @@ pub async fn start_node_inner(
                 if let Some(mut rx) = pairing_handle.inviter_result_rx.take() {
                     let id_dir = identity_dir.clone();
                     tokio::spawn(async move {
-                        while let Some(result) = rx.recv().await {
+                        // ZEB-491: each handoff carries a oneshot `persisted_ack`.
+                        // We persist on the blocking pool, then fire the ack so the
+                        // state machine only advances to `Complete` AFTER
+                        // `owner_state.cbor` is durably on disk. Previously the SM
+                        // reported `Complete` the instant the result was enqueued
+                        // here, with no happens-before edge to durability — a fast
+                        // restart could lose the enrollment.
+                        while let Some(handoff) = rx.recv().await {
                             let id_dir = id_dir.clone();
                             let outcome = tokio::task::spawn_blocking(move || {
-                                crate::pairing::persist::install_inviter_state(&id_dir, result)
+                                crate::pairing::persist::install_inviter_state(
+                                    &id_dir,
+                                    handoff.result,
+                                )
                             })
                             .await;
-                            match outcome {
+                            let ack = match outcome {
                                 Ok(Ok(())) => {
                                     tracing::info!("inviter pairing persisted successfully");
+                                    Ok(())
                                 }
                                 Ok(Err(e)) => {
                                     tracing::error!(
                                         "failed to persist inviter pairing result: {e}"
                                     );
+                                    Err(e)
                                 }
                                 Err(e) => {
                                     tracing::error!("inviter persist task join failed: {e}");
+                                    Err(format!("persist task join failed: {e}"))
                                 }
-                            }
+                            };
+                            // If the SM is gone the ack just drops — harmless.
+                            let _ = handoff.persisted_ack.send(ack);
                         }
                     });
                 }
