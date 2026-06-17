@@ -130,7 +130,9 @@ pub mod community_relay_publisher;
 pub mod community_relay_pull;
 pub mod community_relay_pull_driver;
 pub mod community_relay_resolver;
+// ZEB-487: read-only DTO + mapper for the headless `get_relay_held` RPC.
 pub mod community_state_crdt;
+pub mod relay_held_dto;
 // ZEB-458 P4 Phase B: on-disk persistence for the two relay fleet datasets.
 pub mod community_state_persist;
 pub mod community_state_sync;
@@ -43936,17 +43938,18 @@ pub(crate) async fn set_community_relay_opt_in_inner(
     Ok(())
 }
 
-/// ZEB-458 P4 Phase B (D43): IPC to opt this owner's fleet in (or out) of
-/// volunteering as a community relay for `community_id_hex`. Writes through the
-/// relay-optin fleet-sync doc (LWW-correct stamp), notifies + flushes the
-/// engine so siblings learn the change, and wakes the community-relay announce
-/// publisher (a harmless no-op until T11b spawns it). Flush errors are
-/// log-warn only — the dirty latch retries on the next cycle.
-#[tauri::command]
-async fn set_community_relay_opt_in(
+/// ZEB-458 P4 / ZEB-487: NodeState-level core of `set_community_relay_opt_in`,
+/// shared by the GUI Tauri command and the headless RPC. Opts this owner's fleet
+/// in (or out) of volunteering as a community relay for `community_id_hex`:
+/// snapshots the relay-optin handles, writes through the relay-optin fleet-sync
+/// doc (LWW-correct stamp) via `_inner`, notifies + flushes the engine so
+/// siblings learn the change, and wakes the community-relay announce publisher
+/// (a harmless no-op until T11b spawns it). Flush errors are log-warn only — the
+/// dirty latch retries on the next cycle.
+pub(crate) async fn set_community_relay_opt_in_impl(
+    state: &Mutex<NodeState>,
     community_id_hex: String,
     opted_in: bool,
-    state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
     // Snapshot the handles needed from NodeState, then drop the lock before the
     // async doc-lock acquisition (mirrors set_butler_pin).
@@ -43999,12 +44002,25 @@ async fn set_community_relay_opt_in(
     Ok(())
 }
 
-/// ZEB-458 P4 Phase B (D43): read-only IPC reporting whether this owner's fleet
-/// is currently opted in to relaying for `community_id_hex`.
+/// ZEB-458 P4 Phase B (D43): IPC to opt this owner's fleet in (or out) of
+/// volunteering as a community relay for `community_id_hex`. Thin wrapper over
+/// `set_community_relay_opt_in_impl`.
 #[tauri::command]
-async fn get_community_relay_status(
+async fn set_community_relay_opt_in(
     community_id_hex: String,
+    opted_in: bool,
     state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    set_community_relay_opt_in_impl(state.inner(), community_id_hex, opted_in).await
+}
+
+/// ZEB-458 P4 / ZEB-487: NodeState-level core of `get_community_relay_status`,
+/// shared by the GUI Tauri command and the headless RPC. Read-only report of
+/// whether this owner's fleet is currently opted in to relaying for
+/// `community_id_hex`.
+pub(crate) async fn get_community_relay_status_impl(
+    state: &Mutex<NodeState>,
+    community_id_hex: String,
 ) -> Result<bool, String> {
     let community_id = crate::owner_state_types::SpaceId(parse_space_id_16(&community_id_hex)?);
     let doc = {
@@ -44017,6 +44033,46 @@ async fn get_community_relay_status(
     };
     let opted_in = doc.lock().await.is_opted_in(&community_id);
     Ok(opted_in)
+}
+
+/// ZEB-458 P4 Phase B (D43): read-only IPC reporting whether this owner's fleet
+/// is currently opted in to relaying for `community_id_hex`. Thin wrapper over
+/// `get_community_relay_status_impl`.
+#[tauri::command]
+async fn get_community_relay_status(
+    community_id_hex: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    get_community_relay_status_impl(state.inner(), community_id_hex).await
+}
+
+/// ZEB-487: read-only observability over the relay-hold doc. Reports the
+/// blobs this node (as a community relay) is holding for offline recipients,
+/// optionally filtered to one community. Sealed blobs are never opened.
+pub(crate) async fn get_relay_held_impl(
+    state: &Mutex<NodeState>,
+    community_id_hex: Option<String>,
+) -> Result<crate::relay_held_dto::RelayHeldResponse, String> {
+    let filter = match community_id_hex {
+        Some(h) => Some(crate::owner_state_types::SpaceId(parse_space_id_16(&h)?)),
+        None => None,
+    };
+    let doc = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.relay_hold_doc.clone().ok_or_else(|| {
+            "get_relay_held: relay-hold not running (node not started)".to_string()
+        })?
+    };
+    // Map directly from the guard — do NOT clone the whole RelayHoldDoc, which
+    // would deep-copy every entry's sealed_blob (bytes the DTO mapper ignores).
+    // The map is sync (no .await while the lock is held), so the hold is brief.
+    let held = {
+        let guard = doc.lock().await;
+        crate::relay_held_dto::map_relay_held(&guard, filter.as_ref())
+    };
+    Ok(crate::relay_held_dto::RelayHeldResponse { held })
 }
 
 pub fn run() {

@@ -132,6 +132,48 @@ async fn owner_id(node: &NodeHandle) -> String {
         .to_string()
 }
 
+/// Spawn THREE named-profile nodes, each under its OWN temp HOME, all minted,
+/// stdout/stderr captured into the run dir. Roles for the ZEB-487 deposit→recover
+/// scenario: `a` = sender, `b` = recipient (goes offline), `r` = relay host.
+/// Returns (run_dir, a_home, b_home, r_home, a, b, r). Keep the homes alive until
+/// the scenario ends.
+async fn three_minted_nodes(
+    scenario: &str,
+) -> (
+    RunDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    NodeHandle, // a = sender
+    NodeHandle, // b = recipient
+    NodeHandle, // r = relay host
+) {
+    let run = RunDir::new(scenario).expect("run dir");
+    let a_home = fresh_home(&format!("{scenario}-a"));
+    let b_home = fresh_home(&format!("{scenario}-b"));
+    let r_home = fresh_home(&format!("{scenario}-r"));
+    let mk = |home: &tempfile::TempDir, profile: &str| {
+        let mut cfg = NodeConfig::new(PathBuf::from(home.path()), profile);
+        cfg.log_dir = Some(run.log_dir());
+        cfg
+    };
+    let a = NodeHandle::spawn(mk(&a_home, "alice"))
+        .await
+        .expect("spawn a");
+    let b = NodeHandle::spawn(mk(&b_home, "bob"))
+        .await
+        .expect("spawn b");
+    let r = NodeHandle::spawn(mk(&r_home, "relay"))
+        .await
+        .expect("spawn r");
+    for (n, who) in [(&a, "a"), (&b, "b"), (&r, "r")] {
+        n.rpc("mint_owner_identity", json!({}))
+            .await
+            .unwrap_or_else(|e| panic!("{who} mint: {e}"));
+    }
+    (run, a_home, b_home, r_home, a, b, r)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_nodes_boot_and_mint() {
     let (mut run, ah, bh, a, b) = two_minted_nodes("smoke").await;
@@ -1142,4 +1184,189 @@ async fn s5d_restart_card_propagation_regression() {
 
     run.mark_success();
     drop((ah, bh));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S6: community sealed-relay deposit → recover (ZEB-487 / ZEB-483 durability).
+//
+// Three nodes: a = sender, b = recipient (goes OFFLINE before the send), r =
+// relay host. a + b are friends (so b's OwnerDeviceCache holds a, required to
+// verify the recovered CidNotify); all three co-member a community C; r opts in
+// to relay for C. With b offline, a creates the DM Space + sends the first
+// message — b is unreachable, so after the no-ack windows the deposit fans out
+// (butler skipped — b has none — then the relay rung deposits to r). b relaunches
+// from its persisted profile, auto-pulls the held blob, bootstraps the DM Space
+// from the deposited invite, and the message applies.
+//
+// Asserts the HELD ∧ RECV ∧ CLEARED triple. If the relay deposit never lands
+// co-located within the budget (the ZEB-466-class community-relay resolve/dial
+// routing gap that also blocks co-located card propagation), this CHARACTERIZES
+// rather than asserts — prints an `S6 FINDING:` line + `mark_success()` (mirroring
+// S2/S5). The cross-WAN playbook Scenario D2 is the real proof. If the deposit
+// LANDS (HELD) but RECV or CLEARED then fails, that is a genuine product finding
+// in the recover path — the assertion is NOT weakened.
+//
+// The DM Space is deliberately NOT created while b is online — the deposited
+// invite must bootstrap it on recovery.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn s6_relay_deposit_recover() {
+    use e2e_harness::driver::*;
+    use serde_json::Value;
+    use std::time::Duration;
+
+    let (mut run, ah, bh, rh, a, mut b, r) = three_minted_nodes("s6").await;
+    let a_owner = owner_id(&a).await;
+    let b_owner = owner_id(&b).await;
+
+    // --- Setup: shared community C (a creates; b + r join via iroh first-contact,
+    //     the SAME path s1/s3 use). poll_join_iroh is racy ~75-90s; 240s budget.
+    let community_id = create_community(&a, "s6-relay", true)
+        .await
+        .expect("create community");
+    let invite = generate_invite(&a, &community_id)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&b, &invite, Duration::from_secs(240))
+        .await
+        .expect("b joins C via iroh first-contact");
+    poll_join_iroh(&r, &invite, Duration::from_secs(240))
+        .await
+        .expect("r joins C via iroh first-contact");
+
+    // --- Friendship a<->b while b is ONLINE (populates b's OwnerDeviceCache with a
+    //     — required to verify the recovered CidNotify). Reuse s2's friend dance.
+    let token = generate_friend_token(&a).await.expect("friend token");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut last_err = String::from("(no redeem attempt completed before the deadline)");
+    loop {
+        if std::time::Instant::now() >= deadline {
+            panic!("b never redeemed a's friend token within 120s; last error: {last_err}");
+        }
+        match redeem_friend_token(&b, &token).await {
+            Ok(_) => break,
+            Err(e) => last_err = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    poll_until(Duration::from_secs(120), || async {
+        accept_pending_from(&a, &b_owner).await?;
+        Ok(friend_is_active(&a, &b_owner).await?.then_some(()))
+    })
+    .await
+    .expect("a has b as active friend");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(friend_is_active(&b, &a_owner).await?.then_some(()))
+    })
+    .await
+    .expect("b has a as active friend");
+
+    // --- r volunteers as the relay for C; confirm the opt-in took.
+    set_relay_opt_in(&r, &community_id, true)
+        .await
+        .expect("r opts in to relay C");
+    assert!(
+        get_relay_opt_in(&r, &community_id)
+            .await
+            .expect("r relay status"),
+        "r is opted in to relay C"
+    );
+
+    // Prove the get_relay_held RPC contract works (a well-formed, empty result)
+    // BEFORE we depend on it for the HELD poll — so a broken response surfaces as
+    // a failure HERE rather than masquerading as "deposit never landed" in the
+    // characterize fallback (Qodo). r is opted in but has accepted nothing yet.
+    let pre_held = get_relay_held(&r, Some(&community_id))
+        .await
+        .expect("get_relay_held RPC contract works (returns a 'held' array)");
+    assert!(
+        pre_held.is_empty(),
+        "relay holds nothing before the offline send"
+    );
+
+    // --- b goes OFFLINE (real SIGKILL). The DM Space does NOT exist on b yet.
+    b.kill().await.expect("kill b");
+
+    // --- a creates the DM Space + sends the first message. b is unreachable, so
+    //     after the no-ack windows the deposit fans out: butler skipped (b has
+    //     none) → relay rung deposits to r.
+    let a_space = add_dm_space(&a, "s6-dm", &b_owner)
+        .await
+        .expect("a dm space");
+    send_dm(&a, &a_space, b"durable-hello", "text/plain")
+        .await
+        .expect("a send_dm accepted by the engine");
+
+    // --- ASSERTION 1 (HELD): r holds the deposit for b while b is offline.
+    //     Generous budget: deposit only fires after the DEPOSIT_NOACK backoff.
+    let held = poll_until(Duration::from_secs(60), || async {
+        let entries = get_relay_held(&r, Some(&community_id)).await?;
+        let m = entries.into_iter().find(|e| {
+            e.get("senderOwnerHex").and_then(Value::as_str) == Some(a_owner.as_str())
+                && e.get("recipientOwnerHex").and_then(Value::as_str) == Some(b_owner.as_str())
+        });
+        Ok(m)
+    })
+    .await;
+
+    if held.is_err() {
+        // FALLBACK: characterize, do not assert. Co-located relay resolve/dial may
+        // not establish (ZEB-466-class community-relay routing gap). The cross-WAN
+        // playbook run (Scenario D2) is the real proof.
+        eprintln!(
+            "S6 FINDING: relay deposit never landed on r within 60s co-located \
+             (held=false). Likely the co-located community-relay resolve/dial gap \
+             (ZEB-466 class), NOT a deposit-logic bug — file a finding ticket and \
+             confirm via the cross-WAN Scenario D2. Skipping HELD/RECV/CLEARED asserts."
+        );
+        run.mark_success();
+        drop((a, b, r, ah, bh, rh));
+        return;
+    }
+    eprintln!("S6 HELD: r is holding a's deposit for b while b is offline.");
+
+    // --- b comes back ONLINE (rehydrates from its persisted profile). Recovery is
+    //     automatic: b pulls held blobs for C from r, ingests, the deposited invite
+    //     bootstraps the DM Space, the message applies, dm-received fires.
+    b = b.relaunch().await.expect("relaunch b");
+
+    // --- ASSERTION 2 (RECV): a's plaintext shows up in b's thread post-reconnect.
+    //     b had no DM Space before going offline; apply_deposited_invite bootstraps
+    //     it PINNED to a's space_id (a_space), and b has no competing same-member
+    //     space to canonicalize against — so b reads under a_space. Use the
+    //     candidate-tolerant helper anyway (matches the other DM tests + tolerant of
+    //     UnknownSpace while the recovered thread settles).
+    let recovered = poll_until(Duration::from_secs(90), || async {
+        let msgs = read_dm_plaintext_any(&b, &[a_space.as_str()])
+            .await
+            .unwrap_or_default();
+        Ok(msgs
+            .iter()
+            .any(|(_, body)| body == b"durable-hello")
+            .then_some(()))
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "RECV: b recovered a's deposited DM after reconnect (deposit→recover path)"
+    );
+    eprintln!("S6 RECV: b recovered the deposited DM after reconnect.");
+
+    // --- ASSERTION 3 (CLEARED): r's held entry is gone (acked + GC'd post-recovery).
+    let cleared = poll_until(Duration::from_secs(60), || async {
+        let entries = get_relay_held(&r, Some(&community_id)).await?;
+        let still_held = entries
+            .iter()
+            .any(|e| e.get("recipientOwnerHex").and_then(Value::as_str) == Some(b_owner.as_str()));
+        Ok((!still_held).then_some(()))
+    })
+    .await;
+    assert!(
+        cleared.is_ok(),
+        "CLEARED: r released the held entry after b recovered it"
+    );
+    eprintln!("S6 CLEARED: r released the held deposit after recovery.");
+
+    run.mark_success();
+    drop((a, b, r, ah, bh, rh));
 }

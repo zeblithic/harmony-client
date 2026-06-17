@@ -191,6 +191,32 @@ struct ReadDmThreadArgs {
     before_hlc: Option<u64>,
 }
 
+/// ZEB-487: relay opt-in control. Note the existing `CommunityIdArgs` uses
+/// `community_id`; the relay-rung RPCs key on `community_id_hex`, so they take
+/// their own `…HexArgs` shapes.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetCommunityRelayOptInArgs {
+    community_id_hex: String,
+    opted_in: bool,
+}
+
+/// ZEB-487: `community_id_hex`-keyed arg shape for the relay-status read.
+/// Distinct from the existing `CommunityIdArgs` (which keys on `community_id`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommunityIdHexArgs {
+    community_id_hex: String,
+}
+
+/// ZEB-487: optional community filter for the relay-held observability read.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetRelayHeldArgs {
+    #[serde(default)]
+    community_id_hex: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayNameArgs {
@@ -231,7 +257,7 @@ struct RepublishOwnerCardArgs {
 
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (42 commands). Every handler calls
+/// Build the curated v1 RPC surface (46 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
@@ -416,6 +442,30 @@ pub fn build_registry() -> RpcRegistry {
         |state, _sink, a| async move {
             crate::read_dm_thread_impl(state, a.space_id, a.limit, a.before_hlc).await
         }
+    );
+
+    // Relay rung (ZEB-487).
+    rpc!(
+        m,
+        "set_community_relay_opt_in",
+        SetCommunityRelayOptInArgs,
+        |state, _sink, a| async move {
+            crate::set_community_relay_opt_in_impl(state, a.community_id_hex, a.opted_in).await
+        }
+    );
+    rpc!(
+        m,
+        "get_community_relay_status",
+        CommunityIdHexArgs,
+        |state, _sink, a| async move {
+            crate::get_community_relay_status_impl(state, a.community_id_hex).await
+        }
+    );
+    rpc!(
+        m,
+        "get_relay_held",
+        GetRelayHeldArgs,
+        |state, _sink, a| async move { crate::get_relay_held_impl(state, a.community_id_hex).await }
     );
 
     // Connectivity.
@@ -806,6 +856,10 @@ mod tests {
             "add_space",
             "send_dm",
             "read_dm_thread",
+            // relay rung (ZEB-487)
+            "set_community_relay_opt_in",
+            "get_community_relay_status",
+            "get_relay_held",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_list_peer_reachability",

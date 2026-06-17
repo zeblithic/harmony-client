@@ -239,6 +239,15 @@ impl NodeHandle {
         }
         Ok(())
     }
+
+    /// Take the node offline (real process kill, if still alive) and bring it
+    /// back from the SAME config so its on-disk identity + app-data rehydrate.
+    /// Returns a fresh handle (new port/token after re-discovery). Models the
+    /// offline→online half of the ZEB-487 deposit→recover scenario.
+    pub async fn relaunch(mut self) -> anyhow::Result<Self> {
+        let _ = self.kill().await;
+        NodeHandle::spawn(self.config.clone()).await
+    }
 }
 
 impl Drop for NodeHandle {

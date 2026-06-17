@@ -116,6 +116,37 @@ Proves a member's **signed profile card** (display name + status) published on o
 
    > NOTE: the avatar (`avatarCid` on the card) resolves over the **public CAS content-fetch path** (ZEB-343/344/409/408), a separate layer — S5 asserts the signed name/status, not avatar bytes. The peer-profile broadcast verbs (`subscribe_peer_profile` / `get_cached_peer_profile` / `unsubscribe_peer_profile`, ZEB-281) are also headless-exposed by ZEB-464 for the fuller Reticulum profile, but are not asserted by this scenario.
 
+### Scenario D2 — offline-at-create → relay deposit → recover (ZEB-487 / ZEB-483 durability)
+
+Proves the headline DM durability: a DM created while the recipient is offline is
+deposited on a community relay and delivered when the recipient returns, bootstrapping
+the DM Space from the deposited invite. Three nodes: **A = sender, B = recipient
+(goes offline), R = relay host** (a distinct owner; only needs to be a community
+co-member). Drive with `harmony-app api`; signals on the ZEB-477 thread.
+
+**Setup (all online):**
+
+1. **A:** `create_community '{"name":"s6","isInviteOnly":true}'` → `communityId`; `generate_invite '{"communityId":"…"}'` → invite. Post `INVITE <url>` + `OWNER-A <hex>`.
+2. **B and R:** each poll `connectivity_redeem_invite_iroh '{"url":"<url>"}'` until `{"status":"joined"}`. Post `JOINED-B` / `JOINED-R` + their `OWNER-*`.
+3. **A:** `generate_friend_token` → post `FTOKEN <url>`. **B:** poll `redeem_friend_token '{"url":"<url>"}'` until Ok; both poll `list_friends` until `status:"active"` (A `accept_friend_request '{"ownerIdHex":"<B>"}'` if pending). This populates B's device cache with A. **Do NOT send a DM yet** — the DM Space must not exist on B.
+4. **R:** `set_community_relay_opt_in '{"communityIdHex":"<communityId>","optedIn":true}'`; confirm `get_community_relay_status '{"communityIdHex":"<communityId>"}'` → `true`. Post `RELAY-READY`.
+
+**Run:**
+
+5. **B:** kill the `serve` PID (real offline). Post `OFFLINE`.
+6. **A:** `add_space '{"kind":"dm","name":"s6-dm","members":["<B owner>"]}'` → `spaceId`; `send_dm '{"spaceId":"…","content":<bytes>,"mimeType":"text/plain"}'`. Post `SENT`.
+7. **R:** poll `get_relay_held '{"communityIdHex":"<communityId>"}'` until an entry shows `senderOwnerHex == A` and `recipientOwnerHex == B`. (Deposit fires only after ~2 no-ack windows — be patient.) Post `HELD`.
+8. **B:** relaunch the same `--profile` (rehydrates → auto-pulls + recovers).
+9. **B:** poll `read_dm_thread '{"spaceId":"<A spaceId>","limit":100}'` until A's plaintext appears (hex-decode `body`). Post `RECV`.
+10. **R:** poll `get_relay_held '{"communityIdHex":"<communityId>"}'` until B's entry is gone. Post `CLEARED`.
+11. **PASS** = `HELD` (while B offline) ∧ `RECV` (after reconnect) ∧ `CLEARED`. Post `DONE D2 PASS`.
+
+**Provenance is by construction:** B is killed before the send, so the live tunnel
+cannot carry the message; HELD-while-offline + RECV-after-reconnect + CLEARED proves
+it travelled via the relay deposit. If `get_relay_held` never shows the entry, capture
+R's `<app-data>/profiles/xwan/logs/` + A's outbox logs and file a finding (likely a
+relay resolve/dial issue cross-NAT) — do not call it PASS.
+
 ## Artifacts on failure
 
 Each agent collects, into a run directory it reports back:
