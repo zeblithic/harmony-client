@@ -78,14 +78,16 @@ Three verbs are added to the curated allowlist in `api/rpc.rs`. Each is backed b
 {
   "senderOwnerHex":    "…",  // 32 hex (owner addr of the depositing sender)
   "recipientOwnerHex": "…",  // 32 hex (intended offline recipient)
-  "spaceIdHex":        "…",  // DM Space id the deposit bootstraps
-  "messageCidHex":     "…",  // content id of the held message blob
-  "communityIdHex":    "…",  // the community this relay holds it under
-  "heldAtMs":          0      // wall-clock ms when the relay accepted the deposit
+  "communityIdHex":    "…",  // 32 hex (the community this relay holds it under)
+  "contentIdHex":      "…",  // 64 hex — ContentId(sealed_blob); the relay's per-blob key
+  "heldAtMs":          0,     // held_at.wall_ms — when the relay accepted the deposit
+  "heldByDevice":      "…"    // 64-hex relay device id that accepted the deposit
 }
 ```
 
-`get_relay_held` snapshots `Arc<Mutex<RelayHoldDoc>>` and maps each `RelayHeldBlob`/`RelayHoldEntry` into a `HeldEntryDto`. It never decrypts the sealed blob (the relay cannot — sealed to the recipient device key); it reports only routing metadata already present on the held entry. If NodeState does not already expose the relay-hold Arc the way it exposes `relay_optin_doc` (`lib.rs:1062`), add a `relay_hold_doc` handle to NodeState that aliases the same Arc the relay-hold engine owns (`community_relay_prod.rs:146`) — a one-line mirror of the opt-in handle, no new ownership.
+`get_relay_held` snapshots `Arc<Mutex<RelayHoldDoc>>` (already a NodeState field — `relay_hold_doc`, `lib.rs:1043`, no new wiring) and maps each `RelayHoldEntry` (`community_relay_hold_crdt.rs:23`) into a `HeldEntryDto`.
+
+**Correction vs. the original draft:** the DTO **cannot** carry `spaceIdHex` or a decrypted `messageCidHex` — the held blob is **sealed to the recipient's device key and is opaque to the relay**, and `RelayHoldEntry` stores no DM `space_id`. The relay sees only routing metadata: `sender_owner`, `recipient_owner`, `community_id`, `held_at`, `held_by`, and the sealed-blob content id (the entry's map key is `"{recipientOwnerHex}:{contentIdHex}"`). `contentIdHex` is the recipient's CAS content id for the held blob and uniquely identifies the entry. This does **not** weaken the HELD∧RECV∧CLEARED proof (§4.3): the relay-side assertions key on `(senderOwner, recipientOwner, contentId)` appear/disappear, and the recipient side reads the plaintext (with its `spaceId`) via `read_dm_thread`.
 
 ### 4.2 Headless NodeState access
 
@@ -166,8 +168,8 @@ No code in this spec is throwaway with respect to B.
 ## 8. File-touch map
 
 - `src-tauri/src/api/rpc.rs` — add the three verbs to the registry + allowlist; define `HeldEntryDto`; wire each to its `*_impl`.
-- `src-tauri/src/lib.rs` — extract `set_community_relay_opt_in_impl` and `get_community_relay_status_impl` from the existing commands; thin the Tauri commands to wrappers; add the `get_relay_held` impl + (if needed) a `relay_hold_doc` NodeState handle aliasing the relay-hold engine's Arc.
-- `src-tauri/src/community_relay_prod.rs` — a read helper that maps `RelayHoldDoc` entries → `HeldEntryDto` (reuse/adjacent to `held_for`).
+- `src-tauri/src/lib.rs` — extract `set_community_relay_opt_in_impl` and `get_community_relay_status_impl` from the existing commands (taking `&Mutex<NodeState>`, the `connectivity_redeem_invite_iroh_impl` shape); thin the Tauri commands to wrappers; add `get_relay_held_impl` reading the existing `relay_hold_doc` NodeState field (`lib.rs:1043`, already present — no new handle needed).
+- The `RelayHoldEntry → HeldEntryDto` pure mapper lives next to the DTO (in `api/rpc.rs` or a small `relay_held_dto` module) so it is unit-testable without a live `NodeState`.
 - `e2e-harness/src/node.rs` — `relaunch()` (offline→online same profile).
 - `e2e-harness/src/driver.rs` — `get_relay_held` poll helper.
 - `e2e-harness/tests/e2e_two_node.rs` (or a new `e2e_three_node.rs`) — the `s6_relay_deposit_recover` test (asserted, with the characterize fallback).
