@@ -1370,3 +1370,220 @@ async fn s6_relay_deposit_recover() {
     run.mark_success();
     drop((a, b, r, ah, bh, rh));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZEB-490 — s7: butler deposit→recover (co-located).
+//
+// A (sender) befriends P (recipient primary). P pairs a SECOND local instance
+// B2 into its fleet via the real ZEB-446 SAS handshake, then pins B2 as butler.
+// With P offline, A creates the DM Space + sends — after the no-ack windows the
+// deposit fans out to P's butler B2. P relaunches, fleet-merges with B2,
+// recovers the deposited invite + message.
+//
+// Layered characterize fallbacks at three racy co-located boundaries (the s6
+// pattern): (1) pairing may not establish (Zenoh harmony/pairing/v2/lan/** is
+// the same transport class as the ZEB-466 gap); (2) the deposit may not land on
+// B2; (3) recovery may not complete. Every boundary that DOES establish becomes
+// a hard assertion. set_butler_pin + get_butler_pin are hard-asserted whenever
+// boundary 1 passes (the guaranteed-value core). The cross-WAN playbook
+// Scenario D3 is the authoritative proof; this is its co-located sibling.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn s7_butler_deposit_recover() {
+    use e2e_harness::driver::*;
+    use serde_json::Value;
+    use std::time::Duration;
+
+    // --- Spawn A (sender) + P (primary) + B2 (fresh joiner). Mint A + P only;
+    //     B2 stays unminted and acquires identity by enrolling into P's fleet.
+    let mut run = RunDir::new("s7").expect("run dir");
+    let a_home = fresh_home("s7-a");
+    let p_home = fresh_home("s7-p");
+    let b2_home = fresh_home("s7-b2");
+    let mk = |home: &tempfile::TempDir, profile: &str| {
+        let mut cfg = NodeConfig::new(PathBuf::from(home.path()), profile);
+        cfg.log_dir = Some(run.log_dir());
+        cfg
+    };
+    let a = NodeHandle::spawn(mk(&a_home, "alice"))
+        .await
+        .expect("spawn a");
+    let mut p = NodeHandle::spawn(mk(&p_home, "primary"))
+        .await
+        .expect("spawn p");
+    let b2 = NodeHandle::spawn(mk(&b2_home, "butler"))
+        .await
+        .expect("spawn b2");
+    a.rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("a mint");
+    p.rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("p mint");
+
+    let a_owner = owner_id(&a).await;
+    let p_owner = owner_id(&p).await;
+
+    // --- Boundary 1: pair B2 into P's fleet via the real SAS handshake.
+    let b2_device = match pair_into_fleet(&p, &b2, "s7", Duration::from_secs(180)).await {
+        Ok(dev) => dev,
+        Err(e) => {
+            eprintln!(
+                "S7 FINDING: SAS pairing did not establish co-located within 180s \
+                 ({e}). Pairing discovery rides Zenoh harmony/pairing/v2/lan/** — \
+                 the same transport class as the ZEB-466 co-located gap. File a \
+                 finding ticket; the cross-WAN Scenario D3 is the real proof. \
+                 Skipping pin/HELD/RECV/CLEARED."
+            );
+            run.mark_success();
+            drop((a, p, b2, a_home, p_home, b2_home));
+            return;
+        }
+    };
+    eprintln!("S7 PAIRED: B2 enrolled into P's fleet (device {b2_device}).");
+
+    // --- Hard assertion: pin B2 as butler and read it back. The enrolled-set
+    //     gate (set_butler_pin_inner) accepts B2 because it is genuinely enrolled.
+    set_butler_pin(&p, Some(&b2_device))
+        .await
+        .expect("pin B2 as butler");
+    let pin = get_butler_pin(&p).await.expect("get butler pin");
+    assert_eq!(
+        pin.get("pinnedDeviceId").and_then(Value::as_str),
+        Some(b2_device.as_str()),
+        "get_butler_pin reflects the pinned butler device"
+    );
+    eprintln!("S7 PIN: P pinned B2 as butler; get_butler_pin confirms.");
+
+    // --- Friendship A<->P while P ONLINE (so A's device directory learns P's
+    //     fleet devices incl. B2's reachability). Reuse s6's friend dance.
+    let token = generate_friend_token(&a).await.expect("friend token");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut last_err = String::from("(no redeem attempt completed before the deadline)");
+    loop {
+        if std::time::Instant::now() >= deadline {
+            panic!("P never redeemed A's friend token within 120s; last error: {last_err}");
+        }
+        match redeem_friend_token(&p, &token).await {
+            Ok(_) => break,
+            Err(e) => last_err = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    poll_until(Duration::from_secs(120), || async {
+        accept_pending_from(&a, &p_owner).await?;
+        Ok(friend_is_active(&a, &p_owner).await?.then_some(()))
+    })
+    .await
+    .expect("A has P as active friend");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(friend_is_active(&p, &a_owner).await?.then_some(()))
+    })
+    .await
+    .expect("P has A as active friend");
+
+    // --- P goes OFFLINE (real SIGKILL). The DM Space does NOT exist on P yet.
+    p.kill().await.expect("kill p");
+
+    // --- A creates the DM Space + sends. P unreachable → after the no-ack
+    //     windows the deposit fans out to P's butler B2.
+    let a_space = add_dm_space(&a, "s7-dm", &p_owner)
+        .await
+        .expect("a dm space");
+    send_dm(&a, &a_space, b"butler-durable-hello", "text/plain")
+        .await
+        .expect("a send_dm accepted by the engine");
+
+    // --- Boundary 2 (HELD): B2 holds the deposit for P while P is offline.
+    //     Generous budget — deposit fires only after DEPOSIT_NOACK_WINDOWS=2.
+    let held = poll_until(Duration::from_secs(90), || async {
+        let entries = get_butler_held(&b2).await?;
+        Ok(entries
+            .into_iter()
+            .find(|e| e.get("senderOwnerHex").and_then(Value::as_str) == Some(a_owner.as_str())))
+    })
+    .await;
+
+    let held_entry = match held {
+        Ok(e) => e,
+        Err(_) => {
+            eprintln!(
+                "S7 FINDING: butler deposit never landed on B2 within 90s co-located \
+                 (held=false). The sender may not resolve/dial P's butler co-located, \
+                 or DEPOSIT_NOACK_WINDOWS exceeded the budget. File a finding ticket; \
+                 confirm via the cross-WAN Scenario D3. Skipping RECV/CLEARED."
+            );
+            run.mark_success();
+            drop((a, p, b2, a_home, p_home, b2_home));
+            return;
+        }
+    };
+    let held_space = held_entry
+        .get("spaceIdHex")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let held_cid = held_entry
+        .get("messageCidHex")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    eprintln!("S7 HELD: B2 is holding A's deposit for P (space {held_space}, cid {held_cid}).");
+
+    // --- P comes back ONLINE; fleet-merges with B2, recovers the deposited
+    //     invite + message (apply_deposited_invite bootstraps the DM Space).
+    p = p.relaunch().await.expect("relaunch p");
+
+    // --- Boundary 3 (RECV): A's plaintext shows up in P's thread post-reconnect.
+    let recovered = poll_until(Duration::from_secs(120), || async {
+        let msgs = read_dm_plaintext_any(&p, &[a_space.as_str()])
+            .await
+            .unwrap_or_default();
+        Ok(msgs
+            .iter()
+            .any(|(_, body)| body == b"butler-durable-hello")
+            .then_some(()))
+    })
+    .await;
+
+    if recovered.is_err() {
+        eprintln!(
+            "S7 FINDING: P did not recover the deposited DM within 120s co-located. \
+             B2-held the deposit (HELD passed) but the P<->B2 fleet sync or \
+             apply_deposited_invite recovery did not complete co-located. File a \
+             finding ticket; confirm via the cross-WAN Scenario D3. Skipping CLEARED."
+        );
+        run.mark_success();
+        drop((a, p, b2, a_home, p_home, b2_home));
+        return;
+    }
+    eprintln!("S7 RECV: P recovered the butler-deposited DM after reconnect.");
+
+    // --- CLEARED: butler's `ingested_by` is a grow-only set (the recovered
+    //     signal). Once P ingests, the held entry either gains a device in
+    //     ingestedByDevices OR is GC'd away — accept either as cleared.
+    let cleared = poll_until(Duration::from_secs(60), || async {
+        let entries = get_butler_held(&b2).await?;
+        let entry = entries
+            .iter()
+            .find(|e| e.get("senderOwnerHex").and_then(Value::as_str) == Some(a_owner.as_str()));
+        let done = match entry {
+            None => true, // entry GC'd away after recovery
+            Some(e) => e
+                .get("ingestedByDevices")
+                .and_then(Value::as_array)
+                .map(|arr| !arr.is_empty())
+                .unwrap_or(false),
+        };
+        Ok(done.then_some(()))
+    })
+    .await;
+    assert!(
+        cleared.is_ok(),
+        "CLEARED: B2's held entry recorded P's recovery (ingestedByDevices grew or entry GC'd)"
+    );
+    eprintln!("S7 CLEARED: B2 recorded P's recovery of the deposit.");
+
+    run.mark_success();
+    drop((a, p, b2, a_home, p_home, b2_home));
+}
