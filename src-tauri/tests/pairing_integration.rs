@@ -13,7 +13,7 @@
 use ed25519_dalek::SigningKey;
 use harmony_app::pairing::{
     persist::{install_inviter_state_inner, install_joiner_state_inner},
-    state_machine::{spawn_state_machine, PairingCommand, PairingHandle},
+    state_machine::{spawn_state_machine, InviterEnrollResult, PairingCommand, PairingHandle},
     transport::{InMemoryBroker, PairingTransport},
     types::{PairingState, PairingWireMessage},
 };
@@ -91,7 +91,7 @@ async fn end_to_end_pair_two_devices() {
     // we'd rather not trade correctness checks for incidental message
     // volume in this test.
     let test_interval = Duration::from_secs(60);
-    let inviter_handle = spawn_state_machine(inviter_t.clone(), now_fn.clone(), test_interval);
+    let mut inviter_handle = spawn_state_machine(inviter_t.clone(), now_fn.clone(), test_interval);
     let joiner_handle = spawn_state_machine(joiner_t.clone(), now_fn.clone(), test_interval);
 
     inviter_handle
@@ -113,7 +113,7 @@ async fn end_to_end_pair_two_devices() {
         .unwrap();
 
     drive_to_handshake(&inviter_handle, &joiner_handle).await;
-    drive_to_complete(&inviter_handle, &joiner_handle).await;
+    drive_to_complete(&mut inviter_handle, &joiner_handle).await;
 
     let mut jrx = joiner_handle.joiner_result_rx.expect("result rx");
     let result = timeout(Duration::from_secs(2), jrx.recv())
@@ -285,7 +285,7 @@ async fn end_to_end_persists_state_to_disk() {
     let joiner_t_arc: Arc<dyn PairingTransport> = Arc::new(joiner_t);
     let now_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 1_700_000_001);
     let test_interval = Duration::from_secs(60);
-    let inviter_handle = spawn_state_machine(inviter_t_arc, now_fn.clone(), test_interval);
+    let mut inviter_handle = spawn_state_machine(inviter_t_arc, now_fn.clone(), test_interval);
     let joiner_handle = spawn_state_machine(joiner_t_arc, now_fn.clone(), test_interval);
 
     inviter_handle
@@ -307,19 +307,15 @@ async fn end_to_end_persists_state_to_disk() {
         .unwrap();
 
     drive_to_handshake(&inviter_handle, &joiner_handle).await;
-    drive_to_complete(&inviter_handle, &joiner_handle).await;
+    let inviter_result = drive_to_complete(&mut inviter_handle, &joiner_handle).await;
 
-    // Drain BOTH result receivers — this is exactly what the start_node
-    // drainer tasks do in production.
+    // Drain the joiner result receiver — exactly what the start_node joiner
+    // drainer does in production. (The inviter handoff is drained + acked
+    // inside drive_to_complete, which returns its result above.)
     let mut joiner_rx = joiner_handle.joiner_result_rx.expect("joiner result rx");
     let joiner_result = timeout(Duration::from_secs(2), joiner_rx.recv())
         .await
         .expect("joiner result arrives")
-        .expect("not None");
-    let mut inviter_rx = inviter_handle.inviter_result_rx.expect("inviter result rx");
-    let inviter_result = timeout(Duration::from_secs(2), inviter_rx.recv())
-        .await
-        .expect("inviter result arrives")
         .expect("not None");
 
     // Persist both sides to their respective tempdirs. Use the *_inner
@@ -387,7 +383,20 @@ async fn end_to_end_persists_state_to_disk() {
     );
 }
 
-async fn drive_to_complete(inviter_handle: &PairingHandle, joiner_handle: &PairingHandle) {
+/// Drive both sides from Handshaking to `Complete`, returning the inviter's
+/// `InviterEnrollResult`.
+///
+/// ZEB-491: the inviter no longer reaches `Complete` until its enrollment is
+/// durably persisted. `maybe_advance_to_enroll` now emits an
+/// `InviterEnrollHandoff` and parks at `Enrolling` awaiting the oneshot
+/// `persisted_ack`; the production `start_node` drainer fires that ack after
+/// writing `owner_state.cbor`. Here we simulate the drainer — drain the handoff
+/// and ack `Ok(())` — so the inviter can advance. The drained `result` is
+/// returned so callers that persist it don't re-drain the (now-taken) channel.
+async fn drive_to_complete(
+    inviter_handle: &mut PairingHandle,
+    joiner_handle: &PairingHandle,
+) -> InviterEnrollResult {
     inviter_handle
         .cmd_tx
         .send(PairingCommand::ConfirmSas)
@@ -399,7 +408,8 @@ async fn drive_to_complete(inviter_handle: &PairingHandle, joiner_handle: &Pairi
         .await
         .unwrap();
 
-    // wait_for checks the current value first — see drive_to_handshake.
+    // wait_for checks the current value first — see drive_to_handshake. The
+    // joiner completes on its own (it consumes ENROLL directly, no ack gate).
     let mut joiner_state = joiner_handle.state_rx.clone();
     timeout(Duration::from_secs(3), async {
         joiner_state
@@ -410,6 +420,21 @@ async fn drive_to_complete(inviter_handle: &PairingHandle, joiner_handle: &Pairi
     .await
     .expect("joiner completes");
 
+    // Simulate the start_node inviter drainer: drain the handoff and ack the
+    // persist so the inviter SM can advance past `Enrolling` to `Complete`.
+    let mut inviter_rx = inviter_handle
+        .inviter_result_rx
+        .take()
+        .expect("inviter result rx present");
+    let handoff = timeout(Duration::from_secs(2), inviter_rx.recv())
+        .await
+        .expect("inviter handoff arrives")
+        .expect("handoff not None");
+    handoff
+        .persisted_ack
+        .send(Ok(()))
+        .expect("inviter SM's detached ack task must still hold the persist-ack receiver");
+
     let mut inviter_state = inviter_handle.state_rx.clone();
     timeout(Duration::from_secs(3), async {
         inviter_state
@@ -419,6 +444,8 @@ async fn drive_to_complete(inviter_handle: &PairingHandle, joiner_handle: &Pairi
     })
     .await
     .expect("inviter completes");
+
+    handoff.result
 }
 
 /// Transport wrapper that returns Err on the Nth `Encrypted` publish, to

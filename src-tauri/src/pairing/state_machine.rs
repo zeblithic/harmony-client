@@ -23,6 +23,11 @@ use uuid::Uuid;
 /// "Inviter clicks Add another device first, Joiner second" flow. Tests
 /// use shorter values via [`spawn_state_machine`]'s parameter.
 pub const DEFAULT_DISCOVER_REBROADCAST_INTERVAL: Duration = Duration::from_millis(2500);
+
+/// ZEB-491: bound the wait for the inviter persistence ack so a stalled
+/// drainer (blocked disk/keychain) surfaces as `Failed` instead of dwelling
+/// at `Enrolling` forever.
+const PERSIST_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
 use zeroize::Zeroizing;
 
@@ -80,12 +85,28 @@ pub struct InviterEnrollResult {
     pub master_seed: Zeroizing<[u8; 32]>,
 }
 
+/// Carries the inviter enrollment to the persistence drainer AND a oneshot
+/// the drainer fires once `owner_state.cbor` is durably written, so the SM
+/// only advances to `Complete` after the enrollment is on disk (ZEB-491:
+/// previously `Complete` raced the detached persist and the enrollment was
+/// intermittently lost on a fast restart).
+pub struct InviterEnrollHandoff {
+    pub result: InviterEnrollResult,
+    pub persisted_ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
+/// ZEB-491: (session_id, device_id_hex, persist outcome) forwarded from the
+/// detached ack task back to `run_state_machine`, which performs the
+/// Enrolling→Complete/Failed transition on the main loop (so it can verify the
+/// session is still active and stay responsive while persistence is pending).
+type PersistDoneTx = mpsc::Sender<(Uuid, String, Result<(), String>)>;
+
 /// Handle the UI talks to. Drops the state machine on drop.
 pub struct PairingHandle {
     pub state_rx: watch::Receiver<PairingState>,
     pub cmd_tx: mpsc::Sender<PairingCommand>,
     pub joiner_result_rx: Option<mpsc::Receiver<JoinerEnrollResult>>,
-    pub inviter_result_rx: Option<mpsc::Receiver<InviterEnrollResult>>,
+    pub inviter_result_rx: Option<mpsc::Receiver<InviterEnrollHandoff>>,
     _shutdown: tokio::task::JoinHandle<()>,
 }
 
@@ -97,7 +118,7 @@ pub fn spawn_state_machine(
     let (state_tx, state_rx) = watch::channel(PairingState::Idle);
     let (cmd_tx, cmd_rx) = mpsc::channel::<PairingCommand>(16);
     let (result_tx, result_rx) = mpsc::channel::<JoinerEnrollResult>(1);
-    let (inviter_result_tx, inviter_result_rx) = mpsc::channel::<InviterEnrollResult>(1);
+    let (inviter_result_tx, inviter_result_rx) = mpsc::channel::<InviterEnrollHandoff>(1);
 
     let task = tokio::spawn(run_state_machine(
         transport,
@@ -123,12 +144,16 @@ async fn run_state_machine(
     state_tx: watch::Sender<PairingState>,
     mut cmd_rx: mpsc::Receiver<PairingCommand>,
     result_tx: mpsc::Sender<JoinerEnrollResult>,
-    inviter_result_tx: mpsc::Sender<InviterEnrollResult>,
+    inviter_result_tx: mpsc::Sender<InviterEnrollHandoff>,
     now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
     discover_rebroadcast_interval: Duration,
 ) {
     // Per-session local context. Reset each time we leave a session.
     let mut ctx: Option<SessionCtx> = None;
+
+    // ZEB-491: detached inviter persist-ack forwarder → main loop. See PersistDoneTx.
+    let (persist_done_tx, mut persist_done_rx) =
+        mpsc::channel::<(Uuid, String, Result<(), String>)>(1);
 
     // Periodic DISCOVER re-broadcast: see DEFAULT_DISCOVER_REBROADCAST_INTERVAL.
     // `tokio::time::interval` fires the first tick immediately by default;
@@ -174,6 +199,7 @@ async fn run_state_machine(
                                 &now_fn,
                                 &result_tx,
                                 &inviter_result_tx,
+                                &persist_done_tx,
                             )
                             .await;
                         }
@@ -201,6 +227,7 @@ async fn run_state_machine(
                     &now_fn,
                     &result_tx,
                     &inviter_result_tx,
+                    &persist_done_tx,
                 )
                 .await;
             }
@@ -213,6 +240,34 @@ async fn run_state_machine(
             _ = rebroadcast.tick(), if ctx.as_ref().is_some_and(|c| c.selected_peer_session_id.is_none()) => {
                 if let Some(c) = ctx.as_ref() {
                     let _ = transport.publish(build_discover(c)).await;
+                }
+            }
+            // ZEB-491: durability result for a pending inviter enrollment,
+            // forwarded by the detached ack task in maybe_advance_to_enroll.
+            // Transition only if we're STILL in the same inviter session that
+            // started the persist AND still at `Enrolling` — a Cancel or a new
+            // pairing supersedes it, and (CodeRabbit) a late ack must not
+            // overwrite a terminal `Failed` (peer/wire abort) that fired while
+            // persistence was pending, now possible because the SM stays
+            // responsive during the wait. Preserves terminal-state precedence.
+            done = persist_done_rx.recv() => {
+                if let Some((session_id, device_id_hex, outcome)) = done {
+                    let same_active_session = ctx
+                        .as_ref()
+                        .is_some_and(|c| c.session_id == session_id && c.cert_sent);
+                    let still_enrolling = matches!(&*state_tx.borrow(), PairingState::Enrolling);
+                    if same_active_session && still_enrolling {
+                        match outcome {
+                            Ok(()) => {
+                                let _ = state_tx.send(PairingState::Complete { device_id_hex });
+                            }
+                            Err(e) => {
+                                let _ = state_tx.send(PairingState::Failed {
+                                    reason: format!("persist enrollment: {e}"),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -563,7 +618,8 @@ async fn on_confirm_sas(
     ctx: &mut SessionCtx,
     now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
     result_tx: &mpsc::Sender<JoinerEnrollResult>,
-    inviter_result_tx: &mpsc::Sender<InviterEnrollResult>,
+    inviter_result_tx: &mpsc::Sender<InviterEnrollHandoff>,
+    persist_done_tx: &PersistDoneTx,
 ) {
     let Some(session_key) = ctx.session_key else {
         return;
@@ -626,7 +682,15 @@ async fn on_confirm_sas(
         let _ = state_tx.send(PairingState::WaitingPeerConfirm { peer_session_id });
     }
 
-    maybe_advance_to_enroll(transport, state_tx, ctx, now_fn, inviter_result_tx).await;
+    maybe_advance_to_enroll(
+        transport,
+        state_tx,
+        ctx,
+        now_fn,
+        inviter_result_tx,
+        persist_done_tx,
+    )
+    .await;
     // Joiner waits for the ENROLL message; the receive path emits Enrolling and
     // then completes. result_tx is only consumed on the Joiner side via
     // on_encrypted_payload::Enroll.
@@ -642,7 +706,8 @@ async fn maybe_advance_to_enroll(
     state_tx: &watch::Sender<PairingState>,
     ctx: &mut SessionCtx,
     now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
-    inviter_result_tx: &mpsc::Sender<InviterEnrollResult>,
+    inviter_result_tx: &mpsc::Sender<InviterEnrollHandoff>,
+    persist_done_tx: &PersistDoneTx,
 ) {
     if !(ctx.our_confirmed && ctx.peer_confirmed) {
         return;
@@ -756,7 +821,7 @@ async fn maybe_advance_to_enroll(
         return;
     }
 
-    // Emit the InviterEnrollResult so the persistence layer (drained in
+    // Emit the InviterEnrollHandoff so the persistence layer (drained in
     // start_node) can merge the new enrollment into the freshest on-disk
     // OwnerState. Without this, the new enrollment lives only in RAM and
     // the Inviter's DevicesPanel reverts to showing only itself on next
@@ -782,11 +847,26 @@ async fn maybe_advance_to_enroll(
     // Joiner's ENROLL idempotency guard
     // (`our_signing_key.is_none()` sentinel) absorbs the duplicate
     // ENROLL re-publish.
+    //
+    // ZEB-491: gate `Complete` on the persist actually finishing. We send a
+    // oneshot `persisted_ack` alongside the result; the drainer fires it once
+    // `owner_state.cbor` is durably written (or with an Err on a persist
+    // failure). The SM legitimately DWELLS at `Enrolling` (emitted above)
+    // until the ack arrives. Previously `Complete` was reported the instant
+    // the result was merely ENQUEUED on this mpsc channel, with the actual
+    // disk write happening later in a detached, un-awaited task — so a fast
+    // process restart (or a GUI inviter quitting right after "Done!")
+    // intermittently lost the enrollment because there was no happens-before
+    // edge between `Complete` and durability.
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     if let Err(e) = inviter_result_tx
-        .send(InviterEnrollResult {
-            cert,
-            now,
-            master_seed: master_seed.clone(),
+        .send(InviterEnrollHandoff {
+            result: InviterEnrollResult {
+                cert,
+                now,
+                master_seed: master_seed.clone(),
+            },
+            persisted_ack: ack_tx,
         })
         .await
     {
@@ -802,12 +882,29 @@ async fn maybe_advance_to_enroll(
     ctx.owner_state = Some(prospective_state);
     ctx.cert_sent = true;
 
-    let device_id = joiner_pubkey.identity_hash();
-    let _ = state_tx.send(PairingState::Complete {
-        device_id_hex: hex::encode(device_id),
+    // ZEB-491: do NOT await the persist ack inline — that blocks the single
+    // run_state_machine task from servicing Cancel / wire messages while
+    // persistence is pending (and a stalled drainer would hang the inviter at
+    // Enrolling). Hand the ack to a detached task that forwards the durability
+    // result to the main loop, which transitions to Complete/Failed only if
+    // this same session is still active. We remain at Enrolling until then.
+    let session_id = ctx.session_id;
+    let device_id_hex = hex::encode(joiner_pubkey.identity_hash());
+    let done_tx = persist_done_tx.clone();
+    tokio::spawn(async move {
+        let outcome = match tokio::time::timeout(PERSIST_ACK_TIMEOUT, ack_rx).await {
+            Ok(Ok(r)) => r, // drainer fired the ack: Ok = persisted, Err = persist failed
+            Ok(Err(_)) => Err("inviter persistence task dropped before ack".to_string()),
+            Err(_) => Err("inviter persistence ack timed out".to_string()),
+        };
+        let _ = done_tx.send((session_id, device_id_hex, outcome)).await;
     });
 }
 
+// ZEB-491: the inviter persist-ack forwarder adds an 8th param to this handler
+// chain. Bundling the senders into a context struct is a larger refactor than
+// this round warrants; matches the existing handler-chain pattern in event_loop.rs.
+#[allow(clippy::too_many_arguments)]
 async fn handle_wire_message(
     transport: &Arc<dyn PairingTransport>,
     state_tx: &watch::Sender<PairingState>,
@@ -815,7 +912,8 @@ async fn handle_wire_message(
     msg: PairingWireMessage,
     now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
     result_tx: &mpsc::Sender<JoinerEnrollResult>,
-    inviter_result_tx: &mpsc::Sender<InviterEnrollResult>,
+    inviter_result_tx: &mpsc::Sender<InviterEnrollHandoff>,
+    persist_done_tx: &PersistDoneTx,
 ) {
     // Safety: callers only invoke this when ctx.is_some() (enforced by the
     // select! guard), EXCEPT the Cancel arm which explicitly sets ctx to None.
@@ -959,6 +1057,7 @@ async fn handle_wire_message(
                 now_fn,
                 result_tx,
                 inviter_result_tx,
+                persist_done_tx,
             )
             .await;
         }
@@ -992,6 +1091,8 @@ async fn handle_wire_message(
     }
 }
 
+// ZEB-491: see handle_wire_message — the persist-ack forwarder adds an 8th param.
+#[allow(clippy::too_many_arguments)]
 async fn on_encrypted_payload(
     transport: &Arc<dyn PairingTransport>,
     state_tx: &watch::Sender<PairingState>,
@@ -999,7 +1100,8 @@ async fn on_encrypted_payload(
     payload: EncryptedPayload,
     now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
     result_tx: &mpsc::Sender<JoinerEnrollResult>,
-    inviter_result_tx: &mpsc::Sender<InviterEnrollResult>,
+    inviter_result_tx: &mpsc::Sender<InviterEnrollHandoff>,
+    persist_done_tx: &PersistDoneTx,
 ) {
     match payload {
         EncryptedPayload::Confirm { sas_digits } => {
@@ -1018,7 +1120,15 @@ async fn on_encrypted_payload(
             // ourselves. Previously the scaffold tried to do this without
             // `transport` in scope; we now thread it through.
             if ctx.our_confirmed {
-                maybe_advance_to_enroll(transport, state_tx, ctx, now_fn, inviter_result_tx).await;
+                maybe_advance_to_enroll(
+                    transport,
+                    state_tx,
+                    ctx,
+                    now_fn,
+                    inviter_result_tx,
+                    persist_done_tx,
+                )
+                .await;
             }
         }
         EncryptedPayload::Enroll {
@@ -1354,6 +1464,231 @@ mod tests {
             .owner_state
             .enrollments
             .contains_key(&original_inviter_device_id));
+    }
+
+    /// Spawn a fresh inviter+joiner pair over an in-memory broker and drive
+    /// them through Discover → Select → Handshake → mutual ConfirmSas. After
+    /// this returns, the inviter has signed + published ENROLL and pushed an
+    /// `InviterEnrollHandoff` onto `inviter_result_rx`, then parked at
+    /// `Enrolling` awaiting the persistence ack (ZEB-491). The joiner reaches
+    /// `Complete` on its own (it consumes ENROLL directly). Used by the two
+    /// ZEB-491 ack-gating tests below.
+    async fn drive_paired_to_inviter_handoff() -> (PairingHandle, PairingHandle, OwnerState) {
+        let MintResult {
+            state,
+            recovery_artifact,
+            ..
+        } = mint_owner(1_700_000_000).unwrap();
+        let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+
+        let (inviter_t, joiner_t) = InMemoryBroker::pair();
+        let test_interval = Duration::from_secs(60);
+        let inviter_handle = spawn_state_machine(
+            Arc::new(inviter_t),
+            fixed_clock(1_700_000_001),
+            test_interval,
+        );
+        let joiner_handle = spawn_state_machine(
+            Arc::new(joiner_t),
+            fixed_clock(1_700_000_002),
+            test_interval,
+        );
+
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::StartInviter {
+                display_name: "KRILE".to_string(),
+                owner_state: state.clone(),
+                master_seed,
+            })
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::StartJoiner {
+                display_name: "AVALON".to_string(),
+                signing_key: joiner_sk,
+            })
+            .await
+            .unwrap();
+
+        let mut inviter_state = inviter_handle.state_rx.clone();
+        let mut joiner_state = joiner_handle.state_rx.clone();
+
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter sees joiner within 2s");
+        timeout(Duration::from_secs(2), async {
+            joiner_state
+                .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("joiner sees inviter within 2s");
+
+        let inviter_peer_id = match &*inviter_handle.state_rx.borrow() {
+            PairingState::Discovered { peers } => peers[0].session_id,
+            _ => panic!(),
+        };
+        let joiner_peer_id = match &*joiner_handle.state_rx.borrow() {
+            PairingState::Discovered { peers } => peers[0].session_id,
+            _ => panic!(),
+        };
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: inviter_peer_id,
+            })
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: joiner_peer_id,
+            })
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter handshakes within 2s");
+        timeout(Duration::from_secs(2), async {
+            joiner_state
+                .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("joiner handshakes within 2s");
+
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::ConfirmSas)
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::ConfirmSas)
+            .await
+            .unwrap();
+
+        (inviter_handle, joiner_handle, state)
+    }
+
+    /// ZEB-491 Gap 1: the inviter must NOT report `Complete` while the
+    /// `InviterEnrollHandoff` is still un-acked — it dwells at `Enrolling`
+    /// until the persistence drainer confirms `owner_state.cbor` is on disk.
+    /// Once we send `Ok(())` on `persisted_ack`, the inviter advances to
+    /// `Complete`. This pins the happens-before edge that the old detached,
+    /// un-awaited persist lacked (a fast restart could lose the enrollment).
+    #[tokio::test]
+    async fn inviter_waits_for_persist_ack_before_complete() {
+        let (mut inviter_handle, _joiner_handle, _state) = drive_paired_to_inviter_handoff().await;
+
+        // Pull the handoff off the channel. Until we ack it, the inviter must
+        // stay at Enrolling.
+        let mut irx = inviter_handle.inviter_result_rx.take().expect("inviter rx");
+        let handoff = timeout(Duration::from_secs(2), irx.recv())
+            .await
+            .expect("inviter handoff arrives within 2s")
+            .expect("handoff not None");
+
+        // The carried result is sane: a real cert + the SM's signing-time `now`.
+        assert_eq!(
+            handoff.result.now, 1_700_000_001,
+            "carried `now` is the inviter's fixed clock"
+        );
+        assert_eq!(
+            handoff.result.cert.owner_id, _state.owner_id,
+            "carried cert binds the inviter's owner_id"
+        );
+
+        // Negative assertion: with the handoff un-acked, the inviter must NOT
+        // reach Complete. We assert this by showing a bounded wait_for(Complete)
+        // TIMES OUT while the current state is still Enrolling. Collapse the
+        // result to a bool immediately so the `watch::Ref` borrow it would
+        // otherwise hold doesn't outlive this statement.
+        let mut inviter_state = inviter_handle.state_rx.clone();
+        let reached_complete = timeout(
+            Duration::from_millis(200),
+            inviter_state.wait_for(|s| matches!(s, PairingState::Complete { .. })),
+        )
+        .await
+        .is_ok();
+        let observed = inviter_handle.state_rx.borrow().clone();
+        assert!(
+            !reached_complete,
+            "inviter must NOT reach Complete before the persist ack; observed {observed:?}"
+        );
+        assert!(
+            matches!(observed, PairingState::Enrolling),
+            "inviter must dwell at Enrolling while the handoff is un-acked; got {observed:?}"
+        );
+
+        // Now fire the durability ack — the inviter must advance to Complete.
+        handoff
+            .persisted_ack
+            .send(Ok(()))
+            .expect("ack receiver still live");
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Complete { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter reaches Complete after the persist ack");
+    }
+
+    /// ZEB-491 Gap 1: if the persistence drainer reports a write failure on
+    /// `persisted_ack`, the inviter must surface `Failed` (not `Complete`) so
+    /// the user is never told a pairing succeeded that isn't durably on disk.
+    #[tokio::test]
+    async fn inviter_fails_when_persist_ack_errors() {
+        let (mut inviter_handle, _joiner_handle, _state) = drive_paired_to_inviter_handoff().await;
+
+        let mut irx = inviter_handle.inviter_result_rx.take().expect("inviter rx");
+        let handoff = timeout(Duration::from_secs(2), irx.recv())
+            .await
+            .expect("inviter handoff arrives within 2s")
+            .expect("handoff not None");
+
+        // Drainer hit a disk error — report it on the ack.
+        handoff
+            .persisted_ack
+            .send(Err("disk full".to_string()))
+            .expect("ack receiver still live");
+
+        let mut inviter_state = inviter_handle.state_rx.clone();
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Failed { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter reaches Failed after a persist-ack error");
+
+        let observed = inviter_handle.state_rx.borrow().clone();
+        match observed {
+            PairingState::Failed { reason } => assert!(
+                reason.contains("persist"),
+                "Failed reason must mention persist; got: {reason}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     /// Multi-peer LAN race regression (PR #63 review): a SELECT addressed to
@@ -2269,8 +2604,9 @@ mod tests {
         // Phase 5: Enrolling — cancel the JOINER from Enrolling.
         //
         // Pick the Joiner side because it sits stably at Enrolling waiting
-        // for ENROLL: the Inviter's "Enrolling" is transient (auto-advances
-        // to Complete the moment publish() returns Ok). To keep the Joiner
+        // for ENROLL. (Post-ZEB-491 the Inviter also dwells at Enrolling
+        // until its persistence ack lands, but the Joiner is the side we
+        // assert here.) To keep the Joiner
         // at Enrolling deterministically we silently drop the Inviter's
         // ENROLL — the second `Encrypted` payload it publishes (the first
         // is CONFIRM, which must reach the Joiner so peer_confirmed flips).

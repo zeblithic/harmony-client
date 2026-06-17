@@ -681,6 +681,33 @@ pub fn read_persisted_owner_id(identity_dir: &Path) -> Result<Option<[u8; 16]>, 
     Ok(Some(state.owner_id))
 }
 
+/// ZEB-491 (secondary): read the LIVE enrolled-device set from `owner_state.cbor`
+/// as 64-hex ed25519 verify keys — the same derivation `start_node` uses to seed
+/// `NodeState.fleet_net_enrolled`, but read on demand so it reflects enrollments
+/// that landed AFTER boot (e.g. a device just paired in this session).
+///
+/// Keychain-free by design (sibling of [`read_persisted_owner_id`]): it only
+/// parses the public `OwnerState` CBOR, so it's safe to call on hot validation
+/// paths like `set_butler_pin` without touching the credential store. Returns an
+/// empty set when no identity has been minted yet.
+pub fn read_enrolled_device_vk_hex(
+    identity_dir: &Path,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    if !cbor_path.exists() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let cbor_bytes = std::fs::read(&cbor_path)
+        .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
+    let state: OwnerState =
+        cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
+    Ok(state
+        .enrollments
+        .values()
+        .map(|cert| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
+        .collect())
+}
+
 /// Ensure the local device (derived from `device_sk`) has a fresh `LivenessCert`
 /// in `state`. Returns `true` if it mutated `state` (caller must then persist via
 /// [`save_owner_state_cbor_only`]).
@@ -1185,6 +1212,84 @@ mod persistence_tests {
         assert!(
             loaded.master_seed.is_some(),
             "cbor-only write must NOT clear the master seed"
+        );
+    }
+
+    /// ZEB-491 (secondary): `read_enrolled_device_vk_hex` must reflect an
+    /// enrollment added AFTER the initial mint (i.e. a device paired in-session)
+    /// without any restart. This is the disk-side seam that lets `set_butler_pin`
+    /// validate against the LIVE enrolled set instead of the boot snapshot, so a
+    /// freshly-paired device can be pinned immediately.
+    #[test]
+    fn read_enrolled_vk_hex_sees_post_boot_enrollment() {
+        use harmony_owner::lifecycle::{enroll_via_master, RecoveryArtifact};
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+        use harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS;
+
+        let dir = tempdir().unwrap();
+
+        // Empty/unminted dir → empty set (no owner_state.cbor yet).
+        assert!(
+            read_enrolled_device_vk_hex(dir.path()).unwrap().is_empty(),
+            "no identity minted yet → empty enrolled set"
+        );
+
+        // Mint: exactly one enrollment (the boot/first device).
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            ..
+        } = mint_owner(1_700_000_000).unwrap();
+        let seed = *recovery_artifact.as_bytes();
+        save_owner_state_cbor_only(dir.path(), &state).unwrap();
+
+        let after_mint = read_enrolled_device_vk_hex(dir.path()).unwrap();
+        assert_eq!(after_mint.len(), 1, "boot snapshot has the first device");
+
+        // Simulate an in-session pairing: master-sign + add a SECOND device's
+        // enrollment, then persist cbor-only (no remint, no restart).
+        let new_device_sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let new_device_x25519 =
+            crate::dm_signing::ed25519_pub_to_x25519(&new_device_sk.verifying_key().to_bytes())
+                .unwrap();
+        let new_device_vk_hex = hex::encode(new_device_sk.verifying_key().to_bytes());
+        let new_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: new_device_sk.verifying_key().to_bytes(),
+                x25519_pub: new_device_x25519,
+            },
+            post_quantum: None,
+        };
+        let artifact = RecoveryArtifact::from_seed(seed);
+        let enrolled = enroll_via_master(
+            &state,
+            &artifact,
+            &new_device_sk,
+            new_bundle,
+            1_700_000_500,
+            DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .expect("master-sign new device enrollment");
+        state
+            .add_enrollment(
+                enrolled.enrollment_cert,
+                1_700_000_500,
+                DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .expect("add second enrollment");
+        save_owner_state_cbor_only(dir.path(), &state).unwrap();
+
+        // The LIVE read now sees BOTH devices, including the post-boot one — no
+        // restart required.
+        let after_pair = read_enrolled_device_vk_hex(dir.path()).unwrap();
+        assert_eq!(
+            after_pair.len(),
+            2,
+            "live read sees the post-boot device too"
+        );
+        assert!(
+            after_pair.contains(&new_device_vk_hex),
+            "freshly-paired device's vk hex must be in the live enrolled set"
         );
     }
 
