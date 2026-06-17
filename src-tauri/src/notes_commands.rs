@@ -460,4 +460,367 @@ mod tests {
 
         let _ = engine.shutdown().await;
     }
+
+    /// ZEB-361 — two-engine cross-DEVICE convergence proofs for the Notes
+    /// dataset.
+    ///
+    /// Notes ship as the first consumer of the SP1 fleet-sync substrate
+    /// (ZEB-417), and post-ZEB-492 the engine is built from the distributed
+    /// `KeyTree` on cert-only devices too — yet Notes was the only fleet dataset
+    /// with no cross-device sync test. The CRDT merge unit tests in
+    /// `notes_crdt.rs` exercise `merge_from` in memory only, and the
+    /// single-engine `notes_engine_publishes_on_local_write` proves just the
+    /// SEND half (a local write emits a publish frame). These tests close the
+    /// loop: two real `FleetSyncEngine<NotesDoc>` instances — configured exactly
+    /// as `start_node` configures the production engine (`merge_from` merger,
+    /// `NotesPersist`-shaped sink, `publish_seen: true`, lookup tag
+    /// `b"notes-v1"`) — sharing one CAS and cross-wired publisher↔subscriber,
+    /// driving the REAL `notes_*_core` write path, must converge across the full
+    /// pipeline (encode → CAS put → encrypt → wire frame → decrypt → CAS fetch →
+    /// decode → merge → tracker advance). This is ZEB-361's literal acceptance
+    /// ("a note on device A appears on B, survives offline edits on both sides,
+    /// converges deterministically"). The Zenoh hop the frames ride in
+    /// production can't be unit-tested without a live session; the forwarder
+    /// stands in for it byte-for-byte.
+    mod two_engine_sync {
+        use super::{notes_delete_core, notes_list_core, notes_upsert_core};
+        use crate::content_store::{ContentStore, InMemoryStub};
+        use crate::fleet_sync::{
+            FleetPersist, FleetSyncConfig, FleetSyncEngine, Merger, SyncError, DEFAULT_DEBOUNCE_MS,
+        };
+        use crate::notes_crdt::NotesDoc;
+        use crate::owner_state_crypto::KeyTree;
+        use crate::owner_state_types::Hlc;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::{mpsc, Mutex};
+
+        /// Convergence/wire-round-trip is the assertion; on-disk durability is
+        /// covered separately by `notes_persist.rs`. A no-op sink keeps these
+        /// tests free of per-engine tempdir plumbing.
+        struct NoopNotesPersist;
+        impl FleetPersist<NotesDoc> for NoopNotesPersist {
+            fn persist(&self, _: &NotesDoc, _: &BTreeMap<String, Hlc>) -> Result<(), SyncError> {
+                Ok(())
+            }
+        }
+
+        /// One device's engine plus the handles the harness shuttles between
+        /// devices. `out_rx`/`in_tx` are moved into the forwarder at wiring time.
+        struct NotesEngine {
+            engine: FleetSyncEngine<NotesDoc>,
+            doc: Arc<Mutex<NotesDoc>>,
+            tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+            out_rx: mpsc::Receiver<Vec<u8>>,
+            in_tx: mpsc::Sender<Vec<u8>>,
+        }
+
+        /// Build a notes engine for `device_id` against a shared `kt`/`cas`
+        /// (same owner fleet → same lookup/encryption keys, distinct device id).
+        fn build(device_id: &str, kt: Arc<KeyTree>, cas: Arc<dyn ContentStore>) -> NotesEngine {
+            let (out_tx, out_rx) = mpsc::channel(64);
+            let (in_tx, in_rx) = mpsc::channel(64);
+            let doc = Arc::new(Mutex::new(NotesDoc::default()));
+            let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+            let merger: Merger<NotesDoc> = Arc::new(|local, remote| local.merge_from(remote));
+            let engine = FleetSyncEngine::<NotesDoc>::new(FleetSyncConfig {
+                kt,
+                device_id: device_id.to_string(),
+                state: Arc::clone(&doc),
+                merger,
+                replay_tracker: Arc::clone(&tracker),
+                content_store: cas,
+                publisher_tx: out_tx,
+                subscriber_rx: in_rx,
+                persist: Arc::new(NoopNotesPersist),
+                lookup_key_tag: b"notes-v1",
+                debounce_ms: DEFAULT_DEBOUNCE_MS,
+                publish_seen: true,
+                on_applied: None,
+                sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+            });
+            NotesEngine {
+                engine,
+                doc,
+                tracker,
+                out_rx,
+                in_tx,
+            }
+        }
+
+        /// Stand-in for the Zenoh hop: pump A's outbound frames into B's inbox
+        /// and vice versa until both engines shut down (or the task is aborted).
+        fn spawn_forwarder(
+            mut a_out: mpsc::Receiver<Vec<u8>>,
+            b_in: mpsc::Sender<Vec<u8>>,
+            mut b_out: mpsc::Receiver<Vec<u8>>,
+            a_in: mpsc::Sender<Vec<u8>>,
+        ) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        Some(f) = a_out.recv() => { let _ = b_in.send(f).await; }
+                        Some(f) = b_out.recv() => { let _ = a_in.send(f).await; }
+                        else => break,
+                    }
+                }
+            })
+        }
+
+        /// Bounded condition-polling — a deterministic readiness barrier, not a
+        /// fixed-sleep "assume ready" (the ZEB-459/ZEB-469 pattern).
+        async fn wait_until<F, Fut>(mut cond: F, timeout: Duration) -> bool
+        where
+            F: FnMut() -> Fut,
+            Fut: std::future::Future<Output = bool>,
+        {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if cond().await {
+                    return true;
+                }
+                if tokio::time::Instant::now() > deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn note_written_on_one_device_appears_on_the_sibling() {
+            let kt = Arc::new(KeyTree::derive(&[0x33u8; 32]).expect("kt"));
+            let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+            let a = build("dev-A", Arc::clone(&kt), Arc::clone(&cas));
+            let b = build("dev-B", Arc::clone(&kt), Arc::clone(&cas));
+            let fwd = spawn_forwarder(a.out_rx, b.in_tx, b.out_rx, a.in_tx);
+
+            let note = notes_upsert_core(&a.doc, &a.tracker, "dev-A", None, "buy milk".into())
+                .await
+                .expect("local upsert on A");
+            a.engine.flush_now().await.expect("flush A");
+
+            let b_doc = Arc::clone(&b.doc);
+            let id = note.id.clone();
+            let converged = wait_until(
+                || {
+                    let b_doc = Arc::clone(&b_doc);
+                    let id = id.clone();
+                    async move {
+                        notes_list_core(&b_doc)
+                            .await
+                            .iter()
+                            .any(|n| n.id == id && n.text == "buy milk")
+                    }
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(converged, "B never received A's note within 5s");
+
+            let _ = a.engine.shutdown().await;
+            let _ = b.engine.shutdown().await;
+            fwd.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn independent_notes_on_both_devices_converge_to_the_union() {
+            let kt = Arc::new(KeyTree::derive(&[0x44u8; 32]).expect("kt"));
+            let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+            let a = build("dev-A", Arc::clone(&kt), Arc::clone(&cas));
+            let b = build("dev-B", Arc::clone(&kt), Arc::clone(&cas));
+            let fwd = spawn_forwarder(a.out_rx, b.in_tx, b.out_rx, a.in_tx);
+
+            // Each device adds its own note while the other is "offline" (the
+            // frames cross only once both flush) — accumulate, no key collision.
+            let na = notes_upsert_core(&a.doc, &a.tracker, "dev-A", None, "from-A".into())
+                .await
+                .unwrap();
+            let nb = notes_upsert_core(&b.doc, &b.tracker, "dev-B", None, "from-B".into())
+                .await
+                .unwrap();
+            a.engine.flush_now().await.unwrap();
+            b.engine.flush_now().await.unwrap();
+
+            let a_doc = Arc::clone(&a.doc);
+            let b_doc = Arc::clone(&b.doc);
+            let (ia, ib) = (na.id.clone(), nb.id.clone());
+            let converged = wait_until(
+                || {
+                    let (a_doc, b_doc) = (Arc::clone(&a_doc), Arc::clone(&b_doc));
+                    let (ia, ib) = (ia.clone(), ib.clone());
+                    async move {
+                        let al = notes_list_core(&a_doc).await;
+                        let bl = notes_list_core(&b_doc).await;
+                        al.iter().any(|n| n.id == ia)
+                            && al.iter().any(|n| n.id == ib)
+                            && bl.iter().any(|n| n.id == ia)
+                            && bl.iter().any(|n| n.id == ib)
+                    }
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(
+                converged,
+                "both devices did not converge to the union of their notes within 5s"
+            );
+
+            let _ = a.engine.shutdown().await;
+            let _ = b.engine.shutdown().await;
+            fwd.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_edits_to_the_same_note_converge_over_the_wire() {
+            let kt = Arc::new(KeyTree::derive(&[0x55u8; 32]).expect("kt"));
+            let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+            let a = build("dev-A", Arc::clone(&kt), Arc::clone(&cas));
+            let b = build("dev-B", Arc::clone(&kt), Arc::clone(&cas));
+            let fwd = spawn_forwarder(a.out_rx, b.in_tx, b.out_rx, a.in_tx);
+
+            // Seed a shared note on A and let it replicate to B.
+            let seed = notes_upsert_core(&a.doc, &a.tracker, "dev-A", None, "v1".into())
+                .await
+                .unwrap();
+            a.engine.flush_now().await.unwrap();
+            let id = seed.id.clone();
+            {
+                let b_doc = Arc::clone(&b.doc);
+                let idc = id.clone();
+                assert!(
+                    wait_until(
+                        || {
+                            let b_doc = Arc::clone(&b_doc);
+                            let idc = idc.clone();
+                            async move { notes_list_core(&b_doc).await.iter().any(|n| n.id == idc) }
+                        },
+                        Duration::from_secs(5),
+                    )
+                    .await,
+                    "seed note did not replicate to B"
+                );
+            }
+
+            // Concurrent edits to the SAME id on both devices. The real
+            // HLC-minting write path decides the winner; both sides must agree.
+            notes_upsert_core(
+                &a.doc,
+                &a.tracker,
+                "dev-A",
+                Some(id.clone()),
+                "edited-by-A".into(),
+            )
+            .await
+            .unwrap();
+            notes_upsert_core(
+                &b.doc,
+                &b.tracker,
+                "dev-B",
+                Some(id.clone()),
+                "edited-by-B".into(),
+            )
+            .await
+            .unwrap();
+            a.engine.flush_now().await.unwrap();
+            b.engine.flush_now().await.unwrap();
+
+            let a_doc = Arc::clone(&a.doc);
+            let b_doc = Arc::clone(&b.doc);
+            let idc = id.clone();
+            let converged = wait_until(
+                || {
+                    let (a_doc, b_doc, idc) = (Arc::clone(&a_doc), Arc::clone(&b_doc), idc.clone());
+                    async move {
+                        let at = notes_list_core(&a_doc)
+                            .await
+                            .into_iter()
+                            .find(|n| n.id == idc)
+                            .map(|n| n.text);
+                        let bt = notes_list_core(&b_doc)
+                            .await
+                            .into_iter()
+                            .find(|n| n.id == idc)
+                            .map(|n| n.text);
+                        match (at, bt) {
+                            (Some(at), Some(bt)) => {
+                                at == bt && (at == "edited-by-A" || at == "edited-by-B")
+                            }
+                            _ => false,
+                        }
+                    }
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(
+                converged,
+                "concurrent edits did not converge to a single LWW winner on both devices"
+            );
+
+            let _ = a.engine.shutdown().await;
+            let _ = b.engine.shutdown().await;
+            fwd.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn delete_on_one_device_tombstones_on_the_sibling() {
+            let kt = Arc::new(KeyTree::derive(&[0x66u8; 32]).expect("kt"));
+            let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+            let a = build("dev-A", Arc::clone(&kt), Arc::clone(&cas));
+            let b = build("dev-B", Arc::clone(&kt), Arc::clone(&cas));
+            let fwd = spawn_forwarder(a.out_rx, b.in_tx, b.out_rx, a.in_tx);
+
+            let note = notes_upsert_core(&a.doc, &a.tracker, "dev-A", None, "ephemeral".into())
+                .await
+                .unwrap();
+            a.engine.flush_now().await.unwrap();
+            let id = note.id.clone();
+
+            // Replicate the create to B before deleting.
+            {
+                let b_doc = Arc::clone(&b.doc);
+                let idc = id.clone();
+                assert!(
+                    wait_until(
+                        || {
+                            let b_doc = Arc::clone(&b_doc);
+                            let idc = idc.clone();
+                            async move { notes_list_core(&b_doc).await.iter().any(|n| n.id == idc) }
+                        },
+                        Duration::from_secs(5),
+                    )
+                    .await,
+                    "note did not replicate to B before delete"
+                );
+            }
+
+            // Delete on A; B must converge to NOT listing it (tombstone wins).
+            let deleted = notes_delete_core(&a.doc, &a.tracker, "dev-A", id.clone())
+                .await
+                .unwrap();
+            assert!(deleted, "deleting a live note returns Ok(true)");
+            a.engine.flush_now().await.unwrap();
+
+            let b_doc = Arc::clone(&b.doc);
+            let idc = id.clone();
+            let converged = wait_until(
+                || {
+                    let b_doc = Arc::clone(&b_doc);
+                    let idc = idc.clone();
+                    async move { !notes_list_core(&b_doc).await.iter().any(|n| n.id == idc) }
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(
+                converged,
+                "B still lists the note A deleted (tombstone did not propagate)"
+            );
+
+            let _ = a.engine.shutdown().await;
+            let _ = b.engine.shutdown().await;
+            fwd.abort();
+        }
+    }
 }
