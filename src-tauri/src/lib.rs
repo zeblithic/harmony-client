@@ -44012,12 +44012,13 @@ async fn set_community_relay_opt_in(
     set_community_relay_opt_in_impl(state.inner(), community_id_hex, opted_in).await
 }
 
-/// ZEB-458 P4 Phase B (D43): read-only IPC reporting whether this owner's fleet
-/// is currently opted in to relaying for `community_id_hex`.
-#[tauri::command]
-async fn get_community_relay_status(
+/// ZEB-458 P4 / ZEB-487: NodeState-level core of `get_community_relay_status`,
+/// shared by the GUI Tauri command and the headless RPC. Read-only report of
+/// whether this owner's fleet is currently opted in to relaying for
+/// `community_id_hex`.
+pub(crate) async fn get_community_relay_status_impl(
+    state: &Mutex<NodeState>,
     community_id_hex: String,
-    state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
     let community_id = crate::owner_state_types::SpaceId(parse_space_id_16(&community_id_hex)?);
     let doc = {
@@ -44030,6 +44031,17 @@ async fn get_community_relay_status(
     };
     let opted_in = doc.lock().await.is_opted_in(&community_id);
     Ok(opted_in)
+}
+
+/// ZEB-458 P4 Phase B (D43): read-only IPC reporting whether this owner's fleet
+/// is currently opted in to relaying for `community_id_hex`. Thin wrapper over
+/// `get_community_relay_status_impl`.
+#[tauri::command]
+async fn get_community_relay_status(
+    community_id_hex: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    get_community_relay_status_impl(state.inner(), community_id_hex).await
 }
 
 pub fn run() {
