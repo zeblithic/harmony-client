@@ -158,6 +158,53 @@ impl KeyTree {
             friend_aead,
         })
     }
+
+    /// Export this KeyTree's key material for sealed distribution to an
+    /// enrolled device. Only the seed-holding (inviter) device calls this.
+    pub fn to_fleet_material(&self, epoch: u32) -> FleetKeyMaterial {
+        FleetKeyMaterial {
+            epoch,
+            entry_aead: *self.entry_aead,
+            root_aead: *self.root_aead,
+            lookup: *self.lookup,
+            nonce: *self.nonce,
+            friend_aead: *self.friend_aead,
+        }
+    }
+
+    /// Reconstruct a KeyTree from distributed material (cert-only device, which
+    /// has no master seed to re-derive from). Produces a KeyTree byte-identical
+    /// to the originating seed-holder's.
+    pub fn from_fleet_material(m: &FleetKeyMaterial) -> Self {
+        Self {
+            entry_aead: Zeroizing::new(m.entry_aead),
+            root_aead: Zeroizing::new(m.root_aead),
+            lookup: Zeroizing::new(m.lookup),
+            nonce: Zeroizing::new(m.nonce),
+            friend_aead: Zeroizing::new(m.friend_aead),
+        }
+    }
+}
+
+/// Serializable export of a `KeyTree`'s raw key material, for sealed
+/// distribution to cert-only enrolled devices (ZEB-492). Carries an explicit
+/// `epoch` so a future KeyTree rotation is non-breaking (rotation itself is
+/// out of scope — see the ZEB-492 spec).
+///
+/// SECURITY: this is the ONLY place `KeyTree` key bytes leave the type. No
+/// `Debug` (would print key material). `ZeroizeOnDrop` wipes the key fields on
+/// drop. Only ever moved through the SAS-sealed pairing channel and the
+/// encrypted vault. Mirrors the `SecretVault` pattern (plain `[u8;32]` serde
+/// fields + struct-level zeroize).
+#[derive(serde::Serialize, serde::Deserialize, zeroize::ZeroizeOnDrop)]
+pub struct FleetKeyMaterial {
+    #[zeroize(skip)]
+    pub epoch: u32,
+    entry_aead: [u8; 32],
+    root_aead: [u8; 32],
+    lookup: [u8; 32],
+    nonce: [u8; 32],
+    friend_aead: [u8; 32],
 }
 
 /// Derive the per-space Prolly Tree lookup key.
@@ -1012,5 +1059,57 @@ mod tests {
             canonical_cbor_decode(&recovered_replay).expect("decode replay");
         let result = tracker_b.try_accept(&recovered_at_2);
         assert!(matches!(result, Err(CryptoError::ReplayRejected(d)) if d == "device-a"));
+    }
+
+    #[test]
+    fn fleet_material_round_trips_to_identical_keytree() {
+        let seed = [0x42u8; 32];
+        let kt = KeyTree::derive(&seed).unwrap();
+        let material = kt.to_fleet_material(0);
+        assert_eq!(material.epoch, 0);
+        let kt2 = KeyTree::from_fleet_material(&material);
+        let lk1 = space_lookup_key(&kt, b"notes-v1");
+        let lk2 = space_lookup_key(&kt2, b"notes-v1");
+        assert_eq!(lk1.as_slice(), lk2.as_slice());
+        let lk = space_lookup_key(&kt, b"dm-inbox-v1");
+        let ct = encrypt_entry(&kt, &lk, b"hello fleet").unwrap();
+        let pt = decrypt_entry(&kt2, &lk, &ct).unwrap();
+        assert_eq!(pt, b"hello fleet");
+        let fid = [9u8; 16];
+        let secret = [3u8; 32];
+        let sealed = encrypt_friend_secret(&kt, &fid, &secret).unwrap();
+        let opened = decrypt_friend_secret(&kt2, &fid, &sealed).unwrap();
+        assert_eq!(opened.as_slice(), &secret);
+        // root_aead is the only sub-key not exercised by the entry/friend
+        // paths above; round-trip it source(kt)->target(kt2) too so a
+        // dropped/swapped/corrupted root_aead in to/from_fleet_material is
+        // detectable. Brings all 5 sub-keys under source->target validation.
+        let root_blob = encrypt_root_publish(&kt, b"root pointer").unwrap();
+        let root_pt = decrypt_root_publish(&kt2, &root_blob).unwrap();
+        assert_eq!(root_pt, b"root pointer");
+    }
+
+    #[test]
+    fn fleet_material_cbor_round_trips() {
+        let kt = KeyTree::derive(&[7u8; 32]).unwrap();
+        let m = kt.to_fleet_material(0);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&m, &mut buf).unwrap();
+        let back: FleetKeyMaterial = ciborium::from_reader(buf.as_slice()).unwrap();
+        let kt_back = KeyTree::from_fleet_material(&back);
+        let lk = space_lookup_key(&kt, b"x");
+        let ct = encrypt_entry(&kt, &lk, b"z").unwrap();
+        assert_eq!(decrypt_entry(&kt_back, &lk, &ct).unwrap(), b"z");
+    }
+
+    #[test]
+    fn fleet_material_from_different_seed_cannot_decrypt() {
+        let kt_a = KeyTree::derive(&[1u8; 32]).unwrap();
+        let kt_b = KeyTree::derive(&[2u8; 32]).unwrap();
+        let lk = space_lookup_key(&kt_a, b"notes-v1");
+        let ct = encrypt_entry(&kt_a, &lk, b"secret").unwrap();
+        let kt_b2 = KeyTree::from_fleet_material(&kt_b.to_fleet_material(0));
+        let lk_b = space_lookup_key(&kt_b2, b"notes-v1");
+        assert!(decrypt_entry(&kt_b2, &lk_b, &ct).is_err());
     }
 }
