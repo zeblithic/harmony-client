@@ -147,6 +147,31 @@ it travelled via the relay deposit. If `get_relay_held` never shows the entry, c
 R's `<app-data>/profiles/xwan/logs/` + A's outbox logs and file a finding (likely a
 relay resolve/dial issue cross-NAT) — do not call it PASS.
 
+### Scenario D3 — offline-at-create → butler deposit → recover (ZEB-489 / ZEB-483 durability)
+
+Same durability proof as D2, but the deposit lands on the recipient's **own butler**
+device (ZEB-418) instead of a community sealed-relay. **Roles:** A = **Ildwyn**
+(sender, 1 device). R = **AVALON** (recipient), running **two local profiles** in one
+fleet — primary `P` + butler `B2`. (Baseline keeps both recipient devices on AVALON via
+local pairing, sidestepping cross-WAN pairing. Optional 3-machine variant: run `B2` on
+Koya.) HELD ∧ RECV ∧ CLEARED by construction: P is killed before the send, so the tunnel
+cannot carry it; the deposit lands on B2, and P recovers it on reconnect.
+
+**Setup (AVALON):**
+1. Mint `P`: `harmony-app --profile p serve --api-port 7421` then `... api mint_owner_identity`; `get_owner_state` → `OWNER-P`.
+2. Pair `B2` into P's fleet (second profile, second `serve`): drive the ZEB-446 pairing RPCs — `start_inviter_pairing` on P / `start_joiner_pairing` on B2, `select_pairing_peer`, `confirm_pairing_sas` (SAS match), poll `get_pairing_state` until both report enrolled. `B2` is now a second enrolled device under P's owner.
+3. On P: `set_butler_pin '{"deviceId":"<B2 device id>"}'` (B2's 64-hex enrolled key, from P's device view). `get_butler_pin` → confirms `pinnedDeviceId == <B2>`.
+
+**Run:**
+4. **A (Ildwyn):** friend P (`generate_friend_token` → P `redeem_friend_token`; both `list_friends` → active). `add_space` (DM) with P → `SPACE`.
+5. **Kill P** (real PID kill — `kill <pid>` / `Stop-Process -Force`, never just close a window).
+6. **A:** `send_dm` to P while P is offline → the deposit rung fires after `DEPOSIT_NOACK_WINDOWS=2`; it lands on **B2** (P's online butler).
+7. **B2:** poll `get_butler_held` until the entry appears — **HELD** (`senderOwnerHex == OWNER-A`, `spaceIdHex`/`messageCidHex` present, `ingestedByDevices` does NOT yet contain P).
+8. **Relaunch P** (same `--profile p serve`). P auto-recovers (startup inbox sweep + fleet merge → `apply_deposited_invite` bootstrap).
+9. **B2:** `get_butler_held` now shows `ingestedByDevices` containing P's device id (or the entry GC'd) — **CLEARED**. **P:** `read_dm_thread` shows A's plaintext — **RECV**. Post `DONE D3 PASS`.
+
+**PASS** = `HELD` (on B2 while P offline) ∧ `RECV` (on P after reconnect) ∧ `CLEARED` (on B2 after recovery). If `get_butler_held` never shows the entry, capture both AVALON profiles' logs + A's outbox logs and file a finding under ZEB-489 / ZEB-321 — do not call it PASS. Bring-up/discovery run, not a regression gate.
+
 ## Artifacts on failure
 
 Each agent collects, into a run directory it reports back:

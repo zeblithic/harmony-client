@@ -133,6 +133,8 @@ pub mod community_relay_resolver;
 // ZEB-487: read-only DTO + mapper for the headless `get_relay_held` RPC.
 pub mod community_state_crdt;
 pub mod relay_held_dto;
+// ZEB-489: read-only DTOs + mapper for the headless butler observability RPCs.
+pub mod butler_held_dto;
 // ZEB-458 P4 Phase B: on-disk persistence for the two relay fleet datasets.
 pub mod community_state_persist;
 pub mod community_state_sync;
@@ -43815,19 +43817,18 @@ pub(crate) async fn set_butler_pin_inner(
     Ok(())
 }
 
-/// ZEB-418 P2 D17: IPC to set or clear the pinned butler device.
+/// ZEB-489: NodeState-level core of `set_butler_pin`, shared by the GUI Tauri
+/// command and the headless RPC.
 ///
-/// `device_id`: `Some(hex)` → pin; `null` (JS) / `None` (Rust) → clear.
-/// Validates that the supplied id is in the current enrolled set.  Writes
-/// through the fleet-net doc (LWW-correct stamp), updates the sync snapshot,
-/// notifies the engine, and flushes. Flush errors are log-warn only — the
-/// dirty latch retries. Finishes by firing the routing-republish trigger so
-/// the pkarr-advertised butler set reflects the new pin immediately (local
+/// `device_id`: `Some(hex)` → pin; `None` → clear. Validates the id is in the
+/// current enrolled set, writes through the fleet-net doc (LWW-correct stamp),
+/// refreshes the sync snapshot, notifies the engine, flushes (log-warn only on
+/// failure — the dirty latch retries), and fires the routing-republish trigger
+/// so the pkarr-advertised butler set reflects the new pin immediately (local
 /// writes bypass the `on_applied` debounce path).
-#[tauri::command]
-async fn set_butler_pin(
+pub(crate) async fn set_butler_pin_impl(
+    state: &Mutex<NodeState>,
     device_id: Option<String>,
-    state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
     // Snapshot the handles needed (fleet_net_doc, fleet_net_sync, enrolled
     // set, device_id, snapshot arc, republish trigger) from the NodeState
@@ -43912,6 +43913,77 @@ async fn set_butler_pin(
         rp();
     }
     Ok(())
+}
+
+/// ZEB-418 P2 D17 / ZEB-489: IPC to set or clear the pinned butler device. Thin
+/// wrapper over `set_butler_pin_impl` (GUI + headless RPC share it). `device_id`:
+/// `Some(hex)` → pin; `null`/`None` → clear.
+#[tauri::command]
+async fn set_butler_pin(
+    device_id: Option<String>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    set_butler_pin_impl(state.inner(), device_id).await
+}
+
+/// ZEB-489: NodeState-level core of the headless `get_butler_pin` RPC.
+/// Read-only report of this fleet's currently pinned butler device (none →
+/// `pinned_device_id: None`). Headless-only — the GUI reads `fleet_net_doc`
+/// directly, so there is no `#[tauri::command]` wrapper (mirrors `get_relay_held`).
+pub(crate) async fn get_butler_pin_impl(
+    state: &Mutex<NodeState>,
+) -> Result<crate::butler_held_dto::ButlerPinStatus, String> {
+    let doc = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.fleet_net_doc
+            .clone()
+            .ok_or_else(|| "get_butler_pin: fleet-net not running (node not started)".to_string())?
+    };
+    let (pinned_device_id, pinned_at_ms) = {
+        let g = doc.lock().await;
+        let pinned = g.pinned.clone();
+        // Report the stamp only when a butler is actually pinned AND the HLC is a
+        // real (non-sentinel) value. A never-set/cleared pin has wall_ms=0, which
+        // would read as a bogus 1970 timestamp (Qodo). The explicit `!= 0` filter
+        // makes the suppression self-contained rather than relying on the
+        // implicit "pinned ⇒ non-zero stamp" invariant (CodeRabbit).
+        let at = pinned
+            .as_ref()
+            .map(|_| g.pinned_at.wall_ms)
+            .filter(|&ms| ms != 0);
+        (pinned, at)
+    };
+    Ok(crate::butler_held_dto::ButlerPinStatus {
+        pinned_device_id,
+        pinned_at_ms,
+    })
+}
+
+/// ZEB-489: read-only observability over the butler dm-inbox doc. Reports the
+/// deposits this node (as a fleet butler) is holding for offline fleet-mates as
+/// routing metadata only — the sealed/bulky payload (cidnotify/storage/invite)
+/// is never exposed.
+pub(crate) async fn get_butler_held_impl(
+    state: &Mutex<NodeState>,
+) -> Result<crate::butler_held_dto::ButlerHeldResponse, String> {
+    let doc = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.dm_inbox_doc
+            .clone()
+            .ok_or_else(|| "get_butler_held: dm-inbox not running (node not started)".to_string())?
+    };
+    // Map directly from the guard — do NOT clone the whole DmInboxDoc (which
+    // would deep-copy every entry's sealed payload). The map is sync (no .await
+    // while the lock is held), so the hold is brief.
+    let held = {
+        let guard = doc.lock().await;
+        crate::butler_held_dto::map_butler_held(&guard)
+    };
+    Ok(crate::butler_held_dto::ButlerHeldResponse { held })
 }
 
 /// ZEB-458 P4 Phase B (D43): unit-testable core of `set_community_relay_opt_in`.
