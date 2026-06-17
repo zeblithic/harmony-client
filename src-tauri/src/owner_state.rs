@@ -1282,7 +1282,11 @@ mod persistence_tests {
         // The LIVE read now sees BOTH devices, including the post-boot one — no
         // restart required.
         let after_pair = read_enrolled_device_vk_hex(dir.path()).unwrap();
-        assert_eq!(after_pair.len(), 2, "live read sees the post-boot device too");
+        assert_eq!(
+            after_pair.len(),
+            2,
+            "live read sees the post-boot device too"
+        );
         assert!(
             after_pair.contains(&new_device_vk_hex),
             "freshly-paired device's vk hex must be in the live enrolled set"

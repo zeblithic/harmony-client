@@ -1421,10 +1421,16 @@ mod tests {
 
         let (inviter_t, joiner_t) = InMemoryBroker::pair();
         let test_interval = Duration::from_secs(60);
-        let inviter_handle =
-            spawn_state_machine(Arc::new(inviter_t), fixed_clock(1_700_000_001), test_interval);
-        let joiner_handle =
-            spawn_state_machine(Arc::new(joiner_t), fixed_clock(1_700_000_002), test_interval);
+        let inviter_handle = spawn_state_machine(
+            Arc::new(inviter_t),
+            fixed_clock(1_700_000_001),
+            test_interval,
+        );
+        let joiner_handle = spawn_state_machine(
+            Arc::new(joiner_t),
+            fixed_clock(1_700_000_002),
+            test_interval,
+        );
 
         inviter_handle
             .cmd_tx
@@ -1526,8 +1532,7 @@ mod tests {
     /// un-awaited persist lacked (a fast restart could lose the enrollment).
     #[tokio::test]
     async fn inviter_waits_for_persist_ack_before_complete() {
-        let (mut inviter_handle, _joiner_handle, _state) =
-            drive_paired_to_inviter_handoff().await;
+        let (mut inviter_handle, _joiner_handle, _state) = drive_paired_to_inviter_handoff().await;
 
         // Pull the handoff off the channel. Until we ack it, the inviter must
         // stay at Enrolling.
@@ -1587,8 +1592,7 @@ mod tests {
     /// the user is never told a pairing succeeded that isn't durably on disk.
     #[tokio::test]
     async fn inviter_fails_when_persist_ack_errors() {
-        let (mut inviter_handle, _joiner_handle, _state) =
-            drive_paired_to_inviter_handoff().await;
+        let (mut inviter_handle, _joiner_handle, _state) = drive_paired_to_inviter_handoff().await;
 
         let mut irx = inviter_handle.inviter_result_rx.take().expect("inviter rx");
         let handoff = timeout(Duration::from_secs(2), irx.recv())
