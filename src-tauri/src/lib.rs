@@ -130,7 +130,9 @@ pub mod community_relay_publisher;
 pub mod community_relay_pull;
 pub mod community_relay_pull_driver;
 pub mod community_relay_resolver;
+// ZEB-487: read-only DTO + mapper for the headless `get_relay_held` RPC.
 pub mod community_state_crdt;
+pub mod relay_held_dto;
 // ZEB-458 P4 Phase B: on-disk persistence for the two relay fleet datasets.
 pub mod community_state_persist;
 pub mod community_state_sync;
