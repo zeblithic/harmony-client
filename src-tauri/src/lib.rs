@@ -44046,6 +44046,30 @@ async fn get_community_relay_status(
     get_community_relay_status_impl(state.inner(), community_id_hex).await
 }
 
+/// ZEB-487: read-only observability over the relay-hold doc. Reports the
+/// blobs this node (as a community relay) is holding for offline recipients,
+/// optionally filtered to one community. Sealed blobs are never opened.
+pub(crate) async fn get_relay_held_impl(
+    state: &Mutex<NodeState>,
+    community_id_hex: Option<String>,
+) -> Result<crate::relay_held_dto::RelayHeldResponse, String> {
+    let filter = match community_id_hex {
+        Some(h) => Some(crate::owner_state_types::SpaceId(parse_space_id_16(&h)?)),
+        None => None,
+    };
+    let doc = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.relay_hold_doc.clone().ok_or_else(|| {
+            "get_relay_held: relay-hold not running (node not started)".to_string()
+        })?
+    };
+    let snapshot = doc.lock().await.clone();
+    let held = crate::relay_held_dto::map_relay_held(&snapshot, filter.as_ref());
+    Ok(crate::relay_held_dto::RelayHeldResponse { held })
+}
+
 pub fn run() {
     // ZEB-446: GUI launches honor HARMONY_PROFILE (a --profile flag arrives
     // via main.rs, which already activated — this call is then a no-op).

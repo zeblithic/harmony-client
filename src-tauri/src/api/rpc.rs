@@ -209,6 +209,14 @@ struct CommunityIdHexArgs {
     community_id_hex: String,
 }
 
+/// ZEB-487: optional community filter for the relay-held observability read.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetRelayHeldArgs {
+    #[serde(default)]
+    community_id_hex: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayNameArgs {
@@ -452,6 +460,12 @@ pub fn build_registry() -> RpcRegistry {
         |state, _sink, a| async move {
             crate::get_community_relay_status_impl(state, a.community_id_hex).await
         }
+    );
+    rpc!(
+        m,
+        "get_relay_held",
+        GetRelayHeldArgs,
+        |state, _sink, a| async move { crate::get_relay_held_impl(state, a.community_id_hex).await }
     );
 
     // Connectivity.
@@ -845,6 +859,7 @@ mod tests {
             // relay rung (ZEB-487)
             "set_community_relay_opt_in",
             "get_community_relay_status",
+            "get_relay_held",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_list_peer_reachability",
