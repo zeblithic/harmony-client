@@ -49,16 +49,19 @@ The single auditable serialization surface for KeyTree key material.
 /// (rotation/re-encryption itself is out of scope — see ZEB-492 §Scope).
 ///
 /// SECURITY: this is the ONLY place KeyTree key bytes leave the type.
-/// No `Debug`. All fields `Zeroizing`. Only ever moved through the
-/// SAS-sealed pairing channel and the encrypted vault slot.
-#[derive(Serialize, Deserialize)]
+/// No `Debug`. `ZeroizeOnDrop` wipes the key fields on drop. Only ever
+/// moved through the SAS-sealed pairing channel and the encrypted vault.
+/// Mirrors the existing `SecretVault` pattern (plain `[u8;32]` serde
+/// fields + struct-level zeroize) rather than per-field `Zeroizing`.
+#[derive(Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
 pub struct FleetKeyMaterial {
-    pub epoch: u32,
-    entry_aead: Zeroizing<[u8; 32]>,
-    root_aead: Zeroizing<[u8; 32]>,
-    lookup: Zeroizing<[u8; 32]>,
-    nonce: Zeroizing<[u8; 32]>,
-    friend_aead: Zeroizing<[u8; 32]>,
+    #[zeroize(skip)]
+    pub epoch: u32, // not secret
+    entry_aead: [u8; 32],
+    root_aead: [u8; 32],
+    lookup: [u8; 32],
+    nonce: [u8; 32],
+    friend_aead: [u8; 32],
 }
 ```
 
@@ -103,9 +106,13 @@ The block body is unchanged; only how `kt` is obtained changes. The `seed` bindi
 
 ### 4. Persistence (`identity.rs`, `owner_state.rs`, `pairing/persist.rs`)
 
-- Add `VaultSlot::FleetKeytree` (`identity.rs:1279`).
-- `install_joiner_state_inner` (`persist.rs:38`) persists `result.fleet_keytree` (when `Some`) via the same `load_secret`/save path used for the device key and seed (keychain or per-profile encrypted-file vault). The serialized `FleetKeyMaterial` (CBOR) is the secret payload.
-- `load_owner_state` (`owner_state.rs:386`) reloads it into a new `LoadedOwnerState.fleet_keytree: Option<FleetKeyMaterial>` field (load is best-effort: absent slot → `None`, not an error).
+The existing `load_secret`/`save_secret` path is **32-byte-only** (the consolidated keychain vault's `VaultSlot` accessors and the per-slot v0x01 encrypted files both assume `[u8;32]`). The KeyTree material is ~161 bytes, so it needs a variable-length path. Both backends already have the primitives for this:
+
+- **Keychain path:** add a variable-length `fleet_keytree: Option<Vec<u8>>` field to `SecretVault` (`identity.rs:423`, `#[serde(default)]`, no `VAULT_VERSION` bump — absence decodes to `None`). It rides the consolidated vault's existing variable-length `v0x02` envelope. Add dedicated `vault_{load,save,clear}_fleet_keytree` accessors (parallel to the 32-byte `vault_*_slot`, but `&[u8]`/`Vec<u8>`).
+- **Encrypted-file fallback** (keychain-less, `HARMONY_PASSPHRASE` — the path the `--profile` e2e harness uses): a standalone `fleet_keytree.enc` written/read with the existing generic `encrypt_vault(passphrase, &[u8])` / `decrypt_v2_plaintext` helpers (already variable-length; reused, not reimplemented).
+- Wrap both behind `owner_state::{save,load}_fleet_keytree(keychain, identity_dir, ...)`, mirroring `save_secret`/`load_secret`'s keychain-preferred + file-fallback orchestration. The persisted payload is the CBOR of `FleetKeyMaterial`.
+- `install_joiner_state_inner` (`persist.rs:38`) calls `save_fleet_keytree` when `result.fleet_keytree.is_some()`.
+- `load_owner_state` (`owner_state.rs:386`) reloads via `load_fleet_keytree` into a new `LoadedOwnerState.fleet_keytree: Option<FleetKeyMaterial>` field (best-effort: absent → `None`, not an error).
 - The inviter (seed-holder) does **not** persist a separate fleet KeyTree — it re-derives from the seed on every boot. Only cert-only joiners persist material.
 
 ## Data flow
@@ -155,8 +162,8 @@ Cert-only devices can never be inviters (no seed → `sign_enrollment_for_joiner
 
 - `src-tauri/src/owner_state_crypto.rs` — `FleetKeyMaterial`, `KeyTree::to_fleet_material` / `from_fleet_material`, unit tests.
 - `src-tauri/src/lib.rs` — boot-gate refactor at ~3730.
-- `src-tauri/src/owner_state.rs` — `LoadedOwnerState.fleet_keytree`, load in `load_owner_state`.
-- `src-tauri/src/identity.rs` — `VaultSlot::FleetKeytree`.
+- `src-tauri/src/owner_state.rs` — `LoadedOwnerState.fleet_keytree`, `save_fleet_keytree`/`load_fleet_keytree`, load in `load_owner_state`.
+- `src-tauri/src/identity.rs` — `SecretVault.fleet_keytree` field + `vault_{load,save,clear}_fleet_keytree` accessors (variable-length; reuse `encrypt_vault`/`decrypt_v2_plaintext` for the file fallback).
 - `src-tauri/src/pairing/state_machine.rs` — `JoinerEnrollResult.fleet_keytree`, inviter populate.
 - `src-tauri/src/pairing/persist.rs` — `install_joiner_state` persists material; integration test.
 - `e2e-harness/` — `s7_butler_deposit_recover` upgraded from characterize to assert.
