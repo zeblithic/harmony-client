@@ -574,7 +574,14 @@ pub async fn get_relay_held(node: &NodeHandle, community_id: Option<&str>) -> an
         None => json!({}),
     };
     let v = node.rpc("get_relay_held", args).await?;
-    Ok(v.get("held").and_then(Value::as_array).cloned().unwrap_or_default())
+    // A missing/non-array `held` is a broken response CONTRACT, not "no deposits":
+    // surface it as an error so s6's characterize fallback can't mask a broken
+    // get_relay_held by reading it as held=false (Qodo round-1 fix).
+    let held = v
+        .get("held")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("get_relay_held response missing 'held' array: {v}"))?;
+    Ok(held.clone())
 }
 ```
 
@@ -738,10 +745,13 @@ async fn s6_relay_deposit_recover() {
     b = b.relaunch().await.expect("relaunch b");
 
     // --- ASSERTION 2 (RECV): a's plaintext shows up in b's thread post-reconnect.
-    //     b learns the space id from the bootstrapped Space; read tolerant of the
-    //     a-side id (canonicalizes to min after merge).
+    //     b had no DM Space before going offline; apply_deposited_invite bootstraps
+    //     it PINNED to a's space_id (a_space), and b has no competing same-member
+    //     space to canonicalize against -- so b reads under a_space. Use the
+    //     candidate-tolerant helper anyway (matches the other DM tests + tolerant of
+    //     UnknownSpace while the recovered thread settles).
     let recovered = poll_until(Duration::from_secs(90), || async {
-        let msgs = read_dm_plaintext(&b, &a_space).await.unwrap_or_default();
+        let msgs = read_dm_plaintext_any(&b, &[a_space.as_str()]).await.unwrap_or_default();
         Ok(msgs.iter().any(|(_, body)| body == b"durable-hello").then_some(()))
     })
     .await;
