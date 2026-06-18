@@ -28,13 +28,36 @@ runs:
     - name: apt-get install Tauri Linux deps
       shell: bash
       run: |
-        set -euo pipefail
-        sudo apt-get update
-        sudo apt-get install -y \
-          libgtk-3-dev \
-          libwebkit2gtk-4.1-dev \
-          libayatana-appindicator3-dev \
-          librsvg2-dev \
-          libssl-dev \
-          libsoup-3.0-dev \
-          libjavascriptcoregtk-4.1-dev
+        # ZEB-498: a hung/throttled apt mirror has made this step run up to
+        # 45 min and blow the CI job timeout (observed on PR #287, where apt
+        # alone consumed the whole 45-min budget before clippy even started).
+        # Cap per-connection timeouts so a bad mirror fails fast, and retry the
+        # whole update+install up to 3x with an 8-min per-attempt wall-clock cap
+        # instead of hanging. Bootstraps: even this step's own first run is
+        # protected. Worst case 3x8m=24m << the job timeout, vs an unbounded hang.
+        set -uo pipefail
+        run_apt() {
+          sudo apt-get -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+        }
+        export -f run_apt
+        for attempt in 1 2 3; do
+          echo "apt deps install — attempt $attempt"
+          if timeout 480 bash -c 'set -e; run_apt'; then
+            echo "Tauri Linux deps installed on attempt $attempt"
+            exit 0
+          fi
+          echo "::warning::apt attempt $attempt failed or timed out (>8m); retrying in 15s"
+          sleep 15
+        done
+        echo "::error::Tauri Linux deps install failed after 3 attempts"
+        exit 1
