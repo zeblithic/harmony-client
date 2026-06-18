@@ -25597,7 +25597,15 @@ mod zeb436_orphan_adoption_tests {
             admin_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
-            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA1).cert),
+            // ZEB-497: the inviter_enrollment cert is now cryptographically
+            // verified on the redeem path (cert.owner_id must equal
+            // invite_token.inviter, and the token must be signed by the cert's
+            // enrolled device key). Use the admin's real cert — admin_addr,
+            // invite_token.inviter, and the admin_bootstrap are all already this
+            // same `admin_owner` — so a genuine invite passes the gate. (A
+            // throwaway `mint_test_owner(0xA1).cert` would fail with
+            // InviterEnrollmentOwnerMismatch.)
+            inviter_enrollment: Some(admin_owner.cert.clone()),
             untargeted_decrypt_key: None,
         };
         let invite_url =
