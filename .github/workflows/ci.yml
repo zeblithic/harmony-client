@@ -28,6 +28,12 @@ env:
   SCCACHE_ENDPOINT: https://1ba234d340e59c6bba1e0fe90b7db8db.r2.cloudflarestorage.com
   SCCACHE_REGION: auto
   SCCACHE_S3_KEY_PREFIX: harmony-client
+  # ZEB-499: keep the sccache server alive for the whole job. Its default 600s
+  # idle timeout otherwise expires during rust-test's long *test-execution*
+  # phase (no rustc calls after the binaries compile), so the server shuts down
+  # and the final `sccache --show-stats` spins up a fresh one reporting 0 — the
+  # compiles still cached to R2, but the telemetry was lost. 0 = never idle-out.
+  SCCACHE_IDLE_TIMEOUT: '0'
 
 # Least-privilege GITHUB_TOKEN: this workflow only checks out code and runs
 # local validation commands — it never writes to the repo, opens PRs, posts
