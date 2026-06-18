@@ -25,7 +25,7 @@ harmony wired sccache→R2 into its **Nix devShell** (`flake.nix`: `RUSTC_WRAPPE
 
 ### sccache configuration (env on the 3 Rust jobs)
 
-```
+```yaml
 RUSTC_WRAPPER:           sccache          # exported only when creds present (see degradation)
 CARGO_INCREMENTAL:       '0'              # already global from slice 1 — required by sccache
 SCCACHE_BUCKET:          harmony-sccache

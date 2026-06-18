@@ -464,6 +464,11 @@ caches third-party dependency artifacts). See ZEB-499.
   harmony repo, which shares the bucket).
 - `CARGO_INCREMENTAL=0` is required — incremental artifacts are not cacheable
   by sccache.
+- `SCCACHE_IDLE_TIMEOUT=0` keeps the sccache server alive for the whole job.
+  Its 600s default otherwise expires during `rust-test`'s long
+  test-execution phase, so the server self-terminates and the end-of-job
+  `sccache --show-stats` spins up a fresh one reporting zeros (the compiles
+  still cached to R2 — only the telemetry was lost).
 - `Swatinem/rust-cache` is kept with `cache-targets: false` to warm `~/.cargo`
   (the crates.io index/downloads), which sccache does not cache. We no longer
   cache `target/` — R2 owns compiled artifacts, which also removed the 10 GB
@@ -489,9 +494,12 @@ then revoke the old token.
 
 ## Verifying it works
 
-Each Rust job ends with `sccache --show-stats`. On a PR that doesn't change
-Rust source, expect a high cache-hit rate; the first `main` run after a
-dependency or source change is mostly misses (it uploads to R2 for next time).
+Each Rust job ends with `sccache --show-stats` and, when non-empty, dumps
+`SCCACHE_ERROR_LOG` in a collapsed group — so backend/auth/network failures
+(e.g. a bad R2 credential) are visible in the log, not just counted under
+`Cache errors`. On a PR that doesn't change Rust source, expect a high
+cache-hit rate; the first `main` run after a dependency or source change is
+mostly misses (it uploads to R2 for next time).
 ```
 
 **Step 2: Update the CLAUDE.md sccache note**
