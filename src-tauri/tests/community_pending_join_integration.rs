@@ -87,7 +87,7 @@ fn make_signed_token(
 /// materialized enrolled_device_keys, so the engine admits the event
 /// without any admin-identity-pub binding.
 #[tokio::test]
-async fn pending_join_accepted_via_engine_insert_after_bind_admin_identity_pub() {
+async fn pending_join_accepted_via_engine_insert_without_admin_pub_bind() {
     let community_id = SpaceId([7u8; 16]);
 
     // Admin (invite issuer) — also the engine's configured admin_addr.
