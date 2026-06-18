@@ -43,7 +43,8 @@
 - Tests: 2-envelope snapshot, device key matches 2nd → opens; matches none → Err; untargeted single-blob fallback still opens; invitee-mismatch → Err; open-community raw-key path unchanged.
 
 **Dispatch 1 gate (commit first):**
-```
+
+```bash
 cd src-tauri
 cargo fmt --all
 cargo clippy --locked -p harmony-app --lib --features test-fixtures --no-deps -- -D warnings
@@ -57,22 +58,25 @@ cargo nextest run --locked -p harmony-app --lib --features test-fixtures
 **Task 2.2 — E2E roundtrip.** `targeted_invite_only_generate_then_redeem_roundtrip` in `tests/pkarr_iroh_redeem_full_integration.rs`, mirroring `invite_only_untargeted_generate_then_redeem_roundtrip` (:1040) + `bob_joins_alice_via_iroh_handshake_option_a` (:718): seed Bob as a Joined member of a community Alice shares, generate a targeted invite (resolver finds Bob's key), redeem with Bob's real device key, assert `status=="joined"`. Optional multi-device variant via `mint_second_device`/`make_device_announce` (seal to 2, redeem on 2nd).
 
 **Dispatch 2 gate (commit first):**
-```
+
+```bash
 cd src-tauri
 cargo fmt --all -- --check
 cargo nextest run --locked -p harmony-app --features test-fixtures \
   --test pkarr_iroh_redeem_full_integration -E 'test(wire_format)'
 ```
+
 (plus the specific fixture test target)
 
 ## Final sweep (controller, CI parity)
 
-```
+```bash
 cd src-tauri
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 cargo nextest run --locked --workspace --all-targets --features test-fixtures
 ```
+
 Then push, open PR (`Closes ZEB-369`, related refs in a comment not the body), bot loop.
 
 ## Acceptance

@@ -128,7 +128,10 @@ let candidates: Vec<&[u8]> = if !payload.epoch_snapshot.sealed_epoch_keys.is_emp
 } else {
     vec![payload.epoch_snapshot.sealed_epoch_key.as_slice()]
 };
-// length-guard each (SEALED_MIN) before open; succeed on first open.
+// The URL boundary (Component 2) already enforces exactly SEALED_ENVELOPE_LEN
+// (92) bytes per envelope and at most MAX_ENROLLED_DEVICE_KEYS envelopes, so
+// this `>= SEALED_MIN` filter is a defensive lower bound for internal callers
+// that bypass the URL validation. Succeed on first open.
 let plaintext = candidates.iter()
     .filter(|c| c.len() >= SEALED_MIN)
     .find_map(|c| open_from_owner(&x25519_priv, c).ok())
@@ -145,7 +148,7 @@ Open-community path (raw 32-byte `sealed_epoch_key`) is unchanged (`sealed_epoch
 
 ## Data flow
 
-```
+```text
 generate_invite(community_id, invitee_hint=Some(bob), ...)            [admin = alice]
   └─ resolve_invitee_device_keys(alice's communities, bob) = {bob_d1, bob_d2}
   └─ for each: ed25519_pub_to_x25519 → seal_to_owner(epoch_key) → [env1, env2]
@@ -183,7 +186,7 @@ redeem(url)                                                          [joiner = b
 
 ## Gates (CI parity)
 
-```
+```bash
 cd src-tauri
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings

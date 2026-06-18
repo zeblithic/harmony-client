@@ -829,13 +829,15 @@ pub enum InviteUrlError {
     /// `invite_token.invitee_hint == Some(_)`) carries its sealed epoch key in
     /// `epoch_snapshot.sealed_epoch_keys` (one X25519-sealed 92-byte envelope
     /// per invitee device) with `sealed_epoch_key` left empty. This error fires
-    /// when that shape is violated: the per-device list is empty, an envelope is
-    /// shorter than the 92-byte minimum, or `sealed_epoch_key` is non-empty
-    /// alongside a populated list. Enforced at both encode and decode.
+    /// when that shape is violated: the per-device list is empty, holds more
+    /// than `MAX_ENROLLED_DEVICE_KEYS` envelopes, holds an envelope that is not
+    /// exactly 92 bytes, or `sealed_epoch_key` is non-empty alongside a
+    /// populated list. Enforced at both encode and decode.
     #[error(
         "targeted invite-only payload has a malformed sealed_epoch_keys shape \
-         (empty list, an envelope shorter than 92 bytes, or a non-empty \
-         sealed_epoch_key set alongside it)"
+         (empty list, more than MAX_ENROLLED_DEVICE_KEYS envelopes, an envelope \
+         that is not exactly 92 bytes, or a non-empty sealed_epoch_key set \
+         alongside it)"
     )]
     InvalidSealedEpochKeysShape,
 }
@@ -861,10 +863,12 @@ pub enum InviteUrlError {
 /// stricter URL-friendly value.
 pub const MAX_INVITE_BODY_B64_CHARS: usize = 2_800_000; // ≈ 2 MiB decoded (Phase 1)
 
-/// Minimum byte length of a single X25519-sealed epoch-key envelope
+/// Exact byte length of a single X25519-sealed epoch-key envelope
 /// (32 ephemeral x25519 pubkey + 12 nonce + 32 ciphertext + 16 AEAD tag,
-/// as produced by `seal_to_owner`). Used to length-guard each ZEB-369
-/// per-device envelope.
+/// as produced by `seal_to_owner`). Each ZEB-369 per-device envelope must be
+/// EXACTLY this length — `validate_sealed_epoch_key_shape` rejects anything
+/// else so an untrusted invite URL can't carry an oversized ciphertext that
+/// `open_from_owner` would then AEAD-decrypt in full.
 const SEALED_ENVELOPE_LEN: usize = 92;
 
 /// CR Minor (PR #106 R6): shared helper for the sealed-epoch-key shape
