@@ -36,7 +36,11 @@ jobs:
   rust-check:
     name: Rust — fmt + clippy
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45 (not 30): clippy compiles the whole workspace + all integration test
+    # binaries under --all-targets with no cross-run cache guarantee (the
+    # Swatinem cache evicts past GitHub's 10GB/repo limit), so a cold run sits
+    # near 30 min and intermittently times out. Stopgap; durable fix = ZEB-498.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: src-tauri
@@ -99,7 +103,10 @@ jobs:
   rust-test:
     name: Rust — test (nextest)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45 (not 30): compile/link of ~97 integration test binaries dominates;
+    # a cold-cache run hit 30m21s and was cancelled. Stopgap; durable fix =
+    # ZEB-498 (cache/compile, binary consolidation, tiered split).
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: src-tauri
@@ -204,7 +211,9 @@ jobs:
   msrv:
     name: MSRV — cargo check on declared rust-version
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45 (not 30): cargo check --all-targets is also a cold-cache full compile
+    # and hit the same wall (cancelled on PR #287). Stopgap; durable = ZEB-498.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: src-tauri
