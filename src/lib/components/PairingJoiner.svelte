@@ -3,7 +3,15 @@
   import { PairingService, extractError, type PairingState } from '../pairing-service';
   import Modal from './Modal.svelte';
 
-  let { onClose } = $props<{ onClose?: () => void }>();
+  // `onComplete` (optional) fires only when enrollment reaches the terminal
+  // `complete` state, distinct from `onClose` (which also fires on cancel /
+  // failure). The first-run onboarding gate (ZEB-494) needs that distinction to
+  // tell "enrolled → load the new identity" apart from "cancelled → stay on the
+  // gate"; `DevicesPanel` omits it and keeps its close-then-refresh behaviour.
+  let { onClose, onComplete } = $props<{
+    onClose?: () => void;
+    onComplete?: () => void;
+  }>();
 
   const svc = new PairingService();
   let state = $state<PairingState>({ kind: 'idle' });
@@ -126,7 +134,7 @@
   {:else if state.kind === 'complete'}
     <p>Done! This device is now part of the owner identity.</p>
     <div class="modal-actions">
-      <button class="primary" onclick={onClose}>Close</button>
+      <button class="primary" onclick={onComplete ?? onClose}>Close</button>
     </div>
   {:else if state.kind === 'failed'}
     <p class="error" role="alert">Pairing failed: {state.reason}</p>
