@@ -175,7 +175,7 @@ cargo install sccache
 export RUSTC_WRAPPER=sccache
 ```
 
-First compile after install populates the cache; subsequent compiles of the same dep graph are near-instant. CI does not use sccache (yet — see ZEB-273 Tier 2 follow-up).
+First compile after install populates the cache; subsequent compiles of the same dep graph are near-instant. CI uses sccache backed by Cloudflare R2 (ZEB-499) — see [`docs/ci-sccache.md`](docs/ci-sccache.md).
 
 ## macOS XprotectService — REQUIRED one-time setup
 
