@@ -196,6 +196,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: minted.membership_key.as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(),
         },
         admin_addr: alice_addr,

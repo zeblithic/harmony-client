@@ -76,6 +76,7 @@ fn invite_bootstrap_at_current_epoch_decrypts_new_events() {
     let snapshot = InviteEpochSnapshot {
         epoch: 0,
         sealed_epoch_key: epoch_key.as_bytes().to_vec(),
+        sealed_epoch_keys: Vec::new(),
         state_snapshot: MaterializedCommunityState::default(),
     };
 
@@ -142,6 +143,7 @@ fn stale_invite_unable_to_decrypt_new_events_without_catchup() {
     let dave_snapshot = InviteEpochSnapshot {
         epoch: 0,
         sealed_epoch_key: k0.as_bytes().to_vec(),
+        sealed_epoch_keys: Vec::new(),
         state_snapshot: MaterializedCommunityState::default(),
     };
 

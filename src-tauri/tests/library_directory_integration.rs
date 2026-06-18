@@ -60,6 +60,7 @@ fn open_invite_url_for(community_id: SpaceId, admin_seed: [u8; 32]) -> String {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: vec![0u8; 32],
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr,
@@ -107,6 +108,7 @@ fn invite_only_url() -> String {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: vec![0u8; 92],
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr,
@@ -685,6 +687,7 @@ async fn click_to_join_redeem_invite_smoke() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: membership_key.as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: founder_owner_addr,

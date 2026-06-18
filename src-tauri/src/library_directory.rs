@@ -1340,6 +1340,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 32], // open communities use 32-byte sealed_epoch_key
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -1408,6 +1409,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 92], // invite-only: 92-byte sealed_epoch_key
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -2668,6 +2670,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 92],
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -2746,6 +2749,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0x42u8; 32],
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -2818,6 +2822,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0x42u8; 32],
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr,

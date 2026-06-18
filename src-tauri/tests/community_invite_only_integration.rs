@@ -406,7 +406,9 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
-            sealed_epoch_key,
+            // ZEB-369: targeted invite — sealed envelope rides in sealed_epoch_keys.
+            sealed_epoch_key: Vec::new(),
+            sealed_epoch_keys: vec![sealed_epoch_key],
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: alice_addr,
@@ -641,7 +643,10 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
-            sealed_epoch_key: vec![0xDD; 92], // valid invite-only length: 92 bytes
+            // ZEB-369: targeted invite (invitee_hint = Some) — the envelope rides
+            // in sealed_epoch_keys (one ≥92-byte entry) with sealed_epoch_key empty.
+            sealed_epoch_key: Vec::new(),
+            sealed_epoch_keys: vec![vec![0xDD; 92]],
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: alice_addr,

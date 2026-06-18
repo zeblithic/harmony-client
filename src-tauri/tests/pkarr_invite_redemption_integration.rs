@@ -52,6 +52,7 @@ fn fixture_invite_payload(inviter: OwnerAddr) -> CommunityInvitePayload {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: vec![0u8; 32],
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: inviter,

@@ -277,6 +277,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: minted_a.membership_key.as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(),
         },
         admin_addr: owner_a,
@@ -608,6 +609,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: minted_a.membership_key.as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(),
         },
         admin_addr: owner_a,

@@ -205,6 +205,7 @@ fn invite_payload_with_epoch_snapshot_wire_bytes_pinned() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: vec![0xab; 32],
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: OwnerAddr([0xd0; 16]),

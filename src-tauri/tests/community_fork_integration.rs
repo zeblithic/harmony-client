@@ -803,6 +803,7 @@ async fn fork_invite_carries_snapshot_to_invitee() {
     let epoch_snapshot = harmony_app::community_invite::InviteEpochSnapshot {
         epoch: 0,
         sealed_epoch_key: result.fork_mk.as_bytes().to_vec(),
+        sealed_epoch_keys: Vec::new(),
         state_snapshot: harmony_app::community_invite::MaterializedCommunityState {
             members: Default::default(),
             channels: Default::default(),

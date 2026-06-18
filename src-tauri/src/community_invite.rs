@@ -44,6 +44,24 @@ pub struct InviteEpochSnapshot {
     )]
     pub sealed_epoch_key: Vec<u8>,
 
+    /// ZEB-369: targeted invite-only invites seal the epoch key to EACH of the
+    /// invitee's enrolled device-#2 X25519 keys — one 92-byte envelope per
+    /// device — so the invitee can redeem on any bound device. Empty for open +
+    /// untargeted invites (those carry the single `sealed_epoch_key`);
+    /// `skip_serializing_if` keeps their encoded wire byte-identical to
+    /// pre-ZEB-369 snapshots, and `default` lets those old snapshots decode with
+    /// this field empty. When non-empty, redemption tries each envelope with
+    /// `ed25519_priv_to_x25519(device_sk)` until one opens, and
+    /// `sealed_epoch_key` is left empty.
+    #[serde(
+        rename = "se",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "crate::owner_state_types::serialize_vec_of_vec_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_vec_of_vec_from_bstr"
+    )]
+    pub sealed_epoch_keys: Vec<Vec<u8>>,
+
     #[serde(rename = "ss")]
     pub state_snapshot: MaterializedCommunityState,
 }
@@ -807,6 +825,21 @@ pub enum InviteUrlError {
     /// and is rejected clearly on receipt. Mirrors `UntargetedKeyNotAllowed`.
     #[error("untargeted invite-only payload is missing its untargeted_decrypt_key")]
     UntargetedKeyMissing,
+    /// ZEB-369: a targeted invite-only payload (invite-only,
+    /// `invite_token.invitee_hint == Some(_)`) carries its sealed epoch key in
+    /// `epoch_snapshot.sealed_epoch_keys` (one X25519-sealed 92-byte envelope
+    /// per invitee device) with `sealed_epoch_key` left empty. This error fires
+    /// when that shape is violated: the per-device list is empty, holds more
+    /// than `MAX_ENROLLED_DEVICE_KEYS` envelopes, holds an envelope that is not
+    /// exactly 92 bytes, or `sealed_epoch_key` is non-empty alongside a
+    /// populated list. Enforced at both encode and decode.
+    #[error(
+        "targeted invite-only payload has a malformed sealed_epoch_keys shape \
+         (empty list, more than MAX_ENROLLED_DEVICE_KEYS envelopes, an envelope \
+         that is not exactly 92 bytes, or a non-empty sealed_epoch_key set \
+         alongside it)"
+    )]
+    InvalidSealedEpochKeysShape,
 }
 
 /// Hard cap on the base64url body length (post-prefix-strip, in base64
@@ -830,19 +863,59 @@ pub enum InviteUrlError {
 /// stricter URL-friendly value.
 pub const MAX_INVITE_BODY_B64_CHARS: usize = 2_800_000; // ≈ 2 MiB decoded (Phase 1)
 
-/// CR Minor (PR #106 R6): shared helper for the `sealed_epoch_key` byte-length
+/// Exact byte length of a single X25519-sealed epoch-key envelope
+/// (32 ephemeral x25519 pubkey + 12 nonce + 32 ciphertext + 16 AEAD tag,
+/// as produced by `seal_to_owner`). Each ZEB-369 per-device envelope must be
+/// EXACTLY this length — `validate_sealed_epoch_key_shape` rejects anything
+/// else so an untrusted invite URL can't carry an oversized ciphertext that
+/// `open_from_owner` would then AEAD-decrypt in full.
+const SEALED_ENVELOPE_LEN: usize = 92;
+
+/// CR Minor (PR #106 R6): shared helper for the sealed-epoch-key shape
 /// contract enforced at both the encode and decode boundary. Centralises the
 /// mode labels and expected sizes so they can't drift independently.
 ///
-/// - Open community: 32 raw bytes (EpochKey material, no envelope overhead).
-/// - Invite-only: 92 bytes (32 ephemeral x25519 pubkey + 12 nonce +
-///   32 ciphertext + 16 AEAD tag — as produced by `seal_to_owner`).
-fn validate_sealed_epoch_key_len(
-    is_invite_only: bool,
-    sealed_key_len: usize,
-) -> Result<(), InviteUrlError> {
-    let (mode, expected): (&'static str, usize) = if is_invite_only {
-        ("invite-only", 92)
+/// Three valid shapes (ZEB-369 added the third):
+/// - **Open community**: `sealed_epoch_key` is 32 raw bytes (EpochKey material,
+///   no envelope overhead); `sealed_epoch_keys` empty.
+/// - **Untargeted invite-only**: `sealed_epoch_key` is one 92-byte envelope;
+///   `sealed_epoch_keys` empty.
+/// - **Targeted invite-only** (`invite_token.invitee_hint == Some(_)`):
+///   `sealed_epoch_key` empty; `sealed_epoch_keys` carries one fixed 92-byte
+///   envelope per invitee device, at most MAX_ENROLLED_DEVICE_KEYS of them.
+fn validate_sealed_epoch_key_shape(payload: &CommunityInvitePayload) -> Result<(), InviteUrlError> {
+    let sealed_key_len = payload.epoch_snapshot.sealed_epoch_key.len();
+    let sealed_keys = &payload.epoch_snapshot.sealed_epoch_keys;
+    let is_targeted_invite_only = payload.is_invite_only
+        && payload
+            .invite_token
+            .as_ref()
+            .is_some_and(|t| t.invitee_hint.is_some());
+
+    if is_targeted_invite_only {
+        // Targeted: the single blob must be empty and the per-device list must
+        // be non-empty, bounded to MAX_ENROLLED_DEVICE_KEYS entries, with each
+        // envelope EXACTLY the fixed sealed-envelope length. An untrusted invite
+        // URL must not be able to force oversized or unbounded AEAD decrypt work
+        // during redemption (Qodo Bugs 1+2 — `open_from_owner` decrypts the whole
+        // ciphertext slice, and one envelope is tried per device).
+        if !sealed_key_len_is_empty_targeted(sealed_key_len)
+            || sealed_keys.is_empty()
+            || sealed_keys.len() > crate::community_membership::MAX_ENROLLED_DEVICE_KEYS
+            || sealed_keys.iter().any(|e| e.len() != SEALED_ENVELOPE_LEN)
+        {
+            return Err(InviteUrlError::InvalidSealedEpochKeysShape);
+        }
+        return Ok(());
+    }
+
+    // Open + untargeted invite-only: the per-device list must be empty (it is
+    // ONLY for the targeted shape) and the single blob carries the key.
+    if !sealed_keys.is_empty() {
+        return Err(InviteUrlError::InvalidSealedEpochKeysShape);
+    }
+    let (mode, expected): (&'static str, usize) = if payload.is_invite_only {
+        ("invite-only", SEALED_ENVELOPE_LEN)
     } else {
         ("open", 32)
     };
@@ -854,6 +927,14 @@ fn validate_sealed_epoch_key_len(
         });
     }
     Ok(())
+}
+
+/// Targeted invites leave `sealed_epoch_key` empty (the per-device envelopes
+/// live in `sealed_epoch_keys`). Tiny named predicate so the shape check above
+/// reads cleanly.
+#[inline]
+fn sealed_key_len_is_empty_targeted(len: usize) -> bool {
+    len == 0
 }
 
 /// ZEB-367: the presence of `untargeted_decrypt_key` and the payload's invite
@@ -925,14 +1006,12 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
     {
         return Err(InviteUrlError::OpenCommunityHasBootstrap);
     }
-    // ZEB-249 PR #106 R5: enforce sealed_epoch_key byte-length contract
-    // BEFORE CBOR encoding so a badly-formed payload is caught at the
-    // mint site and never produces a URL that decode_invite_url would
-    // reject. CR Minor (PR #106 R6): delegated to shared helper.
-    validate_sealed_epoch_key_len(
-        payload.is_invite_only,
-        payload.epoch_snapshot.sealed_epoch_key.len(),
-    )?;
+    // ZEB-249 PR #106 R5: enforce sealed-epoch-key shape contract BEFORE CBOR
+    // encoding so a badly-formed payload is caught at the mint site and never
+    // produces a URL that decode_invite_url would reject. CR Minor (PR #106 R6):
+    // delegated to shared helper. ZEB-369: shape-aware (open / untargeted /
+    // targeted invite-only).
+    validate_sealed_epoch_key_shape(payload)?;
     // ZEB-367: confidentiality + redeemability invariant — the untargeted decrypt
     // key and the invite shape must agree exactly (key required on untargeted
     // invite-only, forbidden elsewhere). See validate_untargeted_decrypt_key_shape.
@@ -971,15 +1050,12 @@ pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlE
         .map_err(|e| InviteUrlError::Base64(e.to_string()))?;
     let payload = canonical_cbor_decode::<CommunityInvitePayload>(&bytes)
         .map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
-    // ZEB-249 PR #106 R5: enforce sealed_epoch_key byte-length contract
-    // AFTER decoding so a tampered or malformed URL is rejected with a
-    // clear error rather than silently producing a structurally valid but
-    // semantically broken payload. CR Minor (PR #106 R6): delegated to
-    // shared helper.
-    validate_sealed_epoch_key_len(
-        payload.is_invite_only,
-        payload.epoch_snapshot.sealed_epoch_key.len(),
-    )?;
+    // ZEB-249 PR #106 R5: enforce sealed-epoch-key shape contract AFTER decoding
+    // so a tampered or malformed URL is rejected with a clear error rather than
+    // silently producing a structurally valid but semantically broken payload.
+    // CR Minor (PR #106 R6): delegated to shared helper. ZEB-369: shape-aware
+    // (open / untargeted / targeted invite-only).
+    validate_sealed_epoch_key_shape(&payload)?;
     // ZEB-339: invite-only payloads must carry the inviter's EnrollmentCert
     // (mirrors the admin_bootstrap / admin_identity_pub presence requirement).
     if payload.is_invite_only && payload.inviter_enrollment.is_none() {
@@ -2051,6 +2127,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 32], // correct: 32 bytes for open
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr: OwnerAddr([0u8; 16]),
@@ -2100,6 +2177,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 92], // correct: 92 bytes for invite-only
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -2169,17 +2247,32 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn untargeted_key_rejected_on_targeted_invite_only() {
-        // make_invite_only_payload_correct() builds an UNtargeted invite-only
-        // payload (invitee_hint == None). Flip it to targeted so the
-        // untargeted key becomes illegal. encode_invite_url does NOT verify the
-        // token sig (only structural presence — confirmed by reading the fn),
-        // so mutating invitee_hint without re-signing is fine here.
+    /// Convert the untargeted invite-only baseline into a structurally-VALID
+    /// targeted shape (ZEB-369): `invitee_hint = Some`, the single 92-byte
+    /// envelope moved into `sealed_epoch_keys`, `sealed_epoch_key` emptied. Used
+    /// by the untargeted-key-on-targeted tests so the `sealed_epoch_keys` shape
+    /// check passes and the `untargeted_decrypt_key`-shape check is the one that
+    /// fires. encode_invite_url does NOT verify the token sig, so mutating
+    /// invitee_hint without re-signing is fine here.
+    fn make_targeted_invite_only_payload() -> CommunityInvitePayload {
         let mut p = make_invite_only_payload_correct();
         if let Some(t) = p.invite_token.as_mut() {
             t.invitee_hint = Some(OwnerAddr([5u8; 16]));
         }
+        // Targeted shape: per-device envelopes, empty single blob.
+        let env = std::mem::take(&mut p.epoch_snapshot.sealed_epoch_key);
+        p.epoch_snapshot.sealed_epoch_keys = vec![env];
+        // Targeted invites carry no URL-borne decrypt key.
+        p.untargeted_decrypt_key = None;
+        p
+    }
+
+    #[test]
+    fn untargeted_key_rejected_on_targeted_invite_only() {
+        // A valid targeted invite-only payload + a smuggled untargeted_decrypt_key
+        // → the key is illegal on a targeted payload (it would leak the epoch key
+        // to any URL holder), so encode rejects with UntargetedKeyNotAllowed.
+        let mut p = make_targeted_invite_only_payload();
         p.untargeted_decrypt_key = Some([1u8; 32]);
         assert!(matches!(
             encode_invite_url(&p),
@@ -2207,10 +2300,7 @@ mod tests {
     /// (the round-trip test above only exercises decode's accept path).
     #[test]
     fn decode_rejects_smuggled_untargeted_key_on_targeted_payload() {
-        let mut p = make_invite_only_payload_correct();
-        if let Some(t) = p.invite_token.as_mut() {
-            t.invitee_hint = Some(OwnerAddr([5u8; 16])); // targeted → untargeted key illegal
-        }
+        let mut p = make_targeted_invite_only_payload(); // valid targeted shape
         p.untargeted_decrypt_key = Some([1u8; 32]); // smuggled secret
                                                     // Bypass the encode-side guard by CBOR-encoding directly.
         let cbor = canonical_cbor_encode(&p).expect("cbor encode");
@@ -2219,6 +2309,102 @@ mod tests {
         assert!(matches!(
             decode_invite_url(&url),
             Err(InviteUrlError::UntargetedKeyNotAllowed)
+        ));
+    }
+
+    // ── ZEB-369: targeted invite-only sealed-key shape ───────────────────
+
+    /// A structurally-valid targeted invite-only payload (empty
+    /// `sealed_epoch_key`, one ≥92-byte envelope in `sealed_epoch_keys`,
+    /// `invitee_hint = Some`, no URL key) encodes and round-trips through the
+    /// URL with the per-device envelopes preserved.
+    #[test]
+    fn targeted_invite_only_payload_round_trips_via_url() {
+        let p = make_targeted_invite_only_payload();
+        assert!(p.epoch_snapshot.sealed_epoch_key.is_empty());
+        assert_eq!(p.epoch_snapshot.sealed_epoch_keys.len(), 1);
+        let url = encode_invite_url(&p).expect("targeted invite-only encodes");
+        let back = decode_invite_url(&url).expect("targeted invite-only decodes");
+        assert!(back.epoch_snapshot.sealed_epoch_key.is_empty());
+        assert_eq!(
+            back.epoch_snapshot.sealed_epoch_keys,
+            p.epoch_snapshot.sealed_epoch_keys
+        );
+        assert_eq!(back.untargeted_decrypt_key, None);
+    }
+
+    /// A targeted invite-only payload whose `sealed_epoch_keys` is empty (no
+    /// per-device envelope) is rejected by the shape gate at encode time.
+    #[test]
+    fn targeted_invite_only_rejects_empty_sealed_epoch_keys() {
+        let mut p = make_targeted_invite_only_payload();
+        p.epoch_snapshot.sealed_epoch_keys.clear();
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::InvalidSealedEpochKeysShape)
+        ));
+    }
+
+    /// A targeted invite-only payload with a too-short envelope (< 92 bytes) is
+    /// rejected by the shape gate.
+    #[test]
+    fn targeted_invite_only_rejects_short_envelope() {
+        let mut p = make_targeted_invite_only_payload();
+        p.epoch_snapshot.sealed_epoch_keys = vec![vec![0u8; 50]]; // too short
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::InvalidSealedEpochKeysShape)
+        ));
+    }
+
+    /// Qodo Bug 1 (PR #286): a targeted payload with an OVERSIZED envelope
+    /// (> 92 bytes) is rejected. `open_from_owner` decrypts the whole ciphertext
+    /// slice, so accepting an over-long envelope at the URL boundary would let a
+    /// crafted invite force unbounded AEAD work during redemption.
+    #[test]
+    fn targeted_invite_only_rejects_oversized_envelope() {
+        let mut p = make_targeted_invite_only_payload();
+        p.epoch_snapshot.sealed_epoch_keys = vec![vec![0u8; 4096]]; // oversized
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::InvalidSealedEpochKeysShape)
+        ));
+    }
+
+    /// Qodo Bug 2 (PR #286): a targeted payload carrying more than
+    /// MAX_ENROLLED_DEVICE_KEYS envelopes is rejected at the URL boundary — one
+    /// envelope is tried per device at redeem, so an unbounded list is O(n)
+    /// decrypt amplification on untrusted input.
+    #[test]
+    fn targeted_invite_only_rejects_too_many_envelopes() {
+        let mut p = make_targeted_invite_only_payload();
+        let too_many = crate::community_membership::MAX_ENROLLED_DEVICE_KEYS + 1;
+        p.epoch_snapshot.sealed_epoch_keys = vec![vec![0u8; 92]; too_many];
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::InvalidSealedEpochKeysShape)
+        ));
+    }
+
+    /// The exact-count boundary: exactly MAX_ENROLLED_DEVICE_KEYS well-formed
+    /// envelopes is still accepted (the cap is inclusive).
+    #[test]
+    fn targeted_invite_only_accepts_max_envelopes() {
+        let mut p = make_targeted_invite_only_payload();
+        let at_cap = crate::community_membership::MAX_ENROLLED_DEVICE_KEYS;
+        p.epoch_snapshot.sealed_epoch_keys = vec![vec![0u8; 92]; at_cap];
+        assert!(encode_invite_url(&p).is_ok());
+    }
+
+    /// `sealed_epoch_keys` set on an OPEN payload (non-targeted) is rejected —
+    /// the per-device list is only valid on a targeted invite-only payload.
+    #[test]
+    fn sealed_epoch_keys_rejected_on_open_payload() {
+        let mut p = make_open_payload_correct();
+        p.epoch_snapshot.sealed_epoch_keys = vec![vec![0u8; 92]];
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::InvalidSealedEpochKeysShape)
         ));
     }
 
@@ -2465,6 +2651,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 32],
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr: admin,
@@ -2545,6 +2732,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 32],
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr: admin,
@@ -2616,5 +2804,150 @@ mod tests {
         let decoded: CommunityInvitePayload =
             ciborium::de::from_reader(&bytes[..]).expect("decode");
         assert_eq!(decoded.inviter_enrollment, None);
+    }
+
+    // ── ZEB-369: InviteEpochSnapshot.sealed_epoch_keys wire format ────────
+
+    /// A snapshot carrying two sealed envelopes (the targeted-invite shape)
+    /// survives a canonical-CBOR encode/decode round-trip with both envelopes
+    /// preserved in order, and the encoded form carries the `se` key.
+    #[test]
+    fn snapshot_with_two_sealed_envelopes_round_trips() {
+        let env_a = vec![0xAAu8; 92];
+        let env_b = vec![0xBBu8; 92];
+        let snap = InviteEpochSnapshot {
+            epoch: 7,
+            // Targeted invites leave the single blob empty.
+            sealed_epoch_key: Vec::new(),
+            sealed_epoch_keys: vec![env_a.clone(), env_b.clone()],
+            state_snapshot: MaterializedCommunityState::default(),
+        };
+        let bytes = canonical_cbor_encode(&snap).expect("encode");
+
+        // The `se` key MUST be present on a targeted snapshot.
+        let value: ciborium::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("decode as value");
+        let map = value.as_map().expect("outer is map");
+        let se = map
+            .iter()
+            .find(|(k, _): &&(ciborium::Value, ciborium::Value)| k.as_text() == Some("se"))
+            .map(|(_, v)| v)
+            .expect("targeted snapshot encodes the `se` key");
+        let arr = se.as_array().expect("`se` is a CBOR array");
+        assert_eq!(arr.len(), 2, "two envelopes in the array");
+        // Each element is a CBOR byte-string (major type 2), not an array-of-u8.
+        assert!(
+            arr.iter().all(|v| v.as_bytes().is_some()),
+            "each `se` envelope must encode as a bstr"
+        );
+
+        let back: InviteEpochSnapshot =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).expect("decode snapshot");
+        assert_eq!(back.epoch, 7);
+        assert_eq!(back.sealed_epoch_key, Vec::<u8>::new());
+        assert_eq!(back.sealed_epoch_keys, vec![env_a, env_b]);
+    }
+
+    /// Back-compat: an OLD-format snapshot CBOR (only `ep`/`sk`/`ss`, no `se`
+    /// key — exactly what a pre-ZEB-369 build emitted) decodes with
+    /// `sealed_epoch_keys` defaulting to empty (proves `#[serde(default)]`).
+    #[test]
+    fn old_format_snapshot_decodes_with_empty_sealed_epoch_keys() {
+        // Hand-build the pre-ZEB-369 wire form: a 3-key CBOR map
+        // { "ep": 0, "sk": <32-byte bstr>, "ss": <state map> }.
+        // Encode a state-snapshot sub-map the same way the derive would so the
+        // `ss` value is structurally valid.
+        let old_value = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("ep".into()),
+                ciborium::Value::Integer(0u8.into()),
+            ),
+            (
+                ciborium::Value::Text("sk".into()),
+                ciborium::Value::Bytes(vec![0u8; 32]),
+            ),
+            (
+                ciborium::Value::Text("ss".into()),
+                // MaterializedCommunityState::default() → { "mb": {}, "pl": {} }
+                // ("ch" is skip_serializing_if-empty). Build it via the type's
+                // own encoder to stay faithful.
+                {
+                    let state_bytes = canonical_cbor_encode(&MaterializedCommunityState::default())
+                        .expect("encode state");
+                    ciborium::de::from_reader(&state_bytes[..]).expect("state value")
+                },
+            ),
+        ]);
+        let mut old_bytes = Vec::new();
+        ciborium::ser::into_writer(&old_value, &mut old_bytes).expect("encode old form");
+        // Sanity: the old form carries no `se` key.
+        assert!(
+            !old_bytes.windows(2).any(|w| w == b"se"),
+            "old form must not carry the `se` key"
+        );
+
+        let decoded: InviteEpochSnapshot =
+            ciborium::de::from_reader(&old_bytes[..]).expect("old-format snapshot decodes");
+        assert_eq!(decoded.epoch, 0);
+        assert_eq!(decoded.sealed_epoch_key, vec![0u8; 32]);
+        assert!(
+            decoded.sealed_epoch_keys.is_empty(),
+            "missing `se` key must default to an empty vec"
+        );
+    }
+
+    /// An untargeted/open snapshot (empty `sealed_epoch_keys`) encodes
+    /// BYTE-IDENTICALLY to the pre-ZEB-369 wire form: `skip_serializing_if`
+    /// omits the `se` key entirely. We pin the expected bytes against an
+    /// independently-built old-format CBOR map (the exact bytes a pre-change
+    /// build produced) so a regression that started emitting an empty `se`
+    /// array (or otherwise perturbed the encoding) is caught.
+    #[test]
+    fn untargeted_snapshot_encodes_byte_identical_to_pre_change_form() {
+        let snap = InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: vec![0u8; 32],
+            sealed_epoch_keys: Vec::new(),
+            state_snapshot: MaterializedCommunityState::default(),
+        };
+        let new_bytes = canonical_cbor_encode(&snap).expect("encode");
+
+        // The captured pre-change encoding: the 3-key canonical map the derive
+        // emitted before the `se` field existed. canonical_cbor_encode sorts
+        // map keys, so reconstruct via the same encoder for the `ss` sub-map
+        // and assemble the outer map in canonical (length-then-lex) key order.
+        let state_value: ciborium::Value = {
+            let b = canonical_cbor_encode(&MaterializedCommunityState::default())
+                .expect("encode state");
+            ciborium::de::from_reader(&b[..]).expect("state value")
+        };
+        let expected_value = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("ep".into()),
+                ciborium::Value::Integer(0u8.into()),
+            ),
+            (
+                ciborium::Value::Text("sk".into()),
+                ciborium::Value::Bytes(vec![0u8; 32]),
+            ),
+            (ciborium::Value::Text("ss".into()), state_value),
+        ]);
+        // `canonical_cbor_encode` is just `ciborium::into_writer` under the
+        // hood (it preserves serde field-declaration order — no key sorting),
+        // so encoding this hand-built Value mirrors exactly what the derive
+        // emits for the field order ep, sk, (se skipped), ss.
+        let mut expected_bytes = Vec::new();
+        ciborium::ser::into_writer(&expected_value, &mut expected_bytes)
+            .expect("encode expected form");
+
+        assert_eq!(
+            new_bytes, expected_bytes,
+            "untargeted snapshot must encode byte-identical to the pre-ZEB-369 form"
+        );
+        // Belt-and-suspenders: no `se` key on the wire.
+        assert!(
+            !new_bytes.windows(2).any(|w| w == b"se"),
+            "empty sealed_epoch_keys must omit the `se` key"
+        );
     }
 }

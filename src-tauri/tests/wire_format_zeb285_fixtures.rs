@@ -150,6 +150,7 @@ fn community_invite_with_fork_fields_pinned() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: EpochKey::new([0xAA; 32]).as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: OwnerAddr([0xaa; 16]),
