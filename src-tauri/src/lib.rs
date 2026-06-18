@@ -5658,15 +5658,27 @@ pub async fn start_node_inner(
                                         {
                                             // Cheap session dedupe FIRST (avoid
                                             // re-materializing on every delta once
-                                            // we've already deposited).
-                                            let already_done = device_intro_done
-                                                .lock()
-                                                .map(|g| g.contains(&community_id))
-                                                .unwrap_or(true);
+                                            // this (device, community) is settled).
+                                            // ZEB-495 (Qodo): recover a POISONED dedupe
+                                            // lock instead of treating poison as "done"
+                                            // — the latter would permanently skip
+                                            // self-introduce for the rest of the session.
+                                            let already_done = match device_intro_done.lock() {
+                                                Ok(g) => g.contains(&community_id),
+                                                Err(poisoned) => {
+                                                    tracing::warn!(
+                                                        community_id = ?community_id,
+                                                        "ZEB-495 device_intro_done poisoned; recovering guard"
+                                                    );
+                                                    poisoned.into_inner().contains(&community_id)
+                                                }
+                                            };
                                             if !already_done {
-                                                // Materialize this community and
-                                                // read our own MemberState.
-                                                let needs_announce = if let Some(engine) =
+                                                // Materialize this community ONCE and
+                                                // classify our own membership: are we a
+                                                // Joined member, and is THIS device's
+                                                // key already enrolled?
+                                                let (is_joined, needs_announce) = if let Some(engine) =
                                                     device_intro_registry
                                                         .engine_arc(&community_id)
                                                         .await
@@ -5675,17 +5687,18 @@ pub async fn start_node_inner(
                                                     let st = state_arc.lock().await;
                                                     let mat =
                                                         st.materialized(engine.admin_addr());
-                                                    mat.members
-                                                        .get(&device_intro_self_owner)
-                                                        .map(|m| {
-                                                            m.status == crate::community_membership::MemberStatus::Joined
-                                                                && !m
-                                                                    .enrolled_device_keys
-                                                                    .contains(&device_intro_self_key)
-                                                        })
-                                                        .unwrap_or(false)
+                                                    match mat.members.get(&device_intro_self_owner) {
+                                                        Some(m) => {
+                                                            let joined = m.status == crate::community_membership::MemberStatus::Joined;
+                                                            (
+                                                                joined,
+                                                                joined && !m.enrolled_device_keys.contains(&device_intro_self_key),
+                                                            )
+                                                        }
+                                                        None => (false, false),
+                                                    }
                                                 } else {
-                                                    false
+                                                    (false, false)
                                                 };
                                                 if needs_announce {
                                                     // Build + sign the
@@ -5755,8 +5768,16 @@ pub async fn start_node_inner(
                                                                         });
                                                                     }
                                                                     device_intro_engine.notify_dirty();
-                                                                    if let Ok(mut done) = device_intro_done.lock() {
-                                                                        done.insert(community_id);
+                                                                    // Memoize the settled (device, community)
+                                                                    // so future deltas skip the materialize.
+                                                                    // Poison-recovering (ZEB-495 Qodo).
+                                                                    match device_intro_done.lock() {
+                                                                        Ok(mut done) => {
+                                                                            done.insert(community_id);
+                                                                        }
+                                                                        Err(poisoned) => {
+                                                                            poisoned.into_inner().insert(community_id);
+                                                                        }
                                                                     }
                                                                     tracing::info!(
                                                                         community_id = ?community_id,
@@ -5778,6 +5799,24 @@ pub async fn start_node_inner(
                                                                 error = %e,
                                                                 "ZEB-495 self-introduce: sign_event of DeviceAnnounce failed; will retry on next delta"
                                                             );
+                                                        }
+                                                    }
+                                                } else if is_joined {
+                                                    // ZEB-495 (Qodo): our key is already
+                                                    // enrolled — no announce will ever be
+                                                    // needed for this (device, community).
+                                                    // Memoize so future deltas skip the
+                                                    // expensive re-materialize (the first
+                                                    // device, whose key is already
+                                                    // enrolled, would otherwise
+                                                    // re-materialize on EVERY delta
+                                                    // forever). Poison-recovering.
+                                                    match device_intro_done.lock() {
+                                                        Ok(mut done) => {
+                                                            done.insert(community_id);
+                                                        }
+                                                        Err(poisoned) => {
+                                                            poisoned.into_inner().insert(community_id);
                                                         }
                                                     }
                                                 }
