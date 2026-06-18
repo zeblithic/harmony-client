@@ -825,6 +825,19 @@ pub enum InviteUrlError {
     /// and is rejected clearly on receipt. Mirrors `UntargetedKeyNotAllowed`.
     #[error("untargeted invite-only payload is missing its untargeted_decrypt_key")]
     UntargetedKeyMissing,
+    /// ZEB-369: a targeted invite-only payload (invite-only,
+    /// `invite_token.invitee_hint == Some(_)`) carries its sealed epoch key in
+    /// `epoch_snapshot.sealed_epoch_keys` (one X25519-sealed 92-byte envelope
+    /// per invitee device) with `sealed_epoch_key` left empty. This error fires
+    /// when that shape is violated: the per-device list is empty, an envelope is
+    /// shorter than the 92-byte minimum, or `sealed_epoch_key` is non-empty
+    /// alongside a populated list. Enforced at both encode and decode.
+    #[error(
+        "targeted invite-only payload has a malformed sealed_epoch_keys shape \
+         (empty list, an envelope shorter than 92 bytes, or a non-empty \
+         sealed_epoch_key set alongside it)"
+    )]
+    InvalidSealedEpochKeysShape,
 }
 
 /// Hard cap on the base64url body length (post-prefix-strip, in base64
@@ -848,19 +861,52 @@ pub enum InviteUrlError {
 /// stricter URL-friendly value.
 pub const MAX_INVITE_BODY_B64_CHARS: usize = 2_800_000; // ≈ 2 MiB decoded (Phase 1)
 
-/// CR Minor (PR #106 R6): shared helper for the `sealed_epoch_key` byte-length
+/// Minimum byte length of a single X25519-sealed epoch-key envelope
+/// (32 ephemeral x25519 pubkey + 12 nonce + 32 ciphertext + 16 AEAD tag,
+/// as produced by `seal_to_owner`). Used to length-guard each ZEB-369
+/// per-device envelope.
+const SEALED_ENVELOPE_LEN: usize = 92;
+
+/// CR Minor (PR #106 R6): shared helper for the sealed-epoch-key shape
 /// contract enforced at both the encode and decode boundary. Centralises the
 /// mode labels and expected sizes so they can't drift independently.
 ///
-/// - Open community: 32 raw bytes (EpochKey material, no envelope overhead).
-/// - Invite-only: 92 bytes (32 ephemeral x25519 pubkey + 12 nonce +
-///   32 ciphertext + 16 AEAD tag — as produced by `seal_to_owner`).
-fn validate_sealed_epoch_key_len(
-    is_invite_only: bool,
-    sealed_key_len: usize,
-) -> Result<(), InviteUrlError> {
-    let (mode, expected): (&'static str, usize) = if is_invite_only {
-        ("invite-only", 92)
+/// Three valid shapes (ZEB-369 added the third):
+/// - **Open community**: `sealed_epoch_key` is 32 raw bytes (EpochKey material,
+///   no envelope overhead); `sealed_epoch_keys` empty.
+/// - **Untargeted invite-only**: `sealed_epoch_key` is one 92-byte envelope;
+///   `sealed_epoch_keys` empty.
+/// - **Targeted invite-only** (`invite_token.invitee_hint == Some(_)`):
+///   `sealed_epoch_key` empty; `sealed_epoch_keys` carries one ≥92-byte
+///   envelope per invitee device.
+fn validate_sealed_epoch_key_shape(payload: &CommunityInvitePayload) -> Result<(), InviteUrlError> {
+    let sealed_key_len = payload.epoch_snapshot.sealed_epoch_key.len();
+    let sealed_keys = &payload.epoch_snapshot.sealed_epoch_keys;
+    let is_targeted_invite_only = payload.is_invite_only
+        && payload
+            .invite_token
+            .as_ref()
+            .is_some_and(|t| t.invitee_hint.is_some());
+
+    if is_targeted_invite_only {
+        // Targeted: the single blob must be empty and the per-device list must
+        // be non-empty with each envelope at least the sealed-envelope length.
+        if !sealed_key_len_is_empty_targeted(sealed_key_len)
+            || sealed_keys.is_empty()
+            || sealed_keys.iter().any(|e| e.len() < SEALED_ENVELOPE_LEN)
+        {
+            return Err(InviteUrlError::InvalidSealedEpochKeysShape);
+        }
+        return Ok(());
+    }
+
+    // Open + untargeted invite-only: the per-device list must be empty (it is
+    // ONLY for the targeted shape) and the single blob carries the key.
+    if !sealed_keys.is_empty() {
+        return Err(InviteUrlError::InvalidSealedEpochKeysShape);
+    }
+    let (mode, expected): (&'static str, usize) = if payload.is_invite_only {
+        ("invite-only", SEALED_ENVELOPE_LEN)
     } else {
         ("open", 32)
     };
@@ -872,6 +918,14 @@ fn validate_sealed_epoch_key_len(
         });
     }
     Ok(())
+}
+
+/// Targeted invites leave `sealed_epoch_key` empty (the per-device envelopes
+/// live in `sealed_epoch_keys`). Tiny named predicate so the shape check above
+/// reads cleanly.
+#[inline]
+fn sealed_key_len_is_empty_targeted(len: usize) -> bool {
+    len == 0
 }
 
 /// ZEB-367: the presence of `untargeted_decrypt_key` and the payload's invite
@@ -943,14 +997,12 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
     {
         return Err(InviteUrlError::OpenCommunityHasBootstrap);
     }
-    // ZEB-249 PR #106 R5: enforce sealed_epoch_key byte-length contract
-    // BEFORE CBOR encoding so a badly-formed payload is caught at the
-    // mint site and never produces a URL that decode_invite_url would
-    // reject. CR Minor (PR #106 R6): delegated to shared helper.
-    validate_sealed_epoch_key_len(
-        payload.is_invite_only,
-        payload.epoch_snapshot.sealed_epoch_key.len(),
-    )?;
+    // ZEB-249 PR #106 R5: enforce sealed-epoch-key shape contract BEFORE CBOR
+    // encoding so a badly-formed payload is caught at the mint site and never
+    // produces a URL that decode_invite_url would reject. CR Minor (PR #106 R6):
+    // delegated to shared helper. ZEB-369: shape-aware (open / untargeted /
+    // targeted invite-only).
+    validate_sealed_epoch_key_shape(payload)?;
     // ZEB-367: confidentiality + redeemability invariant — the untargeted decrypt
     // key and the invite shape must agree exactly (key required on untargeted
     // invite-only, forbidden elsewhere). See validate_untargeted_decrypt_key_shape.
@@ -989,15 +1041,12 @@ pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlE
         .map_err(|e| InviteUrlError::Base64(e.to_string()))?;
     let payload = canonical_cbor_decode::<CommunityInvitePayload>(&bytes)
         .map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
-    // ZEB-249 PR #106 R5: enforce sealed_epoch_key byte-length contract
-    // AFTER decoding so a tampered or malformed URL is rejected with a
-    // clear error rather than silently producing a structurally valid but
-    // semantically broken payload. CR Minor (PR #106 R6): delegated to
-    // shared helper.
-    validate_sealed_epoch_key_len(
-        payload.is_invite_only,
-        payload.epoch_snapshot.sealed_epoch_key.len(),
-    )?;
+    // ZEB-249 PR #106 R5: enforce sealed-epoch-key shape contract AFTER decoding
+    // so a tampered or malformed URL is rejected with a clear error rather than
+    // silently producing a structurally valid but semantically broken payload.
+    // CR Minor (PR #106 R6): delegated to shared helper. ZEB-369: shape-aware
+    // (open / untargeted / targeted invite-only).
+    validate_sealed_epoch_key_shape(&payload)?;
     // ZEB-339: invite-only payloads must carry the inviter's EnrollmentCert
     // (mirrors the admin_bootstrap / admin_identity_pub presence requirement).
     if payload.is_invite_only && payload.inviter_enrollment.is_none() {
@@ -2189,17 +2238,32 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn untargeted_key_rejected_on_targeted_invite_only() {
-        // make_invite_only_payload_correct() builds an UNtargeted invite-only
-        // payload (invitee_hint == None). Flip it to targeted so the
-        // untargeted key becomes illegal. encode_invite_url does NOT verify the
-        // token sig (only structural presence — confirmed by reading the fn),
-        // so mutating invitee_hint without re-signing is fine here.
+    /// Convert the untargeted invite-only baseline into a structurally-VALID
+    /// targeted shape (ZEB-369): `invitee_hint = Some`, the single 92-byte
+    /// envelope moved into `sealed_epoch_keys`, `sealed_epoch_key` emptied. Used
+    /// by the untargeted-key-on-targeted tests so the `sealed_epoch_keys` shape
+    /// check passes and the `untargeted_decrypt_key`-shape check is the one that
+    /// fires. encode_invite_url does NOT verify the token sig, so mutating
+    /// invitee_hint without re-signing is fine here.
+    fn make_targeted_invite_only_payload() -> CommunityInvitePayload {
         let mut p = make_invite_only_payload_correct();
         if let Some(t) = p.invite_token.as_mut() {
             t.invitee_hint = Some(OwnerAddr([5u8; 16]));
         }
+        // Targeted shape: per-device envelopes, empty single blob.
+        let env = std::mem::take(&mut p.epoch_snapshot.sealed_epoch_key);
+        p.epoch_snapshot.sealed_epoch_keys = vec![env];
+        // Targeted invites carry no URL-borne decrypt key.
+        p.untargeted_decrypt_key = None;
+        p
+    }
+
+    #[test]
+    fn untargeted_key_rejected_on_targeted_invite_only() {
+        // A valid targeted invite-only payload + a smuggled untargeted_decrypt_key
+        // → the key is illegal on a targeted payload (it would leak the epoch key
+        // to any URL holder), so encode rejects with UntargetedKeyNotAllowed.
+        let mut p = make_targeted_invite_only_payload();
         p.untargeted_decrypt_key = Some([1u8; 32]);
         assert!(matches!(
             encode_invite_url(&p),
@@ -2227,10 +2291,7 @@ mod tests {
     /// (the round-trip test above only exercises decode's accept path).
     #[test]
     fn decode_rejects_smuggled_untargeted_key_on_targeted_payload() {
-        let mut p = make_invite_only_payload_correct();
-        if let Some(t) = p.invite_token.as_mut() {
-            t.invitee_hint = Some(OwnerAddr([5u8; 16])); // targeted → untargeted key illegal
-        }
+        let mut p = make_targeted_invite_only_payload(); // valid targeted shape
         p.untargeted_decrypt_key = Some([1u8; 32]); // smuggled secret
                                                     // Bypass the encode-side guard by CBOR-encoding directly.
         let cbor = canonical_cbor_encode(&p).expect("cbor encode");
@@ -2239,6 +2300,63 @@ mod tests {
         assert!(matches!(
             decode_invite_url(&url),
             Err(InviteUrlError::UntargetedKeyNotAllowed)
+        ));
+    }
+
+    // ── ZEB-369: targeted invite-only sealed-key shape ───────────────────
+
+    /// A structurally-valid targeted invite-only payload (empty
+    /// `sealed_epoch_key`, one ≥92-byte envelope in `sealed_epoch_keys`,
+    /// `invitee_hint = Some`, no URL key) encodes and round-trips through the
+    /// URL with the per-device envelopes preserved.
+    #[test]
+    fn targeted_invite_only_payload_round_trips_via_url() {
+        let p = make_targeted_invite_only_payload();
+        assert!(p.epoch_snapshot.sealed_epoch_key.is_empty());
+        assert_eq!(p.epoch_snapshot.sealed_epoch_keys.len(), 1);
+        let url = encode_invite_url(&p).expect("targeted invite-only encodes");
+        let back = decode_invite_url(&url).expect("targeted invite-only decodes");
+        assert!(back.epoch_snapshot.sealed_epoch_key.is_empty());
+        assert_eq!(
+            back.epoch_snapshot.sealed_epoch_keys,
+            p.epoch_snapshot.sealed_epoch_keys
+        );
+        assert_eq!(back.untargeted_decrypt_key, None);
+    }
+
+    /// A targeted invite-only payload whose `sealed_epoch_keys` is empty (no
+    /// per-device envelope) is rejected by the shape gate at encode time.
+    #[test]
+    fn targeted_invite_only_rejects_empty_sealed_epoch_keys() {
+        let mut p = make_targeted_invite_only_payload();
+        p.epoch_snapshot.sealed_epoch_keys.clear();
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::InvalidSealedEpochKeysShape)
+        ));
+    }
+
+    /// A targeted invite-only payload with a too-short envelope (< 92 bytes) is
+    /// rejected by the shape gate.
+    #[test]
+    fn targeted_invite_only_rejects_short_envelope() {
+        let mut p = make_targeted_invite_only_payload();
+        p.epoch_snapshot.sealed_epoch_keys = vec![vec![0u8; 50]]; // too short
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::InvalidSealedEpochKeysShape)
+        ));
+    }
+
+    /// `sealed_epoch_keys` set on an OPEN payload (non-targeted) is rejected —
+    /// the per-device list is only valid on a targeted invite-only payload.
+    #[test]
+    fn sealed_epoch_keys_rejected_on_open_payload() {
+        let mut p = make_open_payload_correct();
+        p.epoch_snapshot.sealed_epoch_keys = vec![vec![0u8; 92]];
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::InvalidSealedEpochKeysShape)
         ));
     }
 
@@ -2706,9 +2824,8 @@ mod tests {
                 // ("ch" is skip_serializing_if-empty). Build it via the type's
                 // own encoder to stay faithful.
                 {
-                    let state_bytes =
-                        canonical_cbor_encode(&MaterializedCommunityState::default())
-                            .expect("encode state");
+                    let state_bytes = canonical_cbor_encode(&MaterializedCommunityState::default())
+                        .expect("encode state");
                     ciborium::de::from_reader(&state_bytes[..]).expect("state value")
                 },
             ),
