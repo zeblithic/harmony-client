@@ -25639,8 +25639,10 @@ mod zeb436_orphan_adoption_tests {
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
-                sealed_epoch_key,
-                sealed_epoch_keys: Vec::new(),
+                // ZEB-369: targeted invite (invitee_hint = Some) — the sealed
+                // envelope rides in sealed_epoch_keys with sealed_epoch_key empty.
+                sealed_epoch_key: Vec::new(),
+                sealed_epoch_keys: vec![sealed_epoch_key],
                 state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
             },
             admin_addr,
