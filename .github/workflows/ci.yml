@@ -14,6 +14,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # ZEB-498: incremental compilation buys nothing on a once-through CI build,
+  # and its artifacts bloat target/ — exactly what Swatinem/rust-cache tarballs
+  # and saves. Disabling it shrinks each per-job cache (check/test/msrv) so the
+  # three keys fit under GitHub's 10 GB/repo Actions-cache quota with headroom →
+  # far less LRU eviction → PR runs reliably restore a warm dependency cache.
+  CARGO_INCREMENTAL: '0'
 
 # Least-privilege GITHUB_TOKEN: this workflow only checks out code and runs
 # local validation commands — it never writes to the repo, opens PRs, posts
@@ -52,6 +58,20 @@ jobs:
       # in transitively (gdk-sys, webkit2gtk-sys, libsoup-sys, etc).
       - name: Install Tauri Linux deps
         uses: ./.github/actions/install-linux-tauri-deps
+
+      # ZEB-498: mold is a drop-in ELF linker ~2-5x faster than the default
+      # bfd/gold, and the gap widens on this workspace's ~118 statically-linked
+      # integration test binaries — the relink no compile cache can skip (every
+      # lib-touching PR relinks all of them). make-default:true symlinks
+      # /usr/bin/ld -> mold so it needs no RUSTFLAGS, which keeps rust-cache's
+      # key (and the warm dep cache) intact. Installed via the action's own
+      # retrying wget — deliberately NOT apt, to stay off the mirror-flaky
+      # install-linux-tauri-deps step (ZEB-498 P0 / PR #289).
+      - name: Install mold linker (ZEB-498)
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
+        with:
+          mold-version: '2.41.0'
+          make-default: true
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
         with:
@@ -144,6 +164,16 @@ jobs:
       - name: Install Tauri Linux deps
         uses: ./.github/actions/install-linux-tauri-deps
 
+      # ZEB-498: mold fast linker — see the rust-check job for the full
+      # rationale. This is the only job that LINKS all ~118 integration test
+      # binaries, so it benefits most. make-default:true → no RUSTFLAGS → the
+      # rust-cache key stays intact.
+      - name: Install mold linker (ZEB-498)
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
+        with:
+          mold-version: '2.41.0'
+          make-default: true
+
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
         with:
           toolchain: stable
@@ -222,6 +252,16 @@ jobs:
 
       - name: Install Tauri Linux deps
         uses: ./.github/actions/install-linux-tauri-deps
+
+      # ZEB-498: mold fast linker — see the rust-check job for the full
+      # rationale. mold is invoked by the cc driver, so the MSRV toolchain
+      # version is irrelevant. make-default:true → no RUSTFLAGS → rust-cache
+      # key intact.
+      - name: Install mold linker (ZEB-498)
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
+        with:
+          mold-version: '2.41.0'
+          make-default: true
 
       # Use cargo's own TOML parser via `cargo metadata` so single-quoted
       # strings, multi-line definitions, and any other valid TOML form all
