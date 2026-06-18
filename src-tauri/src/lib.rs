@@ -5767,6 +5767,15 @@ pub async fn start_node_inner(
                                                                             }
                                                                         });
                                                                     }
+                                                                    // `notify_dirty()` fires unconditionally — including
+                                                                    // the restart case where `or_insert_with` found an
+                                                                    // already-persisted entry (deposited a prior session,
+                                                                    // not yet relayed by a sibling). That republish is
+                                                                    // INTENTIONAL (ZEB-495, Greptile P2): it re-propagates
+                                                                    // the still-pending intro to a sibling that came
+                                                                    // online since last session. Idempotent by
+                                                                    // construction (insert-once entry + grow-only
+                                                                    // `relayed_by`), so the redundant push is harmless.
                                                                     device_intro_engine.notify_dirty();
                                                                     // Memoize the settled (device, community)
                                                                     // so future deltas skip the materialize.

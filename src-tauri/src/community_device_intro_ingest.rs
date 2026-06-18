@@ -258,6 +258,24 @@ impl CommunityDeviceIntroIngestCtx for ProdCommunityDeviceIntroIngestCtx {
         let signed: crate::community_membership::SignedMembershipEvent =
             crate::owner_state_crypto::canonical_cbor_decode(&entry.signed_event)
                 .map_err(|e| format!("decode DeviceAnnounce: {e:?}"))?;
+        // Defense-in-depth (ZEB-495, Greptile): this dataset's contract is
+        // EXCLUSIVELY `DeviceAnnounce` events — the self-introduce deposit is the
+        // only writer, and it only ever deposits that kind. Assert it before
+        // relaying so a non-`DeviceAnnounce` event smuggled in by a bug, a
+        // misbehaving enrolled sibling, or a future refactor that reuses this
+        // relay path can never ride into the community engine (where
+        // `verify_event` might otherwise accept an enrolled-device-authored
+        // `Leave`/`Ban`). Unrelayable by construction ⇒ leave pending (Err),
+        // TTL-reaped — exactly like the forged-announce `Rejected` path below.
+        if !matches!(
+            signed.kind,
+            crate::community_membership::MembershipEventKind::DeviceAnnounce
+        ) {
+            return Err(format!(
+                "non-DeviceAnnounce event in community-device-intro dataset: {:?}",
+                signed.kind
+            ));
+        }
         match engine.insert_local_event(signed).await {
             // Inserted OR AlreadyKnown ⇒ relayed (idempotent).
             Ok(crate::community_state_crdt::InsertOutcome::Inserted)
