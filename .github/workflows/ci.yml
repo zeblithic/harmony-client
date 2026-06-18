@@ -20,6 +20,14 @@ env:
   # three keys fit under GitHub's 10 GB/repo Actions-cache quota with headroom →
   # far less LRU eviction → PR runs reliably restore a warm dependency cache.
   CARGO_INCREMENTAL: '0'
+  # ZEB-499: sccache → Cloudflare R2 backend config (not secrets). The actual
+  # R2 credentials are injected per-Rust-job from secrets; RUSTC_WRAPPER is
+  # gated on their presence (see each Rust job's "Enable sccache" step), so the
+  # frontend job and fork PRs that lack the secret simply ignore these.
+  SCCACHE_BUCKET: harmony-sccache
+  SCCACHE_ENDPOINT: https://1ba234d340e59c6bba1e0fe90b7db8db.r2.cloudflarestorage.com
+  SCCACHE_REGION: auto
+  SCCACHE_S3_KEY_PREFIX: harmony-client
 
 # Least-privilege GITHUB_TOKEN: this workflow only checks out code and runs
 # local validation commands — it never writes to the repo, opens PRs, posts
@@ -41,6 +49,9 @@ jobs:
   # Engineer wall-clock dominates over runner-minute cost.
   rust-check:
     name: Rust — fmt + clippy
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     runs-on: ubuntu-latest
     # 45 (not 30): clippy compiles the whole workspace + all integration test
     # binaries under --all-targets with no cross-run cache guarantee (the
@@ -78,6 +89,28 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
+      # ZEB-499: install sccache (pinned, binary, off apt) — see docs/ci-sccache.md.
+      - uses: taiki-e/install-action@ec28e287910af896fd98e04056d31fa68607e7ad  # v2.77.4
+        with:
+          tool: sccache
+
+      # ZEB-499: turn sccache on only when the R2 credential is present. Fork
+      # PRs (and any run without the secret) leave RUSTC_WRAPPER unset and
+      # compile normally — cold, but green. SCCACHE_ERROR_LOG surfaces backend
+      # issues; sccache treats a backend error as a cache miss (compiles
+      # directly), so a transient R2 outage can't fail the job.
+      - name: Enable sccache when R2 creds present (ZEB-499)
+        env:
+          R2_KEY: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "$R2_KEY" ]; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_ERROR_LOG=/tmp/sccache.log" >> "$GITHUB_ENV"
+            echo "sccache: R2 backend enabled (prefix=$SCCACHE_S3_KEY_PREFIX)"
+          else
+            echo "sccache: no R2 credentials — building without sccache"
+          fi
+
       # Per-job cache key so rust-check and rust-test don't trample each
       # other's compile artifacts. They share the deps cache (Cargo.lock-keyed)
       # but keep their own check-mode vs test-binary outputs.
@@ -85,6 +118,11 @@ jobs:
         with:
           workspaces: src-tauri
           key: check
+          # ZEB-499: sccache+R2 now owns compilation caching, so stop tarballing
+          # target/ — this is what kills the 10 GB Actions-cache churn (ZEB-440).
+          # rust-cache is kept solely to warm ~/.cargo (registry/index), which
+          # sccache does not cache.
+          cache-targets: false
           # ZEB-440: main-only cache saves — see the rust-test job's
           # rust-cache step for the full rationale.
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -120,8 +158,15 @@ jobs:
       - name: cargo clippy --locked --all-targets
         run: cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 
+      - name: sccache stats (ZEB-499)
+        if: always()
+        run: sccache --show-stats || echo "sccache not active this run"
+
   rust-test:
     name: Rust — test (nextest)
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     runs-on: ubuntu-latest
     # 45 (not 30): compile/link of ~97 integration test binaries dominates;
     # a cold-cache run hit 30m21s and was cancelled. Stopgap; durable fix =
@@ -186,12 +231,32 @@ jobs:
       # instead of `cargo install cargo-nextest` taking ~3 min.
       - uses: taiki-e/install-action@ec28e287910af896fd98e04056d31fa68607e7ad  # v2.77.4
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,sccache
+
+      # ZEB-499: turn sccache on only when the R2 credential is present. Fork
+      # PRs (and any run without the secret) leave RUSTC_WRAPPER unset and
+      # compile normally — cold, but green. SCCACHE_ERROR_LOG surfaces backend
+      # issues; sccache treats a backend error as a cache miss (compiles
+      # directly), so a transient R2 outage can't fail the job.
+      - name: Enable sccache when R2 creds present (ZEB-499)
+        env:
+          R2_KEY: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "$R2_KEY" ]; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_ERROR_LOG=/tmp/sccache.log" >> "$GITHUB_ENV"
+            echo "sccache: R2 backend enabled (prefix=$SCCACHE_S3_KEY_PREFIX)"
+          else
+            echo "sccache: no R2 credentials — building without sccache"
+          fi
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           workspaces: src-tauri
           key: test
+          # ZEB-499: sccache+R2 owns compilation caching now — stop tarballing
+          # target/ (kills the 10 GB churn, ZEB-440). rust-cache warms ~/.cargo only.
+          cache-targets: false
           # ZEB-440: only main updates the cache. PR-branch saves (~1.1 GB
           # compressed per round for this key) had pushed the repo past its
           # 10 GB Actions-cache quota into LRU eviction churn. PR runs
@@ -217,6 +282,10 @@ jobs:
       - name: cargo nextest run --workspace --all-targets
         run: cargo nextest run --locked --workspace --all-targets --features test-fixtures --no-fail-fast
 
+      - name: sccache stats (ZEB-499)
+        if: always()
+        run: sccache --show-stats || echo "sccache not active this run"
+
       # ZEB-440 telemetry: residual usage after build + tests. When the
       # "Avail" number here trends below ~10 GB, the disk cliff is close
       # again — reach for the next lever (debuginfo trim / binary
@@ -240,6 +309,9 @@ jobs:
   # automatically retargets the gate, no second edit required.
   msrv:
     name: MSRV — cargo check on declared rust-version
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     runs-on: ubuntu-latest
     # 45 (not 30): cargo check --all-targets is also a cold-cache full compile
     # and hit the same wall (cancelled on PR #287). Stopgap; durable = ZEB-498.
@@ -285,10 +357,35 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.msrv }}
 
+      # ZEB-499: install sccache (pinned, binary, off apt) — see docs/ci-sccache.md.
+      - uses: taiki-e/install-action@ec28e287910af896fd98e04056d31fa68607e7ad  # v2.77.4
+        with:
+          tool: sccache
+
+      # ZEB-499: turn sccache on only when the R2 credential is present. Fork
+      # PRs (and any run without the secret) leave RUSTC_WRAPPER unset and
+      # compile normally — cold, but green. SCCACHE_ERROR_LOG surfaces backend
+      # issues; sccache treats a backend error as a cache miss (compiles
+      # directly), so a transient R2 outage can't fail the job.
+      - name: Enable sccache when R2 creds present (ZEB-499)
+        env:
+          R2_KEY: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "$R2_KEY" ]; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_ERROR_LOG=/tmp/sccache.log" >> "$GITHUB_ENV"
+            echo "sccache: R2 backend enabled (prefix=$SCCACHE_S3_KEY_PREFIX)"
+          else
+            echo "sccache: no R2 credentials — building without sccache"
+          fi
+
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           workspaces: src-tauri
           key: msrv
+          # ZEB-499: sccache+R2 owns compilation caching now — stop tarballing
+          # target/ (kills the 10 GB churn, ZEB-440). rust-cache warms ~/.cargo only.
+          cache-targets: false
           # ZEB-440: main-only cache saves — see the rust-test job's
           # rust-cache step for the full rationale.
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -297,6 +394,10 @@ jobs:
       # test-fixtures` is required to compile `--all-targets`.
       - name: cargo check --locked --all-targets
         run: cargo check --locked --all-targets --features test-fixtures
+
+      - name: sccache stats (ZEB-499)
+        if: always()
+        run: sccache --show-stats || echo "sccache not active this run"
 
   frontend:
     name: Frontend — tsc, vitest
