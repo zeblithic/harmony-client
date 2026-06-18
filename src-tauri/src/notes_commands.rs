@@ -550,7 +550,12 @@ mod tests {
         }
 
         /// Stand-in for the Zenoh hop: pump A's outbound frames into B's inbox
-        /// and vice versa until both engines shut down (or the task is aborted).
+        /// and vice versa. Exits cleanly once both engines have shut down — a
+        /// dropped publisher closes the matching `recv()` arm, and a closed peer
+        /// inbox makes `send()` fail, both of which stop the loop. Stopping on a
+        /// failed `send` is explicit (not a silent drop) so a mid-test delivery
+        /// failure ends the task — and surfaces via `teardown`'s join — rather
+        /// than masquerading as a convergence timeout.
         fn spawn_forwarder(
             mut a_out: mpsc::Receiver<Vec<u8>>,
             b_in: mpsc::Sender<Vec<u8>>,
@@ -560,12 +565,38 @@ mod tests {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        Some(f) = a_out.recv() => { let _ = b_in.send(f).await; }
-                        Some(f) = b_out.recv() => { let _ = a_in.send(f).await; }
+                        Some(f) = a_out.recv() => {
+                            if b_in.send(f).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(f) = b_out.recv() => {
+                            if a_in.send(f).await.is_err() {
+                                break;
+                            }
+                        }
                         else => break,
                     }
                 }
             })
+        }
+
+        /// Deterministic teardown: shut both engines down (which drops their
+        /// publishers, so the forwarder's `recv()` arms go quiet and it breaks),
+        /// then JOIN the forwarder with a bound. Joining — rather than `abort()`
+        /// — surfaces any forwarder-task panic and makes teardown ordering
+        /// deterministic (Qodo).
+        async fn teardown(
+            a_engine: FleetSyncEngine<NotesDoc>,
+            b_engine: FleetSyncEngine<NotesDoc>,
+            fwd: tokio::task::JoinHandle<()>,
+        ) {
+            let _ = a_engine.shutdown().await;
+            let _ = b_engine.shutdown().await;
+            match tokio::time::timeout(Duration::from_secs(2), fwd).await {
+                Ok(joined) => joined.expect("forwarder task panicked"),
+                Err(_) => panic!("forwarder did not terminate after both engines shut down"),
+            }
         }
 
         /// Bounded condition-polling — a deterministic readiness barrier, not a
@@ -618,9 +649,7 @@ mod tests {
             .await;
             assert!(converged, "B never received A's note within 5s");
 
-            let _ = a.engine.shutdown().await;
-            let _ = b.engine.shutdown().await;
-            fwd.abort();
+            teardown(a.engine, b.engine, fwd).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -666,9 +695,7 @@ mod tests {
                 "both devices did not converge to the union of their notes within 5s"
             );
 
-            let _ = a.engine.shutdown().await;
-            let _ = b.engine.shutdown().await;
-            fwd.abort();
+            teardown(a.engine, b.engine, fwd).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -702,26 +729,30 @@ mod tests {
                 );
             }
 
-            // Concurrent edits to the SAME id on both devices. The real
-            // HLC-minting write path decides the winner; both sides must agree.
-            notes_upsert_core(
-                &a.doc,
-                &a.tracker,
-                "dev-A",
-                Some(id.clone()),
-                "edited-by-A".into(),
-            )
-            .await
-            .unwrap();
-            notes_upsert_core(
-                &b.doc,
-                &b.tracker,
-                "dev-B",
-                Some(id.clone()),
-                "edited-by-B".into(),
-            )
-            .await
-            .unwrap();
+            // Both devices edit the SAME id while neither has yet seen the
+            // other's edit — issued concurrently via `join!` (independent docs +
+            // trackers, no shared state) so the harness orders neither write
+            // before the other. The real HLC-minting write path mints each
+            // device's HLC independently and the higher one wins; both sides
+            // must converge to that winner regardless of which it is.
+            let (ra, rb) = tokio::join!(
+                notes_upsert_core(
+                    &a.doc,
+                    &a.tracker,
+                    "dev-A",
+                    Some(id.clone()),
+                    "edited-by-A".into(),
+                ),
+                notes_upsert_core(
+                    &b.doc,
+                    &b.tracker,
+                    "dev-B",
+                    Some(id.clone()),
+                    "edited-by-B".into(),
+                ),
+            );
+            ra.unwrap();
+            rb.unwrap();
             a.engine.flush_now().await.unwrap();
             b.engine.flush_now().await.unwrap();
 
@@ -758,9 +789,7 @@ mod tests {
                 "concurrent edits did not converge to a single LWW winner on both devices"
             );
 
-            let _ = a.engine.shutdown().await;
-            let _ = b.engine.shutdown().await;
-            fwd.abort();
+            teardown(a.engine, b.engine, fwd).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -818,9 +847,7 @@ mod tests {
                 "B still lists the note A deleted (tombstone did not propagate)"
             );
 
-            let _ = a.engine.shutdown().await;
-            let _ = b.engine.shutdown().await;
-            fwd.abort();
+            teardown(a.engine, b.engine, fwd).await;
         }
     }
 }
