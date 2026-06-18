@@ -30046,7 +30046,12 @@ pub fn delta_to_change(
         // ZEB-458: CommunityRelayAnnounce is relay-state, not
         // membership-state; no MembershipChange is projected. Consumed
         // by CommunityRelayResolver.
-        | crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { .. } => return None,
+        | crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { .. }
+        // ZEB-495 (ZEB-340 Part 2): DeviceAnnounce only adds a device key to
+        // an already-Joined owner's MemberState — it changes no status/power
+        // and projects no MembershipChange. (The roster re-renders the owner
+        // identically; the multi-device effect is invisible at this layer.)
+        | crate::community_membership::MembershipEventKind::DeviceAnnounce => return None,
     };
     Some((cid_hex, change))
 }

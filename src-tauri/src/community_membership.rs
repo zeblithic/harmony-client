@@ -319,6 +319,30 @@ pub enum MembershipEventKind {
         #[serde(rename = "pl")]
         payload: crate::community_relay_announce::CommunityRelayAnnouncePayload,
     },
+
+    /// ZEB-495 (ZEB-340 Part 2): a second device of an already-`Joined`
+    /// owner introduces itself into the community by self-signing this
+    /// event and attaching its own Master `EnrollmentCert` to
+    /// `SignedMembershipEvent.enrollment` — exactly as `Join` carries the
+    /// joiner's cert. On merge, the cert's
+    /// `device_pubkeys.classical.ed25519_verify` is **added** to the
+    /// owner's existing `MemberState.enrolled_device_keys` without
+    /// disturbing status, `joined_at`, or power, so messages and state
+    /// signed by *either* of the owner's devices verify for every member.
+    ///
+    /// Carries NO body — the introduced device's identity lives entirely
+    /// on the carried cert (the device key is `cert.device_pubkeys.
+    /// classical.ed25519_verify`). The signer is resolved via
+    /// `enrolled_key_from_cert` (the cert path — the device is NOT yet in
+    /// the enrolled set), and authorization is "actor is already a Joined
+    /// member" (no power level / admin countersign required: a Master-signed
+    /// cert for an already-admitted owner only ever ADDS a key).
+    ///
+    /// Variant code "e" (1-char value, keeps the same-length-keys invariant
+    /// intact). Unit variant — no inner keys.
+    /// See `docs/specs/2026-06-18-zeb-340-part2-multi-device-per-community-design.md` §Unit 1.
+    #[serde(rename = "e")]
+    DeviceAnnounce,
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -845,6 +869,14 @@ pub enum VerifyError {
     /// ZEB-339: counter-signer's signing key is not in the counter-signer's
     /// materialized `enrolled_device_keys`.
     CounterSignerNotEnrolled,
+    /// ZEB-495 (ZEB-340 Part 2): a `DeviceAnnounce` was signed for an actor
+    /// who is NOT an already-`Joined` member of this community. Unlike
+    /// steady-state kinds (whose signer comes from the materialized enrolled
+    /// set, which implies membership), `DeviceAnnounce`'s signer comes from
+    /// the carried cert, so membership must be checked independently — a
+    /// device may not introduce itself into a community its owner has not
+    /// already joined.
+    DeviceAnnounceForNonMember,
 
     // ── ZEB-458 P4B CommunityRelayAnnounce verify rules ───────────────────────
     //
@@ -1059,6 +1091,12 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::CommunityRelayActorNotMember => {
                 write!(f, "ZEB-458 RCH5 CommunityRelayAnnounce actor is not a community member")
+            }
+            VerifyError::DeviceAnnounceForNonMember => {
+                write!(
+                    f,
+                    "ZEB-495 DeviceAnnounce actor is not an already-Joined community member"
+                )
             }
         }
     }
@@ -2509,6 +2547,34 @@ pub fn materialize_with_now(
                 // ZEB-458: no membership-state effect; consumed by
                 // CommunityRelayResolver for the fresh advertiser set.
             }
+            MembershipEventKind::DeviceAnnounce => {
+                // ZEB-495 (ZEB-340 Part 2): add the introduced device's key to
+                // its owner's EXISTING MemberState. `get_mut`-and-insert
+                // inherently preserves every other field (status, joined_at,
+                // left_at, prior enrolled keys) — no rebuild/replace. Idempotent:
+                // re-announcing an already-present key is a no-op BTreeSet::insert.
+                //
+                // Defensive guards (member present + Joined + cert present):
+                // verify_event already guarantees all three (the actor is a
+                // Joined member and the cert resolved the signer), but materialize
+                // must never panic on a malformed/replayed event that slipped past
+                // verification (corrupted log, etc.), so each is checked here.
+                //
+                // SECURITY INVARIANT (mirrors the Join arm): the cert is ingested
+                // WITHOUT re-verification — verify_event → enrolled_key_from_cert
+                // is the SOLE cert gate (cert.verify, Master-issuer, owner==actor).
+                // The inserted key is the IDENTICAL field that
+                // verify_membership_signer validated the outer signature under.
+                if let Some(member) = m.members.get_mut(&event.actor) {
+                    if member.status == MemberStatus::Joined {
+                        if let Some(cert) = &event.enrollment {
+                            member
+                                .enrolled_device_keys
+                                .insert(cert.device_pubkeys.classical.ed25519_verify);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2699,10 +2765,13 @@ pub fn verify_event(
 
     // 1. ZEB-339: resolve the signer's enrolled device key, then verify the sig.
     let signer = match &event.kind {
-        // Identity-introducing events carry their own cert.
-        MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
-            enrolled_key_from_cert(event)?
-        }
+        // Identity-introducing events carry their own cert. ZEB-495:
+        // DeviceAnnounce is identity-introducing too — the second device's
+        // key is NOT yet in the enrolled set (that is exactly what this
+        // event adds), so its signer is resolved from the carried cert.
+        MembershipEventKind::Join
+        | MembershipEventKind::PendingJoin { .. }
+        | MembershipEventKind::DeviceAnnounce => enrolled_key_from_cert(event)?,
         // Steady-state events: resolve from materialized membership.
         _ => resolve_enrolled_signer(prior_state, event)?,
     };
@@ -2999,6 +3068,31 @@ pub fn verify_event(
             // ZEB-458: membership status (RCH5 analogue) is enforced in
             // the per-kind power-rules block below, alongside the inner-sig
             // and timestamp-skew checks. Same pattern as ReachabilityAnnounce.
+        }
+        MembershipEventKind::DeviceAnnounce => {
+            // ZEB-495 (ZEB-340 Part 2): the actor (owner) MUST already be a
+            // Joined member. This Joined-check is essential and cannot be
+            // skipped: unlike steady-state kinds — whose signer is resolved
+            // from the materialized enrolled set (which itself implies the
+            // actor is a member) — DeviceAnnounce's signer comes from the
+            // carried cert (resolved in step 1 via enrolled_key_from_cert),
+            // so membership is NOT implied by signature resolution and must
+            // be asserted independently here. A device may not introduce
+            // itself into a community its owner has not already joined.
+            //
+            // This is the WHOLE authorization story: a valid Master-signed
+            // cert (owner_id == actor, verified in step 1) for an already-
+            // admitted owner is sufficient. No power level and no admin
+            // countersign are required — the admin vouched for the *owner*,
+            // not per-device; adding another of that owner's own master-
+            // attested devices introduces no new principal, only a key. In
+            // invite-only communities DeviceAnnounce therefore bypasses the
+            // PendingJoin/countersign gate by construction (it is not a
+            // Join/PendingJoin).
+            match prior_state.members.get(&event.actor).map(|m| m.status) {
+                Some(MemberStatus::Joined) => { /* ok */ }
+                _ => return Err(VerifyError::DeviceAnnounceForNonMember),
+            }
         }
     }
 
@@ -3382,6 +3476,13 @@ pub fn verify_event(
             if !is_joined_member(prior_state, &event.actor) {
                 return Err(VerifyError::CommunityRelayActorNotMember);
             }
+        }
+        MembershipEventKind::DeviceAnnounce => {
+            // ZEB-495: NO power gate and NO admin countersign. Authorization
+            // is entirely the cert (verified in step 1) + the already-Joined
+            // membership check (step 4 above). A Master-signed cert for an
+            // already-admitted owner only ever adds one of that owner's own
+            // devices' keys — no escalation is possible.
         }
     }
 
@@ -5757,6 +5858,8 @@ mod tests {
             MembershipEventKind::Fork {
                 fork_space_id: SpaceId([0xfa; 16]),
             },
+            // ZEB-495: unit variant, no body.
+            MembershipEventKind::DeviceAnnounce,
         ];
 
         for variant in &variants {
