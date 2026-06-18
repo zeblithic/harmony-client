@@ -22463,6 +22463,13 @@ fn orphan_dir_adoption_eligible(
         if crate::community_invite::verify_admin_bootstrap(payload).is_err() {
             return false;
         }
+        // ZEB-497: the inviter's enrollment cert must verify and bind to the
+        // token's inviter, and the token must be signed by that enrolled device.
+        if crate::community_invite::verify_inviter_enrollment(payload, now_wall_ms / 1000)
+            .is_err()
+        {
+            return false;
+        }
         let Some(token) = payload.invite_token.as_ref() else {
             return false;
         };
@@ -22603,6 +22610,11 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+
+    // ZEB-497: fail fast — verify the inviter's enrollment cert + token sig
+    // before reserving an HLC, minting the local bootstrap Join, or any network.
+    crate::community_invite::verify_inviter_enrollment(&payload, wall_now_ms / 1000)
+        .map_err(|e| format!("verify inviter enrollment: {e}"))?;
 
     // 4. ZEB-267: atomic HLC reservation. Replaces the
     //    snapshot-then-release pattern + post-commit advance.
