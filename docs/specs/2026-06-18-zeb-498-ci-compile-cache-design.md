@@ -21,8 +21,8 @@ Two levers, each attacking one cost center, both pure-config and secret-free.
 
 Linking ~118 test binaries is the part caching fundamentally can't fix. `mold` is a drop-in ELF linker, typically 2-5× faster than the default `bfd`/`gold`, and the gap widens on many-binary workloads like ours.
 
-- **Install via the pinned `rui314/setup-mold` action** (SHA-pinned per the workflow's pinning policy). Deliberately **not** via `apt` — this keeps mold off the `install-linux-tauri-deps` apt step that ZEB-498 P0 (PR #289) just hardened against mirror hangs; adding a package there would re-expand the exact fragility we just bounded.
-- **Point the linux target's linker at mold for all three Rust jobs** via a shared top-level `RUSTFLAGS: -C link-arg=-fuse-ld=mold` in the workflow `env:`, so `check` / `test` / `msrv` all benefit and key their caches identically.
+- **Install via the pinned `rui314/setup-mold` action** (`@9c9c13bf…`, tag `v1`, SHA-pinned per the workflow's pinning policy; `mold-version: '2.41.0'` pinned explicitly). Deliberately **not** via `apt` — this keeps mold off the `install-linux-tauri-deps` apt step that ZEB-498 P0 (PR #289) just hardened against mirror hangs; adding a package there would re-expand the exact fragility we just bounded. The action downloads the mold release tarball over its own retrying `wget`, independent of the Ubuntu apt mirrors.
+- **Use the action's `make-default: true`** (its default), which symlinks `/usr/bin/ld → mold` so *every* link step (build scripts, final test binaries) uses mold automatically. This is preferred over a `RUSTFLAGS: -C link-arg=-fuse-ld=mold` opt-in because it does **not** change `RUSTFLAGS` — so it leaves `rust-cache`'s key untouched and the existing warm dependency cache stays valid (no one-time cold rebuild). Dependency `.rlib`s are linker-independent archives, so reusing the cache built under the previous linker is correct; only the final binary *link* changes, and that runs fresh every build regardless.
 
 ### Lever 2 — `CARGO_INCREMENTAL=0` (the cache tuning)
 
@@ -44,8 +44,8 @@ Set once in the workflow top-level `env:` so all jobs share it.
 ## Files touched
 
 - `.github/workflows/ci.yml`
-  - Add `RUSTFLAGS: -C link-arg=-fuse-ld=mold` and `CARGO_INCREMENTAL: '0'` to the existing top-level `env:` block (currently just `CARGO_TERM_COLOR`).
-  - Add a pinned `rui314/setup-mold` step to `rust-check`, `rust-test`, and `msrv`, placed **before** the toolchain/cache steps so the linker is on `PATH` at link time. (The `frontend` job is untouched — Node, no linking.)
+  - Add `CARGO_INCREMENTAL: '0'` to the existing top-level `env:` block (currently just `CARGO_TERM_COLOR`). (No `RUSTFLAGS` change — see Lever 1.)
+  - Add a pinned `rui314/setup-mold` step (with `make-default: true`) to `rust-check`, `rust-test`, and `msrv`, placed after `Install Tauri Linux deps` and before the toolchain/build steps so mold is the default linker at link time. (The `frontend` job is untouched — Node, no linking.)
 - No Rust source or `Cargo.toml` profile changes.
 
 ## Validation & success criteria
@@ -56,6 +56,6 @@ Set once in the workflow top-level `env:` so all jobs share it.
 
 ## Risks & mitigations
 
-- **`-fuse-ld=mold` compatibility** — `gcc` on `ubuntu-latest` (24.04, gcc 12+) supports `-fuse-ld=mold`; mold links the same ELF the default linker does. Low risk. If the cc driver ever rejects the flag, fall back to mold's `--ld-path` form via a `[target.x86_64-unknown-linux-gnu]` cargo-config entry. The `msrv` job's older rustc is unaffected — the flag is a link-arg passed to the cc driver, toolchain-version-independent.
-- **One-time cache invalidation** — changing `RUSTFLAGS` rekeys `rust-cache`; the first run after merge is cold by design, then warm. Expected, not a regression.
+- **Global `ld` symlink** — `make-default: true` repoints `/usr/bin/ld` to mold for the whole runner, so every link (build scripts, C-dep linking, final binaries) uses mold. mold is a drop-in for GNU ld on standard ELF, and the C/asm deps here (ring, aws-lc-sys, webkit bindings) compile to objects that rustc links normally — no GNU-ld-specific behavior is relied on. Low risk on an ephemeral CI runner; CI surfaces any incompatibility immediately. If it ever bites, fall back to `make-default: false` + `RUSTFLAGS: -C link-arg=-fuse-ld=mold` (scopes mold to Rust links only, at the cost of a one-time cache rekey). The `msrv` job's older rustc is unaffected — mold is invoked by the cc driver, toolchain-version-independent.
+- **Cache validity preserved** — because `RUSTFLAGS` is unchanged, `rust-cache`'s key is unchanged; the existing warm dependency cache stays valid. `CARGO_INCREMENTAL=0` changes only what `target/` holds (no incremental dir), so the first `main` save after merge stores the smaller tree and PR runs restore it — no cold-rebuild penalty.
 - **`setup-mold` availability** — pinned to a release SHA. Treated as a required step (same as the toolchain action): if it were unavailable, CI fails fast and loudly rather than silently linking slow. Acceptable — matches how the repo already treats its other pinned actions.
