@@ -11404,7 +11404,7 @@ mod zeb_339_signer_verify_tests {
             make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 400);
         let m_lone = materialize(std::slice::from_ref(&lone_announce), admin.owner);
         assert!(
-            m_lone.members.get(&owner.owner).is_none(),
+            !m_lone.members.contains_key(&owner.owner),
             "DeviceAnnounce without a prior Join must not materialize a member"
         );
     }
