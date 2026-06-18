@@ -20374,6 +20374,7 @@ pub(crate) async fn generate_invite_impl(
     let epoch_snapshot = crate::community_invite::InviteEpochSnapshot {
         epoch,
         sealed_epoch_key: sealed_epoch_key_bytes,
+        sealed_epoch_keys: Vec::new(),
         state_snapshot,
     };
 
@@ -24055,6 +24056,7 @@ mod redeem_invite_inner_tests {
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -24124,6 +24126,7 @@ mod redeem_invite_inner_tests {
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: EpochKey::new([0x77; 32]).as_bytes().to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
             },
             admin_addr: OwnerAddr([0x33; 16]),
@@ -24219,6 +24222,7 @@ mod redeem_invite_inner_tests {
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -24344,6 +24348,7 @@ mod redeem_invite_inner_tests {
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -24450,6 +24455,7 @@ mod redeem_invite_inner_tests {
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -24543,6 +24549,7 @@ mod redeem_invite_inner_tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -24617,6 +24624,7 @@ mod redeem_invite_inner_tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: sealed,
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -24689,6 +24697,7 @@ mod zeb436_orphan_adoption_tests {
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -25203,6 +25212,7 @@ mod zeb436_orphan_adoption_tests {
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key,
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -25486,6 +25496,7 @@ mod join_open_community_tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: membership_key_bytes.to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -46500,6 +46511,7 @@ mod generate_invite_helper_tests {
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: EpochKey::new([0x99; 32]).as_bytes().to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
             },
             admin_addr: OwnerAddr([0x11; 16]),
@@ -46557,6 +46569,7 @@ mod generate_invite_helper_tests {
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
             },
             admin_addr: OwnerAddr([0x11; 16]),

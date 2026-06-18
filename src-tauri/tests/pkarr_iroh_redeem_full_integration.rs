@@ -787,6 +787,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key,
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr: s.alice_addr,
@@ -1105,6 +1106,7 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
                 epoch: 0,
                 // (1) sealed to the ephemeral key, not to Bob.
                 sealed_epoch_key: sealed.sealed,
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr: s.alice_addr,
@@ -1354,6 +1356,7 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key,
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr: s.alice_addr,

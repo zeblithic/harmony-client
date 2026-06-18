@@ -181,6 +181,7 @@ fn community_invite_payload_open_wire_bytes_pinned() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: EpochKey::new([0xAA; 32]).as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: OwnerAddr([0x11; 16]),
@@ -239,6 +240,7 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: EpochKey::new([0xAA; 32]).as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: OwnerAddr([0x11; 16]),

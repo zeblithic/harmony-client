@@ -44,6 +44,24 @@ pub struct InviteEpochSnapshot {
     )]
     pub sealed_epoch_key: Vec<u8>,
 
+    /// ZEB-369: targeted invite-only invites seal the epoch key to EACH of the
+    /// invitee's enrolled device-#2 X25519 keys — one 92-byte envelope per
+    /// device — so the invitee can redeem on any bound device. Empty for open +
+    /// untargeted invites (those carry the single `sealed_epoch_key`);
+    /// `skip_serializing_if` keeps their encoded wire byte-identical to
+    /// pre-ZEB-369 snapshots, and `default` lets those old snapshots decode with
+    /// this field empty. When non-empty, redemption tries each envelope with
+    /// `ed25519_priv_to_x25519(device_sk)` until one opens, and
+    /// `sealed_epoch_key` is left empty.
+    #[serde(
+        rename = "se",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "crate::owner_state_types::serialize_vec_of_vec_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_vec_of_vec_from_bstr"
+    )]
+    pub sealed_epoch_keys: Vec<Vec<u8>>,
+
     #[serde(rename = "ss")]
     pub state_snapshot: MaterializedCommunityState,
 }
@@ -2051,6 +2069,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 32], // correct: 32 bytes for open
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr: OwnerAddr([0u8; 16]),
@@ -2100,6 +2119,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 92], // correct: 92 bytes for invite-only
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -2465,6 +2485,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 32],
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr: admin,
@@ -2545,6 +2566,7 @@ mod tests {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 32],
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr: admin,
@@ -2616,5 +2638,151 @@ mod tests {
         let decoded: CommunityInvitePayload =
             ciborium::de::from_reader(&bytes[..]).expect("decode");
         assert_eq!(decoded.inviter_enrollment, None);
+    }
+
+    // ── ZEB-369: InviteEpochSnapshot.sealed_epoch_keys wire format ────────
+
+    /// A snapshot carrying two sealed envelopes (the targeted-invite shape)
+    /// survives a canonical-CBOR encode/decode round-trip with both envelopes
+    /// preserved in order, and the encoded form carries the `se` key.
+    #[test]
+    fn snapshot_with_two_sealed_envelopes_round_trips() {
+        let env_a = vec![0xAAu8; 92];
+        let env_b = vec![0xBBu8; 92];
+        let snap = InviteEpochSnapshot {
+            epoch: 7,
+            // Targeted invites leave the single blob empty.
+            sealed_epoch_key: Vec::new(),
+            sealed_epoch_keys: vec![env_a.clone(), env_b.clone()],
+            state_snapshot: MaterializedCommunityState::default(),
+        };
+        let bytes = canonical_cbor_encode(&snap).expect("encode");
+
+        // The `se` key MUST be present on a targeted snapshot.
+        let value: ciborium::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("decode as value");
+        let map = value.as_map().expect("outer is map");
+        let se = map
+            .iter()
+            .find(|(k, _): &&(ciborium::Value, ciborium::Value)| k.as_text() == Some("se"))
+            .map(|(_, v)| v)
+            .expect("targeted snapshot encodes the `se` key");
+        let arr = se.as_array().expect("`se` is a CBOR array");
+        assert_eq!(arr.len(), 2, "two envelopes in the array");
+        // Each element is a CBOR byte-string (major type 2), not an array-of-u8.
+        assert!(
+            arr.iter().all(|v| v.as_bytes().is_some()),
+            "each `se` envelope must encode as a bstr"
+        );
+
+        let back: InviteEpochSnapshot =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).expect("decode snapshot");
+        assert_eq!(back.epoch, 7);
+        assert_eq!(back.sealed_epoch_key, Vec::<u8>::new());
+        assert_eq!(back.sealed_epoch_keys, vec![env_a, env_b]);
+    }
+
+    /// Back-compat: an OLD-format snapshot CBOR (only `ep`/`sk`/`ss`, no `se`
+    /// key — exactly what a pre-ZEB-369 build emitted) decodes with
+    /// `sealed_epoch_keys` defaulting to empty (proves `#[serde(default)]`).
+    #[test]
+    fn old_format_snapshot_decodes_with_empty_sealed_epoch_keys() {
+        // Hand-build the pre-ZEB-369 wire form: a 3-key CBOR map
+        // { "ep": 0, "sk": <32-byte bstr>, "ss": <state map> }.
+        // Encode a state-snapshot sub-map the same way the derive would so the
+        // `ss` value is structurally valid.
+        let old_value = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("ep".into()),
+                ciborium::Value::Integer(0u8.into()),
+            ),
+            (
+                ciborium::Value::Text("sk".into()),
+                ciborium::Value::Bytes(vec![0u8; 32]),
+            ),
+            (
+                ciborium::Value::Text("ss".into()),
+                // MaterializedCommunityState::default() → { "mb": {}, "pl": {} }
+                // ("ch" is skip_serializing_if-empty). Build it via the type's
+                // own encoder to stay faithful.
+                {
+                    let state_bytes =
+                        canonical_cbor_encode(&MaterializedCommunityState::default())
+                            .expect("encode state");
+                    ciborium::de::from_reader(&state_bytes[..]).expect("state value")
+                },
+            ),
+        ]);
+        let mut old_bytes = Vec::new();
+        ciborium::ser::into_writer(&old_value, &mut old_bytes).expect("encode old form");
+        // Sanity: the old form carries no `se` key.
+        assert!(
+            !old_bytes.windows(2).any(|w| w == b"se"),
+            "old form must not carry the `se` key"
+        );
+
+        let decoded: InviteEpochSnapshot =
+            ciborium::de::from_reader(&old_bytes[..]).expect("old-format snapshot decodes");
+        assert_eq!(decoded.epoch, 0);
+        assert_eq!(decoded.sealed_epoch_key, vec![0u8; 32]);
+        assert!(
+            decoded.sealed_epoch_keys.is_empty(),
+            "missing `se` key must default to an empty vec"
+        );
+    }
+
+    /// An untargeted/open snapshot (empty `sealed_epoch_keys`) encodes
+    /// BYTE-IDENTICALLY to the pre-ZEB-369 wire form: `skip_serializing_if`
+    /// omits the `se` key entirely. We pin the expected bytes against an
+    /// independently-built old-format CBOR map (the exact bytes a pre-change
+    /// build produced) so a regression that started emitting an empty `se`
+    /// array (or otherwise perturbed the encoding) is caught.
+    #[test]
+    fn untargeted_snapshot_encodes_byte_identical_to_pre_change_form() {
+        let snap = InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: vec![0u8; 32],
+            sealed_epoch_keys: Vec::new(),
+            state_snapshot: MaterializedCommunityState::default(),
+        };
+        let new_bytes = canonical_cbor_encode(&snap).expect("encode");
+
+        // The captured pre-change encoding: the 3-key canonical map the derive
+        // emitted before the `se` field existed. canonical_cbor_encode sorts
+        // map keys, so reconstruct via the same encoder for the `ss` sub-map
+        // and assemble the outer map in canonical (length-then-lex) key order.
+        let state_value: ciborium::Value = {
+            let b = canonical_cbor_encode(&MaterializedCommunityState::default())
+                .expect("encode state");
+            ciborium::de::from_reader(&b[..]).expect("state value")
+        };
+        let expected_value = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("ep".into()),
+                ciborium::Value::Integer(0u8.into()),
+            ),
+            (
+                ciborium::Value::Text("sk".into()),
+                ciborium::Value::Bytes(vec![0u8; 32]),
+            ),
+            (ciborium::Value::Text("ss".into()), state_value),
+        ]);
+        // `canonical_cbor_encode` is just `ciborium::into_writer` under the
+        // hood (it preserves serde field-declaration order — no key sorting),
+        // so encoding this hand-built Value mirrors exactly what the derive
+        // emits for the field order ep, sk, (se skipped), ss.
+        let mut expected_bytes = Vec::new();
+        ciborium::ser::into_writer(&expected_value, &mut expected_bytes)
+            .expect("encode expected form");
+
+        assert_eq!(
+            new_bytes, expected_bytes,
+            "untargeted snapshot must encode byte-identical to the pre-ZEB-369 form"
+        );
+        // Belt-and-suspenders: no `se` key on the wire.
+        assert!(
+            !new_bytes.windows(2).any(|w| w == b"se"),
+            "empty sealed_epoch_keys must omit the `se` key"
+        );
     }
 }

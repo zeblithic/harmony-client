@@ -55,6 +55,7 @@ fn community_invite_payload_round_trips_open_form() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: EpochKey::new([2u8; 32]).as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: OwnerAddr([3u8; 16]),
@@ -98,6 +99,7 @@ fn community_invite_payload_round_trips_invite_only_form() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: EpochKey::new([2u8; 32]).as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: OwnerAddr([3u8; 16]),
@@ -173,6 +175,7 @@ fn invite_url_round_trips_open_payload() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: OwnerAddr([0xcd; 16]),
@@ -249,6 +252,7 @@ fn decode_trims_whitespace() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: OwnerAddr([0xcd; 16]),
@@ -313,6 +317,7 @@ fn encode_rejects_open_community_with_admin_identity_pub_set() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: OwnerAddr([0xcd; 16]),
@@ -367,6 +372,7 @@ fn encode_rejects_open_community_with_admin_bootstrap_set() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr,
@@ -1242,6 +1248,7 @@ mod admin_bootstrap_helpers {
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: EpochKey::new([0xBB; 32]).as_bytes().to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr,
@@ -1414,6 +1421,7 @@ mod verify_admin_bootstrap_tests {
                 sealed_epoch_key: harmony_app::owner_state_types::EpochKey::new([0xBB; 32])
                     .as_bytes()
                     .to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(
                 ),
             },

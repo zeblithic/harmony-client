@@ -2398,6 +2398,7 @@ mod task3_kick_setpower_round_trip {
             epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: minted_a.membership_key.as_bytes().to_vec(),
+                sealed_epoch_keys: Vec::new(),
                 state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(
                 ),
             },
@@ -2751,6 +2752,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key,
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: alice_addr,

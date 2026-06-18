@@ -82,6 +82,81 @@ where
     d.deserialize_bytes(VecBytesVisitor)
 }
 
+/// Helper: serialize a `Vec<Vec<u8>>` as a CBOR array of byte-strings
+/// (one bstr per inner `Vec<u8>`). Pairs with
+/// `deserialize_vec_of_vec_from_bstr`.
+///
+/// ZEB-369: targeted invite-only invites carry one X25519-sealed epoch-key
+/// envelope per invitee device in `InviteEpochSnapshot.sealed_epoch_keys`.
+/// Encoding each envelope as a bstr (major type 2) inside the outer array is
+/// far more compact than the default `Vec<u8>` Serialize (which would emit an
+/// array-of-u8, two bytes per byte once values exceed 0x17). Mirrors the
+/// single-`Vec<u8>` `serialize_vec_as_bstr` one nesting level up.
+pub(crate) fn serialize_vec_of_vec_as_bstr<S>(v: &[Vec<u8>], s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::SerializeSeq;
+
+    // Wrap each inner vec in a tiny newtype that overrides Serialize to emit a
+    // bstr (not an array-of-u8). `SerializeSeq::serialize_element` requires
+    // `T: Serialize`, so we can't pass the bare `&[u8]`.
+    struct Bstr<'a>(&'a [u8]);
+    impl serde::Serialize for Bstr<'_> {
+        fn serialize<S2: Serializer>(&self, s: S2) -> Result<S2::Ok, S2::Error> {
+            s.serialize_bytes(self.0)
+        }
+    }
+
+    let mut seq = s.serialize_seq(Some(v.len()))?;
+    for inner in v {
+        seq.serialize_element(&Bstr(inner))?;
+    }
+    seq.end()
+}
+
+/// Helper: deserialize a CBOR array of byte-strings into a `Vec<Vec<u8>>`.
+/// Pairs with `serialize_vec_of_vec_as_bstr`. Each element must be a CBOR
+/// bstr (major type 2); the inner `deserialize_vec_from_bstr` enforces that.
+pub(crate) fn deserialize_vec_of_vec_from_bstr<'de, D>(d: D) -> Result<Vec<Vec<u8>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{SeqAccess, Visitor};
+    use std::fmt;
+
+    /// One element: a CBOR bstr → `Vec<u8>`, routed through the existing
+    /// single-vec bstr visitor so the bstr-only contract is identical.
+    struct InnerVec(Vec<u8>);
+    impl<'de> Deserialize<'de> for InnerVec {
+        fn deserialize<D2: Deserializer<'de>>(d: D2) -> Result<Self, D2::Error> {
+            deserialize_vec_from_bstr(d).map(InnerVec)
+        }
+    }
+
+    struct OuterVisitor;
+    impl<'de> Visitor<'de> for OuterVisitor {
+        type Value = Vec<Vec<u8>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "a CBOR array of byte strings (major type 2)")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(InnerVec(v)) = seq.next_element::<InnerVec>()? {
+                out.push(v);
+            }
+            Ok(out)
+        }
+    }
+
+    d.deserialize_seq(OuterVisitor)
+}
+
 /// Helper: deserialize CBOR bstr into byte array.
 pub(crate) fn deserialize_bytes_from_bstr<'de, const N: usize, D>(d: D) -> Result<[u8; N], D::Error>
 where

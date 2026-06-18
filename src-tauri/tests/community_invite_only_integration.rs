@@ -407,6 +407,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key,
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: alice_addr,
@@ -642,6 +643,7 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: vec![0xDD; 92], // valid invite-only length: 92 bytes
+            sealed_epoch_keys: Vec::new(),
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: alice_addr,
