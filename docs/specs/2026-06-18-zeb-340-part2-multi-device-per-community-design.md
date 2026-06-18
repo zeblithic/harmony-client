@@ -1,7 +1,7 @@
 # ZEB-495 (ZEB-340 Part 2) — Device-introduction event: >1 enrolled device per owner per community
 
 - **Issue:** [ZEB-495](https://linear.app/zeblith/issue/ZEB-495) (parent [ZEB-340](https://linear.app/zeblith/issue/ZEB-340) Part 2; grandparent ZEB-217)
-- **Status:** design 2026-06-18 — core approved (direction confirmed by Jake); **emit-path fork pending a steer**
+- **Status:** design 2026-06-18 — core approved (direction confirmed by Jake); **emit-path decision approved: Option A (fleet relay)**
 - **Predecessors:** ZEB-339 (community membership signs+verifies with the enrolled device key #2 + `EnrollmentCert`), ZEB-492 (fleet KeyTree distributed to cert-only devices at pairing), ZEB-372 (real device X25519 in `PubKeyBundle`)
 
 ## Problem
@@ -105,7 +105,7 @@ invariant (`community_membership.rs:1865-1875`) — `verify_event` is the sole c
 This core (Units 1–4) is identical regardless of the emit-path decision below and is implemented
 first.
 
-## Emit-path fork (needs a steer; default = Option A)
+## Emit-path fork (decided: Option A — fleet relay)
 
 The introduction event must reach other members' community engines. It is gated en route by
 `verify_publisher_sig` (`community_state_sync.rs:3310`), which authorises the **whole zenoh
