@@ -786,8 +786,10 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             community_id: s.community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
-                sealed_epoch_key,
-                sealed_epoch_keys: Vec::new(),
+                // ZEB-369: targeted invite — the per-device sealed envelope rides
+                // in sealed_epoch_keys with sealed_epoch_key empty.
+                sealed_epoch_key: Vec::new(),
+                sealed_epoch_keys: vec![sealed_epoch_key],
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr: s.alice_addr,
@@ -1022,6 +1024,338 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
     })
     .await
     .expect("bob_joins_alice_via_iroh_handshake_option_a timed out at 60s");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// ZEB-369 targeted invite-only roundtrips (generate-shape → real-transport
+// redeem). These mirror `bob_joins_alice_via_iroh_handshake_option_a` exactly
+// for the transport/handshake plumbing; the ONLY thing under test is the
+// ZEB-369 redeem-side try-all over the new multi-envelope wire shape
+// (`sealed_epoch_keys`). The generate-side resolver is unit-tested separately
+// (`resolve_invitee_device_keys_*` in lib.rs); here we hand-build the payload
+// in the shape `generate_invite_impl` would produce for a targeted invite and
+// prove it round-trips through the real iroh redeem path to `status=="joined"`.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Single-envelope targeted invite: Alice seals the epoch key to exactly Bob's
+/// enrolled device-#2 key and ships it in `sealed_epoch_keys` (one entry,
+/// `sealed_epoch_key` empty, `invitee_hint = Some(bob)`, no URL key). Bob
+/// redeems with his real device key over the real iroh handshake and lands
+/// `joined`. This is the ZEB-369 targeted analogue of the untargeted roundtrip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn targeted_invite_only_generate_then_redeem_roundtrip() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // ZEB-374 audit: pre-pay iroh's ~30s first-bind global init OUTSIDE the
+    // 60s budget so full-suite contention can't flake the handshake timeout.
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let s = setup_two_party_iroh_handshake().await;
+
+        // Targeted token bound to Bob, signed with Alice's enrolled device key.
+        let token_minted_at = Hlc {
+            wall_ms: 100_500,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let invite_token_unsigned = InviteToken {
+            inviter: s.alice_addr,
+            invitee_hint: Some(s.bob_addr),
+            minted_at: token_minted_at.clone(),
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let token_payload_bytes =
+            canonical_invite_token_bytes(&invite_token_unsigned).expect("canonical token bytes");
+        let token_sig: [u8; 64] = s.alice_comm_sk.sign(&token_payload_bytes).to_bytes();
+        let invite_token = InviteToken {
+            inviter: s.alice_addr,
+            invitee_hint: Some(s.bob_addr),
+            minted_at: token_minted_at,
+            expires_at: None,
+            sig: token_sig,
+        };
+
+        // Seal the epoch key to Bob's device-#2 X25519 (the key mint_redemption
+        // derives from the `signing_key` param = bob_comm_sk).
+        let bob_x25519_pub = {
+            let verifying_bytes = s.bob_comm_sk.verifying_key().to_bytes();
+            harmony_app::dm_signing::ed25519_pub_to_x25519(&verifying_bytes)
+                .expect("bob_comm ed25519→x25519")
+        };
+        let env = harmony_app::dm_signing::seal_to_owner(
+            &bob_x25519_pub,
+            s.alice_minted.membership_key.as_bytes(),
+        )
+        .expect("seal epoch key to bob");
+
+        // ZEB-369 targeted shape: single envelope in sealed_epoch_keys, empty blob.
+        let invite_payload = CommunityInvitePayload {
+            community_id: s.community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: Vec::new(),
+                sealed_epoch_keys: vec![env],
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr: s.alice_addr,
+            community_name: "Zeb369TargetedCommunity".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(invite_token),
+            admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
+            admin_identity_pub: Some(s.alice_pub),
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: Some(s.alice_comm.cert.clone()),
+            untargeted_decrypt_key: None,
+        };
+        // The shape-aware encode/decode gate must accept the targeted form.
+        let invite_url =
+            community_invite::encode_invite_url(&invite_payload).expect("encode targeted invite");
+
+        s.invite_pub.register_invite(&invite_payload).await;
+        let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+
+        let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
+            invite_url,
+            Some(Arc::clone(&s.pkarr_resolver)),
+            Some(s.bob_reachability.clone()),
+            Some(Arc::clone(&s.bob_ep)),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            None,
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            None,
+            None,
+            |_| {},
+            |_payload: harmony_app::NavUpdatedPayload| {},
+            harmony_app::HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(10_000),
+                open_bi_timeout: Duration::from_millis(10_000),
+                response_read_timeout: Duration::from_millis(10_000),
+                write_timeout: Duration::from_millis(10_000),
+            },
+            || Ok(()),
+        )
+        .await
+        .expect("connectivity_redeem_invite_iroh_inner must Ok");
+
+        assert_eq!(
+            outcome.status, "joined",
+            "targeted single-envelope invite-only redeem must return 'joined' — Bob \
+             opened the only envelope (sealed to his device key) via the ZEB-369 \
+             try-all path. Got status={:?} community_id={:?}.",
+            outcome.status, outcome.community_id
+        );
+        assert_eq!(
+            outcome.community_id.as_deref(),
+            Some(hex::encode(s.community_id.0).as_str()),
+            "community_id must echo Alice's invite"
+        );
+
+        // Bob materializes as Joined off a CRDT carrying the JoinCountersign.
+        let bob_state = s
+            .registry_bob
+            .state_for(&s.community_id)
+            .await
+            .expect("bob state must exist after redeem");
+        let bob_events: Vec<_> = {
+            let g = bob_state.lock().await;
+            g.events.values().cloned().collect()
+        };
+        let bob_materialized = materialize(&bob_events, s.alice_addr);
+        assert_eq!(
+            bob_materialized.members.get(&s.bob_addr).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "Bob must materialize as Joined after the targeted handshake completes"
+        );
+
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("targeted_invite_only_generate_then_redeem_roundtrip timed out at 60s");
+}
+
+/// Multi-device targeted invite: Alice seals the epoch key to TWO device keys —
+/// a throwaway device (envelope #1, which Bob CANNOT open) and Bob's real
+/// device (envelope #2). Bob's device key is deliberately NOT first, so a
+/// "joined" outcome proves the ZEB-369 redeem-side try-all skipped the first
+/// undecryptable envelope and opened the second. This is the high-value proof
+/// that "seal to all my devices, redeem on any one" works over real transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn targeted_invite_only_multi_device_redeem_opens_correct_envelope() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let s = setup_two_party_iroh_handshake().await;
+
+        let token_minted_at = Hlc {
+            wall_ms: 100_500,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let invite_token_unsigned = InviteToken {
+            inviter: s.alice_addr,
+            invitee_hint: Some(s.bob_addr),
+            minted_at: token_minted_at.clone(),
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let token_payload_bytes =
+            canonical_invite_token_bytes(&invite_token_unsigned).expect("canonical token bytes");
+        let token_sig: [u8; 64] = s.alice_comm_sk.sign(&token_payload_bytes).to_bytes();
+        let invite_token = InviteToken {
+            inviter: s.alice_addr,
+            invitee_hint: Some(s.bob_addr),
+            minted_at: token_minted_at,
+            expires_at: None,
+            sig: token_sig,
+        };
+
+        // Envelope #1: sealed to a THROWAWAY device key Bob does NOT hold.
+        let other_device = harmony_app::community_membership::mint_test_owner(0xC3);
+        let other_x25519_pub = {
+            let verifying_bytes = other_device.device_key.verifying_key().to_bytes();
+            harmony_app::dm_signing::ed25519_pub_to_x25519(&verifying_bytes)
+                .expect("other ed25519→x25519")
+        };
+        let env_other = harmony_app::dm_signing::seal_to_owner(
+            &other_x25519_pub,
+            s.alice_minted.membership_key.as_bytes(),
+        )
+        .expect("seal to other device");
+
+        // Envelope #2: sealed to Bob's real device-#2 key.
+        let bob_x25519_pub = {
+            let verifying_bytes = s.bob_comm_sk.verifying_key().to_bytes();
+            harmony_app::dm_signing::ed25519_pub_to_x25519(&verifying_bytes)
+                .expect("bob_comm ed25519→x25519")
+        };
+        let env_bob = harmony_app::dm_signing::seal_to_owner(
+            &bob_x25519_pub,
+            s.alice_minted.membership_key.as_bytes(),
+        )
+        .expect("seal to bob device");
+
+        // Bob's envelope is SECOND — try-all must skip #1 and open #2.
+        let invite_payload = CommunityInvitePayload {
+            community_id: s.community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: Vec::new(),
+                sealed_epoch_keys: vec![env_other, env_bob],
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr: s.alice_addr,
+            community_name: "Zeb369MultiDeviceCommunity".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(invite_token),
+            admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
+            admin_identity_pub: Some(s.alice_pub),
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: Some(s.alice_comm.cert.clone()),
+            untargeted_decrypt_key: None,
+        };
+        let invite_url = community_invite::encode_invite_url(&invite_payload)
+            .expect("encode multi-device invite");
+
+        s.invite_pub.register_invite(&invite_payload).await;
+        let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+
+        let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
+            invite_url,
+            Some(Arc::clone(&s.pkarr_resolver)),
+            Some(s.bob_reachability.clone()),
+            Some(Arc::clone(&s.bob_ep)),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            None,
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            None,
+            None,
+            |_| {},
+            |_payload: harmony_app::NavUpdatedPayload| {},
+            harmony_app::HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(10_000),
+                open_bi_timeout: Duration::from_millis(10_000),
+                response_read_timeout: Duration::from_millis(10_000),
+                write_timeout: Duration::from_millis(10_000),
+            },
+            || Ok(()),
+        )
+        .await
+        .expect("connectivity_redeem_invite_iroh_inner must Ok");
+
+        assert_eq!(
+            outcome.status, "joined",
+            "multi-device targeted redeem must return 'joined' — Bob's envelope was \
+             SECOND, so the ZEB-369 try-all had to skip the first (undecryptable) \
+             envelope and open the second with his device key. Got status={:?} \
+             community_id={:?}.",
+            outcome.status, outcome.community_id
+        );
+        assert_eq!(
+            outcome.community_id.as_deref(),
+            Some(hex::encode(s.community_id.0).as_str()),
+            "community_id must echo Alice's invite"
+        );
+
+        let bob_state = s
+            .registry_bob
+            .state_for(&s.community_id)
+            .await
+            .expect("bob state must exist after redeem");
+        let bob_events: Vec<_> = {
+            let g = bob_state.lock().await;
+            g.events.values().cloned().collect()
+        };
+        let bob_materialized = materialize(&bob_events, s.alice_addr);
+        assert_eq!(
+            bob_materialized.members.get(&s.bob_addr).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "Bob must materialize as Joined after opening the 2nd envelope"
+        );
+
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("targeted_invite_only_multi_device_redeem_opens_correct_envelope timed out at 60s");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1355,8 +1689,9 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
             community_id: s.community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
-                sealed_epoch_key,
-                sealed_epoch_keys: Vec::new(),
+                // ZEB-369: targeted invite — sealed envelope rides in sealed_epoch_keys.
+                sealed_epoch_key: Vec::new(),
+                sealed_epoch_keys: vec![sealed_epoch_key],
                 state_snapshot: MaterializedCommunityState::default(),
             },
             admin_addr: s.alice_addr,
