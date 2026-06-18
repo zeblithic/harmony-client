@@ -40,7 +40,7 @@ work is **frontend-only**: no Rust changes.
 The explain pane gains a secondary action alongside the primary "Create my
 identity":
 
-```
+```text
 Already have Harmony on another device? Add this one to your existing identity.
 
   [ Create my identity ]            ← primary (most first-runs)

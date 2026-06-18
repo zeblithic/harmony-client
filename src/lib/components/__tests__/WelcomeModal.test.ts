@@ -187,28 +187,27 @@ describe('WelcomeModal ZEB-494 — join an existing device', () => {
   });
 
   it('clicking join mounts the PairingJoiner and replaces the gate content', async () => {
-    const { getByTestId, queryByTestId, getByText } = render(WelcomeModal, {
+    const { getByTestId, queryByTestId, findByText } = render(WelcomeModal, {
       props: { open: true, onMinted: vi.fn() },
     });
     await fireEvent.click(getByTestId('welcome-join-existing'));
-    await Promise.resolve(); await Promise.resolve();
     // PairingJoiner is now the sole modal; the gate's own backdrop/content is
-    // suppressed so there is exactly one dialog on screen.
-    expect(getByText('Join existing identity')).toBeTruthy();
+    // suppressed so there is exactly one dialog on screen. findByText waits for
+    // the joiner to mount rather than flushing a fixed number of microtasks.
+    expect(await findByText('Join existing identity')).toBeTruthy();
     expect(queryByTestId('welcome-modal-backdrop')).toBeNull();
     expect(queryByTestId('welcome-create-identity')).toBeNull();
   });
 
   it('cancelling the joiner returns to the explain pane (hard gate not dismissed)', async () => {
-    const { getByTestId, queryByTestId, getByText } = render(WelcomeModal, {
+    const { findByTestId, getByTestId, queryByTestId, findByText } = render(WelcomeModal, {
       props: { open: true, onMinted: vi.fn() },
     });
     await fireEvent.click(getByTestId('welcome-join-existing'));
-    await Promise.resolve(); await Promise.resolve();
     // The joiner's idle-state Cancel button → onClose → back to explain.
-    await fireEvent.click(getByText('Cancel'));
-    await Promise.resolve(); await Promise.resolve();
-    expect(getByTestId('welcome-create-identity')).toBeTruthy();
+    await fireEvent.click(await findByText('Cancel'));
+    // Wait for the explain pane to re-render rather than flushing microtasks.
+    expect(await findByTestId('welcome-create-identity')).toBeTruthy();
     expect(getByTestId('welcome-modal-backdrop')).toBeTruthy();
     expect(queryByTestId('welcome-join-existing')).toBeTruthy();
   });
