@@ -22236,19 +22236,25 @@ pub fn mint_redemption(
     //   scalar from signing_key (RFC 7748 §5 via ed25519_priv_to_x25519)
     //   and decrypt here.
     let epoch_key_bytes: [u8; 32] = if payload.is_invite_only {
-        // Invite-only path: decrypt the 92-byte sealed blob
-        // (32 ephemeral_pub + 12 nonce + 32 ciphertext + 16 AEAD tag).
-        // E2: validate minimum envelope size before attempting decryption so
-        // a truncated payload produces a clear error rather than the generic
+        // Invite-only path: decrypt the X25519-sealed epoch key.
+        // ZEB-369 defense-in-depth: a TARGETED invite binds the token to a
+        // specific invitee (`invitee_hint = Some`). The cryptographic gate is
+        // the seal, but if this owner isn't the targeted invitee, fail early
+        // with a clear error rather than letting every candidate envelope fail
+        // to open. Untargeted tokens (`invitee_hint = None`) skip this — no
+        // behavior change for the existing path.
+        if let Some(token) = payload.invite_token.as_ref() {
+            if let Some(hint) = token.invitee_hint {
+                if hint != self_owner {
+                    return Err("this invite was issued for a different owner".to_string());
+                }
+            }
+        }
+
+        // E2: validate minimum envelope size before attempting decryption so a
+        // truncated payload produces a clear error rather than the generic
         // MalformedSealedEnvelope from open_from_owner.
         const SEALED_MIN: usize = 32 + 12 + 16; // ephemeral_pub + nonce + AEAD tag
-        if payload.epoch_snapshot.sealed_epoch_key.len() < SEALED_MIN {
-            return Err(format!(
-                "invite-only epoch key envelope too short: need ≥ {} bytes, got {}",
-                SEALED_MIN,
-                payload.epoch_snapshot.sealed_epoch_key.len()
-            ));
-        }
         use crate::dm_signing::{ed25519_priv_to_x25519, open_from_owner};
         // ZEB-367: untargeted invite-only invites seal the epoch key to a
         // one-time ephemeral X25519 key whose PRIVATE half rides in the URL
@@ -22259,8 +22265,33 @@ pub fn mint_redemption(
             Some(ephemeral_priv) => zeroize::Zeroizing::new(ephemeral_priv),
             None => ed25519_priv_to_x25519(signing_key),
         };
-        let plaintext = open_from_owner(&x25519_priv, &payload.epoch_snapshot.sealed_epoch_key)
-            .map_err(|e| format!("invite-only epoch key decryption failed: {e}"))?;
+
+        // ZEB-369: a TARGETED invite carries one sealed envelope per invitee
+        // device in `sealed_epoch_keys`. Try each with our device key until one
+        // opens (we may hold any one of the bound devices). An untargeted /
+        // legacy / open invite leaves it empty → fall back to the single blob.
+        let candidates: Vec<&[u8]> = if !payload.epoch_snapshot.sealed_epoch_keys.is_empty() {
+            payload
+                .epoch_snapshot
+                .sealed_epoch_keys
+                .iter()
+                .map(|v| v.as_slice())
+                .collect()
+        } else {
+            vec![payload.epoch_snapshot.sealed_epoch_key.as_slice()]
+        };
+        // Length-guard each (drop truncated envelopes) then open the first that
+        // succeeds. None opening → a clear error (wrong device key, or all
+        // envelopes truncated/tampered).
+        let plaintext = candidates
+            .iter()
+            .filter(|c| c.len() >= SEALED_MIN)
+            .find_map(|c| open_from_owner(&x25519_priv, c).ok())
+            .ok_or_else(|| {
+                "invite-only epoch key decryption failed: \
+                 no envelope opened with this device key"
+                    .to_string()
+            })?;
         plaintext.as_slice().try_into().map_err(|_| {
             format!(
                 "decrypted invite-only epoch key must be 32 bytes (got {})",
@@ -24787,6 +24818,278 @@ mod redeem_invite_inner_tests {
             }
             other => panic!("expected PendingJoin kind, got {:?}", other),
         }
+    }
+
+    // ── ZEB-369: mint_redemption targeted try-all + invitee binding ──────
+
+    /// Seal `raw_key` to the X25519 derived from `device_sk`'s ed25519 key.
+    fn seal_epoch_to_device(device_sk: &ed25519_dalek::SigningKey, raw_key: &[u8; 32]) -> Vec<u8> {
+        use crate::dm_signing::{ed25519_priv_to_x25519, seal_to_owner};
+        let x_priv = ed25519_priv_to_x25519(device_sk);
+        let x_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x_priv));
+        let sealed = seal_to_owner(x_pub.as_bytes(), raw_key).expect("seal");
+        assert_eq!(sealed.len(), 92, "sealed envelope must be 92 bytes");
+        sealed
+    }
+
+    /// Build a TARGETED invite-only payload sealing `raw_key` to each device in
+    /// `envelopes`, bound to `invitee_addr`. `sealed_epoch_key` left empty.
+    fn targeted_invite_only_payload(
+        community_id: SpaceId,
+        admin_addr: OwnerAddr,
+        invitee_addr: OwnerAddr,
+        envelopes: Vec<Vec<u8>>,
+    ) -> CommunityInvitePayload {
+        use crate::community_invite::{
+            InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
+        };
+        CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: Vec::new(),
+                sealed_epoch_keys: envelopes,
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Targeted Test".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(InviteToken {
+                inviter: admin_addr,
+                invitee_hint: Some(invitee_addr),
+                minted_at: Hlc {
+                    wall_ms: 1_700_000_000_000,
+                    logical: 0,
+                    device_id: "admin".into(),
+                },
+                expires_at: None,
+                sig: [0; 64],
+            }),
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: None,
+            untargeted_decrypt_key: None,
+        }
+    }
+
+    /// Two envelopes, our device key matches the SECOND → mint_redemption tries
+    /// each and opens on the second, yielding the correct epoch key.
+    #[test]
+    fn mint_redemption_targeted_opens_second_of_two_envelopes() {
+        let admin_addr = OwnerAddr([0x11; 16]);
+        let community_id = SpaceId([0x33; 16]);
+        let joiner = crate::community_membership::mint_test_owner(0xD3);
+        let joiner_sk = joiner.device_key.clone();
+
+        // Device A is some OTHER device key (we don't hold it); device B is ours.
+        let device_a_sk = ed25519_dalek::SigningKey::from_bytes(&[0xA1u8; 32]);
+        let raw_key = [0xEEu8; 32];
+        let env_a = seal_epoch_to_device(&device_a_sk, &raw_key);
+        let env_b = seal_epoch_to_device(&joiner_sk, &raw_key);
+
+        let payload = targeted_invite_only_payload(
+            community_id,
+            admin_addr,
+            joiner.owner,
+            vec![env_a, env_b],
+        );
+
+        let hlc = Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "joiner".into(),
+        };
+        let minted = mint_redemption(&payload, joiner.owner, &joiner_sk, &joiner.cert, hlc)
+            .expect("targeted redeem opens the 2nd envelope");
+        assert_eq!(
+            minted.membership_key.as_bytes(),
+            &raw_key,
+            "decrypted epoch key must match the sealed key"
+        );
+    }
+
+    /// None of the envelopes were sealed to our device key → clear Err.
+    #[test]
+    fn mint_redemption_targeted_no_matching_envelope_errs() {
+        let admin_addr = OwnerAddr([0x11; 16]);
+        let community_id = SpaceId([0x33; 16]);
+        // Token targets OUR owner (so the binding check passes), but the
+        // envelopes were sealed to keys we don't hold.
+        let joiner = crate::community_membership::mint_test_owner(0xD3);
+        let joiner_sk = joiner.device_key.clone();
+
+        let other_a = ed25519_dalek::SigningKey::from_bytes(&[0xA1u8; 32]);
+        let other_b = ed25519_dalek::SigningKey::from_bytes(&[0xB2u8; 32]);
+        let raw_key = [0xEEu8; 32];
+        let env_a = seal_epoch_to_device(&other_a, &raw_key);
+        let env_b = seal_epoch_to_device(&other_b, &raw_key);
+
+        let payload = targeted_invite_only_payload(
+            community_id,
+            admin_addr,
+            joiner.owner,
+            vec![env_a, env_b],
+        );
+
+        let hlc = Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "joiner".into(),
+        };
+        let err = match mint_redemption(&payload, joiner.owner, &joiner_sk, &joiner.cert, hlc) {
+            Ok(_) => panic!("expected Err: no envelope opens with our device key"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("no envelope opened with this device key"),
+            "unexpected err: {err}"
+        );
+    }
+
+    /// An untargeted invite-only payload (empty sealed_epoch_keys, single blob +
+    /// URL-borne ephemeral key) still opens via the single-blob fallback.
+    #[test]
+    fn mint_redemption_untargeted_single_blob_fallback_opens() {
+        use crate::community_invite::{
+            InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
+        };
+        let admin_addr = OwnerAddr([0x11; 16]);
+        let community_id = SpaceId([0x33; 16]);
+        let joiner = crate::community_membership::mint_test_owner(0xD3);
+        let joiner_sk = joiner.device_key.clone();
+
+        // Seal to a one-time ephemeral X25519 key; ride its private half in the
+        // URL (untargeted_decrypt_key) — mirrors the ZEB-367 untargeted shape.
+        let raw_key = [0xEEu8; 32];
+        let ephemeral_priv = {
+            use rand::RngCore;
+            let mut b = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut b);
+            b
+        };
+        let ephemeral_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(ephemeral_priv));
+        let sealed = crate::dm_signing::seal_to_owner(ephemeral_pub.as_bytes(), &raw_key)
+            .expect("seal to ephemeral");
+
+        let payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: sealed,
+                sealed_epoch_keys: Vec::new(),
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Untargeted Test".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(InviteToken {
+                inviter: admin_addr,
+                invitee_hint: None, // untargeted → no binding check, use URL key
+                minted_at: Hlc {
+                    wall_ms: 1_700_000_000_000,
+                    logical: 0,
+                    device_id: "admin".into(),
+                },
+                expires_at: None,
+                sig: [0; 64],
+            }),
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: None,
+            untargeted_decrypt_key: Some(ephemeral_priv),
+        };
+
+        let hlc = Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "joiner".into(),
+        };
+        let minted = mint_redemption(&payload, joiner.owner, &joiner_sk, &joiner.cert, hlc)
+            .expect("untargeted single-blob fallback opens");
+        assert_eq!(minted.membership_key.as_bytes(), &raw_key);
+    }
+
+    /// A targeted token whose `invitee_hint` is a DIFFERENT owner is rejected
+    /// before any decrypt is attempted (defense-in-depth binding check).
+    #[test]
+    fn mint_redemption_targeted_invitee_mismatch_errs() {
+        let admin_addr = OwnerAddr([0x11; 16]);
+        let community_id = SpaceId([0x33; 16]);
+        let joiner = crate::community_membership::mint_test_owner(0xD3);
+        let joiner_sk = joiner.device_key.clone();
+        // Token targets SOMEONE ELSE, and the envelope is sealed to our key (so
+        // a missing binding check would otherwise succeed) — proves the binding
+        // gate fires first.
+        let raw_key = [0xEEu8; 32];
+        let env = seal_epoch_to_device(&joiner_sk, &raw_key);
+        let other_owner = OwnerAddr([0x99; 16]);
+        let payload =
+            targeted_invite_only_payload(community_id, admin_addr, other_owner, vec![env]);
+
+        let hlc = Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "joiner".into(),
+        };
+        let err = match mint_redemption(&payload, joiner.owner, &joiner_sk, &joiner.cert, hlc) {
+            Ok(_) => panic!("expected Err: invitee mismatch must reject"),
+            Err(e) => e,
+        };
+        assert!(err.contains("different owner"), "unexpected err: {err}");
+    }
+
+    /// Open-community redemption (raw 32-byte sealed_epoch_key, empty
+    /// sealed_epoch_keys) is unchanged — the raw-key path still produces a Join.
+    #[test]
+    fn mint_redemption_open_raw_key_path_unchanged() {
+        use crate::community_invite::{InviteEpochSnapshot, MaterializedCommunityState};
+        use crate::community_membership::MembershipEventKind;
+        let admin_addr = OwnerAddr([0x11; 16]);
+        let community_id = SpaceId([0x33; 16]);
+        let joiner = crate::community_membership::mint_test_owner(0xD3);
+        let joiner_sk = joiner.device_key.clone();
+
+        let raw_key = [0x44u8; 32];
+        let payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: raw_key.to_vec(), // open: raw 32-byte key
+                sealed_epoch_keys: Vec::new(),
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Open Test".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: None,
+            untargeted_decrypt_key: None,
+        };
+
+        let hlc = Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "joiner".into(),
+        };
+        let minted = mint_redemption(&payload, joiner.owner, &joiner_sk, &joiner.cert, hlc)
+            .expect("open redeem produces a join");
+        assert_eq!(minted.membership_key.as_bytes(), &raw_key);
+        assert!(matches!(
+            minted.bootstrap_join.kind,
+            MembershipEventKind::Join
+        ));
     }
 }
 
