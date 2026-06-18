@@ -774,6 +774,11 @@ pub async fn run(
     // `harmony/owner/{addr_hex}/ds/{dataset}`. `None` when no owner identity is
     // loaded (and in test callers that bypass `start_node`).
     mut relay_sync_handles: Option<RelaySyncHandles>,
+    // ZEB-495 (ZEB-340 Part 2): channel pair bridging the
+    // community-device-intro FleetSyncEngine to Zenoh on
+    // `harmony/owner/{addr_hex}/ds/community-device-intro-v1`. `None` when no
+    // owner identity is loaded (and in test callers that bypass `start_node`).
+    mut community_device_intro_sync_handles: Option<DatasetSyncHandles>,
     // ZEB-321 Phase 1 Task 8: bundle of iroh-transport resources built in
     // `start_node`. When `Some`, the event loop spawns the link-manager
     // accept loop + publisher driver as background tasks; when `None`
@@ -1567,6 +1572,26 @@ pub async fn run(
             "relay-optin-v1",
             "relay-optin-sync-degraded",
             crate::community_relay::RELAY_OPTIN_DATASET_MAX_BYTES,
+        )
+        .await;
+    }
+
+    // ── ZEB-495 (ZEB-340 Part 2): community-device-intro fleet-sync adapter ─
+    // Same plumbing as the P2 / relay datasets above — replicates deposited
+    // `DeviceAnnounce` intros across the owner's fleet so an enrolled sibling
+    // can relay a second device's self-introduction into the community engine
+    // (Option A). Keyed off the OWNER address hex, forming
+    // `harmony/owner/{addr_hex}/ds/community-device-intro-v1`. `None` when no
+    // owner identity is loaded.
+    if let Some(handles) = community_device_intro_sync_handles.take() {
+        spawn_dataset_sync_zenoh_adapter(
+            &session,
+            &app,
+            &closing,
+            handles,
+            "community-device-intro-v1",
+            "community-device-intro-sync-degraded",
+            crate::community_device_intro_ingest::COMMUNITY_DEVICE_INTRO_DATASET_MAX_BYTES,
         )
         .await;
     }

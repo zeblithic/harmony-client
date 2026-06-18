@@ -319,6 +319,30 @@ pub enum MembershipEventKind {
         #[serde(rename = "pl")]
         payload: crate::community_relay_announce::CommunityRelayAnnouncePayload,
     },
+
+    /// ZEB-495 (ZEB-340 Part 2): a second device of an already-`Joined`
+    /// owner introduces itself into the community by self-signing this
+    /// event and attaching its own Master `EnrollmentCert` to
+    /// `SignedMembershipEvent.enrollment` — exactly as `Join` carries the
+    /// joiner's cert. On merge, the cert's
+    /// `device_pubkeys.classical.ed25519_verify` is **added** to the
+    /// owner's existing `MemberState.enrolled_device_keys` without
+    /// disturbing status, `joined_at`, or power, so messages and state
+    /// signed by *either* of the owner's devices verify for every member.
+    ///
+    /// Carries NO body — the introduced device's identity lives entirely
+    /// on the carried cert (the device key is `cert.device_pubkeys.
+    /// classical.ed25519_verify`). The signer is resolved via
+    /// `enrolled_key_from_cert` (the cert path — the device is NOT yet in
+    /// the enrolled set), and authorization is "actor is already a Joined
+    /// member" (no power level / admin countersign required: a Master-signed
+    /// cert for an already-admitted owner only ever ADDS a key).
+    ///
+    /// Variant code "e" (1-char value, keeps the same-length-keys invariant
+    /// intact). Unit variant — no inner keys.
+    /// See `docs/specs/2026-06-18-zeb-340-part2-multi-device-per-community-design.md` §Unit 1.
+    #[serde(rename = "e")]
+    DeviceAnnounce,
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -845,6 +869,14 @@ pub enum VerifyError {
     /// ZEB-339: counter-signer's signing key is not in the counter-signer's
     /// materialized `enrolled_device_keys`.
     CounterSignerNotEnrolled,
+    /// ZEB-495 (ZEB-340 Part 2): a `DeviceAnnounce` was signed for an actor
+    /// who is NOT an already-`Joined` member of this community. Unlike
+    /// steady-state kinds (whose signer comes from the materialized enrolled
+    /// set, which implies membership), `DeviceAnnounce`'s signer comes from
+    /// the carried cert, so membership must be checked independently — a
+    /// device may not introduce itself into a community its owner has not
+    /// already joined.
+    DeviceAnnounceForNonMember,
 
     // ── ZEB-458 P4B CommunityRelayAnnounce verify rules ───────────────────────
     //
@@ -1059,6 +1091,12 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::CommunityRelayActorNotMember => {
                 write!(f, "ZEB-458 RCH5 CommunityRelayAnnounce actor is not a community member")
+            }
+            VerifyError::DeviceAnnounceForNonMember => {
+                write!(
+                    f,
+                    "ZEB-495 DeviceAnnounce actor is not an already-Joined community member"
+                )
             }
         }
     }
@@ -2509,6 +2547,34 @@ pub fn materialize_with_now(
                 // ZEB-458: no membership-state effect; consumed by
                 // CommunityRelayResolver for the fresh advertiser set.
             }
+            MembershipEventKind::DeviceAnnounce => {
+                // ZEB-495 (ZEB-340 Part 2): add the introduced device's key to
+                // its owner's EXISTING MemberState. `get_mut`-and-insert
+                // inherently preserves every other field (status, joined_at,
+                // left_at, prior enrolled keys) — no rebuild/replace. Idempotent:
+                // re-announcing an already-present key is a no-op BTreeSet::insert.
+                //
+                // Defensive guards (member present + Joined + cert present):
+                // verify_event already guarantees all three (the actor is a
+                // Joined member and the cert resolved the signer), but materialize
+                // must never panic on a malformed/replayed event that slipped past
+                // verification (corrupted log, etc.), so each is checked here.
+                //
+                // SECURITY INVARIANT (mirrors the Join arm): the cert is ingested
+                // WITHOUT re-verification — verify_event → enrolled_key_from_cert
+                // is the SOLE cert gate (cert.verify, Master-issuer, owner==actor).
+                // The inserted key is the IDENTICAL field that
+                // verify_membership_signer validated the outer signature under.
+                if let Some(member) = m.members.get_mut(&event.actor) {
+                    if member.status == MemberStatus::Joined {
+                        if let Some(cert) = &event.enrollment {
+                            member
+                                .enrolled_device_keys
+                                .insert(cert.device_pubkeys.classical.ed25519_verify);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2699,10 +2765,13 @@ pub fn verify_event(
 
     // 1. ZEB-339: resolve the signer's enrolled device key, then verify the sig.
     let signer = match &event.kind {
-        // Identity-introducing events carry their own cert.
-        MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
-            enrolled_key_from_cert(event)?
-        }
+        // Identity-introducing events carry their own cert. ZEB-495:
+        // DeviceAnnounce is identity-introducing too — the second device's
+        // key is NOT yet in the enrolled set (that is exactly what this
+        // event adds), so its signer is resolved from the carried cert.
+        MembershipEventKind::Join
+        | MembershipEventKind::PendingJoin { .. }
+        | MembershipEventKind::DeviceAnnounce => enrolled_key_from_cert(event)?,
         // Steady-state events: resolve from materialized membership.
         _ => resolve_enrolled_signer(prior_state, event)?,
     };
@@ -2999,6 +3068,31 @@ pub fn verify_event(
             // ZEB-458: membership status (RCH5 analogue) is enforced in
             // the per-kind power-rules block below, alongside the inner-sig
             // and timestamp-skew checks. Same pattern as ReachabilityAnnounce.
+        }
+        MembershipEventKind::DeviceAnnounce => {
+            // ZEB-495 (ZEB-340 Part 2): the actor (owner) MUST already be a
+            // Joined member. This Joined-check is essential and cannot be
+            // skipped: unlike steady-state kinds — whose signer is resolved
+            // from the materialized enrolled set (which itself implies the
+            // actor is a member) — DeviceAnnounce's signer comes from the
+            // carried cert (resolved in step 1 via enrolled_key_from_cert),
+            // so membership is NOT implied by signature resolution and must
+            // be asserted independently here. A device may not introduce
+            // itself into a community its owner has not already joined.
+            //
+            // This is the WHOLE authorization story: a valid Master-signed
+            // cert (owner_id == actor, verified in step 1) for an already-
+            // admitted owner is sufficient. No power level and no admin
+            // countersign are required — the admin vouched for the *owner*,
+            // not per-device; adding another of that owner's own master-
+            // attested devices introduces no new principal, only a key. In
+            // invite-only communities DeviceAnnounce therefore bypasses the
+            // PendingJoin/countersign gate by construction (it is not a
+            // Join/PendingJoin).
+            match prior_state.members.get(&event.actor).map(|m| m.status) {
+                Some(MemberStatus::Joined) => { /* ok */ }
+                _ => return Err(VerifyError::DeviceAnnounceForNonMember),
+            }
         }
     }
 
@@ -3382,6 +3476,13 @@ pub fn verify_event(
             if !is_joined_member(prior_state, &event.actor) {
                 return Err(VerifyError::CommunityRelayActorNotMember);
             }
+        }
+        MembershipEventKind::DeviceAnnounce => {
+            // ZEB-495: NO power gate and NO admin countersign. Authorization
+            // is entirely the cert (verified in step 1) + the already-Joined
+            // membership check (step 4 above). A Master-signed cert for an
+            // already-admitted owner only ever adds one of that owner's own
+            // devices' keys — no escalation is possible.
         }
     }
 
@@ -5757,6 +5858,8 @@ mod tests {
             MembershipEventKind::Fork {
                 fork_space_id: SpaceId([0xfa; 16]),
             },
+            // ZEB-495: unit variant, no body.
+            MembershipEventKind::DeviceAnnounce,
         ];
 
         for variant in &variants {
@@ -11084,6 +11187,422 @@ mod zeb_339_signer_verify_tests {
         assert_eq!(
             enrolled_key_from_cert(&ev),
             Err(VerifyError::EnrollmentCertInvalid)
+        );
+    }
+
+    // ── ZEB-495 (ZEB-340 Part 2) DeviceAnnounce tests ─────────────────────────
+
+    /// Mint a SECOND device under the SAME owner as `mint_test_owner(master_seed)`.
+    /// Reconstructs the owner's master key from `[master_seed; 32]` (the exact
+    /// derivation `mint_test_owner` uses) so the new device's Master cert binds
+    /// to the IDENTICAL `owner_id`. `device_seed` selects fresh device key
+    /// material distinct from `mint_test_owner`'s `[master_seed ^ 0xFF; 32]`
+    /// device key. Returns `(device2_signing_key, device2_master_cert)`.
+    fn mint_second_device(
+        master_seed: u8,
+        device_seed: u8,
+    ) -> (ed25519_dalek::SigningKey, EnrollmentCert) {
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[master_seed; 32]);
+        let master_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: master_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device2_sk = ed25519_dalek::SigningKey::from_bytes(&[device_seed; 32]);
+        let device2_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: device2_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device2_id = device2_bundle.identity_hash();
+        let cert = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device2_id,
+            device2_bundle,
+            1_700_000_000,
+            None,
+        )
+        .expect("sign_master for second device");
+        cert.verify(0).expect("second-device cert self-verifies");
+        (device2_sk, cert)
+    }
+
+    /// Sign a `DeviceAnnounce` for `owner`, signed by the SECOND device's key
+    /// `device2_sk` and carrying the second device's Master cert `cert2`.
+    /// Mirrors the Join attach-cert-after-signing idiom.
+    fn make_device_announce(
+        owner: OwnerAddr,
+        community_id: SpaceId,
+        device2_sk: &ed25519_dalek::SigningKey,
+        cert2: &EnrollmentCert,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [0xDA; 16],
+            community_id,
+            kind: MembershipEventKind::DeviceAnnounce,
+            actor: owner,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "device2".into(),
+            },
+        };
+        let ev = sign_event(&payload, device2_sk).expect("sign DeviceAnnounce");
+        SignedMembershipEvent {
+            enrollment: Some(cert2.clone()),
+            ..ev
+        }
+    }
+
+    /// Build a `MaterializedMembership` where `owner` is a Joined member with
+    /// their FIRST device key enrolled (mirrors the materialize(Join) result).
+    fn joined_with_first_device(owner: &TestOwner) -> MaterializedMembership {
+        let mut keys = BTreeSet::new();
+        keys.insert(owner.cert.device_pubkeys.classical.ed25519_verify);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            owner.owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: keys,
+            },
+        );
+        mat
+    }
+
+    /// Unit 4: a Joined owner + a DeviceAnnounce carrying a SECOND device's
+    /// Master cert ⇒ the second key lands in `enrolled_device_keys`, and
+    /// status / joined_at / power are unchanged. Mirrors
+    /// `materialize_records_enrolled_device_key_from_join_cert`.
+    #[test]
+    fn materialize_records_enrolled_device_key_from_device_announce() {
+        // Use a DISTINCT bootstrap admin so `owner` is a regular (non-admin)
+        // member — this keeps the "power unchanged" assertion meaningful
+        // (the bootstrap admin would otherwise be implicitly granted power 100).
+        let admin = mint_test_owner(0x41);
+        let owner = mint_test_owner(0x31);
+        let community_id = SpaceId([9u8; 16]);
+
+        // First, the owner joins (device #1 enrolled).
+        let join_payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let join = sign_event(&join_payload, &owner.device_key).unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..join
+        };
+
+        // Baseline: materialize the Join alone, so we can prove DeviceAnnounce
+        // changes ONLY enrolled_device_keys (not status/joined_at/power).
+        let m_before = materialize(std::slice::from_ref(&join), admin.owner);
+        let member_before = m_before.members.get(&owner.owner).expect("owner joined");
+        let power_before = m_before
+            .power_levels
+            .get(&owner.owner)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            member_before.enrolled_device_keys.len(),
+            1,
+            "only device #1 enrolled before the announce"
+        );
+
+        // Then, the second device announces itself.
+        let (device2_sk, cert2) = mint_second_device(0x31, 0x32);
+        let device2_key = cert2.device_pubkeys.classical.ed25519_verify;
+        let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 200);
+
+        let m = materialize(&[join, announce.clone()], admin.owner);
+        let member = m.members.get(&owner.owner).expect("owner is a member");
+
+        // Both device keys are now enrolled.
+        assert!(
+            member
+                .enrolled_device_keys
+                .contains(&owner.cert.device_pubkeys.classical.ed25519_verify),
+            "first device key must remain enrolled"
+        );
+        assert!(
+            member.enrolled_device_keys.contains(&device2_key),
+            "second device key from the DeviceAnnounce cert must be enrolled"
+        );
+        assert_eq!(member.enrolled_device_keys.len(), 2, "exactly two keys");
+
+        // Status / joined_at unchanged (joined_at stays the ORIGINAL Join HLC,
+        // not the DeviceAnnounce HLC — DeviceAnnounce never touches it).
+        assert_eq!(member.status, member_before.status, "status unchanged");
+        assert_eq!(member.status, MemberStatus::Joined);
+        assert_eq!(
+            member.joined_at.wall_ms, 100,
+            "joined_at unchanged (original Join timestamp preserved)"
+        );
+        // Power unchanged by DeviceAnnounce (and 0 for this non-admin owner).
+        let power_after = m.power_levels.get(&owner.owner).copied().unwrap_or(0);
+        assert_eq!(
+            power_after, power_before,
+            "DeviceAnnounce introduces no power change"
+        );
+        assert_eq!(power_after, 0, "non-admin owner has no power level");
+
+        // Idempotent: a SECOND announce of the same device key (after the Join)
+        // is a no-op BTreeSet::insert — the enrolled set stays at exactly 2.
+        let join2 = {
+            let p = EventPayload {
+                id: [2u8; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: owner.owner,
+                at: Hlc {
+                    wall_ms: 100,
+                    logical: 0,
+                    device_id: "device1".into(),
+                },
+            };
+            let e = sign_event(&p, &owner.device_key).unwrap();
+            SignedMembershipEvent {
+                enrollment: Some(owner.cert.clone()),
+                ..e
+            }
+        };
+        let announce2 = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 300);
+        let m2 = materialize(&[join2, announce, announce2], admin.owner);
+        assert_eq!(
+            m2.members
+                .get(&owner.owner)
+                .expect("owner present after re-announce")
+                .enrolled_device_keys
+                .len(),
+            2,
+            "re-announcing the same device key is an idempotent no-op (still exactly 2 keys)"
+        );
+
+        // Defensive: a DeviceAnnounce with NO prior Join (owner is not a member)
+        // is a materialize no-op — the owner gets no member entry, no panic.
+        let lone_announce =
+            make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 400);
+        let m_lone = materialize(std::slice::from_ref(&lone_announce), admin.owner);
+        assert!(
+            !m_lone.members.contains_key(&owner.owner),
+            "DeviceAnnounce without a prior Join must not materialize a member"
+        );
+    }
+
+    /// Unit 4: verify_event accepts a DeviceAnnounce signed by a second device
+    /// of an already-Joined owner (cert-path signer resolution + Joined gate).
+    #[test]
+    fn verify_event_accepts_device_announce_from_joined_owner() {
+        let owner = mint_test_owner(0x33);
+        let community_id = SpaceId([0xc1; 16]);
+        let prior = joined_with_first_device(&owner);
+
+        let (device2_sk, cert2) = mint_second_device(0x33, 0x34);
+        let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 1_000);
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: owner.owner,
+            is_invite_only: false,
+        };
+        verify_event(&announce, &prior, &ctx)
+            .expect("DeviceAnnounce from an already-Joined owner must verify");
+
+        // Also succeeds in an invite-only community WITHOUT a countersign:
+        // DeviceAnnounce is not a Join/PendingJoin, so the countersign gate
+        // does not apply (it adds a key for an already-admitted owner).
+        let ctx_invite = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: owner.owner,
+            is_invite_only: true,
+        };
+        verify_event(&announce, &prior, &ctx_invite)
+            .expect("DeviceAnnounce bypasses the invite-only countersign gate by construction");
+    }
+
+    /// Unit 4: verify_event rejects a DeviceAnnounce whose actor is NOT an
+    /// already-Joined member (the cert is valid, but membership is absent).
+    #[test]
+    fn verify_event_rejects_device_announce_from_non_member() {
+        let owner = mint_test_owner(0x35);
+        let community_id = SpaceId([0xc2; 16]);
+
+        // Empty prior state: the owner is NOT a member.
+        let prior = MaterializedMembership::default();
+
+        let (device2_sk, cert2) = mint_second_device(0x35, 0x36);
+        let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 1_000);
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: OwnerAddr([0xaa; 16]),
+            is_invite_only: false,
+        };
+        assert_eq!(
+            verify_event(&announce, &prior, &ctx),
+            Err(VerifyError::DeviceAnnounceForNonMember),
+            "DeviceAnnounce for a non-member must be rejected"
+        );
+
+        // Also rejected when the owner is present but only Left (not Joined).
+        let mut prior_left = MaterializedMembership::default();
+        prior_left.members.insert(
+            owner.owner,
+            MemberState {
+                status: MemberStatus::Left,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: Some(Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "t".into(),
+                }),
+                enrolled_device_keys: {
+                    let mut k = BTreeSet::new();
+                    k.insert(owner.cert.device_pubkeys.classical.ed25519_verify);
+                    k
+                },
+            },
+        );
+        assert_eq!(
+            verify_event(&announce, &prior_left, &ctx),
+            Err(VerifyError::DeviceAnnounceForNonMember),
+            "DeviceAnnounce for a Left (non-Joined) member must be rejected"
+        );
+    }
+
+    /// Unit 4: a member with TWO enrolled keys for one owner — a steady-state
+    /// event signed by EITHER device passes `resolve_enrolled_signer`. This is
+    /// the core multi-device claim: once both keys are in the set, either
+    /// device can author. (The channel-post half of this assertion is covered
+    /// by `verify_channel_event`'s own enrolled-key tests in
+    /// community_channel_log.rs, which already iterate the full key set; that
+    /// path is async + store-backed, so it is not re-set-up here.)
+    #[test]
+    fn both_enrolled_devices_verify_after_announce() {
+        let owner = mint_test_owner(0x37);
+        let community_id = SpaceId([0xc3; 16]);
+
+        // Materialize Join (device #1) then DeviceAnnounce (device #2) so the
+        // member's enrolled set is built by the production materialize path.
+        let join_payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 10,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let join = sign_event(&join_payload, &owner.device_key).unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..join
+        };
+        let (device2_sk, cert2) = mint_second_device(0x37, 0x38);
+        let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 20);
+        let prior = materialize(&[join, announce], owner.owner);
+        assert_eq!(
+            prior
+                .members
+                .get(&owner.owner)
+                .unwrap()
+                .enrolled_device_keys
+                .len(),
+            2,
+            "both device keys must be enrolled after the announce"
+        );
+
+        // A steady-state event (Leave) signed by device #1 resolves.
+        let leave_payload = EventPayload {
+            id: [2u8; 16],
+            community_id,
+            kind: MembershipEventKind::Leave,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 30,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let leave_d1 = sign_event(&leave_payload, &owner.device_key).unwrap();
+        let signer_d1 = resolve_enrolled_signer(&prior, &leave_d1)
+            .expect("event signed by device #1 must resolve");
+        assert_eq!(
+            signer_d1.device_ed25519,
+            owner.cert.device_pubkeys.classical.ed25519_verify
+        );
+
+        // The SAME steady-state event, signed instead by device #2, also resolves.
+        let leave_d2 = sign_event(&leave_payload, &device2_sk).unwrap();
+        let signer_d2 = resolve_enrolled_signer(&prior, &leave_d2)
+            .expect("event signed by device #2 must resolve");
+        assert_eq!(
+            signer_d2.device_ed25519,
+            cert2.device_pubkeys.classical.ed25519_verify
+        );
+        assert_ne!(
+            signer_d1.device_ed25519, signer_d2.device_ed25519,
+            "the two devices resolve to distinct keys"
+        );
+    }
+
+    /// Unit 4: a DeviceAnnounce `SignedMembershipEvent` round-trips through CBOR
+    /// unchanged, and the encoded kind tag is `"e"`.
+    #[test]
+    fn device_announce_wire_roundtrip() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+
+        let owner = mint_test_owner(0x39);
+        let community_id = SpaceId([0xc4; 16]);
+        let (device2_sk, cert2) = mint_second_device(0x39, 0x3a);
+        let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 1_234);
+
+        // Full SignedMembershipEvent round-trip.
+        let bytes = canonical_cbor_encode(&announce).expect("encode SignedMembershipEvent");
+        let decoded: SignedMembershipEvent =
+            ciborium::de::from_reader(&bytes[..]).expect("decode SignedMembershipEvent");
+        assert_eq!(announce, decoded, "DeviceAnnounce event must round-trip");
+
+        // The kind itself encodes its tag as "e" (adjacently-tagged: { "tg": "e" }).
+        let kind_bytes = canonical_cbor_encode(&announce.kind).expect("encode kind");
+        let val: ciborium::Value =
+            ciborium::de::from_reader(&kind_bytes[..]).expect("decode kind to Value");
+        let map = val.as_map().expect("MembershipEventKind encodes as a map");
+        let tag = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("tg"))
+            .map(|(_, v)| v.clone())
+            .expect("kind map has a `tg` tag key");
+        assert_eq!(
+            tag.as_text(),
+            Some("e"),
+            "DeviceAnnounce wire tag must be \"e\""
         );
     }
 }

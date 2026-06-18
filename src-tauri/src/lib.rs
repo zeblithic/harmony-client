@@ -114,6 +114,9 @@ pub mod butler_deposit;
 pub mod channel_backfill;
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
+pub mod community_device_intro_crdt;
+pub mod community_device_intro_ingest;
+pub mod community_device_intro_persist;
 pub mod community_dfrost_crypto;
 pub mod community_dfrost_log;
 pub mod community_dfrost_log_engine;
@@ -1035,6 +1038,33 @@ pub struct NodeState {
     >,
     pub dm_inbox_device_id: Option<String>,
 
+    /// ZEB-495 (ZEB-340 Part 2): community-device-intro dataset
+    /// (`community-device-intro-v1`) — deposited `DeviceAnnounce` intros
+    /// replicated across the owner's fleet so an enrolled sibling can relay a
+    /// second device's self-introduction (Option A). `Some` while the node is
+    /// running and an owner identity is loaded; `None` otherwise. No IPC surface
+    /// — the self-introduce trigger (delta consumer) deposits and the relay
+    /// sweeper drains; held here so stop_inner shuts the engine down and a
+    /// restart re-loads from disk. Mirrors the dm_inbox handles field-for-field.
+    pub community_device_intro_doc: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<crate::community_device_intro_crdt::CommunityDeviceIntroDoc>,
+        >,
+    >,
+    pub community_device_intro_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+    >,
+    pub community_device_intro_sync: Option<
+        std::sync::Arc<
+            crate::fleet_sync::FleetSyncEngine<
+                crate::community_device_intro_crdt::CommunityDeviceIntroDoc,
+            >,
+        >,
+    >,
+    pub community_device_intro_device_id: Option<String>,
+
     /// ZEB-458 P4 Phase B: relay-hold dataset (`relay-hold-v1`, D38) — the
     /// relay's held opaque blobs, replicated across the relay's OWN fleet so
     /// every device of a volunteering owner can serve a recipient pull. `Some`
@@ -1536,6 +1566,12 @@ impl Default for NodeState {
             dm_inbox_tracker: None,
             dm_inbox_sync: None,
             dm_inbox_device_id: None,
+            // ZEB-495 (ZEB-340 Part 2): community-device-intro dataset handles
+            // stay None until start_node wires the FleetSyncEngine.
+            community_device_intro_doc: None,
+            community_device_intro_tracker: None,
+            community_device_intro_sync: None,
+            community_device_intro_device_id: None,
             // ZEB-458 P4 Phase B: relay-hold + relay-optin dataset handles +
             // the resolver/publisher/driver slots stay None until start_node
             // wires the FleetSyncEngines (and T11b spawns the active tasks).
@@ -1804,6 +1840,15 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let dm_inbox_sync_for_shutdown: Option<
         std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::dm_inbox_crdt::DmInboxDoc>>,
     >;
+    // ZEB-495 (ZEB-340 Part 2): community-device-intro fleet-sync engine, taken
+    // outside the lock for the same ephemeral-runtime shutdown pattern.
+    let community_device_intro_sync_for_shutdown: Option<
+        std::sync::Arc<
+            crate::fleet_sync::FleetSyncEngine<
+                crate::community_device_intro_crdt::CommunityDeviceIntroDoc,
+            >,
+        >,
+    >;
     // ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync engines, taken
     // outside the lock for the same ephemeral-runtime shutdown pattern.
     let dm_outhold_sync_for_shutdown: Option<
@@ -2028,6 +2073,14 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.dm_inbox_doc = None;
         guard.dm_inbox_tracker = None;
         guard.dm_inbox_device_id = None;
+        // ZEB-495 (ZEB-340 Part 2): take the community-device-intro engine for
+        // the same ephemeral-runtime shutdown below (mirrors dm-inbox). Its
+        // shutdown also exits the relay sweeper (drops the only strong nudge
+        // sender).
+        community_device_intro_sync_for_shutdown = guard.community_device_intro_sync.take();
+        guard.community_device_intro_doc = None;
+        guard.community_device_intro_tracker = None;
+        guard.community_device_intro_device_id = None;
         // ZEB-418 SP2 P2: take the dm-outhold + fleet-net engines for
         // shutdown and clear the remaining handles (mirrors dm-inbox). The
         // dm-outhold engine shutdown ALSO stops the apply sweeper: the
@@ -2443,6 +2496,37 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                         tracing::error!(
                             error = %e,
                             "could not build ephemeral tokio runtime for dm-inbox \
+                             FleetSyncEngine shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-495 (ZEB-340 Part 2): shut down the community-device-intro fleet-sync
+    // engine alongside dm-inbox so its final debounced publish + persist runs
+    // before the event-loop thread is joined. Same ephemeral-runtime pattern.
+    // This also stops the relay sweeper (the engine task's exit drops the only
+    // strong nudge sender — see the take above).
+    if let Some(community_device_intro_engine) = community_device_intro_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(community_device_intro_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "community-device-intro FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for community-device-intro \
                              FleetSyncEngine shutdown — final flush skipped"
                         );
                     }
@@ -3306,6 +3390,34 @@ pub async fn start_node_inner(
         let mut fleet_net_device_id_opt: Option<String> = None;
         let mut fleet_net_enrolled_opt: Option<std::collections::BTreeSet<String>> = None;
         let mut p2_sync_handles_opt: Option<crate::event_loop::P2SyncHandles> = None;
+        // ZEB-495 (ZEB-340 Part 2): community-device-intro fleet-sync engine +
+        // its NodeState/run handles. Built alongside the dm-inbox engine when an
+        // owner identity loads; lifted to outer scope so the NodeState
+        // assignment and the event_loop::run call site can reach them. Mirrors
+        // the dm_inbox opts above field-for-field.
+        let mut community_device_intro_doc_opt: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<crate::community_device_intro_crdt::CommunityDeviceIntroDoc>,
+            >,
+        > = None;
+        let mut community_device_intro_tracker_opt: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<
+                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                >,
+            >,
+        > = None;
+        let mut community_device_intro_sync_engine_opt: Option<
+            std::sync::Arc<
+                crate::fleet_sync::FleetSyncEngine<
+                    crate::community_device_intro_crdt::CommunityDeviceIntroDoc,
+                >,
+            >,
+        > = None;
+        let mut community_device_intro_device_id_opt: Option<String> = None;
+        let mut community_device_intro_sync_handles_opt: Option<
+            crate::event_loop::DatasetSyncHandles,
+        > = None;
         // ZEB-418 P2 Task 7 (D16): the routing-record re-publish closure,
         // built in the pkarr block below (it captures the case publishers)
         // and threaded into event_loop::run for the periodic
@@ -3813,6 +3925,12 @@ pub async fn start_node_inner(
                     // moved into `DmOutbox::new` further down, so capture the
                     // cert (cheap `Clone`) here while it's still in scope.
                     let own_enrollment_cert_for_friend = own_enrollment_cert.clone();
+                    // ZEB-495 (ZEB-340 Part 2): keep a clone for the
+                    // self-introduce trigger on the community delta consumer
+                    // (the original is moved into `DmOutbox::new` below). This is
+                    // THIS device's own Master cert — the device key it carries
+                    // is what a `DeviceAnnounce` adds to the owner's MemberState.
+                    let own_enrollment_cert_for_device_intro = own_enrollment_cert.clone();
 
                     let crdt_path = identity_dir.join("owner_state_crdt.cbor");
                     let replay_path = identity_dir.join("state_root_replay.cbor");
@@ -4274,6 +4392,104 @@ pub async fn start_node_inner(
                     });
 
                     tracing::info!("BOOT-PROBE 05: dm-inbox engine constructed");
+                    // ── ZEB-495 (ZEB-340 Part 2): community-device-intro ──────
+                    //
+                    // Fleet dataset (Option A relay): deposited-but-not-yet-
+                    // relayed `DeviceAnnounce` membership events, replicated
+                    // across the owner's fleet so an already-enrolled sibling
+                    // can relay a second device's self-introduction into the
+                    // community engine. Mirrors the dm-inbox engine above
+                    // site-for-site (publish_seen stays true — GC depends on
+                    // sibling relay-acks propagating; on_applied nudges the
+                    // relay sweeper). The sweeper itself is spawned LATER, after
+                    // the CommunitySyncRegistry is built (its ProdCtx needs the
+                    // registry to look up community engines).
+                    let community_device_intro_path =
+                        identity_dir.join(crate::community_device_intro_persist::FILENAME);
+                    let community_device_intro_replay_path =
+                        identity_dir.join(crate::community_device_intro_persist::REPLAY_FILENAME);
+                    let community_device_intro_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::community_device_intro_persist::load_doc_or_recover(
+                            &community_device_intro_path,
+                        )
+                        .map_err(|e| format!("load community-device-intro doc: {e}"))?,
+                    ));
+                    let community_device_intro_tracker =
+                        std::sync::Arc::new(tokio::sync::Mutex::new(
+                            crate::community_device_intro_persist::load_replay_or_recover(
+                                &community_device_intro_replay_path,
+                            )
+                            .map_err(|e| format!("load community-device-intro replay: {e}"))?,
+                        ));
+                    let (community_device_intro_out_tx, community_device_intro_out_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let (community_device_intro_in_tx, community_device_intro_in_rx) =
+                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let community_device_intro_merger: crate::fleet_sync::Merger<
+                        crate::community_device_intro_crdt::CommunityDeviceIntroDoc,
+                    > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                    // Relay-nudge channel (capacity-1 level trigger). The
+                    // engine's `on_applied` owns the only STRONG sender, so the
+                    // sweeper exits exactly when the engine shuts down.
+                    let (community_device_intro_nudge_tx, community_device_intro_nudge_rx) =
+                        tokio::sync::mpsc::channel::<()>(1);
+                    let community_device_intro_sync = std::sync::Arc::new(
+                        crate::fleet_sync::FleetSyncEngine::new(
+                            crate::fleet_sync::FleetSyncConfig {
+                                kt: std::sync::Arc::clone(&kt),
+                                device_id: device_id.clone(),
+                                state: std::sync::Arc::clone(&community_device_intro_doc),
+                                merger: community_device_intro_merger,
+                                replay_tracker: std::sync::Arc::clone(
+                                    &community_device_intro_tracker,
+                                ),
+                                content_store: std::sync::Arc::clone(&content_store),
+                                publisher_tx: community_device_intro_out_tx,
+                                subscriber_rx: community_device_intro_in_rx,
+                                persist: std::sync::Arc::new(
+                                    crate::community_device_intro_persist::CommunityDeviceIntroPersist {
+                                        doc_path: community_device_intro_path,
+                                        replay_path: community_device_intro_replay_path,
+                                    },
+                                ),
+                                lookup_key_tag: b"community-device-intro-v1",
+                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                publish_seen: true,
+                                on_applied: Some(
+                                    crate::community_device_intro_ingest::relay_nudge_on_applied(
+                                        community_device_intro_nudge_tx,
+                                    ),
+                                ),
+                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                    std::collections::BTreeMap::new(),
+                                )),
+                            },
+                        ),
+                    );
+                    community_device_intro_doc_opt =
+                        Some(std::sync::Arc::clone(&community_device_intro_doc));
+                    community_device_intro_tracker_opt =
+                        Some(std::sync::Arc::clone(&community_device_intro_tracker));
+                    community_device_intro_sync_engine_opt =
+                        Some(std::sync::Arc::clone(&community_device_intro_sync));
+                    community_device_intro_device_id_opt = Some(device_id.clone());
+                    community_device_intro_sync_handles_opt =
+                        Some(crate::event_loop::DatasetSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: community_device_intro_out_rx,
+                            inbound_tx: community_device_intro_in_tx,
+                        });
+                    // Enrolled-device snapshot for the relay sweeper's GC
+                    // coverage check (same 64-hex form as dm-inbox).
+                    let community_device_intro_enrolled: std::collections::BTreeSet<String> =
+                        loaded
+                            .state
+                            .enrollments
+                            .values()
+                            .map(|cert| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
+                            .collect();
+
+                    tracing::info!("BOOT-PROBE 05c: community-device-intro engine constructed");
                     // ── ZEB-458 P4 Phase B: relay-hold + relay-optin datasets ─
                     //
                     // Two new fleet-replicated datasets, each wired exactly
@@ -4784,6 +5000,38 @@ pub async fn start_node_inner(
                         )
                     };
 
+                    // ── ZEB-495 (ZEB-340 Part 2): community-device-intro relay
+                    // sweeper. Spawned HERE (not at engine-construction time)
+                    // because its ProdCtx needs the just-built registry to look
+                    // up per-community engines. One startup sweep (intros
+                    // deposited while offline / by a sibling), then one debounced
+                    // sweep per on_applied nudge burst; exits when the engine
+                    // shuts down (the nudge channel's only strong sender is the
+                    // engine's on_applied). Mirrors the dm-inbox ingest sweeper.
+                    {
+                        let community_device_intro_ingest_ctx: std::sync::Arc<
+                            dyn crate::community_device_intro_ingest::CommunityDeviceIntroIngestCtx,
+                        > = std::sync::Arc::new(
+                            crate::community_device_intro_ingest::ProdCommunityDeviceIntroIngestCtx {
+                                device_id: device_id.clone(),
+                                registry: std::sync::Arc::clone(&registry),
+                                enrolled: community_device_intro_enrolled,
+                            },
+                        );
+                        let sweeper_engine = std::sync::Arc::clone(&community_device_intro_sync);
+                        tokio::spawn(
+                            crate::community_device_intro_ingest::run_community_device_intro_sweeper(
+                                std::sync::Arc::clone(&community_device_intro_doc),
+                                community_device_intro_ingest_ctx,
+                                community_device_intro_nudge_rx,
+                                std::sync::Arc::new(move || sweeper_engine.notify_dirty()),
+                                std::time::Duration::from_millis(
+                                    crate::community_device_intro_ingest::RELAY_SWEEP_DEBOUNCE_MS,
+                                ),
+                            ),
+                        );
+                    }
+
                     // ZEB-270 Phase 3 Task 4.5: per-(community, channel)
                     // log engine registry. Built BEFORE the delta
                     // consumer spawn so the consumer's 3rd callback can
@@ -5125,6 +5373,52 @@ pub async fn start_node_inner(
                                 let synthesized_catchups: SynthCatchupsSet = std::sync::Arc::new(
                                     std::sync::Mutex::new(std::collections::BTreeSet::new()),
                                 );
+                                // ── ZEB-495 (ZEB-340 Part 2): self-introduce
+                                // trigger captures. On EVERY delta, for the
+                                // delta's community, if the owner is Joined but
+                                // THIS device's enrolled key is not yet in its own
+                                // MemberState, build a signed `DeviceAnnounce`
+                                // (carrying this device's Master cert) and deposit
+                                // it into the community-device-intro fleet dataset
+                                // (Option A relay). Once per (device, community)
+                                // per session via the dedupe set below. The
+                                // cert-presence guard (spec) is STRUCTURAL here:
+                                // `own_enrollment_cert` is unwrapped with
+                                // `ok_or_else(..)?` at start_node load, so a
+                                // seed-holder/first device with no cert never
+                                // reaches this code (it fails boot earlier) and so
+                                // simply never self-introduces. Best-effort +
+                                // logged; never panics the delta consumer.
+                                let device_intro_doc =
+                                    std::sync::Arc::clone(&community_device_intro_doc);
+                                let device_intro_engine =
+                                    std::sync::Arc::clone(&community_device_intro_sync);
+                                let device_intro_signing_key =
+                                    std::sync::Arc::clone(&community_signing_key_arc);
+                                let device_intro_cert =
+                                    own_enrollment_cert_for_device_intro.clone();
+                                let device_intro_hlc_tracker = std::sync::Arc::clone(&tracker);
+                                let device_intro_device_id = device_id.clone();
+                                let device_intro_self_owner = self_owner;
+                                let device_intro_registry = std::sync::Arc::clone(&registry);
+                                // This device's own enrolled ed25519 #2 — the key
+                                // a DeviceAnnounce would add. If it is ALREADY in
+                                // our materialized MemberState, no announce needed.
+                                let device_intro_self_key =
+                                    device_intro_cert.device_pubkeys.classical.ed25519_verify;
+                                // Per-session dedupe: at most one deposit per
+                                // community per node session (redundant deposits
+                                // are harmless — insert-once merge + idempotent
+                                // insert_local_event — but this avoids re-work).
+                                let device_intro_done: std::sync::Arc<
+                                    std::sync::Mutex<
+                                        std::collections::BTreeSet<
+                                            crate::owner_state_types::SpaceId,
+                                        >,
+                                    >,
+                                > = std::sync::Arc::new(std::sync::Mutex::new(
+                                    std::collections::BTreeSet::new(),
+                                ));
                                 move |delta: crate::community_state_sync::CommunityMembershipDelta| {
                                     let registry = std::sync::Arc::clone(&community_registry_for_heal);
                                     let community_signing_key = std::sync::Arc::clone(&signing_key_for_heal);
@@ -5159,6 +5453,23 @@ pub async fn start_node_inner(
                                     // the inner Arc to fire notify().
                                     let network_health_cell =
                                         std::sync::Arc::clone(&network_health_for_hook);
+                                    // ZEB-495: per-invocation clones for the
+                                    // self-introduce trigger (async block moves
+                                    // them).
+                                    let device_intro_doc =
+                                        std::sync::Arc::clone(&device_intro_doc);
+                                    let device_intro_engine =
+                                        std::sync::Arc::clone(&device_intro_engine);
+                                    let device_intro_signing_key =
+                                        std::sync::Arc::clone(&device_intro_signing_key);
+                                    let device_intro_cert = device_intro_cert.clone();
+                                    let device_intro_hlc_tracker =
+                                        std::sync::Arc::clone(&device_intro_hlc_tracker);
+                                    let device_intro_device_id = device_intro_device_id.clone();
+                                    let device_intro_registry =
+                                        std::sync::Arc::clone(&device_intro_registry);
+                                    let device_intro_done =
+                                        std::sync::Arc::clone(&device_intro_done);
                                     async move {
                                         // ZEB-321 Phase 1 Task 8: per spec §7.4,
                                         // freshly-inserted ReachabilityAnnounce
@@ -5332,6 +5643,194 @@ pub async fn start_node_inner(
                                             synth_catchups,
                                         )
                                         .await;
+
+                                        // ── ZEB-495 (ZEB-340 Part 2):
+                                        // self-introduce (Option A). On this
+                                        // delta's community, if the owner is
+                                        // Joined but THIS device's enrolled key is
+                                        // not yet in its own MemberState, deposit a
+                                        // signed `DeviceAnnounce` into the
+                                        // community-device-intro fleet dataset for
+                                        // an enrolled sibling to relay. Once per
+                                        // (device, community) per session.
+                                        // Best-effort + logged; a failure here
+                                        // never affects the rest of the consumer.
+                                        {
+                                            // Cheap session dedupe FIRST (avoid
+                                            // re-materializing on every delta once
+                                            // this (device, community) is settled).
+                                            // ZEB-495 (Qodo): recover a POISONED dedupe
+                                            // lock instead of treating poison as "done"
+                                            // — the latter would permanently skip
+                                            // self-introduce for the rest of the session.
+                                            let already_done = match device_intro_done.lock() {
+                                                Ok(g) => g.contains(&community_id),
+                                                Err(poisoned) => {
+                                                    tracing::warn!(
+                                                        community_id = ?community_id,
+                                                        "ZEB-495 device_intro_done poisoned; recovering guard"
+                                                    );
+                                                    poisoned.into_inner().contains(&community_id)
+                                                }
+                                            };
+                                            if !already_done {
+                                                // Materialize this community ONCE and
+                                                // classify our own membership: are we a
+                                                // Joined member, and is THIS device's
+                                                // key already enrolled?
+                                                let (is_joined, needs_announce) = if let Some(engine) =
+                                                    device_intro_registry
+                                                        .engine_arc(&community_id)
+                                                        .await
+                                                {
+                                                    let state_arc = engine.state();
+                                                    let st = state_arc.lock().await;
+                                                    let mat =
+                                                        st.materialized(engine.admin_addr());
+                                                    match mat.members.get(&device_intro_self_owner) {
+                                                        Some(m) => {
+                                                            let joined = m.status == crate::community_membership::MemberStatus::Joined;
+                                                            (
+                                                                joined,
+                                                                joined && !m.enrolled_device_keys.contains(&device_intro_self_key),
+                                                            )
+                                                        }
+                                                        None => (false, false),
+                                                    }
+                                                } else {
+                                                    (false, false)
+                                                };
+                                                if needs_announce {
+                                                    // Build + sign the
+                                                    // DeviceAnnounce (mirror the
+                                                    // ReachabilityAnnounce envelope
+                                                    // build+sign), attach our cert,
+                                                    // CBOR-encode, and deposit.
+                                                    let announced_at_ms =
+                                                        std::time::SystemTime::now()
+                                                            .duration_since(
+                                                                std::time::UNIX_EPOCH,
+                                                            )
+                                                            .map(|d| d.as_millis() as u64)
+                                                            .unwrap_or(0);
+                                                    let hlc =
+                                                        crate::dm_outbox::reserve_next_hlc_for_device(
+                                                            &device_intro_hlc_tracker,
+                                                            &device_intro_device_id,
+                                                            announced_at_ms,
+                                                        )
+                                                        .await;
+                                                    let event_id: [u8; 16] = {
+                                                        use rand::RngCore;
+                                                        let mut buf = [0u8; 16];
+                                                        rand::thread_rng()
+                                                            .fill_bytes(&mut buf);
+                                                        buf
+                                                    };
+                                                    let envelope =
+                                                        crate::community_membership::EventPayload {
+                                                            id: event_id,
+                                                            community_id,
+                                                            kind: crate::community_membership::MembershipEventKind::DeviceAnnounce,
+                                                            actor: device_intro_self_owner,
+                                                            at: hlc,
+                                                        };
+                                                    match crate::community_membership::sign_event(
+                                                        &envelope,
+                                                        device_intro_signing_key.as_ref(),
+                                                    ) {
+                                                        Ok(mut signed) => {
+                                                            // Attach this device's
+                                                            // own Master cert — the
+                                                            // introduced key (mirror
+                                                            // the Join attach idiom).
+                                                            signed.enrollment =
+                                                                Some(device_intro_cert.clone());
+                                                            match crate::owner_state_crypto::canonical_cbor_encode(&signed) {
+                                                                Ok(bytes) => {
+                                                                    // Deposit: lock
+                                                                    // the dataset
+                                                                    // state, insert-
+                                                                    // once, notify.
+                                                                    {
+                                                                        let mut doc = device_intro_doc.lock().await;
+                                                                        let key = crate::community_device_intro_crdt::CommunityDeviceIntroDoc::key(
+                                                                            &community_id,
+                                                                            &device_intro_device_id,
+                                                                        );
+                                                                        doc.entries.entry(key).or_insert_with(|| {
+                                                                            crate::community_device_intro_crdt::CommunityDeviceIntroEntry {
+                                                                                signed_event: bytes,
+                                                                                community_id,
+                                                                                deposited_at: envelope.at.clone(),
+                                                                                relayed_by: std::collections::BTreeSet::new(),
+                                                                            }
+                                                                        });
+                                                                    }
+                                                                    // `notify_dirty()` fires unconditionally — including
+                                                                    // the restart case where `or_insert_with` found an
+                                                                    // already-persisted entry (deposited a prior session,
+                                                                    // not yet relayed by a sibling). That republish is
+                                                                    // INTENTIONAL (ZEB-495, Greptile P2): it re-propagates
+                                                                    // the still-pending intro to a sibling that came
+                                                                    // online since last session. Idempotent by
+                                                                    // construction (insert-once entry + grow-only
+                                                                    // `relayed_by`), so the redundant push is harmless.
+                                                                    device_intro_engine.notify_dirty();
+                                                                    // Memoize the settled (device, community)
+                                                                    // so future deltas skip the materialize.
+                                                                    // Poison-recovering (ZEB-495 Qodo).
+                                                                    match device_intro_done.lock() {
+                                                                        Ok(mut done) => {
+                                                                            done.insert(community_id);
+                                                                        }
+                                                                        Err(poisoned) => {
+                                                                            poisoned.into_inner().insert(community_id);
+                                                                        }
+                                                                    }
+                                                                    tracing::info!(
+                                                                        community_id = ?community_id,
+                                                                        "ZEB-495 self-introduce: DeviceAnnounce deposited for sibling relay"
+                                                                    );
+                                                                }
+                                                                Err(e) => {
+                                                                    tracing::warn!(
+                                                                        community_id = ?community_id,
+                                                                        error = %e,
+                                                                        "ZEB-495 self-introduce: CBOR-encode of DeviceAnnounce failed; will retry on next delta"
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                community_id = ?community_id,
+                                                                error = %e,
+                                                                "ZEB-495 self-introduce: sign_event of DeviceAnnounce failed; will retry on next delta"
+                                                            );
+                                                        }
+                                                    }
+                                                } else if is_joined {
+                                                    // ZEB-495 (Qodo): our key is already
+                                                    // enrolled — no announce will ever be
+                                                    // needed for this (device, community).
+                                                    // Memoize so future deltas skip the
+                                                    // expensive re-materialize (the first
+                                                    // device, whose key is already
+                                                    // enrolled, would otherwise
+                                                    // re-materialize on EVERY delta
+                                                    // forever). Poison-recovering.
+                                                    match device_intro_done.lock() {
+                                                        Ok(mut done) => {
+                                                            done.insert(community_id);
+                                                        }
+                                                        Err(poisoned) => {
+                                                            poisoned.into_inner().insert(community_id);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             },
@@ -7905,6 +8404,10 @@ pub async fn start_node_inner(
                 // ZEB-458 P4 Phase B: thread the relay-hold + relay-optin
                 // adapter handle bundle into event_loop::run (mirrors p2).
                 let relay_sync_handles_for_loop = relay_sync_handles_opt;
+                // ZEB-495 (ZEB-340 Part 2): thread the community-device-intro
+                // adapter handles into event_loop::run (mirrors relay).
+                let community_device_intro_sync_handles_for_loop =
+                    community_device_intro_sync_handles_opt;
                 // ZEB-321 Phase 1 Task 8: shadow the outer-scope binding into
                 // a move-capturable local so the thread closure can take
                 // ownership without disturbing the iroh_endpoint_arc /
@@ -8009,6 +8512,7 @@ pub async fn start_node_inner(
                                 dm_inbox_sync_handles_for_loop,
                                 p2_sync_handles_for_loop,
                                 relay_sync_handles_for_loop,
+                                community_device_intro_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                                 dial_telemetry_into_loop,
                                 serve_allowlist_for_loop,
@@ -8205,6 +8709,17 @@ pub async fn start_node_inner(
                         guard.dm_inbox_tracker = dm_inbox_tracker_opt.clone();
                         guard.dm_inbox_sync = dm_inbox_sync_engine_opt.clone();
                         guard.dm_inbox_device_id = dm_inbox_device_id_opt.clone();
+                        // ZEB-495 (ZEB-340 Part 2): store the
+                        // community-device-intro dataset handles (no IPC surface
+                        // — the self-introduce trigger + relay sweeper are the
+                        // consumers; stop_inner shuts the engine down).
+                        guard.community_device_intro_doc = community_device_intro_doc_opt.clone();
+                        guard.community_device_intro_tracker =
+                            community_device_intro_tracker_opt.clone();
+                        guard.community_device_intro_sync =
+                            community_device_intro_sync_engine_opt.clone();
+                        guard.community_device_intro_device_id =
+                            community_device_intro_device_id_opt.clone();
                         // ZEB-458 P4 Phase B: store the relay-hold + relay-optin
                         // dataset handles + the shared resolver. The opt-in IPC
                         // (set_community_relay_opt_in / get_community_relay_status)
@@ -8469,6 +8984,11 @@ pub async fn start_node_inner(
             // (mirrors notes; its shutdown on the cleanup path also stops the
             // ingest sweeper by dropping the engine task's nudge sender).
             dm_inbox_sync_engine_opt,
+            // ZEB-495 (ZEB-340 Part 2): same carry-out for the
+            // community-device-intro FleetSyncEngine (mirrors dm-inbox; its
+            // shutdown also stops the relay sweeper by dropping the engine
+            // task's only strong nudge sender).
+            community_device_intro_sync_engine_opt,
             // ZEB-418 SP2 P2: same carry-out for the dm-outhold + fleet-net
             // FleetSyncEngines (the dm-outhold shutdown also stops the apply
             // sweeper by dropping the engine task's nudge sender).
@@ -8512,6 +9032,7 @@ pub async fn start_node_inner(
         mint_engine_for_cleanup,
         notes_engine_for_cleanup,
         dm_inbox_engine_for_cleanup,
+        community_device_intro_engine_for_cleanup,
         dm_outhold_engine_for_cleanup,
         fleet_net_engine_for_cleanup,
         relay_hold_engine_for_cleanup,
@@ -8629,6 +9150,18 @@ pub async fn start_node_inner(
                 tracing::error!(
                     error = %e,
                     "dm-inbox FleetSyncEngine cleanup after start_node failure"
+                );
+            }
+        }
+        // ZEB-495 (ZEB-340 Part 2): same rationale for the
+        // community-device-intro FleetSyncEngine (mirrors dm-inbox).
+        // Shutting it down also exits the relay sweeper (the engine task's
+        // on_applied closure holds the only strong nudge sender).
+        if let Some(community_device_intro_engine) = community_device_intro_engine_for_cleanup {
+            if let Err(e) = community_device_intro_engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "community-device-intro FleetSyncEngine cleanup after start_node failure"
                 );
             }
         }
@@ -30046,7 +30579,12 @@ pub fn delta_to_change(
         // ZEB-458: CommunityRelayAnnounce is relay-state, not
         // membership-state; no MembershipChange is projected. Consumed
         // by CommunityRelayResolver.
-        | crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { .. } => return None,
+        | crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { .. }
+        // ZEB-495 (ZEB-340 Part 2): DeviceAnnounce only adds a device key to
+        // an already-Joined owner's MemberState — it changes no status/power
+        // and projects no MembershipChange. (The roster re-renders the owner
+        // identically; the multi-device effect is invisible at this layer.)
+        | crate::community_membership::MembershipEventKind::DeviceAnnounce => return None,
     };
     Some((cid_hex, change))
 }
@@ -48138,6 +48676,12 @@ mod start_node_race_tests {
             dm_inbox_tracker: None,
             dm_inbox_sync: None,
             dm_inbox_device_id: None,
+            // ZEB-495 (ZEB-340 Part 2): community-device-intro handles unused
+            // in race tests.
+            community_device_intro_doc: None,
+            community_device_intro_tracker: None,
+            community_device_intro_sync: None,
+            community_device_intro_device_id: None,
             // ZEB-458 P4 Phase B: relay-hold + relay-optin handles + the
             // resolver/publisher/driver slots unused in race tests.
             relay_hold_doc: None,
