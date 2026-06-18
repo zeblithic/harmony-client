@@ -172,7 +172,13 @@ jobs:
 
       - name: sccache stats (ZEB-499)
         if: always()
-        run: sccache --show-stats || echo "sccache not active this run"
+        run: |
+          sccache --show-stats || echo "sccache not active this run"
+          # ZEB-499: surface the sccache backend error log (auth/network/R2) so
+          # failures like a bad R2 credential are visible, not just counted.
+          if [ -n "${SCCACHE_ERROR_LOG:-}" ] && [ -s "${SCCACHE_ERROR_LOG}" ]; then
+            echo "::group::sccache error log"; tail -n 200 "${SCCACHE_ERROR_LOG}"; echo "::endgroup::"
+          fi
 
   rust-test:
     name: Rust — test (nextest)
@@ -302,7 +308,13 @@ jobs:
 
       - name: sccache stats (ZEB-499)
         if: always()
-        run: sccache --show-stats || echo "sccache not active this run"
+        run: |
+          sccache --show-stats || echo "sccache not active this run"
+          # ZEB-499: surface the sccache backend error log (auth/network/R2) so
+          # failures like a bad R2 credential are visible, not just counted.
+          if [ -n "${SCCACHE_ERROR_LOG:-}" ] && [ -s "${SCCACHE_ERROR_LOG}" ]; then
+            echo "::group::sccache error log"; tail -n 200 "${SCCACHE_ERROR_LOG}"; echo "::endgroup::"
+          fi
 
       # ZEB-440 telemetry: residual usage after build + tests. When the
       # "Avail" number here trends below ~10 GB, the disk cliff is close
@@ -421,7 +433,13 @@ jobs:
 
       - name: sccache stats (ZEB-499)
         if: always()
-        run: sccache --show-stats || echo "sccache not active this run"
+        run: |
+          sccache --show-stats || echo "sccache not active this run"
+          # ZEB-499: surface the sccache backend error log (auth/network/R2) so
+          # failures like a bad R2 credential are visible, not just counted.
+          if [ -n "${SCCACHE_ERROR_LOG:-}" ] && [ -s "${SCCACHE_ERROR_LOG}" ]; then
+            echo "::group::sccache error log"; tail -n 200 "${SCCACHE_ERROR_LOG}"; echo "::endgroup::"
+          fi
 
   frontend:
     name: Frontend — tsc, vitest

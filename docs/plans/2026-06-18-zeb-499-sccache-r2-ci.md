@@ -1,6 +1,6 @@
 # ZEB-499: sccache → R2 CI Integration — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps are sequential; track execution status in Linear (ZEB-499), not in this file.
 
 **Goal:** Make harmony-client CI cache `rustc` compilation (including the workspace + vendored crates that `Swatinem/rust-cache` can't) on Cloudflare R2 via sccache, so PR builds reuse compiled artifacts instead of recompiling from scratch.
 
@@ -24,7 +24,7 @@
 
 These four vars are not secrets (just backend config) and are harmless on the `frontend` job, so they live at workflow scope to avoid triplication. The `harmony-client` key prefix namespaces our entries in the bucket shared with the harmony repo.
 
-- [ ] **Step 1: Add the static sccache backend env**
+**Step 1: Add the static sccache backend env**
 
 Find (the top-level `env:` block — currently ends at `CARGO_INCREMENTAL: '0'`):
 
@@ -46,7 +46,7 @@ Replace with:
   SCCACHE_S3_KEY_PREFIX: harmony-client
 ```
 
-- [ ] **Step 2: Verify YAML still parses**
+**Step 2: Verify YAML still parses**
 
 Run:
 
@@ -102,7 +102,7 @@ For EACH of the three Rust jobs, four changes: (a) job-level `AWS_*` creds env, 
         run: sccache --show-stats || echo "sccache not active this run"
 ```
 
-- [ ] **Step 1: `rust-check` — add creds env**
+**Step 1: `rust-check` — add creds env**
 
 Find:
 
@@ -121,7 +121,7 @@ Replace with (insert block A right after the `name:` line):
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
 ```
 
-- [ ] **Step 2: `rust-check` — install sccache + enable it (before rust-cache)**
+**Step 2: `rust-check` — install sccache + enable it (before rust-cache)**
 
 Find (the rust-check toolchain step, which is followed by the rust-cache step):
 
@@ -167,7 +167,7 @@ Replace with:
       # Per-job cache key so rust-check and rust-test don't trample each
 ```
 
-- [ ] **Step 3: `rust-check` — rust-cache registry-only**
+**Step 3: `rust-check` — rust-cache registry-only**
 
 Find:
 
@@ -190,7 +190,7 @@ Replace with:
           cache-targets: false
 ```
 
-- [ ] **Step 4: `rust-check` — add show-stats after clippy**
+**Step 4: `rust-check` — add show-stats after clippy**
 
 Find:
 
@@ -210,7 +210,7 @@ Replace with:
         run: sccache --show-stats || echo "sccache not active this run"
 ```
 
-- [ ] **Step 5: `rust-test` — add creds env**
+**Step 5: `rust-test` — add creds env**
 
 Find:
 
@@ -229,7 +229,7 @@ Replace with:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
 ```
 
-- [ ] **Step 6: `rust-test` — add sccache to the existing install-action + enable it**
+**Step 6: `rust-test` — add sccache to the existing install-action + enable it**
 
 Find:
 
@@ -264,7 +264,7 @@ Replace with:
           fi
 ```
 
-- [ ] **Step 7: `rust-test` — rust-cache registry-only**
+**Step 7: `rust-test` — rust-cache registry-only**
 
 Find:
 
@@ -285,7 +285,7 @@ Replace with:
           cache-targets: false
 ```
 
-- [ ] **Step 8: `rust-test` — add show-stats after nextest**
+**Step 8: `rust-test` — add show-stats after nextest**
 
 Find:
 
@@ -303,7 +303,7 @@ Replace with:
         run: sccache --show-stats || echo "sccache not active this run"
 ```
 
-- [ ] **Step 9: `msrv` — add creds env**
+**Step 9: `msrv` — add creds env**
 
 Find:
 
@@ -322,7 +322,7 @@ Replace with:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
 ```
 
-- [ ] **Step 10: `msrv` — install sccache + enable it (before rust-cache)**
+**Step 10: `msrv` — install sccache + enable it (before rust-cache)**
 
 Find (the msrv toolchain step, followed by the rust-cache step):
 
@@ -375,7 +375,7 @@ Replace with:
           cache-targets: false
 ```
 
-- [ ] **Step 11: `msrv` — add show-stats after cargo check**
+**Step 11: `msrv` — add show-stats after cargo check**
 
 Find:
 
@@ -395,7 +395,7 @@ Replace with:
         run: sccache --show-stats || echo "sccache not active this run"
 ```
 
-- [ ] **Step 12: Validate the workflow**
+**Step 12: Validate the workflow**
 
 Run:
 
@@ -411,7 +411,7 @@ command -v actionlint >/dev/null 2>&1 && actionlint .github/workflows/ci.yml && 
 
 Expected: `valid YAML`, four `3`s, `actionlint: clean`.
 
-- [ ] **Step 13: Commit**
+**Step 13: Commit**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client
@@ -443,7 +443,7 @@ EOF
 
 **Files:** Create `docs/ci-sccache.md`; modify `CLAUDE.md`
 
-- [ ] **Step 1: Write `docs/ci-sccache.md`**
+**Step 1: Write `docs/ci-sccache.md`**
 
 ```markdown
 # CI compilation cache (sccache → Cloudflare R2)
@@ -494,7 +494,7 @@ Rust source, expect a high cache-hit rate; the first `main` run after a
 dependency or source change is mostly misses (it uploads to R2 for next time).
 ```
 
-- [ ] **Step 2: Update the CLAUDE.md sccache note**
+**Step 2: Update the CLAUDE.md sccache note**
 
 Find (in `CLAUDE.md`, the sccache productivity tip):
 
@@ -508,7 +508,7 @@ Replace with:
 First compile after install populates the cache; subsequent compiles of the same dep graph are near-instant. CI uses sccache backed by Cloudflare R2 (ZEB-499) — see [`docs/ci-sccache.md`](docs/ci-sccache.md).
 ```
 
-- [ ] **Step 3: Verify the CLAUDE.md edit landed**
+**Step 3: Verify the CLAUDE.md edit landed**
 
 Run:
 
@@ -521,7 +521,7 @@ test -f docs/ci-sccache.md && echo "doc present"
 
 Expected: `1`, `0`, `doc present`.
 
-- [ ] **Step 4: Commit**
+**Step 4: Commit**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client
@@ -540,7 +540,7 @@ EOF
 
 **Files:** none (process / observation)
 
-- [ ] **Step 1: Push and open the PR**
+**Step 1: Push and open the PR**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client
@@ -570,7 +570,7 @@ EOF
 
 (Keep `Closes ZEB-NNN` out of the body — branch-name link will associate ZEB-499; reopen on merge if any out-of-scope follow-ups remain. Put cross-refs in a PR comment.)
 
-- [ ] **Step 2: After CI completes, read the sccache stats**
+**Step 2: After CI completes, read the sccache stats**
 
 In each Rust job's `sccache stats` step, read the hit/miss counts. This PR is expected to be mostly **misses** (cold R2 + the ci.yml change doesn't change Rust source, but R2 starts empty for the `harmony-client` prefix). Confirm sccache **connected to R2** (stats show "Cache location: ... harmony-sccache" / non-zero "Cache writes", no auth errors). The decisive measurement is Task 4 Step 3.
 
@@ -582,7 +582,7 @@ for j in "Rust — test (nextest)" "Rust — fmt + clippy"; do
 done
 ```
 
-- [ ] **Step 3: After merge, confirm the win on a follow-up no-Rust-change PR**
+**Step 3: After merge, confirm the win on a follow-up no-Rust-change PR**
 
 Once this is merged (main run populates R2), the next PR that touches no Rust source should show a **high hit rate** and substantially faster Rust jobs. Record the before/after Rust-job durations in a comment on ZEB-499. If the hit rate is high and jobs are comfortably under ~20 min, file the `timeout-minutes` 45→30 walk-back as the ZEB-498 finisher.
 
