@@ -20710,7 +20710,14 @@ fn resolve_invitee_device_keys(
             }
         }
     }
-    keys
+    // ZEB-369 hardening (Qodo): bound the unioned set to MAX_ENROLLED_DEVICE_KEYS
+    // — the same per-member cap the membership layer enforces (ZEB-401) — so a
+    // pathological/adversarial cross-community membership can't force unbounded
+    // seal work at invite generation. BTreeSet iterates in sorted order, so the
+    // truncation is deterministic.
+    keys.into_iter()
+        .take(crate::community_membership::MAX_ENROLLED_DEVICE_KEYS)
+        .collect()
 }
 
 // ── ZEB-217 Sub-C Phase 3 Task 9: create_community ───────────────────
@@ -47069,6 +47076,36 @@ mod generate_invite_helper_tests {
         assert_eq!(keys.len(), 2, "union of the two distinct device keys");
         assert!(keys.contains(&dev_a_key));
         assert!(keys.contains(&dev_b_key));
+    }
+
+    /// Qodo Bug 2 (PR #286): the SAME invitee Joined across MAX+3 communities,
+    /// each via a DISTINCT device key, would union to MAX+3 keys — but the
+    /// resolver caps the union at MAX_ENROLLED_DEVICE_KEYS so invite generation
+    /// can't be pushed into unbounded seal work by a pathological membership.
+    #[test]
+    fn resolve_invitee_device_keys_caps_union_at_max() {
+        use crate::community_membership::MAX_ENROLLED_DEVICE_KEYS;
+        let admin = crate::community_membership::mint_test_owner(0x41);
+        let n = MAX_ENROLLED_DEVICE_KEYS + 3;
+        let mut communities = Vec::new();
+        let mut invitee_owner = None;
+        for i in 0..n {
+            let comm = SpaceId([i as u8; 16]);
+            // Distinct non-zero 32-byte device seed per community → distinct key.
+            let device = ed25519_dalek::SigningKey::from_bytes(&[(i as u8).wrapping_add(1); 32]);
+            let (owner, _key, join) = join_for_owner_device(0x31, &device, comm, 200);
+            invitee_owner = Some(owner);
+            communities.push((
+                admin.owner,
+                vec![signed_join_with_cert(&admin, comm, 100), join],
+            ));
+        }
+        let keys = resolve_invitee_device_keys(&communities, invitee_owner.unwrap());
+        assert_eq!(
+            keys.len(),
+            MAX_ENROLLED_DEVICE_KEYS,
+            "union must be capped at MAX_ENROLLED_DEVICE_KEYS"
+        );
     }
 
     #[test]

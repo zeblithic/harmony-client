@@ -877,8 +877,8 @@ const SEALED_ENVELOPE_LEN: usize = 92;
 /// - **Untargeted invite-only**: `sealed_epoch_key` is one 92-byte envelope;
 ///   `sealed_epoch_keys` empty.
 /// - **Targeted invite-only** (`invite_token.invitee_hint == Some(_)`):
-///   `sealed_epoch_key` empty; `sealed_epoch_keys` carries one ≥92-byte
-///   envelope per invitee device.
+///   `sealed_epoch_key` empty; `sealed_epoch_keys` carries one fixed 92-byte
+///   envelope per invitee device, at most MAX_ENROLLED_DEVICE_KEYS of them.
 fn validate_sealed_epoch_key_shape(payload: &CommunityInvitePayload) -> Result<(), InviteUrlError> {
     let sealed_key_len = payload.epoch_snapshot.sealed_epoch_key.len();
     let sealed_keys = &payload.epoch_snapshot.sealed_epoch_keys;
@@ -890,10 +890,15 @@ fn validate_sealed_epoch_key_shape(payload: &CommunityInvitePayload) -> Result<(
 
     if is_targeted_invite_only {
         // Targeted: the single blob must be empty and the per-device list must
-        // be non-empty with each envelope at least the sealed-envelope length.
+        // be non-empty, bounded to MAX_ENROLLED_DEVICE_KEYS entries, with each
+        // envelope EXACTLY the fixed sealed-envelope length. An untrusted invite
+        // URL must not be able to force oversized or unbounded AEAD decrypt work
+        // during redemption (Qodo Bugs 1+2 — `open_from_owner` decrypts the whole
+        // ciphertext slice, and one envelope is tried per device).
         if !sealed_key_len_is_empty_targeted(sealed_key_len)
             || sealed_keys.is_empty()
-            || sealed_keys.iter().any(|e| e.len() < SEALED_ENVELOPE_LEN)
+            || sealed_keys.len() > crate::community_membership::MAX_ENROLLED_DEVICE_KEYS
+            || sealed_keys.iter().any(|e| e.len() != SEALED_ENVELOPE_LEN)
         {
             return Err(InviteUrlError::InvalidSealedEpochKeysShape);
         }
@@ -2346,6 +2351,45 @@ mod tests {
             encode_invite_url(&p),
             Err(InviteUrlError::InvalidSealedEpochKeysShape)
         ));
+    }
+
+    /// Qodo Bug 1 (PR #286): a targeted payload with an OVERSIZED envelope
+    /// (> 92 bytes) is rejected. `open_from_owner` decrypts the whole ciphertext
+    /// slice, so accepting an over-long envelope at the URL boundary would let a
+    /// crafted invite force unbounded AEAD work during redemption.
+    #[test]
+    fn targeted_invite_only_rejects_oversized_envelope() {
+        let mut p = make_targeted_invite_only_payload();
+        p.epoch_snapshot.sealed_epoch_keys = vec![vec![0u8; 4096]]; // oversized
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::InvalidSealedEpochKeysShape)
+        ));
+    }
+
+    /// Qodo Bug 2 (PR #286): a targeted payload carrying more than
+    /// MAX_ENROLLED_DEVICE_KEYS envelopes is rejected at the URL boundary — one
+    /// envelope is tried per device at redeem, so an unbounded list is O(n)
+    /// decrypt amplification on untrusted input.
+    #[test]
+    fn targeted_invite_only_rejects_too_many_envelopes() {
+        let mut p = make_targeted_invite_only_payload();
+        let too_many = crate::community_membership::MAX_ENROLLED_DEVICE_KEYS + 1;
+        p.epoch_snapshot.sealed_epoch_keys = vec![vec![0u8; 92]; too_many];
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::InvalidSealedEpochKeysShape)
+        ));
+    }
+
+    /// The exact-count boundary: exactly MAX_ENROLLED_DEVICE_KEYS well-formed
+    /// envelopes is still accepted (the cap is inclusive).
+    #[test]
+    fn targeted_invite_only_accepts_max_envelopes() {
+        let mut p = make_targeted_invite_only_payload();
+        let at_cap = crate::community_membership::MAX_ENROLLED_DEVICE_KEYS;
+        p.epoch_snapshot.sealed_epoch_keys = vec![vec![0u8; 92]; at_cap];
+        assert!(encode_invite_url(&p).is_ok());
     }
 
     /// `sealed_epoch_keys` set on an OPEN payload (non-targeted) is rejected —

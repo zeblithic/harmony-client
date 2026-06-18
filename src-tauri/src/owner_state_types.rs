@@ -146,7 +146,15 @@ where
         where
             A: SeqAccess<'de>,
         {
-            let mut out: Vec<Vec<u8>> = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            // CodeAnt (PR #286): `size_hint()` is attacker-influenced for
+            // untrusted CBOR, so clamp the upfront allocation. The only consumer
+            // (ZEB-369 `sealed_epoch_keys`) is validated to at most
+            // MAX_ENROLLED_DEVICE_KEYS (32) entries at the invite-URL boundary;
+            // the Vec still grows naturally if a valid caller exceeds the hint —
+            // this only bounds the eagerly-reserved capacity.
+            const VEC_OF_VEC_PREALLOC_CAP: usize = 32;
+            let mut out: Vec<Vec<u8>> =
+                Vec::with_capacity(seq.size_hint().unwrap_or(0).min(VEC_OF_VEC_PREALLOC_CAP));
             while let Some(InnerVec(v)) = seq.next_element::<InnerVec>()? {
                 out.push(v);
             }
