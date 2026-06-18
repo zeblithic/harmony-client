@@ -2751,8 +2751,9 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
-            sealed_epoch_key,
-            sealed_epoch_keys: Vec::new(),
+            // ZEB-369: targeted invite — sealed envelope rides in sealed_epoch_keys.
+            sealed_epoch_key: Vec::new(),
+            sealed_epoch_keys: vec![sealed_epoch_key],
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: alice_addr,
