@@ -40,6 +40,13 @@ pub const INTRO_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 /// coalesces a merge burst into one sweep (mirrors `INGEST_SWEEP_DEBOUNCE_MS`).
 pub const RELAY_SWEEP_DEBOUNCE_MS: u64 = 250;
 
+/// Upper bound on one inbound peer-fed `community-device-intro` sample before it
+/// is copied into an owned Vec (the Zenoh adapter's attacker-driven-allocation
+/// guard). Each entry is a signed `DeviceAnnounce` + Master `EnrollmentCert`
+/// (a few KB); a fleet replicating many `(community, device)` intros stays well
+/// under 1 MiB. Generous bound — oversize samples are dropped with a warn.
+pub const COMMUNITY_DEVICE_INTRO_DATASET_MAX_BYTES: usize = 1024 * 1024;
+
 /// Injectable context for [`ingest_pending`]: this device's id, the relay
 /// (decode + `insert_local_event` into the community engine), the
 /// enrolled-device snapshot for the GC coverage check, and the TTL clock.
