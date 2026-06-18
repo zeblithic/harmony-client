@@ -94,21 +94,27 @@ jobs:
         with:
           tool: sccache
 
-      # ZEB-499: turn sccache on only when the R2 credential is present. Fork
-      # PRs (and any run without the secret) leave RUSTC_WRAPPER unset and
-      # compile normally — cold, but green. SCCACHE_ERROR_LOG surfaces backend
-      # issues; sccache treats a backend error as a cache miss (compiles
-      # directly), so a transient R2 outage can't fail the job.
-      - name: Enable sccache when R2 creds present (ZEB-499)
+      # ZEB-499: enable sccache only when R2 is actually reachable. A startup
+      # storage-check failure (bad secret, R2 down) is FATAL — sccache fails
+      # every rustc invocation, it does NOT degrade to cache-miss the way
+      # mid-build read/write errors do. So probe first: `sccache --start-server`
+      # performs the init check (a read of .sccache_check); only if it succeeds
+      # do we set RUSTC_WRAPPER. Otherwise (and for fork PRs with no secret) we
+      # build uncached-but-green instead of taking CI red.
+      - name: Enable sccache when R2 reachable (ZEB-499)
         env:
           R2_KEY: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
         run: |
-          if [ -n "$R2_KEY" ]; then
+          if [ -z "$R2_KEY" ]; then
+            echo "sccache: no R2 credentials — building without sccache"
+            exit 0
+          fi
+          if sccache --start-server; then
             echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
             echo "SCCACHE_ERROR_LOG=/tmp/sccache.log" >> "$GITHUB_ENV"
-            echo "sccache: R2 backend enabled (prefix=$SCCACHE_S3_KEY_PREFIX)"
+            echo "sccache: R2 reachable — enabled (prefix=$SCCACHE_S3_KEY_PREFIX)"
           else
-            echo "sccache: no R2 credentials — building without sccache"
+            echo "::warning::sccache could not reach R2 (bad creds or outage) — building without sccache"
           fi
 
       # Per-job cache key so rust-check and rust-test don't trample each
@@ -233,21 +239,27 @@ jobs:
         with:
           tool: cargo-nextest,sccache
 
-      # ZEB-499: turn sccache on only when the R2 credential is present. Fork
-      # PRs (and any run without the secret) leave RUSTC_WRAPPER unset and
-      # compile normally — cold, but green. SCCACHE_ERROR_LOG surfaces backend
-      # issues; sccache treats a backend error as a cache miss (compiles
-      # directly), so a transient R2 outage can't fail the job.
-      - name: Enable sccache when R2 creds present (ZEB-499)
+      # ZEB-499: enable sccache only when R2 is actually reachable. A startup
+      # storage-check failure (bad secret, R2 down) is FATAL — sccache fails
+      # every rustc invocation, it does NOT degrade to cache-miss the way
+      # mid-build read/write errors do. So probe first: `sccache --start-server`
+      # performs the init check (a read of .sccache_check); only if it succeeds
+      # do we set RUSTC_WRAPPER. Otherwise (and for fork PRs with no secret) we
+      # build uncached-but-green instead of taking CI red.
+      - name: Enable sccache when R2 reachable (ZEB-499)
         env:
           R2_KEY: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
         run: |
-          if [ -n "$R2_KEY" ]; then
+          if [ -z "$R2_KEY" ]; then
+            echo "sccache: no R2 credentials — building without sccache"
+            exit 0
+          fi
+          if sccache --start-server; then
             echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
             echo "SCCACHE_ERROR_LOG=/tmp/sccache.log" >> "$GITHUB_ENV"
-            echo "sccache: R2 backend enabled (prefix=$SCCACHE_S3_KEY_PREFIX)"
+            echo "sccache: R2 reachable — enabled (prefix=$SCCACHE_S3_KEY_PREFIX)"
           else
-            echo "sccache: no R2 credentials — building without sccache"
+            echo "::warning::sccache could not reach R2 (bad creds or outage) — building without sccache"
           fi
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
@@ -362,21 +374,27 @@ jobs:
         with:
           tool: sccache
 
-      # ZEB-499: turn sccache on only when the R2 credential is present. Fork
-      # PRs (and any run without the secret) leave RUSTC_WRAPPER unset and
-      # compile normally — cold, but green. SCCACHE_ERROR_LOG surfaces backend
-      # issues; sccache treats a backend error as a cache miss (compiles
-      # directly), so a transient R2 outage can't fail the job.
-      - name: Enable sccache when R2 creds present (ZEB-499)
+      # ZEB-499: enable sccache only when R2 is actually reachable. A startup
+      # storage-check failure (bad secret, R2 down) is FATAL — sccache fails
+      # every rustc invocation, it does NOT degrade to cache-miss the way
+      # mid-build read/write errors do. So probe first: `sccache --start-server`
+      # performs the init check (a read of .sccache_check); only if it succeeds
+      # do we set RUSTC_WRAPPER. Otherwise (and for fork PRs with no secret) we
+      # build uncached-but-green instead of taking CI red.
+      - name: Enable sccache when R2 reachable (ZEB-499)
         env:
           R2_KEY: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
         run: |
-          if [ -n "$R2_KEY" ]; then
+          if [ -z "$R2_KEY" ]; then
+            echo "sccache: no R2 credentials — building without sccache"
+            exit 0
+          fi
+          if sccache --start-server; then
             echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
             echo "SCCACHE_ERROR_LOG=/tmp/sccache.log" >> "$GITHUB_ENV"
-            echo "sccache: R2 backend enabled (prefix=$SCCACHE_S3_KEY_PREFIX)"
+            echo "sccache: R2 reachable — enabled (prefix=$SCCACHE_S3_KEY_PREFIX)"
           else
-            echo "sccache: no R2 credentials — building without sccache"
+            echo "::warning::sccache could not reach R2 (bad creds or outage) — building without sccache"
           fi
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
