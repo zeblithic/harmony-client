@@ -22465,8 +22465,7 @@ fn orphan_dir_adoption_eligible(
         }
         // ZEB-497: the inviter's enrollment cert must verify and bind to the
         // token's inviter, and the token must be signed by that enrolled device.
-        if crate::community_invite::verify_inviter_enrollment(payload, now_wall_ms / 1000)
-            .is_err()
+        if crate::community_invite::verify_inviter_enrollment(payload, now_wall_ms / 1000).is_err()
         {
             return false;
         }
