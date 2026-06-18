@@ -22,6 +22,22 @@ vi.mock('../../owner-service', () => ({
   extractError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
 }));
 
+// ZEB-494: WelcomeModal now renders PairingJoiner in the 'joining' stage. Mock
+// PairingService so the joiner mounts cleanly in its idle state (no Tauri).
+vi.mock('../../pairing-service', () => ({
+  PairingService: class {
+    state = { kind: 'idle' };
+    onChange?: () => void;
+    init = vi.fn().mockResolvedValue(undefined);
+    dispose = vi.fn();
+    startJoiner = vi.fn().mockResolvedValue(undefined);
+    selectPeer = vi.fn().mockResolvedValue(undefined);
+    confirmSas = vi.fn().mockResolvedValue(undefined);
+    cancel = vi.fn().mockResolvedValue(undefined);
+  },
+  extractError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
+}));
+
 beforeEach(() => {
   mintMock.mockReset();
   requestExportSavePathMock.mockReset();
@@ -160,5 +176,39 @@ describe('WelcomeModal hard gate + flow', () => {
     // would just re-fail).
     expect(getByTestId('welcome-already-exists-reload')).toBeTruthy();
     expect(queryByTestId('welcome-create-identity')).toBeNull();
+  });
+});
+
+describe('WelcomeModal ZEB-494 — join an existing device', () => {
+  it('explain pane offers a "join another of my devices" path alongside mint', () => {
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
+    expect(getByTestId('welcome-create-identity')).toBeTruthy();
+    expect(getByTestId('welcome-join-existing')).toBeTruthy();
+  });
+
+  it('clicking join mounts the PairingJoiner and replaces the gate content', async () => {
+    const { getByTestId, queryByTestId, findByText } = render(WelcomeModal, {
+      props: { open: true, onMinted: vi.fn() },
+    });
+    await fireEvent.click(getByTestId('welcome-join-existing'));
+    // PairingJoiner is now the sole modal; the gate's own backdrop/content is
+    // suppressed so there is exactly one dialog on screen. findByText waits for
+    // the joiner to mount rather than flushing a fixed number of microtasks.
+    expect(await findByText('Join existing identity')).toBeTruthy();
+    expect(queryByTestId('welcome-modal-backdrop')).toBeNull();
+    expect(queryByTestId('welcome-create-identity')).toBeNull();
+  });
+
+  it('cancelling the joiner returns to the explain pane (hard gate not dismissed)', async () => {
+    const { findByTestId, getByTestId, queryByTestId, findByText } = render(WelcomeModal, {
+      props: { open: true, onMinted: vi.fn() },
+    });
+    await fireEvent.click(getByTestId('welcome-join-existing'));
+    // The joiner's idle-state Cancel button → onClose → back to explain.
+    await fireEvent.click(await findByText('Cancel'));
+    // Wait for the explain pane to re-render rather than flushing microtasks.
+    expect(await findByTestId('welcome-create-identity')).toBeTruthy();
+    expect(getByTestId('welcome-modal-backdrop')).toBeTruthy();
+    expect(queryByTestId('welcome-join-existing')).toBeTruthy();
   });
 });

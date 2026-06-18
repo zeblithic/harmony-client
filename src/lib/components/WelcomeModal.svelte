@@ -17,6 +17,7 @@
     MIN_RECOVERY_PASSPHRASE_LEN,
   } from '../recovery-policy';
   import { trapFocus } from '../focus-trap';
+  import PairingJoiner from './PairingJoiner.svelte';
 
   interface Props {
     open: boolean;
@@ -24,7 +25,7 @@
   }
   const { open, onMinted }: Props = $props();
 
-  type Stage = 'explain' | 'minting' | 'backup' | 'skip-confirm';
+  type Stage = 'explain' | 'minting' | 'backup' | 'skip-confirm' | 'joining';
   let stage = $state<Stage>('explain');
   let mintResult = $state<MintIpcResult | null>(null);
   let mintError = $state<string | null>(null);
@@ -127,9 +128,42 @@
     }
     await onMinted(mintResult);
   }
+
+  // ZEB-494: enter the "join an existing device" flow — pair this fresh device
+  // into the user's existing owner identity instead of minting a new one. The
+  // joiner pairing IPCs work pre-identity (the Zenoh transport + pairing state
+  // machine are up at hasOwnerIdentity=false), so this reuses the existing
+  // PairingJoiner unchanged.
+  function handleJoinExisting() {
+    mintError = null;
+    stage = 'joining';
+  }
+
+  // ZEB-494: pairing completed — enrollment installed owner_state.cbor + the
+  // distributed fleet KeyTree on disk. A cert-only device builds its fleet
+  // engines from that KeyTree only on a fresh boot (ZEB-492 / s7), so reload to
+  // re-run start_node: it loads the installed identity (hasOwnerIdentity=true →
+  // this hard gate no longer mounts) and builds the engines. Cleaner than the
+  // onMinted hot-flip, which only works because mint installs a seed-holder
+  // in-place within the same boot.
+  function handleJoinComplete() {
+    location.reload();
+  }
 </script>
 
-{#if open}
+{#if open && stage === 'joining'}
+  <!-- ZEB-494: pair this device into an existing identity instead of minting.
+       Rendered as the sole modal (the gate's own backdrop is suppressed below)
+       so there's one modal on screen. Cancel/failure returns to the explain
+       pane — the hard gate is NOT dismissed; only a completed enrollment (which
+       reloads into the joined identity) or a successful mint leaves the gate. -->
+  <PairingJoiner
+    onComplete={handleJoinComplete}
+    onClose={() => { stage = 'explain'; }}
+  />
+{/if}
+
+{#if open && stage !== 'joining'}
   <div class="modal-backdrop" data-testid="welcome-modal-backdrop" role="presentation">
     <div
       bind:this={modalEl}
@@ -154,8 +188,8 @@
           is yours if you ever lose this device.
         </p>
         <p class="muted">
-          Single-device only in v0.1.0-alpha — multi-device sync ships in a
-          later release.
+          Already have Harmony on another device? You can add this one to your
+          existing identity instead of starting fresh.
         </p>
         {#if mintError}
           <p class="error" data-testid="welcome-mint-error">{mintError}</p>
@@ -183,6 +217,13 @@
               disabled={stage === 'minting'}
             >
               {stage === 'minting' ? 'Creating your identity…' : 'Create my identity'}
+            </button>
+            <button
+              data-testid="welcome-join-existing"
+              onclick={handleJoinExisting}
+              disabled={stage === 'minting'}
+            >
+              Join another of my devices
             </button>
           {/if}
         </div>

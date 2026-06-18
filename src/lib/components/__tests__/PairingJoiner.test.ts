@@ -60,4 +60,37 @@ describe('PairingJoiner', () => {
     expect(dialog).toHaveAttribute('aria-modal', 'true');
     expect(dialog).toHaveAttribute('aria-labelledby', 'join-heading');
   });
+
+  // ZEB-494 / PR #283 (Qodo + CodeAnt): Escape on the terminal `complete`
+  // screen must route through onComplete (not onClose), so the onboarding gate
+  // reloads into the joined identity rather than bouncing back to the gate.
+  it('Escape on the completed screen fires onComplete, not onClose', async () => {
+    mockedInvoke.mockResolvedValueOnce({ kind: 'complete' }); // get_pairing_state
+    const onClose = vi.fn();
+    const onComplete = vi.fn();
+    render(PairingJoiner, { props: { onClose, onComplete } });
+    // Confirm we're in the terminal `complete` branch before dismissing.
+    await screen.findByText(/this device is now part of the owner identity/i);
+    const dialog = screen.getByRole('dialog');
+    await fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+    // Terminal state → no wasted backend cancel IPC.
+    expect(invoke).not.toHaveBeenCalledWith('cancel_pairing');
+  });
+
+  // Guard the inverse: Escape in a non-terminal state keeps cancel semantics
+  // (backend cancel IPC + onClose), and never fires onComplete.
+  it('Escape in a non-terminal state still cancels via onClose', async () => {
+    mockedInvoke.mockResolvedValueOnce({ kind: 'idle' }); // get_pairing_state
+    mockedInvoke.mockResolvedValue(undefined); // cancel_pairing
+    const onClose = vi.fn();
+    const onComplete = vi.fn();
+    render(PairingJoiner, { props: { onClose, onComplete } });
+    const dialog = await screen.findByRole('dialog');
+    await fireEvent.keyDown(dialog, { key: 'Escape' });
+    await vi.waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    expect(invoke).toHaveBeenCalledWith('cancel_pairing');
+    expect(onComplete).not.toHaveBeenCalled();
+  });
 });

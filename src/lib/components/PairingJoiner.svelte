@@ -3,7 +3,15 @@
   import { PairingService, extractError, type PairingState } from '../pairing-service';
   import Modal from './Modal.svelte';
 
-  let { onClose } = $props<{ onClose?: () => void }>();
+  // `onComplete` (optional) fires only when enrollment reaches the terminal
+  // `complete` state, distinct from `onClose` (which also fires on cancel /
+  // failure). The first-run onboarding gate (ZEB-494) needs that distinction to
+  // tell "enrolled → load the new identity" apart from "cancelled → stay on the
+  // gate"; `DevicesPanel` omits it and keeps its close-then-refresh behaviour.
+  let { onClose, onComplete } = $props<{
+    onClose?: () => void;
+    onComplete?: () => void;
+  }>();
 
   const svc = new PairingService();
   let state = $state<PairingState>({ kind: 'idle' });
@@ -44,9 +52,20 @@
   }
 
   async function handleCancel() {
-    // Skip the backend cancel IPC in terminal states — there's nothing to
-    // cancel and the call would be a wasted invoke (CodeRabbit, PR #68 round 2).
-    if (state.kind !== 'complete' && state.kind !== 'failed') {
+    // A completed enrollment is terminal *success*, not a cancel — so Escape
+    // must mirror the 'complete' Close button (onComplete ?? onClose). Without
+    // this, the first-run onboarding gate's Escape path falls through to
+    // onClose and bounces back to the explain pane with the identity installed
+    // but unloaded, instead of reloading into the newly joined identity
+    // (Qodo + CodeAnt, PR #283).
+    if (state.kind === 'complete') {
+      (onComplete ?? onClose)?.();
+      return;
+    }
+    // Skip the backend cancel IPC in the other terminal state ('failed') —
+    // there's nothing to cancel and the call would be a wasted invoke
+    // (CodeRabbit, PR #68 round 2).
+    if (state.kind !== 'failed') {
       try { await svc.cancel(); } catch (e) { /* ignore */ }
     }
     onClose?.();
@@ -126,7 +145,7 @@
   {:else if state.kind === 'complete'}
     <p>Done! This device is now part of the owner identity.</p>
     <div class="modal-actions">
-      <button class="primary" onclick={onClose}>Close</button>
+      <button class="primary" onclick={onComplete ?? onClose}>Close</button>
     </div>
   {:else if state.kind === 'failed'}
     <p class="error" role="alert">Pairing failed: {state.reason}</p>
