@@ -52,9 +52,20 @@
   }
 
   async function handleCancel() {
-    // Skip the backend cancel IPC in terminal states — there's nothing to
-    // cancel and the call would be a wasted invoke (CodeRabbit, PR #68 round 2).
-    if (state.kind !== 'complete' && state.kind !== 'failed') {
+    // A completed enrollment is terminal *success*, not a cancel — so Escape
+    // must mirror the 'complete' Close button (onComplete ?? onClose). Without
+    // this, the first-run onboarding gate's Escape path falls through to
+    // onClose and bounces back to the explain pane with the identity installed
+    // but unloaded, instead of reloading into the newly joined identity
+    // (Qodo + CodeAnt, PR #283).
+    if (state.kind === 'complete') {
+      (onComplete ?? onClose)?.();
+      return;
+    }
+    // Skip the backend cancel IPC in the other terminal state ('failed') —
+    // there's nothing to cancel and the call would be a wasted invoke
+    // (CodeRabbit, PR #68 round 2).
+    if (state.kind !== 'failed') {
       try { await svc.cancel(); } catch (e) { /* ignore */ }
     }
     onClose?.();
