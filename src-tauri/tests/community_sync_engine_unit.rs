@@ -707,7 +707,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
 
 #[tokio::test]
 async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
-    use harmony_app::community_state_sync::{CommunityMembershipDelta, LocalInsertError};
+    use harmony_app::community_state_sync::CommunityMembershipDelta;
     use std::time::Duration;
 
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(8);
@@ -845,20 +845,17 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
     };
     let bad_event = sign_event_with_identity(&bad_payload, &identity).expect("sign");
     let result = engine.insert_local_event(bad_event).await;
-    // With this StaticResolver the bad-actor address returns None at
-    // resolve time, so the impl short-circuits with Err(UnknownActor)
-    // BEFORE verify_event runs. Verify failures (when the resolver does
-    // resolve the actor) surface as Ok(InsertOutcome::Rejected(_)) — the
-    // engine's `insert_local_event` no longer carries a `Verify` variant
-    // because the verify-rejection path always reaches the CRDT layer
-    // and gets folded into the Insert outcome. Widening the matcher
-    // preserves the test's intent ("a bogus actor must not insert").
+    // `insert_local_event` routes straight to the CRDT layer's
+    // `insert_event`, so a bogus actor (one that can't be verified
+    // against the materialized membership) surfaces as
+    // `Ok(InsertOutcome::Rejected(_))` rather than a pre-insert `Err`.
+    // The matcher preserves the test's intent ("a bogus actor must not
+    // insert").
     assert!(matches!(
         result,
-        Err(LocalInsertError::UnknownActor(_))
-            | Ok(harmony_app::community_state_crdt::InsertOutcome::Rejected(
-                _
-            ))
+        Ok(harmony_app::community_state_crdt::InsertOutcome::Rejected(
+            _
+        ))
     ));
 
     engine.shutdown().await.expect("shutdown");
@@ -881,10 +878,6 @@ fn classify_incoming_error_covers_publisher_auth_variants() {
                 left_at: None,
             },
             "publisher_not_joined",
-        ),
-        (
-            CommunitySyncError::UnknownPublisher { addr: alice },
-            "publisher_unknown",
         ),
         (
             CommunitySyncError::PublisherSigInvalid { addr: alice },
@@ -1061,8 +1054,8 @@ async fn publish_carries_valid_publisher_sig() {
 //   2. PublisherNotJoined — Alice was Joined then Kicked. Her own
 //      validly-signed publish at HLC > kick HLC fails the membership-
 //      at-HLC gate. Tracker NOT advanced.
-//   3. UnknownPublisher — resolver doesn't know publisher_addr (cold
-//      cache). Same envelope re-delivered after resolver populates
+//   3. Cold cache — publisher not yet materialized as a member. Same
+//      envelope re-delivered after the publisher's Join propagates
 //      → admit + tracker advances.
 //
 // Each test asserts BOTH the reason_tag AND that the tracker did not
@@ -1484,10 +1477,10 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
 
 #[tokio::test]
 async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
-    // The same envelope is delivered twice. First time the resolver
-    // returns None for alice → UnknownPublisher rejection. Then we
-    // populate the resolver (via Mutex<HashMap> so the test owns the
-    // entries) and re-deliver — the engine accepts.
+    // The same envelope is delivered twice. First time alice is not yet
+    // materialized as a member → PublisherNotJoined rejection. Then her
+    // cert-bearing Join propagates into the receiver's CRDT and we
+    // re-deliver — the engine accepts.
     use ed25519_dalek::Signer;
     use harmony_app::community_state_sync::{encrypt_blob, encrypt_root_publish};
     use harmony_app::community_state_sync::{CommunityDegradedReport, CommunityRootSignedPayload};

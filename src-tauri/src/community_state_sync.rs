@@ -544,12 +544,6 @@ pub enum CommunitySyncError {
     /// muddy any future retry-vs-give-up logic.
     #[error("blob not found in CAS for cid {cid:?} (fetch timeout or admit-rejected)")]
     BlobNotFound { cid: ContentId },
-    /// Engine config has `identity_resolver: None`, so receive-side
-    /// `verify_event` can't resolve identity_pubs. Distinct error
-    /// class because the cause is configuration (Sub-A's owner-device
-    /// cache wasn't wired in), not transport or crypto failure.
-    #[error("no identity resolver configured — Phase 2 receive-side verify needs one")]
-    MissingIdentityResolver,
 
     /// Publish was signed correctly but the publisher's membership
     /// state at the publish HLC does NOT have status `Joined`. Either
@@ -573,19 +567,6 @@ pub enum CommunitySyncError {
         /// publisher was never a member.
         left_at: Option<Hlc>,
     },
-
-    /// `IdentityResolver` returned `None` for `publisher_addr`. Cold
-    /// cache (the publisher's identity_pub hasn't propagated to our
-    /// owner-state cache yet) or the addr was never a member.
-    /// Transient when caused by cold cache; persistent when caused by
-    /// a wholly-fabricated addr — both surface the same way at this
-    /// layer. Tracker NOT advanced; next publish after cache
-    /// propagation succeeds.
-    #[error(
-        "publisher {addr:?} identity not in resolver — \
-         cache cold or addr not yet propagated"
-    )]
-    UnknownPublisher { addr: OwnerAddr },
 
     /// Ed25519 signature over `canonical_cbor(CommunityRootSignedPayload)`
     /// did not validate against the resolved identity_pub. This is
@@ -632,10 +613,6 @@ pub enum CommunitySyncError {
 /// distinct error strings to the frontend.
 #[derive(thiserror::Error, Debug)]
 pub enum LocalInsertError {
-    #[error("identity_resolver not configured — engine cannot verify local events")]
-    MissingIdentityResolver,
-    #[error("actor identity not in resolver: {0:?}")]
-    UnknownActor(OwnerAddr),
     /// Defense-in-depth guard at `insert_local_event` entry — caller
     /// passed an event whose embedded `community_id` does not match the
     /// engine's configured `community_id`. Without this guard the misroute
@@ -867,14 +844,13 @@ pub struct CommunitySyncEngineConfig {
     pub crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
 
     /// ZEB-254: 64-byte composite identity pub of the community admin
-    /// (`X25519_pub || Ed25519_pub`). Required for the P5 gate in
-    /// `verify_event` — PendingJoin events carry an InviteToken signed by
-    /// the admin's Ed25519 key; without this field the gate unconditionally
-    /// fails with `PendingJoinTokenInvalid`. `None` for engines that will
-    /// never see PendingJoin events (non-joiner engines, legacy tests).
-    /// The joiner side populates this from
-    /// `CommunityInvitePayload.admin_identity_pub` at spawn time (see
-    /// `redeem_invite_inner`).
+    /// (`X25519_pub || Ed25519_pub`), as decoded from the invite URL
+    /// (`CommunityInvitePayload.admin_identity_pub`). Carried on the
+    /// config for API stability; the engine no longer threads it into a
+    /// verify-path consumer (ZEB-339 moved PendingJoin verification to
+    /// the carried EnrollmentCert / materialized enrolled_device_keys).
+    /// `None` for engines that never see an invite payload (admin's own
+    /// `create_community`, boot reconcile, open communities).
     pub admin_identity_pub: Option<[u8; 64]>,
 
     /// ZEB-254 Task 11: callback fired when a `JoinCountersign` targeting a
@@ -976,18 +952,6 @@ pub struct CommunitySyncEngine {
     /// own clone via `InternalCtx`). `None` for engines spawned
     /// without a registry, e.g. legacy unit tests.
     pending_redemptions: Option<PendingRedemptionMap>,
-    /// ZEB-254: 64-byte composite identity pub of the community admin.
-    /// Shared with the spawned `InternalCtx` task via `Arc<OnceLock>` so
-    /// both the engine's `insert_local_event*` path and the task's
-    /// `handle_incoming_publish` path can read the same binding.
-    ///
-    /// Set at construction when `CommunitySyncEngineConfig.admin_identity_pub`
-    /// is `Some`, or by calling `bind_admin_identity_pub` after spawn (the
-    /// joiner path: `redeem_invite_inner` knows the admin pub only after
-    /// parsing the invite URL, which happens before the engine spawn).
-    /// Unset for non-joiner engines (admin's own `create_community`, boot
-    /// reconcile); those engines never process PendingJoin events.
-    admin_identity_pub: Arc<std::sync::OnceLock<[u8; 64]>>,
     /// ZEB-254 Task 10: owner address of the local member, retained so
     /// `maybe_spawn_auto_counter_sign` can check self-eligibility and
     /// sign JoinCountersign events without reaching back into NodeState.
@@ -1053,19 +1017,6 @@ impl CommunitySyncEngine {
         // so the insert_local_event path can fire the pending-clear hook.
         let crdt_state_for_engine = cfg.crdt_state.as_ref().map(Arc::clone);
         let crdt_state_for_task = cfg.crdt_state;
-        // ZEB-254: admin_identity_pub is shared between the engine (for
-        // insert_local_event* VerifyContext) and the spawned task (for
-        // handle_incoming_publish VerifyContext). Both get an Arc clone of
-        // the same OnceLock so `bind_admin_identity_pub` sets it for both
-        // paths atomically. Populated now if the config carries a value;
-        // otherwise left unset for non-joiner engines.
-        let admin_pub_lock: Arc<std::sync::OnceLock<[u8; 64]>> =
-            Arc::new(std::sync::OnceLock::new());
-        if let Some(pub_bytes) = cfg.admin_identity_pub {
-            // OnceLock::set always succeeds on a fresh lock.
-            let _ = admin_pub_lock.set(pub_bytes);
-        }
-        let admin_pub_lock_for_task = Arc::clone(&admin_pub_lock);
 
         // ZEB-254 Task 10: clone self-identity fields before moving cfg
         // into InternalCtx — the engine struct retains its own copies
@@ -1105,7 +1056,6 @@ impl CommunitySyncEngine {
             delta_tx: cfg.delta_tx,
             pending_redemptions: cfg.pending_redemptions,
             crdt_state: crdt_state_for_task,
-            admin_identity_pub: admin_pub_lock_for_task,
             nav_emitter: nav_emitter_for_task,
             root_serve_rx: cfg.root_serve_rx,
         }));
@@ -1126,7 +1076,6 @@ impl CommunitySyncEngine {
             is_invite_only: is_invite_only_for_engine,
             delta_tx: delta_tx_for_engine,
             pending_redemptions: pending_redemptions_for_engine,
-            admin_identity_pub: admin_pub_lock,
             // ZEB-254 Task 10: retain self_owner / signing_key / device_id on
             // the engine so `maybe_spawn_auto_counter_sign` can build +
             // sign JoinCountersign events without back-referencing NodeState.
@@ -1172,78 +1121,6 @@ impl CommunitySyncEngine {
         self.admin_addr
     }
 
-    /// ZEB-254: bind the admin identity pub AFTER engine construction.
-    ///
-    /// The joiner path (`redeem_invite_inner`) decodes the admin pub from the
-    /// invite URL before spawning the engine, then calls this method on the
-    /// freshly-spawned engine so the P5 gate in `verify_event` can validate
-    /// PendingJoin events' InviteToken signatures. The binding is shared with
-    /// the spawned internal task (`InternalCtx`) via `Arc<OnceLock>`, so
-    /// `handle_incoming_publish`'s `VerifyContext` also sees it.
-    ///
-    /// No-op if already set (OnceLock::set returns Err on the second call).
-    /// Returns `true` if the binding was set by this call, `false` if it was
-    /// already set (which is not an error — the engine may have been
-    /// constructed with a pre-populated binding via `CommunitySyncEngineConfig
-    /// .admin_identity_pub`).
-    pub fn bind_admin_identity_pub(&self, pub_bytes: [u8; 64]) -> bool {
-        self.admin_identity_pub.set(pub_bytes).is_ok()
-    }
-
-    /// R4-4: engine-internal counterpart to R3-C1's registry-time pre-bind.
-    ///
-    /// At startup, if the engine's `admin_identity_pub` OnceLock is still
-    /// unset (the spawn-time `resolver.resolve(&admin_addr)` in R3-C1
-    /// returned `None`, e.g., the joiner crashed before OwnerDeviceCache
-    /// learned the admin) AND the persisted CRDT contains admin-authored
-    /// events (proof we've at least heard from the admin once), try the
-    /// resolver again. After restart, owner_state has finished loading
-    /// from disk and the cache may now hold the admin entry that was
-    /// missing at engine-spawn time.
-    ///
-    /// This is the engine-internal complement to R3-C3's restart heal
-    /// pass for `Space.pending_join_at`: both close the same crash-window
-    /// gap (the post-verify side-effect didn't run because the events
-    /// returned `AlreadyKnown` on the reconcile insert).
-    ///
-    /// Best-effort + idempotent. Returns `true` if the bind was newly
-    /// committed, `false` if either the lock was already set or the
-    /// resolver still misses. Caller need not await — the engine remains
-    /// functional with `None`; this just promotes the binding to
-    /// guarantee P5 validation on the FIRST incoming PendingJoin instead
-    /// of relying on the opportunistic bind in
-    /// `insert_event_with_resolved_pubs` / the merge path.
-    pub async fn try_rehydrate_admin_identity_pub(&self) -> bool {
-        // Already bound — nothing to do.
-        if self.admin_identity_pub.get().is_some() {
-            return false;
-        }
-        // Need a resolver to retry. (Tests / non-IPC engines may omit
-        // it; in those cases we cannot recover.)
-        let resolver = match self.identity_resolver.as_ref() {
-            Some(r) => r,
-            None => return false,
-        };
-        // Check the persisted CRDT for at least one admin-authored event.
-        // Without this, an engine that was spawned but never received
-        // anything from the admin would still trigger a resolver call
-        // (cheap but adds boot-time work for engines that have no
-        // admin history yet).
-        let admin_seen_in_log = {
-            let g = self.state.lock().await;
-            g.events.values().any(|e| e.actor == self.admin_addr)
-        };
-        if !admin_seen_in_log {
-            return false;
-        }
-        // Retry the resolver. If owner_state has populated the cache
-        // since spawn-time, this now hits.
-        match resolver.resolve(&self.admin_addr).await {
-            Some(p) => self.admin_identity_pub.set(p).is_ok(),
-            None => false,
-        }
-    }
-
     /// ZEB-254 Task 10: when a `PendingJoin` event is freshly inserted,
     /// check self-eligibility and — if eligible — spawn a task that
     /// signs + inserts a `JoinCountersign` event.
@@ -1283,7 +1160,6 @@ impl CommunitySyncEngine {
         let signing_key = Arc::clone(&self.signing_key);
         let device_id = self.device_id.clone();
         let state = Arc::clone(&self.state);
-        let admin_identity_pub = Arc::clone(&self.admin_identity_pub);
         let identity_resolver = self.identity_resolver.clone();
         let is_invite_only = self.is_invite_only;
         let notify_dirty = Arc::clone(&self.notify_dirty);
@@ -1300,7 +1176,6 @@ impl CommunitySyncEngine {
             signing_key,
             device_id,
             state,
-            admin_identity_pub,
             identity_resolver,
             is_invite_only,
             notify_dirty,
@@ -1388,7 +1263,7 @@ impl CommunitySyncEngine {
         // the actor's materialized `enrolled_device_keys` (steady-state).
         // The old `OwnerDeviceCacheResolver` lookup MISSED for remote
         // `owner_id` actors (its cache is keyed by Reticulum device-hash,
-        // not owner_id), wrongly rejecting them with `UnknownActor`. The
+        // not owner_id), wrongly rejecting them as unresolved actors. The
         // slim VerifyContext below carries no caller-resolved pubs.
         self.insert_event_with_resolved_pubs(event).await
     }
@@ -1434,11 +1309,7 @@ impl CommunitySyncEngine {
         // ZEB-339 Task 9: VerifyContext carries no caller-resolved pubs;
         // verify_event resolves the signer from the carried EnrollmentCert
         // (Join/PendingJoin) or the actor's materialized
-        // enrolled_device_keys (steady-state). The admin_identity_pub
-        // OnceLock is no longer fed from here — its value has no remaining
-        // verify-path consumer (T4 removed the PendingJoin P5 gate); the
-        // external `bind_admin_identity_pub` / `try_rehydrate` plumbing
-        // (lib.rs) is left intact but inert.
+        // enrolled_device_keys (steady-state).
         let ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
@@ -1794,13 +1665,6 @@ struct InternalCtx {
     /// key lookup. `None` for tests that use the spawn-time fallback.
     /// See `CommunitySyncEngineConfig.crdt_state` for the lock-order contract.
     crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
-    /// ZEB-254: shared binding (Arc<OnceLock>) for the admin identity pub.
-    /// Shared with the engine struct so `bind_admin_identity_pub` sets it
-    /// for both the IPC-path (`insert_local_event*`) and this task path
-    /// (`handle_incoming_publish`) at once. `get()` returns `None` until
-    /// it is set, which leaves P5 failing for non-joiner engines (correct
-    /// — they don't receive PendingJoin events).
-    admin_identity_pub: Arc<std::sync::OnceLock<[u8; 64]>>,
 
     /// ZEB-254 Task 11: callback for the joiner-side Space-pending-clear hook.
     /// Shared with the engine struct via `Arc` clone so both paths observe the
@@ -1834,7 +1698,6 @@ async fn spawn_auto_counter_sign_task(
     signing_key: Arc<ed25519_dalek::SigningKey>,
     device_id: String,
     state: Arc<Mutex<CommunityState>>,
-    _admin_identity_pub: Arc<std::sync::OnceLock<[u8; 64]>>,
     _identity_resolver: Option<Arc<dyn IdentityResolver>>,
     is_invite_only: bool,
     notify_dirty: Arc<Notify>,
@@ -2016,7 +1879,6 @@ fn maybe_spawn_auto_counter_sign_for_ctx(
     let signing_key = Arc::clone(&ctx.signing_key);
     let device_id = ctx.device_id.clone();
     let state = Arc::clone(&ctx.state);
-    let admin_identity_pub = Arc::clone(&ctx.admin_identity_pub);
     let identity_resolver = ctx.identity_resolver.clone();
     let is_invite_only = ctx.is_invite_only;
     let notify_dirty = Arc::clone(&ctx.notify_dirty);
@@ -2032,7 +1894,6 @@ fn maybe_spawn_auto_counter_sign_for_ctx(
         signing_key,
         device_id,
         state,
-        admin_identity_pub,
         identity_resolver,
         is_invite_only,
         notify_dirty,
@@ -3011,8 +2872,8 @@ impl IncomingOutcome {
 ///    `payload.publisher_addr`'s status is not `Joined`, reject with
 ///    `PublisherNotJoined`. Tracker NOT advanced.
 /// 4. **Identity-pub resolution** — `IdentityResolver::resolve` for
-///    `payload.publisher_addr`; `None` → `UnknownPublisher`. Tracker
-///    NOT advanced.
+///    `payload.publisher_addr`; an unresolved publisher is rejected.
+///    Tracker NOT advanced.
 /// 5. **Ed25519 sig verification** — verify `payload.publisher_sig`
 ///    against the resolved identity_pub (Ed25519 half = bytes [32..64])
 ///    over `canonical_cbor(CommunityRootSignedPayload::from(&payload))`.
@@ -3485,10 +3346,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
 
             // ZEB-339 Task 9: VerifyContext carries no caller-resolved
             // pubs; verify_event derives signer keys from the carried
-            // cert / materialized membership. The admin_identity_pub
-            // OnceLock late-bind machinery is gone here — its value had
-            // no remaining verify-path consumer (T4 removed the
-            // PendingJoin P5 gate).
+            // cert / materialized membership.
             let ctx_v = VerifyContext {
                 expected_community_id: ctx.community_id,
                 admin_addr: ctx.admin_addr,
@@ -3822,9 +3680,7 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
         CommunitySyncError::Persist(_) => "persist_failed",
         CommunitySyncError::PersistDirMissing(_) => "persist_failed",
         CommunitySyncError::MisroutedBlob { .. } => "misrouted_blob",
-        CommunitySyncError::MissingIdentityResolver => "missing_identity_resolver",
         CommunitySyncError::PublisherNotJoined { .. } => "publisher_not_joined",
-        CommunitySyncError::UnknownPublisher { .. } => "publisher_unknown",
         CommunitySyncError::PublisherSigInvalid { .. } => "publisher_sig_invalid",
         CommunitySyncError::PublishRetryExhausted => "publish_retry_exhausted",
         CommunitySyncError::LiveEpochKeyMissing(_) => "live_epoch_key_missing",
@@ -4609,24 +4465,6 @@ impl CommunitySyncRegistry {
         let state = Arc::new(Mutex::new(initial_state));
         let tracker = Arc::new(Mutex::new(initial_tracker));
 
-        // ZEB-254 R3 (C1): pre-bind admin_identity_pub at spawn time via the
-        // registry's own identity_resolver, so the engine's receive task
-        // (which `spawn_engine_with_guard` dispatches BEFORE the caller can
-        // run `bind_admin_identity_pub`) sees the binding for the very
-        // first incoming publish. Without this, a PendingJoin arriving
-        // in the boot-reconcile window verifies under `admin_identity_pub:
-        // None` and falls back to the opportunistic late-bind path (which
-        // only kicks in if the bootstrap Join is in the same batch).
-        //
-        // Resolver short-circuit: when self_owner == admin_addr the
-        // resolver returns the local identity_pub immediately (no cache
-        // hit needed). For joiner engines, the resolver consults the
-        // owner-device cache — which may not yet have the admin recorded
-        // on first-ever join. In that case resolve() returns None and we
-        // fall back to the post-spawn `bind_admin_identity_pub` flow.
-        let admin_identity_pub_resolved: Option<[u8; 64]> =
-            self.cfg.identity_resolver.resolve(&admin_addr).await;
-
         let engine = Arc::new(CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
             membership_key,
@@ -4661,13 +4499,11 @@ impl CommunitySyncRegistry {
             // ZEB-249 §10.6 (Phase A): pass the live owner-state CRDT
             // so the engine can read current_epoch_key dynamically.
             crdt_state: self.crdt_state.as_ref().map(Arc::clone),
-            // ZEB-254 R3 (C1): if the resolver knew about the admin at
-            // spawn time, plumb the pub in here so the receive task is
-            // never running with `admin_identity_pub: None`. Falls back
-            // to None when the resolver lookup misses (first-time join
-            // path) — IPC callers then call `bind_admin_identity_pub`
-            // post-spawn before any PendingJoin event can land.
-            admin_identity_pub: admin_identity_pub_resolved,
+            // ZEB-339 / ZEB-496: the admin identity pub has no remaining
+            // verify-path consumer; the engine ignores this field, so the
+            // registry no longer pays a spawn-time resolver lookup to
+            // populate it.
+            admin_identity_pub: None,
             // ZEB-254 Task 11: clone the nav_emitter from the registry so
             // the engine can fire nav-updated on joiner-side countersign.
             // `None` for test registries that don't supply one.
@@ -4968,8 +4804,8 @@ pub struct OwnerDeviceCacheResolver {
     /// is keyed by its address-as-hash in the cache layout) but fails
     /// for self because our `address_hash != our local signing device
     /// hash` in general — so own-authored events would otherwise
-    /// resolve to `None` and fail `LocalInsertError::UnknownActor`.
-    /// CodeRabbit MAJOR finding on PR #87 round 2 (and the
+    /// resolve to `None` and fail local verification as an unresolved
+    /// actor. CodeRabbit MAJOR finding on PR #87 round 2 (and the
     /// "Known production-path concern" callout from the PR body).
     self_owner: OwnerAddr,
     /// Self's 64-byte identity public bytes — what `insert_local_event`
