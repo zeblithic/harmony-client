@@ -1,11 +1,8 @@
-//! Regression test for ZEB-254 Issue 2: engine-level PendingJoin acceptance
-//! when `admin_identity_pub` is bound via `bind_admin_identity_pub`.
+//! Regression test for ZEB-254 Issue 2: engine-level PendingJoin acceptance.
 //!
-//! Before the fix, all engine-level callsites hard-coded
-//! `admin_identity_pub: None`, so the P5 gate (InviteToken sig verification)
-//! unconditionally rejected every PendingJoin event with
-//! `PendingJoinTokenInvalid`. Tests passed only because they constructed
-//! `VerifyContext` directly with `Some(&admin_pub)`, bypassing the engine.
+//! ZEB-339 moved PendingJoin verification off the admin-identity-pub P5 gate
+//! and onto the carried EnrollmentCert / materialized enrolled_device_keys, so
+//! the engine no longer needs an admin-pub binding to admit a PendingJoin.
 //! This test inserts a PendingJoin through the engine's
 //! `insert_local_event_with_pubs` path to confirm the plumbing is live.
 
@@ -84,14 +81,13 @@ fn make_signed_token(
 }
 
 /// Regression: PendingJoin inserted through the engine's
-/// `insert_local_event_with_pubs` must be accepted (not rejected with
-/// `PendingJoinTokenInvalid`) after `bind_admin_identity_pub` is called.
+/// `insert_local_event_with_pubs` must be accepted.
 ///
-/// Before the ZEB-254 R1 fix, the 4 engine-level `VerifyContext`
-/// constructions hard-coded `admin_identity_pub: None`, so P5 gate
-/// unconditionally returned `PendingJoinTokenInvalid`.
+/// ZEB-339 verifies PendingJoin via the carried EnrollmentCert /
+/// materialized enrolled_device_keys, so the engine admits the event
+/// without any admin-identity-pub binding.
 #[tokio::test]
-async fn pending_join_accepted_via_engine_insert_after_bind_admin_identity_pub() {
+async fn pending_join_accepted_via_engine_insert_without_admin_pub_bind() {
     let community_id = SpaceId([7u8; 16]);
 
     // Admin (invite issuer) — also the engine's configured admin_addr.
@@ -150,14 +146,10 @@ async fn pending_join_accepted_via_engine_insert_after_bind_admin_identity_pub()
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None, // starts unset — bind_admin_identity_pub sets it below
+        admin_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
-
-    // ZEB-254 R1 fix: bind the admin identity pub so the engine's P5 gate
-    // can verify PendingJoin InviteToken signatures.
-    engine.bind_admin_identity_pub(admin_pub);
 
     // Insert the admin's bootstrap Join first so `prior_state_at_event`
     // sees the admin as Joined (required for membership-at-HLC derivation).
@@ -209,8 +201,8 @@ async fn pending_join_accepted_via_engine_insert_after_bind_admin_identity_pub()
     let pending_join =
         sign_event_with_identity(&pending_join_payload, &joiner_priv).expect("sign PendingJoin");
 
-    // Insert through the engine — this exercises the P5 gate using
-    // `self.admin_identity_pub.get()` populated by `bind_admin_identity_pub`.
+    // Insert through the engine — ZEB-339 verifies the PendingJoin via the
+    // carried EnrollmentCert / materialized membership, not an admin-pub gate.
     let outcome = engine
         .insert_local_event_with_pubs(pending_join, joiner_pub, None)
         .await
@@ -218,8 +210,7 @@ async fn pending_join_accepted_via_engine_insert_after_bind_admin_identity_pub()
 
     assert!(
         matches!(outcome, InsertOutcome::Inserted),
-        "PendingJoin must be Inserted via engine after bind_admin_identity_pub; \
-         got {:?} — P5 gate likely still using None admin_identity_pub",
+        "PendingJoin must be Inserted via engine; got {:?}",
         outcome
     );
 
@@ -1450,18 +1441,14 @@ async fn pending_join_resolves_when_admin_comes_online() {
 // ── ZEB-254 R1 (C1): boot-reconcile late-bind regression test ────────────────
 
 /// Regression: an admin engine spawned with `admin_identity_pub: None`
-/// (simulating the boot-reconcile path in `spawn_engine_inner_now` before
-/// the ZEB-254 R1 fix) must still accept a PendingJoin after the admin's
-/// bootstrap Join triggers the opportunistic late-bind in
-/// `insert_event_with_resolved_pubs`.
+/// (simulating the boot-reconcile path in `spawn_engine_inner_now`) must
+/// still accept a PendingJoin and auto-counter-sign it.
 ///
-/// The test intentionally does NOT pre-set `admin_identity_pub` in the engine
-/// config.  The only source of truth is the `identity_resolver` — which
-/// resolves the admin's pub from the admin's bootstrap Join — plus the
-/// opportunistic late-bind that promotes that resolved pub into the OnceLock.
-///
-/// Before the fix, the OnceLock remained empty for boot-reconcile engines and
-/// P5 unconditionally returned `PendingJoinTokenInvalid`.
+/// Historical note: this originally guarded an opportunistic admin-pub
+/// late-bind into a OnceLock. ZEB-339 moved PendingJoin verification onto
+/// the carried EnrollmentCert / materialized membership and ZEB-496
+/// removed that inert OnceLock, so acceptance no longer depends on any
+/// admin-pub binding. The test still pins the end-to-end behaviour.
 #[tokio::test]
 async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind() {
     let community_id = SpaceId([0xE0u8; 16]);
@@ -1500,9 +1487,8 @@ async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind(
         None, // <-- boot-reconcile: no pre-set admin_identity_pub
     );
 
-    // Step 1: insert admin bootstrap Join. The resolver returns admin_pub for
-    // admin_addr; the opportunistic late-bind in insert_event_with_resolved_pubs
-    // populates the OnceLock from this resolved actor_pub.
+    // Step 1: insert admin bootstrap Join so the admin is materialized as
+    // Joined (self-eligibility precondition for the auto-counter-sign hook).
     let admin_join_payload = EventPayload {
         id: [0xC1u8; 16],
         community_id,
@@ -1526,8 +1512,8 @@ async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind(
         bootstrap_outcome
     );
 
-    // Step 2: insert a PendingJoin from joiner. The P5 gate now sees a populated
-    // admin_identity_pub (set by the late-bind above) and can verify the token.
+    // Step 2: insert a PendingJoin from joiner. ZEB-339 verifies it via the
+    // carried EnrollmentCert / materialized membership.
     let token = make_signed_token(
         &admin_priv,
         admin_addr,
@@ -1558,8 +1544,7 @@ async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind(
 
     assert!(
         matches!(pending_outcome, InsertOutcome::Inserted),
-        "PendingJoin must be Inserted after opportunistic late-bind; got {:?} — \
-         boot-reconcile engines likely still returning None from admin_identity_pub",
+        "PendingJoin must be Inserted on a boot-reconcile engine; got {:?}",
         pending_outcome
     );
 
@@ -1590,7 +1575,7 @@ async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind(
 
     assert!(
         found,
-        "auto-counter-sign must fire on boot-reconcile engine after late-bind"
+        "auto-counter-sign must fire on boot-reconcile engine"
     );
 
     engine.shutdown().await.expect("shutdown");
@@ -1598,26 +1583,17 @@ async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind(
 
 // ── ZEB-254 bot-review Q2: state-root receive path late-bind ─────────────────
 
-/// ZEB-254 bot-review Q2: opportunistic late-bind of `admin_identity_pub` on
-/// the state-root receive path.
+/// ZEB-254 bot-review Q2 (state-root receive path): a boot-reconcile engine
+/// that ingests the admin's bootstrap Join followed by a PendingJoin must
+/// accept the PendingJoin and auto-counter-sign it.
 ///
-/// The Phase B inner loop in `handle_incoming_publish` now contains the same
-/// late-bind guard as `insert_event_with_resolved_pubs`. When a state-root
-/// blob arrives containing BOTH the admin's bootstrap Join AND a PendingJoin
-/// (sorted by event_sort_key so the Join arrives first), the admin's pub is
-/// extracted from the resolved actor_pub for the Join and stored in the
-/// OnceLock; the subsequent PendingJoin entry then sees a populated
-/// `admin_identity_pub` and passes P5.
-///
-/// Driving `handle_incoming_publish` directly requires building a fully
-/// encrypted wire packet (root + blob, correct epoch key) — a non-trivial
-/// fixture. Instead this test validates the same OnceLock promotion path
-/// via sequential `insert_local_event_with_pubs` calls (same OnceLock shared
-/// with `InternalCtx`). The code path in `handle_incoming_publish` Phase B
-/// uses the identical `ctx.admin_identity_pub.set(actor_pub)` pattern on the
-/// same `Arc<OnceLock>`, so the observable outcome (PendingJoin accepted after
-/// admin Join without pre-set admin_identity_pub) is identical. This test is a
-/// functional regression guard for the Q2 fix.
+/// Historical note: this originally guarded an opportunistic admin-pub
+/// late-bind into a shared OnceLock on the receive path. ZEB-339 moved
+/// PendingJoin verification onto the carried EnrollmentCert / materialized
+/// membership and ZEB-496 removed that inert OnceLock, so acceptance no
+/// longer depends on an admin-pub binding. Driving `handle_incoming_publish`
+/// directly requires a fully encrypted wire packet, so this test validates
+/// the equivalent path via sequential `insert_local_event_with_pubs` calls.
 #[tokio::test]
 async fn boot_reconcile_engine_accepts_pending_join_via_state_root_late_bind() {
     let community_id = SpaceId([0xF0u8; 16]);
@@ -1669,9 +1645,8 @@ async fn boot_reconcile_engine_accepts_pending_join_via_state_root_late_bind() {
     let pending_id = pending_join.id;
 
     // Admin engine with admin_identity_pub: None (boot-reconcile mode).
-    // The admin's pub must be promoted into the OnceLock by the late-bind
-    // when the admin Join is inserted — WITHOUT any prior call to
-    // bind_admin_identity_pub or pre-seeding in the config.
+    // ZEB-339 verifies PendingJoin via the carried EnrollmentCert /
+    // materialized membership, so no admin-pub binding is needed.
     let cs_dst = make_cas();
     // Keep _pub_rx alive (not just `_`) so the engine's publisher_tx stays
     // valid for the entire test; dropping it immediately would close the
@@ -1692,10 +1667,8 @@ async fn boot_reconcile_engine_accepts_pending_join_via_state_root_late_bind() {
         None, // <-- boot-reconcile: no pre-set admin_identity_pub
     );
 
-    // Step 1: insert admin bootstrap Join with the correct actor_pub.
-    // The late-bind in insert_event_with_resolved_pubs (and in
-    // handle_incoming_publish's Phase B loop) sees event.actor == admin_addr
-    // and admin_identity_pub.get().is_none() → sets the OnceLock to actor_pub.
+    // Step 1: insert admin bootstrap Join so the admin is materialized as
+    // Joined (required for self-eligibility of the auto-counter-sign hook).
     let o1 = dst_engine
         .insert_local_event_with_pubs(admin_join, admin_pub, None)
         .await
@@ -1706,17 +1679,16 @@ async fn boot_reconcile_engine_accepts_pending_join_via_state_root_late_bind() {
         o1
     );
 
-    // Step 2: insert the PendingJoin with the joiner's actor_pub. The OnceLock
-    // is now populated (set by step 1), so P5 can verify the token sig.
-    // The actor_pub here is joiner_pub — correctly scoped to this event.
+    // Step 2: insert the PendingJoin with the joiner's actor_pub. ZEB-339
+    // verifies it against the carried EnrollmentCert / materialized
+    // membership; the actor_pub here is joiner_pub, scoped to this event.
     let o2 = dst_engine
         .insert_local_event_with_pubs(pending_join, joiner_pub, None)
         .await
         .expect("pending join insert");
     assert!(
         matches!(o2, InsertOutcome::Inserted),
-        "PendingJoin must be Inserted after state-root late-bind promotes the OnceLock; \
-         got {:?} — Q2 bot-review fix missing or OnceLock not shared between paths",
+        "PendingJoin must be Inserted; got {:?}",
         o2
     );
 
@@ -1743,10 +1715,7 @@ async fn boot_reconcile_engine_accepts_pending_join_via_state_root_late_bind() {
     .await
     .expect("timed out waiting for auto-JoinCountersign on state-root receive path");
 
-    assert!(
-        found,
-        "auto-counter-sign must fire after state-root late-bind"
-    );
+    assert!(found, "auto-counter-sign must fire on PendingJoin insert");
 
     dst_engine.shutdown().await.expect("dst shutdown");
 }

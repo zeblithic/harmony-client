@@ -6053,55 +6053,8 @@ pub async fn start_node_inner(
                     }
 
                     tracing::info!(
-                        "BOOT-PROBE 09: community engines constructed, entering rehydrate pass"
+                        "BOOT-PROBE 09: community engines constructed, entering healing pass"
                     );
-                    // ZEB-254 R4-4: restart-time rehydrate pass for the
-                    // engine's `admin_identity_pub` OnceLock. The R3-C1
-                    // pre-bind at spawn time calls
-                    // `resolver.resolve(&admin_addr)`, but if the
-                    // OwnerDeviceCache was still cold at that moment
-                    // (e.g., the joiner crashed before the admin's
-                    // device entry got learned), the OnceLock is left
-                    // unset. Since the joiner's persisted CRDT may
-                    // already contain the admin's bootstrap Join (it
-                    // arrived in the SAME publish that bootstrapped
-                    // the engine, returned `AlreadyKnown` on the
-                    // reconcile insert, and the post-verify bind
-                    // therefore never fired), no later event-flow
-                    // will rebind the lock until a brand-new admin
-                    // event arrives.
-                    //
-                    // Sweep every spawned engine and call
-                    // `try_rehydrate_admin_identity_pub` — best-effort,
-                    // idempotent, no-ops cleanly on already-bound
-                    // engines and on engines whose persisted log
-                    // contains no admin events.
-                    {
-                        let space_ids: Vec<crate::owner_state_types::SpaceId> = {
-                            let g = crdt_state.lock().await;
-                            g.spaces
-                                .iter()
-                                .filter(|(_, s)| {
-                                    s.kind == crate::owner_state_types::SpaceKind::Community
-                                        && s.left_at.is_none()
-                                })
-                                .map(|(id, _)| *id)
-                                .collect()
-                        };
-                        for space_id in space_ids {
-                            let engine = match registry.engine_arc(&space_id).await {
-                                Some(e) => e,
-                                None => continue,
-                            };
-                            if engine.try_rehydrate_admin_identity_pub().await {
-                                tracing::info!(
-                                    ?space_id,
-                                    "ZEB-254 R4-4: admin_identity_pub rehydrated at boot \
-                                     (resolver re-resolve hit after spawn-time cold miss)"
-                                );
-                            }
-                        }
-                    }
 
                     // ZEB-254 R3 (C3): restart-time healing pass for
                     // pending_join_at. The post-Inserted clear hook only
@@ -6258,9 +6211,7 @@ pub async fn start_node_inner(
 
                     community_registry_arc = Some(std::sync::Arc::clone(&registry));
 
-                    tracing::info!(
-                        "BOOT-PROBE 10: rehydrate+healing done, entering reachability replay"
-                    );
+                    tracing::info!("BOOT-PROBE 10: healing done, entering reachability replay");
                     // ── ZEB-321 Phase 1 PR #157 round 2 (Cursor HIGH): replay
                     //    ReachabilityAnnounce history into the resolver ──
                     //
@@ -20989,22 +20940,6 @@ pub async fn create_community_inner(
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
 
-    // ZEB-254 R1 (C1): bind admin_identity_pub so the P5 gate can verify
-    // PendingJoin InviteToken signatures on this engine. The admin IS the
-    // community creator — we derive the 64-byte composite pub from the
-    // signing key (same layout as the joiner path at ~L9350).
-    {
-        use crate::dm_signing::ed25519_priv_to_x25519;
-        let x25519_priv = ed25519_priv_to_x25519(&signing_key);
-        let x25519_pub =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
-        let ed25519_pub_bytes = signing_key.verifying_key().to_bytes();
-        let mut admin_identity_pub = [0u8; 64];
-        admin_identity_pub[..32].copy_from_slice(x25519_pub.as_bytes());
-        admin_identity_pub[32..].copy_from_slice(&ed25519_pub_bytes);
-        engine_arc.bind_admin_identity_pub(admin_identity_pub);
-    }
-
     // Bootstrap-Join via the engine. The engine's `insert_local_event`
     // runs verify_event (which authorizes the admin self-Join via the
     // bootstrap rule) and fires `notify_dirty` on success; the debounced
@@ -22797,17 +22732,6 @@ where
         )
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
-
-    // ZEB-254: bind admin identity pub to the engine so the P5 gate in
-    // verify_event can validate PendingJoin InviteToken signatures. Must
-    // happen before any event insert (including the bootstrap admin Join
-    // below) so the shared OnceLock is populated before the task's
-    // handle_incoming_publish path could race it. Invite-only payloads
-    // always carry admin_identity_pub; open-community payloads carry None
-    // (no PendingJoin events possible → no binding needed).
-    if let Some(pub_bytes) = payload.admin_identity_pub {
-        engine_arc.bind_admin_identity_pub(pub_bytes);
-    }
 
     // ZEB-249 Task 6 spec §5.2: seed the bootstrap hint BEFORE the first
     // insert_local_event so the guard (version == 0 && events.is_empty())

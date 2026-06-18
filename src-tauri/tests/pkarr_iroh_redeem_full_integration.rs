@@ -442,10 +442,6 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
         .engine_arc(&community_id)
         .await
         .expect("alice engine arc");
-    // bind_admin_identity_pub: the _admin_identity_pub param in
-    // spawn_auto_counter_sign_task is unused (ZEB-339 cert path), so the
-    // exact bytes here don't affect correctness. Kept for structural parity.
-    alice_engine.bind_admin_identity_pub(alice_pub);
     alice_engine
         .insert_local_event(alice_minted.bootstrap_join.clone())
         .await
