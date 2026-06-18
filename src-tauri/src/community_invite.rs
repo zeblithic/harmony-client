@@ -1225,6 +1225,14 @@ pub enum CommunityInviteVerifyError {
     /// engine's local-insert pipeline rather than at sig classes.
     #[error("engine local-insert error")]
     EngineLocalError,
+    /// inviter_enrollment cert failed verification (bad master signature,
+    /// expired, or non-Master issuer). ZEB-497.
+    #[error("inviter enrollment cert invalid")]
+    InviterEnrollmentCertInvalid,
+    /// inviter_enrollment cert binds a different owner than invite_token.inviter.
+    /// ZEB-497.
+    #[error("inviter enrollment owner mismatch")]
+    InviterEnrollmentOwnerMismatch,
 }
 
 impl CommunityInviteVerifyError {
@@ -1245,6 +1253,8 @@ impl CommunityInviteVerifyError {
             Self::CounterSignAttachFailed => "community_invite_counter_sign_attach_failed",
             Self::EngineRejected => "community_invite_engine_rejected",
             Self::EngineLocalError => "community_invite_engine_local_error",
+            Self::InviterEnrollmentCertInvalid => "community_invite_inviter_enrollment_cert_invalid",
+            Self::InviterEnrollmentOwnerMismatch => "community_invite_inviter_enrollment_owner_mismatch",
         }
     }
 }
