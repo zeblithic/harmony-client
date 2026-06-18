@@ -1924,7 +1924,10 @@ pub fn materialize_with_now(
                     // If a future path ever inserts events into the log bypassing
                     // `verify_event` (e.g. snapshot-seed / import), re-verify here.
                     if let Some(cert) = event.enrollment.as_ref() {
-                        enrolled.insert(cert.device_pubkeys.classical.ed25519_verify);
+                        insert_enrolled_key_capped(
+                            &mut enrolled,
+                            cert.device_pubkeys.classical.ed25519_verify,
+                        );
                     }
                     m.members.insert(
                         event.actor,
@@ -2389,7 +2392,10 @@ pub fn materialize_with_now(
                             // before reaching the materialized log. See the Join
                             // arm above for the full rationale.
                             if let Some(cert) = event.enrollment.as_ref() {
-                                enrolled.insert(cert.device_pubkeys.classical.ed25519_verify);
+                                insert_enrolled_key_capped(
+                                    &mut enrolled,
+                                    cert.device_pubkeys.classical.ed25519_verify,
+                                );
                             }
                             m.members.insert(
                                 event.actor,
@@ -2432,7 +2438,10 @@ pub fn materialize_with_now(
                                 .map(|s| s.enrolled_device_keys.clone())
                                 .unwrap_or_default();
                             if let Some(cert) = event.enrollment.as_ref() {
-                                enrolled.insert(cert.device_pubkeys.classical.ed25519_verify);
+                                insert_enrolled_key_capped(
+                                    &mut enrolled,
+                                    cert.device_pubkeys.classical.ed25519_verify,
+                                );
                             }
                             m.members.insert(
                                 event.actor,
@@ -2580,19 +2589,14 @@ pub fn materialize_with_now(
                 if let Some(member) = m.members.get_mut(&event.actor) {
                     if member.status == MemberStatus::Joined {
                         if let Some(cert) = &event.enrollment {
-                            let key = cert.device_pubkeys.classical.ed25519_verify;
-                            // ZEB-401: defense-in-depth cap. verify_event already
-                            // rejects an over-limit DeviceAnnounce, but materialize
-                            // must hold the invariant even for a malformed/replayed
-                            // event that bypassed verification (corrupted log) — so
-                            // only insert a NEW key while under the bound. An
-                            // already-present key is idempotent (no growth) and
-                            // stays a no-op insert.
-                            if member.enrolled_device_keys.contains(&key)
-                                || member.enrolled_device_keys.len() < MAX_ENROLLED_DEVICE_KEYS
-                            {
-                                member.enrolled_device_keys.insert(key);
-                            }
+                            // ZEB-401: same capped insert as every other key-adding
+                            // arm. verify_event already rejects an over-limit
+                            // DeviceAnnounce, but materialize holds the invariant
+                            // uniformly even for an event that bypassed verification.
+                            insert_enrolled_key_capped(
+                                &mut member.enrolled_device_keys,
+                                cert.device_pubkeys.classical.ed25519_verify,
+                            );
                         }
                     }
                 }
@@ -3115,11 +3119,15 @@ pub fn verify_event(
                 Some(m) if m.status == MemberStatus::Joined => m,
                 _ => return Err(VerifyError::DeviceAnnounceForNonMember),
             };
-            // ZEB-401: bound the per-member enrolled-key set so every verify
-            // loop that iterates it (`verify_channel_event`, `verify_publisher_
-            // sig`, `resolve_enrolled_signer`, …) stays cheap. A DeviceAnnounce
-            // adds the carried cert's device key; reject only when that key is
-            // NEW and the set is already at MAX_ENROLLED_DEVICE_KEYS — an
+            // ZEB-401: loud, early reject of an over-limit DeviceAnnounce. The
+            // load-bearing bound is enforced uniformly in materialize (via
+            // insert_enrolled_key_capped at every key-adding arm); this reject is
+            // an ADDITIONAL DeviceAnnounce-specific signal — correct here because a
+            // DeviceAnnounce exists ONLY to add a key, so rejecting an over-limit
+            // one loses nothing (unlike a Join, which must still re-admit the
+            // member, so its overflow key is silently dropped at materialize
+            // instead of failing the join). Reject only when the carried cert's
+            // key is NEW and the set is already at MAX_ENROLLED_DEVICE_KEYS — an
             // idempotent re-announce of an already-enrolled key is no growth and
             // stays allowed. The cert is present by construction (step 1 resolved
             // the signer via enrolled_key_from_cert), but its absence is handled
@@ -3686,16 +3694,37 @@ pub const MAX_MODERATION_REASON_CHARS: usize = 280;
 /// verifies, hit only on a member's OWN bad-signature events since the loops
 /// short-circuit via `.any()` for legitimate ones — bounded at ~1.6ms.
 ///
-/// Enforced in two places: `verify_event` rejects an over-limit `DeviceAnnounce`
-/// (`VerifyError::EnrolledDeviceKeyLimit`, the loud primary gate), and
-/// `materialize` refuses to grow the set past the bound (a silent defense-in-
-/// depth backstop for any malformed/replayed event that bypassed verification).
+/// `materialize` is the UNIFORM enforcement point: every key-adding arm
+/// (`Join`, `PendingJoin` countersigned + un-countersigned, `DeviceAnnounce`)
+/// routes its cert-key insert through [`insert_enrolled_key_capped`], so the
+/// materialized set every verify loop iterates can never exceed the bound —
+/// including the Leave→Join rejoin path, where `Leave` preserves the set and a
+/// fresh cert per rejoin would otherwise accumulate keys without limit.
+/// `verify_event` additionally rejects an over-limit `DeviceAnnounce`
+/// (`VerifyError::EnrolledDeviceKeyLimit`) as an early/loud signal — that reject
+/// is DeviceAnnounce-specific because a DeviceAnnounce exists ONLY to add a key
+/// (rejecting it loses nothing), whereas a `Join`/`PendingJoin` at the cap must
+/// still (re)admit the member, so its overflow key is silently dropped rather
+/// than failing the whole join.
 pub const MAX_ENROLLED_DEVICE_KEYS: usize = 32;
 
 /// ZEB-401: compile-time guard — the cap must clear ZEB-169's ~12-device
 /// target with headroom so the limit never bites a legitimate multi-device
 /// owner. Lowering `MAX_ENROLLED_DEVICE_KEYS` below 12 fails the build.
 const _: () = assert!(MAX_ENROLLED_DEVICE_KEYS >= 12);
+
+/// ZEB-401: insert `key` into a member's enrolled-device-key set while holding
+/// the `MAX_ENROLLED_DEVICE_KEYS` bound. An already-present key is idempotent;
+/// a NEW key is added only while the set is under the cap. This is the single
+/// load-bearing enforcement point — it must wrap EVERY site that grows a
+/// member's `enrolled_device_keys`, so no event kind (Join / PendingJoin /
+/// DeviceAnnounce, including repeated Leave→Join) can push the set the verify
+/// loops iterate past the bound.
+fn insert_enrolled_key_capped(set: &mut BTreeSet<[u8; 32]>, key: [u8; 32]) {
+    if set.contains(&key) || set.len() < MAX_ENROLLED_DEVICE_KEYS {
+        set.insert(key);
+    }
+}
 
 /// ZEB-254: PendingJoin events older than this (community current HLC
 /// minus event HLC, in wall-ms) are hidden from materialize unless a
@@ -11830,6 +11859,86 @@ mod zeb_339_signer_verify_tests {
             member.enrolled_device_keys.len(),
             MAX_ENROLLED_DEVICE_KEYS,
             "materialize must cap the enrolled-key set at MAX regardless of how many announces arrive"
+        );
+    }
+
+    /// ZEB-401 (Qodo gap): the Join/rejoin path must ALSO honor the cap. `Leave`
+    /// preserves `enrolled_device_keys` and a subsequent `Join` from a FRESH
+    /// device unions its cert key in, so repeated Leave→Join with new certs would
+    /// grow the set without bound if only `DeviceAnnounce` were capped. Drive
+    /// MAX+5 such cycles and assert the set never exceeds MAX.
+    #[test]
+    fn materialize_caps_enrolled_keys_across_repeated_rejoin() {
+        let admin = mint_test_owner(0x71);
+        let owner = mint_test_owner(0x72);
+        let community_id = SpaceId([0xf1; 16]);
+
+        // Device #1 joins.
+        let join1_payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let join1 = sign_event(&join1_payload, &owner.device_key).unwrap();
+        let join1 = SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..join1
+        };
+        let mut events = vec![join1];
+
+        // Repeated Leave (device #1) → Join from a FRESH device of the same owner.
+        let cycles: u16 = MAX_ENROLLED_DEVICE_KEYS as u16 + 5;
+        for i in 0..cycles {
+            let leave_payload = EventPayload {
+                id: [0x20u8.wrapping_add(i as u8); 16],
+                community_id,
+                kind: MembershipEventKind::Leave,
+                actor: owner.owner,
+                at: Hlc {
+                    wall_ms: 200 + (i as u64) * 2,
+                    logical: 0,
+                    device_id: "device1".into(),
+                },
+            };
+            let leave = sign_event(&leave_payload, &owner.device_key).unwrap();
+            events.push(leave);
+
+            let (sk_i, cert_i) = mint_second_device(0x72, 0x80u8.wrapping_add(i as u8));
+            let rejoin_payload = EventPayload {
+                id: [0x60u8.wrapping_add(i as u8); 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: owner.owner,
+                at: Hlc {
+                    wall_ms: 201 + (i as u64) * 2,
+                    logical: 0,
+                    device_id: "device2".into(),
+                },
+            };
+            let rejoin = sign_event(&rejoin_payload, &sk_i).unwrap();
+            events.push(SignedMembershipEvent {
+                enrollment: Some(cert_i),
+                ..rejoin
+            });
+        }
+
+        let m = materialize(&events, admin.owner);
+        let member = m.members.get(&owner.owner).expect("owner is a member");
+        assert_eq!(
+            member.status,
+            MemberStatus::Joined,
+            "owner ends Joined after the last rejoin"
+        );
+        assert_eq!(
+            member.enrolled_device_keys.len(),
+            MAX_ENROLLED_DEVICE_KEYS,
+            "Join/rejoin path must honor the cap — Leave→Join must not accumulate keys past MAX"
         );
     }
 }
