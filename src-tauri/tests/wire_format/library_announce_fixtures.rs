@@ -5,7 +5,7 @@
 //! (field renames, key additions, type substitutions) BEFORE they
 //! break cross-device compat.
 //!
-//! Companion to `wire_format_library_directory_fixtures.rs` (Phase 1).
+//! Companion to `wire_format/library_directory_fixtures.rs` (Phase 1).
 
 use ciborium::value::Value as CborValue;
 use ed25519_dalek::{Signer, SigningKey};

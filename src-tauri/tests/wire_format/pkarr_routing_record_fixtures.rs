@@ -2,7 +2,7 @@
 //! CBOR-encoded `ReachabilityAnnouncePayload` embedded in a
 //! `PkarrRoutingRecord`).
 //!
-//! Mirrors the Phase 1 pin in `wire_format_reachability_announce_fixtures.rs`.
+//! Mirrors the Phase 1 pin in `wire_format/reachability_announce_fixtures.rs`.
 //! If this test fails, the routing_blob wire format changed — every pkarr
 //! record published by harmony-client v1 would be undecodable by old resolvers
 //! without a migration. Regenerate only with full understanding.
@@ -45,7 +45,7 @@ fn routing_blob_canonical_cbor_pinned() {
 
     // Pin: this is the exact byte sequence a PkarrRoutingRecord.routing_blob
     // field will contain for alice's reachability record with the fixture inputs.
-    // Matches Phase 1's wire_format_reachability_announce_fixtures.rs pin.
+    // Matches Phase 1's wire_format/reachability_announce_fixtures.rs pin.
     assert_eq!(
         hex,
         "a5626e645820abababababababababababababababababababababababababababababababab62726c7568747470733a2f2f646572702e6578616d706c652f626461806274731b0000018bcfe568006273675840cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",

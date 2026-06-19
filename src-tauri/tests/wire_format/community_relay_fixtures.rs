@@ -6,15 +6,15 @@
 //! `eprintln!("{}", hex::encode(&bytes));`, capture the output, and replace
 //! the expected hex below — then re-run to confirm the pin holds.
 //!
-//! Follows the exact pattern of `wire_format_community_fixtures.rs` and
-//! `wire_format_channel_log_fixtures.rs`: deterministic struct fields,
+//! Follows the exact pattern of `wire_format/community_fixtures.rs` and
+//! `wire_format/channel_log_fixtures.rs`: deterministic struct fields,
 //! `canonical_cbor_encode`, hex assertion.
 //!
 //! All structs use fixed literal byte fields so the output is deterministic
 //! across platforms and Rust versions.
 //!
 //! **No `test-fixtures` gate is needed here (deliberate).** Unlike
-//! `wire_format_channel_log_fixtures.rs` — which gates the specific items that
+//! `wire_format/channel_log_fixtures.rs` — which gates the specific items that
 //! import/call the deterministic-nonce helper `encrypt_channel_packet_with_nonce`
 //! on `#[cfg(feature = "test-fixtures")]` — this suite calls NO deterministic-nonce
 //! crypto. It constructs the wire types from fixed byte literals and runs

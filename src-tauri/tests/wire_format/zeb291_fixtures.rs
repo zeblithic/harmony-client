@@ -7,7 +7,7 @@
 //! wire-protocol break — review carefully before updating the pinned
 //! bytes (cross-version compat, peer interop).
 //!
-//! Pattern mirrors `tests/wire_format_zeb290_fixtures.rs`: deterministic
+//! Pattern mirrors `tests/wire_format/zeb290_fixtures.rs`: deterministic
 //! signing-key-irrelevant envelopes (`sig` is a 64-byte zero placeholder,
 //! matching Phase 1; signature semantics are exercised in the
 //! envelope-signing tests in `community_voting_core.rs`'s own test
@@ -63,7 +63,7 @@ const EXPECTED_ENVELOPE_TIER2_POLLCREATE_HEX: &str = "a8627467617062767201627472
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Helpers (mirror wire_format_zeb290_fixtures.rs).
+// Helpers (mirror wire_format/zeb290_fixtures.rs).
 // ---------------------------------------------------------------------------
 
 fn fixture_hlc() -> Hlc {

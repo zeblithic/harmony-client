@@ -1,6 +1,6 @@
 //! ZEB-343: pin the canonical CBOR wire format of ProfileCardBroadcast WITH an
 //! avatar_cid set (7-entry map incl. "av"). The no-avatar case stays in
-//! wire_format_profile_card_fixtures.rs (6-entry map, byte-identical to ZEB-341).
+//! wire_format/profile_card_fixtures.rs (6-entry map, byte-identical to ZEB-341).
 //!
 //! ZEB-345 extends this with the additive `profile_page_root` ("pp") field:
 //! - pp-only card -> 7-entry map (0xA7), keys incl. "pp" but NOT "av";

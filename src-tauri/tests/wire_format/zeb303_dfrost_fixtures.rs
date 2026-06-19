@@ -11,7 +11,7 @@
 //! wire-protocol break — review carefully before updating the pinned
 //! bytes (cross-version compat, peer interop).
 //!
-//! Pattern matches `wire_format_zeb290_fixtures.rs` (the Phase 1 voting
+//! Pattern matches `wire_format/zeb290_fixtures.rs` (the Phase 1 voting
 //! envelope fixture set).
 
 use harmony_app::community_dfrost_types::{

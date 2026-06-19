@@ -15,13 +15,13 @@
 //!
 //! ## Regen pattern
 //!
-//! Follows the same regen pattern as `tests/wire_format_voting_tier3_fixtures.rs`
+//! Follows the same regen pattern as `tests/wire_format/voting_tier3_fixtures.rs`
 //! (ZEB-309 Phase 4a-main). To regenerate the binary fixtures after an
 //! intentional wire-format change:
 //!
 //!     REGENERATE_VOTING_TIER3_SECRET_FIXTURES=1 cargo nextest run \
 //!         --locked -p harmony-app --all-targets --features test-fixtures \
-//!         --test wire_format_voting_tier3_secret_fixtures
+//!         --test wire_format_tests
 //!
 //! Then commit the new `.cbor` files in `tests/fixtures/voting_tier3_secret/`.
 //! Without the env var set, each test compares against the pinned bytes and
