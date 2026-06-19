@@ -355,20 +355,6 @@ pub(crate) fn build_dm_packet_with_blob(
     crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
 }
 
-/// ZEB-504: reconstruct a signed `DmInvite` wire packet for `space_id` from the
-/// durable Space record. Shared by the deposit rung
-/// ([`DmOutbox::build_invite_packet_bytes`]) and the live PQ-tunnel transport
-/// (`iroh_tunnel_dm_transport::IrohTunnelDmTransport::send`) so the cold
-/// first-contact invite is re-driven over the *warming* tunnel byte-for-byte the
-/// same way the deposit path rebuilds it — closing the gap where the live tunnel
-/// carried only the CidNotify and the recipient bounced it with `SpaceNotFound`.
-///
-/// `Ok(None)` for a genuinely non-DM Space OR a missing Space record (the caller
-/// then carries only the CidNotify — a vanished record can't be classified as a
-/// DM, and is unreachable for a real outbox entry whose DM Space is
-/// fleet-replicated alongside it). `Err` for a DM/GroupDm Space that EXISTS but
-/// has no `content_key`, or a sign/encode failure — the invite is load-bearing
-/// there, so the caller must NOT silently drop it.
 /// ZEB-504: resolve the inviter's own `sender_devices` list for a
 /// `DmInviteSigned`, sourced from the live `OwnerDeviceCache` (authoritative)
 /// with a pre-bootstrap singleton fallback, plus the Phase-3b defense-in-depth
@@ -414,6 +400,20 @@ pub(crate) fn resolve_sender_devices(
     }
 }
 
+/// ZEB-504: reconstruct a signed `DmInvite` wire packet for `space_id` from the
+/// durable Space record. Shared by the deposit rung
+/// ([`DmOutbox::build_invite_packet_bytes`]) and the live PQ-tunnel transport
+/// (`iroh_tunnel_dm_transport::IrohTunnelDmTransport::send`) so the cold
+/// first-contact invite is re-driven over the *warming* tunnel byte-for-byte the
+/// same way the deposit path rebuilds it — closing the gap where the live tunnel
+/// carried only the CidNotify and the recipient bounced it with `SpaceNotFound`.
+///
+/// `Ok(None)` for a genuinely non-DM Space OR a missing Space record (the caller
+/// then carries only the CidNotify — a vanished record can't be classified as a
+/// DM, and is unreachable for a real outbox entry whose DM Space is
+/// fleet-replicated alongside it). `Err` for a DM/GroupDm Space that EXISTS but
+/// has no `content_key`, or a sign/encode failure — the invite is load-bearing
+/// there, so the caller must NOT silently drop it.
 pub(crate) fn build_invite_packet_from_space(
     state: &OwnerState,
     space_id: &SpaceId,
@@ -1467,28 +1467,27 @@ impl DmOutbox {
         build_dm_packet(signed, &self.signing_key)
     }
 
-    /// ZEB-483: rebuild + sign the DmInvite wire bytes for a DM-Space deposit —
-    /// a `DmInviteSigned` reconstructed from the persisted `Space` record that is
-    /// admission-EQUIVALENT to the tunnel-carrier invite `add_space_dm_inner`
-    /// builds (lib.rs:10410), so a deposited copy bootstraps the same Space. It is
-    /// NOT byte-identical to the tunnel invite: `sender_devices` is a singleton of
-    /// this signing device (matching `build_cidnotify_packet_bytes`), not the
-    /// sender's full device list — benign, because the deposit-recover path
-    /// bootstraps ONLY the Space (it never refreshes the OwnerDeviceCache from a
-    /// deposited invite, see `apply_invite`'s `refresh_owner_device_cache`), and
-    /// the recipient already knows the sender's devices from the friend handshake.
+    /// ZEB-483 / ZEB-504: rebuild + sign the DmInvite wire bytes for a DM-Space
+    /// deposit by delegating to the shared [`build_invite_packet_from_space`] —
+    /// the SAME reconstruction the live PQ-tunnel transport uses — so the deposit
+    /// rung and the live tunnel rebuild the bootstrap invite identically (both
+    /// carry the sender's full `OwnerDeviceCache` device list via
+    /// `resolve_sender_devices`, not a singleton). A deposited copy therefore
+    /// bootstraps exactly the Space `add_space_dm_inner` would.
     ///
-    /// `Ok(Some)` for a healthy DM/GroupDm Space. `Ok(None)` for a genuinely
-    /// non-DM Space, OR a missing Space record — deposit the CidNotify alone. A
-    /// missing record is unreachable for a real DM outbox entry (the DM Space is
-    /// created and fleet-replicated alongside the entry, and "leave DM" sets
-    /// `left_at` rather than removing the record), and we can't classify a vanished
-    /// record as a DM, so we don't fail closed on it. For a DM/GroupDm Space that
-    /// EXISTS, the invite IS load-bearing for offline recovery, so an absent
-    /// `content_key` or a sign/encode failure returns `Err`: the caller then SKIPS
-    /// the deposit candidate and leaves the entry pending for retry (CodeRabbit)
-    /// rather than deposit a CidNotify an offline recipient would recover into
-    /// `SpaceNotFound`.
+    /// The deposit-recover path bootstraps ONLY the Space — it never refreshes
+    /// the OwnerDeviceCache from a deposited invite (see `apply_invite`'s
+    /// `refresh_owner_device_cache = false`); the recipient learns the sender's
+    /// devices from the friend handshake / the verified CidNotify path.
+    ///
+    /// Return semantics are the free fn's: `Ok(Some)` for a healthy DM/GroupDm
+    /// Space; `Ok(None)` for a non-DM or missing Space record (deposit the
+    /// CidNotify alone — a vanished record is unreachable for a real DM entry
+    /// and can't be classified as a DM); `Err` for a DM/GroupDm Space that
+    /// EXISTS but has no `content_key`, or a sign/encode failure — load-bearing
+    /// for offline recovery, so the caller SKIPS the deposit candidate and
+    /// leaves the entry pending for retry rather than depositing a CidNotify the
+    /// recipient would recover into `SpaceNotFound`.
     fn build_invite_packet_bytes(
         &self,
         state: &OwnerState,
