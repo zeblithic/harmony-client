@@ -10,7 +10,7 @@
 //! - `StaticIdentityResolver` — minimal IdentityResolver for tests.
 //! - `setup_two_voting_engine_bridge` — creates two VotingLogEngine instances
 //!   wired with bidirectional mpsc bridges (same shape as dfrost transport test).
-//! - `wait_for` — polling helper that avoids tokio::time::sleep flakiness.
+//! - `wait_for_log` — polling helper that avoids tokio::time::sleep flakiness.
 //! - Event builders: `build_tier3_poll_create_event`, `build_decline_event`,
 //!   `build_draft_candidate_event`, `build_draft_approval_event`,
 //!   `build_ratification_ballot_event`, `build_sortition_failed_event`.
@@ -402,25 +402,6 @@ pub async fn setup_two_voting_engine_bridge_with_signing_and_app(
 }
 
 // ─── Polling helper ────────────────────────────────────────────────────────────
-
-/// Poll `predicate()` every `poll_interval_ms` until it returns `Some(T)`
-/// or `timeout_ms` elapses. Returns `None` on timeout.
-///
-/// This is the ZEB-307 R3 pattern: avoids a fixed `tokio::time::sleep`
-/// that would make tests flaky under heavy load.
-pub async fn wait_for<F, T>(timeout_ms: u64, poll_interval_ms: u64, mut predicate: F) -> Option<T>
-where
-    F: FnMut() -> Option<T>,
-{
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_millis(timeout_ms) {
-        if let Some(v) = predicate() {
-            return Some(v);
-        }
-        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
-    }
-    None
-}
 
 /// Convenience wrapper: poll log_a + log_b until `predicate(log)` is true
 /// on the target log. Times out after 5 000 ms.
