@@ -18,7 +18,7 @@
 //!
 //! To regenerate the hex after an intentional schema change:
 //!
-//! 1. `UPDATE_BACKFILL_FIXTURE=1 cargo test --test wire_format_channel_log_fixtures \
+//! 1. `UPDATE_BACKFILL_FIXTURE=1 cargo test --test wire_format_tests \
 //!     backfill_reply_packet_wire_bytes_pinned -- --nocapture`
 //! 2. Copy the hex printed to stderr.
 //! 3. Replace the `expected_hex` literal in the assertion below.

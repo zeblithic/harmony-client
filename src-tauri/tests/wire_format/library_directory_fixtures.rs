@@ -2,7 +2,7 @@
 //!
 //! Captures the canonical-CBOR encoding of `LibraryDirectoryEntry` and
 //! `LibraryEntry` so accidental field renames or type changes surface
-//! as a hex-bytes diff in CI. Mirrors `wire_format_community_sync_fixtures.rs`.
+//! as a hex-bytes diff in CI. Mirrors `wire_format/community_sync_fixtures.rs`.
 
 use harmony_app::library_directory::LibraryDirectoryEntry;
 use harmony_app::owner_state_crypto::canonical_cbor_encode;

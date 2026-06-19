@@ -1,7 +1,7 @@
 //! ZEB-309 Phase 4a-main: canonical CBOR fixtures for Tier 3 wire format.
 //!
 //! Follows the ZEB-250 regen-on-first-run pattern (see
-//! tests/wire_format_zeb250_fixtures.rs). To regenerate after
+//! tests/wire_format/zeb250_fixtures.rs). To regenerate after
 //! intentional wire-format changes:
 //!
 //!     REGENERATE_VOTING_TIER3_FIXTURES=1 cargo nextest run \

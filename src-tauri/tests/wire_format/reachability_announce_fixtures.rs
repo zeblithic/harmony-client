@@ -3,7 +3,7 @@
 //! tests fail, treat it as a wire-protocol break and review carefully
 //! (cross-version compatibility, peer interop, etc.).
 //!
-//! Mirrors src-tauri/tests/wire_format_community_fixtures.rs.
+//! Mirrors src-tauri/tests/wire_format/community_fixtures.rs.
 
 use harmony_app::community_membership::{MembershipEventKind, SignedMembershipEvent};
 use harmony_app::owner_state_crypto::canonical_cbor_encode;

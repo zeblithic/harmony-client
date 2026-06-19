@@ -3,7 +3,7 @@
 //! wire-protocol break and review carefully (cross-version compatibility,
 //! peer interop).
 //!
-//! Mirrors `wire_format_library_directory_fixtures.rs` (Sub-D Phase 1+3).
+//! Mirrors `wire_format/library_directory_fixtures.rs` (Sub-D Phase 1+3).
 
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
 use harmony_app::owner_state_types::{Hlc, SpaceId};

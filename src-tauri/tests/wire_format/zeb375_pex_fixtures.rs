@@ -29,7 +29,7 @@
 //!     nonce is derived from the secret key + message — no randomness).
 //!
 //! The companion `mint_test_owner_is_deterministic` test in
-//! `wire_format_zeb370_fixtures.rs` proves this empirically; the same property
+//! `wire_format/zeb370_fixtures.rs` proves this empirically; the same property
 //! lets us EXACT-HEX-PIN the cert-carrying referral types here.
 //!
 //! These fixtures use FIXED field values (fixed seeds / repeated-byte addresses /
