@@ -403,25 +403,6 @@ pub async fn setup_two_voting_engine_bridge_with_signing_and_app(
 
 // ─── Polling helper ────────────────────────────────────────────────────────────
 
-/// Poll `predicate()` every `poll_interval_ms` until it returns `Some(T)`
-/// or `timeout_ms` elapses. Returns `None` on timeout.
-///
-/// This is the ZEB-307 R3 pattern: avoids a fixed `tokio::time::sleep`
-/// that would make tests flaky under heavy load.
-pub async fn wait_for<F, T>(timeout_ms: u64, poll_interval_ms: u64, mut predicate: F) -> Option<T>
-where
-    F: FnMut() -> Option<T>,
-{
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_millis(timeout_ms) {
-        if let Some(v) = predicate() {
-            return Some(v);
-        }
-        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
-    }
-    None
-}
-
 /// Convenience wrapper: poll log_a + log_b until `predicate(log)` is true
 /// on the target log. Times out after 5 000 ms.
 pub async fn wait_for_log<F>(
