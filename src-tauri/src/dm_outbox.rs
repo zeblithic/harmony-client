@@ -355,6 +355,55 @@ pub(crate) fn build_dm_packet_with_blob(
     crate::dm_envelope::encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))
 }
 
+/// ZEB-504: reconstruct a signed `DmInvite` wire packet for `space_id` from the
+/// durable Space record. Shared by the deposit rung
+/// ([`DmOutbox::build_invite_packet_bytes`]) and the live PQ-tunnel transport
+/// (`iroh_tunnel_dm_transport::IrohTunnelDmTransport::send`) so the cold
+/// first-contact invite is re-driven over the *warming* tunnel byte-for-byte the
+/// same way the deposit path rebuilds it — closing the gap where the live tunnel
+/// carried only the CidNotify and the recipient bounced it with `SpaceNotFound`.
+///
+/// `Ok(None)` for a genuinely non-DM Space OR a missing Space record (the caller
+/// then carries only the CidNotify — a vanished record can't be classified as a
+/// DM, and is unreachable for a real outbox entry whose DM Space is
+/// fleet-replicated alongside it). `Err` for a DM/GroupDm Space that EXISTS but
+/// has no `content_key`, or a sign/encode failure — the invite is load-bearing
+/// there, so the caller must NOT silently drop it.
+pub(crate) fn build_invite_packet_from_space(
+    state: &OwnerState,
+    space_id: &SpaceId,
+    signing_key: &ed25519_dalek::SigningKey,
+    self_owner: OwnerAddr,
+    our_signing_device_hash: DeviceIdentityHash,
+    inviter_identity_pub: [u8; 64],
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(space) = state.spaces.get(space_id) else {
+        return Ok(None);
+    };
+    if !matches!(space.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+        return Ok(None);
+    }
+    let content_key = space
+        .content_key
+        .clone()
+        .ok_or_else(|| format!("DM space {space_id:?} has no content_key"))?;
+    let signed = crate::dm_envelope::DmInviteSigned {
+        space_id: space.id,
+        kind: space.kind,
+        members: space.members.clone(),
+        inviter: self_owner,
+        content_key,
+        sender_devices: vec![our_signing_device_hash],
+        created_at: space.created_at.clone(),
+        signing_device_hash: our_signing_device_hash,
+        inviter_identity_pub,
+    };
+    crate::dm_envelope::build_signed_invite(signed, signing_key)
+        .and_then(|p| crate::dm_envelope::encode_packet(&p))
+        .map(Some)
+        .map_err(|e| format!("invite rebuild failed: {e}"))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AttemptState {
     last_attempt_wall_ms: u64,
@@ -1396,31 +1445,16 @@ impl DmOutbox {
         state: &OwnerState,
         space_id: &SpaceId,
     ) -> Result<Option<Vec<u8>>, String> {
-        let Some(space) = state.spaces.get(space_id) else {
-            return Ok(None);
-        };
-        if !matches!(space.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
-            return Ok(None);
-        }
-        let content_key = space
-            .content_key
-            .clone()
-            .ok_or_else(|| format!("DM space {space_id:?} has no content_key"))?;
-        let signed = crate::dm_envelope::DmInviteSigned {
-            space_id: space.id,
-            kind: space.kind,
-            members: space.members.clone(),
-            inviter: self.self_owner,
-            content_key,
-            sender_devices: vec![self.our_signing_device_hash],
-            created_at: space.created_at.clone(),
-            signing_device_hash: self.our_signing_device_hash,
-            inviter_identity_pub: self.private_identity.public_identity().to_public_bytes(),
-        };
-        crate::dm_envelope::build_signed_invite(signed, &self.signing_key)
-            .and_then(|p| crate::dm_envelope::encode_packet(&p))
-            .map(Some)
-            .map_err(|e| format!("invite rebuild failed: {e}"))
+        // ZEB-504: delegate to the shared free fn so the deposit rung and the
+        // live-tunnel transport rebuild the bootstrap invite identically.
+        build_invite_packet_from_space(
+            state,
+            space_id,
+            &self.signing_key,
+            self.self_owner,
+            self.our_signing_device_hash,
+            self.private_identity.public_identity().to_public_bytes(),
+        )
     }
 
     /// Build + push one butler-deposit candidate for `(entry_id,
@@ -8658,6 +8692,7 @@ mod tests {
             Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])),
             alice,
             DeviceIdentityHash([0xaa; 16]),
+            [0x55u8; 64],
             std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
         );
 

@@ -8081,6 +8081,9 @@ pub async fn start_node_inner(
                                 signing_key_arc.clone(),
                                 self_owner,
                                 our_signing_device_hash,
+                                // ZEB-504: this node's device-Identity pubs so the
+                                // live tunnel can rebuild a bootstrap DmInvite.
+                                identity_pub_64,
                                 std::sync::Arc::clone(&content_store),
                             ),
                         );
