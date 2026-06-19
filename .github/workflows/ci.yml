@@ -77,7 +77,7 @@ jobs:
         uses: ./.github/actions/install-linux-tauri-deps
 
       # ZEB-498: mold is a drop-in ELF linker ~2-5x faster than the default
-      # bfd/gold, and the gap widens on this workspace's ~118 statically-linked
+      # bfd/gold, and the gap widens on this workspace's ~119 statically-linked
       # integration test binaries — the relink no compile cache can skip (every
       # lib-touching PR relinks all of them). make-default:true symlinks
       # /usr/bin/ld -> mold so it needs no RUSTFLAGS, which keeps rust-cache's
@@ -187,7 +187,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     runs-on: ubuntu-latest
     # 35 (post-ZEB-499 sccache→R2): warm runs land in ~20 min (test-exec
-    # ~12-13 min is sccache-immune; compile/link of ~97 integration test binaries
+    # ~12-13 min is sccache-immune; compile/link of ~119 integration test binaries
     # is cached off R2); 35 leaves headroom for a full-cache-miss cold compile.
     # Walked back from the 45 stopgap (ZEB-498).
     timeout-minutes: 35
@@ -197,7 +197,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
-      # ZEB-440: this is the only job that LINKS — 113+ integration-test
+      # ZEB-440: this is the only job that LINKS — ~119 integration-test
       # binaries at ~90-108 MB each (line-tables-only debuginfo since ZEB-304,
       # statically-linked lib) ≈ 10-12 GB of executables per build generation,
       # before counting the
@@ -229,7 +229,7 @@ jobs:
         uses: ./.github/actions/install-linux-tauri-deps
 
       # ZEB-498: mold fast linker — see the rust-check job for the full
-      # rationale. This is the only job that LINKS all ~118 integration test
+      # rationale. This is the only job that LINKS all ~119 integration test
       # binaries, so it benefits most. make-default:true → no RUSTFLAGS → the
       # rust-cache key stays intact.
       - name: Install mold linker (ZEB-498)
