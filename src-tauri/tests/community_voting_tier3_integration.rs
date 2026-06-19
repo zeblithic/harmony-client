@@ -1122,9 +1122,9 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
 
     // ── Step 8: Assert full convergence ──────────────────────────────────────
 
-    // Give any async tasks a moment to settle.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
+    // ZEB-469: no fixed settle delay — engine_a applied kd=cl/kd=rs synchronously
+    // inside publish_event (apply-before-broadcast), and engine_b is gated by the
+    // wait_for_log above, so both logs are settled here.
     let (t3_a, t3_b) = {
         let log_a = engines.log_a.lock().await;
         let log_b = engines.log_b.lock().await;
@@ -1389,10 +1389,9 @@ async fn tier3_decline_triggers_backup_promotion_across_engines() {
     .await
     .expect("engine_b: must receive 3 decline events within 5s");
 
-    // Give async tasks a moment to settle.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
     // ── Step 6: assert convergence on BOTH engines ────────────────────────────
+    // ZEB-469: no settle sleep — log_a is synchronous (publish applies before
+    // broadcast); engine_b's 3 declines are gated by the wait_for_log above.
 
     let t_after_declines = hlc_at(t_decline_base + 200, "observer");
 
@@ -1804,10 +1803,9 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
     .await
     .expect("engine_b: must receive all 40 decline events within 5s");
 
-    // Give async tasks a moment to settle.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
     // ── Step 6: assert convergence on both engines: declines.len()==40 ────────
+    // ZEB-469: no settle sleep — log_a is synchronous; engine_b's 40 declines are
+    // gated by the wait_for_log above.
 
     let t_after_all_declines = hlc_at(
         backup_decline_base + (SORTITION_SIZE as u64) * 10 + 1,
@@ -1876,9 +1874,8 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
     .await
     .expect("engine_b: stage must transition to Failed within 5s");
 
-    // Give engine_a a moment to settle (it applied synchronously, but confirm).
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
+    // ZEB-469: no settle sleep — engine_a applied kd=sf synchronously in
+    // publish_event; engine_b's Failed transition is gated by the wait_for_log above.
     // Assert both engines are in Failed stage.
     {
         let log_a = engines.log_a.lock().await;
@@ -2371,10 +2368,10 @@ async fn tier3_kd_ss_idempotent_apply_cross_engine_convergence() {
     .await
     .expect("engine_b: must have 3 events (cr + ss_a + ss_b) within 5s");
 
-    // Give async tasks a moment to settle.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
     // ── Step 6: assert cross-engine convergence — sortition_result identical ───
+    // ZEB-469: no settle sleep — both engines are gated by the events.len() >= 3
+    // wait_for_log barriers above (which deterministically wait for the bridged
+    // duplicate kd=ss); materialization is atomic under the apply lock.
 
     let sr_a = {
         let log = engines.log_a.lock().await;
@@ -2606,9 +2603,9 @@ async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
     .await
     .expect("engine_b: must have 3 events within 5s");
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
     // ── Step 5: assert convergence ────────────────────────────────────────────
+    // ZEB-469: no settle sleep — both engines are gated by the events.len() >= 3
+    // wait_for_log barriers above; materialization is atomic under the apply lock.
 
     let sr_a = {
         let log = engines.log_a.lock().await;
