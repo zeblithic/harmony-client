@@ -10,7 +10,7 @@
 //! - `StaticIdentityResolver` — minimal IdentityResolver for tests.
 //! - `setup_two_voting_engine_bridge` — creates two VotingLogEngine instances
 //!   wired with bidirectional mpsc bridges (same shape as dfrost transport test).
-//! - `wait_for` — polling helper that avoids tokio::time::sleep flakiness.
+//! - `wait_for_log` — polling helper that avoids tokio::time::sleep flakiness.
 //! - Event builders: `build_tier3_poll_create_event`, `build_decline_event`,
 //!   `build_draft_candidate_event`, `build_draft_approval_event`,
 //!   `build_ratification_ballot_event`, `build_sortition_failed_event`.
