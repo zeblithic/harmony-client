@@ -779,12 +779,16 @@ pub async fn leave_community(node: &NodeHandle, community_id: &str) -> anyhow::R
 /// Owner-visible communities (`list_owner_communities` — already filters out
 /// rows whose `Space.left_at` is set, both live and after a restart-rehydrate).
 pub async fn list_owner_communities(node: &NodeHandle) -> anyhow::Result<Vec<Value>> {
-    Ok(node
-        .rpc("list_owner_communities", json!({}))
-        .await?
-        .as_array()
-        .cloned()
-        .unwrap_or_default())
+    let v = node.rpc("list_owner_communities", json!({})).await?;
+    // The backend command returns `Vec<CommunityNavDto>`, so a successful response is
+    // always a JSON array. A non-array is a broken response CONTRACT, not "no
+    // communities": surface it as an error so `community_listed` can't mask an RPC/DTO
+    // regression by reading it as an empty list (Qodo; cf. get_relay_held / PR #277).
+    v.as_array().cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "list_owner_communities response is not a JSON array (Vec<CommunityNavDto>): {v}"
+        )
+    })
 }
 
 /// Whether `space_id` appears in `list_owner_communities`. The id field on
