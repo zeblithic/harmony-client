@@ -4237,14 +4237,23 @@ impl CommunitySyncRegistry {
         Ok(engine)
     }
 
-    /// Register a oneshot to fire when the `SignedMembershipEvent` with
-    /// `event_id` is Inserted into any engine in this registry. Replaces
-    /// any existing oneshot for the same `event_id` (the prior sender is
-    /// dropped, which the prior caller's `.await` on the receiver
-    /// surfaces as `Err(RecvError)` — interpret as "redemption
-    /// superseded"). v1 doesn't deduplicate registrations because the
-    /// caller pattern (one `redeem_invite` IPC = one fresh `event_id`)
-    /// keeps the map naturally sparse.
+    /// Register a oneshot to fire when a `JoinCountersign` whose
+    /// `target_event_id == event_id` is Inserted into any engine in this
+    /// registry — i.e. when the PendingJoin identified by `event_id` is
+    /// counter-signed by an admin.
+    ///
+    /// ZEB-501: previously this fired on the Insert of the event whose own
+    /// id == `event_id`, which the joiner's own PendingJoin self-insert
+    /// satisfied synchronously — so the redeem never actually waited for the
+    /// counter-sign and always reported `pending == false`. The insert hook
+    /// now notifies only on `JoinCountersign.target_event_id`.
+    ///
+    /// Replaces any existing oneshot for the same `event_id` (the prior
+    /// sender is dropped, which the prior caller's `.await` on the receiver
+    /// surfaces as `Err(RecvError)` — interpret as "redemption superseded").
+    /// v1 doesn't deduplicate registrations because the caller pattern (one
+    /// `redeem_invite` IPC = one fresh `event_id`) keeps the map naturally
+    /// sparse.
     pub async fn register_pending_redemption(
         &self,
         event_id: crate::community_membership::EventId,
