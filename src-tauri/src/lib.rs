@@ -22463,6 +22463,12 @@ fn orphan_dir_adoption_eligible(
         if crate::community_invite::verify_admin_bootstrap(payload).is_err() {
             return false;
         }
+        // ZEB-497: the inviter's enrollment cert must verify and bind to the
+        // token's inviter, and the token must be signed by that enrolled device.
+        if crate::community_invite::verify_inviter_enrollment(payload, now_wall_ms / 1000).is_err()
+        {
+            return false;
+        }
         let Some(token) = payload.invite_token.as_ref() else {
             return false;
         };
@@ -22603,6 +22609,11 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+
+    // ZEB-497: fail fast — verify the inviter's enrollment cert + token sig
+    // before reserving an HLC, minting the local bootstrap Join, or any network.
+    crate::community_invite::verify_inviter_enrollment(&payload, wall_now_ms / 1000)
+        .map_err(|e| format!("verify inviter enrollment: {e}"))?;
 
     // 4. ZEB-267: atomic HLC reservation. Replaces the
     //    snapshot-then-release pattern + post-commit advance.
@@ -25585,7 +25596,15 @@ mod zeb436_orphan_adoption_tests {
             admin_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
-            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA1).cert),
+            // ZEB-497: the inviter_enrollment cert is now cryptographically
+            // verified on the redeem path (cert.owner_id must equal
+            // invite_token.inviter, and the token must be signed by the cert's
+            // enrolled device key). Use the admin's real cert — admin_addr,
+            // invite_token.inviter, and the admin_bootstrap are all already this
+            // same `admin_owner` — so a genuine invite passes the gate. (A
+            // throwaway `mint_test_owner(0xA1).cert` would fail with
+            // InviterEnrollmentOwnerMismatch.)
+            inviter_enrollment: Some(admin_owner.cert.clone()),
             untargeted_decrypt_key: None,
         };
         let invite_url =

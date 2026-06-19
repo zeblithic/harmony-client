@@ -2766,8 +2766,16 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         forked_from: None,
         pre_fork_snapshot: None,
         // ZEB-339: invite-only payloads must carry the inviter's EnrollmentCert.
-        // This test fails before the joiner verifies it (inviter unreachable →
-        // timeout → rollback), so any valid cert satisfies the presence check.
+        // ZEB-497/ZEB-500: the redeem path now cryptographically verifies this
+        // cert (verify_inviter_enrollment), so this throwaway 0xA1 cert (owner !=
+        // invite_token.inviter) makes the redeem fail-fast at the gate
+        // (InviterEnrollmentOwnerMismatch). NOTE: the "inviter unreachable -> Err
+        // + rollback" behavior this test is named for was REMOVED by ZEB-474
+        // (Reticulum teardown) — an unreachable inviter now commits the Space and
+        // returns Ok{pending}. So with a consistent cert the test would NOT see an
+        // Err; it passes today only via the gate fail-fast (no owner-state write
+        // before the gate). ZEB-500 tracks rewriting this test to current behavior
+        // (and checking the commit-on-unreachable isn't a ZEB-258 regression).
         inviter_enrollment: Some(mint_test_owner(0xA1).cert),
         untargeted_decrypt_key: None,
     })

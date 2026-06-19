@@ -1225,6 +1225,14 @@ pub enum CommunityInviteVerifyError {
     /// engine's local-insert pipeline rather than at sig classes.
     #[error("engine local-insert error")]
     EngineLocalError,
+    /// inviter_enrollment cert failed verification (bad master signature,
+    /// expired, or non-Master issuer). ZEB-497.
+    #[error("inviter enrollment cert invalid")]
+    InviterEnrollmentCertInvalid,
+    /// inviter_enrollment cert binds a different owner than invite_token.inviter.
+    /// ZEB-497.
+    #[error("inviter enrollment owner mismatch")]
+    InviterEnrollmentOwnerMismatch,
 }
 
 impl CommunityInviteVerifyError {
@@ -1245,6 +1253,12 @@ impl CommunityInviteVerifyError {
             Self::CounterSignAttachFailed => "community_invite_counter_sign_attach_failed",
             Self::EngineRejected => "community_invite_engine_rejected",
             Self::EngineLocalError => "community_invite_engine_local_error",
+            Self::InviterEnrollmentCertInvalid => {
+                "community_invite_inviter_enrollment_cert_invalid"
+            }
+            Self::InviterEnrollmentOwnerMismatch => {
+                "community_invite_inviter_enrollment_owner_mismatch"
+            }
         }
     }
 }
@@ -1776,6 +1790,44 @@ pub fn verify_invite_token_sig_device_key(
     let sig = Signature::from_bytes(&token.sig);
     vk.verify_strict(&token_canonical, &sig)
         .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)
+}
+
+/// Verify the inviter's `inviter_enrollment` cert on an invite-only invite:
+/// recover the inviter's enrolled device key from the cert, bind it to
+/// `invite_token.inviter`, and verify the token signature against it. No-op for
+/// open communities. Mirrors `iroh_friend_acceptor::verify_enrolled_device`
+/// with the community error type (ZEB-497).
+pub fn verify_inviter_enrollment(
+    payload: &CommunityInvitePayload,
+    now_secs: u64,
+) -> Result<(), CommunityInviteVerifyError> {
+    if !payload.is_invite_only {
+        return Ok(());
+    }
+    let cert = payload
+        .inviter_enrollment
+        .as_ref()
+        .ok_or(CommunityInviteVerifyError::InviterEnrollmentCertInvalid)?;
+    let token = payload
+        .invite_token
+        .as_ref()
+        .ok_or(CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+    // Recover the inviter's enrolled device key from the bare cert (master-sig +
+    // expiry, then reject non-Master issuers — quorum certs are only
+    // structurally checked by cert.verify and would admit unverified sigs).
+    cert.verify(now_secs)
+        .map_err(|_| CommunityInviteVerifyError::InviterEnrollmentCertInvalid)?;
+    if !matches!(
+        cert.issuer,
+        harmony_owner::certs::EnrollmentIssuer::Master { .. }
+    ) {
+        return Err(CommunityInviteVerifyError::InviterEnrollmentCertInvalid);
+    }
+    if cert.owner_id != token.inviter.0 {
+        return Err(CommunityInviteVerifyError::InviterEnrollmentOwnerMismatch);
+    }
+    let device_key = cert.device_pubkeys.classical.ed25519_verify;
+    verify_invite_token_sig_device_key(token, &device_key)
 }
 
 // =====================================================================
