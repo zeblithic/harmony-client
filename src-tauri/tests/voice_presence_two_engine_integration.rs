@@ -288,9 +288,40 @@ async fn run_inner() {
         Arc::clone(&now_ms),
     );
 
-    // Loopback subscriber declaration needs ~1 s to settle + peers to discover
-    // before A starts publishing (same as the channel-messages template).
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // ZEB-469: deterministically wait until A's session has discovered B's REMOTE
+    // presence subscriber before A starts publishing, rather than a fixed sleep that
+    // races CI scheduling (same flake class as the channel-messages template, fixed in
+    // ZEB-459). A's heartbeats go out on the live wire (no replay), so any beacon
+    // published before B's subscriber is matched is lost. `Locality::Remote` matches
+    // B's subscriber specifically (A runs no local presence subscriber). matching_status
+    // reads the session routing tables (no network round-trip), so an Err is a real
+    // session failure — surface it loudly rather than masking it as a timeout.
+    {
+        let readiness_pub = session_a
+            .declare_publisher(
+                zenoh::key_expr::KeyExpr::try_from(pres_topic.clone()).expect("presence topic key"),
+            )
+            .allowed_destination(zenoh::sample::Locality::Remote)
+            .await
+            .expect("declare presence readiness publisher");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if readiness_pub
+                .matching_status()
+                .await
+                .expect("presence matching_status query failed")
+                .matching()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "A never matched B's remote presence subscriber within 30s \
+                 (inter-session zenoh discovery did not complete)"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 
     // ── Spawn A's REAL heartbeat publisher (4 s cadence; fires immediately) ──
     let joined_hlc = Hlc {
@@ -369,6 +400,13 @@ async fn run_inner() {
     // Give the subscriber several poll cycles to (attempt to) process it, then
     // assert R never appears while A is still present (subscriber is alive and
     // processing — so R's absence is a genuine gate rejection, not a dead loop).
+    //
+    // ZEB-469 audit: retained. This is a *negative* assertion (R must NOT appear), so
+    // its only failure mode is a spurious pass, never a spurious CI failure — the "A
+    // still present" check below already proves the subscriber is live. The
+    // deterministic delivery-canary form (used in Assertion 5 just below) would make
+    // it strictly stronger; converting it is a larger change than this flake-hardening
+    // pass (the sleep is not a CI-flake source).
     tokio::time::sleep(Duration::from_secs(2)).await;
     {
         let g = map_b.lock().await;
@@ -417,7 +455,18 @@ async fn run_inner() {
         Arc::clone(&closing),
         Arc::clone(&now_ms),
     );
-    // Let the second subscriber's declaration settle before publishing.
+    // ZEB-469 audit: retained (readiness barrier, but a deterministic conversion is
+    // blocked here). A publisher matching_status barrier — the fix used for the other
+    // readiness waits in this file — does NOT work for `sub_other`: the main presence
+    // subscriber (`sub_handle`) is already declared on this SAME wire topic on
+    // `session_b`, so session_a's matching_status reports 'matched' before `sub_other`
+    // has registered. And `spawn_voice_presence_subscriber` returns only a JoinHandle
+    // (it declares its subscriber inside the spawned task), exposing no readiness
+    // signal to await. A deterministic conversion needs a readiness-probe loop
+    // (poll-publish the right-scope canary until owner_c lands, then a seq-advancing
+    // follow-up to prove in-order wrong-scope delivery) — deferred to a focused
+    // follow-up. `sub_other` shares session_b's already-routed pres_topic, so this is a
+    // local declaration only; the 1s wait is conservative and low-flake in practice.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // (1) RIGHT-scope canary: C, sealed under `channel_key_other`. This is the
@@ -515,7 +564,38 @@ async fn run_inner() {
         .declare_subscriber(&media_sub_key)
         .await
         .expect("declare media subscriber");
-    tokio::time::sleep(Duration::from_secs(1)).await; // settle
+    // ZEB-469: deterministically wait until A's session has discovered B's REMOTE
+    // media subscriber before publishing the sealed frame, rather than a fixed settle.
+    // This is a fresh wire topic (`harmony/voice/{c}/{ch}/*`) with no prior matching,
+    // so a publisher matching_status barrier is well-defined here (a concrete-key
+    // publisher on `…/{deviceA}` intersects the wildcard subscriber). The frame goes
+    // out live (no replay); if put before the subscriber is matched it is lost and the
+    // recv loop below stalls to its 10s ceiling.
+    {
+        let media_ready_pub = session_a
+            .declare_publisher(
+                zenoh::key_expr::KeyExpr::try_from(media_topic_a.clone()).expect("media topic key"),
+            )
+            .allowed_destination(zenoh::sample::Locality::Remote)
+            .await
+            .expect("declare media readiness publisher");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if media_ready_pub
+                .matching_status()
+                .await
+                .expect("media matching_status query failed")
+                .matching()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "A never matched B's remote media subscriber within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 
     let original_frame: Vec<u8> = (0u8..40).collect();
     let sealed_frame = encrypt_voice_packet(

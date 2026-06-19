@@ -527,8 +527,50 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         SpawnOutcome::DeferredForCommit => panic!("unexpected deferred spawn"),
     };
 
-    // Wait for the new adapter to fully declare its subscriber/queryable.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // ZEB-469: deterministically wait until B's session has discovered A's REMOTE
+    // backfill queryable before requesting backfill, rather than a fixed sleep that
+    // races CI scheduling. Backfill is a zenoh GET against A's queryable (declared
+    // on `harmony/channels/{c}/{ch}/since/**`); a query issued before that queryable
+    // is discovered finds no responder, returns zero replies, and the backfill
+    // silently no-ops — so the 150-event completeness wait below would stall to its
+    // 30s ceiling (the flake this removes). This is the query-side analog of the
+    // ZEB-459 publisher `matching_status` barrier above.
+    //
+    // `Locality::Remote` is load-bearing: B's own re-spawned adapter also declares a
+    // queryable on this `since/**` key on `session_b`, so a default (`Any`) matching
+    // check would be satisfied by B's *local* queryable and pass before A was
+    // reachable. Restricting to remote queryables waits for A specifically. A querier
+    // on the concrete `since/0/0` key intersects A's `since/**` queryable.
+    let backfill_probe_key = format!(
+        "harmony/channels/{}/{}/since/0/0",
+        hex::encode(community_id.0),
+        hex::encode(channel_id.0)
+    );
+    let backfill_querier = session_b
+        .declare_querier(
+            zenoh::key_expr::KeyExpr::try_from(backfill_probe_key).expect("backfill probe key"),
+        )
+        .allowed_destination(zenoh::sample::Locality::Remote)
+        .await
+        .expect("declare backfill readiness querier");
+    let backfill_ready_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let matched = backfill_querier
+            .matching_status()
+            .await
+            .expect("backfill querier matching_status query failed")
+            .matching();
+        if matched {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < backfill_ready_deadline,
+            "B never matched A's remote backfill queryable within 30s \
+             (re-spawned adapter's queryable discovery did not complete)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(backfill_querier);
 
     Arc::clone(&engine_b2)
         .request_backfill(None)
@@ -606,6 +648,16 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
 
     // Give the loopback ~1s to arrive at B's subscriber + traverse
     // verify_channel_event (where the replay tracker drops it).
+    //
+    // ZEB-469 audit: deliberately retained. This is a *negative* assertion — we
+    // confirm the replayed duplicate does NOT re-emit — so its only failure mode
+    // is a spurious pass (the drop simply isn't exercised if the packet is slow),
+    // never a spurious CI failure: A↔B subscriber matching is already established
+    // (B just received all 150 events and stabilized above), and a late legit
+    // delivery is ruled out by the preceding wait_for_stable_count. A fully
+    // deterministic conversion would require an engine-level "events dropped by
+    // replay tracker" counter to wait on; that instrumentation is out of scope
+    // for this flake-hardening pass (the sleep is not a CI-flake source).
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let final_count = received_b.lock().expect("received_b lock").len();
