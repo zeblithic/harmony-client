@@ -1378,15 +1378,15 @@ impl CommunitySyncEngine {
                 self.nav_emitter.clone(),
             );
 
-            // ZEB-262 Phase 4: fire any redeem_invite oneshot waiting on
-            // this event id OR (ZEB-254 Task 11) on the JoinCountersign's
-            // target_event_id. The send is sync; the lock is released before
-            // we touch any other channel.
+            // ZEB-501: wake the joiner's redeem oneshot ONLY on a real
+            // JoinCountersign (its `target_event_id` == the awaited
+            // `bootstrap_join.id`). The legacy ZEB-262 notify-on-`event.id`
+            // was satisfied by the joiner's OWN PendingJoin self-insert
+            // (its id == the registered key), so the redeem never actually
+            // waited for the admin's countersign — `pending` was always
+            // false. The send is sync; the lock is released before we touch
+            // any other channel.
             if let Some(pending) = self.pending_redemptions.as_ref() {
-                notify_pending_redemption_in_map(pending, &event.id).await;
-                // ZEB-254 Task 11: also notify on target_event_id so that a
-                // JoinCountersign wakes any pending_redemption registered on
-                // the bootstrap_join's EventId.
                 if let crate::community_membership::MembershipEventKind::JoinCountersign {
                     target_event_id,
                 } = &event.kind
@@ -3450,13 +3450,14 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         tracker.record(payload.publisher_addr, payload.at.clone());
     }
 
-    // ZEB-262 Phase 4: fire any redeem_invite oneshots waiting on events
-    // that were Inserted in this merge cycle. ZEB-254 Task 11: also notify
-    // on JoinCountersign's target_event_id so a pending_redemption keyed on
-    // the bootstrap_join EventId is woken by the admin's JoinCountersign.
+    // ZEB-501: wake the joiner's redeem oneshot ONLY on a real
+    // JoinCountersign's `target_event_id` (see the matching note at the
+    // local-insert hook). The legacy ZEB-262 notify-on-`event.id` is
+    // removed — harmless here in practice (the joiner's own PendingJoin
+    // echo arrives `AlreadyKnown`, not `Inserted`), but dropped for
+    // symmetry so only a countersign ever wakes the redeem.
     if let Some(pending) = ctx.pending_redemptions.as_ref() {
         for event in &inserted_events {
-            notify_pending_redemption_in_map(pending, &event.id).await;
             if let crate::community_membership::MembershipEventKind::JoinCountersign {
                 target_event_id,
             } = &event.kind
