@@ -718,6 +718,100 @@ async fn s4_restart_durability() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// S4b: leave durability — a LEFT community must NOT resurrect after a restart
+// (ZEB-427 Half B). Sibling of S4 (restart durability). The headline bug:
+// leaving a community removed it from the
+// live list (the frontend reacted to the nav "removed" emit) but
+// `leave_community` never set `Space.left_at`, so the next boot re-listed it as a
+// zombie ("no power, no channels"). PR #228 makes leave set `left_at` + fence it;
+// this proves the end-to-end effect through a real boot → leave → restart → boot
+// cycle (the live re-probe ZEB-427 was left open pending).
+//
+// Single-node + deterministic (no first-contact). Two communities exercise the
+// original create-persists / leave-doesn't asymmetry in one run:
+//   • `kept` — created, never left → MUST rehydrate after restart (control; the
+//              same "a created community persists" half ZEB-393 / S4 cover).
+//   • `left` — created then left → MUST be filtered live AND stay gone after the
+//              restart (the ZEB-427 regression guard).
+// The owner leaving their own single-member community is the SOLO-LEAVE path,
+// which still runs the `persist_community_left_at` fence (lib.rs:27650), so it
+// faithfully exercises the fix. Graceful shutdown mirrors S4; the fence's crash
+// (non-graceful) durability is separately unit-proven by #228's fenced
+// SyncEngine disk round-trip.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s4b_leave_durability() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let mut run = RunDir::new("s4b").expect("run dir");
+    let home = fresh_home("s4b");
+    let mut cfg = NodeConfig::new(PathBuf::from(home.path()), "alice");
+    cfg.log_dir = Some(run.log_dir());
+
+    let mut alice = NodeHandle::spawn(cfg.clone()).await.expect("spawn");
+    mint(&alice).await.expect("mint");
+
+    let kept = create_community(&alice, "s4b-kept", true)
+        .await
+        .expect("create kept community");
+    let left = create_community(&alice, "s4b-left", true)
+        .await
+        .expect("create community to leave");
+    assert_ne!(kept, left, "two distinct communities");
+
+    // Leave one. No owner-leave guard; a single-member leave is the solo path,
+    // which still sets `left_at` + fences (ZEB-427 Half B).
+    leave_community(&alice, &left)
+        .await
+        .expect("owner leaves the single-member community");
+
+    // LIVE: `list_owner_communities` filters `left_at` immediately — the left
+    // community is hidden, the kept one remains.
+    assert!(
+        community_listed(&alice, &kept)
+            .await
+            .expect("list owner communities (kept, live)"),
+        "kept community is listed before restart"
+    );
+    assert!(
+        !community_listed(&alice, &left)
+            .await
+            .expect("list owner communities (left, live)"),
+        "left community is hidden from the live list (left_at filter)"
+    );
+
+    // GRACEFUL restart (flushes owner-state on exit, mirroring S4) — pre-#228
+    // this is exactly where a left community RESURRECTED.
+    alice.shutdown().await.expect("graceful shutdown");
+    drop(alice);
+    let alice = NodeHandle::spawn(cfg)
+        .await
+        .expect("relaunch against the persisted home");
+
+    // The kept community must rehydrate. Once it reappears, the boot rehydration
+    // pass (engine sweep + nav hydration — the SAME path that would resurrect a
+    // left community) has completed, so the left community's absence below is
+    // meaningful, not merely "not loaded yet".
+    poll_until(Duration::from_secs(120), || async {
+        Ok(community_listed(&alice, &kept).await?.then_some(()))
+    })
+    .await
+    .expect("kept community rehydrated after restart (control)");
+
+    // REGRESSION GUARD (ZEB-427): the left community must NOT resurrect.
+    assert!(
+        !community_listed(&alice, &left)
+            .await
+            .expect("list owner communities (left, post-restart)"),
+        "left community must NOT resurrect after restart (ZEB-427 Half B)"
+    );
+
+    run.mark_success();
+    drop((alice, home));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // S5: profile-card propagation (ZEB-341 / ZEB-464). After Bob joins Alice's
 // community (S1 first-contact establishes the transport path between two never-
 // met nodes), each publishes its signed owner card and subscribes to the peer's

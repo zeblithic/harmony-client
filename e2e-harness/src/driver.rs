@@ -769,6 +769,48 @@ async fn poll_pairing_complete(node: &NodeHandle, timeout: Duration) -> anyhow::
     .await
 }
 
+/// Leave a community (ZEB-427 Half B: the engine commits the Leave, then the
+/// owner-state Space row is marked `left_at` and fenced to disk).
+pub async fn leave_community(node: &NodeHandle, community_id: &str) -> anyhow::Result<Value> {
+    node.rpc("leave_community", json!({ "communityId": community_id }))
+        .await
+}
+
+/// Owner-visible communities (`list_owner_communities` — already filters out
+/// rows whose `Space.left_at` is set, both live and after a restart-rehydrate).
+pub async fn list_owner_communities(node: &NodeHandle) -> anyhow::Result<Vec<Value>> {
+    let v = node.rpc("list_owner_communities", json!({})).await?;
+    // The backend command returns `Vec<CommunityNavDto>`, so a successful response is
+    // always a JSON array. A non-array is a broken response CONTRACT, not "no
+    // communities": surface it as an error so `community_listed` can't mask an RPC/DTO
+    // regression by reading it as an empty list (Qodo; cf. get_relay_held / PR #277).
+    v.as_array().cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "list_owner_communities response is not a JSON array (Vec<CommunityNavDto>): {v}"
+        )
+    })
+}
+
+/// Whether `space_id` appears in `list_owner_communities`. The id field on
+/// `CommunityNavDto` is camelCase `spaceId` (NOT `id`) — checking the wrong key
+/// is an always-false trap that masquerades as a sync/durability failure (the
+/// bug that long mis-`#[ignore]`'d S3/S4). A community object present but missing
+/// a string `spaceId` is a DTO/schema mismatch, surfaced loudly rather than read
+/// as absence.
+pub async fn community_listed(node: &NodeHandle, space_id: &str) -> anyhow::Result<bool> {
+    for c in list_owner_communities(node).await? {
+        let sid = c.get("spaceId").and_then(Value::as_str).ok_or_else(|| {
+            anyhow::anyhow!(
+                "community object missing string `spaceId` key (DTO/schema mismatch?): {c}"
+            )
+        })?;
+        if sid == space_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::assert_sas_match;
