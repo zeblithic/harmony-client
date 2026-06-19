@@ -8081,6 +8081,9 @@ pub async fn start_node_inner(
                                 signing_key_arc.clone(),
                                 self_owner,
                                 our_signing_device_hash,
+                                // ZEB-504: this node's device-Identity pubs so the
+                                // live tunnel can rebuild a bootstrap DmInvite.
+                                identity_pub_64,
                                 std::sync::Arc::clone(&content_store),
                             ),
                         );
@@ -10951,24 +10954,12 @@ pub fn add_space_dm_inner(
 
     // ── 7. Build + sign the DmInvite. Our own devices come from
     //       OwnerDeviceCache (populated by Flow A); fall back to just
-    //       our_signing_device_hash if no entry yet (pre-bootstrap). ──
-    let our_devices: Vec<crate::owner_state_types::DeviceIdentityHash> = state
-        .owner_device_cache
-        .devices
-        .get(&self_owner)
-        .map(|e| e.devices.clone())
-        .unwrap_or_else(|| vec![our_signing_device_hash]);
-    // Defense in depth — sender_devices MUST contain signing_device_hash
-    // (Phase 3b invariant; validated wire-side by decode_packet).
-    let sender_devices = if our_devices.contains(&our_signing_device_hash) {
-        our_devices
-    } else {
-        let mut combined = our_devices;
-        combined.push(our_signing_device_hash);
-        combined.sort();
-        combined.dedup();
-        combined
-    };
+    //       our_signing_device_hash if no entry yet (pre-bootstrap).
+    //       ZEB-504: shared with the live-tunnel invite-rebuild path so the
+    //       two can never diverge (a divergence shrank the receiver's cached
+    //       device set — see `resolve_sender_devices`). ──
+    let sender_devices =
+        crate::dm_outbox::resolve_sender_devices(state, self_owner, our_signing_device_hash);
 
     let signed_invite = crate::dm_envelope::DmInviteSigned {
         space_id: canonical_space_id,

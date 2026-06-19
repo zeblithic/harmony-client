@@ -125,6 +125,13 @@ pub struct IrohTunnelDmTransport {
     /// Our signing device hash (the single-device `sender_devices` + the
     /// `signing_device_hash` claim).
     our_signing_device_hash: DeviceIdentityHash,
+    /// ZEB-504: this node's 64-byte device-Identity public bytes
+    /// (`X25519_pub(32) || Ed25519_pub(32)`). Carried so the live-tunnel send
+    /// can rebuild a bootstrap `DmInvite` from the Space record (the invite's
+    /// `inviter_identity_pub` ships the inviter's pubs inline so a first-contact
+    /// recipient can verify the signature before it has an `OwnerDeviceCache`
+    /// entry) — mirroring the deposit rung's `build_invite_packet_bytes`.
+    inviter_identity_pub: [u8; 64],
     /// ZEB-484: the local CAS, read on `send` to inline the encrypted DM blob
     /// over the tunnel for live delivery (when it fits `INLINE_BLOB_MAX`).
     cas: Arc<dyn ContentStore>,
@@ -136,12 +143,14 @@ pub struct IrohTunnelDmTransport {
 }
 
 impl IrohTunnelDmTransport {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mgr: Arc<TunnelManager>,
         crdt_state: Arc<tokio::sync::Mutex<OwnerState>>,
         signing_key: Arc<ed25519_dalek::SigningKey>,
         self_owner: OwnerAddr,
         our_signing_device_hash: DeviceIdentityHash,
+        inviter_identity_pub: [u8; 64],
         cas: Arc<dyn ContentStore>,
     ) -> Self {
         Self::with_tunnel_send_cap(
@@ -150,6 +159,7 @@ impl IrohTunnelDmTransport {
             signing_key,
             self_owner,
             our_signing_device_hash,
+            inviter_identity_pub,
             cas,
             MAX_CONCURRENT_TUNNEL_SENDS,
         )
@@ -158,12 +168,14 @@ impl IrohTunnelDmTransport {
     /// Construct with an explicit concurrent-tunnel-send cap. `new` uses
     /// [`MAX_CONCURRENT_TUNNEL_SENDS`]; tests use this to exercise the
     /// shed-when-saturated path with a small (or zero) cap.
+    #[allow(clippy::too_many_arguments)]
     fn with_tunnel_send_cap(
         mgr: Arc<TunnelManager>,
         crdt_state: Arc<tokio::sync::Mutex<OwnerState>>,
         signing_key: Arc<ed25519_dalek::SigningKey>,
         self_owner: OwnerAddr,
         our_signing_device_hash: DeviceIdentityHash,
+        inviter_identity_pub: [u8; 64],
         cas: Arc<dyn ContentStore>,
         tunnel_send_cap: usize,
     ) -> Self {
@@ -173,25 +185,63 @@ impl IrohTunnelDmTransport {
             signing_key,
             self_owner,
             our_signing_device_hash,
+            inviter_identity_pub,
             cas,
             tunnel_send_sem: Arc::new(tokio::sync::Semaphore::new(tunnel_send_cap)),
         }
     }
 
-    /// Snapshot the recipient's reachable tunnel contacts: for each bound
-    /// device of `recipient` that advertised a `DeviceTunnelContact`, derive
-    /// its tunnel NodeId (`blake3(pq_dsa_pubkey)`, matching harmony-tunnel) and
-    /// pair it with the contact. Devices with no contact yet (`None`) are
-    /// skipped — the tunnel can't reach them, and the deposit rung covers them.
+    /// Snapshot the recipient's reachable tunnel contacts AND (ZEB-504) the
+    /// bootstrap `DmInvite` to ride ahead of the CidNotify, under ONE
+    /// `crdt_state` lock so no lock is held across the tunnel `send_dm` calls.
     ///
-    /// Reads under a short `crdt_state` lock and clones out so no lock is held
-    /// across the tunnel `send_dm` calls.
-    async fn resolve_tunnel_targets(
+    /// ZEB-504: rebuild the bootstrap `DmInvite` for `entry`'s Space from the
+    /// durable Space record, to re-drive it over the (eventually-warm) tunnel.
+    ///
+    /// The first `add_space` to a new friend emits the invite fire-and-forget
+    /// over a guaranteed-COLD tunnel, so it is dropped and never recovered
+    /// (re-`add_space` dedupes and won't resend). To fix it, every message send
+    /// re-drives the invite until the recipient acks this entry — an ack implies
+    /// they admitted a CidNotify, which requires the Space to exist, so the
+    /// invite is no longer needed. `apply_invite` on the receiver is an
+    /// idempotent CRDT merge, so re-sending until the ack lands is safe.
+    /// Returns `None` once acked, or for a non-DM Space / rebuild error (the
+    /// CidNotify still attempts; the deposit rung carries the invite for the
+    /// offline case).
+    ///
+    /// CodeAnt: called only AFTER the tunnel-send permit is acquired, so the
+    /// signing/encoding cost (under the owner-state lock) is never paid for a
+    /// tunnel attempt that is immediately shed by the concurrency cap.
+    async fn build_bootstrap_invite(
         &self,
+        entry: &OutboxEntry,
         recipient: OwnerAddr,
-    ) -> Vec<([u8; 32], crate::owner_state_types::DeviceTunnelContact)> {
+    ) -> Option<Vec<u8>> {
+        // Acked → the Space exists on the recipient → no invite needed.
+        if entry.delivered_to.contains(&recipient) {
+            return None;
+        }
         let state = self.crdt_state.lock().await;
-        resolve_owner_tunnel_targets(&state, recipient)
+        match crate::dm_outbox::build_invite_packet_from_space(
+            &state,
+            &entry.space_id,
+            &self.signing_key,
+            self.self_owner,
+            self.our_signing_device_hash,
+            self.inviter_identity_pub,
+        ) {
+            Ok(invite) => invite,
+            Err(e) => {
+                tracing::warn!(
+                    recipient = ?recipient,
+                    space_id = ?entry.space_id,
+                    error = %e,
+                    "ZEB-504: bootstrap invite rebuild failed; sending CidNotify alone \
+                     (deposit rung still carries the invite for the offline case)"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -237,7 +287,13 @@ impl DmTransport for IrohTunnelDmTransport {
         recipient: OwnerAddr,
         _destinations: Vec<[u8; 16]>,
     ) -> Result<(), TransportError> {
-        let targets = self.resolve_tunnel_targets(recipient).await;
+        // Resolve reachable tunnel targets first (cheap: a single owner-state
+        // lock, no signing). The expensive invite rebuild is deferred until a
+        // send permit is actually acquired (CodeAnt) — see below.
+        let targets = {
+            let state = self.crdt_state.lock().await;
+            resolve_owner_tunnel_targets(&state, recipient)
+        };
 
         // ZEB-485 (CodeAnt): cap concurrent in-flight tunnel sends. The spawned
         // build+send below is detached (required — see the deadlock note), so an
@@ -248,6 +304,11 @@ impl DmTransport for IrohTunnelDmTransport {
         if !targets.is_empty() {
             match Arc::clone(&self.tunnel_send_sem).try_acquire_owned() {
                 Ok(permit) => {
+                    // Permit held → this attempt WILL run, so it's now worth
+                    // rebuilding the bootstrap invite (ZEB-504). Doing it here
+                    // rather than before the semaphore avoids signing/encoding
+                    // work under the owner-state lock for shed attempts (CodeAnt).
+                    let invite_wire = self.build_bootstrap_invite(entry, recipient).await;
                     let signed = crate::dm_envelope::DmCidNotifySigned {
                         space_id: entry.space_id,
                         message_cid: entry.message_cid,
@@ -279,6 +340,15 @@ impl DmTransport for IrohTunnelDmTransport {
                         {
                             Ok(packet) => {
                                 for (node_id, contact) in &targets {
+                                    // ZEB-504: send the bootstrap invite FIRST so
+                                    // the recipient creates the Space before the
+                                    // CidNotify is admitted (else `SpaceNotFound`).
+                                    // The tunnel's in-order FIFO preserves this
+                                    // ordering per peer; `invite_wire` is `None`
+                                    // once the recipient has acked (Space exists).
+                                    if let Some(inv) = &invite_wire {
+                                        mgr.send_dm(*node_id, contact, inv.clone());
+                                    }
                                     mgr.send_dm(*node_id, contact, packet.clone());
                                 }
                             }
@@ -392,8 +462,271 @@ mod tests {
             signing_key,
             OwnerAddr([0xff; 16]),
             DeviceIdentityHash([0xaa; 16]),
+            [0x55u8; 64],
             cas,
         )
+    }
+
+    /// ZEB-504: insert a minimal DM `Space` (carrying a `content_key`) so the
+    /// transport can rebuild a bootstrap invite for it. Members are sorted to
+    /// honor the `Space::members` strictly-ascending invariant (production's
+    /// `add_space` sorts; a direct insert here must too, else the rebuilt invite
+    /// fails decode's `members` check).
+    fn install_dm_space(state: &mut OwnerState, space_id: SpaceId, mut members: Vec<OwnerAddr>) {
+        members.sort();
+        let space = crate::owner_state_types::Space {
+            id: space_id,
+            kind: crate::owner_state_types::SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "dm".into(),
+            transport: None,
+            members,
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            content_key: Some(crate::owner_state_types::DmContentKey::new([0x42u8; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+        state.spaces.insert(space_id, space);
+    }
+
+    /// Build owner-state with `recipient` reachable (one tunnel contact) and a DM
+    /// Space `space` present — the fixture both new ZEB-504 tests share.
+    fn state_with_recipient_and_dm_space(
+        recipient: OwnerAddr,
+        space: SpaceId,
+        dsa_pubkey: &[u8],
+    ) -> OwnerState {
+        let contact = DeviceTunnelContact {
+            iroh_node_id: [0x09; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: dsa_pubkey.to_vec(),
+            pq_kem_pubkey: vec![0x08u8; 32],
+        };
+        let mut owner_state = OwnerState::default();
+        owner_state.owner_device_cache.devices.insert(
+            recipient,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0x33; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+                device_tunnel_contacts: vec![Some(contact)],
+            },
+        );
+        install_dm_space(
+            &mut owner_state,
+            space,
+            vec![OwnerAddr([0xff; 16]), recipient],
+        );
+        owner_state
+    }
+
+    /// ZEB-504: a recipient who hasn't acked the entry → `send` routes the
+    /// bootstrap `DmInvite` FIRST, then the CidNotify, so the receiver creates
+    /// the Space before the message is admitted (else `SpaceNotFound`).
+    #[tokio::test]
+    async fn send_routes_bootstrap_invite_before_cidnotify_when_unacked() {
+        let mgr = test_manager().await;
+        let recipient = OwnerAddr([0x11; 16]);
+        let dsa_pubkey = vec![0x07u8; 32];
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+        let space = SpaceId([0xcc; 16]);
+
+        let state = Arc::new(tokio::sync::Mutex::new(state_with_recipient_and_dm_space(
+            recipient,
+            space,
+            &dsa_pubkey,
+        )));
+        let transport = make_transport(
+            Arc::clone(&mgr),
+            state,
+            Arc::new(crate::content_store::InMemoryStub::default()),
+        );
+
+        let cid = ContentId::from_bytes([0xee; 32]);
+        // delivered_to empty → recipient un-acked → invite must ride along.
+        let entry = synthetic_outbox_entry(space, cid, recipient);
+
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
+
+        let err = transport
+            .send(&entry, recipient, Vec::new())
+            .await
+            .expect_err("tunnel transport must return Transient (always-deposit)");
+        assert!(matches!(err, TransportError::Transient(_)));
+
+        // First routed packet = the bootstrap invite; second = the CidNotify.
+        let first = wait_for_routed(&mut cmd_rx).await;
+        let second = wait_for_routed(&mut cmd_rx).await;
+        fn tag(b: &[u8]) -> String {
+            match crate::dm_envelope::decode_packet(b) {
+                Ok(crate::dm_envelope::DmPacket::Invite { .. }) => "Invite".into(),
+                Ok(crate::dm_envelope::DmPacket::CidNotify { .. }) => "CidNotify".into(),
+                Ok(crate::dm_envelope::DmPacket::CidNotifyWithBlob { .. }) => "WithBlob".into(),
+                Ok(crate::dm_envelope::DmPacket::Ack { .. }) => "Ack".into(),
+                Err(e) => format!("DecodeErr({e})"),
+            }
+        }
+        assert!(
+            matches!(
+                crate::dm_envelope::decode_packet(&first),
+                Ok(crate::dm_envelope::DmPacket::Invite { .. })
+            ),
+            "first routed packet must be the bootstrap DmInvite (ZEB-504); got first={}, second={}",
+            tag(&first),
+            tag(&second)
+        );
+        assert!(
+            matches!(
+                crate::dm_envelope::decode_packet(&second),
+                Ok(crate::dm_envelope::DmPacket::CidNotify { .. })
+                    | Ok(crate::dm_envelope::DmPacket::CidNotifyWithBlob { .. })
+            ),
+            "second routed packet must be the CidNotify"
+        );
+    }
+
+    /// ZEB-504: once the recipient has ACKed (an ack implies they admitted a
+    /// CidNotify, so the Space exists on their side), `send` omits the invite and
+    /// routes only the CidNotify.
+    #[tokio::test]
+    async fn send_omits_invite_once_recipient_acked() {
+        let mgr = test_manager().await;
+        let recipient = OwnerAddr([0x11; 16]);
+        let dsa_pubkey = vec![0x07u8; 32];
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+        let space = SpaceId([0xcc; 16]);
+
+        let state = Arc::new(tokio::sync::Mutex::new(state_with_recipient_and_dm_space(
+            recipient,
+            space,
+            &dsa_pubkey,
+        )));
+        let transport = make_transport(
+            Arc::clone(&mgr),
+            state,
+            Arc::new(crate::content_store::InMemoryStub::default()),
+        );
+
+        let cid = ContentId::from_bytes([0xee; 32]);
+        let mut entry = synthetic_outbox_entry(space, cid, recipient);
+        entry.delivered_to.insert(recipient); // ACKed → Space exists; no invite.
+
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
+
+        let err = transport
+            .send(&entry, recipient, Vec::new())
+            .await
+            .expect_err("tunnel transport must return Transient (always-deposit)");
+        assert!(matches!(err, TransportError::Transient(_)));
+
+        // Exactly one routed packet, and it is the CidNotify (no invite).
+        let first = wait_for_routed(&mut cmd_rx).await;
+        assert!(
+            matches!(
+                crate::dm_envelope::decode_packet(&first),
+                Ok(crate::dm_envelope::DmPacket::CidNotify { .. })
+                    | Ok(crate::dm_envelope::DmPacket::CidNotifyWithBlob { .. })
+            ),
+            "acked recipient must receive only the CidNotify"
+        );
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            wait_for_routed(&mut cmd_rx),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "no bootstrap invite must be routed for an already-acked recipient"
+        );
+    }
+
+    /// ZEB-504 regression (Qodo): the rebuilt bootstrap invite must carry the
+    /// inviter's FULL cached device set, not a bare singleton. The live-tunnel
+    /// resend is applied receiver-side with `refresh_owner_device_cache=true` at
+    /// a fresh local `learned_at` HLC, and `apply_owner_device_update` is
+    /// LWW-REPLACE (not union); a singleton resend would therefore shrink the
+    /// receiver's cached inviter device set and later drop messages signed by the
+    /// inviter's other devices as `UnknownSigningKey`.
+    #[tokio::test]
+    async fn send_invite_carries_full_inviter_device_set() {
+        let mgr = test_manager().await;
+        let recipient = OwnerAddr([0x11; 16]);
+        let dsa_pubkey = vec![0x07u8; 32];
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+        let space = SpaceId([0xcc; 16]);
+
+        let mut owner_state = state_with_recipient_and_dm_space(recipient, space, &dsa_pubkey);
+        // The inviter (self, OwnerAddr([0xff;16]) per `make_transport`) has THREE
+        // enrolled devices; the signing device ([0xaa;16]) is one of them. Stored
+        // sorted ascending, mirroring `apply_owner_device_update`.
+        let self_owner = OwnerAddr([0xff; 16]);
+        let full_devices = vec![
+            DeviceIdentityHash([0xaa; 16]),
+            DeviceIdentityHash([0xbb; 16]),
+            DeviceIdentityHash([0xdd; 16]),
+        ];
+        owner_state.owner_device_cache.devices.insert(
+            self_owner,
+            OwnerDeviceEntry {
+                devices: full_devices.clone(),
+                device_identity_pubs: vec![None; 3],
+                learned_at: Hlc {
+                    wall_ms: 5,
+                    logical: 0,
+                    device_id: "self".into(),
+                },
+                device_tunnel_contacts: vec![None; 3],
+            },
+        );
+
+        let state = Arc::new(tokio::sync::Mutex::new(owner_state));
+        let transport = make_transport(
+            Arc::clone(&mgr),
+            state,
+            Arc::new(crate::content_store::InMemoryStub::default()),
+        );
+
+        let cid = ContentId::from_bytes([0xee; 32]);
+        // delivered_to empty → recipient un-acked → invite rides along first.
+        let entry = synthetic_outbox_entry(space, cid, recipient);
+
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
+        let _ = transport.send(&entry, recipient, Vec::new()).await;
+
+        let first = wait_for_routed(&mut cmd_rx).await;
+        let Ok(crate::dm_envelope::DmPacket::Invite { signed, .. }) =
+            crate::dm_envelope::decode_packet(&first)
+        else {
+            panic!("first routed packet must be the bootstrap DmInvite");
+        };
+        assert_eq!(
+            signed.sender_devices, full_devices,
+            "rebuilt invite must carry the inviter's full cached device set, \
+             not a singleton (ZEB-504 device-list-regression)"
+        );
     }
 
     /// A recipient whose cached entry advertises a `DeviceTunnelContact` →
@@ -787,6 +1120,7 @@ mod tests {
             Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])),
             OwnerAddr([0xff; 16]),
             DeviceIdentityHash([0xaa; 16]),
+            [0x55u8; 64],
             Arc::new(crate::content_store::InMemoryStub::default()),
             0,
         );
