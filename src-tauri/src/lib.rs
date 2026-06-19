@@ -6472,6 +6472,8 @@ pub async fn start_node_inner(
                                                 announced_at_ms,
                                                 &actor,
                                                 &hlc,
+                                                Vec::new(),
+                                                0,
                                                 community_signing_key.as_ref(),
                                             ) {
                                                 Ok(p) => p,
@@ -50893,6 +50895,8 @@ mod zeb_321_event_loop_wiring_tests {
             wall_ms,
             &actor,
             &hlc,
+            Vec::new(),
+            0,
             identity,
         )
         .expect("build signed payload");
