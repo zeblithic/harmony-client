@@ -2766,8 +2766,14 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         forked_from: None,
         pre_fork_snapshot: None,
         // ZEB-339: invite-only payloads must carry the inviter's EnrollmentCert.
-        // This test fails before the joiner verifies it (inviter unreachable →
-        // timeout → rollback), so any valid cert satisfies the presence check.
+        // ZEB-497/ZEB-500: the redeem path now cryptographically verifies this
+        // cert (verify_inviter_enrollment) BEFORE the unreachable-resolve branch,
+        // so this throwaway 0xA1 cert makes the redeem fail-fast at the gate
+        // (InviterEnrollmentOwnerMismatch) rather than at the inviter-unreachable
+        // rollback this test is named for. The ZEB-258 no-mutation invariant is
+        // still exercised (the gate is fail-fast, before any owner-state write);
+        // ZEB-500 tracks migrating Alice to a consistent mint_test_owner fixture
+        // so the test reaches the unreachable-resolve branch again.
         inviter_enrollment: Some(mint_test_owner(0xA1).cert),
         untargeted_decrypt_key: None,
     })
