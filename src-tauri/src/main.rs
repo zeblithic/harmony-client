@@ -128,7 +128,71 @@ enum RestoreFormat {
     },
 }
 
+/// Minimum per-thread stack (bytes) this process needs so Zenoh's internal
+/// tokio runtime survives the large `add_space`/DM async state machines. 8 MiB
+/// matches `.cargo/config.toml`'s dev `[env]` net and the explicit
+/// `.thread_stack_size` on our own runtime in `lib.rs`. See ZEB-503 / ZEB-149.
+const MIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Parse a raw `RUST_MIN_STACK` value into bytes, whitespace-tolerant. Returns
+/// `None` if absent OR malformed — std itself silently falls back to the 2 MiB
+/// default on an unparseable value, so a malformed value behaves like "unset"
+/// and must be raised. Split out (and pure) so the trim/parse is unit-testable.
+fn parse_min_stack(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+}
+
+/// Pure decision for [`raise_min_stack`]: given the currently-set
+/// `RUST_MIN_STACK` (parsed bytes; `None` if unset or unparseable), return
+/// `Some(target)` if it should be raised, else `None` (the operator's value is
+/// already adequate). Split out so it is unit-testable without mutating the
+/// process-global environment.
+fn min_stack_target(current: Option<usize>) -> Option<usize> {
+    match current {
+        Some(cur) if cur >= MIN_STACK_BYTES => None,
+        _ => Some(MIN_STACK_BYTES),
+    }
+}
+
+/// Raise `RUST_MIN_STACK` to at least [`MIN_STACK_BYTES`] unless the operator
+/// already set a larger value. MUST be called before any thread is spawned —
+/// std caches `thread::min_stack()` on first read, and the value is only
+/// consulted when a thread (including Zenoh's internal runtime workers) is
+/// created.
+fn raise_min_stack() {
+    let raw = std::env::var("RUST_MIN_STACK").ok();
+    let current = parse_min_stack(raw.as_deref());
+    // Present but unparseable: std would silently fall back to the 2 MiB default
+    // (the very overflow this guards against). Warn before overriding so a
+    // formatting mistake isn't swallowed. Tracing isn't up yet → stderr.
+    if current.is_none() {
+        if let Some(bad) = raw.as_deref() {
+            eprintln!(
+                "harmony-app: ignoring malformed RUST_MIN_STACK={bad:?}; using the \
+                 {MIN_STACK_BYTES}-byte floor (Zenoh's internal runtime needs it; ZEB-503)"
+            );
+        }
+    }
+    if let Some(target) = min_stack_target(current) {
+        std::env::set_var("RUST_MIN_STACK", target.to_string());
+    }
+}
+
 fn main() {
+    // ZEB-503 / ZEB-149: raise the per-thread stack floor before anything
+    // spawns a thread. Zenoh 1.x builds its OWN internal tokio runtime
+    // (`event_loop.rs` `RuntimeBuilder`) whose worker threads we cannot size via
+    // our own runtime builder; the `add_space` -> `DmInvite` path's large async
+    // state machines overflow the std 2 MiB default and abort the process
+    // (STATUS_STACK_OVERFLOW / SIGSEGV). The mitigations in `.cargo/config.toml`
+    // do NOT cover a directly-run binary: the `[env] RUST_MIN_STACK` only reaches
+    // cargo-spawned launches (cargo run / tauri dev / nextest), and the MSVC
+    // `/STACK` image default is overridden by the explicit per-thread stack size
+    // std passes to the OS. Setting it here — before the first thread spawn — is
+    // the single place that reaches every launch, including a `tauri build`
+    // artifact and the headless `serve` the agent harness runs directly.
+    raise_min_stack();
+
     // Cli::parse() exits the process on any unrecognized flag / positional,
     // which would block GUI launch on hosts that pass OS-injected argv:
     // - macOS file-open Apple Events translated to argv (`-psn_X_Y` and friends)
@@ -309,4 +373,44 @@ fn init_tracing() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{min_stack_target, parse_min_stack, MIN_STACK_BYTES};
+
+    #[test]
+    fn parse_min_stack_trims_and_rejects_malformed() {
+        assert_eq!(parse_min_stack(None), None);
+        assert_eq!(parse_min_stack(Some("")), None);
+        assert_eq!(parse_min_stack(Some("   ")), None);
+        assert_eq!(parse_min_stack(Some("not-a-number")), None);
+        assert_eq!(parse_min_stack(Some("8388608")), Some(8 * 1024 * 1024));
+        // Whitespace (e.g. a stray newline in a systemd unit) is tolerated, so a
+        // valid operator value is preserved rather than silently overwritten.
+        assert_eq!(
+            parse_min_stack(Some("  33554432\n")),
+            Some(32 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn raises_when_unset_or_below_floor() {
+        // Unset / unparseable -> raise to the floor.
+        assert_eq!(min_stack_target(None), Some(MIN_STACK_BYTES));
+        // The std 2 MiB default that overflows the add_space path -> raise.
+        assert_eq!(
+            min_stack_target(Some(2 * 1024 * 1024)),
+            Some(MIN_STACK_BYTES)
+        );
+        assert_eq!(min_stack_target(Some(0)), Some(MIN_STACK_BYTES));
+    }
+
+    #[test]
+    fn preserves_adequate_or_higher_operator_value() {
+        // Exactly the floor -> leave it.
+        assert_eq!(min_stack_target(Some(MIN_STACK_BYTES)), None);
+        // A larger operator-set value (e.g. the 32 MiB harness workaround) wins.
+        assert_eq!(min_stack_target(Some(32 * 1024 * 1024)), None);
+    }
 }
