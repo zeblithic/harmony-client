@@ -752,10 +752,10 @@ async fn s4b_leave_durability() {
     let mut alice = NodeHandle::spawn(cfg.clone()).await.expect("spawn");
     mint(&alice).await.expect("mint");
 
-    let kept = create_community(&alice, "s6-kept", true)
+    let kept = create_community(&alice, "s4b-kept", true)
         .await
         .expect("create kept community");
-    let left = create_community(&alice, "s6-left", true)
+    let left = create_community(&alice, "s4b-left", true)
         .await
         .expect("create community to leave");
     assert_ne!(kept, left, "two distinct communities");
