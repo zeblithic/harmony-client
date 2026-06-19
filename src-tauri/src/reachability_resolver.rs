@@ -42,10 +42,25 @@ pub trait ReachabilityFallback: Send + Sync {
 /// device entries coexist; same-owner-same-device updates are LWW.
 type ResolverKey = (OwnerAddr, [u8; 32]);
 
+/// Provenance of a resolved reachability payload, used to apply a per-source
+/// butler-set freshness policy (Decision 3): durable replicated CRDT records
+/// carry seal-targets that stay valid even when the recipient's primary is
+/// long-offline, so they are exempt from the live pkarr freshness window;
+/// pkarr-sourced records keep the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReachabilitySource {
+    /// Projected from a durable community-membership ReachabilityAnnounce CRDT
+    /// event (persisted, replicated, boot-replayed).
+    DurableCrdt,
+    /// Fetched live from the recipient's pkarr routing blob.
+    PkarrLive,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolverEntry {
     pub payload: ReachabilityAnnouncePayload,
     pub hlc: Hlc,
+    pub source: ReachabilitySource,
 }
 
 pub struct ReachabilityResolver {
@@ -107,12 +122,34 @@ impl ReachabilityResolver {
     ///
     /// Per PR #157 round 5: keyed by `(actor, payload.iroh_node_id)` so
     /// same-owner-different-device announces don't overwrite each other.
+    ///
+    /// CRDT-projection update (the default, durable source). All
+    /// membership-apply call sites use this unchanged.
     pub fn update(&self, actor: OwnerAddr, payload: ReachabilityAnnouncePayload, hlc: Hlc) {
+        self.update_with_source(actor, payload, hlc, ReachabilitySource::DurableCrdt);
+    }
+
+    /// Source-tagged update (Task 3, Decision 3). Only the pkarr-cache-back
+    /// path in [`resolve_async`](Self::resolve_async) /
+    /// [`resolve_async_with_source`](Self::resolve_async_with_source) passes
+    /// `PkarrLive`; every membership-apply projection goes through
+    /// [`update`](Self::update) and is therefore `DurableCrdt`.
+    pub fn update_with_source(
+        &self,
+        actor: OwnerAddr,
+        payload: ReachabilityAnnouncePayload,
+        hlc: Hlc,
+        source: ReachabilitySource,
+    ) {
         let key: ResolverKey = (actor, payload.iroh_node_id);
         let node_id = payload.iroh_node_id;
         let mut map = self.inner.write().expect("resolver write lock");
         let was_present = map.contains_key(&key);
-        let next = ResolverEntry { payload, hlc };
+        let next = ResolverEntry {
+            payload,
+            hlc,
+            source,
+        };
         match map.get(&key) {
             Some(prev) if !should_replace(prev, &next) => { /* keep prev */ }
             _ => {
@@ -285,16 +322,69 @@ impl ReachabilityResolver {
             return Vec::new();
         };
         let payloads = fb.resolve(addr).await;
-        // 3. Populate cache so subsequent sync resolves hit warm.
+        // 3. Populate cache so subsequent sync resolves hit warm. Tagged
+        //    `PkarrLive` (Task 3, Decision 3) so the per-source freshness
+        //    policy keeps the live window on these — unlike CRDT-projected
+        //    entries, which are window-exempt.
         for payload in &payloads {
             let hlc = Hlc {
                 wall_ms: payload.announced_at_ms,
                 logical: 0,
                 device_id: String::new(),
             };
-            self.update(*addr, payload.clone(), hlc);
+            self.update_with_source(*addr, payload.clone(), hlc, ReachabilitySource::PkarrLive);
         }
         payloads
+    }
+
+    /// Like [`resolve`](Self::resolve), but carries each entry's source for the
+    /// per-source butler-set freshness policy (Task 3, Decision 3).
+    pub fn resolve_with_source(
+        &self,
+        actor: &OwnerAddr,
+    ) -> Vec<(ReachabilityAnnouncePayload, ReachabilitySource)> {
+        let map = self.inner.read().expect("resolver read lock");
+        map.range((*actor, [0u8; 32])..=(*actor, [0xFFu8; 32]))
+            .map(|(_, v)| (v.payload.clone(), v.source))
+            .collect()
+    }
+
+    /// Like [`resolve_async`](Self::resolve_async), but carries source. Cache
+    /// hits keep their stored source; pkarr fallback results are `PkarrLive`.
+    pub async fn resolve_async_with_source(
+        &self,
+        addr: &OwnerAddr,
+    ) -> Vec<(ReachabilityAnnouncePayload, ReachabilitySource)> {
+        // 1. Sync cache check — preserves each cached entry's source.
+        let cached = self.resolve_with_source(addr);
+        if !cached.is_empty() {
+            return cached;
+        }
+        // 2. Fallback to pkarr if configured.
+        let fb = {
+            let guard = self
+                .fallback_source
+                .read()
+                .expect("fallback_source poisoned");
+            guard.clone()
+        };
+        let Some(fb) = fb else {
+            return Vec::new();
+        };
+        let payloads = fb.resolve(addr).await;
+        // 3. Populate cache (PkarrLive) and return all results tagged PkarrLive.
+        for payload in &payloads {
+            let hlc = Hlc {
+                wall_ms: payload.announced_at_ms,
+                logical: 0,
+                device_id: String::new(),
+            };
+            self.update_with_source(*addr, payload.clone(), hlc, ReachabilitySource::PkarrLive);
+        }
+        payloads
+            .into_iter()
+            .map(|p| (p, ReachabilitySource::PkarrLive))
+            .collect()
     }
 }
 

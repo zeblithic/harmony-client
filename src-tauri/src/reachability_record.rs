@@ -144,6 +144,22 @@ pub fn fresh_butler_set(blob: &ReachabilityAnnouncePayload, now_ms: u64) -> Vec<
         .collect()
 }
 
+/// Like [`fresh_butler_set`] but WITHOUT the freshness window — for butler-sets
+/// sourced from the durable community CRDT (Decision 3). The seal-target vk is
+/// durable even when the advertised endpoint has drifted (a stale endpoint just
+/// fails the dial and falls through; the vk stays a valid seal target). A
+/// zero/missing `bs_at` still means "no butler-set".
+pub fn durable_butler_set(blob: &ReachabilityAnnouncePayload) -> Vec<ButlerSetEntry> {
+    if blob.bs_at == 0 {
+        return Vec::new();
+    }
+    blob.butler_set
+        .iter()
+        .take(crate::butler_deposit::BUTLER_SET_MAX_ENTRIES)
+        .cloned()
+        .collect()
+}
+
 impl CanonicalPayloadSealed for ReachabilityAnnouncePayload {}
 impl CanonicalPayload for ReachabilityAnnouncePayload {}
 

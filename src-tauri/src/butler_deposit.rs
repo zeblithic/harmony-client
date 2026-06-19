@@ -425,6 +425,42 @@ pub(crate) fn freshest_butler_set(
         .unwrap_or_default()
 }
 
+/// Source-aware variant of [`freshest_butler_set`]: durable-CRDT entries are
+/// window-exempt ([`crate::reachability_record::durable_butler_set`]); pkarr-live
+/// entries keep the 15-min window ([`crate::reachability_record::fresh_butler_set`]).
+/// Picks the entry with the newest `bs_at` among those that yield a non-empty set.
+///
+/// Task 3 adds the selector + its unit test; Task 4 wires the production deposit
+/// path (`community_relay_prod.rs`, same crate) to call it. Until then only the
+/// `#[cfg(test)]` unit test exercises it, so the non-test build sees it unused.
+#[allow(dead_code)]
+pub(crate) fn freshest_butler_set_by_source(
+    tagged: &[(
+        ReachabilityAnnouncePayload,
+        crate::reachability_resolver::ReachabilitySource,
+    )],
+    now_ms: u64,
+) -> Vec<ButlerSetEntry> {
+    use crate::reachability_resolver::ReachabilitySource;
+    tagged
+        .iter()
+        .map(|(b, src)| {
+            let set = match src {
+                ReachabilitySource::DurableCrdt => {
+                    crate::reachability_record::durable_butler_set(b)
+                }
+                ReachabilitySource::PkarrLive => {
+                    crate::reachability_record::fresh_butler_set(b, now_ms)
+                }
+            };
+            (b.bs_at, set)
+        })
+        .filter(|(_, set)| !set.is_empty())
+        .max_by_key(|(bs_at, _)| *bs_at)
+        .map(|(_, set)| set)
+        .unwrap_or_default()
+}
+
 /// Production [`ButlerDepositClient`] (ZEB-418 P1 Task 8): resolve the
 /// RECIPIENT OWNER's routing record (in-memory CRDT cache first, pkarr
 /// fallback on miss, via `ReachabilityResolver::resolve_async`), read the
@@ -881,6 +917,44 @@ mod tests {
         // Only stale → empty (rung skipped). No blobs at all → empty.
         assert!(freshest_butler_set(&[stale], now).is_empty());
         assert!(freshest_butler_set(&[], now).is_empty());
+    }
+
+    /// Task 3 (Decision 3): durable-CRDT butler-sets are window-exempt — their
+    /// vk seal-targets stay valid even when the recipient's primary device is
+    /// long-offline — while pkarr-live butler-sets keep the freshness window.
+    #[test]
+    fn durable_source_butler_set_survives_past_freshness_window() {
+        use crate::reachability_resolver::ReachabilitySource;
+        let now = 100 * BUTLER_SET_FRESHNESS_MS; // far past the window
+        let stale = ReachabilityAnnouncePayload {
+            iroh_node_id: [1; 32],
+            home_relay_url: "r".into(),
+            direct_addresses: vec![],
+            announced_at_ms: 1,
+            identity_signature: [0; 64],
+            butler_set: vec![crate::reachability_record::ButlerSetEntry {
+                device_id: [9; 16],
+                iroh_endpoint_id: [8; 32],
+                device_ed25519_verify: [7; 32],
+                home_relay: "r".into(),
+                pinned: false,
+            }],
+            bs_at: 1, // ancient stamp
+        };
+        // DurableCrdt: window-exempt -> returns the set.
+        let durable =
+            freshest_butler_set_by_source(&[(stale.clone(), ReachabilitySource::DurableCrdt)], now);
+        assert_eq!(
+            durable.len(),
+            1,
+            "durable butler-set must survive the window"
+        );
+        // PkarrLive: windowed -> filtered to empty.
+        let live = freshest_butler_set_by_source(&[(stale, ReachabilitySource::PkarrLive)], now);
+        assert!(
+            live.is_empty(),
+            "pkarr butler-set past the window must be empty"
+        );
     }
 
     #[tokio::test]
