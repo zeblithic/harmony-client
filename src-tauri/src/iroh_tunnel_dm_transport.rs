@@ -195,59 +195,53 @@ impl IrohTunnelDmTransport {
     /// bootstrap `DmInvite` to ride ahead of the CidNotify, under ONE
     /// `crdt_state` lock so no lock is held across the tunnel `send_dm` calls.
     ///
-    /// Targets: for each bound device of `recipient` that advertised a
-    /// `DeviceTunnelContact`, derive its tunnel NodeId (`blake3(pq_dsa_pubkey)`,
-    /// matching harmony-tunnel) and pair it with the contact. Devices with no
-    /// contact yet (`None`) are skipped — the tunnel can't reach them, and the
-    /// deposit rung covers them.
+    /// ZEB-504: rebuild the bootstrap `DmInvite` for `entry`'s Space from the
+    /// durable Space record, to re-drive it over the (eventually-warm) tunnel.
     ///
-    /// Invite (ZEB-504): the first `add_space` to a new friend emits the invite
-    /// fire-and-forget over a guaranteed-COLD tunnel, so it is dropped and never
-    /// recovered (re-`add_space` dedupes and won't resend). To fix it, every
-    /// message send re-drives the invite over the (eventually-warm) tunnel until
-    /// the recipient acks this entry — an ack implies they admitted a CidNotify,
-    /// which requires the Space to exist, so the invite is no longer needed.
-    /// `apply_invite` on the receiver is an idempotent CRDT merge, so re-sending
-    /// until the ack lands is safe. A non-DM Space or a rebuild error yields
-    /// `None` (the CidNotify still attempts; the deposit rung carries the invite
-    /// for the offline case).
-    async fn resolve_targets_and_invite(
+    /// The first `add_space` to a new friend emits the invite fire-and-forget
+    /// over a guaranteed-COLD tunnel, so it is dropped and never recovered
+    /// (re-`add_space` dedupes and won't resend). To fix it, every message send
+    /// re-drives the invite until the recipient acks this entry — an ack implies
+    /// they admitted a CidNotify, which requires the Space to exist, so the
+    /// invite is no longer needed. `apply_invite` on the receiver is an
+    /// idempotent CRDT merge, so re-sending until the ack lands is safe.
+    /// Returns `None` once acked, or for a non-DM Space / rebuild error (the
+    /// CidNotify still attempts; the deposit rung carries the invite for the
+    /// offline case).
+    ///
+    /// CodeAnt: called only AFTER the tunnel-send permit is acquired, so the
+    /// signing/encoding cost (under the owner-state lock) is never paid for a
+    /// tunnel attempt that is immediately shed by the concurrency cap.
+    async fn build_bootstrap_invite(
         &self,
         entry: &OutboxEntry,
         recipient: OwnerAddr,
-    ) -> (
-        Vec<([u8; 32], crate::owner_state_types::DeviceTunnelContact)>,
-        Option<Vec<u8>>,
-    ) {
+    ) -> Option<Vec<u8>> {
+        // Acked → the Space exists on the recipient → no invite needed.
+        if entry.delivered_to.contains(&recipient) {
+            return None;
+        }
         let state = self.crdt_state.lock().await;
-        let targets = resolve_owner_tunnel_targets(&state, recipient);
-        // Only rebuild the invite while the recipient hasn't acked this entry
-        // (and only if there's actually a tunnel target to carry it).
-        let invite = if targets.is_empty() || entry.delivered_to.contains(&recipient) {
-            None
-        } else {
-            match crate::dm_outbox::build_invite_packet_from_space(
-                &state,
-                &entry.space_id,
-                &self.signing_key,
-                self.self_owner,
-                self.our_signing_device_hash,
-                self.inviter_identity_pub,
-            ) {
-                Ok(invite) => invite,
-                Err(e) => {
-                    tracing::warn!(
-                        recipient = ?recipient,
-                        space_id = ?entry.space_id,
-                        error = %e,
-                        "ZEB-504: bootstrap invite rebuild failed; sending CidNotify alone \
-                         (deposit rung still carries the invite for the offline case)"
-                    );
-                    None
-                }
+        match crate::dm_outbox::build_invite_packet_from_space(
+            &state,
+            &entry.space_id,
+            &self.signing_key,
+            self.self_owner,
+            self.our_signing_device_hash,
+            self.inviter_identity_pub,
+        ) {
+            Ok(invite) => invite,
+            Err(e) => {
+                tracing::warn!(
+                    recipient = ?recipient,
+                    space_id = ?entry.space_id,
+                    error = %e,
+                    "ZEB-504: bootstrap invite rebuild failed; sending CidNotify alone \
+                     (deposit rung still carries the invite for the offline case)"
+                );
+                None
             }
-        };
-        (targets, invite)
+        }
     }
 }
 
@@ -293,7 +287,13 @@ impl DmTransport for IrohTunnelDmTransport {
         recipient: OwnerAddr,
         _destinations: Vec<[u8; 16]>,
     ) -> Result<(), TransportError> {
-        let (targets, invite_wire) = self.resolve_targets_and_invite(entry, recipient).await;
+        // Resolve reachable tunnel targets first (cheap: a single owner-state
+        // lock, no signing). The expensive invite rebuild is deferred until a
+        // send permit is actually acquired (CodeAnt) — see below.
+        let targets = {
+            let state = self.crdt_state.lock().await;
+            resolve_owner_tunnel_targets(&state, recipient)
+        };
 
         // ZEB-485 (CodeAnt): cap concurrent in-flight tunnel sends. The spawned
         // build+send below is detached (required — see the deadlock note), so an
@@ -304,6 +304,11 @@ impl DmTransport for IrohTunnelDmTransport {
         if !targets.is_empty() {
             match Arc::clone(&self.tunnel_send_sem).try_acquire_owned() {
                 Ok(permit) => {
+                    // Permit held → this attempt WILL run, so it's now worth
+                    // rebuilding the bootstrap invite (ZEB-504). Doing it here
+                    // rather than before the semaphore avoids signing/encoding
+                    // work under the owner-state lock for shed attempts (CodeAnt).
+                    let invite_wire = self.build_bootstrap_invite(entry, recipient).await;
                     let signed = crate::dm_envelope::DmCidNotifySigned {
                         space_id: entry.space_id,
                         message_cid: entry.message_cid,
