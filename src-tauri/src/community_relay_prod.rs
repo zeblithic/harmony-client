@@ -550,8 +550,10 @@ pub trait ButlerSetResolve: Send + Sync {
 }
 
 /// Production butler-set resolution over the live [`ReachabilityResolver`]
-/// (in-memory CRDT cache first, pkarr fallback on miss) + `freshest_butler_set`
-/// — identical to the butler client's resolution step.
+/// (in-memory CRDT cache first, pkarr fallback on miss) +
+/// `freshest_butler_set_by_source` (durable-CRDT entries window-exempt,
+/// pkarr-live windowed — Task 4) — identical to the butler client's
+/// resolution step.
 pub struct ReachabilityButlerSetResolve(pub crate::reachability_resolver::ReachabilityResolver);
 
 #[async_trait]
@@ -561,8 +563,8 @@ impl ButlerSetResolve for ReachabilityButlerSetResolve {
         recipient_owner: &crate::owner_state_types::OwnerAddr,
         now_ms: u64,
     ) -> Vec<crate::reachability_record::ButlerSetEntry> {
-        let blobs = self.0.resolve_async(recipient_owner).await;
-        crate::butler_deposit::freshest_butler_set(&blobs, now_ms)
+        let tagged = self.0.resolve_async_with_source(recipient_owner).await;
+        crate::butler_deposit::freshest_butler_set_by_source(&tagged, now_ms)
     }
 }
 
