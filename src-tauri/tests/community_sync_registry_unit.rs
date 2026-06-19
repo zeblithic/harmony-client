@@ -282,8 +282,14 @@ async fn shutdown_engine_and_cleanup_persistence_removes_dir_after_engine_stops(
     );
 }
 
+/// ZEB-501 regression guard: a non-countersign event (here a Join) whose own
+/// id matches a registered pending-redemption key must NOT fire the oneshot.
+/// Only a `JoinCountersign` targeting that id wakes the redeem — the joiner's
+/// own PendingJoin self-insert used to wake it (the bug). The positive
+/// direction (a JoinCountersign fires the oneshot → redeem returns Joined) is
+/// covered by `pkarr_iroh_redeem_full_integration`.
 #[tokio::test]
-async fn pending_redemption_oneshot_fires_when_event_id_inserts_via_local() {
+async fn pending_redemption_oneshot_not_fired_by_own_event_insert() {
     use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use harmony_app::owner_state_types::Hlc;
 
@@ -378,11 +384,16 @@ async fn pending_redemption_oneshot_fires_when_event_id_inserts_via_local() {
         .await
         .expect("insert");
 
-    // Oneshot fires on Inserted.
-    tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+    // ZEB-501: a Join whose own id == the registered key must NOT fire the
+    // oneshot — only a JoinCountersign with target_event_id == the key does.
+    // (Pre-fix, this Insert fired it via the legacy notify-on-event.id.)
+    // 200ms is comfortably longer than the in-process local-insert + hook path.
+    tokio::time::timeout(std::time::Duration::from_millis(200), rx)
         .await
-        .expect("oneshot did not fire within 2s")
-        .expect("oneshot sender dropped without firing");
+        .expect_err(
+            "ZEB-501: a non-countersign (Join) insert must NOT wake the \
+             pending-redemption oneshot, even when its id matches the key",
+        );
 }
 
 #[tokio::test]

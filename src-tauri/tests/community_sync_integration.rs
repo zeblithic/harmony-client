@@ -2600,8 +2600,8 @@ mod task3_kick_setpower_round_trip {
 // reachable destination for the inviter. Two tests drive it with different
 // `fence_check` closures:
 //
-//   * `redeem_invite_only_commits_durable_join_when_inviter_unreachable`
-//     (fence = Ok)  — asserts the current latched-pending COMMIT.
+//   * `redeem_invite_only_commits_pending_join_when_inviter_unreachable`
+//     (fence = Ok)  — asserts the latched-pending COMMIT (pending=true).
 //   * `redeem_invite_only_rolls_back_owner_state_on_fence_failure`
 //     (fence = Err) — asserts the ZEB-258 owner-state rollback invariant
 //     still holds for a GENUINE failure (the Space commit is the last
@@ -2663,12 +2663,12 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
     use harmony_app::owner_state_types::DeviceIdentityHash;
     use std::collections::BTreeMap;
 
-    // No HARMONY_REDEEM_INVITE_TIMEOUT_MS override: both tests are independent of
-    // the redeem timeout. The joiner's own PendingJoin insert synchronously fires
-    // the redeem oneshot (community_state_sync.rs:1386, before the step-7d timeout
-    // await — ZEB-501), so the timeout is never reached regardless of its value
-    // and the redeem returns immediately. Avoiding the env mutation also removes
-    // the process-global cross-test env race Qodo/CodeAnt flagged on #293.
+    // ZEB-501: the redeem oneshot now fires ONLY on a real JoinCountersign, so an
+    // unreachable inviter (no countersign) genuinely reaches the step-7d timeout.
+    // Both tests drive that timeout with a short `redeem_timeout` passed via
+    // `RedeemInviteOverrides` (50ms) — NOT the process-global
+    // HARMONY_REDEEM_INVITE_TIMEOUT_MS env var, so there is no cross-test env
+    // race (the one Qodo/CodeAnt flagged on #293).
 
     // ZEB-497/ZEB-500: Alice (the inviter/admin) is a consistent ENROLLED-DEVICE
     // owner so the redeem path's `verify_inviter_enrollment` gate PASSES — her
@@ -2934,18 +2934,25 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
     }
 }
 
-/// Post-ZEB-474 / ZEB-254: an unreachable inviter no longer rolls back. The
-/// redeem COMMITS the owner-state Space (durable latched-pending join) and
-/// returns Ok. Confirmed in ZEB-500 to NOT be a ZEB-258 regression — ZEB-258
-/// governs rollback on *genuine* failure, exercised by the fence test below.
+/// ZEB-501 / Post-ZEB-474 / ZEB-254: an unreachable inviter no longer rolls
+/// back AND no longer falsely reports `joined`. With no admin to counter-sign,
+/// the redeem oneshot — which now fires only on a real JoinCountersign — times
+/// out, so the redeem COMMITS the owner-state Space as a *latched-pending* join:
+/// `pending == true`, `pending_join_at == Some` (greyed in nav until a
+/// JoinCountersign arrives). Confirmed in ZEB-500 to NOT be a ZEB-258
+/// regression — ZEB-258 governs rollback on *genuine* failure, exercised by the
+/// fence test below. The positive direction (counter-sign present → pending ==
+/// false → Joined) is covered by `pkarr_iroh_redeem_full_integration`.
 #[tokio::test]
-async fn redeem_invite_only_commits_durable_join_when_inviter_unreachable() {
+async fn redeem_invite_only_commits_pending_join_when_inviter_unreachable() {
     use harmony_app::owner_state_persist::canonicalize;
 
     let fx = build_unreachable_invite_only_redeem_fixture().await;
 
-    // fence_check = Ok: the production snapshot-then-commit fence passes.
-    let result = harmony_app::redeem_invite_inner(
+    // fence_check = Ok: the production snapshot-then-commit fence passes. A short
+    // `redeem_timeout` (ZEB-501) drives the offline-admin timeout fast without
+    // mutating the process-global env var.
+    let result = harmony_app::redeem_invite_inner_with_overrides(
         fx.url,
         Arc::clone(&fx.crdt_state),
         Arc::clone(&fx.hlc_tracker),
@@ -2959,23 +2966,22 @@ async fn redeem_invite_only_commits_durable_join_when_inviter_unreachable() {
         Arc::clone(&fx.dm_outbox),
         fx.channel_log_registry,
         || Ok(()),
-        None, // ZEB-325: no pre-delivered counter-sign
+        None, // identity_dir
+        harmony_app::RedeemInviteOverrides {
+            redeem_timeout: Some(std::time::Duration::from_millis(50)),
+            ..Default::default()
+        },
     )
     .await;
 
     let dto = result.expect("unreachable inviter must COMMIT (latched-pending join), not Err");
 
-    // ZEB-501: the joiner's own PendingJoin insert synchronously satisfies the
-    // redeem oneshot (community_state_sync.rs:1386 fires on event.id ==
-    // bootstrap_join.id, before the step-7d timeout await), so the timeout
-    // never fires and `pending` is false even though no admin counter-signed.
-    // A 1ms timeout reproduces this (the fire is synchronous, not a race).
-    // Pinning current behavior; ZEB-501 decides whether the offline-admin
-    // greying should be restored or the dead ZEB-254 timeout path removed.
+    // ZEB-501: with the self-fire removed, no admin counter-sign means the
+    // step-7d oneshot times out → the redeem latches the join as pending.
     assert!(
-        !dto.pending,
-        "ZEB-501: redeem oneshot is satisfied by the joiner's own PendingJoin \
-         insert, so `pending` is currently always false here; got {dto:?}"
+        dto.pending,
+        "ZEB-501: an unreachable (un-counter-signed) redeem must report \
+         pending=true (latched-pending join); got {dto:?}"
     );
 
     // The owner-state Space row IS committed — the durable latched join, the
@@ -2994,11 +3000,11 @@ async fn redeem_invite_only_commits_durable_join_when_inviter_unreachable() {
             .spaces
             .get(&fx.community_id)
             .expect("redeem committed the owner-state Space row");
-        // ZEB-501: pending_join_at stays None — it is only set when the step-7d
-        // timeout fires, which never happens on this path (see above).
+        // ZEB-501: pending_join_at IS set — the join is latched pending the
+        // admin's counter-sign; it ungreys when the JoinCountersign arrives.
         assert!(
-            row.pending_join_at.is_none(),
-            "ZEB-501: pending_join_at is None here (timeout never fires); got {:?}",
+            row.pending_join_at.is_some(),
+            "ZEB-501: pending_join_at must be Some for an offline-admin redeem; got {:?}",
             row.pending_join_at
         );
         assert!(
@@ -3023,7 +3029,9 @@ async fn redeem_invite_only_rolls_back_owner_state_on_fence_failure() {
 
     // fence_check = Err: the production fence rejects (e.g. the node was
     // stopped, or a stop+restart raced the await chain) — a GENUINE failure.
-    let result = harmony_app::redeem_invite_inner(
+    // A short `redeem_timeout` (ZEB-501) reaches the fence fast (no admin
+    // counter-sign arrives, so the oneshot times out first).
+    let result = harmony_app::redeem_invite_inner_with_overrides(
         fx.url,
         Arc::clone(&fx.crdt_state),
         Arc::clone(&fx.hlc_tracker),
@@ -3037,7 +3045,11 @@ async fn redeem_invite_only_rolls_back_owner_state_on_fence_failure() {
         Arc::clone(&fx.dm_outbox),
         fx.channel_log_registry,
         || Err("simulated node-stopped fence rejection".to_string()),
-        None,
+        None, // identity_dir
+        harmony_app::RedeemInviteOverrides {
+            redeem_timeout: Some(std::time::Duration::from_millis(50)),
+            ..Default::default()
+        },
     )
     .await;
 

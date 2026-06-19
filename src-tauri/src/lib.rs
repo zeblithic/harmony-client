@@ -22114,11 +22114,16 @@ pub struct RedeemInviteResultDto {
     pub community_name: String,
     pub is_invite_only: bool,
     /// ZEB-254: true if the redemption returned before a JoinCountersign
-    /// landed locally (admin was offline; the 5s fast-path timeout
-    /// fired). The community appears in nav greyed; ungreys when
-    /// JoinCountersign arrives via state-root sync. false if either
-    /// (a) fast-path counter-sign came back within 5s, or (b) community
-    /// is open (no countersign required).
+    /// landed locally (admin was offline; the fast-path timeout fired).
+    /// The community appears in nav greyed; ungreys when the JoinCountersign
+    /// arrives via state-root sync. false if either (a) a counter-sign
+    /// landed within the timeout, or (b) the community is open (no
+    /// countersign required).
+    ///
+    /// ZEB-501: this case is now actually reachable. Previously the
+    /// joiner's own PendingJoin self-insert woke the redeem oneshot before
+    /// the timeout, so `pending` was effectively always false even with an
+    /// offline admin; the oneshot now fires only on a real JoinCountersign.
     pub pending: bool,
 }
 
@@ -22373,6 +22378,14 @@ pub struct RedeemInviteOverrides {
     /// so `insert_local_event_with_pubs` is called with explicit pubs.
     /// Must be `Some` whenever `pre_delivered_countersign` is `Some`.
     pub admin_identity_pub: Option<[u8; 64]>,
+
+    /// ZEB-501: explicit step-7d redeem-timeout override. When `Some`, the
+    /// await for a `JoinCountersign` uses this duration instead of the
+    /// `HARMONY_REDEEM_INVITE_TIMEOUT_MS`-or-5s production default. Lets
+    /// tests drive the offline-admin (timeout → `pending: true`) path with
+    /// a short wait WITHOUT mutating the process-global env var — the
+    /// cross-test env race removed in ZEB-500. `None` in production.
+    pub redeem_timeout: Option<std::time::Duration>,
 }
 
 /// ZEB-262 Phase 4: invite-only `redeem_invite` inner helper. Encodes
@@ -23158,19 +23171,27 @@ where
             }
         } // end: else { … } from R6 pre_delivered_countersign guard
 
-        // 7d. Await oneshot ≤ T (env-overridable for tests).
-        // ZEB-254: 5s fast-path timeout (down from 15s). On timeout,
-        // redeem_invite_inner does NOT roll back — it proceeds to commit
-        // the Space with pending_join_at = Some and returns Ok { pending:
-        // true }. The PendingJoin event is already on the wire via the
-        // engine's state-root publisher; admins counter-sign whenever
-        // they next come online.
-        let timeout_ms: u64 = std::env::var("HARMONY_REDEEM_INVITE_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5_000);
+        // 7d. Await the redeem oneshot ≤ T. ZEB-501: the oneshot now fires
+        // ONLY on a real JoinCountersign (the joiner's own PendingJoin
+        // self-insert no longer wakes it), so this await genuinely waits
+        // for the admin's counter-sign. ZEB-254: 5s fast-path timeout. On
+        // timeout, redeem_invite_inner does NOT roll back — it proceeds to
+        // commit the Space with pending_join_at = Some and returns
+        // Ok { pending: true }. The PendingJoin event is already on the
+        // wire via the engine's state-root publisher; admins counter-sign
+        // whenever they next come online.
+        //
+        // Timeout precedence: an explicit `overrides.redeem_timeout`
+        // (tests) wins; else `HARMONY_REDEEM_INVITE_TIMEOUT_MS`; else 5s.
+        let redeem_timeout = overrides.redeem_timeout.unwrap_or_else(|| {
+            let ms = std::env::var("HARMONY_REDEEM_INVITE_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5_000);
+            std::time::Duration::from_millis(ms)
+        });
 
-        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), notify_rx).await {
+        match tokio::time::timeout(redeem_timeout, notify_rx).await {
             Ok(Ok(())) => {
                 // Counter-signed Join landed — proceed to commit.
             }
@@ -40283,6 +40304,9 @@ where
         pre_minted: Some(minted),
         pre_delivered_countersign: Some(countersign),
         admin_identity_pub: Some(admin_id_pub),
+        // ZEB-501: production uses the env-or-5s default (the pre-delivered
+        // countersign resolves the oneshot well within it).
+        redeem_timeout: None,
     };
     let result = redeem_invite_inner_with_overrides(
         invite_url,
