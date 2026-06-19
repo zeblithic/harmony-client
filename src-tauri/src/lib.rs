@@ -6401,6 +6401,16 @@ pub async fn start_node_inner(
                         let self_owner_for_cb = self_owner;
                         let hlc_tracker_for_cb = std::sync::Arc::clone(&tracker);
                         let device_id_for_cb = device_id.clone();
+                        // ZEB-418/durable-seal-targets Task 2: butler-set inputs
+                        // captured for the CRDT publisher. Unlike the sync pkarr
+                        // blob builder (which reads a `fleet_vk_map` std RwLock
+                        // view because it can't lock the async crdt mutex), this
+                        // publish_fn is async and already captures `crdt_state`,
+                        // so it locks and builds the vk-map inline per publish.
+                        let fleet_net_snapshot_for_pub = std::sync::Arc::clone(&fleet_net_snapshot);
+                        let butler_self_device_id_hash_for_pub = this_device_id_hash;
+                        let butler_self_device_vk_for_pub =
+                            loaded.device_signing_key.verifying_key().to_bytes();
                         let publish_fn: crate::reachability_publisher::PublishFn =
                             std::sync::Arc::new(move || {
                                 // Per-invocation clones — the closure is
@@ -6419,6 +6429,11 @@ pub async fn start_node_inner(
                                     std::sync::Arc::clone(&friend_pub_cell_for_cb);
                                 let crdt_state = std::sync::Arc::clone(&crdt_state_for_cb);
                                 let kt = std::sync::Arc::clone(&kt_for_cb);
+                                // Task 2 per-invocation butler-set clones.
+                                let fleet_net_snapshot =
+                                    std::sync::Arc::clone(&fleet_net_snapshot_for_pub);
+                                let butler_self_device_id_hash = butler_self_device_id_hash_for_pub;
+                                let butler_self_device_vk = butler_self_device_vk_for_pub;
                                 Box::pin(async move {
                                     // 1. Snapshot iroh state ONCE.
                                     let node_id_bytes: [u8; 32] = *ep.node_id().as_bytes();
@@ -6439,6 +6454,64 @@ pub async fn start_node_inner(
                                         .unwrap_or_default()
                                         .as_millis()
                                         as u64;
+
+                                    // 1b. Build the owner's durable butler-set ONCE
+                                    // (identical across communities; cloned per
+                                    // payload). Task 2: this carries the recipient's
+                                    // device-key seal-targets in the durable CRDT
+                                    // record so a fully-offline recipient's DM-deposit
+                                    // seal-targets stay resolvable. Mirrors the sync
+                                    // pkarr blob builder's `build_butler_set` /
+                                    // `vk_map_from_device_cache` usage; the async path
+                                    // locks `crdt_state` directly instead of reading a
+                                    // separate std RwLock view. The lock guard is
+                                    // scoped to this block and dropped before the
+                                    // per-community loop / the later friend-reconcile
+                                    // lock, so there is no double-lock / deadlock.
+                                    let (self_butler_set, self_bs_at) = {
+                                        let st = crdt_state.lock().await;
+                                        let vk_map = crate::fleet_net::vk_map_from_device_cache(
+                                            &st.owner_device_cache,
+                                            &actor,
+                                            &device_id,
+                                            butler_self_device_vk,
+                                        );
+                                        let snap = fleet_net_snapshot
+                                            .read()
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        let self_entry =
+                                            crate::reachability_record::ButlerSetEntry {
+                                                device_id: butler_self_device_id_hash,
+                                                iroh_endpoint_id: node_id_bytes,
+                                                device_ed25519_verify: butler_self_device_vk,
+                                                home_relay: home_relay.clone(),
+                                                pinned: false,
+                                            };
+                                        let vk_lookup = |dev_id: &str| -> Option<[u8; 32]> {
+                                            let vk = vk_map.get(dev_id).copied();
+                                            if vk.is_none() {
+                                                tracing::debug!(
+                                                    device_id = %dev_id,
+                                                    "Task 2: fleet-net device has no resolvable \
+                                                     vk in the owner_device_cache view; skipping \
+                                                     butler-set entry"
+                                                );
+                                            }
+                                            vk
+                                        };
+                                        let set = crate::fleet_net::build_butler_set(
+                                            &snap,
+                                            &device_id,
+                                            self_entry,
+                                            &vk_lookup,
+                                            announced_at_ms.saturating_sub(
+                                                crate::butler_deposit::BUTLER_SET_FRESHNESS_MS,
+                                            ),
+                                        );
+                                        let bs_at =
+                                            if set.is_empty() { 0 } else { announced_at_ms };
+                                        (set, bs_at)
+                                    };
 
                                     // 2. Iterate joined communities. When NONE
                                     // are joined this loop is skipped, but the
@@ -6472,8 +6545,8 @@ pub async fn start_node_inner(
                                                 announced_at_ms,
                                                 &actor,
                                                 &hlc,
-                                                Vec::new(),
-                                                0,
+                                                self_butler_set.clone(),
+                                                self_bs_at,
                                                 community_signing_key.as_ref(),
                                             ) {
                                                 Ok(p) => p,

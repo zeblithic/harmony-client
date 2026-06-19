@@ -158,7 +158,7 @@ pub fn canonical_payload_bytes(p: &ReachabilityAnnouncePayload) -> Result<Vec<u8
 /// payload struct itself but are bound into the signature so a replay
 /// attacker can't lift a `ReachabilityAnnouncePayload` from one envelope
 /// and re-attach it under a different actor or HLC. The butler set (`bs`)
-/// + its freshness stamp (`ba`) ARE payload fields, bound here so they
+/// and its freshness stamp (`ba`) ARE payload fields, bound here so they
 /// can't be forged or stripped (see the butler-set binding note below).
 ///
 /// All field keys are 2 chars to satisfy the same-length-keys
