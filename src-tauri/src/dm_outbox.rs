@@ -369,6 +369,51 @@ pub(crate) fn build_dm_packet_with_blob(
 /// fleet-replicated alongside it). `Err` for a DM/GroupDm Space that EXISTS but
 /// has no `content_key`, or a sign/encode failure — the invite is load-bearing
 /// there, so the caller must NOT silently drop it.
+/// ZEB-504: resolve the inviter's own `sender_devices` list for a
+/// `DmInviteSigned`, sourced from the live `OwnerDeviceCache` (authoritative)
+/// with a pre-bootstrap singleton fallback, plus the Phase-3b defense-in-depth
+/// invariant that the signing device is always present.
+///
+/// Shared by `add_space_dm_inner`'s original-invite path and
+/// [`build_invite_packet_from_space`]'s rebuild path so the two can never
+/// diverge. They DID diverge — the rebuild path hard-coded a bare singleton —
+/// and that was a device-list-regression bug: a rebuilt invite re-driven over
+/// the live tunnel (ZEB-504) is applied receiver-side with
+/// `refresh_owner_device_cache = true` at a fresh *local* `learned_at` HLC, and
+/// [`crate::owner_state_crdt::OwnerState::apply_owner_device_update`] is
+/// LWW-by-`learned_at` and REPLACES (not unions) the device list. A singleton
+/// resend would therefore shrink the receiver's cached inviter device set down
+/// to one device, dropping later messages signed by the inviter's other devices
+/// as `UnknownSigningKey`. (The deposit-recover path applies with
+/// `refresh = false`, so it never mutates the cache — but it shares this helper
+/// for a consistent invite shape, which is harmless there.)
+///
+/// Behavior-preserving extraction of `add_space_dm_inner`'s prior inline logic:
+/// the cache stores `devices` already sorted+deduped, so the common branch
+/// returns it as-is; only the (rare) fallback that must append the signing hash
+/// re-sorts.
+pub(crate) fn resolve_sender_devices(
+    state: &OwnerState,
+    self_owner: OwnerAddr,
+    our_signing_device_hash: DeviceIdentityHash,
+) -> Vec<DeviceIdentityHash> {
+    let our_devices: Vec<DeviceIdentityHash> = state
+        .owner_device_cache
+        .devices
+        .get(&self_owner)
+        .map(|e| e.devices.clone())
+        .unwrap_or_else(|| vec![our_signing_device_hash]);
+    if our_devices.contains(&our_signing_device_hash) {
+        our_devices
+    } else {
+        let mut combined = our_devices;
+        combined.push(our_signing_device_hash);
+        combined.sort();
+        combined.dedup();
+        combined
+    }
+}
+
 pub(crate) fn build_invite_packet_from_space(
     state: &OwnerState,
     space_id: &SpaceId,
@@ -393,7 +438,11 @@ pub(crate) fn build_invite_packet_from_space(
         members: space.members.clone(),
         inviter: self_owner,
         content_key,
-        sender_devices: vec![our_signing_device_hash],
+        // ZEB-504: carry the inviter's FULL cached device set, sourced exactly
+        // like `add_space_dm_inner`'s original invite (NOT a bare singleton) —
+        // see `resolve_sender_devices` for why a singleton here would
+        // LWW-shrink the receiver's OwnerDeviceCache on the live-tunnel resend.
+        sender_devices: resolve_sender_devices(state, self_owner, our_signing_device_hash),
         created_at: space.created_at.clone(),
         signing_device_hash: our_signing_device_hash,
         inviter_identity_pub,

@@ -658,6 +658,72 @@ mod tests {
         );
     }
 
+    /// ZEB-504 regression (Qodo): the rebuilt bootstrap invite must carry the
+    /// inviter's FULL cached device set, not a bare singleton. The live-tunnel
+    /// resend is applied receiver-side with `refresh_owner_device_cache=true` at
+    /// a fresh local `learned_at` HLC, and `apply_owner_device_update` is
+    /// LWW-REPLACE (not union); a singleton resend would therefore shrink the
+    /// receiver's cached inviter device set and later drop messages signed by the
+    /// inviter's other devices as `UnknownSigningKey`.
+    #[tokio::test]
+    async fn send_invite_carries_full_inviter_device_set() {
+        let mgr = test_manager().await;
+        let recipient = OwnerAddr([0x11; 16]);
+        let dsa_pubkey = vec![0x07u8; 32];
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+        let space = SpaceId([0xcc; 16]);
+
+        let mut owner_state = state_with_recipient_and_dm_space(recipient, space, &dsa_pubkey);
+        // The inviter (self, OwnerAddr([0xff;16]) per `make_transport`) has THREE
+        // enrolled devices; the signing device ([0xaa;16]) is one of them. Stored
+        // sorted ascending, mirroring `apply_owner_device_update`.
+        let self_owner = OwnerAddr([0xff; 16]);
+        let full_devices = vec![
+            DeviceIdentityHash([0xaa; 16]),
+            DeviceIdentityHash([0xbb; 16]),
+            DeviceIdentityHash([0xdd; 16]),
+        ];
+        owner_state.owner_device_cache.devices.insert(
+            self_owner,
+            OwnerDeviceEntry {
+                devices: full_devices.clone(),
+                device_identity_pubs: vec![None; 3],
+                learned_at: Hlc {
+                    wall_ms: 5,
+                    logical: 0,
+                    device_id: "self".into(),
+                },
+                device_tunnel_contacts: vec![None; 3],
+            },
+        );
+
+        let state = Arc::new(tokio::sync::Mutex::new(owner_state));
+        let transport = make_transport(
+            Arc::clone(&mgr),
+            state,
+            Arc::new(crate::content_store::InMemoryStub::default()),
+        );
+
+        let cid = ContentId::from_bytes([0xee; 32]);
+        // delivered_to empty → recipient un-acked → invite rides along first.
+        let entry = synthetic_outbox_entry(space, cid, recipient);
+
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
+        let _ = transport.send(&entry, recipient, Vec::new()).await;
+
+        let first = wait_for_routed(&mut cmd_rx).await;
+        let Ok(crate::dm_envelope::DmPacket::Invite { signed, .. }) =
+            crate::dm_envelope::decode_packet(&first)
+        else {
+            panic!("first routed packet must be the bootstrap DmInvite");
+        };
+        assert_eq!(
+            signed.sender_devices, full_devices,
+            "rebuilt invite must carry the inviter's full cached device set, \
+             not a singleton (ZEB-504 device-list-regression)"
+        );
+    }
+
     /// A recipient whose cached entry advertises a `DeviceTunnelContact` →
     /// `send` derives the tunnel NodeId (`blake3(pq_dsa)`), builds the packet,
     /// and routes it through `TunnelManager::send_dm` (observable as a buffered
