@@ -1378,6 +1378,23 @@ async fn s6_relay_deposit_recover() {
         "relay holds nothing before the offline send"
     );
 
+    // --- REACHABILITY-SYNC BARRIER (durable seal-targets, Tasks 1-5). The relay
+    //     rung resolves b's SEAL TARGETS on the SENDER (a), from a's reachability
+    //     resolver, which carries b's ReachabilityAnnounce payload INCLUDING its
+    //     durable butler-set. That resolution only succeeds for a fully-offline b
+    //     if b's announce replicated to a BEFORE the kill. Block here until a has
+    //     observed b's announce (the durable butler-set rides the same announce,
+    //     so observing the announce = observing the set — the headless
+    //     connectivity_list_peer_reachability DTO does not expose the set field
+    //     itself, so this asserts that announce-observed proxy). Generous budget:
+    //     the publisher loop + community-CRDT replication is co-located but racy.
+    poll_reachability_observed(&a, &b_owner, Duration::from_secs(120))
+        .await
+        .expect(
+            "REACHABILITY: a observed b's ReachabilityAnnounce (durable seal-targets) before kill",
+        );
+    eprintln!("S6 REACHABILITY: a observed b's announce; durable seal-targets replicated.");
+
     // --- b goes OFFLINE (real SIGKILL). The DM Space does NOT exist on b yet.
     b.kill().await.expect("kill b");
 
@@ -1391,9 +1408,12 @@ async fn s6_relay_deposit_recover() {
         .await
         .expect("a send_dm accepted by the engine");
 
-    // --- ASSERTION 1 (HELD): r holds the deposit for b while b is offline.
-    //     Generous budget: deposit only fires after the DEPOSIT_NOACK backoff.
-    let held = poll_until(Duration::from_secs(60), || async {
+    // --- ASSERTION 1 (HELD): r holds the deposit for b while b is offline. Now a
+    //     HARD assert (was a characterize-fallback): the reachability-sync barrier
+    //     above guarantees a resolved b's durable seal-targets before the kill, so
+    //     the relay deposit MUST land. Generous budget: deposit only fires after
+    //     the DEPOSIT_NOACK backoff.
+    let held = poll_until(Duration::from_secs(90), || async {
         let entries = get_relay_held(&r, Some(&community_id)).await?;
         let m = entries.into_iter().find(|e| {
             e.get("senderOwnerHex").and_then(Value::as_str) == Some(a_owner.as_str())
@@ -1402,21 +1422,10 @@ async fn s6_relay_deposit_recover() {
         Ok(m)
     })
     .await;
-
-    if held.is_err() {
-        // FALLBACK: characterize, do not assert. Co-located relay resolve/dial may
-        // not establish (ZEB-466-class community-relay routing gap). The cross-WAN
-        // playbook run (Scenario D2) is the real proof.
-        eprintln!(
-            "S6 FINDING: relay deposit never landed on r within 60s co-located \
-             (held=false). Likely the co-located community-relay resolve/dial gap \
-             (ZEB-466 class), NOT a deposit-logic bug — file a finding ticket and \
-             confirm via the cross-WAN Scenario D2. Skipping HELD/RECV/CLEARED asserts."
-        );
-        run.mark_success();
-        drop((a, b, r, ah, bh, rh));
-        return;
-    }
+    assert!(
+        held.is_ok(),
+        "HELD: r holds a's deposit for offline b (durable seal-targets)"
+    );
     eprintln!("S6 HELD: r is holding a's deposit for b while b is offline.");
 
     // --- b comes back ONLINE (rehydrates from its persisted profile). Recovery is
@@ -1529,6 +1538,11 @@ async fn s7_butler_deposit_recover() {
     let p_owner = owner_id(&p).await;
 
     // --- Boundary 1: pair B2 into P's fleet via the real SAS handshake.
+    //     CHARACTERIZE (left as-is, NOT hardened by the durable-seal-targets
+    //     work): this gates on the co-located pairing TRANSPORT (Zenoh
+    //     harmony/pairing/v2/lan/**), a pre-condition unrelated to deposit
+    //     seal-target durability — it stays a fallback pending its own
+    //     pairing-transport ticket.
     let b2_device = match pair_into_fleet(&p, &b2, "s7", Duration::from_secs(180)).await {
         Ok(dev) => dev,
         Err(e) => {
@@ -1632,7 +1646,10 @@ async fn s7_butler_deposit_recover() {
             .expect("peer device exposes deviceVkHex")
             .to_string(),
         // Intermittent inviter-persist gap (ZEB-491): B2's enrollment did not
-        // land on P — characterize boundary 0.
+        // land on P — characterize boundary 0. CHARACTERIZE (left as-is, NOT
+        // hardened by the durable-seal-targets work): this gates on the ZEB-491
+        // inviter-enrollment-persist gap, a pre-condition unrelated to deposit
+        // seal-target durability — it stays a fallback pending ZEB-491.
         [] => {
             eprintln!(
                 "S7 FINDING (ZEB-491): after pairing + reboot, P's persisted \
@@ -1709,6 +1726,25 @@ async fn s7_butler_deposit_recover() {
          (get_butler_held OK, empty) — ZEB-492 KeyTree distribution reached the engines."
     );
 
+    // --- REACHABILITY-SYNC BARRIER (durable seal-targets, Tasks 1-5). The butler
+    //     deposit resolves P's SEAL TARGETS on the SENDER (A), from A's
+    //     reachability resolver, which carries P's ReachabilityAnnounce payload
+    //     INCLUDING its DURABLE butler-set (P's butler-set advertises B2). That
+    //     resolution only succeeds for a fully-offline P if P's announce (with the
+    //     B2 butler-set) replicated to A BEFORE the kill. Block here until A has
+    //     observed P's announce (the durable butler-set rides the same announce —
+    //     the headless connectivity_list_peer_reachability DTO does not expose the
+    //     set field, so this asserts that announce-observed proxy). P is online
+    //     (relaunched post-pairing) and has pinned B2 as butler, so its publisher
+    //     advertises the B2-bearing durable set. Generous budget: the publisher
+    //     loop + community-CRDT replication is co-located but racy.
+    poll_reachability_observed(&a, &p_owner, Duration::from_secs(120))
+        .await
+        .expect(
+            "REACHABILITY: A observed P's ReachabilityAnnounce (durable butler-set) before kill",
+        );
+    eprintln!("S7 REACHABILITY: A observed P's announce; durable B2 butler-set replicated.");
+
     // --- P goes OFFLINE (real SIGKILL). The DM Space does NOT exist on P yet.
     p.kill().await.expect("kill p");
 
@@ -1721,47 +1757,22 @@ async fn s7_butler_deposit_recover() {
         .await
         .expect("a send_dm accepted by the engine");
 
-    // --- Boundary 2 (HELD): B2 holds the deposit for P while P is offline.
-    //     Generous budget — deposit fires only after DEPOSIT_NOACK_WINDOWS=2.
-    let held = poll_until(Duration::from_secs(90), || async {
+    // --- Boundary 2 (HELD): B2 holds the deposit for P while P is offline. Now a
+    //     HARD assert (was a characterize-fallback): the reachability-sync barrier
+    //     above guarantees A resolved P's durable butler-set (advertising B2)
+    //     before the kill, so the butler deposit MUST land on B2. `get_butler_held`
+    //     returns an explicit RPC/contract error rather than held=false, so a
+    //     timeout here is a genuine deposit-path failure, not a masked broken
+    //     response (Qodo / ZEB-487). Generous budget — deposit fires only after
+    //     DEPOSIT_NOACK_WINDOWS=2.
+    let held_entry = poll_until(Duration::from_secs(120), || async {
         let entries = get_butler_held(&b2).await?;
         Ok(entries
             .into_iter()
             .find(|e| e.get("senderOwnerHex").and_then(Value::as_str) == Some(a_owner.as_str())))
     })
-    .await;
-
-    let held_entry = match held {
-        Ok(e) => e,
-        Err(e) => {
-            // Surface the real cause: a poll_until timeout (deposit genuinely
-            // never landed → characterize) vs a get_butler_held RPC/contract
-            // error (a real bug worth seeing), which `get_butler_held` returns
-            // explicitly so it can't masquerade as held=false (Qodo / ZEB-487).
-            //
-            // NB (post-ZEB-492): B2's butler engine readiness is now HARD-asserted
-            // at boundary 0b above, so a timeout here is NOT an engine gap. It is
-            // the SEPARATE co-located sender->butler deposit-ROUTING gap: with P
-            // offline, A's outbox must resolve P's reachability record (in-memory
-            // CRDT cache or pkarr fallback) for a fresh butler-set advertisement to
-            // dial. Co-located that resolve returns no fresh set, so the deposit
-            // rung is skipped silently (DepositRungOutcome::SkippedNoFreshButlerSet)
-            // and A just keeps bumping its direct-send backoff — distinct from the
-            // KeyTree distribution this scenario now proves. The cross-WAN Scenario
-            // D3 is the authoritative proof of the full deposit path; file a finding
-            // ticket if it regresses there.
-            eprintln!(
-                "S7 FINDING: butler deposit not observed on B2 within 90s co-located \
-                 ({e}). B2's butler engine is up (boundary 0b passed); the gap is the \
-                 co-located sender->butler deposit-routing resolve/dial (A finds no \
-                 fresh butler set for offline P -> rung skipped), NOT ZEB-492. Confirm \
-                 via the cross-WAN Scenario D3. Skipping RECV/CLEARED."
-            );
-            run.mark_success();
-            drop((a, p, b2, a_home, p_home, b2_home));
-            return;
-        }
-    };
+    .await
+    .expect("HELD: B2 holds A's deposit for offline P (durable butler-set)");
     let held_space = held_entry
         .get("spaceIdHex")
         .and_then(Value::as_str)
@@ -1779,6 +1790,9 @@ async fn s7_butler_deposit_recover() {
     p = p.relaunch().await.expect("relaunch p");
 
     // --- Boundary 3 (RECV): A's plaintext shows up in P's thread post-reconnect.
+    //     Now a HARD assert (was a characterize-fallback): once B2 holds the
+    //     deposit (HELD passed) the P<->B2 fleet sync + apply_deposited_invite
+    //     recovery MUST complete.
     let recovered = poll_until(Duration::from_secs(120), || async {
         let msgs = read_dm_plaintext_any(&p, &[a_space.as_str()])
             .await
@@ -1789,18 +1803,10 @@ async fn s7_butler_deposit_recover() {
             .then_some(()))
     })
     .await;
-
-    if recovered.is_err() {
-        eprintln!(
-            "S7 FINDING: P did not recover the deposited DM within 120s co-located. \
-             B2-held the deposit (HELD passed) but the P<->B2 fleet sync or \
-             apply_deposited_invite recovery did not complete co-located. File a \
-             finding ticket; confirm via the cross-WAN Scenario D3. Skipping CLEARED."
-        );
-        run.mark_success();
-        drop((a, p, b2, a_home, p_home, b2_home));
-        return;
-    }
+    assert!(
+        recovered.is_ok(),
+        "RECV: P recovered the butler-deposited DM"
+    );
     eprintln!("S7 RECV: P recovered the butler-deposited DM after reconnect.");
 
     // --- CLEARED: butler's `ingested_by` is a grow-only set (the recovered

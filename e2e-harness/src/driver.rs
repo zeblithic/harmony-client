@@ -811,6 +811,90 @@ pub async fn community_listed(node: &NodeHandle, space_id: &str) -> anyhow::Resu
     Ok(false)
 }
 
+// ── Reachability-sync barrier (durable seal-targets) ─────────────────────────
+//
+// The deposit rungs (relay + butler) resolve a recipient's SEAL TARGETS on the
+// SENDER, from the sender's `ReachabilityResolver` (in-memory CRDT cache, pkarr
+// fallback) carrying the recipient's `ReachabilityAnnounce` payload — which now
+// (Tasks 1-5) carries the recipient's DURABLE butler-set. So a deposit for a
+// fully-offline recipient resolves ONLY once that recipient's announce has
+// replicated to the sender BEFORE the recipient is killed. These helpers give a
+// deterministic barrier for that replication: poll until the observing node's
+// `connectivity_list_peer_reachability` snapshot contains the target owner.
+
+/// Snapshot of the peer-reachability entries this node's LWW resolver knows.
+/// `PeerReachabilityDto` is `#[serde(rename_all = "camelCase")]` — the owner key
+/// is `ownerAddress` (the 32-hex `OwnerAddr`, same value `owner_id`/`ownerId`
+/// returns and what `add_dm_space`/friend RPCs key on). A successful response is
+/// always a JSON array; a non-array is a broken response CONTRACT, surfaced as an
+/// error rather than read as "no peers" (cf. get_relay_held / list_owner_communities).
+pub async fn list_peer_reachability(node: &NodeHandle) -> anyhow::Result<Vec<Value>> {
+    let v = node
+        .rpc("connectivity_list_peer_reachability", json!({}))
+        .await?;
+    v.as_array().cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "connectivity_list_peer_reachability response is not a JSON array \
+             (Vec<PeerReachabilityDto>): {v}"
+        )
+    })
+}
+
+/// Whether `node` has OBSERVED `target_owner`'s `ReachabilityAnnounce` — i.e. an
+/// entry whose `ownerAddress` matches the target's 32-hex owner id is present in
+/// `node`'s resolver. An entry present but missing a string `ownerAddress` is a
+/// DTO/schema mismatch, surfaced loudly rather than read as absence (the ZEB-462
+/// wrong-key trap).
+pub async fn has_observed_reachability(
+    node: &NodeHandle,
+    target_owner: &str,
+) -> anyhow::Result<bool> {
+    for e in list_peer_reachability(node).await? {
+        let owner = e
+            .get("ownerAddress")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "peer-reachability entry missing string `ownerAddress` key \
+                 (DTO/schema mismatch?): {e}"
+                )
+            })?;
+        if owner == target_owner {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Reachability-sync barrier: poll until `observer` has observed `target_owner`'s
+/// `ReachabilityAnnounce` (carrying the durable butler-set, Tasks 1-5) in its
+/// resolver, or `timeout` elapses.
+///
+/// This is the load-bearing precondition for the deposit→recover hard asserts:
+/// once the observer (the SENDER) sees the target's announce, its resolver holds
+/// the target's payload INCLUDING the durable butler-set, so a deposit for the
+/// then-offline target resolves seal targets instead of skipping the rung. The
+/// announce payload and its embedded durable butler-set replicate together via
+/// the SAME community-CRDT path, so observing the announce is observing the set.
+///
+/// NB: the headless `connectivity_list_peer_reachability` DTO
+/// (`PeerReachabilityDto`) does NOT expose the butler-set field, so this asserts
+/// the announce-observed PROXY rather than reading the set directly. The set
+/// cannot arrive separately from its carrying announce, so the proxy is exact for
+/// the replication-before-kill guarantee this barrier exists to provide.
+pub async fn poll_reachability_observed(
+    observer: &NodeHandle,
+    target_owner: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    poll_until(timeout, || async {
+        Ok(has_observed_reachability(observer, target_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::assert_sas_match;
