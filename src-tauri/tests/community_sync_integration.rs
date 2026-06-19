@@ -2607,21 +2607,6 @@ mod task3_kick_setpower_round_trip {
 //     still holds for a GENUINE failure (the Space commit is the last
 //     persistent step; a fence Err before it leaves owner-state untouched).
 
-/// RAII guard: sets `HARMONY_REDEEM_INVITE_TIMEOUT_MS` for the test and
-/// restores the prior value on Drop (including on panic), keeping the
-/// binary's env-var state clean for subsequent tests.
-struct RedeemTimeoutGuard {
-    prior: Option<std::ffi::OsString>,
-}
-impl Drop for RedeemTimeoutGuard {
-    fn drop(&mut self) {
-        match self.prior.take() {
-            Some(v) => std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", v),
-            None => std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS"),
-        }
-    }
-}
-
 /// Resolver mapping the inviter's `OwnerAddr` to a placeholder pubkey. Under
 /// the enrolled-device model the redeem verify path resolves the inviter's
 /// signer from her materialized cert, not from this pub, and these tests stop
@@ -2660,7 +2645,6 @@ struct UnreachableRedeemFixture {
     _adapter_rx: mpsc::Receiver<harmony_app::event_loop::CommunityAdapterRequest>,
     _channel_log_adapter_rx:
         mpsc::UnboundedReceiver<harmony_app::event_loop::ChannelLogAdapterRequest>,
-    _timeout_guard: RedeemTimeoutGuard,
     _dir: tempfile::TempDir,
 }
 
@@ -2679,12 +2663,12 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
     use harmony_app::owner_state_types::DeviceIdentityHash;
     use std::collections::BTreeMap;
 
-    // Short timeout so the test runs fast; restored on Drop.
-    let _timeout_guard = {
-        let prior = std::env::var_os("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
-        std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", "300");
-        RedeemTimeoutGuard { prior }
-    };
+    // No HARMONY_REDEEM_INVITE_TIMEOUT_MS override: both tests are independent of
+    // the redeem timeout. The joiner's own PendingJoin insert synchronously fires
+    // the redeem oneshot (community_state_sync.rs:1386, before the step-7d timeout
+    // await — ZEB-501), so the timeout is never reached regardless of its value
+    // and the redeem returns immediately. Avoiding the env mutation also removes
+    // the process-global cross-test env race Qodo/CodeAnt flagged on #293.
 
     // ZEB-497/ZEB-500: Alice (the inviter/admin) is a consistent ENROLLED-DEVICE
     // owner so the redeem path's `verify_inviter_enrollment` gate PASSES — her
@@ -2946,7 +2930,6 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
         pre_bytes,
         _adapter_rx,
         _channel_log_adapter_rx,
-        _timeout_guard,
         _dir: dir,
     }
 }
