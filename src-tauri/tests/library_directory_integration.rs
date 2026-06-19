@@ -788,7 +788,7 @@ async fn click_to_join_redeem_invite_smoke() {
 
     // CAS servicer stub (drains the channel so `put_local` doesn't
     // block forever on a oneshot reply). Mirrors the pattern from
-    // `community_sync_integration::redeem_invite_only_rolls_back_when_inviter_unreachable`.
+    // `community_sync_integration::build_unreachable_invite_only_redeem_fixture`.
     let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<harmony_app::content_store::CasOp>(8);
     tokio::spawn(async move {
         while let Some(op) = cas_op_rx.recv().await {

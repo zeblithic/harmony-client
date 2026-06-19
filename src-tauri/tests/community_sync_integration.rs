@@ -2584,28 +2584,88 @@ mod task3_kick_setpower_round_trip {
     }
 }
 
-// ── ZEB-262 Phase 4 Task 8: redeem_invite invite-only rollback regression ─
+// ── ZEB-500: invite-only redeem when the inviter is UNREACHABLE ──────────
 //
-// Construct an invite-only invite from Alice (admin) and drive
-// `redeem_invite_inner` from Bob's side without ever populating an
-// `OwnerDeviceCache` entry for the inviter. The inner helper's
-// `resolve_destinations_for_owner` returns an empty Vec, which
-// short-circuits to a "no destinations" Err well before the 300ms
-// timeout fires (the test typically completes in ~10ms).
+// Post-ZEB-474 (Reticulum carrier teardown) + ZEB-254 (offline
+// counter-signer queue), an unreachable/timed-out inviter no longer rolls
+// back the redemption — it COMMITS the owner-state Space (a durable
+// latched-pending join) and returns Ok. This supersedes the pre-ZEB-474
+// "rolls back when inviter unreachable" behavior this test was originally
+// named for (ZEB-258-era). ZEB-500 has the full migration rationale and the
+// confirmation that the commit is NOT a ZEB-258 regression.
 //
-// We assert:
-//   1. the call returns Err (no-destinations rollback path);
-//   2. owner-state CRDT is byte-identical pre/post the failed call
-//      (ZEB-258 reorder invariant: Space row commit must NOT happen
-//      until after the oneshot resolves successfully — and on this
-//      rollback path it never resolves at all).
+// `build_unreachable_invite_only_redeem_fixture` builds a gate-passing
+// invite-only URL (ZEB-497: Alice is a consistent enrolled-device owner so
+// `verify_inviter_enrollment` passes) plus Bob's redeem-side deps, with NO
+// reachable destination for the inviter. Two tests drive it with different
+// `fence_check` closures:
 //
-// The helper `redeem_invite_inner` accepts a closure for the
-// snapshot-then-commit fence (`F: Fn() -> Result<(), String>`); the
-// production wrapper passes a closure that re-locks `NodeState`'s std
-// Mutex and compares `generation`, while this test passes `|| Ok(())`.
-#[tokio::test]
-async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
+//   * `redeem_invite_only_commits_durable_join_when_inviter_unreachable`
+//     (fence = Ok)  — asserts the current latched-pending COMMIT.
+//   * `redeem_invite_only_rolls_back_owner_state_on_fence_failure`
+//     (fence = Err) — asserts the ZEB-258 owner-state rollback invariant
+//     still holds for a GENUINE failure (the Space commit is the last
+//     persistent step; a fence Err before it leaves owner-state untouched).
+
+/// RAII guard: sets `HARMONY_REDEEM_INVITE_TIMEOUT_MS` for the test and
+/// restores the prior value on Drop (including on panic), keeping the
+/// binary's env-var state clean for subsequent tests.
+struct RedeemTimeoutGuard {
+    prior: Option<std::ffi::OsString>,
+}
+impl Drop for RedeemTimeoutGuard {
+    fn drop(&mut self) {
+        match self.prior.take() {
+            Some(v) => std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", v),
+            None => std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS"),
+        }
+    }
+}
+
+/// Resolver mapping the inviter's `OwnerAddr` to a placeholder pubkey. Under
+/// the enrolled-device model the redeem verify path resolves the inviter's
+/// signer from her materialized cert, not from this pub, and these tests stop
+/// at the unreachable branch before any CRDT-sync round-trip would consult it.
+struct UnreachableInviterResolver {
+    addr: OwnerAddr,
+    pubkey: [u8; 64],
+}
+#[async_trait::async_trait]
+impl IdentityResolver for UnreachableInviterResolver {
+    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+        if *addr == self.addr {
+            Some(self.pubkey)
+        } else {
+            None
+        }
+    }
+}
+
+/// Everything a `redeem_invite_inner` call needs, minus the `fence_check`
+/// closure (which the two tests vary). Built fresh per test — `url`,
+/// `adapter_tx`, and `channel_log_registry` are consumed by the redeem call.
+#[allow(dead_code)] // several fields are RAII-only (held alive, never read)
+struct UnreachableRedeemFixture {
+    url: String,
+    crdt_state: Arc<Mutex<harmony_app::owner_state_crdt::OwnerState>>,
+    hlc_tracker: Arc<Mutex<std::collections::BTreeMap<String, Hlc>>>,
+    registry: Arc<CommunitySyncRegistry>,
+    adapter_tx: mpsc::Sender<harmony_app::event_loop::CommunityAdapterRequest>,
+    dm_outbox: Arc<Mutex<harmony_app::dm_outbox::DmOutbox>>,
+    channel_log_registry: Arc<harmony_app::community_channel_log_engine::ChannelLogRegistry>,
+    bob_owner: TestOwner,
+    bob_signing_key: Arc<ed25519_dalek::SigningKey>,
+    community_id: SpaceId,
+    pre_bytes: Vec<u8>,
+    _adapter_rx: mpsc::Receiver<harmony_app::event_loop::CommunityAdapterRequest>,
+    _channel_log_adapter_rx:
+        mpsc::UnboundedReceiver<harmony_app::event_loop::ChannelLogAdapterRequest>,
+    _timeout_guard: RedeemTimeoutGuard,
+    _dir: tempfile::TempDir,
+}
+
+async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixture {
+    use ed25519_dalek::Signer;
     use harmony_app::community_channel_log_engine::{
         ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
     };
@@ -2613,59 +2673,31 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         encode_invite_url, CommunityInvitePayload, InviteEpochSnapshot, InviteToken,
         MaterializedCommunityState,
     };
-    use harmony_app::community_state_sync::{
-        CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
-    };
-    use harmony_app::content_store::{ContentStore, RuntimeContentStore};
     use harmony_app::dm_outbox::DmOutbox;
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::owner_state_persist::canonicalize;
-    use harmony_app::owner_state_types::{DeviceIdentityHash, EpochKey};
+    use harmony_app::owner_state_types::DeviceIdentityHash;
     use std::collections::BTreeMap;
 
-    // Short timeout so the test runs fast. RAII guard restores any
-    // prior value on Drop (including on panic), keeping the binary's
-    // env-var state clean for subsequent tests.
-    struct RedeemTimeoutGuard {
-        prior: Option<std::ffi::OsString>,
-    }
-    impl Drop for RedeemTimeoutGuard {
-        fn drop(&mut self) {
-            match self.prior.take() {
-                Some(v) => std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", v),
-                None => std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS"),
-            }
-        }
-    }
+    // Short timeout so the test runs fast; restored on Drop.
     let _timeout_guard = {
         let prior = std::env::var_os("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
         std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", "300");
         RedeemTimeoutGuard { prior }
     };
 
-    struct AliceResolver {
-        addr: OwnerAddr,
-        pubkey: [u8; 64],
-    }
-    #[async_trait::async_trait]
-    impl IdentityResolver for AliceResolver {
-        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
-            if *addr == self.addr {
-                Some(self.pubkey)
-            } else {
-                None
-            }
-        }
-    }
-
-    // ZEB-339: the admin-bootstrap + InviteToken path still uses the IDENTITY
-    // model (verify_admin_bootstrap binds admin_identity_pub → admin_addr and
-    // verifies the bootstrap sig against it), so Alice is a PrivateIdentity here
-    // and her bootstrap Join is signed by her identity key. The invite-only
-    // payload additionally carries her enrolled-device cert (inviter_enrollment).
-    let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
-    let alice_addr = OwnerAddr(alice.identity.address_hash);
-    let alice_pub = alice.identity.to_public_bytes();
+    // ZEB-497/ZEB-500: Alice (the inviter/admin) is a consistent ENROLLED-DEVICE
+    // owner so the redeem path's `verify_inviter_enrollment` gate PASSES — her
+    // cert's owner_id == invite_token.inviter, the cert is a Master cert that
+    // verifies unexpired, and the token sig verifies against the cert's device
+    // key. With the gate passed, the redeem proceeds PAST it to the
+    // inviter-unreachable timeout branch (the gate would otherwise fail-fast on a
+    // mismatched throwaway cert). The InviteToken + bootstrap Join are signed by
+    // Alice's enrolled device_key (NOT a PrivateIdentity). Seed 0xA7 is unique
+    // here: master key [0xA7;32], device key [0x58;32] (=0xA7^0xFF) — no collision
+    // with bob_owner 0xB2 (→0x4D) or the 0xA3 throwaway (→0x5C) in this test.
+    let alice = mint_test_owner(0xA7);
+    let alice_addr = alice.owner;
     // ZEB-339: Bob (the joiner) is an enrolled-device owner — his redemption
     // Join's actor = owner_id, signed by his device key, carrying his Master
     // cert (passed into redeem_invite_inner). A separate PrivateIdentity backs
@@ -2677,11 +2709,13 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     let bob_device_hash = DeviceIdentityHash(bob.identity.address_hash);
 
     // Build an invite-only URL Alice would have generated for Bob. The
-    // InviteToken sig is computed via `PrivateIdentity::sign` over the
-    // canonical token-payload bytes (inviter, invitee_hint, minted_at).
-    // We construct a placeholder InviteToken to call
-    // `canonical_invite_token_bytes` (which only reads the payload
-    // fields, ignoring `sig`), then re-construct with the real sig.
+    // InviteToken sig is computed via Alice's enrolled `device_key`
+    // (ZEB-497: the gate's `verify_invite_token_sig_device_key` checks the sig
+    // against the device key bound in `inviter_enrollment`) over the canonical
+    // token-payload bytes (inviter, invitee_hint, minted_at). We construct a
+    // placeholder InviteToken to call `canonical_invite_token_bytes` (which only
+    // reads the payload fields, ignoring `sig`), then re-construct with the real
+    // sig.
     let community_id = SpaceId([0x33; 16]);
     let mk = EpochKey::new([0xaa; 32]);
     let minted_at = Hlc {
@@ -2699,7 +2733,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     let token_payload_bytes =
         harmony_app::community_invite::canonical_invite_token_bytes(&placeholder_token)
             .expect("canonical_invite_token_bytes");
-    let token_sig = alice.sign(&token_payload_bytes);
+    let token_sig = alice.device_key.sign(&token_payload_bytes).to_bytes();
     let invite_token = InviteToken {
         inviter: alice_addr,
         invitee_hint: Some(bob_addr),
@@ -2723,18 +2757,19 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
                 device_id: "alice-dev".into(),
             },
         };
-        let mut ev = harmony_app::community_membership::sign_event_with_identity(&payload, &alice)
-            .expect("sign admin bootstrap");
-        // ZEB-339: encode_invite_url now requires the bootstrap-Join to embed
-        // the admin's EnrollmentCert. This test rolls back before the joiner
-        // verifies it (inviter unreachable → timeout), so any present cert
-        // satisfies the encode-time presence check.
-        ev.enrollment = Some(mint_test_owner(0xA3).cert);
+        // ZEB-497: sign with Alice's enrolled device_key (not a PrivateIdentity)
+        // and attach HER OWN Master cert so the bootstrap Join is consistent with
+        // the inviter_enrollment cert the redeem gate now verifies.
+        let mut ev = sign_event(&payload, &alice.device_key).expect("sign admin bootstrap");
+        // ZEB-339: encode_invite_url requires the bootstrap-Join to embed the
+        // admin's EnrollmentCert. ZEB-497: use Alice's consistent cert
+        // (cert.owner_id == alice_addr) rather than a throwaway.
+        ev.enrollment = Some(alice.cert.clone());
         ev
     };
     // CR Major (PR #106 R6): use a real sealed_epoch_key so the snapshot
-    // decrypts successfully and any Err must come from the intended
-    // "inviter unreachable" rollback branch, not from AEAD failure.
+    // decrypts successfully — a redeem outcome must reflect the
+    // inviter-unreachable / fence path under test, not an AEAD failure.
     // Seal `mk` to Bob's x25519 pubkey (derived from Bob's ed25519 signing key).
     let sealed_epoch_key = {
         use harmony_app::dm_signing::{ed25519_pub_to_x25519, seal_to_owner};
@@ -2762,21 +2797,22 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         expires_at: None,
         invite_token: Some(invite_token),
         admin_bootstrap: Some(admin_bootstrap),
-        admin_identity_pub: Some(alice_pub),
+        // ZEB-339: admin_identity_pub is inert on the post-ZEB-339 verify path
+        // (verify_admin_bootstrap binds the cert, not this pub) but is required
+        // present at encode. Pass an inert placeholder.
+        admin_identity_pub: Some([0u8; 64]),
         forked_from: None,
         pre_fork_snapshot: None,
         // ZEB-339: invite-only payloads must carry the inviter's EnrollmentCert.
-        // ZEB-497/ZEB-500: the redeem path now cryptographically verifies this
-        // cert (verify_inviter_enrollment), so this throwaway 0xA1 cert (owner !=
-        // invite_token.inviter) makes the redeem fail-fast at the gate
-        // (InviterEnrollmentOwnerMismatch). NOTE: the "inviter unreachable -> Err
-        // + rollback" behavior this test is named for was REMOVED by ZEB-474
-        // (Reticulum teardown) — an unreachable inviter now commits the Space and
-        // returns Ok{pending}. So with a consistent cert the test would NOT see an
-        // Err; it passes today only via the gate fail-fast (no owner-state write
-        // before the gate). ZEB-500 tracks rewriting this test to current behavior
-        // (and checking the commit-on-unreachable isn't a ZEB-258 regression).
-        inviter_enrollment: Some(mint_test_owner(0xA1).cert),
+        // ZEB-497/ZEB-500: the redeem path cryptographically verifies this cert
+        // (verify_inviter_enrollment) BEFORE the inviter-unreachable timeout
+        // branch. Alice is now a consistent enrolled-device owner
+        // (mint_test_owner(0xA7)), so the gate PASSES (cert.owner_id ==
+        // invite_token.inviter == alice_addr, Master cert verifies, token sig
+        // verifies against the cert's device key) and the redeem proceeds to the
+        // unreachable timeout branch — see the assertions below for the current
+        // latched-pending behavior.
+        inviter_enrollment: Some(alice.cert.clone()),
         untargeted_decrypt_key: None,
     })
     .expect("encode URL");
@@ -2816,9 +2852,13 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "bob-dev".into(),
         content_store: cs,
-        identity_resolver: Arc::new(AliceResolver {
+        // ZEB-497: under the enrolled-device model the redeem verify path resolves
+        // Alice's signer from her materialized cert, not from this resolver pub;
+        // and this test stops at the unreachable timeout branch before any
+        // CRDT-sync round-trip would consult it. Pass an inert placeholder pub.
+        identity_resolver: Arc::new(UnreachableInviterResolver {
             addr: alice_addr,
-            pubkey: alice_pub,
+            pubkey: [0u8; 64],
         }),
         identity_dir: dir.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
@@ -2834,9 +2874,10 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
 
     // ZEB-473 (Move 1a): the unicast send channel was removed from
-    // `redeem_invite_inner` with the Reticulum carrier. The oneshot still never
-    // fires here (no countersign arrives), so the timeout path is driven the
-    // same way; this test's rollback assertion is unaffected.
+    // `redeem_invite_inner` with the Reticulum carrier; redemption proceeds via
+    // CRDT state-root sync. No admin engine is present here, so no real
+    // JoinCountersign arrives — see the per-test assertions and ZEB-501 for what
+    // satisfies the redeem oneshot regardless.
 
     // Adapter request channel — kept alive so the spawn-side dispatch
     // doesn't fail Closed. (We don't need the event_loop on the other
@@ -2867,10 +2908,10 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         bob_enrollment_sync,
     )));
 
-    // ZEB-271: ChannelLogRegistry required by the new redeem_invite_inner
+    // ZEB-271: ChannelLogRegistry required by the redeem_invite_inner
     // signature. Build a minimal instance with a dummy adapter bridge — no
-    // Zenoh session needed since this test fails before any channel-log
-    // spawns occur (inviter is unreachable → timeout → rollback).
+    // Zenoh session needed; the redeem paths under test never reach
+    // steady-state channel-log fan-out.
     let (channel_log_adapter_tx, _channel_log_adapter_rx) =
         mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
     let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
@@ -2884,57 +2925,155 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         transport_epoch_rx: None,
     });
 
-    // Pre-call snapshot of owner-state's canonical encoding. Any
-    // mutation between here and post-call would change the bytes.
+    // Pre-call snapshot of owner-state's canonical encoding — used to detect
+    // whether the redeem committed (Test A) or rolled back (Test B).
     let pre_bytes: Vec<u8> = {
         let g = crdt_state.lock().await;
         canonicalize(&g).expect("encode pre-state")
     };
 
-    // Drive `redeem_invite_inner` directly. The `fence_check` closure
-    // is a no-op for this test (production wraps a NodeState
-    // generation guard); inviter is unreachable (no
-    // OwnerDeviceCache entry for alice_addr → resolve_destinations
-    // returns empty → early Err). Either way the rollback path runs
-    // and owner-state must remain untouched.
-    let result = harmony_app::redeem_invite_inner(
+    UnreachableRedeemFixture {
         url,
-        Arc::clone(&crdt_state),
-        Arc::clone(&hlc_tracker),
-        "bob-dev".into(),
-        bob_addr,
-        Arc::clone(&bob_signing_key),
-        bob_owner.cert.clone(),
-        Arc::clone(&registry),
+        crdt_state,
+        hlc_tracker,
+        registry,
         adapter_tx,
-        None, // ZEB-434: no transport-epoch watch in this test
-        Arc::clone(&dm_outbox),
+        dm_outbox,
         channel_log_registry,
+        bob_owner,
+        bob_signing_key,
+        community_id,
+        pre_bytes,
+        _adapter_rx,
+        _channel_log_adapter_rx,
+        _timeout_guard,
+        _dir: dir,
+    }
+}
+
+/// Post-ZEB-474 / ZEB-254: an unreachable inviter no longer rolls back. The
+/// redeem COMMITS the owner-state Space (durable latched-pending join) and
+/// returns Ok. Confirmed in ZEB-500 to NOT be a ZEB-258 regression — ZEB-258
+/// governs rollback on *genuine* failure, exercised by the fence test below.
+#[tokio::test]
+async fn redeem_invite_only_commits_durable_join_when_inviter_unreachable() {
+    use harmony_app::owner_state_persist::canonicalize;
+
+    let fx = build_unreachable_invite_only_redeem_fixture().await;
+
+    // fence_check = Ok: the production snapshot-then-commit fence passes.
+    let result = harmony_app::redeem_invite_inner(
+        fx.url,
+        Arc::clone(&fx.crdt_state),
+        Arc::clone(&fx.hlc_tracker),
+        "bob-dev".into(),
+        fx.bob_owner.owner,
+        Arc::clone(&fx.bob_signing_key),
+        fx.bob_owner.cert.clone(),
+        Arc::clone(&fx.registry),
+        fx.adapter_tx,
+        None, // ZEB-434: no transport-epoch watch in this test
+        Arc::clone(&fx.dm_outbox),
+        fx.channel_log_registry,
         || Ok(()),
-        None, // ZEB-325: this test exercises the Reticulum-required fast-fail path.
+        None, // ZEB-325: no pre-delivered counter-sign
+    )
+    .await;
+
+    let dto = result.expect("unreachable inviter must COMMIT (latched-pending join), not Err");
+
+    // ZEB-501: the joiner's own PendingJoin insert synchronously satisfies the
+    // redeem oneshot (community_state_sync.rs:1386 fires on event.id ==
+    // bootstrap_join.id, before the step-7d timeout await), so the timeout
+    // never fires and `pending` is false even though no admin counter-signed.
+    // A 1ms timeout reproduces this (the fire is synchronous, not a race).
+    // Pinning current behavior; ZEB-501 decides whether the offline-admin
+    // greying should be restored or the dead ZEB-254 timeout path removed.
+    assert!(
+        !dto.pending,
+        "ZEB-501: redeem oneshot is satisfied by the joiner's own PendingJoin \
+         insert, so `pending` is currently always false here; got {dto:?}"
+    );
+
+    // The owner-state Space row IS committed — the durable latched join, the
+    // opposite of the pre-ZEB-474 rollback.
+    let post_bytes: Vec<u8> = {
+        let g = fx.crdt_state.lock().await;
+        canonicalize(&g).expect("encode post-state")
+    };
+    assert_ne!(
+        fx.pre_bytes, post_bytes,
+        "redeem must COMMIT the Space (durable latched-pending join), not roll back"
+    );
+    {
+        let g = fx.crdt_state.lock().await;
+        let row = g
+            .spaces
+            .get(&fx.community_id)
+            .expect("redeem committed the owner-state Space row");
+        // ZEB-501: pending_join_at stays None — it is only set when the step-7d
+        // timeout fires, which never happens on this path (see above).
+        assert!(
+            row.pending_join_at.is_none(),
+            "ZEB-501: pending_join_at is None here (timeout never fires); got {:?}",
+            row.pending_join_at
+        );
+        assert!(
+            row.left_at.is_none(),
+            "a fresh join must not be marked left"
+        );
+    }
+
+    fx.registry.shutdown_all().await.expect("shutdown");
+}
+
+/// ZEB-258 invariant (still load-bearing for GENUINE failures): the owner-state
+/// Space commit is the LAST persistent step (step 9), gated behind the
+/// snapshot-then-commit fence (step 8). A fence Err *before* the commit must
+/// leave owner-state byte-identical — no orphan Space row. Distinct from the
+/// inviter-unreachable timeout, which now commits (test above).
+#[tokio::test]
+async fn redeem_invite_only_rolls_back_owner_state_on_fence_failure() {
+    use harmony_app::owner_state_persist::canonicalize;
+
+    let fx = build_unreachable_invite_only_redeem_fixture().await;
+
+    // fence_check = Err: the production fence rejects (e.g. the node was
+    // stopped, or a stop+restart raced the await chain) — a GENUINE failure.
+    let result = harmony_app::redeem_invite_inner(
+        fx.url,
+        Arc::clone(&fx.crdt_state),
+        Arc::clone(&fx.hlc_tracker),
+        "bob-dev".into(),
+        fx.bob_owner.owner,
+        Arc::clone(&fx.bob_signing_key),
+        fx.bob_owner.cert.clone(),
+        Arc::clone(&fx.registry),
+        fx.adapter_tx,
+        None,
+        Arc::clone(&fx.dm_outbox),
+        fx.channel_log_registry,
+        || Err("simulated node-stopped fence rejection".to_string()),
+        None,
     )
     .await;
 
     assert!(
         result.is_err(),
-        "invite-only redeem must Err when inviter is unreachable; got {:?}",
-        result
+        "a fence-check rejection must surface as Err; got {result:?}"
     );
 
-    // ZEB-258 invariant: owner-state CRDT byte-identical pre/post the
-    // failed call. A regression that committed `minted.space` BEFORE
-    // the oneshot await would diverge here.
+    // ZEB-258: owner-state CRDT byte-identical pre/post the failed redeem.
     let post_bytes: Vec<u8> = {
-        let g = crdt_state.lock().await;
+        let g = fx.crdt_state.lock().await;
         canonicalize(&g).expect("encode post-state")
     };
     assert_eq!(
-        pre_bytes, post_bytes,
-        "ZEB-258: owner-state CRDT must be byte-identical pre/post a \
-         failed redeem_invite (orphan Space row would prove the \
-         reorder didn't land)"
+        fx.pre_bytes, post_bytes,
+        "ZEB-258: owner-state CRDT must be byte-identical after a genuine \
+         (fence) redeem failure — an orphan Space row would prove the \
+         commit-last reorder regressed"
     );
 
-    // RedeemTimeoutGuard restores the prior env-var on Drop after this.
-    registry.shutdown_all().await.expect("shutdown");
+    fx.registry.shutdown_all().await.expect("shutdown");
 }
