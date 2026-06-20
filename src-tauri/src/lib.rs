@@ -39974,7 +39974,7 @@ where
     // 6. Verify the record's inner sig, identity binding, and skew.
     if rec.verify_inner_sig().is_err()
         || rec.verify_identity_match(&admin_id_pub).is_err()
-        || rec.verify_skew(now_ms).is_err()
+        || rec.verify_freshness(now_ms).is_err()
     {
         return Ok(RedemptionOutcome {
             status: "inviter_unreachable".to_string(),
@@ -41543,7 +41543,7 @@ async fn connectivity_discover_identity(
     // Verify the record is authentic and fresh.
     if rec.verify_inner_sig().is_err()
         || rec.verify_identity_match(&identity_pub).is_err()
-        || rec.verify_skew(now_ms).is_err()
+        || rec.verify_freshness(now_ms).is_err()
     {
         return Ok(None);
     }
@@ -43051,7 +43051,7 @@ pub async fn connectivity_add_friend_by_key_inner(
     };
     if rec.verify_inner_sig().is_err()
         || rec.verify_identity_match(&identity_pub).is_err()
-        || rec.verify_skew(now_ms).is_err()
+        || rec.verify_freshness(now_ms).is_err()
     {
         // A record that doesn't authenticate is treated as not-reachable (same as
         // `connectivity_discover_identity`'s `Ok(None)`).

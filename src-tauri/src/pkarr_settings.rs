@@ -191,10 +191,28 @@ pub(crate) fn is_local_host(host: &str) -> bool {
 
 impl PkarrSettings {
     pub fn load_or_default(path: &PathBuf) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let contents = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            // Missing / unreadable file is the normal first-run case — quiet default.
+            Err(_) => return Self::default(),
+        };
+        match serde_json::from_str(&contents) {
+            Ok(settings) => settings,
+            Err(e) => {
+                // Fail CLOSED and LOUD: a corrupt settings file must not silently
+                // revert a prior opt-in, but it must NEVER fail open either —
+                // silently becoming discoverable would violate a real opt-out, and
+                // privacy-fail-open is worse than a freeze. Surface it so the
+                // operator can fix the file; fall back to the (not-discoverable)
+                // default in the meantime.
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "connectivity-settings.json failed to parse — failing closed to defaults; a prior opt-in (e.g. identity_discoverable) will NOT take effect until the file is fixed"
+                );
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self, path: &PathBuf) -> std::io::Result<()> {
@@ -214,6 +232,25 @@ mod tests {
     #[test]
     fn defaults_to_not_discoverable() {
         let settings = PkarrSettings::default();
+        assert!(!settings.identity_discoverable);
+    }
+
+    #[test]
+    fn parse_error_fails_closed_not_open() {
+        // A corrupt settings file must fail CLOSED (not discoverable), never
+        // open. Privacy-fail-open would silently violate a real opt-out.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("connectivity-settings.json");
+        std::fs::write(&path, b"{ this is not valid json").unwrap();
+        let settings = PkarrSettings::load_or_default(&path);
+        assert!(!settings.identity_discoverable);
+    }
+
+    #[test]
+    fn missing_file_returns_default() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let settings = PkarrSettings::load_or_default(&path);
         assert!(!settings.identity_discoverable);
     }
 

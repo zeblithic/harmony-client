@@ -12,6 +12,13 @@ use crate::owner_state_types::{
     deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr,
 };
 
+/// Signed validity window applied to every reachability pkarr record
+/// (identity / community / friend / invite). One epoch (7 days): covers the
+/// ~3.5-day republish gap with margin and never outlives the per-epoch
+/// ephemeral key. The resolver (`harmony_pkarr::verify_freshness`) honors a
+/// record while `now <= announced_at + this`.
+pub(crate) const REACHABILITY_RECORD_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 /// One entry of the butler-set advertisement carried in the pkarr routing
 /// blob (ZEB-418 SP2 P1, spec §3): an online device of this owner that
 /// accepts sealed DM deposits on behalf of offline siblings.
