@@ -39682,6 +39682,30 @@ async fn invite_targets_orphaned_community_dir(
     !functional_row_exists
 }
 
+/// Synthesize an iroh `EndpointAddr` from a verified reachability routing
+/// record: iroh node id (required) + home relay url (skipped if malformed) +
+/// direct addresses. Shared by the redeem and add-friend dial paths.
+fn endpoint_addr_from_routing(
+    routing: &crate::reachability_record::ReachabilityAnnouncePayload,
+) -> Result<iroh::EndpointAddr, String> {
+    let id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode iroh_node_id: {e}"))?;
+    let mut addr = iroh::EndpointAddr::new(id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => addr = addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        addr = addr.with_ip_addr(*da);
+    }
+    Ok(addr)
+}
+
 /// Inner orchestration body of `connectivity_redeem_invite_iroh`, split out
 /// so integration tests can drive it with explicit resources rather than
 /// the full Tauri AppState. ZEB-325 Phase 2c **option A**: direct iroh
@@ -40014,21 +40038,8 @@ where
     // synthesis for a Zenoh ALPN dial). The `iroh_node_id` is the iroh
     // EndpointId (32-byte Ed25519 pub); skip malformed relay URLs
     // silently (direct addrs alone may still succeed).
-    let alice_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
-        .map_err(|e| format!("decode inviter iroh_node_id: {e}"))?;
-    let mut alice_addr = iroh::EndpointAddr::new(alice_iroh_id);
-    if !routing.home_relay_url.is_empty() {
-        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
-            Ok(url) => alice_addr = alice_addr.with_relay_url(url),
-            Err(e) => tracing::trace!(
-                "skip malformed home_relay_url {:?}: {e}",
-                routing.home_relay_url
-            ),
-        }
-    }
-    for da in &routing.direct_addresses {
-        alice_addr = alice_addr.with_ip_addr(*da);
-    }
+    let mut alice_addr = endpoint_addr_from_routing(&routing)
+        .map_err(|e| format!("synthesize inviter addr: {e}"))?;
 
     // 8. Open the iroh QUIC connection on the handshake ALPN.
     //
@@ -40039,37 +40050,105 @@ where
     // QUIC-level timeout (minutes, on some configurations). Distinct
     // tracing for dial-timeout vs open_bi-timeout vs response-timeout
     // so diagnostics can attribute failures.
-    let conn = match tokio::time::timeout(
-        dial_config.connect_timeout,
-        iroh_endpoint
-            .inner()
-            .connect(alice_addr, crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1),
-    )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            tracing::warn!(
-                error = %e,
-                inviter = %hex::encode(inviter_addr.0),
-                "ZEB-325 Phase 2c option A: iroh connect failed"
-            );
-            return Ok(RedemptionOutcome {
-                status: "inviter_unreachable".to_string(),
-                community_id: None,
-            });
+    //
+    // B4: a single diverse-relay re-resolve retry. The first
+    // `resolve_window` hit may have come from a stale relay serving a
+    // dead endpoint; on the FIRST connect failure we re-resolve the
+    // freshest record across ALL relays (`resolve_window_freshest`),
+    // re-verify + re-decode + re-synthesize the addr, and dial once
+    // more. Only CONNECT failures trigger the retry — a fresher addr
+    // fixes "can't reach the endpoint", not a post-connect stream
+    // failure (open_bi stays one-shot below).
+    let mut conn = None;
+    for attempt in 0..2 {
+        match tokio::time::timeout(
+            dial_config.connect_timeout,
+            iroh_endpoint.inner().connect(
+                alice_addr.clone(),
+                crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(c)) => {
+                conn = Some(c);
+                break;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    inviter = %hex::encode(inviter_addr.0),
+                    "ZEB-325 Phase 2c option A: iroh connect failed"
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_ms = dial_config.connect_timeout.as_millis() as u64,
+                    attempt,
+                    inviter = %hex::encode(inviter_addr.0),
+                    "ZEB-325 Phase 2c option A: iroh connect timeout (dial)"
+                );
+            }
         }
-        Err(_elapsed) => {
-            tracing::warn!(
-                timeout_ms = dial_config.connect_timeout.as_millis() as u64,
-                inviter = %hex::encode(inviter_addr.0),
-                "ZEB-325 Phase 2c option A: iroh connect timeout (dial)"
-            );
-            return Ok(RedemptionOutcome {
-                status: "inviter_unreachable".to_string(),
-                community_id: None,
-            });
+        // After the first failure, try a diverse-relay re-resolve before
+        // the final attempt. If the freshest record fails to resolve,
+        // verify, decode, or synthesize, fall through to the
+        // unreachable outcome below.
+        if attempt == 0 {
+            match resolver.resolve_window_freshest(&verifying_keys).await {
+                Ok(Some(rec2))
+                    if rec2.verify_inner_sig().is_ok()
+                        && rec2.verify_identity_match(&admin_id_pub).is_ok()
+                        && rec2.verify_freshness(now_ms).is_ok() =>
+                {
+                    match ciborium::from_reader::<
+                        crate::reachability_record::ReachabilityAnnouncePayload,
+                        _,
+                    >(rec2.routing_blob.as_slice())
+                    {
+                        Ok(routing2) => match endpoint_addr_from_routing(&routing2) {
+                            Ok(addr2) => {
+                                tracing::info!(
+                                    inviter = %hex::encode(inviter_addr.0),
+                                    "ZEB-325 Phase 2c option A: connect failed — \
+                                     re-resolved freshest record across all relays, \
+                                     retrying dial"
+                                );
+                                alice_addr = addr2;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "B4: re-resolved record synthesize failed"
+                                );
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "B4: re-resolved routing_blob decode failed"
+                            );
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    tracing::warn!(
+                        inviter = %hex::encode(inviter_addr.0),
+                        "B4: diverse-relay re-resolve found no fresh verified record"
+                    );
+                    break;
+                }
+            }
         }
+    }
+    let Some(conn) = conn else {
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
     };
     let (mut send, mut recv) =
         match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
@@ -43063,39 +43142,96 @@ pub async fn connectivity_add_friend_by_key_inner(
             .map_err(|e| format!("decode routing_blob: {e}"))?;
 
     // 3. Synthesize an EndpointAddr from the verified routing record.
-    let target_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
-        .map_err(|e| format!("decode target iroh_node_id: {e}"))?;
-    let mut target_addr = iroh::EndpointAddr::new(target_iroh_id);
-    if !routing.home_relay_url.is_empty() {
-        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
-            Ok(url) => target_addr = target_addr.with_relay_url(url),
-            Err(e) => tracing::trace!(
-                "skip malformed home_relay_url {:?}: {e}",
-                routing.home_relay_url
-            ),
-        }
-    }
-    for da in &routing.direct_addresses {
-        target_addr = target_addr.with_ip_addr(*da);
-    }
+    let mut target_addr =
+        endpoint_addr_from_routing(&routing).map_err(|e| format!("synthesize target addr: {e}"))?;
 
     // 4. Connect on the friend ALPN + open a bi-stream, bounded by dial_config.
-    let conn = match tokio::time::timeout(
-        dial_config.connect_timeout,
-        iroh_endpoint
-            .inner()
-            .connect(target_addr, crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1),
-    )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => return Err(format!("target_unreachable: iroh connect failed: {e}")),
-        Err(_elapsed) => {
-            return Err(format!(
-                "target_unreachable: iroh connect timeout after {}ms",
-                dial_config.connect_timeout.as_millis()
-            ));
+    //
+    // B4: a single diverse-relay re-resolve retry. On the FIRST connect
+    // failure we re-resolve the freshest record across ALL relays
+    // (`resolve_window_freshest`) — a stale first-hit relay may have
+    // served a dead endpoint — re-verify it against `identity_pub`,
+    // re-decode, re-synthesize the addr, and dial once more. Only CONNECT
+    // failures retry (open_bi below stays one-shot). The final failure
+    // returns the SAME `target_unreachable: ...` error string as a
+    // one-shot dial would.
+    let mut conn = None;
+    let mut last_err: Option<String> = None;
+    for attempt in 0..2 {
+        match tokio::time::timeout(
+            dial_config.connect_timeout,
+            iroh_endpoint.inner().connect(
+                target_addr.clone(),
+                crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(c)) => {
+                conn = Some(c);
+                break;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, attempt, "add_friend_by_key: iroh connect failed");
+                last_err = Some(format!("target_unreachable: iroh connect failed: {e}"));
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_ms = dial_config.connect_timeout.as_millis() as u64,
+                    attempt,
+                    "add_friend_by_key: iroh connect timeout (dial)"
+                );
+                last_err = Some(format!(
+                    "target_unreachable: iroh connect timeout after {}ms",
+                    dial_config.connect_timeout.as_millis()
+                ));
+            }
         }
+        // After the first failure, try a diverse-relay re-resolve before
+        // the final attempt. If the freshest record fails to resolve,
+        // verify, decode, or synthesize, fall through to `last_err` below.
+        if attempt == 0 {
+            match resolver.resolve_window_freshest(&verifying_keys).await {
+                Ok(Some(rec2))
+                    if rec2.verify_inner_sig().is_ok()
+                        && rec2.verify_identity_match(&identity_pub).is_ok()
+                        && rec2.verify_freshness(now_ms).is_ok() =>
+                {
+                    match ciborium::from_reader::<
+                        crate::reachability_record::ReachabilityAnnouncePayload,
+                        _,
+                    >(rec2.routing_blob.as_slice())
+                    {
+                        Ok(routing2) => match endpoint_addr_from_routing(&routing2) {
+                            Ok(addr2) => {
+                                tracing::info!(
+                                    "add_friend_by_key: connect failed — re-resolved \
+                                     freshest record across all relays, retrying dial"
+                                );
+                                target_addr = addr2;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "B4: re-resolved record synthesize failed");
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, "B4: re-resolved routing_blob decode failed");
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    tracing::warn!("B4: diverse-relay re-resolve found no fresh verified record");
+                    break;
+                }
+            }
+        }
+    }
+    let Some(conn) = conn else {
+        return Err(
+            last_err.unwrap_or_else(|| "target_unreachable: iroh connect failed".to_string())
+        );
     };
     let (mut send, mut recv) =
         match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
@@ -51672,6 +51808,57 @@ mod zeb_321_connectivity_ipc_tests {
         );
         assert_eq!(entry.record.home_relay_url, "https://relay.example/");
         assert_eq!(entry.record.announced_at_ms, 1_700_000_000_000);
+    }
+
+    /// B4: `endpoint_addr_from_routing` synthesizes an `EndpointAddr` whose
+    /// id matches `EndpointId::from_bytes(iroh_node_id)` for a valid
+    /// 32-byte node id (a real Ed25519 verifying key).
+    #[test]
+    fn endpoint_addr_from_routing_valid_node_id() {
+        use ed25519_dalek::SigningKey;
+        let node_id = SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes();
+        let routing = crate::reachability_record::ReachabilityAnnouncePayload {
+            iroh_node_id: node_id,
+            home_relay_url: "https://relay.example/".into(),
+            direct_addresses: vec![],
+            announced_at_ms: 1_700_000_000_000,
+            identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
+        };
+        let addr = endpoint_addr_from_routing(&routing).expect("valid node id → Ok");
+        assert_eq!(
+            addr.id,
+            iroh::EndpointId::from_bytes(&node_id).expect("valid EndpointId"),
+            "synthesized addr id must match the routing record's iroh_node_id"
+        );
+    }
+
+    /// B4: a malformed `home_relay_url` is skipped (logged at trace), NOT
+    /// fatal — synthesis still succeeds as long as the node id is valid.
+    #[test]
+    fn endpoint_addr_from_routing_skips_malformed_relay() {
+        use ed25519_dalek::SigningKey;
+        let node_id = SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes();
+        let routing = crate::reachability_record::ReachabilityAnnouncePayload {
+            iroh_node_id: node_id,
+            home_relay_url: "not a url".into(),
+            direct_addresses: vec![],
+            announced_at_ms: 1_700_000_000_000,
+            identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
+        };
+        let addr =
+            endpoint_addr_from_routing(&routing).expect("malformed relay skipped, not fatal");
+        assert_eq!(
+            addr.id,
+            iroh::EndpointId::from_bytes(&node_id).expect("valid EndpointId"),
+        );
     }
 }
 
