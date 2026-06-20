@@ -792,7 +792,20 @@ impl ProdCommunityRelayDepositClient {
 #[async_trait]
 impl crate::community_relay::CommunityRelayDepositClient for ProdCommunityRelayDepositClient {
     async fn deposit(&self, req: &crate::butler_deposit::ButlerDepositRequest) -> bool {
-        // 1. Resolve R's fresh butler set — the SEAL TARGETS (R's device keys,
+        // 1. Communities both parties have Joined (D40 gate). None → no relay
+        //    rung is permitted. Checked FIRST (ahead of the seal-target resolve
+        //    and the enrolled-device fallback) so a stale cross-community
+        //    `OwnerDeviceCache` entry can't drive wasted target derivation — the
+        //    fallback's `crdt_state` lock + vk extraction — for a recipient we no
+        //    longer share a community with; this membership gate would reject the
+        //    deposit regardless (Greptile P2). The gate is membership-only and
+        //    never permits a deposit on its own.
+        let communities = self.shared_communities(&req.recipient_owner).await;
+        if communities.is_empty() {
+            return false;
+        }
+
+        // 2. Resolve R's fresh butler set — the SEAL TARGETS (R's device keys,
         //    NOT any relay's). Empty → fall back to R's ENROLLED device vks from
         //    durable community membership (the relay only seals to a vk; it
         //    holds the ciphertext, R pulls — no endpoint dial to R). Still empty
@@ -807,13 +820,6 @@ impl crate::community_relay::CommunityRelayDepositClient for ProdCommunityRelayD
                 .await;
         }
         if targets.is_empty() {
-            return false;
-        }
-
-        // 2. Communities both parties have Joined (D40 gate). None → no relay
-        //    rung is permitted.
-        let communities = self.shared_communities(&req.recipient_owner).await;
-        if communities.is_empty() {
             return false;
         }
 
@@ -2384,6 +2390,68 @@ mod tests {
         assert!(
             sealed_blobs.lock().await.is_empty(),
             "no enrolled devices and no butler-set → no dial"
+        );
+    }
+
+    /// Greptile P2 regression: the D40 shared-community gate is checked BEFORE
+    /// the enrolled-device fallback, so a STALE `OwnerDeviceCache` entry for a
+    /// recipient we no longer share a community with cannot drive a deposit (or
+    /// the fallback's target derivation). The recipient HAS a derivable enrolled
+    /// device here AND the relay would ack — but with no shared community the
+    /// deposit short-circuits to false with no dial.
+    #[tokio::test]
+    async fn relay_deposit_no_deposit_when_stale_cache_but_no_shared_community() {
+        use crate::owner_state_types::{DeviceIdentityHash, OwnerDeviceEntry};
+
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+
+        // A derivable enrolled-device entry survives in the cache (e.g. from an
+        // old projection before the sender left the shared community).
+        let (_dev_key, dev_pub) = recipient_device_identity(0xA1);
+        let crdt_state = crdt_with_spaces(&[(community, SpaceKind::Community)]);
+        {
+            let mut st = crdt_state.lock().await;
+            st.owner_device_cache.devices.insert(
+                OwnerAddr(recipient),
+                OwnerDeviceEntry {
+                    devices: vec![DeviceIdentityHash([0xA1; 16])],
+                    device_identity_pubs: vec![Some(dev_pub)],
+                    learned_at: Hlc {
+                        wall_ms: 1,
+                        logical: 0,
+                        device_id: "t".into(),
+                    },
+                    device_tunnel_contacts: vec![None],
+                },
+            );
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve { targets: vec![] }), // no butler-set
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(MockDial {
+                acking: HashSet::from([[0x01; 16]]), // would ack if reached
+                calls: calls.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_state,
+            // Only the SENDER is joined — recipient is NOT a co-member.
+            fake(&[(SpaceId([community; 16]), sender)]),
+        );
+
+        assert!(
+            !client.deposit(&req(recipient, cid)).await,
+            "no shared community → false even though a stale enrolled-device entry exists"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "D40 gate short-circuits before any relay dial"
         );
     }
 
