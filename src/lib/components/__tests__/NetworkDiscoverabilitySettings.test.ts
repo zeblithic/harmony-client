@@ -18,7 +18,11 @@ import type { RelayHealth } from '../../types/network-health';
 const mockInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 
 // Default relay list matching Rust default_relays() — must stay in sync.
-const DEFAULT_RELAYS = ['https://relay.pkarr.org', 'https://pkarr.pubky.app'];
+const DEFAULT_RELAYS = [
+  'https://pkarr.q8.fyi',
+  'https://relay.pkarr.org',
+  'https://pkarr.pubky.app',
+];
 
 function makeRelay(url: string, healthy = true): RelayHealth {
   return {
@@ -217,11 +221,11 @@ describe('NetworkDiscoverabilitySettings', () => {
 
       await waitFor(() => {
         const rows = screen.getAllByTestId('relay-row');
-        expect(rows.length).toBe(2);
+        expect(rows.length).toBe(DEFAULT_RELAYS.length);
       });
 
       const badges = screen.getAllByTestId('relay-badge');
-      expect(badges.length).toBe(2);
+      expect(badges.length).toBe(DEFAULT_RELAYS.length);
       badges.forEach((b) => expect(b.textContent).toContain('Healthy'));
     });
 
@@ -292,9 +296,9 @@ describe('NetworkDiscoverabilitySettings', () => {
       const errEl = screen.getByTestId('relay-error');
       expect(errEl.textContent).toContain('invalid URL: missing scheme');
 
-      // List must remain unchanged (2 default relays).
+      // List must remain unchanged (the default relays).
       const rows = screen.getAllByTestId('relay-row');
-      expect(rows.length).toBe(2);
+      expect(rows.length).toBe(DEFAULT_RELAYS.length);
     });
 
     it('Remove submits remove_pkarr_relay with only the target URL (server-authoritative RMW)', async () => {
@@ -441,8 +445,8 @@ describe('NetworkDiscoverabilitySettings', () => {
 
       render(NetworkDiscoverabilitySettings);
 
-      // Initial load succeeds: both relays render, no error.
-      await waitFor(() => expect(screen.getAllByTestId('relay-row')).toHaveLength(2));
+      // Initial load succeeds: all default relays render, no error.
+      await waitFor(() => expect(screen.getAllByTestId('relay-row')).toHaveLength(DEFAULT_RELAYS.length));
       expect(screen.queryByTestId('relay-error')).toBeNull();
 
       // A subsequent event-driven refresh fails.
@@ -457,7 +461,7 @@ describe('NetworkDiscoverabilitySettings', () => {
         expect(getCalls.length).toBeGreaterThanOrEqual(2);
       });
       expect(screen.queryByTestId('relay-error')).toBeNull();
-      expect(screen.getAllByTestId('relay-row')).toHaveLength(2);
+      expect(screen.getAllByTestId('relay-row')).toHaveLength(DEFAULT_RELAYS.length);
     });
   });
 });
