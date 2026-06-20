@@ -40096,11 +40096,15 @@ where
         // verify, decode, or synthesize, fall through to the
         // unreachable outcome below.
         if attempt == 0 {
+            // Resample wall-clock: the original now_ms predates the first
+            // resolve + connect-timeout awaits, so a fresh sample keeps the TTL
+            // check honest for this re-resolved record.
+            let retry_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
             match resolver.resolve_window_freshest(&verifying_keys).await {
                 Ok(Some(rec2))
                     if rec2.verify_inner_sig().is_ok()
                         && rec2.verify_identity_match(&admin_id_pub).is_ok()
-                        && rec2.verify_freshness(now_ms).is_ok() =>
+                        && rec2.verify_freshness(retry_now_ms).is_ok() =>
                 {
                     match ciborium::from_reader::<
                         crate::reachability_record::ReachabilityAnnouncePayload,
@@ -40115,6 +40119,19 @@ where
                                      re-resolved freshest record across all relays, \
                                      retrying dial"
                                 );
+                                // Re-seed the ReachabilityResolver with the
+                                // fresher record so a follow-up dial (e.g.
+                                // IrohZenohLinkManager::new_link, which reads the
+                                // resolver to synthesize an EndpointAddr) targets
+                                // the same endpoint we're about to dial — not the
+                                // stale pre-retry one.
+                                reachability_resolver
+                                    .seed_from_pkarr(
+                                        inviter_addr,
+                                        crate::owner_state_types::DeviceIdentityHash([0u8; 16]),
+                                        routing2.clone(),
+                                    )
+                                    .await;
                                 alice_addr = addr2;
                             }
                             Err(e) => {
@@ -43191,11 +43208,15 @@ pub async fn connectivity_add_friend_by_key_inner(
         // the final attempt. If the freshest record fails to resolve,
         // verify, decode, or synthesize, fall through to `last_err` below.
         if attempt == 0 {
+            // Resample wall-clock: the original now_ms predates the first
+            // resolve + connect-timeout awaits, so a fresh sample keeps the TTL
+            // check honest for this re-resolved record.
+            let retry_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
             match resolver.resolve_window_freshest(&verifying_keys).await {
                 Ok(Some(rec2))
                     if rec2.verify_inner_sig().is_ok()
                         && rec2.verify_identity_match(&identity_pub).is_ok()
-                        && rec2.verify_freshness(now_ms).is_ok() =>
+                        && rec2.verify_freshness(retry_now_ms).is_ok() =>
                 {
                     match ciborium::from_reader::<
                         crate::reachability_record::ReachabilityAnnouncePayload,
