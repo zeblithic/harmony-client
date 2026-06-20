@@ -7032,7 +7032,6 @@ pub async fn start_node_inner(
                     //     short-lived invite bootstraps, not what butler-set
                     //     resolution reads (identity/friend records are).
                     let routing_republish: std::sync::Arc<dyn Fn() + Send + Sync> = {
-                        let publisher = std::sync::Arc::clone(&pkarr_publisher_arc);
                         let identity_pub = std::sync::Arc::clone(&pkarr_identity_pub);
                         let community_pub = std::sync::Arc::clone(&pkarr_community_pub);
                         let friend_pub = std::sync::Arc::clone(&pkarr_friend_pub);
@@ -7045,9 +7044,11 @@ pub async fn start_node_inner(
                         let hlc_tracker = std::sync::Arc::clone(&tracker);
                         let republish_device_id = device_id.clone();
                         let ep_opt = iroh_endpoint_arc.clone();
+                        // ZEB-516: captured so the periodic identity (case-B)
+                        // republish reads the persisted discoverable setting.
+                        let pkarr_settings_path = pkarr_settings_path.clone();
                         std::sync::Arc::new(move || {
                             // Per-invocation clones — the closure is `Fn`.
-                            let publisher = std::sync::Arc::clone(&publisher);
                             let identity_pub = std::sync::Arc::clone(&identity_pub);
                             let community_pub = std::sync::Arc::clone(&community_pub);
                             let friend_pub = std::sync::Arc::clone(&friend_pub);
@@ -7060,6 +7061,7 @@ pub async fn start_node_inner(
                             let hlc_tracker = std::sync::Arc::clone(&hlc_tracker);
                             let device_id = republish_device_id.clone();
                             let ep_opt = ep_opt.clone();
+                            let pkarr_settings_path = pkarr_settings_path.clone();
                             tokio::spawn(async move {
                                 // 1. Fleet-net self-row re-stamp (fresh
                                 //    seen_at + current relay), mirroring the
@@ -7098,13 +7100,28 @@ pub async fn start_node_inner(
                                     }
                                     fleet_engine.notify_dirty();
                                 }
-                                // 2. Identity (case B) — only when active.
-                                let identity_active = publisher
-                                    .active_handles()
+                                // 2. Identity (case B) — re-publish whenever the
+                                //    user has opted in, read from the PERSISTED
+                                //    setting (same source of truth as the boot
+                                //    enable + the toggle IPC), NOT the publisher's
+                                //    current handle set. case-C/D below refresh
+                                //    unconditionally; gating case-B on
+                                //    `active_handles` made it the one publication
+                                //    with no redundancy, so a single dropped boot
+                                //    publish froze the identity record forever.
+                                //    Reading the setting self-heals it on the next
+                                //    tick. (ZEB-516)
+                                // Read the persisted setting OFF the executor — a
+                                // sync file read on the tick would block the
+                                // runtime thread; matches the off-executor
+                                // disk-read pattern (PR #207/#280).
+                                let identity_discoverable =
+                                    tokio::task::spawn_blocking(move || {
+                                        identity_republish_enabled(&pkarr_settings_path)
+                                    })
                                     .await
-                                    .iter()
-                                    .any(|h| h == pkarr_identity_publisher::HANDLE);
-                                if identity_active {
+                                    .unwrap_or(false);
+                                if identity_discoverable {
                                     identity_pub.enable().await;
                                 }
                                 // 3. Community (case C).
@@ -7133,7 +7150,7 @@ pub async fn start_node_inner(
                                     .await;
                                 }
                                 tracing::debug!(
-                                    identity = identity_active,
+                                    identity = identity_discoverable,
                                     friends = friends_snapshot.len(),
                                     "ZEB-418 P2: routing-record re-publish completed"
                                 );
@@ -41293,6 +41310,48 @@ fn effective_persisted_relays(settings_path: Option<&std::path::Path>) -> Vec<St
         .map(|p| pkarr_settings::PkarrSettings::load_or_default(&p.to_path_buf()).relays)
         .unwrap_or_default();
     effective_pkarr_relays(persisted)
+}
+
+/// ZEB-516: case-B (identity) pkarr re-publish gate for `routing_republish`.
+/// Reads the PERSISTED `identity_discoverable` flag — the same source of truth
+/// as the boot enable and the toggle IPC — so the periodic refresh re-publishes
+/// the identity record whenever the user has opted in, independent of the
+/// publisher's current handle set. case-C/D refresh unconditionally; gating
+/// case-B on `active_handles` left it with no redundancy, so a single dropped
+/// boot publish froze the identity record permanently. Returns false when the
+/// setting is off or the file is missing/unreadable (matches `load_or_default`).
+fn identity_republish_enabled(settings_path: &std::path::Path) -> bool {
+    pkarr_settings::PkarrSettings::load_or_default(&settings_path.to_path_buf())
+        .identity_discoverable
+}
+
+#[cfg(test)]
+mod identity_republish_gate_tests {
+    use super::identity_republish_enabled;
+
+    #[test]
+    fn follows_persisted_setting_not_handle_state() {
+        // ZEB-516: the periodic refresh must re-publish case-B based on the
+        // PERSISTED discoverable setting, NOT whether "identity" is already in
+        // the publisher's active handles — so a dropped/never-landed boot
+        // publish self-heals on the next tick (mirroring case-C/D).
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        std::fs::write(&path, r#"{"identity_discoverable":true}"#).expect("write");
+        assert!(
+            identity_republish_enabled(&path),
+            "discoverable=true must enable case-B republish"
+        );
+        std::fs::write(&path, r#"{"identity_discoverable":false}"#).expect("write");
+        assert!(
+            !identity_republish_enabled(&path),
+            "discoverable=false must disable case-B republish"
+        );
+        assert!(
+            !identity_republish_enabled(&td.path().join("missing.json")),
+            "missing settings file must default to off (no publish)"
+        );
+    }
 }
 
 /// ZEB-380: serializes all pkarr-relay settings mutations (add/remove/set/reset)
