@@ -190,27 +190,54 @@ pub(crate) fn is_local_host(host: &str) -> bool {
 }
 
 impl PkarrSettings {
+    /// Most-restrictive settings for when persisted state is present but
+    /// untrustworthy (corrupt or unreadable). Distinct from [`Default`], which
+    /// is the genuine first-run profile: `Default` leaves `friend_auto_accept_known`
+    /// ON (the product default), so reusing it on a corrupt file would silently
+    /// re-grant auto-accept to a user who had opted OUT. Fail closed on every
+    /// privacy/trust toggle (`identity_discoverable` OFF, `friend_auto_accept_known`
+    /// OFF) while keeping the vetted relay pool — relays are operational
+    /// infrastructure, not a user opt-out, and emptying them would brick
+    /// connectivity for no security gain.
+    fn fail_closed_defaults() -> Self {
+        Self {
+            identity_discoverable: false,
+            friend_auto_accept_known: false,
+            relays: default_relays(),
+        }
+    }
+
     pub fn load_or_default(path: &PathBuf) -> Self {
         let contents = match std::fs::read_to_string(path) {
             Ok(s) => s,
-            // Missing / unreadable file is the normal first-run case — quiet default.
-            Err(_) => return Self::default(),
+            // A genuinely-absent file is the normal first-run case — quiet default.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                // An existing-but-unreadable file (permissions, I/O error) is NOT
+                // first-run: treating it as one could silently drop a prior
+                // opt-out. Fail CLOSED and LOUD until the file is readable again.
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "connectivity-settings.json could not be read — failing closed; any prior privacy/trust opt-out stays in effect until the file is readable"
+                );
+                return Self::fail_closed_defaults();
+            }
         };
         match serde_json::from_str(&contents) {
             Ok(settings) => settings,
             Err(e) => {
-                // Fail CLOSED and LOUD: a corrupt settings file must not silently
-                // revert a prior opt-in, but it must NEVER fail open either —
-                // silently becoming discoverable would violate a real opt-out, and
-                // privacy-fail-open is worse than a freeze. Surface it so the
-                // operator can fix the file; fall back to the (not-discoverable)
-                // default in the meantime.
+                // Fail CLOSED and LOUD: a corrupt settings file must NEVER fail
+                // open — silently becoming discoverable or re-enabling auto-accept
+                // would violate a real opt-out, and privacy-fail-open is worse
+                // than a freeze. Surface it so the operator can fix the file; use
+                // the most-restrictive defaults in the meantime.
                 tracing::error!(
                     path = %path.display(),
                     error = %e,
-                    "connectivity-settings.json failed to parse — failing closed to defaults; a prior opt-in (e.g. identity_discoverable) will NOT take effect until the file is fixed"
+                    "connectivity-settings.json failed to parse — failing closed; any prior privacy/trust opt-in will NOT take effect until the file is fixed"
                 );
-                Self::default()
+                Self::fail_closed_defaults()
             }
         }
     }
@@ -237,21 +264,40 @@ mod tests {
 
     #[test]
     fn parse_error_fails_closed_not_open() {
-        // A corrupt settings file must fail CLOSED (not discoverable), never
-        // open. Privacy-fail-open would silently violate a real opt-out.
+        // A corrupt settings file must fail CLOSED on EVERY privacy/trust toggle,
+        // never open. Privacy-fail-open would silently violate a real opt-out —
+        // both `identity_discoverable` (don't broadcast) and
+        // `friend_auto_accept_known` (don't auto-accept) must land restrictive.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("connectivity-settings.json");
         std::fs::write(&path, b"{ this is not valid json").unwrap();
         let settings = PkarrSettings::load_or_default(&path);
         assert!(!settings.identity_discoverable);
+        assert!(!settings.friend_auto_accept_known);
+    }
+
+    #[test]
+    fn unreadable_file_fails_closed_not_first_run() {
+        // An existing-but-unreadable path must NOT be mistaken for first-run
+        // (which would re-enable auto-accept). A directory at the settings path
+        // yields a non-NotFound read error, exercising the fail-closed branch.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("connectivity-settings.json");
+        std::fs::create_dir(&path).unwrap();
+        let settings = PkarrSettings::load_or_default(&path);
+        assert!(!settings.identity_discoverable);
+        assert!(!settings.friend_auto_accept_known);
     }
 
     #[test]
     fn missing_file_returns_default() {
+        // A genuinely-absent file IS first-run: the product default
+        // (auto-accept ON) applies, distinct from the fail-closed paths above.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("does-not-exist.json");
         let settings = PkarrSettings::load_or_default(&path);
         assert!(!settings.identity_discoverable);
+        assert!(settings.friend_auto_accept_known);
     }
 
     #[test]
