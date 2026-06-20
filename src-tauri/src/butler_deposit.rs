@@ -31,7 +31,7 @@ use crate::owner_state_crypto::{
     canonical_cbor_decode, canonical_cbor_encode, sealed::CanonicalPayloadSealed, CanonicalPayload,
 };
 use crate::owner_state_types::{ContentId, OutboxEntryId, OwnerAddr, SpaceId};
-use crate::reachability_record::{fresh_butler_set, ButlerSetEntry, ReachabilityAnnouncePayload};
+use crate::reachability_record::{ButlerSetEntry, ReachabilityAnnouncePayload};
 
 /// Domain-separation prefix for the deposit frame signature. The sender's
 /// cert-bound device ed25519 signs `domain ‖ recipient_owner ‖ sealed_blob`
@@ -406,19 +406,43 @@ pub fn build_deposit_frame(
     })
 }
 
-/// Pick the butler set to dial from the recipient's resolved routing blobs:
-/// each of the owner's devices publishes a whole-fleet set (spec §3 — "both
-/// writers describe the same fleet"), so take the FRESH set with the newest
-/// `bs_at` rather than merging across blobs. Freshness + the max-2 cap are
-/// enforced per blob by [`crate::reachability_record::fresh_butler_set`];
-/// an empty return means "no fresh butler set" (rung skipped silently).
-pub(crate) fn freshest_butler_set(
-    blobs: &[ReachabilityAnnouncePayload],
+/// Pick the butler set to dial from the recipient's resolved routing blobs,
+/// carrying each blob's reachability source for the per-source freshness policy:
+/// durable-CRDT entries are window-exempt
+/// ([`crate::reachability_record::durable_butler_set`]) because their vk
+/// seal-targets stay valid even when the recipient's primary device is
+/// long-offline; pkarr-live entries keep the 15-min window
+/// ([`crate::reachability_record::fresh_butler_set`]). Each of the owner's
+/// devices publishes a whole-fleet set (spec §3 — "both writers describe the
+/// same fleet"), so among the entries that yield a non-empty set we take the one
+/// with the newest `bs_at` rather than merging across blobs. The max-2 cap is
+/// enforced per blob by the underlying readers; an empty return means "no
+/// resolvable butler set" (rung skipped silently).
+///
+/// Task 4 wires both production deposit rungs to this selector:
+/// [`IrohButlerDepositClient::deposit`] (same module) and
+/// [`crate::community_relay_prod::ReachabilityButlerSetResolve::resolve_targets`].
+pub(crate) fn freshest_butler_set_by_source(
+    tagged: &[(
+        ReachabilityAnnouncePayload,
+        crate::reachability_resolver::ReachabilitySource,
+    )],
     now_ms: u64,
 ) -> Vec<ButlerSetEntry> {
-    blobs
+    use crate::reachability_resolver::ReachabilitySource;
+    tagged
         .iter()
-        .map(|b| (b.bs_at, fresh_butler_set(b, now_ms)))
+        .map(|(b, src)| {
+            let set = match src {
+                ReachabilitySource::DurableCrdt => {
+                    crate::reachability_record::durable_butler_set(b)
+                }
+                ReachabilitySource::PkarrLive => {
+                    crate::reachability_record::fresh_butler_set(b, now_ms)
+                }
+            };
+            (b.bs_at, set)
+        })
         .filter(|(_, set)| !set.is_empty())
         .max_by_key(|(bs_at, _)| *bs_at)
         .map(|(_, set)| set)
@@ -427,8 +451,10 @@ pub(crate) fn freshest_butler_set(
 
 /// Production [`ButlerDepositClient`] (ZEB-418 P1 Task 8): resolve the
 /// RECIPIENT OWNER's routing record (in-memory CRDT cache first, pkarr
-/// fallback on miss, via `ReachabilityResolver::resolve_async`), read the
-/// freshest advertised butler set, and try each entry in priority order —
+/// fallback on miss, via `ReachabilityResolver::resolve_async_with_source`),
+/// read the freshest advertised butler set via [`freshest_butler_set_by_source`]
+/// (durable-CRDT entries window-exempt, pkarr-live windowed — Task 4), and try
+/// each entry in priority order —
 /// dial `harmony/butler-deposit/v1`, write the length-prefixed sealed
 /// frame, read the length-prefixed ack, verify the ack matches the deposit.
 /// First ack wins; every entry failing = rung failure (the caller's retry
@@ -514,8 +540,11 @@ impl ButlerDepositClient for IrohButlerDepositClient {
         // 1. Resolve the recipient OWNER's routing blobs and read the
         // freshest advertised butler set. Missing/stale → rung silently
         // skipped (spec §6: a stale ad can never make delivery worse).
-        let blobs = self.resolver.resolve_async(&req.recipient_owner).await;
-        let entries = freshest_butler_set(&blobs, req.now_ms);
+        let tagged = self
+            .resolver
+            .resolve_async_with_source(&req.recipient_owner)
+            .await;
+        let entries = freshest_butler_set_by_source(&tagged, req.now_ms);
         if entries.is_empty() {
             return DepositRungOutcome::SkippedNoFreshButlerSet;
         }
@@ -845,42 +874,156 @@ mod tests {
         assert_eq!(body.len(), DEPOSIT_MAX_FRAME_BYTES);
     }
 
-    /// ZEB-418 P1 Task 8: the sender's butler-set selection takes the FRESH
-    /// set with the newest `bs_at` (no cross-blob merge — every device of
-    /// the owner advertises the same fleet), ignores stale blobs entirely,
-    /// and yields empty (rung skipped) when nothing fresh exists.
+    /// Task 3 (Decision 3): durable-CRDT butler-sets are window-exempt — their
+    /// vk seal-targets stay valid even when the recipient's primary device is
+    /// long-offline — while pkarr-live butler-sets keep the freshness window.
     #[test]
-    fn freshest_butler_set_picks_newest_fresh_blob_and_skips_stale() {
-        use crate::reachability_record::{ButlerSetEntry, ReachabilityAnnouncePayload};
-        let entry = |seed: u8| ButlerSetEntry {
-            device_id: [seed; 16],
-            iroh_endpoint_id: [seed; 32],
-            device_ed25519_verify: [seed; 32],
-            home_relay: "https://use1-1.relay.iroh.network./".into(),
-            pinned: false,
+    fn durable_source_butler_set_survives_past_freshness_window() {
+        use crate::reachability_resolver::ReachabilitySource;
+        let now = 100 * BUTLER_SET_FRESHNESS_MS; // far past the window
+        let stale = ReachabilityAnnouncePayload {
+            iroh_node_id: [1; 32],
+            home_relay_url: "r".into(),
+            direct_addresses: vec![],
+            announced_at_ms: 1,
+            identity_signature: [0; 64],
+            butler_set: vec![crate::reachability_record::ButlerSetEntry {
+                device_id: [9; 16],
+                iroh_endpoint_id: [8; 32],
+                device_ed25519_verify: [7; 32],
+                home_relay: "r".into(),
+                pinned: false,
+            }],
+            bs_at: 1, // ancient stamp
         };
-        let blob = |bs_at: u64, seeds: &[u8]| ReachabilityAnnouncePayload {
-            iroh_node_id: [0xAB; 32],
+        // DurableCrdt: window-exempt -> returns the set.
+        let durable =
+            freshest_butler_set_by_source(&[(stale.clone(), ReachabilitySource::DurableCrdt)], now);
+        assert_eq!(
+            durable.len(),
+            1,
+            "durable butler-set must survive the window"
+        );
+        // PkarrLive: windowed -> filtered to empty.
+        let live = freshest_butler_set_by_source(&[(stale, ReachabilitySource::PkarrLive)], now);
+        assert!(
+            live.is_empty(),
+            "pkarr butler-set past the window must be empty"
+        );
+    }
+
+    /// Task 4: the deposit path resolves a recipient whose butler-set lives in
+    /// the durable community CRDT even when its `bs_at` is far past the pkarr
+    /// freshness window. Pinned at the resolver seam the deposit client uses:
+    /// `resolve_async_with_source` (cache hit after `update`, so no live pkarr
+    /// fallback) → `freshest_butler_set_by_source` returns the durable set.
+    #[tokio::test]
+    async fn butler_deposit_resolves_durable_butler_set_past_window() {
+        use crate::owner_state_types::Hlc;
+        use crate::reachability_resolver::{ReachabilityResolver, ReachabilitySource};
+        let resolver = ReachabilityResolver::new();
+        let addr = OwnerAddr([0x5; 16]);
+        let payload = ReachabilityAnnouncePayload {
+            iroh_node_id: [0xA; 32],
             home_relay_url: "https://derp.example/".into(),
+            direct_addresses: vec![],
+            announced_at_ms: 1,
+            identity_signature: [0; 64],
+            butler_set: vec![ButlerSetEntry {
+                device_id: [9; 16],
+                iroh_endpoint_id: [8; 32],
+                device_ed25519_verify: [7; 32],
+                home_relay: "https://derp.example/".into(),
+                pinned: false,
+            }],
+            bs_at: 1, // ancient stamp — far before `now`
+        };
+        // `update` (not `update_with_source`) tags it `DurableCrdt`.
+        resolver.update(
+            addr,
+            payload,
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "x".into(),
+            },
+        );
+        let now = 100 * BUTLER_SET_FRESHNESS_MS; // far past the window
+        let tagged = resolver.resolve_async_with_source(&addr).await;
+        assert!(
+            matches!(tagged[0].1, ReachabilitySource::DurableCrdt),
+            "cache-hit entry keeps its DurableCrdt source"
+        );
+        let set = freshest_butler_set_by_source(&tagged, now);
+        assert_eq!(set.len(), 1, "durable butler-set resolves past the window");
+    }
+
+    /// Task 4 (reviewer-flagged gap): the mixed durable+pkarr selection path.
+    /// Both sources are non-empty, but the durable one is past-window and the
+    /// pkarr one is fresh. `freshest_butler_set_by_source` must (a) return a
+    /// non-empty set and (b) select by newest `bs_at` AMONG the entries that
+    /// survive their own source's freshness policy — so the durable past-window
+    /// set, despite a smaller `bs_at`, is the only surviving candidate when the
+    /// pkarr entry's `bs_at` is *higher but still windowed-in*, and vice versa.
+    #[test]
+    fn freshest_butler_set_by_source_mixed_picks_newest_surviving() {
+        use crate::reachability_resolver::ReachabilitySource;
+        let now = 100 * BUTLER_SET_FRESHNESS_MS;
+        let blob = |bs_at: u64, seed: u8| ReachabilityAnnouncePayload {
+            iroh_node_id: [seed; 32],
+            home_relay_url: "r".into(),
             direct_addresses: vec![],
             announced_at_ms: bs_at,
             identity_signature: [0; 64],
-            butler_set: seeds.iter().map(|s| entry(*s)).collect(),
+            butler_set: vec![ButlerSetEntry {
+                device_id: [seed; 16],
+                iroh_endpoint_id: [seed; 32],
+                device_ed25519_verify: [seed; 32],
+                home_relay: "r".into(),
+                pinned: false,
+            }],
             bs_at,
         };
-        let now = 1_700_000_000_000u64;
-        let stale = blob(now - BUTLER_SET_FRESHNESS_MS - 1, &[0x01]);
-        let older_fresh = blob(now - 60_000, &[0x02]);
-        let newest_fresh = blob(now - 1_000, &[0x03, 0x04]);
+        // Durable entry: ancient stamp, window-exempt → survives.
+        let durable = blob(1, 0xDD);
+        // Pkarr entry: fresh (within window of `now`) → survives.
+        let fresh_pkarr = blob(now - 1_000, 0xEE);
 
-        // Stale blob is ignored even though it lists an entry; among the
-        // fresh blobs the newest bs_at wins wholesale, priority order kept.
-        let picked = freshest_butler_set(&[stale.clone(), newest_fresh, older_fresh], now);
-        assert_eq!(picked, vec![entry(0x03), entry(0x04)]);
+        // Both survive; the fresh pkarr entry has the strictly newer `bs_at`,
+        // so it wins the `max_by_key(bs_at)` selection.
+        let picked = freshest_butler_set_by_source(
+            &[
+                (durable.clone(), ReachabilitySource::DurableCrdt),
+                (fresh_pkarr, ReachabilitySource::PkarrLive),
+            ],
+            now,
+        );
+        assert_eq!(picked.len(), 1, "mixed-source must yield a non-empty set");
+        assert_eq!(
+            picked[0].device_id, [0xEE; 16],
+            "newer surviving bs_at wins (the fresh pkarr entry)"
+        );
 
-        // Only stale → empty (rung skipped). No blobs at all → empty.
-        assert!(freshest_butler_set(&[stale], now).is_empty());
-        assert!(freshest_butler_set(&[], now).is_empty());
+        // Now make the pkarr entry past-window (filtered to empty for its
+        // source) while the durable one stays exempt: the durable set wins
+        // even though its `bs_at` is the smaller of the two.
+        let stale_pkarr = blob(2, 0xEE); // higher bs_at than durable, but past window
+        let picked = freshest_butler_set_by_source(
+            &[
+                (durable, ReachabilitySource::DurableCrdt),
+                (stale_pkarr, ReachabilitySource::PkarrLive),
+            ],
+            now,
+        );
+        assert_eq!(
+            picked.len(),
+            1,
+            "durable survives when the higher-bs_at pkarr entry is past-window"
+        );
+        assert_eq!(
+            picked[0].device_id, [0xDD; 16],
+            "durable set is the only surviving candidate"
+        );
     }
 
     #[tokio::test]

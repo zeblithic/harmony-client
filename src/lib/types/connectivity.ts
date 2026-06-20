@@ -33,6 +33,12 @@ export interface ReachabilityRecord {
 export interface PeerReachability {
   ownerAddress: string;
   record: ReachabilityRecord;
+  /**
+   * Provenance of this entry: `'durableCrdt'` (replicated community-membership
+   * CRDT — window-exempt seal-targets) or `'pkarrLive'` (live pkarr cache-back,
+   * 15-min windowed). An opaque string for forward-compat. (ZEB-488)
+   */
+  source: 'durableCrdt' | 'pkarrLive' | string;
 }
 
 /**

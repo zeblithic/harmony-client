@@ -8,7 +8,10 @@
 use harmony_app::community_membership::{MembershipEventKind, SignedMembershipEvent};
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-use harmony_app::reachability_record::ReachabilityAnnouncePayload;
+use harmony_app::reachability_record::{
+    build_signed_payload, verify_inner_signature, ButlerSetEntry, ReachabilityAnnouncePayload,
+};
+use harmony_identity::PrivateIdentity;
 
 fn fixture_hlc() -> Hlc {
     Hlc {
@@ -27,6 +30,28 @@ fn fixture_payload() -> ReachabilityAnnouncePayload {
         identity_signature: [0xCD; 64],
         butler_set: Vec::new(),
         bs_at: 0,
+    }
+}
+
+/// A payload carrying a non-empty butler set, with a FIXED fake
+/// `identity_signature` (this pins the `bs`/`ba` wire SHAPE, not a real
+/// signature — same approach as [`fixture_payload`]). `bs_at` is deliberately
+/// distinct from `announced_at_ms` so a `ts`↔`ba` field swap is caught.
+fn fixture_payload_with_butler_set() -> ReachabilityAnnouncePayload {
+    ReachabilityAnnouncePayload {
+        iroh_node_id: [0xAB; 32],
+        home_relay_url: "https://derp.example/".into(),
+        direct_addresses: vec![],
+        announced_at_ms: 1_700_000_000_000,
+        identity_signature: [0xCD; 64],
+        butler_set: vec![ButlerSetEntry {
+            device_id: [0x10; 16],
+            iroh_endpoint_id: [0x11; 32],
+            device_ed25519_verify: [0x12; 32],
+            home_relay: "https://use1-1.relay.iroh.network./".into(),
+            pinned: true,
+        }],
+        bs_at: 1_700_000_000_001,
     }
 }
 
@@ -53,6 +78,73 @@ fn reachability_announce_payload_wire_bytes_pinned() {
         hex,
         "a5626e645820abababababababababababababababababababababababababababababababab62726c7568747470733a2f2f646572702e6578616d706c652f626461806274731b0000018bcfe568006273675840cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
         "ReachabilityAnnouncePayload wire format changed"
+    );
+}
+
+/// ZEB-418 durable seal-targets: a `ReachabilityAnnouncePayload` signed WITH a
+/// non-empty butler set must (a) round-trip through canonical CBOR carrying the
+/// butler set + freshness stamp intact, and (b) still pass `verify_inner_
+/// signature` after decode — proving the inner identity signature binds the
+/// seal-targets so a relay/co-member can't forge or strip them.
+#[test]
+fn signed_reachability_with_butler_set_round_trips_and_verifies() {
+    let identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let public = identity.public_identity();
+    let actor = OwnerAddr(public.address_hash);
+    let hlc = fixture_hlc();
+    let butler = ButlerSetEntry {
+        device_id: [0x10; 16],
+        iroh_endpoint_id: [0x11; 32],
+        device_ed25519_verify: [0x12; 32],
+        home_relay: "https://use1-1.relay.iroh.network./".into(),
+        pinned: false,
+    };
+
+    let payload = build_signed_payload(
+        [0xAB; 32],
+        "https://derp.example/".into(),
+        vec![],
+        1_700_000_000_000,
+        &actor,
+        &hlc,
+        vec![butler.clone()],
+        1_700_000_000_000,
+        &identity,
+    )
+    .expect("sign");
+
+    // Inner sig verifies on the freshly-built payload.
+    verify_inner_signature(&payload, &actor, &hlc, &public.verifying_key).expect("verify");
+
+    // Canonical-encode → decode: butler set + stamp must survive.
+    let bytes = canonical_cbor_encode(&payload).expect("encode");
+    let decoded: ReachabilityAnnouncePayload =
+        ciborium::de::from_reader(&bytes[..]).expect("decode");
+    assert_eq!(decoded.butler_set, vec![butler]);
+    assert_eq!(decoded.bs_at, 1_700_000_000_000);
+
+    // Inner sig still verifies after the round-trip.
+    verify_inner_signature(&decoded, &actor, &hlc, &public.verifying_key)
+        .expect("verify after round-trip");
+}
+
+/// CodeRabbit (PR #303): pin the WITH-butler-set wire bytes, not just the
+/// same-code round-trip. A round-trip would still pass if the `bs`/`ba` wire
+/// shape drifted consistently in both serializer and deserializer; this golden
+/// hex catches cross-version drift in the butler-set encoding (and a `ts`↔`ba`
+/// swap, via the distinct `bs_at`). Companion to
+/// [`signed_reachability_with_butler_set_round_trips_and_verifies`], which
+/// proves the inner-sig binding.
+#[test]
+fn reachability_announce_payload_with_butler_set_wire_bytes_pinned() {
+    let payload = fixture_payload_with_butler_set();
+    let bytes = canonical_cbor_encode(&payload).expect("encode");
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    eprintln!("reachability_announce_payload_with_butler_set hex: {hex}");
+    assert_eq!(
+        hex,
+        "a7626e645820abababababababababababababababababababababababababababababababab62726c7568747470733a2f2f646572702e6578616d706c652f626461806274731b0000018bcfe568006273675840cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd62627381a5616450101010101010101010101010101010106265705820111111111111111111111111111111111111111111111111111111111111111162766b58201212121212121212121212121212121212121212121212121212121212121212626872782368747470733a2f2f757365312d312e72656c61792e69726f682e6e6574776f726b2e2f62706ef56262611b0000018bcfe56801",
+        "ReachabilityAnnouncePayload (with butler set) wire format changed"
     );
 }
 

@@ -550,8 +550,10 @@ pub trait ButlerSetResolve: Send + Sync {
 }
 
 /// Production butler-set resolution over the live [`ReachabilityResolver`]
-/// (in-memory CRDT cache first, pkarr fallback on miss) + `freshest_butler_set`
-/// — identical to the butler client's resolution step.
+/// (in-memory CRDT cache first, pkarr fallback on miss) +
+/// `freshest_butler_set_by_source` (durable-CRDT entries window-exempt,
+/// pkarr-live windowed — Task 4) — identical to the butler client's
+/// resolution step.
 pub struct ReachabilityButlerSetResolve(pub crate::reachability_resolver::ReachabilityResolver);
 
 #[async_trait]
@@ -561,8 +563,8 @@ impl ButlerSetResolve for ReachabilityButlerSetResolve {
         recipient_owner: &crate::owner_state_types::OwnerAddr,
         now_ms: u64,
     ) -> Vec<crate::reachability_record::ButlerSetEntry> {
-        let blobs = self.0.resolve_async(recipient_owner).await;
-        crate::butler_deposit::freshest_butler_set(&blobs, now_ms)
+        let tagged = self.0.resolve_async_with_source(recipient_owner).await;
+        crate::butler_deposit::freshest_butler_set_by_source(&tagged, now_ms)
     }
 }
 
@@ -737,25 +739,87 @@ impl ProdCommunityRelayDepositClient {
             |c, o| joined.contains(&(*c, o.0)),
         )
     }
+
+    /// When the recipient advertises no (durable or live) butler-set, fall back
+    /// to <=2 of their ENROLLED device ed25519 vks from durable community
+    /// membership (`OwnerDeviceCache`). The relay only seals to the vk (it
+    /// holds; the recipient pulls), so endpoint/relay fields are unused —
+    /// left zero/empty. D35 preserved (seal to device keys, bounded fan-out).
+    ///
+    /// SECURITY: the vks are sourced ONLY from durable CRDT membership
+    /// (`owner_device_cache.device_identity_pubs`), never from transient or
+    /// unauthenticated input. The ed25519 verify key is bytes `[32..64]` of
+    /// the canonical 64-byte `X25519_pub(32) || Ed25519_pub(32)` identity pub
+    /// (the same slice `dm_signing::verify_dm_packet_signature` treats as the
+    /// verifying key). `device_id` is the canonical `DeviceIdentityHash`
+    /// (`SHA256(X25519 || Ed25519)[:16]`) taken from the parallel `devices`
+    /// vec — NOT recomputed from the ed25519 half — so the entry stays
+    /// self-consistent with durable membership. (`devices` and
+    /// `device_identity_pubs` are index-parallel: re-paired jointly on
+    /// deserialize, see `OwnerDeviceEntry`'s manual `Deserialize`.)
+    async fn enrolled_device_fallback_targets(
+        &self,
+        recipient_owner: &crate::owner_state_types::OwnerAddr,
+    ) -> Vec<crate::reachability_record::ButlerSetEntry> {
+        let st = self.crdt_state.lock().await;
+        let Some(entry) = st.owner_device_cache.devices.get(recipient_owner) else {
+            return Vec::new();
+        };
+        entry
+            .devices
+            .iter()
+            .zip(entry.device_identity_pubs.iter())
+            .filter_map(|(dev_id, pub_opt)| pub_opt.as_ref().map(|p| (dev_id, p)))
+            // Order-dependent selection: `devices` is sorted ascending by
+            // hash, so this picks the two lex-smallest-device-hash enrolled
+            // devices. Unlike the real butler-set this fallback has no
+            // priority/pinning — it is a best-effort last resort.
+            .take(crate::butler_deposit::BUTLER_SET_MAX_ENTRIES)
+            .map(|(dev_id, identity_pub)| {
+                let ed: [u8; 32] = identity_pub[32..64].try_into().expect("64 - 32 == 32");
+                crate::reachability_record::ButlerSetEntry {
+                    device_id: dev_id.0, // canonical DeviceIdentityHash from membership
+                    iroh_endpoint_id: [0u8; 32],
+                    device_ed25519_verify: ed,
+                    home_relay: String::new(),
+                    pinned: false,
+                }
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
 impl crate::community_relay::CommunityRelayDepositClient for ProdCommunityRelayDepositClient {
     async fn deposit(&self, req: &crate::butler_deposit::ButlerDepositRequest) -> bool {
-        // 1. Resolve R's fresh butler set — the SEAL TARGETS (R's device keys,
-        //    NOT any relay's). Empty → no device to seal to (accepted gap, D35).
-        let targets = self
+        // 1. Communities both parties have Joined (D40 gate). None → no relay
+        //    rung is permitted. Checked FIRST (ahead of the seal-target resolve
+        //    and the enrolled-device fallback) so a stale cross-community
+        //    `OwnerDeviceCache` entry can't drive wasted target derivation — the
+        //    fallback's `crdt_state` lock + vk extraction — for a recipient we no
+        //    longer share a community with; this membership gate would reject the
+        //    deposit regardless (Greptile P2). The gate is membership-only and
+        //    never permits a deposit on its own.
+        let communities = self.shared_communities(&req.recipient_owner).await;
+        if communities.is_empty() {
+            return false;
+        }
+
+        // 2. Resolve R's fresh butler set — the SEAL TARGETS (R's device keys,
+        //    NOT any relay's). Empty → fall back to R's ENROLLED device vks from
+        //    durable community membership (the relay only seals to a vk; it
+        //    holds the ciphertext, R pulls — no endpoint dial to R). Still empty
+        //    → no device to seal to (accepted gap, D35).
+        let mut targets = self
             .butler_resolver
             .resolve_targets(&req.recipient_owner, req.now_ms)
             .await;
         if targets.is_empty() {
-            return false;
+            targets = self
+                .enrolled_device_fallback_targets(&req.recipient_owner)
+                .await;
         }
-
-        // 2. Communities both parties have Joined (D40 gate). None → no relay
-        //    rung is permitted.
-        let communities = self.shared_communities(&req.recipient_owner).await;
-        if communities.is_empty() {
+        if targets.is_empty() {
             return false;
         }
 
@@ -2009,6 +2073,385 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "both device-target copies deposited to the first acking relay"
+        );
+    }
+
+    // =================================================================
+    // Task 5: relay rung enrolled-device fallback (butler-less recipient).
+    // When the recipient advertises NO butler-set, the relay deposit falls
+    // back to their ENROLLED device ed25519 vks from durable community
+    // membership (OwnerDeviceCache). The relay only seals to the vk (it
+    // holds; R pulls) so this is safe and D35-bounded (<=2).
+    // =================================================================
+
+    /// Relay-dial seam mock that ACKS every dial AND records each frame's
+    /// `sealed_blob`, so a test can prove which device key each copy sealed to.
+    struct RecordingDial {
+        sealed_blobs: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl RelayDepositDial for RecordingDial {
+        async fn dial_deposit(
+            &self,
+            _relay: &CommunityRelayEntry,
+            frame: &RelayDepositFrame,
+        ) -> Result<(), String> {
+            self.sealed_blobs
+                .lock()
+                .await
+                .push(frame.sealed_blob.clone());
+            Ok(())
+        }
+    }
+
+    /// A real ed25519 device identity for the recipient: returns the signing
+    /// key (so the test holds the x25519 priv to OPEN the sealed blob) and the
+    /// canonical 64-byte `X25519_pub(32) || Ed25519_pub(32)` identity pub the
+    /// owner_device_cache stores.
+    fn recipient_device_identity(seed: u8) -> (ed25519_dalek::SigningKey, [u8; 64]) {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let ed_pub: [u8; 32] = signing.verifying_key().to_bytes();
+        let x_pub = crate::dm_signing::ed25519_pub_to_x25519(&ed_pub)
+            .expect("real ed25519 pub converts to x25519");
+        let mut identity_pub = [0u8; 64];
+        identity_pub[..32].copy_from_slice(&x_pub);
+        identity_pub[32..].copy_from_slice(&ed_pub);
+        (signing, identity_pub)
+    }
+
+    #[tokio::test]
+    async fn relay_deposit_enrolled_device_fallback() {
+        use crate::dm_signing::{ed25519_priv_to_x25519, open_from_owner_with_info};
+        use crate::owner_state_types::{DeviceIdentityHash, OwnerDeviceEntry};
+
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+
+        // Recipient has two ENROLLED devices in durable membership, but NO
+        // butler-set (the resolver returns empty).
+        let (dev_a_key, dev_a_pub) = recipient_device_identity(0xA1);
+        let (dev_b_key, dev_b_pub) = recipient_device_identity(0xB2);
+
+        // Build the recipient's owner_device_cache entry from those two pubs.
+        let crdt_state = crdt_with_spaces(&[(community, SpaceKind::Community)]);
+        {
+            let mut st = crdt_state.lock().await;
+            st.owner_device_cache.devices.insert(
+                OwnerAddr(recipient),
+                OwnerDeviceEntry {
+                    devices: vec![
+                        DeviceIdentityHash([0xA1; 16]),
+                        DeviceIdentityHash([0xB2; 16]),
+                    ],
+                    device_identity_pubs: vec![Some(dev_a_pub), Some(dev_b_pub)],
+                    learned_at: Hlc {
+                        wall_ms: 1,
+                        logical: 0,
+                        device_id: "t".into(),
+                    },
+                    device_tunnel_contacts: vec![None, None],
+                },
+            );
+        }
+
+        let sealed_blobs = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve { targets: vec![] }), // EMPTY butler set
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(RecordingDial {
+                sealed_blobs: sealed_blobs.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_state,
+            fake(&[
+                (SpaceId([community; 16]), sender),
+                (SpaceId([community; 16]), recipient),
+            ]),
+        );
+
+        // Deposit succeeds via the enrolled-device fallback.
+        assert!(
+            client.deposit(&req(recipient, cid)).await,
+            "deposit must succeed by sealing to enrolled device vks"
+        );
+
+        // Exactly two copies (one per enrolled device, capped at
+        // BUTLER_SET_MAX_ENTRIES == 2).
+        let blobs = sealed_blobs.lock().await.clone();
+        assert_eq!(
+            blobs.len(),
+            crate::butler_deposit::BUTLER_SET_MAX_ENTRIES,
+            "one sealed copy per enrolled device, capped at 2"
+        );
+
+        // Each enrolled device's x25519 priv (derived from its ed25519 signing
+        // key — the [32..64] half of its identity pub) opens EXACTLY ONE copy.
+        // This proves the fallback sealed to the enrolled ed25519 vks.
+        for key in [&dev_a_key, &dev_b_key] {
+            let x_priv = ed25519_priv_to_x25519(key);
+            let opened = blobs
+                .iter()
+                .filter(|blob| {
+                    open_from_owner_with_info(
+                        &x_priv,
+                        blob,
+                        crate::community_relay::COMMUNITY_RELAY_SEAL_INFO,
+                    )
+                    .is_ok()
+                })
+                .count();
+            assert_eq!(
+                opened, 1,
+                "each enrolled device key must open exactly one sealed copy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_deposit_enrolled_device_fallback_skips_none_pubs() {
+        // A recipient whose middle device has a known hash but no propagated
+        // identity_pub (`device_identity_pubs = [Some(a), None, Some(b)]`).
+        // The `None` is skipped (NOT counted toward the cap), and the two
+        // surviving devices (a, b) are the seal targets — proving the
+        // filter_map branch is exercised and the right keys win.
+        use crate::dm_signing::{ed25519_priv_to_x25519, open_from_owner_with_info};
+        use crate::owner_state_types::{DeviceIdentityHash, OwnerDeviceEntry};
+
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+
+        let (dev_a_key, dev_a_pub) = recipient_device_identity(0xA1);
+        let (dev_b_key, dev_b_pub) = recipient_device_identity(0xB2);
+
+        let crdt_state = crdt_with_spaces(&[(community, SpaceKind::Community)]);
+        {
+            let mut st = crdt_state.lock().await;
+            st.owner_device_cache.devices.insert(
+                OwnerAddr(recipient),
+                OwnerDeviceEntry {
+                    // Three parallel devices; the middle pub is unpropagated.
+                    devices: vec![
+                        DeviceIdentityHash([0xA1; 16]),
+                        DeviceIdentityHash([0xCC; 16]),
+                        DeviceIdentityHash([0xB2; 16]),
+                    ],
+                    device_identity_pubs: vec![Some(dev_a_pub), None, Some(dev_b_pub)],
+                    learned_at: Hlc {
+                        wall_ms: 1,
+                        logical: 0,
+                        device_id: "t".into(),
+                    },
+                    device_tunnel_contacts: vec![None, None, None],
+                },
+            );
+        }
+
+        let sealed_blobs = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve { targets: vec![] }), // EMPTY butler set
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(RecordingDial {
+                sealed_blobs: sealed_blobs.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_state,
+            fake(&[
+                (SpaceId([community; 16]), sender),
+                (SpaceId([community; 16]), recipient),
+            ]),
+        );
+
+        assert!(client.deposit(&req(recipient, cid)).await);
+
+        // Exactly two copies — the `None` is skipped, not counted toward the cap.
+        let blobs = sealed_blobs.lock().await.clone();
+        assert_eq!(
+            blobs.len(),
+            2,
+            "the None-pub device is skipped; exactly the two propagated devices are sealed to"
+        );
+
+        // The two surviving devices (a, b) are the seal targets.
+        for key in [&dev_a_key, &dev_b_key] {
+            let x_priv = ed25519_priv_to_x25519(key);
+            let opened = blobs
+                .iter()
+                .filter(|blob| {
+                    open_from_owner_with_info(
+                        &x_priv,
+                        blob,
+                        crate::community_relay::COMMUNITY_RELAY_SEAL_INFO,
+                    )
+                    .is_ok()
+                })
+                .count();
+            assert_eq!(
+                opened, 1,
+                "each propagated device key must open exactly one sealed copy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_deposit_enrolled_device_fallback_caps_at_two() {
+        // Recipient has THREE enrolled devices but no butler-set; the fallback
+        // must seal to at most BUTLER_SET_MAX_ENTRIES (2) of them (D35).
+        use crate::owner_state_types::{DeviceIdentityHash, OwnerDeviceEntry};
+
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+
+        let (_a, pub_a) = recipient_device_identity(0xA1);
+        let (_b, pub_b) = recipient_device_identity(0xB2);
+        let (_c, pub_c) = recipient_device_identity(0xC3);
+
+        let crdt_state = crdt_with_spaces(&[(community, SpaceKind::Community)]);
+        {
+            let mut st = crdt_state.lock().await;
+            st.owner_device_cache.devices.insert(
+                OwnerAddr(recipient),
+                OwnerDeviceEntry {
+                    devices: vec![
+                        DeviceIdentityHash([0xA1; 16]),
+                        DeviceIdentityHash([0xB2; 16]),
+                        DeviceIdentityHash([0xC3; 16]),
+                    ],
+                    device_identity_pubs: vec![Some(pub_a), Some(pub_b), Some(pub_c)],
+                    learned_at: Hlc {
+                        wall_ms: 1,
+                        logical: 0,
+                        device_id: "t".into(),
+                    },
+                    device_tunnel_contacts: vec![None, None, None],
+                },
+            );
+        }
+
+        let sealed_blobs = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve { targets: vec![] }),
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(RecordingDial {
+                sealed_blobs: sealed_blobs.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_state,
+            fake(&[
+                (SpaceId([community; 16]), sender),
+                (SpaceId([community; 16]), recipient),
+            ]),
+        );
+
+        assert!(client.deposit(&req(recipient, cid)).await);
+        assert_eq!(
+            sealed_blobs.lock().await.len(),
+            crate::butler_deposit::BUTLER_SET_MAX_ENTRIES,
+            "fallback fan-out is bounded at BUTLER_SET_MAX_ENTRIES (D35)"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_deposit_no_fallback_when_recipient_absent_from_cache() {
+        // No butler-set AND no owner_device_cache entry for the recipient →
+        // nothing to seal to → false, no dial.
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+
+        let sealed_blobs = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve { targets: vec![] }),
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(RecordingDial {
+                sealed_blobs: sealed_blobs.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            // owner_device_cache has NO entry for the recipient.
+            crdt_with_spaces(&[(community, SpaceKind::Community)]),
+            fake(&[
+                (SpaceId([community; 16]), sender),
+                (SpaceId([community; 16]), recipient),
+            ]),
+        );
+
+        assert!(!client.deposit(&req(recipient, cid)).await);
+        assert!(
+            sealed_blobs.lock().await.is_empty(),
+            "no enrolled devices and no butler-set → no dial"
+        );
+    }
+
+    /// Greptile P2 regression: the D40 shared-community gate is checked BEFORE
+    /// the enrolled-device fallback, so a STALE `OwnerDeviceCache` entry for a
+    /// recipient we no longer share a community with cannot drive a deposit (or
+    /// the fallback's target derivation). The recipient HAS a derivable enrolled
+    /// device here AND the relay would ack — but with no shared community the
+    /// deposit short-circuits to false with no dial.
+    #[tokio::test]
+    async fn relay_deposit_no_deposit_when_stale_cache_but_no_shared_community() {
+        use crate::owner_state_types::{DeviceIdentityHash, OwnerDeviceEntry};
+
+        let sender = [0x01; 16];
+        let recipient = [0x02; 16];
+        let community = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+
+        // A derivable enrolled-device entry survives in the cache (e.g. from an
+        // old projection before the sender left the shared community).
+        let (_dev_key, dev_pub) = recipient_device_identity(0xA1);
+        let crdt_state = crdt_with_spaces(&[(community, SpaceKind::Community)]);
+        {
+            let mut st = crdt_state.lock().await;
+            st.owner_device_cache.devices.insert(
+                OwnerAddr(recipient),
+                OwnerDeviceEntry {
+                    devices: vec![DeviceIdentityHash([0xA1; 16])],
+                    device_identity_pubs: vec![Some(dev_pub)],
+                    learned_at: Hlc {
+                        wall_ms: 1,
+                        logical: 0,
+                        device_id: "t".into(),
+                    },
+                    device_tunnel_contacts: vec![None],
+                },
+            );
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = deposit_client(
+            Arc::new(FakeButlerSetResolve { targets: vec![] }), // no butler-set
+            relay_resolver_with(&[(community, 0x01)], TEST_NOW),
+            Arc::new(MockDial {
+                acking: HashSet::from([[0x01; 16]]), // would ack if reached
+                calls: calls.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            sender,
+            crdt_state,
+            // Only the SENDER is joined — recipient is NOT a co-member.
+            fake(&[(SpaceId([community; 16]), sender)]),
+        );
+
+        assert!(
+            !client.deposit(&req(recipient, cid)).await,
+            "no shared community → false even though a stale enrolled-device entry exists"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "D40 gate short-circuits before any relay dial"
         );
     }
 

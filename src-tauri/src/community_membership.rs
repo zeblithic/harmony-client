@@ -10224,6 +10224,8 @@ mod zeb_321_reachability_verify_tests {
             announced_at_ms,
             &actor,
             &hlc,
+            &[],
+            0,
         )
         .expect("inner signed bytes");
         let identity_signature = owner.device_key.sign(&inner).to_bytes();

@@ -42,10 +42,37 @@ pub trait ReachabilityFallback: Send + Sync {
 /// device entries coexist; same-owner-same-device updates are LWW.
 type ResolverKey = (OwnerAddr, [u8; 32]);
 
+/// Provenance of a resolved reachability payload, used to apply a per-source
+/// butler-set freshness policy (Decision 3): durable replicated CRDT records
+/// carry seal-targets that stay valid even when the recipient's primary is
+/// long-offline, so they are exempt from the live pkarr freshness window;
+/// pkarr-sourced records keep the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReachabilitySource {
+    /// Projected from a durable community-membership ReachabilityAnnounce CRDT
+    /// event (persisted, replicated, boot-replayed).
+    DurableCrdt,
+    /// Fetched live from the recipient's pkarr routing blob.
+    PkarrLive,
+}
+
+impl ReachabilitySource {
+    /// Stable camelCase tag for the `connectivity_list_peer_reachability` DTO so
+    /// consumers (e.g. the e2e durable-replication barrier) can tell a durable
+    /// CRDT-replicated record apart from a live pkarr cache-back.
+    pub fn as_dto_str(self) -> &'static str {
+        match self {
+            ReachabilitySource::DurableCrdt => "durableCrdt",
+            ReachabilitySource::PkarrLive => "pkarrLive",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolverEntry {
     pub payload: ReachabilityAnnouncePayload,
     pub hlc: Hlc,
+    pub source: ReachabilitySource,
 }
 
 pub struct ReachabilityResolver {
@@ -107,12 +134,34 @@ impl ReachabilityResolver {
     ///
     /// Per PR #157 round 5: keyed by `(actor, payload.iroh_node_id)` so
     /// same-owner-different-device announces don't overwrite each other.
+    ///
+    /// CRDT-projection update (the default, durable source). All
+    /// membership-apply call sites use this unchanged.
     pub fn update(&self, actor: OwnerAddr, payload: ReachabilityAnnouncePayload, hlc: Hlc) {
+        self.update_with_source(actor, payload, hlc, ReachabilitySource::DurableCrdt);
+    }
+
+    /// Source-tagged update (Task 3, Decision 3). Only the pkarr-cache-back
+    /// path in [`resolve_async`](Self::resolve_async) /
+    /// [`resolve_async_with_source`](Self::resolve_async_with_source) passes
+    /// `PkarrLive`; every membership-apply projection goes through
+    /// [`update`](Self::update) and is therefore `DurableCrdt`.
+    pub fn update_with_source(
+        &self,
+        actor: OwnerAddr,
+        payload: ReachabilityAnnouncePayload,
+        hlc: Hlc,
+        source: ReachabilitySource,
+    ) {
         let key: ResolverKey = (actor, payload.iroh_node_id);
         let node_id = payload.iroh_node_id;
         let mut map = self.inner.write().expect("resolver write lock");
         let was_present = map.contains_key(&key);
-        let next = ResolverEntry { payload, hlc };
+        let next = ResolverEntry {
+            payload,
+            hlc,
+            source,
+        };
         match map.get(&key) {
             Some(prev) if !should_replace(prev, &next) => { /* keep prev */ }
             _ => {
@@ -154,6 +203,19 @@ impl ReachabilityResolver {
         let map = self.inner.read().expect("resolver read lock");
         map.iter()
             .map(|((owner, _node_id), v)| (*owner, v.payload.clone()))
+            .collect()
+    }
+
+    /// Like [`list_active_peers`](Self::list_active_peers), but carries each
+    /// entry's [`ReachabilitySource`] so diagnostics / the e2e durable-sync
+    /// barrier can distinguish a durable CRDT-replicated record from a live
+    /// pkarr cache-back.
+    pub fn list_active_peers_with_source(
+        &self,
+    ) -> Vec<(OwnerAddr, ReachabilityAnnouncePayload, ReachabilitySource)> {
+        let map = self.inner.read().expect("resolver read lock");
+        map.iter()
+            .map(|((owner, _node_id), v)| (*owner, v.payload.clone(), v.source))
             .collect()
     }
 
@@ -232,11 +294,14 @@ impl ReachabilityResolver {
     /// `EndpointId` — see spec §7.3 and the docstring on
     /// `resolve_by_node_id` above.
     ///
-    /// Uses the same HLC construction pattern as `resolve_async`'s cache
-    /// population (`wall_ms = payload.announced_at_ms, logical = 0,
-    /// device_id = ""`) so any subsequent higher-HLC CRDT-sourced record
-    /// wins under the existing LWW comparator — no separate provenance
-    /// channel needed for the Phase 2c first cut.
+    /// Tagged [`ReachabilitySource::PkarrLive`] — this is a pkarr-resolved
+    /// record, so its butler-set must stay subject to the live 15-min freshness
+    /// window, not the durable-CRDT exemption (Qodo "Api mismatch": routing the
+    /// seed through `update()` would mis-tag it `DurableCrdt`). Uses the same HLC
+    /// construction pattern as `resolve_async`'s cache population
+    /// (`wall_ms = payload.announced_at_ms, logical = 0, device_id = ""`); a
+    /// later durable-CRDT record for the same `(owner, node_id)` then takes over
+    /// the slot via the source-priority guard in `should_replace`.
     ///
     /// `async` for API alignment with the Task 3 IPC handler (which
     /// `.await`s this call between two sync-locked sections). The
@@ -253,7 +318,7 @@ impl ReachabilityResolver {
             logical: 0,
             device_id: String::new(),
         };
-        self.update(owner_addr, payload, hlc);
+        self.update_with_source(owner_addr, payload, hlc, ReachabilitySource::PkarrLive);
     }
 
     /// Async resolve: checks the in-memory CRDT cache first (via the
@@ -285,16 +350,75 @@ impl ReachabilityResolver {
             return Vec::new();
         };
         let payloads = fb.resolve(addr).await;
-        // 3. Populate cache so subsequent sync resolves hit warm.
+        // 3. Populate cache so subsequent sync resolves hit warm. Tagged
+        //    `PkarrLive` (Task 3, Decision 3) so the per-source freshness
+        //    policy keeps the live window on these — unlike CRDT-projected
+        //    entries, which are window-exempt.
         for payload in &payloads {
             let hlc = Hlc {
                 wall_ms: payload.announced_at_ms,
                 logical: 0,
                 device_id: String::new(),
             };
-            self.update(*addr, payload.clone(), hlc);
+            self.update_with_source(*addr, payload.clone(), hlc, ReachabilitySource::PkarrLive);
         }
         payloads
+    }
+
+    /// Like [`resolve`](Self::resolve), but carries each entry's source for the
+    /// per-source butler-set freshness policy (Task 3, Decision 3).
+    pub fn resolve_with_source(
+        &self,
+        actor: &OwnerAddr,
+    ) -> Vec<(ReachabilityAnnouncePayload, ReachabilitySource)> {
+        let map = self.inner.read().expect("resolver read lock");
+        map.range((*actor, [0u8; 32])..=(*actor, [0xFFu8; 32]))
+            .map(|(_, v)| (v.payload.clone(), v.source))
+            .collect()
+    }
+
+    /// Like [`resolve_async`](Self::resolve_async), but carries source. Cache
+    /// hits keep their stored source; on a cache miss the pkarr fallback results
+    /// are stored `PkarrLive` and the AUTHORITATIVE post-store resolver view is
+    /// re-read and returned — a concurrent durable-CRDT `update()` may have
+    /// landed during the fallback await and won the slot via source-priority, so
+    /// returning the pre-await pkarr vector would mis-tag a now-durable entry as
+    /// `PkarrLive` (Qodo "resolve_async_with_source TOCTOU").
+    pub async fn resolve_async_with_source(
+        &self,
+        addr: &OwnerAddr,
+    ) -> Vec<(ReachabilityAnnouncePayload, ReachabilitySource)> {
+        // 1. Sync cache check — preserves each cached entry's source.
+        let cached = self.resolve_with_source(addr);
+        if !cached.is_empty() {
+            return cached;
+        }
+        // 2. Fallback to pkarr if configured.
+        let fb = {
+            let guard = self
+                .fallback_source
+                .read()
+                .expect("fallback_source poisoned");
+            guard.clone()
+        };
+        let Some(fb) = fb else {
+            return Vec::new();
+        };
+        let payloads = fb.resolve(addr).await;
+        // 3. Populate cache (PkarrLive) and return all results tagged PkarrLive.
+        for payload in &payloads {
+            let hlc = Hlc {
+                wall_ms: payload.announced_at_ms,
+                logical: 0,
+                device_id: String::new(),
+            };
+            self.update_with_source(*addr, payload.clone(), hlc, ReachabilitySource::PkarrLive);
+        }
+        // Re-read the authoritative resolver view rather than returning the
+        // pre-await pkarr vector: source-priority LWW may have kept/installed a
+        // concurrently-arrived durable entry for this `(owner, node_id)`, which
+        // must be returned tagged `DurableCrdt`, not `PkarrLive` (CA3 TOCTOU).
+        self.resolve_with_source(addr)
     }
 }
 
@@ -304,6 +428,21 @@ impl ReachabilityResolver {
 /// `Hlc::is_strictly_newer_than`. Ties on HLC fall through to
 /// `announced_at_ms` then lex `iroh_node_id`, per spec §5.4.
 fn should_replace(prev: &ResolverEntry, next: &ResolverEntry) -> bool {
+    // Source-priority guard (ZEB-488; Qodo "Pkarr evicts durable reachability").
+    // Durable-CRDT seal-targets are authoritative and window-EXEMPT, so the
+    // single LWW slot per `(owner, iroh_node_id)` must never let a pkarr
+    // cache-back evict a durable record — otherwise the entry becomes
+    // `PkarrLive`, the 15-min freshness window re-applies, and a fully-offline
+    // recipient's seal-targets vanish after the window (the exact gap this PR
+    // closes). Conversely a durable announce that replicates LATER (with an
+    // older `announced_at_ms` than a frequently-refreshed pkarr blob) must still
+    // take over the slot, so an HLC-blind upgrade is required. Same-source
+    // updates fall through to the HLC/announced_at/node_id LWW below.
+    match (prev.source, next.source) {
+        (ReachabilitySource::DurableCrdt, ReachabilitySource::PkarrLive) => return false,
+        (ReachabilitySource::PkarrLive, ReachabilitySource::DurableCrdt) => return true,
+        _ => {}
+    }
     let prev_key = (
         prev.hlc.wall_ms,
         prev.hlc.logical,
@@ -376,6 +515,92 @@ mod tests {
         let records = r.resolve(&actor);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].announced_at_ms, 2000);
+    }
+
+    /// Q1 / ZEB-488: a fresher pkarr cache-back must NOT evict a durable record.
+    /// The durable entry's butler-set is window-exempt; letting a 15-min-windowed
+    /// pkarr entry overwrite the slot reopens "empty seal-targets after 15 min".
+    #[test]
+    fn durable_not_evicted_by_fresher_pkarr() {
+        let r = ReachabilityResolver::new();
+        let actor = OwnerAddr([0x11; 16]);
+        r.update_with_source(
+            actor,
+            make_payload(1, 1000),
+            make_hlc(1000, 0, "a"),
+            ReachabilitySource::DurableCrdt,
+        );
+        // Fresher pkarr cache-back for the SAME (owner, node_id).
+        r.update_with_source(
+            actor,
+            make_payload(1, 9000),
+            make_hlc(9000, 0, "a"),
+            ReachabilitySource::PkarrLive,
+        );
+        let tagged = r.resolve_with_source(&actor);
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(
+            tagged[0].1,
+            ReachabilitySource::DurableCrdt,
+            "durable record must survive a fresher pkarr cache-back"
+        );
+        assert_eq!(
+            tagged[0].0.announced_at_ms, 1000,
+            "durable payload retained, not the pkarr one"
+        );
+    }
+
+    /// Q1 / ZEB-488: a durable announce that replicates LATER — with an OLDER
+    /// announced_at than a frequently-refreshed pkarr blob — must still take over
+    /// the slot. The pkarr→durable upgrade is HLC-blind by design.
+    #[test]
+    fn pkarr_upgraded_by_older_durable() {
+        let r = ReachabilityResolver::new();
+        let actor = OwnerAddr([0x11; 16]);
+        r.update_with_source(
+            actor,
+            make_payload(1, 9000),
+            make_hlc(9000, 0, "a"),
+            ReachabilitySource::PkarrLive,
+        );
+        r.update_with_source(
+            actor,
+            make_payload(1, 1000),
+            make_hlc(1000, 0, "a"),
+            ReachabilitySource::DurableCrdt,
+        );
+        let tagged = r.resolve_with_source(&actor);
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(
+            tagged[0].1,
+            ReachabilitySource::DurableCrdt,
+            "durable must upgrade the slot regardless of HLC ordering"
+        );
+        assert_eq!(tagged[0].0.announced_at_ms, 1000);
+    }
+
+    /// The source guard governs only cross-source collisions; same-source updates
+    /// keep ordinary HLC LWW.
+    #[test]
+    fn same_source_keeps_hlc_lww() {
+        let r = ReachabilityResolver::new();
+        let actor = OwnerAddr([0x11; 16]);
+        r.update_with_source(
+            actor,
+            make_payload(1, 1000),
+            make_hlc(1000, 0, "a"),
+            ReachabilitySource::PkarrLive,
+        );
+        r.update_with_source(
+            actor,
+            make_payload(1, 2000),
+            make_hlc(2000, 0, "a"),
+            ReachabilitySource::PkarrLive,
+        );
+        let tagged = r.resolve_with_source(&actor);
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].0.announced_at_ms, 2000);
+        assert_eq!(tagged[0].1, ReachabilitySource::PkarrLive);
     }
 
     /// Same owner, DIFFERENT devices — both records coexist. This is the
@@ -726,6 +951,86 @@ mod fallback_tests {
         let (got_owner, got_payload) = by_node.unwrap();
         assert_eq!(got_owner, owner_addr);
         assert_eq!(got_payload.iroh_node_id, payload.iroh_node_id);
+    }
+
+    /// CA2 ("Api mismatch"): `seed_from_pkarr` must tag the record `PkarrLive`,
+    /// not `DurableCrdt`. It is a pkarr-resolved record, so its butler-set stays
+    /// subject to the live freshness window; mis-tagging it durable would make a
+    /// stale pkarr set window-exempt.
+    #[tokio::test]
+    async fn seed_from_pkarr_tags_pkarr_live() {
+        use crate::owner_state_types::DeviceIdentityHash;
+        let resolver = ReachabilityResolver::new();
+        let owner_addr = OwnerAddr([0x77; 16]);
+        let device_hash = DeviceIdentityHash([0x77; 16]);
+        let payload = make_payload(0xBE, 4200);
+        resolver
+            .seed_from_pkarr(owner_addr, device_hash, payload)
+            .await;
+        let tagged = resolver.resolve_with_source(&owner_addr);
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(
+            tagged[0].1,
+            ReachabilitySource::PkarrLive,
+            "pkarr-seeded record must be tagged PkarrLive, not DurableCrdt"
+        );
+    }
+
+    /// Fallback stub that injects a concurrent DURABLE update for the same
+    /// `(owner, node_id)` the pkarr blob will report — deterministically
+    /// reproducing the CA3 TOCTOU: a durable announce landing DURING the
+    /// `resolve_async_with_source` fallback await.
+    struct DurableInjectingFallback {
+        resolver: ReachabilityResolver,
+        owner: OwnerAddr,
+        durable: ReachabilityAnnouncePayload,
+        pkarr: ReachabilityAnnouncePayload,
+    }
+
+    #[async_trait]
+    impl ReachabilityFallback for DurableInjectingFallback {
+        async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
+            self.resolver.update_with_source(
+                self.owner,
+                self.durable.clone(),
+                Hlc {
+                    wall_ms: self.durable.announced_at_ms,
+                    logical: 0,
+                    device_id: String::new(),
+                },
+                ReachabilitySource::DurableCrdt,
+            );
+            vec![self.pkarr.clone()]
+        }
+    }
+
+    /// CA3: `resolve_async_with_source` re-reads the authoritative resolver view
+    /// after pkarr population, so a durable entry that arrived concurrently
+    /// (during the fallback await) for the SAME `(owner, node_id)` is returned
+    /// tagged `DurableCrdt` — even though the pkarr blob is fresher — rather than
+    /// the pre-await pkarr-tagged vector.
+    #[tokio::test]
+    async fn resolve_async_with_source_reread_keeps_concurrent_durable() {
+        let r = ReachabilityResolver::new();
+        let addr = OwnerAddr([0x33; 16]);
+        let durable = make_payload(0xAA, 1000); // older
+        let pkarr = make_payload(0xAA, 9000); // fresher, SAME node_id
+        let fb = Arc::new(DurableInjectingFallback {
+            resolver: r.clone(),
+            owner: addr,
+            durable,
+            pkarr,
+        });
+        r.set_fallback_source(fb);
+
+        let out = r.resolve_async_with_source(&addr).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].1,
+            ReachabilitySource::DurableCrdt,
+            "concurrent durable must survive + be returned, not the pre-await pkarr tag"
+        );
+        assert_eq!(out[0].0.announced_at_ms, 1000);
     }
 
     /// CodeRabbit PR #158 round 2: Clone must share fallback_source, not

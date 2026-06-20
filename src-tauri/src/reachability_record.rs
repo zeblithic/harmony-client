@@ -95,8 +95,11 @@ pub struct ReachabilityAnnouncePayload {
     pub announced_at_ms: u64,
 
     /// Inner Ed25519 signature by the device's HARMONY identity key
-    /// over canonical CBOR of (nd, rl, da, ts, actor, hlc). Binds the
-    /// Iroh NodeId to the harmony identity. 64 bytes.
+    /// over canonical CBOR of (nd, rl, da, ts, actor, hlc, bs, ba) — the
+    /// 8-field preimage built by [`inner_signed_bytes`] (the butler set `bs`
+    /// and its stamp `ba` were folded in for ZEB-418 durable seal-targets, a
+    /// flag-day change). Binds the Iroh NodeId AND the seal-targets to the
+    /// harmony identity. 64 bytes.
     #[serde(
         rename = "sg",
         serialize_with = "serialize_bytes_as_bstr",
@@ -108,8 +111,11 @@ pub struct ReachabilityAnnouncePayload {
     /// [`crate::butler_deposit::BUTLER_SET_MAX_ENTRIES`]). Elided when empty
     /// so blobs without a butler set stay byte-identical to the legacy
     /// encoding (pinned by `routing_blob_without_butler_set_is_wire_
-    /// identical_to_legacy`). Read through [`fresh_butler_set`] — never
-    /// directly — so stale ads are filtered.
+    /// identical_to_legacy`). Read through a source-appropriate accessor —
+    /// never directly: [`fresh_butler_set`] for pkarr-live records (applies the
+    /// freshness window) or [`durable_butler_set`] for durable CRDT records
+    /// (window-exempt, Decision 3). The caller picks by [`crate::reachability_
+    /// resolver::ReachabilitySource`].
     #[serde(rename = "bs", default, skip_serializing_if = "Vec::is_empty")]
     pub butler_set: Vec<ButlerSetEntry>,
 
@@ -144,6 +150,22 @@ pub fn fresh_butler_set(blob: &ReachabilityAnnouncePayload, now_ms: u64) -> Vec<
         .collect()
 }
 
+/// Like [`fresh_butler_set`] but WITHOUT the freshness window — for butler-sets
+/// sourced from the durable community CRDT (Decision 3). The seal-target vk is
+/// durable even when the advertised endpoint has drifted (a stale endpoint just
+/// fails the dial and falls through; the vk stays a valid seal target). A
+/// zero/missing `bs_at` still means "no butler-set".
+pub fn durable_butler_set(blob: &ReachabilityAnnouncePayload) -> Vec<ButlerSetEntry> {
+    if blob.bs_at == 0 {
+        return Vec::new();
+    }
+    blob.butler_set
+        .iter()
+        .take(crate::butler_deposit::BUTLER_SET_MAX_ENTRIES)
+        .cloned()
+        .collect()
+}
+
 impl CanonicalPayloadSealed for ReachabilityAnnouncePayload {}
 impl CanonicalPayload for ReachabilityAnnouncePayload {}
 
@@ -153,28 +175,44 @@ pub fn canonical_payload_bytes(p: &ReachabilityAnnouncePayload) -> Result<Vec<u8
 }
 
 /// Deterministic byte string the inner identity signature covers:
-/// CBOR of (nd, rl, da, ts, ac, hl). The actor + hlc are pulled
+/// CBOR of (nd, rl, da, ts, ac, hl, bs, ba). The actor + hlc are pulled
 /// from the surrounding membership envelope; they're NOT part of the
 /// payload struct itself but are bound into the signature so a replay
 /// attacker can't lift a `ReachabilityAnnouncePayload` from one envelope
-/// and re-attach it under a different actor or HLC.
+/// and re-attach it under a different actor or HLC. The butler set (`bs`)
+/// and its freshness stamp (`ba`) ARE payload fields, bound here so they
+/// can't be forged or stripped (see the butler-set binding note below).
 ///
-/// All 6 field keys are 2 chars to satisfy the same-length-keys
+/// All field keys are 2 chars to satisfy the same-length-keys
 /// invariant at this nesting level. This sig-input map MUST be kept
 /// distinct from `ReachabilityAnnouncePayload`'s wire shape (which has
-/// only the 5 self-contained fields nd/rl/da/ts/sg); confusing them
-/// would let a peer replay the inner-sig bytes verbatim.
+/// the self-contained fields nd/rl/da/ts/sg/bs/ba but NOT ac/hl);
+/// confusing them would let a peer replay the inner-sig bytes verbatim.
+///
+/// **Butler-set binding (ZEB-418 durable seal-targets):** the recipient's
+/// `butler_set` (`bs`) + freshness stamp `bs_at` (`ba`) are folded into the
+/// preimage so a co-member or relay can neither forge nor strip the device-key
+/// seal-targets used for offline DM deposit — they're authenticated by the
+/// recipient's own harmony identity. NOTE: this is a flag-day preimage change
+/// — records signed before this field was added will NOT verify against the
+/// extended preimage (and vice-versa). The pkarr routing blob is unaffected:
+/// it zero-fills `identity_signature` and never calls this function, so only
+/// durable CRDT membership records carry the extended signature.
 ///
 /// **Not a `CanonicalPayload`**: this function encodes via raw
 /// `ciborium::into_writer` rather than the repo's `canonical_cbor_encode`
 /// helper because the input struct holds references and the
 /// `CanonicalPayload` sealed-trait API requires owned types. The
-/// underlying serde impls for all six fields (`[u8;32]`, `&str`,
-/// `&[SocketAddr]`, `u64`, `&OwnerAddr`, `&Hlc`) are deterministic,
+/// underlying serde impls for all eight fields (`[u8;32]`, `&str`,
+/// `&[SocketAddr]`, `u64`, `&OwnerAddr`, `&Hlc`, `&[ButlerSetEntry]`,
+/// `u64`) are deterministic,
 /// so the byte sequence is stable across runs and machines — sufficient
 /// for sign/verify symmetry. If a future requirement needs strict
 /// canonical (length-prefix-sorted) encoding here, switch to an owned
 /// struct that impls `CanonicalPayload`. Per CodeRabbit on PR #157.
+// Each argument is a distinct semantic field of the signed preimage; bundling
+// them into a struct would obscure the sign/verify contract.
+#[allow(clippy::too_many_arguments)]
 pub fn inner_signed_bytes(
     iroh_node_id: &[u8; 32],
     home_relay_url: &str,
@@ -182,6 +220,8 @@ pub fn inner_signed_bytes(
     announced_at_ms: u64,
     actor: &OwnerAddr,
     hlc: &Hlc,
+    butler_set: &[ButlerSetEntry],
+    bs_at: u64,
 ) -> Result<Vec<u8>, CryptoError> {
     #[derive(Serialize)]
     struct InnerSigInput<'a> {
@@ -197,6 +237,10 @@ pub fn inner_signed_bytes(
         ac: &'a OwnerAddr,
         #[serde(rename = "hl")]
         hl: &'a Hlc,
+        #[serde(rename = "bs")]
+        bs: &'a [ButlerSetEntry],
+        #[serde(rename = "ba")]
+        ba: u64,
     }
     let input = InnerSigInput {
         nd: iroh_node_id,
@@ -205,6 +249,8 @@ pub fn inner_signed_bytes(
         ts: announced_at_ms,
         ac: actor,
         hl: hlc,
+        bs: butler_set,
+        ba: bs_at,
     };
     let mut buf = Vec::new();
     ciborium::into_writer(&input, &mut buf).map_err(|e| CryptoError::CborEncode(format!("{e}")))?;
@@ -214,6 +260,7 @@ pub fn inner_signed_bytes(
 /// Sign a fresh `ReachabilityAnnouncePayload` using the device's harmony
 /// identity signing key. Caller is responsible for ensuring `actor`
 /// matches the identity (`identity.identity.address_hash`).
+#[allow(clippy::too_many_arguments)]
 pub fn build_signed_payload(
     iroh_node_id: [u8; 32],
     home_relay_url: String,
@@ -221,6 +268,8 @@ pub fn build_signed_payload(
     announced_at_ms: u64,
     actor: &OwnerAddr,
     hlc: &Hlc,
+    butler_set: Vec<ButlerSetEntry>,
+    bs_at: u64,
     identity: &harmony_identity::PrivateIdentity,
 ) -> Result<ReachabilityAnnouncePayload, CryptoError> {
     let inner = inner_signed_bytes(
@@ -230,6 +279,8 @@ pub fn build_signed_payload(
         announced_at_ms,
         actor,
         hlc,
+        &butler_set,
+        bs_at,
     )?;
     let sig = identity.sign(&inner);
     Ok(ReachabilityAnnouncePayload {
@@ -238,8 +289,8 @@ pub fn build_signed_payload(
         direct_addresses,
         announced_at_ms,
         identity_signature: sig,
-        butler_set: Vec::new(),
-        bs_at: 0,
+        butler_set,
+        bs_at,
     })
 }
 
@@ -251,6 +302,7 @@ pub fn build_signed_payload(
 /// so the production reachability mint MUST sign the inner sig with device
 /// #2. Caller is responsible for ensuring `actor` matches the enrolled
 /// device key's owner.
+#[allow(clippy::too_many_arguments)]
 pub fn build_signed_payload_with_key(
     iroh_node_id: [u8; 32],
     home_relay_url: String,
@@ -258,6 +310,8 @@ pub fn build_signed_payload_with_key(
     announced_at_ms: u64,
     actor: &OwnerAddr,
     hlc: &Hlc,
+    butler_set: Vec<ButlerSetEntry>,
+    bs_at: u64,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<ReachabilityAnnouncePayload, CryptoError> {
     use ed25519_dalek::Signer;
@@ -268,6 +322,8 @@ pub fn build_signed_payload_with_key(
         announced_at_ms,
         actor,
         hlc,
+        &butler_set,
+        bs_at,
     )?;
     let sig = signing_key.sign(&inner).to_bytes();
     Ok(ReachabilityAnnouncePayload {
@@ -276,8 +332,8 @@ pub fn build_signed_payload_with_key(
         direct_addresses,
         announced_at_ms,
         identity_signature: sig,
-        butler_set: Vec::new(),
-        bs_at: 0,
+        butler_set,
+        bs_at,
     })
 }
 
@@ -297,6 +353,8 @@ pub fn verify_inner_signature(
         p.announced_at_ms,
         actor,
         hlc,
+        &p.butler_set,
+        p.bs_at,
     )
     .map_err(|_| InnerSigError::Encode)?;
     let sig = ed25519_dalek::Signature::from_bytes(&p.identity_signature);
@@ -526,6 +584,8 @@ mod tests {
             1_700_000_000_000,
             &actor,
             &hlc,
+            Vec::new(),
+            0,
             &identity,
         )
         .expect("sign");
@@ -557,6 +617,8 @@ mod tests {
             1_700_000_000_000,
             &actor,
             &hlc,
+            Vec::new(),
+            0,
             &signing_key,
         )
         .expect("build_signed_payload_with_key");
@@ -599,6 +661,8 @@ mod tests {
             1_700_000_000_000,
             &actor,
             &hlc,
+            Vec::new(),
+            0,
             &identity,
         )
         .expect("sign");
@@ -606,6 +670,55 @@ mod tests {
 
         assert_eq!(
             verify_inner_signature(&p, &actor, &hlc, &public.verifying_key),
+            Err(InnerSigError::Invalid)
+        );
+    }
+
+    /// The inner identity signature must COVER the butler set + its freshness
+    /// stamp, so a co-member or relay can neither forge nor strip the
+    /// recipient's seal-targets (ZEB-418 durable seal-targets). A signed
+    /// payload built WITH a non-empty butler set verifies; tampering with a
+    /// butler entry, or clearing the set/stamp, must both invalidate the sig.
+    #[test]
+    fn inner_sig_covers_butler_set_and_rejects_tamper() {
+        let identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+        let public = identity.public_identity();
+        let actor = OwnerAddr(public.address_hash);
+        let hlc = fixture_hlc();
+        let p = build_signed_payload(
+            [0xAB; 32],
+            "https://derp.example/".into(),
+            vec![],
+            1_700_000_000_000,
+            &actor,
+            &hlc,
+            vec![fixture_butler_entry(0x10)],
+            1_700_000_000_000,
+            &identity,
+        )
+        .expect("sign");
+
+        // Sanity: the butler set + stamp are carried in the payload.
+        assert_eq!(p.butler_set, vec![fixture_butler_entry(0x10)]);
+        assert_eq!(p.bs_at, 1_700_000_000_000);
+
+        // Honest record verifies.
+        verify_inner_signature(&p, &actor, &hlc, &public.verifying_key).expect("verify");
+
+        // (a) Tamper a butler entry → sig must reject.
+        let mut tampered = p.clone();
+        tampered.butler_set[0].device_ed25519_verify[0] ^= 0xFF;
+        assert_eq!(
+            verify_inner_signature(&tampered, &actor, &hlc, &public.verifying_key),
+            Err(InnerSigError::Invalid)
+        );
+
+        // (b) Strip the butler set + zero the stamp → sig must reject.
+        let mut stripped = p.clone();
+        stripped.butler_set.clear();
+        stripped.bs_at = 0;
+        assert_eq!(
+            verify_inner_signature(&stripped, &actor, &hlc, &public.verifying_key),
             Err(InnerSigError::Invalid)
         );
     }

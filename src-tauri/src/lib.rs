@@ -6401,6 +6401,16 @@ pub async fn start_node_inner(
                         let self_owner_for_cb = self_owner;
                         let hlc_tracker_for_cb = std::sync::Arc::clone(&tracker);
                         let device_id_for_cb = device_id.clone();
+                        // ZEB-418/durable-seal-targets Task 2: butler-set inputs
+                        // captured for the CRDT publisher. Unlike the sync pkarr
+                        // blob builder (which reads a `fleet_vk_map` std RwLock
+                        // view because it can't lock the async crdt mutex), this
+                        // publish_fn is async and already captures `crdt_state`,
+                        // so it locks and builds the vk-map inline per publish.
+                        let fleet_net_snapshot_for_pub = std::sync::Arc::clone(&fleet_net_snapshot);
+                        let butler_self_device_id_hash_for_pub = this_device_id_hash;
+                        let butler_self_device_vk_for_pub =
+                            loaded.device_signing_key.verifying_key().to_bytes();
                         let publish_fn: crate::reachability_publisher::PublishFn =
                             std::sync::Arc::new(move || {
                                 // Per-invocation clones — the closure is
@@ -6419,6 +6429,11 @@ pub async fn start_node_inner(
                                     std::sync::Arc::clone(&friend_pub_cell_for_cb);
                                 let crdt_state = std::sync::Arc::clone(&crdt_state_for_cb);
                                 let kt = std::sync::Arc::clone(&kt_for_cb);
+                                // Task 2 per-invocation butler-set clones.
+                                let fleet_net_snapshot =
+                                    std::sync::Arc::clone(&fleet_net_snapshot_for_pub);
+                                let butler_self_device_id_hash = butler_self_device_id_hash_for_pub;
+                                let butler_self_device_vk = butler_self_device_vk_for_pub;
                                 Box::pin(async move {
                                     // 1. Snapshot iroh state ONCE.
                                     let node_id_bytes: [u8; 32] = *ep.node_id().as_bytes();
@@ -6439,6 +6454,64 @@ pub async fn start_node_inner(
                                         .unwrap_or_default()
                                         .as_millis()
                                         as u64;
+
+                                    // 1b. Build the owner's durable butler-set ONCE
+                                    // (identical across communities; cloned per
+                                    // payload). Task 2: this carries the recipient's
+                                    // device-key seal-targets in the durable CRDT
+                                    // record so a fully-offline recipient's DM-deposit
+                                    // seal-targets stay resolvable. Mirrors the sync
+                                    // pkarr blob builder's `build_butler_set` /
+                                    // `vk_map_from_device_cache` usage; the async path
+                                    // locks `crdt_state` directly instead of reading a
+                                    // separate std RwLock view. The lock guard is
+                                    // scoped to this block and dropped before the
+                                    // per-community loop / the later friend-reconcile
+                                    // lock, so there is no double-lock / deadlock.
+                                    let (self_butler_set, self_bs_at) = {
+                                        let st = crdt_state.lock().await;
+                                        let vk_map = crate::fleet_net::vk_map_from_device_cache(
+                                            &st.owner_device_cache,
+                                            &actor,
+                                            &device_id,
+                                            butler_self_device_vk,
+                                        );
+                                        let snap = fleet_net_snapshot
+                                            .read()
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        let self_entry =
+                                            crate::reachability_record::ButlerSetEntry {
+                                                device_id: butler_self_device_id_hash,
+                                                iroh_endpoint_id: node_id_bytes,
+                                                device_ed25519_verify: butler_self_device_vk,
+                                                home_relay: home_relay.clone(),
+                                                pinned: false,
+                                            };
+                                        let vk_lookup = |dev_id: &str| -> Option<[u8; 32]> {
+                                            let vk = vk_map.get(dev_id).copied();
+                                            if vk.is_none() {
+                                                tracing::debug!(
+                                                    device_id = %dev_id,
+                                                    "Task 2: fleet-net device has no resolvable \
+                                                     vk in the owner_device_cache view; skipping \
+                                                     butler-set entry"
+                                                );
+                                            }
+                                            vk
+                                        };
+                                        let set = crate::fleet_net::build_butler_set(
+                                            &snap,
+                                            &device_id,
+                                            self_entry,
+                                            &vk_lookup,
+                                            announced_at_ms.saturating_sub(
+                                                crate::butler_deposit::BUTLER_SET_FRESHNESS_MS,
+                                            ),
+                                        );
+                                        let bs_at =
+                                            if set.is_empty() { 0 } else { announced_at_ms };
+                                        (set, bs_at)
+                                    };
 
                                     // 2. Iterate joined communities. When NONE
                                     // are joined this loop is skipped, but the
@@ -6472,6 +6545,8 @@ pub async fn start_node_inner(
                                                 announced_at_ms,
                                                 &actor,
                                                 &hlc,
+                                                self_butler_set.clone(),
+                                                self_bs_at,
                                                 community_signing_key.as_ref(),
                                             ) {
                                                 Ok(p) => p,
@@ -21318,6 +21393,13 @@ pub(crate) async fn create_community_impl(
         }
     }
 
+    // durable-seal-targets: wake the reachability publisher so this device
+    // emits a per-community `ReachabilityAnnounce` (carrying its durable
+    // butler-set) for the just-created community NOW, rather than after the
+    // 60-min idle tick. The membership is committed + registered above, so the
+    // publisher's `known_ids()` loop will include it.
+    force_reachability_republish(state);
+
     Ok(community_id)
 }
 
@@ -23728,6 +23810,13 @@ pub(crate) async fn redeem_invite_impl(
             }
         }
     }
+
+    // durable-seal-targets: wake the reachability publisher so this freshly-
+    // joined member emits a per-community `ReachabilityAnnounce` (carrying its
+    // durable butler-set) NOW — co-members (a DM sender's resolver) learn its
+    // seal-targets without waiting up to 60 min for the idle tick. Membership is
+    // committed + registered above.
+    force_reachability_republish(state);
 
     Ok(dto)
 }
@@ -39317,7 +39406,7 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         Ok(())
     };
 
-    connectivity_redeem_invite_iroh_inner(
+    let outcome = connectivity_redeem_invite_iroh_inner(
         invite_url,
         pkarr_resolver,
         reachability_resolver,
@@ -39340,7 +39429,21 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         HandshakeDialConfig::from_env(),
         fence_check,
     )
-    .await
+    .await?;
+
+    // durable-seal-targets: on a successful cross-WAN first-contact JOIN (the
+    // path the two-agent e2e + the GUI use for never-met nodes), wake the
+    // reachability publisher so this freshly-joined member emits a per-community
+    // `ReachabilityAnnounce` (carrying its durable butler-set) NOW — a DM
+    // sender's resolver learns its seal-targets without waiting up to 60 min.
+    // Gated on "joined": the inner committed the membership + spawned the engine
+    // (registered in `known_ids()`) only on that status; other outcomes
+    // (inviter_unreachable / join_failed) committed no new community.
+    if outcome.status == "joined" {
+        force_reachability_republish(state);
+    }
+
+    Ok(outcome)
 }
 
 /// Upper bound on a durable-on-commit fence's `flush_now().await`.
@@ -44391,6 +44494,12 @@ pub struct ReachabilityRecordDto {
 pub struct PeerReachabilityDto {
     pub owner_address: String,
     pub record: ReachabilityRecordDto,
+    /// Provenance of this entry: `"durableCrdt"` (replicated community-membership
+    /// CRDT, window-exempt seal-targets) or `"pkarrLive"` (live pkarr cache-back,
+    /// 15-min windowed). Lets a consumer gate on durable replication specifically
+    /// — e.g. the e2e durable-seal-target barrier, which must not be satisfied by
+    /// a transient pkarr cache-back (ZEB-488; Qodo "Barrier ignores entry source").
+    pub source: String,
 }
 
 /// Snapshot of THIS device's reachability state.
@@ -44468,11 +44577,11 @@ pub(crate) async fn connectivity_list_peer_reachability_impl(
     let Some(resolver) = g.reachability_resolver.as_ref() else {
         return Ok(Vec::new());
     };
-    let peers = resolver.list_active_peers();
+    let peers = resolver.list_active_peers_with_source();
     drop(g);
     let dtos: Vec<PeerReachabilityDto> = peers
         .into_iter()
-        .map(|(actor, payload)| PeerReachabilityDto {
+        .map(|(actor, payload, source)| PeerReachabilityDto {
             owner_address: hex::encode(actor.0),
             record: ReachabilityRecordDto {
                 iroh_node_id: hex::encode(payload.iroh_node_id),
@@ -44484,6 +44593,7 @@ pub(crate) async fn connectivity_list_peer_reachability_impl(
                     .collect(),
                 announced_at_ms: payload.announced_at_ms,
             },
+            source: source.as_dto_str().to_string(),
         })
         .collect();
     Ok(dtos)
@@ -44515,6 +44625,42 @@ async fn connectivity_force_republish(
     };
     force.notify_one();
     Ok(true)
+}
+
+/// Wake the reachability publisher so it republishes the per-community
+/// `ReachabilityAnnounce` immediately, INSTEAD of waiting for the next
+/// startup / network-change / 60-min idle tick.
+///
+/// The publisher's loop iterates `registry.known_ids()` and, for each
+/// community, signs + inserts a `ReachabilityAnnounce` carrying this device's
+/// DURABLE butler-set (the seal-targets a fully-offline recipient's DM deposit
+/// resolves). Two state changes the publisher does NOT otherwise observe make
+/// the advertised announce stale, so they call this:
+///
+///  * **community create / join** — a freshly-joined member must publish a
+///    per-community announce so co-members (the sender's resolver) learn its
+///    seal-targets without waiting up to 60 min. Call AFTER the membership is
+///    committed to the registry (so `known_ids()` includes it).
+///  * **butler-set / pin change** — the next announce must carry the new set
+///    (e.g. a newly-pinned butler device); local writes never reach the
+///    inbound-merge debounce path. Call AFTER the fleet-net write lands.
+///
+/// `Notify::notify_one()` coalesces, so back-to-back calls collapse into one
+/// wakeup. No-op (logged at trace) when the publisher isn't running — iroh boot
+/// failed, or no owner identity is loaded (the publisher is identity-gated).
+/// Best-effort: a missing handle never fails the caller's IPC, mirroring the
+/// other post-commit republish hooks (`routing_republish`).
+pub(crate) fn force_reachability_republish(state: &Mutex<NodeState>) {
+    let Ok(g) = state.lock() else {
+        tracing::warn!("force_reachability_republish: NodeState poisoned; skipping");
+        return;
+    };
+    match g.iroh_publisher_force.as_ref() {
+        Some(force) => force.notify_one(),
+        None => tracing::trace!(
+            "force_reachability_republish: reachability publisher not running; skipping"
+        ),
+    }
 }
 
 /// ZEB-329 boot helper: stand-in `PkarrSnapshot` used when the pkarr
@@ -44952,6 +45098,16 @@ pub(crate) async fn set_butler_pin_impl(
     if let Some(rp) = routing_republish {
         rp();
     }
+
+    // durable-seal-targets: a pin change rewrites this device's advertised
+    // butler-set, so the COMMUNITY-CRDT `ReachabilityAnnounce` must be
+    // re-emitted too (the `routing_republish` above only refreshes the PKARR
+    // routing record + fleet-net self-row, not the per-community announce the
+    // deposit rungs resolve seal-targets from). The fleet-net doc + snapshot are
+    // already updated above, and the reachability publish-fn reads the snapshot
+    // when it next runs, so waking it now makes the next announce carry the new
+    // butler-set. Best-effort; no-op when the publisher isn't running.
+    force_reachability_republish(state);
     Ok(())
 }
 
@@ -50893,6 +51049,8 @@ mod zeb_321_event_loop_wiring_tests {
             wall_ms,
             &actor,
             &hlc,
+            Vec::new(),
+            0,
             identity,
         )
         .expect("build signed payload");
