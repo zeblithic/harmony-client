@@ -95,8 +95,11 @@ pub struct ReachabilityAnnouncePayload {
     pub announced_at_ms: u64,
 
     /// Inner Ed25519 signature by the device's HARMONY identity key
-    /// over canonical CBOR of (nd, rl, da, ts, actor, hlc). Binds the
-    /// Iroh NodeId to the harmony identity. 64 bytes.
+    /// over canonical CBOR of (nd, rl, da, ts, actor, hlc, bs, ba) — the
+    /// 8-field preimage built by [`inner_signed_bytes`] (the butler set `bs`
+    /// and its stamp `ba` were folded in for ZEB-418 durable seal-targets, a
+    /// flag-day change). Binds the Iroh NodeId AND the seal-targets to the
+    /// harmony identity. 64 bytes.
     #[serde(
         rename = "sg",
         serialize_with = "serialize_bytes_as_bstr",
@@ -108,8 +111,11 @@ pub struct ReachabilityAnnouncePayload {
     /// [`crate::butler_deposit::BUTLER_SET_MAX_ENTRIES`]). Elided when empty
     /// so blobs without a butler set stay byte-identical to the legacy
     /// encoding (pinned by `routing_blob_without_butler_set_is_wire_
-    /// identical_to_legacy`). Read through [`fresh_butler_set`] — never
-    /// directly — so stale ads are filtered.
+    /// identical_to_legacy`). Read through a source-appropriate accessor —
+    /// never directly: [`fresh_butler_set`] for pkarr-live records (applies the
+    /// freshness window) or [`durable_butler_set`] for durable CRDT records
+    /// (window-exempt, Decision 3). The caller picks by [`crate::reachability_
+    /// resolver::ReachabilitySource`].
     #[serde(rename = "bs", default, skip_serializing_if = "Vec::is_empty")]
     pub butler_set: Vec<ButlerSetEntry>,
 
