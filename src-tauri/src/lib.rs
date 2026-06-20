@@ -7111,8 +7111,16 @@ pub async fn start_node_inner(
                                 //    publish froze the identity record forever.
                                 //    Reading the setting self-heals it on the next
                                 //    tick. (ZEB-516)
+                                // Read the persisted setting OFF the executor — a
+                                // sync file read on the tick would block the
+                                // runtime thread; matches the off-executor
+                                // disk-read pattern (PR #207/#280).
                                 let identity_discoverable =
-                                    identity_republish_enabled(&pkarr_settings_path);
+                                    tokio::task::spawn_blocking(move || {
+                                        identity_republish_enabled(&pkarr_settings_path)
+                                    })
+                                    .await
+                                    .unwrap_or(false);
                                 if identity_discoverable {
                                     identity_pub.enable().await;
                                 }
