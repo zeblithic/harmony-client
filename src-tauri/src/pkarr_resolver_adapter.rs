@@ -78,8 +78,8 @@ impl ReachabilityFallback for PkarrResolverAdapter {
                     {
                         continue;
                     }
-                    // RPK4: verify timestamp skew.
-                    if rec.verify_skew(now_ms).is_err() {
+                    // RPK4: verify freshness (future-strict + signed TTL).
+                    if rec.verify_freshness(now_ms).is_err() {
                         continue;
                     }
                     // Decode routing_blob into harmony-client's ReachabilityAnnouncePayload.

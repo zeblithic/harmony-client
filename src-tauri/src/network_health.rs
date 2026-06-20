@@ -1338,7 +1338,7 @@ impl PkarrSelfTest for ProdSelfTest {
                 Ok(Ok(Some(rec))) => {
                     if rec.verify_inner_sig().is_err()
                         || rec.verify_identity_match(&id_pub).is_err()
-                        || rec.verify_skew(now_ms).is_err()
+                        || rec.verify_freshness(now_ms).is_err()
                     {
                         StepOutcome::Fail {
                             reason: "resolved record failed verification".into(),
@@ -2557,7 +2557,14 @@ mod tests {
         });
         let id_sk2 = id_sk.clone();
         let builder: RecordBuilder = std::sync::Arc::new(move |at_ms| {
-            PkarrRoutingRecord::sign_new(b"routing".to_vec(), id_pub, at_ms, &id_sk2).expect("sign")
+            PkarrRoutingRecord::sign_new(
+                b"routing".to_vec(),
+                id_pub,
+                at_ms,
+                at_ms + crate::reachability_record::REACHABILITY_RECORD_TTL_MS,
+                &id_sk2,
+            )
+            .expect("sign")
         });
         publisher
             .register("identity".to_string(), key_builder, builder)

@@ -61,8 +61,14 @@ impl PkarrFriendPublisher {
             id_pub[32..].copy_from_slice(&cd_key.verifying_key().to_bytes());
             let sealed = seal_case_d_payload(&payload_secret, epoch, &blob_builder())
                 .expect("case-d payload seal");
-            PkarrRoutingRecord::sign_new(sealed, id_pub, at_ms, &cd_key)
-                .expect("sign — derived key matches embedded id_pub by construction")
+            PkarrRoutingRecord::sign_new(
+                sealed,
+                id_pub,
+                at_ms,
+                at_ms + crate::reachability_record::REACHABILITY_RECORD_TTL_MS,
+                &cd_key,
+            )
+            .expect("sign — derived key matches embedded id_pub by construction")
         });
         self.publisher
             .register(friend_handle(&friend_owner), key_builder, builder)

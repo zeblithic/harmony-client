@@ -54,8 +54,14 @@ impl PkarrIdentityPublisher {
         let id_pub = self.identity_pub;
         let blob_builder = Arc::clone(&self.routing_blob_builder);
         let builder: RecordBuilder = Arc::new(move |at_ms| {
-            PkarrRoutingRecord::sign_new(blob_builder(), id_pub, at_ms, &id_sk)
-                .expect("sign — fixed-size buffers should not fail")
+            PkarrRoutingRecord::sign_new(
+                blob_builder(),
+                id_pub,
+                at_ms,
+                at_ms + crate::reachability_record::REACHABILITY_RECORD_TTL_MS,
+                &id_sk,
+            )
+            .expect("sign — fixed-size buffers should not fail")
         });
 
         self.publisher
