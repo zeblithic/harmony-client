@@ -1378,7 +1378,7 @@ async fn s6_relay_deposit_recover() {
         "relay holds nothing before the offline send"
     );
 
-    // --- REACHABILITY-SYNC BARRIER (durable seal-targets, Tasks 1-5). The relay
+    // --- REACHABILITY-SYNC BARRIER (durable seal-targets, ZEB-488). The relay
     //     rung resolves b's SEAL TARGETS on the SENDER (a), from a's reachability
     //     resolver, which carries b's ReachabilityAnnounce payload INCLUDING its
     //     durable butler-set. That resolution only succeeds for a fully-offline b
@@ -1771,7 +1771,7 @@ async fn s7_butler_deposit_recover() {
          (get_butler_held OK, empty) — ZEB-492 KeyTree distribution reached the engines."
     );
 
-    // --- REACHABILITY-SYNC BARRIER (durable seal-targets, Tasks 1-5). The butler
+    // --- REACHABILITY-SYNC BARRIER (durable seal-targets, ZEB-488). The butler
     //     deposit resolves P's SEAL TARGETS on the SENDER (A), from A's
     //     reachability resolver, which carries P's ReachabilityAnnounce payload
     //     INCLUDING its DURABLE butler-set (P's butler-set advertises B2). That
@@ -1814,7 +1814,7 @@ async fn s7_butler_deposit_recover() {
 
     let held_entry = match held {
         Ok(e) => e,
-        Err(_) => {
+        Err(e) => {
             // s7 HELD characterized: P's published butler-set carries a stale/wrong
             // B2 iroh endpoint, so A dials the wrong place and the deposit never
             // reaches B2. Root cause (artifact logs): the fleet-net P<->B2 endpoint
@@ -1828,12 +1828,14 @@ async fn s7_butler_deposit_recover() {
             // is the authoritative butler-rung deposit proof. See ZEB-510.
             eprintln!(
                 "S7 FINDING (ZEB-510): butler deposit not observed on B2 within 120s \
-                 co-located. A resolved P's durable butler-set and dialed (resolution \
-                 proven), but P's published butler-set carries a stale/wrong B2 iroh \
-                 endpoint — P never learned B2's endpoint co-located (fleet-net P<->B2 \
-                 endpoint propagation gap; fleet-sync content-fetch fails over the \
-                 co-located transport). Cross-WAN Scenario D3 (ZEB-477) is the proof. \
-                 Skipping HELD/RECV/CLEARED."
+                 co-located ({e}). A resolved P's durable butler-set and dialed \
+                 (resolution proven), but P's published butler-set carries a \
+                 stale/wrong B2 iroh endpoint — P never learned B2's endpoint \
+                 co-located (fleet-net P<->B2 endpoint propagation gap; fleet-sync \
+                 content-fetch fails over the co-located transport). Cross-WAN \
+                 Scenario D3 (ZEB-477) is the proof. Skipping HELD/RECV/CLEARED. \
+                 (The preserved error distinguishes a poll_until timeout — deposit \
+                 never landed — from a get_butler_held RPC/contract error.)"
             );
             run.mark_success();
             drop((a, p, b2, a_home, p_home, b2_home));

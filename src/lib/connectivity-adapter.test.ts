@@ -99,6 +99,7 @@ describe('connectivity-adapter', () => {
             directAddresses: [],
             announcedAtMs: 1_700_000_000_000,
           },
+          source: 'durableCrdt',
         },
       ];
       mockInvoke.mockResolvedValueOnce(sample);

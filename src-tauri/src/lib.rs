@@ -44494,6 +44494,12 @@ pub struct ReachabilityRecordDto {
 pub struct PeerReachabilityDto {
     pub owner_address: String,
     pub record: ReachabilityRecordDto,
+    /// Provenance of this entry: `"durableCrdt"` (replicated community-membership
+    /// CRDT, window-exempt seal-targets) or `"pkarrLive"` (live pkarr cache-back,
+    /// 15-min windowed). Lets a consumer gate on durable replication specifically
+    /// — e.g. the e2e durable-seal-target barrier, which must not be satisfied by
+    /// a transient pkarr cache-back (ZEB-488; Qodo "Barrier ignores entry source").
+    pub source: String,
 }
 
 /// Snapshot of THIS device's reachability state.
@@ -44571,11 +44577,11 @@ pub(crate) async fn connectivity_list_peer_reachability_impl(
     let Some(resolver) = g.reachability_resolver.as_ref() else {
         return Ok(Vec::new());
     };
-    let peers = resolver.list_active_peers();
+    let peers = resolver.list_active_peers_with_source();
     drop(g);
     let dtos: Vec<PeerReachabilityDto> = peers
         .into_iter()
-        .map(|(actor, payload)| PeerReachabilityDto {
+        .map(|(actor, payload, source)| PeerReachabilityDto {
             owner_address: hex::encode(actor.0),
             record: ReachabilityRecordDto {
                 iroh_node_id: hex::encode(payload.iroh_node_id),
@@ -44587,6 +44593,7 @@ pub(crate) async fn connectivity_list_peer_reachability_impl(
                     .collect(),
                 announced_at_ms: payload.announced_at_ms,
             },
+            source: source.as_dto_str().to_string(),
         })
         .collect();
     Ok(dtos)
