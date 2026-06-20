@@ -31,12 +31,19 @@ fn default_friend_auto_accept_known() -> bool {
     true
 }
 
-/// Default for [`PkarrSettings::relays`]: a vetted, liveness-probed >=2 set
-/// (2026-06-05). `relay.pkarr.org` (n0-operated) + `pkarr.pubky.app` (Pubky).
-/// Redundancy means one host-level relay hiccup is no longer terminal for
-/// first-contact (ZEB-330).
+/// Default for [`PkarrSettings::relays`]: the Zeblithic-operated
+/// `pkarr.q8.fyi` (primary) followed by the vetted public fallbacks
+/// `relay.pkarr.org` (n0-operated) + `pkarr.pubky.app` (Pubky).
+///
+/// The self-hosted primary gives the fleet a single deterministic
+/// publish/resolve rendezvous, avoiding the cross-relay partition where two
+/// peers each publish to a *different* reachable relay and so never resolve
+/// each other (ZEB-513). The public relays are retained behind it so one
+/// host-level relay hiccup is never terminal for first-contact (ZEB-330,
+/// ZEB-380 redundancy).
 pub fn default_relays() -> Vec<String> {
     vec![
+        "https://pkarr.q8.fyi".to_string(),
         "https://relay.pkarr.org".to_string(),
         "https://pkarr.pubky.app".to_string(),
     ]
@@ -258,6 +265,21 @@ mod tests {
         let settings = PkarrSettings::default();
         assert_eq!(settings.relays, default_relays());
         assert!(settings.relays.len() >= 2, "must ship a >=2 relay default");
+    }
+
+    #[test]
+    fn self_hosted_relay_leads_default_pool() {
+        // The Zeblithic-operated relay leads the pool so the fleet shares one
+        // deterministic rendezvous (ZEB-513); the public relays stay behind it
+        // as redundancy fallbacks (ZEB-330/380).
+        let relays = default_relays();
+        assert_eq!(
+            relays.first().map(String::as_str),
+            Some("https://pkarr.q8.fyi"),
+            "self-hosted relay must be the primary default"
+        );
+        assert!(relays.iter().any(|r| r == "https://relay.pkarr.org"));
+        assert!(relays.iter().any(|r| r == "https://pkarr.pubky.app"));
     }
 
     #[test]
