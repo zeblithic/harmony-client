@@ -21393,6 +21393,13 @@ pub(crate) async fn create_community_impl(
         }
     }
 
+    // durable-seal-targets: wake the reachability publisher so this device
+    // emits a per-community `ReachabilityAnnounce` (carrying its durable
+    // butler-set) for the just-created community NOW, rather than after the
+    // 60-min idle tick. The membership is committed + registered above, so the
+    // publisher's `known_ids()` loop will include it.
+    force_reachability_republish(state);
+
     Ok(community_id)
 }
 
@@ -23803,6 +23810,13 @@ pub(crate) async fn redeem_invite_impl(
             }
         }
     }
+
+    // durable-seal-targets: wake the reachability publisher so this freshly-
+    // joined member emits a per-community `ReachabilityAnnounce` (carrying its
+    // durable butler-set) NOW — co-members (a DM sender's resolver) learn its
+    // seal-targets without waiting up to 60 min for the idle tick. Membership is
+    // committed + registered above.
+    force_reachability_republish(state);
 
     Ok(dto)
 }
@@ -39392,7 +39406,7 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         Ok(())
     };
 
-    connectivity_redeem_invite_iroh_inner(
+    let outcome = connectivity_redeem_invite_iroh_inner(
         invite_url,
         pkarr_resolver,
         reachability_resolver,
@@ -39415,7 +39429,21 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         HandshakeDialConfig::from_env(),
         fence_check,
     )
-    .await
+    .await?;
+
+    // durable-seal-targets: on a successful cross-WAN first-contact JOIN (the
+    // path the two-agent e2e + the GUI use for never-met nodes), wake the
+    // reachability publisher so this freshly-joined member emits a per-community
+    // `ReachabilityAnnounce` (carrying its durable butler-set) NOW — a DM
+    // sender's resolver learns its seal-targets without waiting up to 60 min.
+    // Gated on "joined": the inner committed the membership + spawned the engine
+    // (registered in `known_ids()`) only on that status; other outcomes
+    // (inviter_unreachable / join_failed) committed no new community.
+    if outcome.status == "joined" {
+        force_reachability_republish(state);
+    }
+
+    Ok(outcome)
 }
 
 /// Upper bound on a durable-on-commit fence's `flush_now().await`.
@@ -44592,6 +44620,42 @@ async fn connectivity_force_republish(
     Ok(true)
 }
 
+/// Wake the reachability publisher so it republishes the per-community
+/// `ReachabilityAnnounce` immediately, INSTEAD of waiting for the next
+/// startup / network-change / 60-min idle tick.
+///
+/// The publisher's loop iterates `registry.known_ids()` and, for each
+/// community, signs + inserts a `ReachabilityAnnounce` carrying this device's
+/// DURABLE butler-set (the seal-targets a fully-offline recipient's DM deposit
+/// resolves). Two state changes the publisher does NOT otherwise observe make
+/// the advertised announce stale, so they call this:
+///
+///  * **community create / join** — a freshly-joined member must publish a
+///    per-community announce so co-members (the sender's resolver) learn its
+///    seal-targets without waiting up to 60 min. Call AFTER the membership is
+///    committed to the registry (so `known_ids()` includes it).
+///  * **butler-set / pin change** — the next announce must carry the new set
+///    (e.g. a newly-pinned butler device); local writes never reach the
+///    inbound-merge debounce path. Call AFTER the fleet-net write lands.
+///
+/// `Notify::notify_one()` coalesces, so back-to-back calls collapse into one
+/// wakeup. No-op (logged at trace) when the publisher isn't running — iroh boot
+/// failed, or no owner identity is loaded (the publisher is identity-gated).
+/// Best-effort: a missing handle never fails the caller's IPC, mirroring the
+/// other post-commit republish hooks (`routing_republish`).
+pub(crate) fn force_reachability_republish(state: &Mutex<NodeState>) {
+    let Ok(g) = state.lock() else {
+        tracing::warn!("force_reachability_republish: NodeState poisoned; skipping");
+        return;
+    };
+    match g.iroh_publisher_force.as_ref() {
+        Some(force) => force.notify_one(),
+        None => tracing::trace!(
+            "force_reachability_republish: reachability publisher not running; skipping"
+        ),
+    }
+}
+
 /// ZEB-329 boot helper: stand-in `PkarrSnapshot` used when the pkarr
 /// publisher isn't wired (no owner identity loaded at start_node).
 /// Mirrors `ProdPkarrSnapshot`'s Phase-1 conservative defaults so the
@@ -45027,6 +45091,16 @@ pub(crate) async fn set_butler_pin_impl(
     if let Some(rp) = routing_republish {
         rp();
     }
+
+    // durable-seal-targets: a pin change rewrites this device's advertised
+    // butler-set, so the COMMUNITY-CRDT `ReachabilityAnnounce` must be
+    // re-emitted too (the `routing_republish` above only refreshes the PKARR
+    // routing record + fleet-net self-row, not the per-community announce the
+    // deposit rungs resolve seal-targets from). The fleet-net doc + snapshot are
+    // already updated above, and the reachability publish-fn reads the snapshot
+    // when it next runs, so waking it now makes the next announce carry the new
+    // butler-set. Best-effort; no-op when the publisher isn't running.
+    force_reachability_republish(state);
     Ok(())
 }
 

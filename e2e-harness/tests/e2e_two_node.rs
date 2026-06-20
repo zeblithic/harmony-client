@@ -1388,7 +1388,7 @@ async fn s6_relay_deposit_recover() {
     //     connectivity_list_peer_reachability DTO does not expose the set field
     //     itself, so this asserts that announce-observed proxy). Generous budget:
     //     the publisher loop + community-CRDT replication is co-located but racy.
-    poll_reachability_observed(&a, &b_owner, Duration::from_secs(120))
+    poll_reachability_observed(&a, &b_owner, Duration::from_secs(60))
         .await
         .expect(
             "REACHABILITY: a observed b's ReachabilityAnnounce (durable seal-targets) before kill",
@@ -1594,6 +1594,25 @@ async fn s7_butler_deposit_recover() {
     .expect("P has A as active friend");
     eprintln!("S7 FRIENDS: A<->P active; P had time to persist B2's enrollment.");
 
+    // --- Shared community A<->P. REQUIRED for the durable-seal-targets path the
+    //     reachability-sync barrier (below) asserts: P's durable butler-set
+    //     (advertising B2) is carried in the per-community `ReachabilityAnnounce`
+    //     CRDT, which replicates ONLY to CO-MEMBERS. Without a shared community,
+    //     A would learn P's butler-set solely via P's pkarr friend record — the
+    //     windowed PkarrLive path this task does NOT harden — and A's
+    //     community-CRDT resolver (what the barrier reads) would never observe P.
+    //     A creates; P joins via the same iroh first-contact path s6 uses.
+    let community_id = create_community(&a, "s7-butler", true)
+        .await
+        .expect("a creates shared community");
+    let invite = generate_invite(&a, &community_id)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&p, &invite, Duration::from_secs(240))
+        .await
+        .expect("P joins the shared community via iroh first-contact");
+    eprintln!("S7 COMMUNITY: A<->P co-members of {community_id} (durable announce path).");
+
     // --- Relaunch P so start_node rebuilds `fleet_net_enrolled` (a boot-time
     //     snapshot, lib.rs:4618 → 8203, that runtime pairing does NOT refresh)
     //     from P's PERSISTED enrollments — the precondition for set_butler_pin.
@@ -1738,7 +1757,7 @@ async fn s7_butler_deposit_recover() {
     //     (relaunched post-pairing) and has pinned B2 as butler, so its publisher
     //     advertises the B2-bearing durable set. Generous budget: the publisher
     //     loop + community-CRDT replication is co-located but racy.
-    poll_reachability_observed(&a, &p_owner, Duration::from_secs(120))
+    poll_reachability_observed(&a, &p_owner, Duration::from_secs(60))
         .await
         .expect(
             "REACHABILITY: A observed P's ReachabilityAnnounce (durable butler-set) before kill",
