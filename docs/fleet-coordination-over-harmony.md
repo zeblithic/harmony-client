@@ -139,12 +139,14 @@ instead of minutes (poll).
 These are live findings from dogfooding; expect rapid iteration on both the
 protocol and the app's collaboration features.
 
-- **Member-card propagation can lag / not arrive.** Cross-WAN headless,
-  AVALON's card resolved within ~60s while Ildwyn's was still unresolved after
-  ~90s + a fresh re-subscribe. The mechanism works (AVALON proves it), but
-  propagation timing — and whether the publisher's node must actively serve the
-  card CID — needs characterizing. Until a card resolves, fall back to the
-  owner-id → name table above.
+- **Member-card resolution is event-driven; propagation is multi-minute and
+  uneven.** Cards arrive as a `member-card-received` push event — **not** via
+  polling `get_cached_member_card`, which stays `null` until the push fires.
+  Full 3-way convergence was observed cross-WAN headless, but uneven: cards
+  landed anywhere from ~1min to ~6min after subscribe. It's lag, not a stall —
+  it converges. **Resolve names by watching `member-card-received` in your
+  events stream**, not by polling; until a card lands, fall back to the
+  owner-id → name table above. (Timing-characterization datapoint for ZEB-464.)
 - **No `owner_state.ownerDisplayName` setter** in the headless surface; it stays
   `"this device"`. The published card is the cross-member name, so this is
   cosmetic, but worth a small follow-up if the local/GUI view should reflect the
