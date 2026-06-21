@@ -48766,6 +48766,23 @@ mod channel_message_ipc_tests {
         assert!(err.contains("name/mime too long"), "got: {err}");
     }
 
+    #[test]
+    fn prepare_artifact_meta_accepts_at_boundaries() {
+        // The cap and field-length checks use `>` (strictly greater), so values
+        // EXACTLY at the limit must be accepted. Pins the `>` boundary against a
+        // future `>=` typo on either check (the reject tests only cover MAX+1).
+        let (_, _, size) = prepare_artifact_meta(MAX_ARTIFACT_BYTES, "/p/a.bin", None, None)
+            .expect("size exactly at the cap must be accepted");
+        assert_eq!(size, MAX_ARTIFACT_BYTES);
+
+        let max = crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES;
+        let (name, mime, _) =
+            prepare_artifact_meta(1, "/p/a.bin", Some("n".repeat(max)), Some("m".repeat(max)))
+                .expect("name/mime exactly at the field cap must be accepted");
+        assert_eq!(name.len(), max);
+        assert_eq!(mime.len(), max);
+    }
+
     #[tokio::test]
     async fn post_channel_message_rejects_short_community_id() {
         let app = mock_app_with_default_node_state();
