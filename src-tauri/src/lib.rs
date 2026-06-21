@@ -20339,6 +20339,143 @@ pub(crate) async fn ingest_channel_artifact_impl(
     })
 }
 
+/// ZEB-535: pure post-fetch tail of [`download_channel_artifact_impl`].
+///
+/// Given the fetched bytes (ciphertext if `encrypted`, else plaintext):
+/// 1. Decrypt with the supplied epoch key when `encrypted` (the nonce that
+///    `encrypt_blob` prepended is read back by `decrypt_blob`).
+/// 2. Verify the **plaintext** length equals `expected_size` BEFORE writing —
+///    a mismatch errors and leaves no file on disk.
+/// 3. Write atomically: a `.partial` temp file in the dest dir, then rename.
+///
+/// Factored out so the decrypt/verify/atomic-write contract is unit-testable
+/// without a `NodeState` / event loop. Returns the bytes written.
+async fn finalize_artifact(
+    bytes: Vec<u8>,
+    encrypted: bool,
+    epoch_key_opt: Option<crate::owner_state_types::EpochKey>,
+    expected_size: u64,
+    dest_path: &str,
+) -> Result<u64, String> {
+    let plaintext = if encrypted {
+        let epoch_key =
+            epoch_key_opt.ok_or_else(|| "encrypted artifact requires an epoch key".to_string())?;
+        crate::community_state_sync::decrypt_blob(&epoch_key, &bytes)
+            .map_err(|e| format!("decrypt: {e:?}"))?
+    } else {
+        bytes
+    };
+
+    // Verify length BEFORE any write so a mismatch never leaves a file.
+    if plaintext.len() as u64 != expected_size {
+        return Err(format!(
+            "size mismatch: got {} expected {expected_size}",
+            plaintext.len()
+        ));
+    }
+
+    // Atomic write: temp file in the dest dir, then rename over the target.
+    let dest = std::path::Path::new(dest_path);
+    let tmp = dest.with_extension("partial");
+    tokio::fs::write(&tmp, &plaintext)
+        .await
+        .map_err(|e| format!("write tmp: {e}"))?;
+    tokio::fs::rename(&tmp, dest)
+        .await
+        .map_err(|e| format!("rename: {e}"))?;
+    Ok(plaintext.len() as u64)
+}
+
+/// ZEB-535: download an in-channel CAS artifact to a local path.
+///
+/// Counterpart to [`ingest_channel_artifact_impl`]: fetch the (possibly
+/// chunked, encrypted) bytes for `cid` via the existing `FetchRequest` path,
+/// then hand off to the pure [`finalize_artifact`] tail (decrypt-if-flagged,
+/// size-verify against `expected_size`, atomic temp+rename). Returns the
+/// number of plaintext bytes written.
+///
+/// The decrypt path reads the live community epoch key via
+/// `current_epoch_key_for` only when `cid.flags().encrypted` — a public
+/// artifact never touches the CRDT. `serveable` is set to `encrypted` so a
+/// fetched encrypted artifact's books are re-allowlisted for member-to-member
+/// serving (mirrors the ingest side; the serve gate refuses un-allowlisted
+/// encrypted CIDs).
+///
+/// The fetch + decrypt are whole-artifact-in-memory (~2× at decrypt) —
+/// intentional for v1; the cap bounds the cost. Note the `FetchRequest`
+/// `max_bytes` here is the *plaintext* cap, while an encrypted artifact's
+/// ciphertext is slightly larger (nonce+tag overhead); acceptable for v1
+/// since real artifacts sit well below the 1 GiB boundary.
+///
+/// PR1: backend impl wired to the Tauri IPC in PR2 (Task 9); exercised
+/// end-to-end by the Task 7 two-node integration test. Allow until the IPC
+/// caller lands.
+#[allow(dead_code)]
+pub(crate) async fn download_channel_artifact_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    cid: String,
+    dest_path: String,
+    expected_size: u64,
+    max_bytes: Option<u64>,
+) -> Result<u64, String> {
+    use harmony_content::cid::ContentId;
+
+    let cid_bytes: [u8; 32] = hex::decode(&cid)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| "invalid cid hex".to_string())?;
+    let content_id = ContentId::from_bytes(cid_bytes);
+    let encrypted = content_id.flags().encrypted;
+
+    let cap = max_bytes
+        .map(|m| m.min(MAX_ARTIFACT_BYTES))
+        .unwrap_or(MAX_ARTIFACT_BYTES);
+    if expected_size > cap {
+        return Err(format!("expected_size {expected_size} exceeds cap {cap}"));
+    }
+
+    // Resolve the epoch key up front (only when encrypted) so the fetch and
+    // CRDT read don't interleave under the same lock. Mirrors the inlined
+    // hex-16 community-id decode from `ingest_channel_artifact_impl` /
+    // `post_channel_message_impl` (no `decode_hex16` helper exists).
+    let epoch_key_opt = if encrypted {
+        if community_id.len() != 32 {
+            return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+        }
+        let cid_bytes16: [u8; 16] = hex::decode(&community_id)
+            .map_err(|e| format!("invalid community_id hex: {e}"))?
+            .try_into()
+            .map_err(|_| "community_id length wrong".to_string())?;
+        let space = crate::owner_state_types::SpaceId(cid_bytes16);
+        Some(current_epoch_key_for(state, &space).await?)
+    } else {
+        None
+    };
+
+    let fetch_tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid,
+            reply: reply_tx,
+            max_bytes: Some(cap as usize),
+            serveable: encrypted, // re-serve encrypted artifact books
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    let bytes = reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())??;
+
+    finalize_artifact(bytes, encrypted, epoch_key_opt, expected_size, &dest_path).await
+}
+
 /// Tauri IPC: list locally-known messages in a channel.
 ///
 /// `since` filters to events strictly newer than the given HLC; `None`
@@ -48711,6 +48848,42 @@ mod channel_message_ipc_tests {
         let err = prepare_artifact_meta(MAX_ARTIFACT_BYTES + 1, "/tmp/whatever.bin", None, None)
             .expect_err("oversized artifact must error");
         assert!(err.contains("artifact too large"), "got: {err}");
+    }
+
+    // ── ZEB-535: channel artifact download — finalize tail ──────────────
+    #[tokio::test]
+    async fn finalize_artifact_writes_public_and_verifies_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let n = finalize_artifact(b"hello".to_vec(), false, None, 5, dest.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn finalize_artifact_rejects_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let err = finalize_artifact(b"hello".to_vec(), false, None, 99, dest.to_str().unwrap())
+            .await
+            .expect_err("size mismatch");
+        assert!(err.contains("size mismatch"), "got: {err}");
+        assert!(!dest.exists(), "no file written on mismatch");
+    }
+
+    #[tokio::test]
+    async fn finalize_artifact_decrypts_encrypted() {
+        let key = crate::owner_state_types::EpochKey::new([7u8; 32]);
+        let ct = crate::community_state_sync::encrypt_blob(&key, b"secret-log").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let n = finalize_artifact(ct, true, Some(key), 10, dest.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"secret-log");
     }
 
     #[test]
