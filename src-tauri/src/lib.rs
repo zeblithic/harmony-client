@@ -454,8 +454,47 @@ pub async fn streaming_ingest<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    streaming_ingest_with_options(
+        reader,
+        ingest_tx,
+        chunker_config,
+        cancel,
+        IngestOptions::default(),
+    )
+    .await
+}
+
+/// ZEB-535: ingest options. Default = unencrypted, not serveable (the avatar
+/// + file-vault behavior, unchanged).
+///
+/// - `flags` is stamped onto every leaf + bundle CID via `for_book` /
+///   `build_with_flags`. An encrypted artifact sets `flags.encrypted = true`
+///   so `cid.flags().encrypted` drives decrypt-on-fetch.
+/// - `serveable` flows onto each `IngestRequest` so the event loop allowlists
+///   every CID for member-to-member serving (the serve gate silently refuses
+///   un-allowlisted encrypted CIDs).
+#[derive(Clone, Copy, Default)]
+pub struct IngestOptions {
+    pub flags: harmony_content::cid::ContentFlags,
+    pub serveable: bool,
+}
+
+/// ZEB-535: options-aware variant of [`streaming_ingest`]. Stamps `opts.flags`
+/// onto every leaf + bundle CID and propagates `opts.serveable` through each
+/// ingest hop. `streaming_ingest` delegates here with `IngestOptions::default()`
+/// (unencrypted, not serveable) so the avatar / file-vault paths are unchanged.
+pub async fn streaming_ingest_with_options<R>(
+    reader: R,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    chunker_config: harmony_content::chunker::ChunkerConfig,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    opts: IngestOptions,
+) -> Result<(harmony_content::cid::ContentId, u64), IngestError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use harmony_content::chunker::Chunker;
-    use harmony_content::cid::{ContentFlags, ContentId};
+    use harmony_content::cid::ContentId;
     use tokio::io::AsyncReadExt;
 
     let mut reader = reader;
@@ -499,11 +538,16 @@ where
                 &mut open_chunk,
                 Vec::with_capacity(chunker_config.max_chunk),
             );
-            let cid = ContentId::for_book(&chunk, ContentFlags::default())
+            let cid = ContentId::for_book(&chunk, opts.flags)
                 .map_err(|e| IngestError::other(format!("leaf CID: {e:?}")))?;
-            send_ingest(ingest_tx, hex::encode(cid.to_bytes()), chunk)
-                .await
-                .map_err(IngestError::IngestChannel)?;
+            send_ingest(
+                ingest_tx,
+                hex::encode(cid.to_bytes()),
+                chunk,
+                opts.serveable,
+            )
+            .await
+            .map_err(IngestError::IngestChannel)?;
             leaf_cids.push(cid);
             window_pos = cut;
         }
@@ -516,11 +560,16 @@ where
             &mut open_chunk,
             Vec::with_capacity(chunker_config.max_chunk),
         );
-        let cid = ContentId::for_book(&chunk, ContentFlags::default())
+        let cid = ContentId::for_book(&chunk, opts.flags)
             .map_err(|e| IngestError::other(format!("leaf CID: {e:?}")))?;
-        send_ingest(ingest_tx, hex::encode(cid.to_bytes()), chunk)
-            .await
-            .map_err(IngestError::IngestChannel)?;
+        send_ingest(
+            ingest_tx,
+            hex::encode(cid.to_bytes()),
+            chunk,
+            opts.serveable,
+        )
+        .await
+        .map_err(IngestError::IngestChannel)?;
         leaf_cids.push(cid);
     }
 
@@ -530,15 +579,20 @@ where
         // walker doesn't mis-surface 0-byte placeholder files as failures.
         // `build_bundle_tree`'s empty-input error path remains in place as a
         // defensive guard for direct callers that bypass `streaming_ingest`.
-        let cid = ContentId::for_book(&[], ContentFlags::default())
+        let cid = ContentId::for_book(&[], opts.flags)
             .map_err(|e| IngestError::other(format!("empty-file CID: {e:?}")))?;
-        send_ingest(ingest_tx, hex::encode(cid.to_bytes()), Vec::new())
-            .await
-            .map_err(IngestError::IngestChannel)?;
+        send_ingest(
+            ingest_tx,
+            hex::encode(cid.to_bytes()),
+            Vec::new(),
+            opts.serveable,
+        )
+        .await
+        .map_err(IngestError::IngestChannel)?;
         return Ok((cid, 0));
     }
 
-    let root = build_bundle_tree(leaf_cids, total_bytes, ingest_tx).await?;
+    let root = build_bundle_tree_with_options(leaf_cids, total_bytes, ingest_tx, opts).await?;
     Ok((root, total_bytes))
 }
 
@@ -560,8 +614,19 @@ pub(crate) async fn build_bundle_tree(
     total_size: u64,
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
 ) -> Result<harmony_content::cid::ContentId, IngestError> {
+    build_bundle_tree_with_options(leaf_cids, total_size, ingest_tx, IngestOptions::default()).await
+}
+
+/// ZEB-535: options-aware variant of [`build_bundle_tree`]. Stamps `opts.flags`
+/// onto each interior bundle CID and propagates `opts.serveable` through the
+/// ingest hop. `build_bundle_tree` delegates here with `IngestOptions::default()`.
+pub(crate) async fn build_bundle_tree_with_options(
+    leaf_cids: Vec<harmony_content::cid::ContentId>,
+    total_size: u64,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    opts: IngestOptions,
+) -> Result<harmony_content::cid::ContentId, IngestError> {
     use harmony_content::bundle::{BundleBuilder, MAX_BUNDLE_ENTRIES};
-    use harmony_content::cid::ContentFlags;
 
     // Empty input is an error (matches dag::ingest's EmptyData).
     if leaf_cids.is_empty() {
@@ -599,11 +664,16 @@ pub(crate) async fn build_bundle_tree(
                 builder.with_metadata(total_size, chunk_count, 0, [0u8; 8]);
             }
             let (bundle_bytes, bundle_cid) = builder
-                .build_with_flags(ContentFlags::default())
+                .build_with_flags(opts.flags)
                 .map_err(|e| IngestError::ManifestBuild(format!("{e:?}")))?;
-            send_ingest(ingest_tx, hex::encode(bundle_cid.to_bytes()), bundle_bytes)
-                .await
-                .map_err(IngestError::IngestChannel)?;
+            send_ingest(
+                ingest_tx,
+                hex::encode(bundle_cid.to_bytes()),
+                bundle_bytes,
+                opts.serveable,
+            )
+            .await
+            .map_err(IngestError::IngestChannel)?;
             next_level.push(bundle_cid);
         }
 
@@ -12609,6 +12679,7 @@ async fn export_content(
             cid_hex: cid,
             reply: reply_tx,
             max_bytes: None,
+            serveable: false,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -13179,11 +13250,15 @@ pub async fn send_ingest(
     tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     cid_hex: String,
     data: Vec<u8>,
+    // ZEB-535: allowlist this CID for member-to-member serve (encrypted
+    // artifact subtree). Avatar / file-vault / folder callers pass `false`.
+    serveable: bool,
 ) -> Result<(), String> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send(event_loop::IngestRequest {
         cid_hex,
         data,
+        serveable,
         reply: reply_tx,
     })
     .await
@@ -13213,6 +13288,7 @@ pub(crate) async fn build_folder_manifest_only(
         ingest_tx,
         hex::encode(built.manifest_cid.to_bytes()),
         built.manifest_bytes,
+        false,
     )
     .await
     .map_err(IngestError::IngestChannel)?;
@@ -13220,6 +13296,7 @@ pub(crate) async fn build_folder_manifest_only(
         ingest_tx,
         hex::encode(built.bundle_cid.to_bytes()),
         built.bundle_bytes,
+        false,
     )
     .await
     .map_err(IngestError::IngestChannel)?;
@@ -13648,6 +13725,7 @@ pub(crate) async fn create_folder_at_root_with_children(
         ingest_tx,
         hex::encode(built.manifest_cid.to_bytes()),
         built.manifest_bytes,
+        false,
     )
     .await
     {
@@ -13660,6 +13738,7 @@ pub(crate) async fn create_folder_at_root_with_children(
         ingest_tx,
         hex::encode(built.bundle_cid.to_bytes()),
         built.bundle_bytes,
+        false,
     )
     .await
     {
@@ -13821,7 +13900,7 @@ pub(crate) async fn create_folder_nested_with_children(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(ingest_tx, cid_hex, bytes).await?;
+        send_ingest(ingest_tx, cid_hex, bytes, false).await?;
     }
 
     // 4. Rekey the top-level sidecar entry. CAS-style: pass root_old
@@ -14484,7 +14563,7 @@ pub async fn rename_content_impl(
     // Drain-then-rekey ordering — same correctness reasoning as
     // move_content and create_folder_nested.
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(&ingest_tx, cid_hex, bytes).await?;
+        send_ingest(&ingest_tx, cid_hex, bytes, false).await?;
     }
 
     let stored_at_ms = std::time::SystemTime::now()
@@ -14780,7 +14859,7 @@ async fn move_case_a(
     // strictly better than ingest-after-rekey-failure: an orphan-bytes
     // outcome on this path beats an unreachable-chain outcome).
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(ingest_tx, cid_hex, bytes).await?;
+        send_ingest(ingest_tx, cid_hex, bytes, false).await?;
     }
 
     // Single CAS rekey on the source/destination sidecar (they are the
@@ -14857,7 +14936,7 @@ async fn move_case_b(
     .await?;
 
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(ingest_tx, cid_hex, bytes).await?;
+        send_ingest(ingest_tx, cid_hex, bytes, false).await?;
     }
 
     // STAGE 1: rekey destination.
@@ -14969,7 +15048,7 @@ async fn move_case_c(
     )
     .await?;
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(ingest_tx, cid_hex, bytes).await?;
+        send_ingest(ingest_tx, cid_hex, bytes, false).await?;
     }
 
     // STAGE 1: rekey destination.
@@ -15072,7 +15151,7 @@ async fn move_case_d(
     )
     .await?;
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(ingest_tx, cid_hex, bytes).await?;
+        send_ingest(ingest_tx, cid_hex, bytes, false).await?;
     }
 
     // Size of the new top-level entry: try to read the moved child's
@@ -15758,6 +15837,7 @@ async fn fetch_content(
             cid_hex: cid,
             reply: reply_tx,
             max_bytes: None,
+            serveable: false,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -15794,6 +15874,7 @@ async fn fetch_avatar(
             cid_hex: cid,
             reply: reply_tx,
             max_bytes: Some(AVATAR_MAX_BYTES),
+            serveable: false,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -15901,6 +15982,7 @@ async fn fetch_profile_doc(
             cid_hex: cid,
             reply: reply_tx,
             max_bytes: None,
+            serveable: false,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -47209,6 +47291,137 @@ mod streaming_ingest_tests {
         for ((a_hex, a_data), (b_hex, b_data)) in captured_a.iter().zip(captured_b.iter()) {
             assert_eq!(a_hex, b_hex, "IPC ordering must match");
             assert_eq!(a_data, b_data, "leaf/bundle bytes must match");
+        }
+    }
+
+    /// ZEB-535: drain that also captures each request's `serveable` flag and
+    /// the parsed CID, so a test can assert encrypted+serveable propagation.
+    fn spawn_ingest_drain_with_flags(
+        mut rx: mpsc::Receiver<IngestRequest>,
+    ) -> tokio::task::JoinHandle<Vec<(String, bool)>> {
+        tokio::spawn(async move {
+            let mut captured = Vec::new();
+            while let Some(req) = rx.recv().await {
+                captured.push((req.cid_hex.clone(), req.serveable));
+                let _ = req.reply.send(Ok(()));
+            }
+            captured
+        })
+    }
+
+    /// ZEB-535: an encrypted + serveable multi-chunk ingest must produce, for
+    /// EVERY emitted `IngestRequest`, `serveable == true` and a CID whose
+    /// `flags().encrypted` is true (leaves AND interior bundles). This is the
+    /// subtree-authorization contract: a chunked encrypted artifact is many
+    /// CIDs, and the serve gate refuses any encrypted CID not allowlisted.
+    #[tokio::test]
+    async fn streaming_ingest_with_options_encrypted_serveable_flags_every_cid() {
+        // 2 KiB at small_chunker_config (max_chunk=256) → many leaves + a root
+        // bundle → exercises both for_book leaves and build_with_flags bundles.
+        let bytes: Vec<u8> = (0..2048).map(|i| ((i * 37) % 251) as u8).collect();
+        let (tx, rx) = mpsc::channel::<IngestRequest>(64);
+        let drain = spawn_ingest_drain_with_flags(rx);
+
+        let opts = IngestOptions {
+            flags: ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+            serveable: true,
+        };
+        let (root, _total) = streaming_ingest_with_options(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+            opts,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        // Multi-chunk: at least leaves + 1 root bundle were sent.
+        assert!(
+            captured.len() >= 2,
+            "expected leaves + root, got {}",
+            captured.len()
+        );
+        assert!(root.flags().encrypted, "root CID must be encrypted-flagged");
+        for (cid_hex, serveable) in &captured {
+            assert!(
+                serveable,
+                "every IngestRequest must be serveable; cid={cid_hex}"
+            );
+            let arr: [u8; 32] = hex::decode(cid_hex)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .expect("cid hex parses to 32 bytes");
+            assert!(
+                ContentId::from_bytes(arr).flags().encrypted,
+                "every emitted CID must be encrypted-flagged; cid={cid_hex}"
+            );
+        }
+    }
+
+    /// ZEB-535: the single-chunk encrypted path also yields an encrypted root.
+    #[tokio::test]
+    async fn streaming_ingest_with_options_single_chunk_encrypted_root() {
+        let bytes: Vec<u8> = (0..32u8).collect(); // below min_chunk → one leaf
+        let (tx, rx) = mpsc::channel::<IngestRequest>(8);
+        let drain = spawn_ingest_drain_with_flags(rx);
+
+        let opts = IngestOptions {
+            flags: ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+            serveable: true,
+        };
+        let (root, total) = streaming_ingest_with_options(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+            opts,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        assert_eq!(total, 32);
+        assert_eq!(root.cid_type(), CidType::Book);
+        assert!(root.flags().encrypted, "single-chunk root is encrypted");
+        assert_eq!(captured.len(), 1, "one leaf, no bundle");
+        assert!(captured[0].1, "the single leaf is serveable");
+    }
+
+    /// ZEB-535: the legacy `streaming_ingest` delegate keeps the unchanged
+    /// default behavior — unencrypted CIDs, not serveable.
+    #[tokio::test]
+    async fn streaming_ingest_delegate_defaults_unencrypted_not_serveable() {
+        let bytes: Vec<u8> = (0..2048).map(|i| ((i * 37) % 251) as u8).collect();
+        let (tx, rx) = mpsc::channel::<IngestRequest>(64);
+        let drain = spawn_ingest_drain_with_flags(rx);
+
+        let (root, _total) = streaming_ingest(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        assert!(!root.flags().encrypted, "default root is unencrypted");
+        for (cid_hex, serveable) in &captured {
+            assert!(
+                !serveable,
+                "default ingest must NOT be serveable; cid={cid_hex}"
+            );
         }
     }
 }

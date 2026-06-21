@@ -268,12 +268,20 @@ pub struct FetchRequest {
     /// ZEB-344: optional assembled-byte ceiling enforced by `fetch_recursive`.
     /// `None` = unbounded (all callers except `fetch_avatar`).
     pub max_bytes: Option<usize>,
+    /// ZEB-535: re-serve fetched (encrypted) artifact books. A fetcher that
+    /// allowlists every CID it pulls can in turn serve those CIDs to other
+    /// members; `false` for the avatar / content / profile-doc paths.
+    pub serveable: bool,
 }
 
 /// A content-ingest request: store local file bytes in the runtime's storage tier.
 pub struct IngestRequest {
     pub cid_hex: String,
     pub data: Vec<u8>,
+    /// ZEB-535: allowlist this CID for member-to-member serve. `true` for an
+    /// encrypted-artifact subtree (the sharer authorizes each chunk CID);
+    /// `false` for the unencrypted avatar / file-vault ingest paths.
+    pub serveable: bool,
     pub reply: oneshot::Sender<Result<(), String>>,
 }
 
@@ -3174,6 +3182,10 @@ pub async fn run(
                 let session = session.clone();
                 let cid_hex = req.cid_hex;
                 let max_bytes = req.max_bytes;
+                // ZEB-535: re-serve fetched (encrypted) artifact books — when set,
+                // every CID admitted during this fetch is allowlisted so this node
+                // can serve the artifact to other members.
+                let serveable = req.serveable;
                 // ZEB-155: clone the completion sender so the spawned
                 // task can notify the main loop after a successful fetch.
                 let completion_tx = fetch_completion_tx.clone();
@@ -3226,7 +3238,7 @@ pub async fn run(
                     // event_loop.rs:1625) would race the completion
                     // arm and walk a partial cache (Cursor + Qodo R1).
                     let fetch_one_with_admit =
-                        wrap_fetch_one_with_admission(fetch_one, cas_op_tx_for_fetch);
+                        wrap_fetch_one_with_admission(fetch_one, cas_op_tx_for_fetch, serveable);
 
                     let result = fetch_recursive(fetch_one_with_admit, root, max_bytes).await;
                     // ZEB-155: reply to the fetch caller FIRST so a full
@@ -3281,6 +3293,17 @@ pub async fn run(
                         dispatch_action(action, &session, &zenoh_tx, &app, &closing, &own_zid)
                             .await;
                     }
+                    // ZEB-535: allowlist this CID for member-to-member serving so a
+                    // chunked encrypted artifact's CIDs are servable (the serve gate
+                    // refuses encrypted CIDs that aren't allowlisted). cid_ok already
+                    // proved the hex decodes to 32 bytes above.
+                    if req.serveable {
+                        if let Ok(b) = hex::decode(&req.cid_hex) {
+                            if let Ok(arr) = <[u8; 32]>::try_from(b) {
+                                serve_allowlist.allow(ContentId::from_bytes(arr));
+                            }
+                        }
+                    }
                     let _ = req.reply.send(Ok(()));
                 }
             }
@@ -3295,7 +3318,7 @@ pub async fn run(
             Some(op) = cas_op_rx.recv() => {
                 use crate::content_store::CasOp;
                 match op {
-                    CasOp::PutLocal { cid, blob, reply } => {
+                    CasOp::PutLocal { cid, blob, serveable, reply } => {
                         let cid_hex = hex::encode(cid.to_bytes());
                         let key_expr = format!("harmony/content/publish/{cid_hex}");
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
@@ -3305,6 +3328,12 @@ pub async fn run(
                         for action in runtime.tick() {
                             dispatch_action(action, &session, &zenoh_tx, &app, &closing, &own_zid)
                                 .await;
+                        }
+                        // ZEB-535: allowlist a serveable CID so a fetcher that
+                        // re-admits an encrypted artifact book can in turn serve it
+                        // to other members (the fetch-admission wrapper sets this).
+                        if serveable {
+                            serve_allowlist.allow(cid);
                         }
                         // We do NOT inspect tick() actions for a "rejected"
                         // signal — StorageTier silently drops corrupted
@@ -3395,6 +3424,11 @@ pub async fn run(
                                         let _ = cas_op_tx_for_admit.try_send(crate::content_store::CasOp::PutLocal {
                                             cid,
                                             blob: bytes.clone(),
+                                            // ZEB-535: GetOrFetch (community-root /
+                                            // CRDT sync) does not re-serve via this
+                                            // hop; the put_serveable path allowlists
+                                            // community roots explicitly.
+                                            serveable: false,
                                             reply: None,
                                         });
                                         let _ = reply.send(Ok(Some(bytes)));
@@ -5710,6 +5744,9 @@ where
 pub(crate) fn wrap_fetch_one_with_admission<F, Fut>(
     fetch_one: F,
     cas_op_tx: tokio::sync::mpsc::Sender<crate::content_store::CasOp>,
+    // ZEB-535: when true, each admitted CID is allowlisted for member-to-member
+    // serving (re-serve encrypted artifact books). `false` for avatar/content.
+    serveable: bool,
 ) -> impl Fn(
     ContentId,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>
@@ -5765,6 +5802,7 @@ where
                 cas_op_tx.send(crate::content_store::CasOp::PutLocal {
                     cid,
                     blob: bytes.clone(),
+                    serveable,
                     reply: Some(reply_tx),
                 }),
             )
@@ -6185,12 +6223,29 @@ mod fetch_one_wrapper_tests {
     /// The task exits when all senders are dropped (`recv()` returns
     /// None) — which happens when `fetch_recursive` consumes the
     /// wrapped closure and returns, releasing the last `cas_op_tx`.
-    async fn responder_collect_admits(mut rx: mpsc::Receiver<CasOp>) -> Vec<(ContentId, Vec<u8>)> {
+    async fn responder_collect_admits(rx: mpsc::Receiver<CasOp>) -> Vec<(ContentId, Vec<u8>)> {
+        let (admits, _serveable) = responder_collect_admits_with_serveable(rx).await;
+        admits
+    }
+
+    /// Like `responder_collect_admits` but also captures each admit's
+    /// `serveable` flag (ZEB-535), so a test can assert the flag propagated
+    /// from the wrapper's `serveable` param into every `CasOp::PutLocal`.
+    async fn responder_collect_admits_with_serveable(
+        mut rx: mpsc::Receiver<CasOp>,
+    ) -> (Vec<(ContentId, Vec<u8>)>, Vec<bool>) {
         let mut admits: Vec<(ContentId, Vec<u8>)> = Vec::new();
+        let mut serveables: Vec<bool> = Vec::new();
         while let Some(op) = rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid,
+                    blob,
+                    serveable,
+                    reply,
+                } => {
                     admits.push((cid, blob));
+                    serveables.push(serveable);
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(()));
                     }
@@ -6203,7 +6258,7 @@ mod fetch_one_wrapper_tests {
                 }
             }
         }
-        admits
+        (admits, serveables)
     }
 
     #[tokio::test]
@@ -6232,7 +6287,7 @@ mod fetch_one_wrapper_tests {
         };
 
         let (cas_op_tx, cas_op_rx) = mpsc::channel::<CasOp>(16);
-        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx, false);
 
         // R1 (Cursor + Qodo): the wrapper now uses synchronous
         // admission, so each per-CID call blocks awaiting a PutLocal
@@ -6265,6 +6320,46 @@ mod fetch_one_wrapper_tests {
         assert_eq!(admit_map.get(&c), Some(&c_bytes));
     }
 
+    /// ZEB-535: the wrapper's `serveable` param must propagate onto EVERY
+    /// `CasOp::PutLocal` it emits, so a fetcher pulling a chunked encrypted
+    /// artifact re-serves every CID it admits (not just the root).
+    #[tokio::test]
+    async fn serveable_flag_propagates_to_every_admit() {
+        let a_bytes = b"aaa".to_vec();
+        let b_bytes = b"bbbb".to_vec();
+        let a = ContentId::for_book(&a_bytes, ContentFlags::default()).unwrap();
+        let b = ContentId::for_book(&b_bytes, ContentFlags::default()).unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b);
+        let (payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
+
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        store.insert(a, a_bytes.clone());
+        store.insert(b, b_bytes.clone());
+        store.insert(root, payload.clone());
+
+        let fetcher = move |cid: ContentId| {
+            let bytes = store.get(&cid).cloned();
+            std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
+        };
+
+        let (cas_op_tx, cas_op_rx) = mpsc::channel::<CasOp>(16);
+        // serveable: true — every admit must carry it.
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx, true);
+        let responder = tokio::spawn(responder_collect_admits_with_serveable(cas_op_rx));
+
+        let _ = fetch_recursive(wrapped, root, None).await.unwrap();
+        let (admits, serveables) = responder.await.unwrap();
+
+        assert_eq!(admits.len(), 3, "root bundle + 2 leaves");
+        assert_eq!(serveables.len(), 3);
+        assert!(
+            serveables.iter().all(|s| *s),
+            "every admit must carry serveable=true; got {serveables:?}"
+        );
+    }
+
     #[tokio::test]
     async fn skips_admit_on_fetch_failure() {
         // fetch_one returns Err for the requested CID. Verify no
@@ -6277,7 +6372,7 @@ mod fetch_one_wrapper_tests {
         };
 
         let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(4);
-        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx, false);
 
         let result = wrapped(cid).await;
         assert!(
@@ -6311,7 +6406,7 @@ mod fetch_one_wrapper_tests {
 
         let (cas_op_tx, cas_op_rx) = mpsc::channel::<CasOp>(1);
         drop(cas_op_rx); // close the receiver — every send will Err.
-        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx, false);
 
         let result = wrapped(cid).await;
         assert!(
@@ -6341,7 +6436,7 @@ mod fetch_one_wrapper_tests {
         };
 
         let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(1);
-        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx, false);
 
         // Receiver pulls the PutLocal but parks forever, holding the
         // PutLocal (and its reply_tx) in scope so the wrapper's
@@ -6371,7 +6466,7 @@ mod fetch_one_wrapper_tests {
         let (cas_op_tx, _cas_op_rx) = mpsc::channel::<CasOp>(8);
         let fetcher =
             move |_cid: ContentId| std::future::ready(Ok::<Vec<u8>, String>(b"TAMPERED".to_vec()));
-        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx, false);
         let result = wrapped(cid).await;
         assert!(
             result.is_err(),
