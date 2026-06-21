@@ -20053,7 +20053,7 @@ pub(crate) async fn post_channel_message_impl(
         .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
 
     let msg_id = engine
-        .publish(body, reply_to_msg_id, mention_addrs)
+        .publish(body, reply_to_msg_id, mention_addrs, None)
         .await
         .map_err(|e| e.to_string())?;
     Ok(hex::encode(msg_id.0))
@@ -27283,6 +27283,7 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
                         at,
                         body,
                         mentions,
+                        attachments,
                         reply_to,
                         community_id: ev_community_id,
                         channel_id: ev_channel_id,
@@ -27306,6 +27307,26 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
                             mentions: mentions
                                 .as_ref()
                                 .map(|v| v.iter().map(|a| hex::encode(a.0)).collect()),
+                            // ZEB-535: project attachments identically to
+                            // message_dto_for_event (hex cid + derived encrypted
+                            // flag); empty list -> None.
+                            attachments: attachments.as_ref().filter(|v| !v.is_empty()).map(|v| {
+                                v.iter()
+                                    .map(|a| {
+                                        crate::community_channel_log_engine::ChannelAttachmentDto {
+                                            cid: hex::encode(a.cid),
+                                            mime: a.mime.clone(),
+                                            name: a.name.clone(),
+                                            size: a.size,
+                                            encrypted: harmony_content::cid::ContentId::from_bytes(
+                                                a.cid,
+                                            )
+                                            .flags()
+                                            .encrypted,
+                                        }
+                                    })
+                                    .collect()
+                            }),
                             kind,
                             poll_id,
                         })
@@ -32594,7 +32615,7 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
                     Vec::with_capacity(crate::community_channel_log_engine::POLL_BODY_LEN);
                 body.push(crate::community_channel_log_engine::POLL_BODY_MAGIC);
                 body.extend_from_slice(poll_id_hex.as_bytes());
-                if let Err(e) = engine.publish(body, None, None).await {
+                if let Err(e) = engine.publish(body, None, None, None).await {
                     tracing::warn!(
                         error = %e,
                         community_id = %hex::encode(space_id.0),
@@ -33229,7 +33250,7 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
                     Vec::with_capacity(crate::community_channel_log_engine::POLL_BODY_LEN);
                 body.push(crate::community_channel_log_engine::POLL_BODY_MAGIC);
                 body.extend_from_slice(poll_id_hex.as_bytes());
-                if let Err(e) = engine.publish(body, None, None).await {
+                if let Err(e) = engine.publish(body, None, None, None).await {
                     tracing::warn!(
                         error = %e,
                         community_id = %hex::encode(space_id.0),

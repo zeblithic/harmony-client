@@ -411,7 +411,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     let mut posted_ids = Vec::new();
     for i in 0..100 {
         let id = Arc::clone(&engine_a)
-            .publish(format!("msg-{i}").into_bytes(), None, None)
+            .publish(format!("msg-{i}").into_bytes(), None, None, None)
             .await
             .expect("publish");
         posted_ids.push(id);
@@ -480,7 +480,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
 
     for i in 100..150 {
         Arc::clone(&engine_a)
-            .publish(format!("msg-{i}").into_bytes(), None, None)
+            .publish(format!("msg-{i}").into_bytes(), None, None, None)
             .await
             .expect("publish offline");
         if (i + 1) % 16 == 0 {
