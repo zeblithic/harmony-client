@@ -184,6 +184,13 @@ impl SyncEngine {
         self.inner.flush_now().await
     }
 
+    /// Durably persist owner-state to disk WITHOUT publishing. See
+    /// `FleetSyncEngine::persist_now`. Used by `fence_owner_state_flush` so a
+    /// stalled state-root publish can't starve owner-state durability (ZEB-509).
+    pub async fn persist_now(&self) -> Result<(), SyncError> {
+        self.inner.persist_now().await
+    }
+
     /// Stop the internal task, flushing any pending writes first.
     /// Must be called explicitly during graceful shutdown — `Drop`
     /// is best-effort only.
