@@ -678,6 +678,8 @@ impl ChannelLogEngine {
             body: &body_str,
             reply_to,
             mentions,
+            // ZEB-535: Task 2 replaces this with the real attachment list.
+            attachments: None,
         };
         let event = sign_channel_event(&payload, &self.signing_key)
             .map_err(ChannelLogEngineError::ChannelEvent)?;
@@ -2296,6 +2298,7 @@ mod tests {
             body,
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         sign_channel_event(&payload, signing_key).expect("sign")
     }
@@ -2467,6 +2470,7 @@ mod tests {
             body: "hi @bob",
             reply_to: None,
             mentions: Some(vec![m0, m1]),
+            attachments: None,
         };
         let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
         let dto = fix.engine.event_to_dto(&ev);
@@ -2519,6 +2523,7 @@ mod tests {
             body: "empty mentions",
             reply_to: None,
             mentions: Some(vec![]),
+            attachments: None,
         };
         let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
         assert!(fix.engine.event_to_dto(&ev).mentions.is_none());

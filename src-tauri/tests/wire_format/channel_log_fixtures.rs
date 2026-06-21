@@ -60,6 +60,7 @@ fn fixture() -> SignedChannelEvent {
         body: "hello",
         reply_to: None,
         mentions: None,
+        attachments: None,
     };
     sign_channel_event(&payload, &key).expect("sign")
 }
@@ -80,6 +81,7 @@ fn fixture_with_mentions() -> SignedChannelEvent {
         body: "hello",
         reply_to: None,
         mentions: Some(vec![OwnerAddr([0xb2; 16]), OwnerAddr([0xc3; 16])]),
+        attachments: None,
     };
     sign_channel_event(&payload, &key).expect("sign")
 }
@@ -153,6 +155,7 @@ fn backfill_reply_packet_wire_bytes_pinned() {
         body: "hello",
         reply_to: None,
         mentions: None,
+        attachments: None,
     };
     let event: SignedChannelEvent = sign_channel_event(&payload, &signing_key).expect("sign");
 

@@ -292,6 +292,7 @@ fn make_signed_event(
         body,
         reply_to: None,
         mentions: None,
+        attachments: None,
     };
     sign_channel_event(&payload, signing_key).expect("sign")
 }

@@ -987,6 +987,7 @@ mod tests {
             id: crate::community_channel_log::MessageId([0u8; 16]),
             content_kind: 0,
             mentions: None,
+            attachments: None,
             reply_to: None,
             sig: [0u8; 64],
         }
