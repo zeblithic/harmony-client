@@ -2634,6 +2634,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_to_dto_projects_unencrypted_attachment() {
+        // Companion to event_to_dto_projects_attachments: a CID built with
+        // default (non-encrypted) flags must project encrypted=false. The
+        // positive-only test would still pass if the projection inverted the
+        // flag, so this negative case is what actually pins the derivation.
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let pub_cid = harmony_content::cid::ContentId::for_book(
+            b"ct",
+            harmony_content::cid::ContentFlags::default(),
+        )
+        .expect("cid")
+        .to_bytes();
+        let att = crate::community_channel_log::ChannelAttachment {
+            cid: pub_cid,
+            mime: "text/plain".into(),
+            name: "public.txt".into(),
+            size: 9,
+        };
+        let id = {
+            use rand::RngCore;
+            let mut b = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut b);
+            MessageId(b)
+        };
+        let payload = ChannelPostPayload {
+            id,
+            community_id: fix.community_id,
+            channel_id: fix.channel_id,
+            author: fix.self_owner,
+            at: Hlc {
+                wall_ms: 5_000,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            content_kind: 0,
+            body: "see log",
+            reply_to: None,
+            mentions: None,
+            attachments: Some(vec![att]),
+        };
+        let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
+        let dto = fix.engine.event_to_dto(&ev);
+        let got = dto.attachments.expect("attachments present");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].cid, hex::encode(pub_cid));
+        assert!(
+            !got[0].encrypted,
+            "default-flag cid projects encrypted=false"
+        );
+    }
+
+    #[tokio::test]
     async fn list_messages_walks_tail_then_segments() {
         // Spec §14.1: with seal_threshold=4 and 10 events appended,
         // the engine ends up with 2 sealed segments + 2 events in the
@@ -2882,6 +2934,26 @@ mod tests {
         assert!(
             dto.mentions.is_none(),
             "empty mentions must normalize to None (mn key omitted)"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_normalizes_empty_attachments_to_none() {
+        // Mirrors publish_normalizes_empty_mentions_to_none: Some(vec![])
+        // attachments must serialize WITHOUT the pa key (omitted), so an
+        // empty attachment list is byte-identical to an attachment-less post.
+        // Load-bearing for signature stability (sig is over canonical CBOR).
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, None, Some(vec![]))
+            .await
+            .expect("publish with empty attachments");
+        let msgs = fix.engine.list_messages(None, 100).await.expect("list");
+        assert_eq!(msgs.len(), 1);
+        let dto = fix.engine.event_to_dto(&msgs[0]);
+        assert!(
+            dto.attachments.is_none(),
+            "empty attachments must normalize to None (pa key omitted)"
         );
     }
 
