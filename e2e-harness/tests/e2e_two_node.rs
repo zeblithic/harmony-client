@@ -1930,3 +1930,174 @@ async fn s7_butler_deposit_recover() {
     run.mark_success();
     drop((a, p, b2, a_home, p_home, b2_home));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S8 (hard-assert): multi-member CHANNEL messaging. Two co-located nodes join one
+// invite-only community + a shared channel; BOTH post a text message; each node
+// MUST see the OTHER's (remote-authored) message — asserted BOTH ways: the
+// `channel-message-received` WS event fires AND the message lands in
+// `list_channel_messages` keyed on the remote author's ownerId. Mirrors S2-hard's
+// dual hard-assert, but for community channels rather than 1:1 DMs.
+//
+// First proof that a message authored on node A is read back on node B — the
+// multi-member channel-delivery primitive behind putting the fleet on Harmony
+// (ZEB-529 / ZEB-528).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Strictly decode a `ChannelMessageDto.body` into bytes. serde serializes the
+/// DTO's `body: Vec<u8>` as a JSON ARRAY of byte numbers (NO hex wrapper —
+/// unlike the DM `dm-received` payload, which IS hex), so matching it as hex
+/// would silently never match. Returns `None` on a missing/non-array body or any
+/// element that isn't an integer in `0..=255` — strict rather than
+/// coercing/truncating, so a schema regression can't false-match in a
+/// hard-assert (Qodo). Mirrors the driver's strict-schema convention
+/// (`channels_contains` / `get_relay_held`).
+fn channel_msg_body_bytes(msg: &serde_json::Value) -> Option<Vec<u8>> {
+    msg.get("body")?
+        .as_array()?
+        .iter()
+        .map(|n| n.as_u64().filter(|v| *v <= u8::MAX as u64).map(|v| v as u8))
+        .collect()
+}
+
+/// True iff `node`'s view of `(community, channel)` contains a message whose
+/// `author` (camelCase DTO key == the author node's ownerId) and decoded `body`
+/// both match — proves a specific remote-authored message is readable.
+async fn channel_has_message_from(
+    node: &e2e_harness::NodeHandle,
+    community_id: &str,
+    channel_id: &str,
+    author_owner: &str,
+    want_body: &[u8],
+) -> anyhow::Result<bool> {
+    let msgs = e2e_harness::driver::list_channel_messages(node, community_id, channel_id).await?;
+    Ok(msgs.iter().any(|m| {
+        m.get("author").and_then(|a| a.as_str()) == Some(author_owner)
+            && channel_msg_body_bytes(m).as_deref() == Some(want_body)
+    }))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s8_channel_multi_member_message_exchange() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let (mut run, ah, bh, alice, bob) = two_minted_nodes("s8").await;
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    // Subscribe to BOTH event streams BEFORE any post, so neither node can miss
+    // its peer's `channel-message-received` frame (the WS forwards from connect).
+    let (mut alice_events, _a_ev) = alice.events().await.expect("subscribe alice events");
+    let (mut bob_events, _b_ev) = bob.events().await.expect("subscribe bob events");
+
+    // --- Community + invite + Bob iroh first-contact join (S1 path).
+    let community = create_community(&alice, "s8-community", true)
+        .await
+        .expect("create community");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins alice's community via iroh first-contact");
+
+    // Roster converges both ways (transport path is live).
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("alice sees bob joined");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&bob, &community, &alice_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("bob sees alice joined");
+
+    // --- Alice creates a shared channel; Bob must converge on it (S3 path).
+    //     write_power 0 so both members can post.
+    let channel = create_channel(&alice, &community, "s8-shared", 0)
+        .await
+        .expect("alice creates shared channel");
+    poll_until(Duration::from_secs(180), || async {
+        Ok(channels_contains(&bob, &community, &channel)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("bob converges the shared channel (ZEB-434 channel propagation)");
+    assert!(
+        channels_contains(&alice, &community, &channel)
+            .await
+            .expect("alice list channels"),
+        "alice sees her own channel"
+    );
+
+    // --- Both members post a distinct text message to the shared channel.
+    let alice_body: &[u8] = b"hello-channel-from-alice";
+    let bob_body: &[u8] = b"hello-channel-from-bob";
+    post_channel_message(&alice, &community, &channel, alice_body)
+        .await
+        .expect("alice's post_channel_message accepted");
+    post_channel_message(&bob, &community, &channel, bob_body)
+        .await
+        .expect("bob's post_channel_message accepted");
+
+    // ── HARD ASSERT #1 (WS events, remote-authored both ways) ──
+    // Payload (ChannelMessageReceivedPayload): { communityId, channelId,
+    // message: ChannelMessageDto{ author, body(JSON byte-array), .. } }.
+    e2e_harness::await_event(&mut bob_events, Duration::from_secs(60), |f| {
+        f.event == "channel-message-received"
+            && f.payload.get("channelId").and_then(|c| c.as_str()) == Some(channel.as_str())
+            && f.payload
+                .get("message")
+                .map(|m| {
+                    m.get("author").and_then(|a| a.as_str()) == Some(alice_owner.as_str())
+                        && channel_msg_body_bytes(m).as_deref() == Some(alice_body)
+                })
+                .unwrap_or(false)
+    })
+    .await
+    .expect("bob MUST receive a channel-message-received for alice's remote-authored message");
+
+    e2e_harness::await_event(&mut alice_events, Duration::from_secs(60), |f| {
+        f.event == "channel-message-received"
+            && f.payload.get("channelId").and_then(|c| c.as_str()) == Some(channel.as_str())
+            && f.payload
+                .get("message")
+                .map(|m| {
+                    m.get("author").and_then(|a| a.as_str()) == Some(bob_owner.as_str())
+                        && channel_msg_body_bytes(m).as_deref() == Some(bob_body)
+                })
+                .unwrap_or(false)
+    })
+    .await
+    .expect("alice MUST receive a channel-message-received for bob's remote-authored message");
+
+    // ── HARD ASSERT #2 (read-back, remote-authored both ways) ──
+    poll_until(Duration::from_secs(30), || async {
+        Ok(
+            channel_has_message_from(&bob, &community, &channel, &alice_owner, alice_body)
+                .await?
+                .then_some(()),
+        )
+    })
+    .await
+    .expect("bob's channel read-back MUST contain alice's remote-authored message");
+    poll_until(Duration::from_secs(30), || async {
+        Ok(
+            channel_has_message_from(&alice, &community, &channel, &bob_owner, bob_body)
+                .await?
+                .then_some(()),
+        )
+    })
+    .await
+    .expect("alice's channel read-back MUST contain bob's remote-authored message");
+
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}

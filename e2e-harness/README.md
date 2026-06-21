@@ -42,10 +42,12 @@ machine** (two co-located nodes):
 | `s2_dm_delivery_over_tunnel_hard_assert` | live 1:1 DM byte-delivery over the PQ tunnel (ZEB-473): Alice→Bob DM MUST fire `dm-received` + land in Bob's thread. | ⏸️ `#[ignore]` — tunnel delivers the signed CidNotify co-located, but the DM Space (random per-owner `SpaceId` + `content_key`) has no cross-owner carrier (DmInvite rode Reticulum, removed in harmony#280; re-wiring onto the tunnel is a later move) → receiver rejects every tunnel DM at `verify_cidnotify_admission: SpaceNotFound`. Un-ignore once the DM-Space invite carrier lands. |
 | `s3_offline_channel_reconnect_catchup` | channel created while peer offline → reconnect catch-up (ZEB-434) | ✅ pass |
 | `s4_restart_durability` | single-node community survives a restart (ZEB-393) | ✅ pass |
+| `s8_channel_multi_member_message_exchange` | two members in one community both post to a shared channel → each reads back the OTHER's remote-authored message (`channel-message-received` WS event + `list_channel_messages`), hard-asserted (ZEB-529) | ✅ pass |
 
 The single-machine harness validates **first-contact + join/handshake-time state**
 (S1, S2), **single-node restart durability** (S4), and **co-located ongoing
-community-state sync + offline→restart→catch-up** (S3). S3/S4 were previously
+community-state sync + offline→restart→catch-up** (S3), plus **multi-member
+channel message exchange** (S8). S3/S4 were previously
 `#[ignore]`'d "blocked by ZEB-462", but that was a harness bug — the assertions
 checked `c.get("id")` while the DTOs are camelCase (`channelId` / `spaceId`), so
 they always timed out and *looked* like a sync failure. With the keys corrected

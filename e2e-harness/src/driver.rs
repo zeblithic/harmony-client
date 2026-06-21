@@ -390,7 +390,12 @@ pub async fn list_channel_messages(
             json!({ "communityId": community_id, "channelId": channel_id, "limit": 100 }),
         )
         .await?;
-    Ok(v.as_array().cloned().unwrap_or_default())
+    // A non-array response is a broken RPC/DTO CONTRACT, not "no messages":
+    // surface it loudly so a schema regression can't masquerade as a poll_until
+    // timeout (the ZEB-462 masking trap). Matches `get_relay_held` / channels.
+    v.as_array()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("list_channel_messages expected a JSON array, got: {v}"))
 }
 
 // ── Profile cards (ZEB-341) + peer-profile broadcast (ZEB-281) — ZEB-464 ──────
