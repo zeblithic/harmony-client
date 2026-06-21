@@ -19952,8 +19952,17 @@ async fn post_channel_message(
     channel_id: String,
     body: Vec<u8>,
     reply_to: Option<String>,
+    mentions: Option<Vec<String>>,
 ) -> Result<String, String> {
-    post_channel_message_impl(state_lock.inner(), community_id, channel_id, body, reply_to).await
+    post_channel_message_impl(
+        state_lock.inner(),
+        community_id,
+        channel_id,
+        body,
+        reply_to,
+        mentions,
+    )
+    .await
 }
 
 /// ZEB-445: shared IPC/RPC seam.
@@ -19963,6 +19972,7 @@ pub(crate) async fn post_channel_message_impl(
     channel_id: String,
     body: Vec<u8>,
     reply_to: Option<String>,
+    mentions: Option<Vec<String>>,
 ) -> Result<String, String> {
     if community_id.len() != 32 {
         return Err("community_id must be 16 bytes (32 hex chars)".to_string());
@@ -19995,6 +20005,27 @@ pub(crate) async fn post_channel_message_impl(
         None => None,
     };
 
+    // ZEB-534: parse each mention hex string -> OwnerAddr (mirrors the
+    // reply_to hex parse). Malformed/short hex is rejected before the
+    // engine sees it; bounds (MAX_MENTIONS) are enforced in publish().
+    let mention_addrs: Option<Vec<crate::owner_state_types::OwnerAddr>> = match mentions {
+        Some(list) => {
+            let mut out = Vec::with_capacity(list.len());
+            for s in list {
+                if s.len() != 32 {
+                    return Err("each mention must be 16 bytes (32 hex chars)".to_string());
+                }
+                let bytes: [u8; 16] = hex::decode(&s)
+                    .map_err(|e| format!("invalid mention hex: {e}"))?
+                    .try_into()
+                    .map_err(|_| "mention length wrong".to_string())?;
+                out.push(crate::owner_state_types::OwnerAddr(bytes));
+            }
+            Some(out)
+        }
+        None => None,
+    };
+
     let registry = {
         let guard = state
             .lock()
@@ -20012,7 +20043,7 @@ pub(crate) async fn post_channel_message_impl(
         .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
 
     let msg_id = engine
-        .publish(body, reply_to_msg_id, None)
+        .publish(body, reply_to_msg_id, mention_addrs)
         .await
         .map_err(|e| e.to_string())?;
     Ok(hex::encode(msg_id.0))
@@ -48234,9 +48265,16 @@ mod channel_message_ipc_tests {
     async fn post_channel_message_rejects_short_community_id() {
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err = post_channel_message(state, "deadbeef".into(), "00".repeat(16), vec![1], None)
-            .await
-            .expect_err("short cid must error");
+        let err = post_channel_message(
+            state,
+            "deadbeef".into(),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+        )
+        .await
+        .expect_err("short cid must error");
         assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
     }
 
@@ -48244,7 +48282,7 @@ mod channel_message_ipc_tests {
     async fn post_channel_message_rejects_short_channel_id() {
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err = post_channel_message(state, "00".repeat(16), "ab".into(), vec![1], None)
+        let err = post_channel_message(state, "00".repeat(16), "ab".into(), vec![1], None, None)
             .await
             .expect_err("short chid must error");
         assert!(err.contains("channel_id must be 16 bytes"), "got: {err}");
@@ -48254,9 +48292,10 @@ mod channel_message_ipc_tests {
     async fn post_channel_message_rejects_bad_hex() {
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err = post_channel_message(state, "zz".repeat(16), "00".repeat(16), vec![1], None)
-            .await
-            .expect_err("bad hex must error");
+        let err =
+            post_channel_message(state, "zz".repeat(16), "00".repeat(16), vec![1], None, None)
+                .await
+                .expect_err("bad hex must error");
         assert!(err.contains("invalid community_id hex"), "got: {err}");
     }
 
@@ -48270,10 +48309,45 @@ mod channel_message_ipc_tests {
             "00".repeat(16),
             vec![1],
             Some("ab".into()),
+            None,
         )
         .await
         .expect_err("short reply_to must error");
         assert!(err.contains("reply_to must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_bad_mention_hex() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            Some(vec!["zz".repeat(16)]),
+        )
+        .await
+        .expect_err("bad mention hex must error");
+        assert!(err.contains("invalid mention hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_short_mention() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            Some(vec!["ab".into()]),
+        )
+        .await
+        .expect_err("short mention must error");
+        assert!(err.contains("each mention must be 16 bytes"), "got: {err}");
     }
 
     #[tokio::test]
@@ -48285,6 +48359,7 @@ mod channel_message_ipc_tests {
             "00".repeat(16),
             "11".repeat(16),
             vec![104, 105],
+            None,
             None,
         )
         .await

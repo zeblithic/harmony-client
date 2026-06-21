@@ -27,6 +27,12 @@ export interface ChannelMessageDto {
    * IPC boundary. UI dispatches to `<PollMessage>` keyed on this.
    */
   pollId?: string;
+  /**
+   * ZEB-534: owner-ids (hex) this message addresses, or absent if none.
+   * Recipients derive "mentions me" as `selfOwnerHex` ∈ mentions. GUI
+   * render/notify is a follow-up; this field just carries the data.
+   */
+  mentions?: string[];
 }
 
 interface ChannelMessageReceivedPayload {
@@ -108,6 +114,7 @@ export class ChannelMessageService {
     channelId: string,
     body: string,
     replyTo?: string,
+    mentions?: string[],
   ): Promise<string> {
     if (!this.adapter) throw new Error('ChannelMessageService.postMessage: adapter not connected');
     const bodyBytes = Array.from(new TextEncoder().encode(body));
@@ -116,6 +123,7 @@ export class ChannelMessageService {
       channelId,
       body: bodyBytes,
       replyTo,
+      mentions,
     }) as string;
     return messageId;
   }

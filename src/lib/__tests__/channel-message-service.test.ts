@@ -42,6 +42,7 @@ describe('ChannelMessageService', () => {
       channelId: 'bb'.repeat(16),
       body: Array.from(new TextEncoder().encode('hello')),
       replyTo: undefined,
+      mentions: undefined,
     });
     expect(msgId).toBe('aabb' + 'cc'.repeat(14));
   });
@@ -55,6 +56,26 @@ describe('ChannelMessageService', () => {
       channelId: 'bb'.repeat(16),
       body: Array.from(new TextEncoder().encode('hi')),
       replyTo: 'cc'.repeat(16),
+      mentions: undefined,
+    });
+  });
+
+  it('postMessage forwards mentions when provided', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('mid');
+    await service.postMessage(
+      'aa'.repeat(16),
+      'bb'.repeat(16),
+      'hi',
+      undefined,
+      ['cc'.repeat(16), 'dd'.repeat(16)],
+    );
+    expect(adapter.invoke).toHaveBeenCalledWith('post_channel_message', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      body: Array.from(new TextEncoder().encode('hi')),
+      replyTo: undefined,
+      mentions: ['cc'.repeat(16), 'dd'.repeat(16)],
     });
   });
 

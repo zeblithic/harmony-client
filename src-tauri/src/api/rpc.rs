@@ -147,6 +147,7 @@ struct PostChannelMessageArgs {
     channel_id: String,
     body: Vec<u8>,
     reply_to: Option<String>,
+    mentions: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -387,6 +388,7 @@ pub fn build_registry() -> RpcRegistry {
                 a.channel_id,
                 a.body,
                 a.reply_to,
+                a.mentions,
             )
             .await
         }
