@@ -20146,6 +20146,199 @@ pub(crate) async fn post_channel_message_impl(
     Ok(hex::encode(msg_id.0))
 }
 
+/// ZEB-535: default plaintext cap for a single channel artifact (1 GiB).
+/// Community/operator-configurable later; the wire structure supports far more.
+pub(crate) const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// ZEB-535: minimal extension -> MIME map for channel artifacts. Content
+/// sniffing is intentionally out of scope; an unknown extension falls back to
+/// `application/octet-stream` (the frontend treats that as a generic download).
+pub(crate) fn detect_mime(name: &str) -> String {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "txt" => "text/plain",
+        "json" => "application/json",
+        "png" => "image/png",
+        "diff" | "patch" => "text/x-diff",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// ZEB-535: pure cap + name/mime resolution for a channel artifact. Factored
+/// out of [`ingest_channel_artifact_impl`] so the cap and field-length
+/// validation are unit-testable without standing up a `NodeState` /
+/// event loop. Returns `(name, mime, size)`.
+///
+/// - Rejects `path_meta_len > MAX_ARTIFACT_BYTES` before any read happens.
+/// - Defaults `name` from the source path's file name (`"artifact"` if the
+///   path has no usable file-name component).
+/// - Defaults `mime` from the resolved name's extension via [`detect_mime`].
+/// - Rejects an over-long name/mime (`> MAX_ATTACHMENT_FIELD_BYTES`) so the
+///   signed `attachments` field can never exceed the engine's bound.
+pub(crate) fn prepare_artifact_meta(
+    path_meta_len: u64,
+    source_path: &str,
+    name: Option<String>,
+    mime: Option<String>,
+) -> Result<(String, String, u64), String> {
+    if path_meta_len > MAX_ARTIFACT_BYTES {
+        return Err(format!(
+            "artifact too large: {path_meta_len} > {MAX_ARTIFACT_BYTES}"
+        ));
+    }
+    let name = name.unwrap_or_else(|| {
+        std::path::Path::new(source_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("artifact")
+            .to_string()
+    });
+    let mime = mime.unwrap_or_else(|| detect_mime(&name));
+    if name.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+        || mime.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+    {
+        return Err("attachment name/mime too long".to_string());
+    }
+    Ok((name, mime, path_meta_len))
+}
+
+/// ZEB-535: read the live community epoch key for `community_id`.
+///
+/// Mirrors `community_state_sync::live_epoch_key`'s `Some(crdt_state)` arm:
+/// clone the `Arc<Mutex<OwnerState>>` out from under the std `NodeState`
+/// lock, then read `guard.spaces.get(community_id)` -> `current_epoch_key`
+/// from the owner-state CRDT. `live_epoch_key` itself is private to
+/// `community_state_sync` and threads a spawn-time fallback we deliberately
+/// don't want here (substituting the fallback would reopen the §10.6
+/// backward-secrecy gap), so the lookup is inlined rather than reused.
+async fn current_epoch_key_for(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: &crate::owner_state_types::SpaceId,
+) -> Result<crate::owner_state_types::EpochKey, String> {
+    let crdt = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.crdt_state.clone().ok_or_else(|| {
+            "no live epoch key for community (not joined / epoch not established)".to_string()
+        })?
+    };
+    let guard = crdt.lock().await;
+    guard
+        .spaces
+        .get(community_id)
+        .and_then(|space| space.current_epoch_key.clone())
+        .ok_or_else(|| {
+            "no live epoch key for community (not joined / epoch not established)".to_string()
+        })
+}
+
+/// ZEB-535: ingest a file as an in-channel CAS artifact.
+///
+/// Stat + cap the file, optionally encrypt the whole file with the live
+/// community epoch key, chunk the (cipher | plain) bytes through
+/// [`streaming_ingest_with_options`], and return a `ChannelAttachmentDto`
+/// for the caller to attach to a channel message.
+///
+/// Encrypted artifacts set `flags.encrypted = true` (so `cid.flags().encrypted`
+/// drives decrypt-on-fetch) and `serveable = true` (so the event loop
+/// allowlists every CID for member-to-member serving; the serve gate silently
+/// refuses un-allowlisted encrypted CIDs). The encrypt path reads + encrypts
+/// the whole file in memory — intentional for v1; the cap bounds the cost.
+///
+/// PR1: backend impl wired to the Tauri IPC in PR2 (Task 9); exercised
+/// end-to-end by the Task 7 two-node integration test. Allow dead_code until
+/// the IPC caller lands.
+#[allow(dead_code)]
+pub(crate) async fn ingest_channel_artifact_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    source_path: String,
+    name: Option<String>,
+    mime: Option<String>,
+    encrypt: bool,
+) -> Result<crate::community_channel_log_engine::ChannelAttachmentDto, String> {
+    use harmony_content::chunker::ChunkerConfig;
+    use harmony_content::cid::{ContentFlags, ContentId};
+
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes16: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let space = crate::owner_state_types::SpaceId(cid_bytes16);
+
+    // 1. Stat + cap (reject before reading). Cap + name/mime resolution +
+    //    field-length validation live in the pure `prepare_artifact_meta`.
+    let meta = tokio::fs::metadata(&source_path)
+        .await
+        .map_err(|e| format!("stat: {e}"))?;
+    let (name, mime, size) = prepare_artifact_meta(meta.len(), &source_path, name, mime)?;
+
+    let ingest_tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.ingest_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    let root: ContentId = if encrypt {
+        let plaintext = tokio::fs::read(&source_path)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        let epoch_key = current_epoch_key_for(state, &space).await?;
+        let ciphertext = crate::community_state_sync::encrypt_blob(&epoch_key, &plaintext)
+            .map_err(|e| format!("encrypt: {e:?}"))?;
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(ciphertext));
+        let (root, _n) = streaming_ingest_with_options(
+            reader,
+            &ingest_tx,
+            ChunkerConfig::DEFAULT,
+            None,
+            IngestOptions {
+                flags: ContentFlags {
+                    encrypted: true,
+                    ..Default::default()
+                },
+                serveable: true,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        root
+    } else {
+        // Public: stream plaintext from disk (no whole-file buffer), default flags.
+        // fast-follow: deterministic-CID reuse of an already-public copy is deferred;
+        // for v1 we re-ingest — dedup happens book-granular in CAS.
+        let file = tokio::fs::File::open(&source_path)
+            .await
+            .map_err(|e| format!("open: {e}"))?;
+        let (root, _n) = streaming_ingest_with_options(
+            tokio::io::BufReader::new(file),
+            &ingest_tx,
+            ChunkerConfig::DEFAULT,
+            None,
+            IngestOptions::default(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        root
+    };
+
+    Ok(crate::community_channel_log_engine::ChannelAttachmentDto {
+        cid: hex::encode(root.to_bytes()),
+        mime,
+        name,
+        size,
+        encrypted: root.flags().encrypted,
+    })
+}
+
 /// Tauri IPC: list locally-known messages in a channel.
 ///
 /// `since` filters to events strictly newer than the given HLC; `None`
@@ -48508,6 +48701,69 @@ mod channel_message_ipc_tests {
         let app = tauri::test::mock_app();
         app.manage(StdMutex::new(NodeState::default()));
         app
+    }
+
+    // ── ZEB-535: channel artifact ingest cap + meta resolution ──────────
+    #[tokio::test]
+    async fn ingest_channel_artifact_rejects_oversized() {
+        // Exercise the cap via the pure helper so no NodeState/event loop is
+        // needed: a stat length one byte over the cap must be rejected.
+        let err = prepare_artifact_meta(MAX_ARTIFACT_BYTES + 1, "/tmp/whatever.bin", None, None)
+            .expect_err("oversized artifact must error");
+        assert!(err.contains("artifact too large"), "got: {err}");
+    }
+
+    #[test]
+    fn detect_mime_maps_known_extensions() {
+        assert_eq!(detect_mime("a.txt"), "text/plain");
+        assert_eq!(detect_mime("a.json"), "application/json");
+        assert_eq!(detect_mime("a.png"), "image/png");
+        assert_eq!(detect_mime("a.diff"), "text/x-diff");
+        assert_eq!(detect_mime("a.patch"), "text/x-diff");
+        assert_eq!(detect_mime("a.unknownext"), "application/octet-stream");
+        // No extension at all also falls back to the generic type.
+        assert_eq!(detect_mime("noext"), "application/octet-stream");
+    }
+
+    #[test]
+    fn prepare_artifact_meta_defaults_name_and_mime_from_path() {
+        // Neither name nor mime supplied: name defaults from the file_name,
+        // mime defaults from that name's extension.
+        let (name, mime, size) =
+            prepare_artifact_meta(42, "/some/dir/report.json", None, None).expect("under cap");
+        assert_eq!(name, "report.json");
+        assert_eq!(mime, "application/json");
+        assert_eq!(size, 42);
+    }
+
+    #[test]
+    fn prepare_artifact_meta_honors_explicit_name_and_mime() {
+        let (name, mime, size) = prepare_artifact_meta(
+            7,
+            "/some/dir/report.json",
+            Some("custom.bin".to_string()),
+            Some("application/x-custom".to_string()),
+        )
+        .expect("under cap");
+        assert_eq!(name, "custom.bin");
+        assert_eq!(mime, "application/x-custom");
+        assert_eq!(size, 7);
+    }
+
+    #[test]
+    fn prepare_artifact_meta_rejects_overlong_name() {
+        let long = "x".repeat(crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES + 1);
+        let err = prepare_artifact_meta(1, "/p/a.txt", Some(long), None)
+            .expect_err("over-long name must error");
+        assert!(err.contains("name/mime too long"), "got: {err}");
+    }
+
+    #[test]
+    fn prepare_artifact_meta_rejects_overlong_mime() {
+        let long = "y".repeat(crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES + 1);
+        let err = prepare_artifact_meta(1, "/p/a.txt", None, Some(long))
+            .expect_err("over-long mime must error");
+        assert!(err.contains("name/mime too long"), "got: {err}");
     }
 
     #[tokio::test]
