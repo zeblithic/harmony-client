@@ -2125,10 +2125,6 @@ async fn s9_three_member_channel_convergence() {
     let b_owner = owner_id(&b).await;
     let c_owner = owner_id(&c).await;
 
-    // Subscribe to the 3rd member's event stream BEFORE any post so we can
-    // hard-assert real-time fan-out reaches the late joiner ZEB-526 implicates.
-    let (mut c_events, _c_ev) = c.events().await.expect("subscribe c events");
-
     // --- Founder a creates the invite-only community; b then c join via iroh
     //     first-contact (a fresh invite per joiner).
     let community = create_community(&a, "s9-community", true)
@@ -2146,7 +2142,7 @@ async fn s9_three_member_channel_convergence() {
     // --- THE ZEB-526 PROBE: every node's roster MUST converge to all three
     //     members. If c's join never reaches a/b (or vice-versa), this times out.
     for (node, who) in [(&a, "a"), (&b, "b"), (&c, "c")] {
-        poll_until(Duration::from_secs(180), || async {
+        poll_until(Duration::from_secs(90), || async {
             let has_a = roster_has_joined(node, &community, &a_owner).await?;
             let has_b = roster_has_joined(node, &community, &b_owner).await?;
             let has_c = roster_has_joined(node, &community, &c_owner).await?;
@@ -2161,7 +2157,7 @@ async fn s9_three_member_channel_convergence() {
         .await
         .expect("a creates shared channel");
     for (node, who) in [(&b, "b"), (&c, "c")] {
-        poll_until(Duration::from_secs(180), || async {
+        poll_until(Duration::from_secs(90), || async {
             Ok(channels_contains(node, &community, &channel)
                 .await?
                 .then_some(()))
@@ -2169,6 +2165,11 @@ async fn s9_three_member_channel_convergence() {
         .await
         .unwrap_or_else(|e| panic!("{who} MUST converge the shared channel: {e}"));
     }
+
+    // Subscribe to the 3rd member's event stream now — AFTER convergence but
+    // BEFORE any post — so we catch the real-time fan-out without buffering the
+    // whole join/convergence window's frames in the unbounded WS channel (Qodo).
+    let (mut c_events, _c_ev) = c.events().await.expect("subscribe c events");
 
     // --- All three post a distinct message.
     let a_body: &[u8] = b"s9-from-alice";
@@ -2206,26 +2207,28 @@ async fn s9_three_member_channel_convergence() {
     );
 
     // --- HARD ASSERT (read-back): every node's channel view MUST contain all
-    //     three members' messages.
+    //     three members' messages. One poll per node (checking all three authors
+    //     per tick) keeps the worst-case wait bounded vs nine independent polls
+    //     (Qodo: avoid compounded sequential timeouts).
     let want: [(&str, &[u8]); 3] = [
         (a_owner.as_str(), a_body),
         (b_owner.as_str(), b_body),
         (c_owner.as_str(), c_body),
     ];
     for (node, who) in [(&a, "a"), (&b, "b"), (&c, "c")] {
-        for (author_owner, body) in want {
-            poll_until(Duration::from_secs(45), || async {
-                Ok(
-                    channel_has_message_from(node, &community, &channel, author_owner, body)
-                        .await?
-                        .then_some(()),
-                )
-            })
-            .await
-            .unwrap_or_else(|e| {
-                panic!("{who}'s read-back MUST contain author {author_owner}'s message: {e}")
-            });
-        }
+        poll_until(Duration::from_secs(60), || async {
+            for (author_owner, body) in want {
+                if !channel_has_message_from(node, &community, &channel, author_owner, body).await?
+                {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(()))
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!("{who}'s read-back MUST contain all three members' messages: {e}")
+        });
     }
 
     run.mark_success();
