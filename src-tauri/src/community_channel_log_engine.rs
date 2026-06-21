@@ -652,6 +652,7 @@ impl ChannelLogEngine {
             content_kind: 0,
             body: &body_str,
             reply_to,
+            mentions: None,
         };
         let event = sign_channel_event(&payload, &self.signing_key)
             .map_err(ChannelLogEngineError::ChannelEvent)?;
@@ -2258,6 +2259,7 @@ mod tests {
             content_kind: 0,
             body,
             reply_to: None,
+            mentions: None,
         };
         sign_channel_event(&payload, signing_key).expect("sign")
     }

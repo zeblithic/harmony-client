@@ -59,6 +59,7 @@ fn fixture() -> SignedChannelEvent {
         content_kind: 0,
         body: "hello",
         reply_to: None,
+        mentions: None,
     };
     sign_channel_event(&payload, &key).expect("sign")
 }
@@ -117,6 +118,7 @@ fn backfill_reply_packet_wire_bytes_pinned() {
         content_kind: 0,
         body: "hello",
         reply_to: None,
+        mentions: None,
     };
     let event: SignedChannelEvent = sign_channel_event(&payload, &signing_key).expect("sign");
 

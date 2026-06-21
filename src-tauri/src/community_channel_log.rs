@@ -158,7 +158,7 @@ pub enum SignedChannelEvent {
     Post {
         // Field order matches RFC 8949 §4.2.1 canonical CBOR ordering
         // for our 2-char keys: bytewise lexicographic sort of
-        // at, au, bd, ch, ci, id, kd, rt, sg. ciborium emits map keys
+        // at, au, bd, ch, ci, id, kd, mn, rt, sg. ciborium emits map keys
         // in declaration order, so this declaration is what a strict
         // RFC 8949 reader would produce. See ChannelPostSignedSet's
         // doc comment for the full rationale.
@@ -176,6 +176,8 @@ pub enum SignedChannelEvent {
         id: MessageId,
         #[serde(rename = "kd")]
         content_kind: u8,
+        #[serde(rename = "mn", skip_serializing_if = "Option::is_none", default)]
+        mentions: Option<Vec<OwnerAddr>>,
         #[serde(rename = "rt", skip_serializing_if = "Option::is_none", default)]
         reply_to: Option<MessageId>,
         #[serde(
@@ -203,6 +205,11 @@ pub struct ChannelPostPayload<'a> {
     pub content_kind: u8,
     pub body: &'a str,
     pub reply_to: Option<MessageId>,
+    /// ZEB-534: owner-ids this post addresses. `None` is wire-identical
+    /// to a pre-feature post. Carried into the signed set (tamper-
+    /// evident), mirroring `reply_to`. Owned `Vec` (not a borrow) because
+    /// `sign_channel_event` moves it into the owned event variant.
+    pub mentions: Option<Vec<OwnerAddr>>,
 }
 
 /// Pre-signature payload (everything except the signature itself).
@@ -214,7 +221,7 @@ pub struct ChannelPostPayload<'a> {
 ///
 /// Field order matches RFC 8949 §4.2.1 canonical CBOR ordering
 /// (length-first, then bytewise lexicographic — for same-length keys
-/// this reduces to bytewise sort): at, au, bd, ch, ci, id, kd, rt.
+/// this reduces to bytewise sort): at, au, bd, ch, ci, id, kd, mn, rt.
 /// ciborium emits map keys in declaration order, so this declaration
 /// matches what a strict RFC 8949 reader would produce, ensuring
 /// cross-language signature compatibility.
@@ -239,6 +246,8 @@ struct ChannelPostSignedSet<'a> {
     id: &'a MessageId,
     #[serde(rename = "kd")]
     content_kind: u8,
+    #[serde(rename = "mn", skip_serializing_if = "Option::is_none")]
+    mentions: &'a Option<Vec<OwnerAddr>>,
     #[serde(rename = "rt", skip_serializing_if = "Option::is_none")]
     reply_to: &'a Option<MessageId>,
 }
@@ -322,6 +331,7 @@ pub fn sign_channel_event(
         community_id: payload.community_id,
         id: payload.id,
         content_kind: payload.content_kind,
+        mentions: payload.mentions.clone(),
         reply_to: payload.reply_to,
         sig: [0u8; 64], // placeholder — overwritten below
     };
@@ -353,6 +363,7 @@ fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, Chan
         community_id,
         id,
         content_kind,
+        mentions,
         reply_to,
         sig: _,
     } = event;
@@ -364,6 +375,7 @@ fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, Chan
         community_id,
         id,
         content_kind: *content_kind,
+        mentions,
         reply_to,
     };
     let mut canon = Vec::with_capacity(256);
@@ -1459,6 +1471,7 @@ mod tests {
             content_kind: 0,
             body,
             reply_to: None,
+            mentions: None,
         };
         (payload, key)
     }
@@ -1475,6 +1488,7 @@ mod tests {
             at,
             content_kind,
             body,
+            mentions,
             reply_to,
             sig,
         } = signed;
@@ -1485,8 +1499,97 @@ mod tests {
         assert_eq!(at, payload.at);
         assert_eq!(content_kind, payload.content_kind);
         assert_eq!(body, payload.body);
+        assert_eq!(mentions, payload.mentions);
         assert_eq!(reply_to, payload.reply_to);
         assert_eq!(sig.len(), 64);
+    }
+
+    #[test]
+    fn sign_channel_event_carries_mentions() {
+        let key = fixture_signing_key(0xa1);
+        let m = vec![fixture_owner_addr(0xb2), fixture_owner_addr(0xc3)];
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author: fixture_owner_addr(0xa1),
+            at: fixture_hlc(100_000, "a-dev"),
+            content_kind: 0,
+            body: "ping",
+            reply_to: None,
+            mentions: Some(m.clone()),
+        };
+        let signed = sign_channel_event(&payload, &key).expect("sign");
+        let SignedChannelEvent::Post { mentions, .. } = signed;
+        assert_eq!(mentions, Some(m));
+    }
+
+    #[test]
+    fn mentions_none_omits_mn_key_some_includes_it() {
+        // CBOR text key "mn" encodes as 62 6d 6e (text-string len-2 + 'm','n').
+        const MN_KEY_HEX: &str = "626d6e";
+        let key = fixture_signing_key(0xa1);
+
+        // mentions: None -> mn key absent (wire-identical to pre-feature).
+        let (none_payload, _k) = fixture_payload("no mentions");
+        let none_event = sign_channel_event(&none_payload, &key).expect("sign");
+        let mut none_bytes = Vec::new();
+        ciborium::into_writer(&none_event, &mut none_bytes).expect("encode");
+        assert!(
+            !hex::encode(&none_bytes).contains(MN_KEY_HEX),
+            "mentions:None must omit the mn key"
+        );
+
+        // mentions: Some -> mn key present.
+        let some_payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author: fixture_owner_addr(0xa1),
+            at: fixture_hlc(100_000, "a-dev"),
+            content_kind: 0,
+            body: "x",
+            reply_to: None,
+            mentions: Some(vec![fixture_owner_addr(0xb2)]),
+        };
+        let some_event = sign_channel_event(&some_payload, &key).expect("sign");
+        let mut some_bytes = Vec::new();
+        ciborium::into_writer(&some_event, &mut some_bytes).expect("encode");
+        assert!(
+            hex::encode(&some_bytes).contains(MN_KEY_HEX),
+            "mentions:Some must include the mn key"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_channel_event_accepts_post_with_mentions() {
+        // Mirrors verify_channel_event_happy_path but with mentions
+        // populated: proves the signature (which now covers mn) verifies
+        // end-to-end.
+        let state = fixture_state_with_alice_joined();
+        let mut tracker = ChannelLogReplayTracker::new();
+        let (key, author, _pub64) = fixture_identity(0xa1);
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author,
+            at: fixture_hlc(100_000, "a-dev"),
+            content_kind: 0,
+            body: "hi @bob",
+            reply_to: None,
+            mentions: Some(vec![fixture_owner_addr(0xb2)]),
+        };
+        let event = sign_channel_event(&payload, &key).expect("sign");
+        verify_channel_event(
+            &event,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+        )
+        .await
+        .expect("verify accepts post with mentions");
     }
 
     #[test]
@@ -1596,6 +1699,7 @@ mod tests {
             content_kind: 0,
             body: "test",
             reply_to: None,
+            mentions: None,
         };
         sign_channel_event(&payload, &key).expect("sign")
     }
@@ -1673,6 +1777,7 @@ mod tests {
             content_kind: 0,
             body: "x",
             reply_to: None,
+            mentions: None,
         };
         let payload_b = ChannelPostPayload {
             id: MessageId([0x22; 16]),
@@ -1687,6 +1792,7 @@ mod tests {
             content_kind: 0,
             body: "y",
             reply_to: None,
+            mentions: None,
         };
         let event_a = sign_channel_event(&payload_a, &key).expect("sign a");
         let event_b = sign_channel_event(&payload_b, &key).expect("sign b");
@@ -1716,6 +1822,7 @@ mod tests {
             content_kind: 0,
             body: "x",
             reply_to: None,
+            mentions: None,
         };
         let payload_b = ChannelPostPayload {
             id: MessageId([0x22; 16]),
@@ -1730,6 +1837,7 @@ mod tests {
             content_kind: 0,
             body: "y",
             reply_to: None,
+            mentions: None,
         };
         let event_a = sign_channel_event(&payload_a, &key_a).expect("sign a");
         let event_b = sign_channel_event(&payload_b, &key_b).expect("sign b");
@@ -1967,6 +2075,7 @@ mod tests {
             content_kind: 0,
             body: "hello from device key",
             reply_to: None,
+            mentions: None,
         };
         let event = sign_channel_event(&payload, &device_key).expect("sign");
 
@@ -2038,6 +2147,7 @@ mod tests {
             content_kind: 0,
             body: "imposter",
             reply_to: None,
+            mentions: None,
         };
         let event = sign_channel_event(&payload, &imposter).expect("sign");
 
@@ -2166,6 +2276,7 @@ mod tests {
             content_kind: 0,
             body: "signed by a key enrolled later",
             reply_to: None,
+            mentions: None,
         };
         let event = sign_channel_event(&payload, &device_key).expect("sign");
 
@@ -2834,6 +2945,7 @@ mod tests {
             content_kind: 0,
             body: "wrong community",
             reply_to: None,
+            mentions: None,
         };
         let foreign_event = sign_channel_event(&payload, &key).expect("sign");
         let err = log
@@ -2867,6 +2979,7 @@ mod tests {
             content_kind: 0,
             body: "wrong channel",
             reply_to: None,
+            mentions: None,
         };
         let foreign_event = sign_channel_event(&payload, &key).expect("sign");
         let err = log
