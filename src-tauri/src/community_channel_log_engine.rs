@@ -862,8 +862,15 @@ impl ChannelLogEngine {
             },
             body: body_bytes,
             reply_to: reply_to.map(|m| hex::encode(m.0)),
+            // Omit an empty mentions list to honor the DTO contract
+            // (no-mention posts have no `mentions` field). `publish()`
+            // normalizes `Some([])` -> `None` at mint time, but this
+            // projection also runs on arbitrary inbound/persisted events,
+            // where a remote peer could sign `mn: []` (empty passes the
+            // cap check). Filter here so the DTO is consistent regardless.
             mentions: mentions
                 .as_ref()
+                .filter(|v| !v.is_empty())
                 .map(|v| v.iter().map(|a| hex::encode(a.0)).collect()),
             kind,
             poll_id,
@@ -2482,6 +2489,39 @@ mod tests {
             &fix.signing_key,
         );
         assert!(fix.engine.event_to_dto(&ev_none).mentions.is_none());
+    }
+
+    #[tokio::test]
+    async fn event_to_dto_omits_empty_mentions() {
+        // A signed event carrying `Some(vec![])` (reachable inbound: a
+        // remote peer can sign `mn: []`, which passes the cap check) must
+        // still project to a DTO with no `mentions` field, matching the
+        // no-mention contract. `sign_channel_event` does not normalize, so
+        // this builds the empty-vec event directly.
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let id = {
+            use rand::RngCore;
+            let mut b = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut b);
+            MessageId(b)
+        };
+        let payload = ChannelPostPayload {
+            id,
+            community_id: fix.community_id,
+            channel_id: fix.channel_id,
+            author: fix.self_owner,
+            at: Hlc {
+                wall_ms: 5_002,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            content_kind: 0,
+            body: "empty mentions",
+            reply_to: None,
+            mentions: Some(vec![]),
+        };
+        let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
+        assert!(fix.engine.event_to_dto(&ev).mentions.is_none());
     }
 
     #[tokio::test]

@@ -118,17 +118,26 @@ export class ChannelMessageService {
   ): Promise<string> {
     if (!this.adapter) throw new Error('ChannelMessageService.postMessage: adapter not connected');
     const bodyBytes = Array.from(new TextEncoder().encode(body));
-    const messageId = await this.adapter.invoke('post_channel_message', {
-      communityId,
-      channelId,
-      body: bodyBytes,
-      replyTo,
-      // Send an empty mention list as undefined so the backend never emits
-      // a `mn: []` (which would change the signed bytes vs. a mention-less
-      // post). The backend also normalizes this defensively.
-      mentions: mentions && mentions.length > 0 ? mentions : undefined,
-    }) as string;
-    return messageId;
+    try {
+      const messageId = await this.adapter.invoke('post_channel_message', {
+        communityId,
+        channelId,
+        body: bodyBytes,
+        replyTo,
+        // Send an empty mention list as undefined so the backend never emits
+        // a `mn: []` (which would change the signed bytes vs. a mention-less
+        // post). The backend also normalizes this defensively.
+        mentions: mentions && mentions.length > 0 ? mentions : undefined,
+      }) as string;
+      return messageId;
+    } catch (e: unknown) {
+      // Tauri IPC rejections are raw strings in production (Error objects
+      // only in tests). Normalize so callers reading `.message` keep the
+      // validation detail (e.g. "too many mentions: N (max 64)" or a bad-hex
+      // rejection from the new mentions path). Mirrors MessageService.send.
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
   }
 
   /** Page through locally-known messages. Caches results + notifies

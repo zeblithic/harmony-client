@@ -354,6 +354,17 @@ describe('ChannelMessageService', () => {
     ).rejects.toThrow('no engine for ...');
   });
 
+  it('postMessage normalizes a raw-string IPC rejection into an Error', async () => {
+    // Production IPC rejections are raw strings (the new mentions path can
+    // reject with "too many mentions: N (max 64)"). postMessage must wrap
+    // them so callers reading `.message` keep the detail.
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockRejectedValue('too many mentions: 65 (max 64)');
+    await expect(
+      service.postMessage('aa'.repeat(16), 'bb'.repeat(16), 'hi'),
+    ).rejects.toThrow('too many mentions: 65 (max 64)');
+  });
+
   it('postMessage throws when adapter not connected', async () => {
     await expect(
       service.postMessage('aa'.repeat(16), 'bb'.repeat(16), 'hi'),
