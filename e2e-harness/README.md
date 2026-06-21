@@ -43,11 +43,12 @@ machine** (two co-located nodes):
 | `s3_offline_channel_reconnect_catchup` | channel created while peer offline → reconnect catch-up (ZEB-434) | ✅ pass |
 | `s4_restart_durability` | single-node community survives a restart (ZEB-393) | ✅ pass |
 | `s8_channel_multi_member_message_exchange` | two members in one community both post to a shared channel → each reads back the OTHER's remote-authored message (`channel-message-received` WS event + `list_channel_messages`), hard-asserted (ZEB-529) | ✅ pass |
+| `s9_three_member_channel_convergence` | THREE members join one invite-only community (iroh first-contact) → all rosters converge to {a,b,c}, both joiners converge on a shared channel, every node reads back all three members' messages, and the 3rd member gets the founder's message in real-time; hard-asserted (ZEB-530). The all-online 3rd-member case converges co-located — narrows ZEB-526 to the offline/3b case. | ✅ pass |
 
 The single-machine harness validates **first-contact + join/handshake-time state**
 (S1, S2), **single-node restart durability** (S4), and **co-located ongoing
 community-state sync + offline→restart→catch-up** (S3), plus **multi-member
-channel message exchange** (S8). S3/S4 were previously
+channel message exchange** (S8) and **3-member convergence** (S9). S3/S4 were previously
 `#[ignore]`'d "blocked by ZEB-462", but that was a harness bug — the assertions
 checked `c.get("id")` while the DTOs are camelCase (`channelId` / `spaceId`), so
 they always timed out and *looked* like a sync failure. With the keys corrected

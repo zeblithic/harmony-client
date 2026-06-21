@@ -127,7 +127,12 @@ pub async fn list_community_members(
             json!({ "communityId": community_id }),
         )
         .await?;
-    Ok(v.as_array().cloned().unwrap_or_default())
+    // A non-array response is a broken RPC/DTO CONTRACT, not "no members":
+    // surface it loudly so a schema regression can't masquerade as a roster
+    // convergence timeout (the ZEB-462 masking trap). Matches list_channel_messages.
+    v.as_array()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("list_community_members expected a JSON array, got: {v}"))
 }
 
 /// True once `member_owner` appears in `community_id`'s roster with a joined

@@ -2101,3 +2101,136 @@ async fn s8_channel_multi_member_message_exchange() {
     run.mark_success();
     drop((alice, bob, ah, bh));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S9 (hard-assert): THREE-member community convergence + channel messaging,
+// co-located. Founder `a` + two joiners `b`, `c` each redeem a fresh invite via
+// iroh first-contact. ALL THREE rosters MUST converge to {a,b,c}, both joiners
+// MUST converge on a shared channel, and every node MUST read back all three
+// members' channel messages. Directly exercises the 3rd-member convergence path
+// (ZEB-526 / ZEB-530): does c's join reach a + b, and does the channel fan-out
+// reach all three co-located? All three are ONLINE throughout — this isolates
+// the all-online 3rd-member case from the offline-2nd-member 3b scenario that
+// first surfaced ZEB-526.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn s9_three_member_channel_convergence() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    // three_minted_nodes returns (run, a_home, b_home, r_home, a, b, r); here the
+    // three roles are simply three community members a / b / c.
+    let (mut run, ah, bh, ch, a, b, c) = three_minted_nodes("s9").await;
+    let a_owner = owner_id(&a).await;
+    let b_owner = owner_id(&b).await;
+    let c_owner = owner_id(&c).await;
+
+    // --- Founder a creates the invite-only community; b then c join via iroh
+    //     first-contact (a fresh invite per joiner).
+    let community = create_community(&a, "s9-community", true)
+        .await
+        .expect("create community");
+    let invite_b = generate_invite(&a, &community).await.expect("invite for b");
+    poll_join_iroh(&b, &invite_b, Duration::from_secs(240))
+        .await
+        .expect("b joins via iroh first-contact");
+    let invite_c = generate_invite(&a, &community).await.expect("invite for c");
+    poll_join_iroh(&c, &invite_c, Duration::from_secs(240))
+        .await
+        .expect("c joins via iroh first-contact");
+
+    // --- THE ZEB-526 PROBE: every node's roster MUST converge to all three
+    //     members. If c's join never reaches a/b (or vice-versa), this times out.
+    for (node, who) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+        poll_until(Duration::from_secs(90), || async {
+            let has_a = roster_has_joined(node, &community, &a_owner).await?;
+            let has_b = roster_has_joined(node, &community, &b_owner).await?;
+            let has_c = roster_has_joined(node, &community, &c_owner).await?;
+            Ok((has_a && has_b && has_c).then_some(()))
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{who}'s roster MUST converge to all three members: {e}"));
+    }
+
+    // --- Founder creates a shared channel; both joiners must converge on it.
+    let channel = create_channel(&a, &community, "s9-shared", 0)
+        .await
+        .expect("a creates shared channel");
+    for (node, who) in [(&b, "b"), (&c, "c")] {
+        poll_until(Duration::from_secs(90), || async {
+            Ok(channels_contains(node, &community, &channel)
+                .await?
+                .then_some(()))
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{who} MUST converge the shared channel: {e}"));
+    }
+
+    // Subscribe to the 3rd member's event stream now — AFTER convergence but
+    // BEFORE any post — so we catch the real-time fan-out without buffering the
+    // whole join/convergence window's frames in the unbounded WS channel (Qodo).
+    let (mut c_events, _c_ev) = c.events().await.expect("subscribe c events");
+
+    // --- All three post a distinct message.
+    let a_body: &[u8] = b"s9-from-alice";
+    let b_body: &[u8] = b"s9-from-bob";
+    let c_body: &[u8] = b"s9-from-carol";
+    post_channel_message(&a, &community, &channel, a_body)
+        .await
+        .expect("a posts");
+    post_channel_message(&b, &community, &channel, b_body)
+        .await
+        .expect("b posts");
+    post_channel_message(&c, &community, &channel, c_body)
+        .await
+        .expect("c posts");
+
+    // --- HARD ASSERT (real-time): the 3rd member c receives the founder's
+    //     remote-authored message over the WS stream (real-time fan-out to a
+    //     late joiner). Read-back below covers full eventual propagation. A
+    //     single targeted await avoids cross-message ordering hazards on the
+    //     shared stream.
+    e2e_harness::await_event(&mut c_events, Duration::from_secs(60), |f| {
+        f.event == "channel-message-received"
+            && f.payload.get("channelId").and_then(|x| x.as_str()) == Some(channel.as_str())
+            && f.payload
+                .get("message")
+                .map(|m| {
+                    m.get("author").and_then(|x| x.as_str()) == Some(a_owner.as_str())
+                        && channel_msg_body_bytes(m).as_deref() == Some(a_body)
+                })
+                .unwrap_or(false)
+    })
+    .await
+    .expect(
+        "c (3rd member) MUST receive the founder's remote-authored channel message in real-time",
+    );
+
+    // --- HARD ASSERT (read-back): every node's channel view MUST contain all
+    //     three members' messages. One poll per node (checking all three authors
+    //     per tick) keeps the worst-case wait bounded vs nine independent polls
+    //     (Qodo: avoid compounded sequential timeouts).
+    let want: [(&str, &[u8]); 3] = [
+        (a_owner.as_str(), a_body),
+        (b_owner.as_str(), b_body),
+        (c_owner.as_str(), c_body),
+    ];
+    for (node, who) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+        poll_until(Duration::from_secs(60), || async {
+            for (author_owner, body) in want {
+                if !channel_has_message_from(node, &community, &channel, author_owner, body).await?
+                {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(()))
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!("{who}'s read-back MUST contain all three members' messages: {e}")
+        });
+    }
+
+    run.mark_success();
+    drop((a, b, c, ah, bh, ch));
+}
