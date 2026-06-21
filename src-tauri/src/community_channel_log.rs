@@ -1835,6 +1835,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn verify_channel_event_rejects_post_over_attachment_field_len() {
+        // ZEB-535: a validly-signed inbound event whose attachment name/mime
+        // exceeds MAX_ATTACHMENT_FIELD_BYTES must be rejected at verify time,
+        // so a remote peer can't ship unbounded metadata strings.
+        let state = fixture_state_with_alice_joined();
+        let mut tracker = ChannelLogReplayTracker::new();
+        let (key, author, _pub64) = fixture_identity(0xa1);
+        let mut oversized = fixture_attachment(0xb2);
+        oversized.name = "x".repeat(MAX_ATTACHMENT_FIELD_BYTES + 1);
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author,
+            at: fixture_hlc(100_000, "a-dev"),
+            content_kind: 0,
+            body: "x",
+            reply_to: None,
+            mentions: None,
+            attachments: Some(vec![oversized]),
+        };
+        let event = sign_channel_event(&payload, &key).expect("sign");
+        let err = verify_channel_event(
+            &event,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+        )
+        .await
+        .expect_err("over-length attachment field must be rejected");
+        assert!(
+            matches!(err, ChannelEventError::AttachmentFieldTooLong { max }
+                if max == MAX_ATTACHMENT_FIELD_BYTES),
+            "got: {err:?}"
+        );
+    }
+
     #[test]
     fn sign_channel_event_signature_verifies_against_canonical_cbor() {
         use ed25519_dalek::Verifier;
