@@ -20375,14 +20375,20 @@ async fn finalize_artifact(
     }
 
     // Atomic write: temp file in the dest dir, then rename over the target.
+    // The temp shares dest's dir (via with_extension) so the rename is a true
+    // same-filesystem atomic swap. The fixed ".partial" name assumes one
+    // download per dest at a time (the v1 IPC flow); concurrent downloads to the
+    // same dest would race on the temp.
     let dest = std::path::Path::new(dest_path);
     let tmp = dest.with_extension("partial");
     tokio::fs::write(&tmp, &plaintext)
         .await
         .map_err(|e| format!("write tmp: {e}"))?;
-    tokio::fs::rename(&tmp, dest)
-        .await
-        .map_err(|e| format!("rename: {e}"))?;
+    if let Err(e) = tokio::fs::rename(&tmp, dest).await {
+        // Best-effort: don't leave the temp behind if the rename fails.
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(format!("rename: {e}"));
+    }
     Ok(plaintext.len() as u64)
 }
 
@@ -48884,6 +48890,35 @@ mod channel_message_ipc_tests {
             .unwrap();
         assert_eq!(n, 10);
         assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"secret-log");
+    }
+
+    #[tokio::test]
+    async fn finalize_artifact_encrypted_without_key_errs() {
+        // The encrypted => Some(key) guard must reject with a clean error (no
+        // panic, no file) when an encrypted artifact arrives with no epoch key.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let err = finalize_artifact(b"x".to_vec(), true, None, 1, dest.to_str().unwrap())
+            .await
+            .expect_err("encrypted without key must error");
+        assert!(err.contains("requires an epoch key"), "got: {err}");
+        assert!(!dest.exists(), "no file written on missing key");
+    }
+
+    #[tokio::test]
+    async fn finalize_artifact_wrong_key_errs_not_panics() {
+        // Ciphertext decrypted with the wrong epoch key must surface as a clean
+        // AEAD error (never a panic or a silent garbage write).
+        let key = crate::owner_state_types::EpochKey::new([7u8; 32]);
+        let wrong = crate::owner_state_types::EpochKey::new([9u8; 32]);
+        let ct = crate::community_state_sync::encrypt_blob(&key, b"secret-log").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let err = finalize_artifact(ct, true, Some(wrong), 10, dest.to_str().unwrap())
+            .await
+            .expect_err("wrong key must error");
+        assert!(err.contains("decrypt"), "got: {err}");
+        assert!(!dest.exists(), "no file written on decrypt failure");
     }
 
     #[test]
