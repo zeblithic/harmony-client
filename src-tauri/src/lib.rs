@@ -20172,9 +20172,15 @@ pub(crate) fn detect_mime(name: &str) -> String {
 /// ZEB-535: pure cap + name/mime resolution for a channel artifact. Factored
 /// out of [`ingest_channel_artifact_impl`] so the cap and field-length
 /// validation are unit-testable without standing up a `NodeState` /
-/// event loop. Returns `(name, mime, size)`.
+/// event loop. Returns `(name, mime)`.
 ///
-/// - Rejects `path_meta_len > MAX_ARTIFACT_BYTES` before any read happens.
+/// - Rejects `path_meta_len > MAX_ARTIFACT_BYTES` before any read happens — a
+///   cheap fast-reject on the pre-ingest stat. The AUTHORITATIVE artifact size
+///   (and the size re-check against the cap) is computed by the caller from the
+///   *actual* ingested byte count, not from this stat: a file changing between
+///   the stat and the read/stream would otherwise sign a `size` that doesn't
+///   match the content (breaking download size-verification) and could slip
+///   past the cap if it grows after the stat.
 /// - Defaults `name` from the source path's file name (`"artifact"` if the
 ///   path has no usable file-name component).
 /// - Defaults `mime` from the resolved name's extension via [`detect_mime`].
@@ -20185,7 +20191,7 @@ pub(crate) fn prepare_artifact_meta(
     source_path: &str,
     name: Option<String>,
     mime: Option<String>,
-) -> Result<(String, String, u64), String> {
+) -> Result<(String, String), String> {
     if path_meta_len > MAX_ARTIFACT_BYTES {
         return Err(format!(
             "artifact too large: {path_meta_len} > {MAX_ARTIFACT_BYTES}"
@@ -20204,7 +20210,7 @@ pub(crate) fn prepare_artifact_meta(
     {
         return Err("attachment name/mime too long".to_string());
     }
-    Ok((name, mime, path_meta_len))
+    Ok((name, mime))
 }
 
 /// ZEB-535: read the live community epoch key for `community_id`.
@@ -20273,12 +20279,16 @@ pub(crate) async fn ingest_channel_artifact_impl(
         .map_err(|_| "community_id length wrong".to_string())?;
     let space = crate::owner_state_types::SpaceId(cid_bytes16);
 
-    // 1. Stat + cap (reject before reading). Cap + name/mime resolution +
-    //    field-length validation live in the pure `prepare_artifact_meta`.
+    // 1. Stat + cap (cheap fast-reject before reading). Name/mime resolution +
+    //    field-length validation live in the pure `prepare_artifact_meta`. The
+    //    DTO `size` is NOT taken from this stat — it's the actual ingested byte
+    //    count computed below, re-checked against the cap, so a file changing
+    //    between the stat and the read/stream can't sign a mismatched `size`
+    //    (which would break download size-verification) or grow past the cap.
     let meta = tokio::fs::metadata(&source_path)
         .await
         .map_err(|e| format!("stat: {e}"))?;
-    let (name, mime, size) = prepare_artifact_meta(meta.len(), &source_path, name, mime)?;
+    let (name, mime) = prepare_artifact_meta(meta.len(), &source_path, name, mime)?;
 
     let ingest_tx = {
         let g = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -20287,10 +20297,22 @@ pub(crate) async fn ingest_channel_artifact_impl(
             .ok_or_else(|| "not connected".to_string())?
     };
 
-    let root: ContentId = if encrypt {
+    // Authoritative artifact size = the bytes actually read + ingested (the
+    // plaintext length the download side size-verifies against), not the
+    // pre-ingest stat. Re-checked against the cap after the read.
+    let (root, size): (ContentId, u64) = if encrypt {
         let plaintext = tokio::fs::read(&source_path)
             .await
             .map_err(|e| format!("read: {e}"))?;
+        // Re-check the cap against the bytes we actually read (a file that grew
+        // after the stat could otherwise exceed it).
+        if plaintext.len() as u64 > MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "artifact too large: {} > {MAX_ARTIFACT_BYTES}",
+                plaintext.len()
+            ));
+        }
+        let size = plaintext.len() as u64;
         let epoch_key = current_epoch_key_for(state, &space).await?;
         let ciphertext = crate::community_state_sync::encrypt_blob(&epoch_key, &plaintext)
             .map_err(|e| format!("encrypt: {e:?}"))?;
@@ -20310,7 +20332,7 @@ pub(crate) async fn ingest_channel_artifact_impl(
         )
         .await
         .map_err(|e| e.to_string())?;
-        root
+        (root, size)
     } else {
         // Public: stream plaintext from disk (no whole-file buffer), default flags.
         // fast-follow: deterministic-CID reuse of an already-public copy is deferred;
@@ -20318,7 +20340,7 @@ pub(crate) async fn ingest_channel_artifact_impl(
         let file = tokio::fs::File::open(&source_path)
             .await
             .map_err(|e| format!("open: {e}"))?;
-        let (root, _n) = streaming_ingest_with_options(
+        let (root, n) = streaming_ingest_with_options(
             tokio::io::BufReader::new(file),
             &ingest_tx,
             ChunkerConfig::DEFAULT,
@@ -20327,7 +20349,12 @@ pub(crate) async fn ingest_channel_artifact_impl(
         )
         .await
         .map_err(|e| e.to_string())?;
-        root
+        // `n` is the actually-streamed byte count. Re-check the cap against it
+        // (a file that grew after the stat could otherwise exceed it).
+        if n > MAX_ARTIFACT_BYTES {
+            return Err(format!("artifact too large: {n} > {MAX_ARTIFACT_BYTES}"));
+        }
+        (root, n)
     };
 
     Ok(crate::community_channel_log_engine::ChannelAttachmentDto {
@@ -20339,6 +20366,11 @@ pub(crate) async fn ingest_channel_artifact_impl(
     })
 }
 
+/// ZEB-535: monotonic counter making each artifact download's temp file name
+/// unique within this process (combined with the pid), so concurrent downloads
+/// to the same dest can't clobber each other's `.partial` temp.
+static ARTIFACT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// ZEB-535: pure post-fetch tail of [`download_channel_artifact_impl`].
 ///
 /// Given the fetched bytes (ciphertext if `encrypted`, else plaintext):
@@ -20346,7 +20378,7 @@ pub(crate) async fn ingest_channel_artifact_impl(
 ///    `encrypt_blob` prepended is read back by `decrypt_blob`).
 /// 2. Verify the **plaintext** length equals `expected_size` BEFORE writing —
 ///    a mismatch errors and leaves no file on disk.
-/// 3. Write atomically: a `.partial` temp file in the dest dir, then rename.
+/// 3. Write atomically: a unique-per-call temp file in the dest dir, then rename.
 ///
 /// Factored out so the decrypt/verify/atomic-write contract is unit-testable
 /// without a `NodeState` / event loop. Returns the bytes written.
@@ -20376,11 +20408,13 @@ async fn finalize_artifact(
 
     // Atomic write: temp file in the dest dir, then rename over the target.
     // The temp shares dest's dir (via with_extension) so the rename is a true
-    // same-filesystem atomic swap. The fixed ".partial" name assumes one
-    // download per dest at a time (the v1 IPC flow); concurrent downloads to the
-    // same dest would race on the temp.
+    // same-filesystem atomic swap. The temp name is UNIQUE per call (pid + a
+    // process-wide atomic counter), so concurrent downloads to the same dest
+    // and any pre-existing `<dest>.partial` can't collide or interfere with
+    // each other's temp.
     let dest = std::path::Path::new(dest_path);
-    let tmp = dest.with_extension("partial");
+    let seq = ARTIFACT_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dest.with_extension(format!("partial.{}.{}", std::process::id(), seq));
     tokio::fs::write(&tmp, &plaintext)
         .await
         .map_err(|e| format!("write tmp: {e}"))?;
@@ -20408,10 +20442,11 @@ async fn finalize_artifact(
 /// encrypted CIDs).
 ///
 /// The fetch + decrypt are whole-artifact-in-memory (~2× at decrypt) —
-/// intentional for v1; the cap bounds the cost. Note the `FetchRequest`
-/// `max_bytes` here is the *plaintext* cap, while an encrypted artifact's
-/// ciphertext is slightly larger (nonce+tag overhead); acceptable for v1
-/// since real artifacts sit well below the 1 GiB boundary.
+/// intentional for v1; the cap bounds the cost. The `FetchRequest` `max_bytes`
+/// bounds the *assembled* bytes: for an encrypted CID that's the ciphertext, so
+/// the plaintext `cap` is widened by `BLOB_ENCRYPTION_OVERHEAD` (nonce+tag) so a
+/// near-cap encrypted artifact still fetches; the plaintext is still bounded by
+/// the `expected_size > cap` check.
 ///
 /// PR1: backend impl wired to the Tauri IPC in PR2 (Task 9); exercised
 /// end-to-end by the Task 7 two-node integration test. Allow until the IPC
@@ -20465,12 +20500,27 @@ pub(crate) async fn download_channel_artifact_impl(
             .clone()
             .ok_or_else(|| "not connected".to_string())?
     };
+    // The fetch `max_bytes` bounds the ASSEMBLED bytes, which for an encrypted
+    // CID is the ciphertext — larger than the plaintext by `encrypt_blob`'s
+    // nonce+tag overhead. Add that overhead to the cap so an encrypted artifact
+    // sized near the plaintext cap doesn't fail `fetch_recursive`. The
+    // `expected_size > cap` check above still bounds the plaintext.
+    let fetch_cap = if encrypted {
+        cap.saturating_add(crate::community_state_sync::BLOB_ENCRYPTION_OVERHEAD as u64)
+    } else {
+        cap
+    };
+
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     fetch_tx
         .send(event_loop::FetchRequest {
             cid_hex: cid,
             reply: reply_tx,
-            max_bytes: Some(cap as usize),
+            max_bytes: Some(fetch_cap as usize),
+            // SECURITY (ZEB-539): re-serve is currently granted from the CID's encrypted flag
+            // during the fetch, before the assembled artifact is validated. PR2 (which wires the
+            // IPC caller) must instead allowlist for re-serving only AFTER successful validation
+            // and after confirming the CID is an authorized channel attachment for the community.
             serveable: encrypted, // re-serve encrypted artifact books
         })
         .await
@@ -48921,6 +48971,26 @@ mod channel_message_ipc_tests {
         assert!(!dest.exists(), "no file written on decrypt failure");
     }
 
+    #[tokio::test]
+    async fn finalize_artifact_ignores_stale_fixed_partial() {
+        // ZEB-535: the temp file is now unique per call (pid + counter), so a
+        // pre-existing file at the OLD fixed `<dest>.partial` path must NOT
+        // interfere — finalize still succeeds and writes the right bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        // Plant a stale file exactly where the old fixed temp name would land.
+        let stale = dest.with_extension("partial");
+        tokio::fs::write(&stale, b"STALE GARBAGE").await.unwrap();
+
+        let n = finalize_artifact(b"hello".to_vec(), false, None, 5, dest.to_str().unwrap())
+            .await
+            .expect("finalize must succeed despite the stale fixed-name temp");
+        assert_eq!(n, 5);
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"hello");
+        // The stale fixed-name file is untouched — we no longer collide with it.
+        assert_eq!(tokio::fs::read(&stale).await.unwrap(), b"STALE GARBAGE");
+    }
+
     #[test]
     fn detect_mime_maps_known_extensions() {
         assert_eq!(detect_mime("a.txt"), "text/plain");
@@ -48936,17 +49006,19 @@ mod channel_message_ipc_tests {
     #[test]
     fn prepare_artifact_meta_defaults_name_and_mime_from_path() {
         // Neither name nor mime supplied: name defaults from the file_name,
-        // mime defaults from that name's extension.
-        let (name, mime, size) =
+        // mime defaults from that name's extension. (Size is no longer produced
+        // here — it comes from the actual ingested byte count in
+        // `ingest_channel_artifact_impl`; this helper only validates the cap +
+        // resolves name/mime.)
+        let (name, mime) =
             prepare_artifact_meta(42, "/some/dir/report.json", None, None).expect("under cap");
         assert_eq!(name, "report.json");
         assert_eq!(mime, "application/json");
-        assert_eq!(size, 42);
     }
 
     #[test]
     fn prepare_artifact_meta_honors_explicit_name_and_mime() {
-        let (name, mime, size) = prepare_artifact_meta(
+        let (name, mime) = prepare_artifact_meta(
             7,
             "/some/dir/report.json",
             Some("custom.bin".to_string()),
@@ -48955,7 +49027,6 @@ mod channel_message_ipc_tests {
         .expect("under cap");
         assert_eq!(name, "custom.bin");
         assert_eq!(mime, "application/x-custom");
-        assert_eq!(size, 7);
     }
 
     #[test]
@@ -48979,12 +49050,12 @@ mod channel_message_ipc_tests {
         // The cap and field-length checks use `>` (strictly greater), so values
         // EXACTLY at the limit must be accepted. Pins the `>` boundary against a
         // future `>=` typo on either check (the reject tests only cover MAX+1).
-        let (_, _, size) = prepare_artifact_meta(MAX_ARTIFACT_BYTES, "/p/a.bin", None, None)
-            .expect("size exactly at the cap must be accepted");
-        assert_eq!(size, MAX_ARTIFACT_BYTES);
+        let (name, _mime) = prepare_artifact_meta(MAX_ARTIFACT_BYTES, "/p/a.bin", None, None)
+            .expect("stat len exactly at the cap must be accepted");
+        assert_eq!(name, "a.bin");
 
         let max = crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES;
-        let (name, mime, _) =
+        let (name, mime) =
             prepare_artifact_meta(1, "/p/a.bin", Some("n".repeat(max)), Some("m".repeat(max)))
                 .expect("name/mime exactly at the field cap must be accepted");
         assert_eq!(name.len(), max);

@@ -22,7 +22,8 @@ use crate::community_channel_log::{
     decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, sign_channel_event,
     verify_channel_event, ChannelAttachment, ChannelEventError, ChannelKey, ChannelLog,
     ChannelLogConfig, ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload,
-    CommunityStateAtHlc, MessageId, SignedChannelEvent, MAX_ATTACHMENTS, MAX_MENTIONS,
+    CommunityStateAtHlc, MessageId, SignedChannelEvent, MAX_ATTACHMENTS,
+    MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -63,6 +64,9 @@ pub enum ChannelLogEngineError {
 
     #[error("too many attachments: {count} (max {max})")]
     TooManyAttachments { count: usize, max: usize },
+
+    #[error("attachment name/mime too long (max {max})")]
+    AttachmentFieldTooLong { max: usize },
 
     #[error("limit too large: {limit} (max {max})")]
     LimitTooLarge { limit: u32, max: u32 },
@@ -660,6 +664,20 @@ impl ChannelLogEngine {
                     count: a.len(),
                     max: MAX_ATTACHMENTS,
                 });
+            }
+            // ZEB-535: bound each attachment's name/mime length at mint to
+            // match `verify_channel_event`'s field-length cap. Without this a
+            // local publisher could mint a post that every remote peer drops at
+            // verification (`AttachmentFieldTooLong`) — a cross-node
+            // inconsistency. Mirrors the MAX_MENTIONS precedent.
+            for att in a {
+                if att.name.len() > MAX_ATTACHMENT_FIELD_BYTES
+                    || att.mime.len() > MAX_ATTACHMENT_FIELD_BYTES
+                {
+                    return Err(ChannelLogEngineError::AttachmentFieldTooLong {
+                        max: MAX_ATTACHMENT_FIELD_BYTES,
+                    });
+                }
             }
         }
         // ZEB-534: normalize Some(empty) -> None so an empty mentions list
@@ -2915,6 +2933,30 @@ mod tests {
             .expect_err("over-cap must error");
         assert!(
             matches!(err, ChannelLogEngineError::TooManyAttachments { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_overlong_attachment_field() {
+        // ZEB-535: an attachment with a name/mime longer than
+        // MAX_ATTACHMENT_FIELD_BYTES must be rejected at publish() time, so a
+        // locally-minted post can't be dropped by remote peers at
+        // verify_channel_event (which enforces the same cap).
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let overlong = vec![crate::community_channel_log::ChannelAttachment {
+            cid: [1u8; 32],
+            mime: "text/plain".into(),
+            name: "x".repeat(MAX_ATTACHMENT_FIELD_BYTES + 1),
+            size: 1,
+        }];
+        let err = Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, None, Some(overlong))
+            .await
+            .expect_err("over-long attachment field must error");
+        assert!(
+            matches!(err, ChannelLogEngineError::AttachmentFieldTooLong { max }
+                if max == MAX_ATTACHMENT_FIELD_BYTES),
             "got: {err:?}"
         );
     }

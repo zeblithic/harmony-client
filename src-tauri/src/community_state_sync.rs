@@ -78,6 +78,13 @@ const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const MIN_WIRE_LEN: usize = NONCE_LEN + TAG_LEN;
 
+/// Per-blob ciphertext overhead added by [`encrypt_blob`]: a prepended
+/// 12-byte nonce + a 16-byte Poly1305 tag = 28 bytes. Callers that bound a
+/// fetch by plaintext size (e.g. `download_channel_artifact_impl`) must add
+/// this to their `max_bytes` for encrypted CIDs, since the assembled
+/// ciphertext is larger than the plaintext it decrypts to.
+pub const BLOB_ENCRYPTION_OVERHEAD: usize = NONCE_LEN + TAG_LEN;
+
 /// Domain-separation prefix for the per-community blob nonce.
 /// Combined with the SHA-256 of the plaintext to derive a deterministic
 /// nonce — see `encrypt_blob` for the full derivation.
