@@ -25,7 +25,7 @@
 //! 4. Re-run without the env var to confirm the pin holds.
 
 use harmony_app::community_channel_log::{
-    sign_channel_event, ChannelPostPayload, MessageId, SignedChannelEvent,
+    sign_channel_event, ChannelAttachment, ChannelPostPayload, MessageId, SignedChannelEvent,
 };
 use harmony_app::community_membership::ChannelId;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
@@ -84,6 +84,49 @@ fn fixture_with_mentions() -> SignedChannelEvent {
         attachments: None,
     };
     sign_channel_event(&payload, &key).expect("sign")
+}
+
+// ZEB-535: a populated-`attachments` post. Mirrors `fixture_with_mentions`'s
+// deterministic seeds; the only difference is `attachments: Some(..)` (one
+// `ChannelAttachment`) and `mentions: None`, so the new wire pin isolates the
+// `pa` key's encoding.
+fn fixture_with_attachments() -> SignedChannelEvent {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0xa1; 32]);
+    let payload = ChannelPostPayload {
+        id: MessageId([0x11; 16]),
+        community_id: SpaceId([0xc0; 16]),
+        channel_id: ChannelId([0x01; 16]),
+        author: OwnerAddr([0xa1; 16]),
+        at: Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".to_string(),
+        },
+        content_kind: 0,
+        body: "see log",
+        reply_to: None,
+        mentions: None,
+        attachments: Some(vec![ChannelAttachment {
+            cid: [0xb2; 32],
+            mime: "text/plain".to_string(),
+            name: "log.txt".to_string(),
+            size: 42,
+        }]),
+    };
+    sign_channel_event(&payload, &key).expect("sign")
+}
+
+#[test]
+fn signed_channel_event_post_with_attachments_wire_bytes_pinned() {
+    let event = fixture_with_attachments();
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&event, &mut bytes).expect("encode");
+    // ZEB-535: the `pa` array sits between kd and rt (skipped) / sg. To
+    // regenerate this hex, temporarily uncomment the eprintln below, run with
+    // --nocapture, paste the printed value, then re-comment the eprintln.
+    // eprintln!("WITH_ATTACHMENTS: {}", hex::encode(&bytes));
+    let expected_hex = "a2627467617062766ca9626174a361771a000186a0616c00616465612d64657662617550a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a162626467736565206c6f67626368500101010101010101010101010101010162636950c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c06269645011111111111111111111111111111111626b640062706181a46263645820b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2626d696a746578742f706c61696e626e6d676c6f672e74787462737a182a62736758404143bba35a43ca437f0faa59d53039dd5465dacd22e0550fcac06acc41aeabacd3239a20ae12d31c0fe4b091a4dbdba1aef0359e078432ec8ec1277d92139603";
+    assert_eq!(hex::encode(&bytes), expected_hex);
 }
 
 #[test]
