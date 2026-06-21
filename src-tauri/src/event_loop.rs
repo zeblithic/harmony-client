@@ -3273,38 +3273,38 @@ pub async fn run(
 
             // ── Content-ingest requests from Tauri commands ────────
             Some(req) = ingest_rx.recv() => {
-                // Validate the CID hex decodes to exactly 32 bytes — this is
-                // the only precondition for parse_subscription_event to route
-                // the message into StorageTierEvent::PublishContent.
-                let cid_ok = hex::decode(&req.cid_hex)
+                // Parse the CID hex to exactly 32 bytes — this is the only
+                // precondition for parse_subscription_event to route the message
+                // into StorageTierEvent::PublishContent. Capturing the parsed
+                // ContentId here lets the serveable allowlist below reuse it
+                // (no redundant re-decode, no unreachable failure branch).
+                let parsed_cid = hex::decode(&req.cid_hex)
                     .ok()
                     .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                    .is_some();
-                if !cid_ok {
-                    let _ = req.reply.send(Err(format!("invalid CID hex: {}", req.cid_hex)));
-                } else {
-                    let key_expr = format!("harmony/content/publish/{}", req.cid_hex);
-                    runtime.push_event(RuntimeEvent::SubscriptionMessage {
-                        key_expr,
-                        payload: req.data,
-                    });
-                    // Tick immediately so content is committed before replying.
-                    for action in runtime.tick() {
-                        dispatch_action(action, &session, &zenoh_tx, &app, &closing, &own_zid)
-                            .await;
+                    .map(ContentId::from_bytes);
+                match parsed_cid {
+                    None => {
+                        let _ = req.reply.send(Err(format!("invalid CID hex: {}", req.cid_hex)));
                     }
-                    // ZEB-535: allowlist this CID for member-to-member serving so a
-                    // chunked encrypted artifact's CIDs are servable (the serve gate
-                    // refuses encrypted CIDs that aren't allowlisted). cid_ok already
-                    // proved the hex decodes to 32 bytes above.
-                    if req.serveable {
-                        if let Ok(b) = hex::decode(&req.cid_hex) {
-                            if let Ok(arr) = <[u8; 32]>::try_from(b) {
-                                serve_allowlist.allow(ContentId::from_bytes(arr));
-                            }
+                    Some(cid) => {
+                        let key_expr = format!("harmony/content/publish/{}", req.cid_hex);
+                        runtime.push_event(RuntimeEvent::SubscriptionMessage {
+                            key_expr,
+                            payload: req.data,
+                        });
+                        // Tick immediately so content is committed before replying.
+                        for action in runtime.tick() {
+                            dispatch_action(action, &session, &zenoh_tx, &app, &closing, &own_zid)
+                                .await;
                         }
+                        // ZEB-535: allowlist this CID for member-to-member serving so a
+                        // chunked encrypted artifact's CIDs are servable (the serve gate
+                        // refuses encrypted CIDs that aren't allowlisted).
+                        if req.serveable {
+                            serve_allowlist.allow(cid);
+                        }
+                        let _ = req.reply.send(Ok(()));
                     }
-                    let _ = req.reply.send(Ok(()));
                 }
             }
 
