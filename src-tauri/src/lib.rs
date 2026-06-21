@@ -39601,8 +39601,10 @@ mod zeb427_fence_tests {
             pub_tx,
             sub_rx,
             paths,
-            // Tiny debounce so the dirty-wakeup arm fires almost immediately.
-            10,
+            // Large debounce: only the explicit flush_now calls drive
+            // publishes; the wedge below is established deterministically, not
+            // via the debounce-wakeup arm.
+            600_000,
         );
 
         // First flush fills the capacity-1 publisher channel (rx alive, never
@@ -39613,12 +39615,21 @@ mod zeb427_fence_tests {
             .await
             .expect("first flush must succeed (channel has capacity)");
 
-        // Arm the debounce: its wakeup arm calls `publish_root_now`, whose
-        // `publisher_tx.send` blocks forever on the now-full channel — wedging
-        // the single-writer task so it can never service `persist_now`. Give
-        // the task time to enter the blocked publish before fencing.
-        engine.notify_dirty();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Deterministically wedge the single-writer task instead of sleeping: a
+        // SECOND flush_now must block forever inside `publish_root_now` on the
+        // now-full channel, so its oneshot reply never arrives. Asserting this
+        // second flush times out both ESTABLISHES and PROVES the wedged state —
+        // no fixed "hope the task got there" sleep. The flush can never actually
+        // complete (the channel is provably full), so the assertion holds
+        // regardless of scheduling; the bound only gives the task time to pick
+        // up the oneshot and enter the blocked publish before the fence runs.
+        let wedge =
+            tokio::time::timeout(std::time::Duration::from_millis(500), engine.flush_now()).await;
+        assert!(
+            wedge.is_err(),
+            "second flush must block on the full publisher channel and wedge the \
+             engine task; it returned ({wedge:?}) — the stall rig is broken"
+        );
 
         let started = std::time::Instant::now();
         fence_owner_state_flush(
@@ -39633,10 +39644,9 @@ mod zeb427_fence_tests {
             "bounded fence must return promptly on a stalled engine; took {:?}",
             started.elapsed()
         );
-        // The task is provably wedged inside publish (capacity-1 channel full,
-        // receiver never drained), so the persist_now oneshot reply never
-        // arrives — only the timeout branch can return, and elapsed must
-        // reflect the bound actually firing.
+        // The task is provably wedged inside publish (proven above), so the
+        // persist_now oneshot reply never arrives — only the timeout branch can
+        // return, and elapsed must reflect the bound actually firing.
         assert!(
             started.elapsed() >= std::time::Duration::from_millis(100),
             "fence returned before its bound on a stalled engine ({:?}) — \

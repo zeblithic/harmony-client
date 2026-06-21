@@ -1028,6 +1028,13 @@ mod engine_tests {
         persist: RecordingPersist,
         out_rx: mpsc::Receiver<Vec<u8>>,
         out_tx: mpsc::Sender<Vec<u8>>,
+        /// Held only to keep the inbound subscriber channel open for the
+        /// engine's lifetime; dropping it would close `subscriber_rx` and make
+        /// the engine task log a spurious "inbound subscriber channel closed"
+        /// error during these persist-only tests. Mirrors `build_engine`, which
+        /// keeps its `in_tx` alive in `Built` for the same reason.
+        #[allow(dead_code)]
+        in_tx: mpsc::Sender<Vec<u8>>,
     }
 
     fn build_engine_inspectable(
@@ -1036,7 +1043,10 @@ mod engine_tests {
         publisher_capacity: usize,
     ) -> BuiltInspectable {
         let (out_tx, out_rx) = mpsc::channel(publisher_capacity);
-        let (_in_tx, in_rx) = mpsc::channel(64);
+        // Keep the inbound sender alive (stored in BuiltInspectable below) so
+        // the engine task doesn't immediately observe a closed subscriber
+        // channel and log a spurious error during these persist-only tests.
+        let (in_tx, in_rx) = mpsc::channel(64);
         let state = Arc::new(Mutex::new(ToyDoc::default()));
         let tracker = Arc::new(Mutex::new(BTreeMap::new()));
         let persist = RecordingPersist::default();
@@ -1062,6 +1072,7 @@ mod engine_tests {
             persist,
             out_rx,
             out_tx,
+            in_tx,
         }
     }
 
