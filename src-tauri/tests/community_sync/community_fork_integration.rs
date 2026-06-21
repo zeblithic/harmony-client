@@ -55,7 +55,9 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
     tokio::spawn(async move {
         while let Some(op) = rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     store.lock().await.insert(cid, blob);
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(()));

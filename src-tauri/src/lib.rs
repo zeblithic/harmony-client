@@ -609,6 +609,11 @@ where
 /// Split out from `streaming_ingest` so the tree-build logic can be
 /// unit-tested with synthetic CIDs (no chunker, no I/O).
 ///
+/// ZEB-535: the production ingest path now calls
+/// [`build_bundle_tree_with_options`] directly; this default-flags delegate is
+/// retained for the in-crate synthetic-CID unit tests (its only callers), so it
+/// is `#[cfg(test)]`-gated to avoid a dead-code warning in the lib build.
+#[cfg(test)]
 pub(crate) async fn build_bundle_tree(
     leaf_cids: Vec<harmony_content::cid::ContentId>,
     total_size: u64,

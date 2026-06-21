@@ -124,7 +124,9 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
     tokio::spawn(async move {
         while let Some(op) = rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     store.lock().await.insert(cid, blob);
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(()));
@@ -2236,7 +2238,9 @@ mod task3_kick_setpower_round_trip {
         tokio::spawn(async move {
             while let Some(op) = cas_op_rx.recv().await {
                 match op {
-                    CasOp::PutLocal { cid, blob, reply } => {
+                    CasOp::PutLocal {
+                        cid, blob, reply, ..
+                    } => {
                         cas_for_servicer.lock().await.insert(cid, blob);
                         if let Some(r) = reply {
                             let _ = r.send(Ok(()));
