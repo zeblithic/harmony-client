@@ -39472,42 +39472,53 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
 /// UI promptly when the engine is wedged.
 pub(crate) const OWNER_STATE_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// ZEB-393 Bug A durable-on-commit fence, bounded (Qodo PR #226 R1).
+/// ZEB-509 durable-on-commit fence, bounded. Persist a just-committed owner-state
+/// Space mutation (community create / join / leave-adjacent write) to
+/// `owner_state_crdt.cbor` before the calling IPC returns, using the
+/// publish-INDEPENDENT persist path.
 ///
-/// Flush the owner-state SyncEngine so a just-committed Space mutation
-/// (community create / join / leave-adjacent write) reaches
-/// `owner_state_crdt.cbor` before the calling IPC returns. Non-fatal by
-/// design: on flush error OR timeout we log a warning and re-arm the
-/// debounce (`notify_dirty`) so the persist is retried, rather than
-/// failing an operation that has already committed in-memory.
+/// Why persist-only: `flush_now` publishes before it persists, so under
+/// "no responder" the publish leg back-pressures past `timeout`, the future is
+/// cancelled mid-publish, and persist never runs — losing the just-committed
+/// Space on a later crash (ZEB-509: redeemer reloads `spaces: {}` →
+/// `LiveEpochKeyMissing` → "no responder" deadlock). `persist_now` writes to disk
+/// without the publish leg, so durability always lands. Then `notify_dirty` arms
+/// the debounce so the owner-state root still propagates to sibling devices,
+/// best-effort, never blocking durability. Mirrors `fence_community_crdt_persist`.
 ///
-/// `context` names the calling IPC in the warning; `community_id` is
-/// the hex space id for log correlation.
+/// Bounded + non-fatal: a wedged engine task can't hang create/redeem; on persist
+/// error/timeout we log + leave the debounce armed.
+///
+/// `context` names the calling IPC in the warning; `community_id` is the hex space
+/// id for log correlation.
 pub(crate) async fn fence_owner_state_flush(
     engine: &crate::owner_state_sync::SyncEngine,
     timeout: std::time::Duration,
     context: &'static str,
     community_id: &str,
 ) {
-    match tokio::time::timeout(timeout, engine.flush_now()).await {
+    match tokio::time::timeout(timeout, engine.persist_now()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             tracing::warn!(
                 error = %e,
                 community_id = %community_id,
-                "{context}: owner-state flush_now failed; re-arming debounce"
+                "{context}: owner-state persist_now failed; debounce left armed"
             );
-            engine.notify_dirty();
         }
         Err(_elapsed) => {
             tracing::warn!(
                 timeout_ms = timeout.as_millis() as u64,
                 community_id = %community_id,
-                "{context}: owner-state flush_now timed out; re-arming debounce"
+                "{context}: owner-state persist_now timed out; debounce left armed"
             );
-            engine.notify_dirty();
         }
     }
+    // Best-effort propagation of the owner-state root to sibling devices — the
+    // publish `flush_now` used to do synchronously. Fires on the next debounce;
+    // never blocks durability. Also serves as the re-arm on the error/timeout
+    // arms above.
+    engine.notify_dirty();
 }
 
 /// ZEB-462 B: durable-on-commit fence for the COMMUNITY MEMBERSHIP CRDT,
@@ -39558,13 +39569,13 @@ pub(crate) async fn fence_community_crdt_persist(
 mod zeb427_fence_tests {
     use super::*;
 
-    /// Qodo (PR #226 R1): the fence must return within its bound even
-    /// when the engine's internal task is wedged. Rig the stall by
-    /// giving the engine a capacity-1 publisher channel whose receiver
-    /// is alive but never drained: the first flush fills the channel,
-    /// the second blocks inside the engine task on the publisher send,
-    /// so its oneshot reply never arrives and only the timeout can
-    /// return control.
+    /// Qodo (PR #226 R1): the fence must return within its bound even when
+    /// the engine's internal task is wedged. The fence is now persist-only
+    /// (ZEB-509), so a saturated publisher no longer stalls it directly; to
+    /// wedge the task we make its debounce-wakeup arm block on a full
+    /// publisher channel. With the single-writer task stuck inside
+    /// `publish_root_now`, it can never service the `persist_now` oneshot,
+    /// so only the fence's `timeout` can return control.
     #[tokio::test]
     async fn fence_owner_state_flush_returns_on_stalled_engine() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -39575,6 +39586,8 @@ mod zeb427_fence_tests {
         let kt = std::sync::Arc::new(
             crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"),
         );
+        // Capacity-1 publisher channel whose receiver is alive but never
+        // drained — the first publish fills it, the second blocks forever.
         let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let engine = crate::owner_state_sync::SyncEngine::new(
@@ -39588,15 +39601,35 @@ mod zeb427_fence_tests {
             pub_tx,
             sub_rx,
             paths,
+            // Large debounce: only the explicit flush_now calls drive
+            // publishes; the wedge below is established deterministically, not
+            // via the debounce-wakeup arm.
             600_000,
         );
 
-        // First flush fills the capacity-1 publisher channel (rx alive,
-        // never drained), wedging the engine task on its next publish.
+        // First flush fills the capacity-1 publisher channel (rx alive, never
+        // drained). flush_now itself succeeds — the channel had capacity for
+        // exactly one frame.
         engine
             .flush_now()
             .await
             .expect("first flush must succeed (channel has capacity)");
+
+        // Deterministically wedge the single-writer task instead of sleeping: a
+        // SECOND flush_now must block forever inside `publish_root_now` on the
+        // now-full channel, so its oneshot reply never arrives. Asserting this
+        // second flush times out both ESTABLISHES and PROVES the wedged state —
+        // no fixed "hope the task got there" sleep. The flush can never actually
+        // complete (the channel is provably full), so the assertion holds
+        // regardless of scheduling; the bound only gives the task time to pick
+        // up the oneshot and enter the blocked publish before the fence runs.
+        let wedge =
+            tokio::time::timeout(std::time::Duration::from_millis(500), engine.flush_now()).await;
+        assert!(
+            wedge.is_err(),
+            "second flush must block on the full publisher channel and wedge the \
+             engine task; it returned ({wedge:?}) — the stall rig is broken"
+        );
 
         let started = std::time::Instant::now();
         fence_owner_state_flush(
@@ -39611,9 +39644,9 @@ mod zeb427_fence_tests {
             "bounded fence must return promptly on a stalled engine; took {:?}",
             started.elapsed()
         );
-        // The publisher channel is provably full (capacity 1, one prior
-        // flush, receiver never drained), so the only way back is the
-        // timeout branch — elapsed must reflect the bound actually firing.
+        // The task is provably wedged inside publish (proven above), so the
+        // persist_now oneshot reply never arrives — only the timeout branch can
+        // return, and elapsed must reflect the bound actually firing.
         assert!(
             started.elapsed() >= std::time::Duration::from_millis(100),
             "fence returned before its bound on a stalled engine ({:?}) — \

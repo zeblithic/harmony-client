@@ -161,6 +161,7 @@ pub struct FleetSyncEngine<S: Send + 'static> {
     /// most-recent actual publish.
     has_pending_dirty: Arc<AtomicBool>,
     flush_now_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
+    persist_now_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
     /// Carries `Result<(), SyncError>` so the final publish + persist
     /// errors propagate to the caller rather than being silently
     /// swallowed by `()`.
@@ -196,6 +197,7 @@ where
         let notify_dirty = Arc::new(Notify::new());
         let has_pending_dirty = Arc::new(AtomicBool::new(false));
         let (flush_now_tx, flush_now_rx) = mpsc::channel(8);
+        let (persist_now_tx, persist_now_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         let replay_tracker = Arc::clone(&config.replay_tracker);
@@ -220,6 +222,7 @@ where
             notify_dirty: Arc::clone(&notify_dirty),
             has_pending_dirty: Arc::clone(&has_pending_dirty),
             flush_now_rx,
+            persist_now_rx,
             shutdown_rx,
         }));
 
@@ -227,6 +230,7 @@ where
             notify_dirty,
             has_pending_dirty,
             flush_now_tx,
+            persist_now_tx,
             shutdown_tx,
             replay_tracker,
             sibling_acks,
@@ -258,6 +262,22 @@ where
     pub async fn flush_now(&self) -> Result<(), SyncError> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.flush_now_tx
+            .send(resp_tx)
+            .await
+            .map_err(|_| SyncError::TransportClosed)?;
+        resp_rx.await.map_err(|_| SyncError::TransportClosed)?
+    }
+
+    /// Force an immediate durable persist WITHOUT publishing. Returns when the
+    /// on-disk write has completed. Unlike `flush_now`, this never touches the
+    /// network publish path, so durability cannot be starved by a stalled publish
+    /// (e.g. no zenoh responder). Used by the durable-on-commit fences where the
+    /// only requirement is that local state reach disk; any pending state-root
+    /// publish still fires on the next debounce. Mirrors
+    /// `community_state_sync::CommunitySyncEngine::persist_now`.
+    pub async fn persist_now(&self) -> Result<(), SyncError> {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        self.persist_now_tx
             .send(resp_tx)
             .await
             .map_err(|_| SyncError::TransportClosed)?;
@@ -360,6 +380,7 @@ struct Ctx<S> {
     notify_dirty: Arc<Notify>,
     has_pending_dirty: Arc<AtomicBool>,
     flush_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
+    persist_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
     shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
 }
 
@@ -458,6 +479,17 @@ where
                 let persist_result = persist_now(&ctx).await;
                 let result = pub_result.and(persist_result);
                 let _ = resp_tx.send(result);
+            }
+            Some(resp_tx) = ctx.persist_now_rx.recv() => {
+                // Publish-INDEPENDENT durable persist (durable-on-commit fence).
+                // Persists state + tracker to disk without the publish leg, so a
+                // stalled publish (no zenoh responder) can never starve durability
+                // — the ZEB-509 bug this path fixes. Deliberately does NOT touch
+                // `has_pending_dirty`: any pending state-root publish still fires
+                // on the next debounce / flush_now. Mirrors the community engine's
+                // persist_now arm.
+                let persist_result = persist_now(&ctx).await;
+                let _ = resp_tx.send(persist_result);
             }
             maybe_bytes = ctx.subscriber_rx.recv(), if !inbound_closed => {
                 let Some(bytes) = maybe_bytes else {
@@ -963,6 +995,203 @@ mod engine_tests {
             out_rx,
             in_tx,
         }
+    }
+
+    /// Inspectable durability sink: records every `(state, tracker)` snapshot
+    /// the engine asks to persist so a test can assert the mutated state
+    /// actually reached the persist backend.
+    #[derive(Clone, Default)]
+    struct RecordingPersist {
+        persisted: Arc<std::sync::Mutex<Vec<ToyDoc>>>,
+    }
+    impl FleetPersist<ToyDoc> for RecordingPersist {
+        fn persist(
+            &self,
+            state: &ToyDoc,
+            _tracker: &BTreeMap<String, Hlc>,
+        ) -> Result<(), SyncError> {
+            self.persisted
+                .lock()
+                .expect("persist mutex")
+                .push(state.clone());
+            Ok(())
+        }
+    }
+
+    /// Like `build_engine`, but with an inspectable persist backend and a
+    /// caller-chosen publisher-channel capacity so a test can saturate the
+    /// outbound publish leg. Returns the engine plus the handles the
+    /// persist-only tests need.
+    struct BuiltInspectable {
+        engine: FleetSyncEngine<ToyDoc>,
+        state: Arc<Mutex<ToyDoc>>,
+        persist: RecordingPersist,
+        out_rx: mpsc::Receiver<Vec<u8>>,
+        out_tx: mpsc::Sender<Vec<u8>>,
+        /// Held only to keep the inbound subscriber channel open for the
+        /// engine's lifetime; dropping it would close `subscriber_rx` and make
+        /// the engine task log a spurious "inbound subscriber channel closed"
+        /// error during these persist-only tests. Mirrors `build_engine`, which
+        /// keeps its `in_tx` alive in `Built` for the same reason.
+        #[allow(dead_code)]
+        in_tx: mpsc::Sender<Vec<u8>>,
+    }
+
+    fn build_engine_inspectable(
+        device_id: &str,
+        cas: Arc<dyn ContentStore>,
+        publisher_capacity: usize,
+    ) -> BuiltInspectable {
+        let (out_tx, out_rx) = mpsc::channel(publisher_capacity);
+        // Keep the inbound sender alive (stored in BuiltInspectable below) so
+        // the engine task doesn't immediately observe a closed subscriber
+        // channel and log a spurious error during these persist-only tests.
+        let (in_tx, in_rx) = mpsc::channel(64);
+        let state = Arc::new(Mutex::new(ToyDoc::default()));
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let persist = RecordingPersist::default();
+        let engine = FleetSyncEngine::new(FleetSyncConfig {
+            kt: make_kt(),
+            device_id: device_id.to_string(),
+            state: Arc::clone(&state),
+            merger: Arc::new(|local: &mut ToyDoc, remote: ToyDoc| toy_merge(local, remote)),
+            replay_tracker: Arc::clone(&tracker),
+            content_store: cas,
+            publisher_tx: out_tx.clone(),
+            subscriber_rx: in_rx,
+            persist: Arc::new(persist.clone()),
+            lookup_key_tag: TOY_TAG,
+            debounce_ms: 3_600_000, // effectively disable the debounce wakeup
+            publish_seen: false,
+            on_applied: None,
+            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+        });
+        BuiltInspectable {
+            engine,
+            state,
+            persist,
+            out_rx,
+            out_tx,
+            in_tx,
+        }
+    }
+
+    /// `persist_now` must durably write the mutated state to the persist
+    /// backend WITHOUT emitting any publish on the outbound channel. Mirrors
+    /// `community_state_sync::persist_now_fences_crdt_without_publishing_zeb462`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persist_now_persists_without_publishing() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let built = build_engine_inspectable("dev-persist", Arc::clone(&cas), 8);
+
+        // Mutate local state, then fence it durable via the persist-only path.
+        {
+            let mut doc = built.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "durable".into(),
+                },
+            );
+        }
+
+        // (1) persist_now returns Ok.
+        built.engine.persist_now().await.expect("persist_now");
+
+        // (2) the mutated state reached the persist backend.
+        let persisted = built
+            .persist
+            .persisted
+            .lock()
+            .expect("persist mutex")
+            .clone();
+        assert!(
+            persisted
+                .iter()
+                .any(|doc| doc.entries.get("k1").is_some_and(|e| e.val == "durable")),
+            "persist_now must durably write the mutated state to the persist backend"
+        );
+
+        // (3) ZERO publishes on the outbound channel during persist_now.
+        let mut out_rx = built.out_rx;
+        assert!(
+            matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "persist_now must NOT publish — the outbound channel must be empty"
+        );
+
+        built.engine.shutdown().await.ok();
+    }
+
+    /// The precise property `flush_now` lacks: `persist_now` completes promptly
+    /// even when the outbound publisher channel is saturated to capacity, since
+    /// it never touches the publish leg. A `flush_now` here would block on the
+    /// saturated publisher send. (ZEB-509: durability must never wait on publish.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persist_now_persists_without_publishing_under_saturated_publisher() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        // Capacity-1 publisher channel whose receiver is never drained.
+        let built = build_engine_inspectable("dev-persist-sat", Arc::clone(&cas), 1);
+
+        // Saturate the publisher channel to capacity (rx held, never drained),
+        // so any publish leg would back-pressure indefinitely.
+        built
+            .out_tx
+            .send(vec![0xab; 4])
+            .await
+            .expect("prime saturated publisher channel");
+        assert!(
+            built.out_tx.try_send(vec![0xcd; 4]).is_err(),
+            "publisher channel must be provably full for this test to be meaningful"
+        );
+
+        {
+            let mut doc = built.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "durable-under-saturation".into(),
+                },
+            );
+        }
+
+        // persist_now must return Ok PROMPTLY despite the saturated publisher.
+        let result = tokio::time::timeout(Duration::from_secs(5), built.engine.persist_now()).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "persist_now must complete even with the publisher channel saturated; got {result:?}"
+        );
+
+        // State still reached disk.
+        let persisted = built
+            .persist
+            .persisted
+            .lock()
+            .expect("persist mutex")
+            .clone();
+        assert!(
+            persisted.iter().any(|doc| doc
+                .entries
+                .get("k1")
+                .is_some_and(|e| e.val == "durable-under-saturation")),
+            "persist_now must persist mutated state even under a saturated publisher"
+        );
+
+        // The only frame on the channel is the one the test primed — no publish.
+        let mut out_rx = built.out_rx;
+        assert_eq!(
+            out_rx.try_recv().expect("primed frame"),
+            vec![0xab; 4],
+            "the channel must hold only the test's priming frame"
+        );
+        assert!(
+            matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "persist_now must not have published any additional frame"
+        );
+
+        // Drain so shutdown's final flush isn't itself starved by the saturation.
+        built.engine.shutdown().await.ok();
     }
 
     /// Bounded condition-polling helper (no fixed sleeps).
