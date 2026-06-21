@@ -22,7 +22,7 @@ use crate::community_channel_log::{
     decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, sign_channel_event,
     verify_channel_event, ChannelEventError, ChannelKey, ChannelLog, ChannelLogConfig,
     ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc,
-    MessageId, SignedChannelEvent,
+    MessageId, SignedChannelEvent, MAX_MENTIONS,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -57,6 +57,9 @@ pub enum ChannelLogEngineError {
 
     #[error("body too large: {len} bytes (max {max})")]
     BodyTooLarge { len: usize, max: usize },
+
+    #[error("too many mentions: {count} (max {max})")]
+    TooManyMentions { count: usize, max: usize },
 
     #[error("limit too large: {limit} (max {max})")]
     LimitTooLarge { limit: u32, max: u32 },
@@ -146,6 +149,13 @@ pub struct ChannelMessageDto {
     /// of the poll-body convention).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_id: Option<String>,
+    /// ZEB-534: owner-ids (lowercase hex) this message addresses. Omitted
+    /// when the post carries no mentions so existing consumers never see
+    /// `mentions: null`. Recipients derive "mentions me" as
+    /// `self_owner_hex ∈ mentions`. `ChannelMessageReceivedPayload` carries
+    /// the full DTO, so this rides the live event automatically.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mentions: Option<Vec<String>>,
 }
 
 /// Magic-byte prefix for ZEB-291 Phase 1.5 poll-message bodies. Chosen
@@ -607,6 +617,7 @@ impl ChannelLogEngine {
         self: &Arc<Self>,
         body: Vec<u8>,
         reply_to: Option<MessageId>,
+        mentions: Option<Vec<OwnerAddr>>,
     ) -> Result<MessageId, ChannelLogEngineError> {
         if body.len() > MAX_BODY_BYTES {
             return Err(ChannelLogEngineError::BodyTooLarge {
@@ -614,6 +625,20 @@ impl ChannelLogEngine {
                 max: MAX_BODY_BYTES,
             });
         }
+        if let Some(m) = &mentions {
+            if m.len() > MAX_MENTIONS {
+                return Err(ChannelLogEngineError::TooManyMentions {
+                    count: m.len(),
+                    max: MAX_MENTIONS,
+                });
+            }
+        }
+        // ZEB-534: normalize Some(empty) -> None so an empty mentions list
+        // never emits the `mn` key. Without this, `Some(vec![])` would
+        // serialize `mn: []` and change the signed bytes — defeating the
+        // "mention-less posts are byte-identical to pre-feature" invariant
+        // for callers that default to an empty list.
+        let mentions = mentions.filter(|m| !m.is_empty());
 
         // Phase 2 stores body as String inside SignedChannelEvent::Post
         // (the canonical-CBOR signature covers a `&str`). The IPC layer
@@ -652,6 +677,7 @@ impl ChannelLogEngine {
             content_kind: 0,
             body: &body_str,
             reply_to,
+            mentions,
         };
         let event = sign_channel_event(&payload, &self.signing_key)
             .map_err(ChannelLogEngineError::ChannelEvent)?;
@@ -817,6 +843,7 @@ impl ChannelLogEngine {
             author,
             at,
             body,
+            mentions,
             reply_to,
             ..
         } = event;
@@ -835,6 +862,16 @@ impl ChannelLogEngine {
             },
             body: body_bytes,
             reply_to: reply_to.map(|m| hex::encode(m.0)),
+            // Omit an empty mentions list to honor the DTO contract
+            // (no-mention posts have no `mentions` field). `publish()`
+            // normalizes `Some([])` -> `None` at mint time, but this
+            // projection also runs on arbitrary inbound/persisted events,
+            // where a remote peer could sign `mn: []` (empty passes the
+            // cap check). Filter here so the DTO is consistent regardless.
+            mentions: mentions
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .map(|v| v.iter().map(|a| hex::encode(a.0)).collect()),
             kind,
             poll_id,
         }
@@ -2258,6 +2295,7 @@ mod tests {
             content_kind: 0,
             body,
             reply_to: None,
+            mentions: None,
         };
         sign_channel_event(&payload, signing_key).expect("sign")
     }
@@ -2405,6 +2443,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_to_dto_projects_mentions_as_hex() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let m0 = OwnerAddr([0xb2; 16]);
+        let m1 = OwnerAddr([0xc3; 16]);
+        let id = {
+            use rand::RngCore;
+            let mut b = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut b);
+            MessageId(b)
+        };
+        let payload = ChannelPostPayload {
+            id,
+            community_id: fix.community_id,
+            channel_id: fix.channel_id,
+            author: fix.self_owner,
+            at: Hlc {
+                wall_ms: 5_000,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            content_kind: 0,
+            body: "hi @bob",
+            reply_to: None,
+            mentions: Some(vec![m0, m1]),
+        };
+        let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
+        let dto = fix.engine.event_to_dto(&ev);
+        assert_eq!(
+            dto.mentions,
+            Some(vec![hex::encode(m0.0), hex::encode(m1.0)])
+        );
+
+        // Mention-less event omits the field.
+        let ev_none = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            Hlc {
+                wall_ms: 5_001,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            "no mentions",
+            &fix.signing_key,
+        );
+        assert!(fix.engine.event_to_dto(&ev_none).mentions.is_none());
+    }
+
+    #[tokio::test]
+    async fn event_to_dto_omits_empty_mentions() {
+        // A signed event carrying `Some(vec![])` (reachable inbound: a
+        // remote peer can sign `mn: []`, which passes the cap check) must
+        // still project to a DTO with no `mentions` field, matching the
+        // no-mention contract. `sign_channel_event` does not normalize, so
+        // this builds the empty-vec event directly.
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let id = {
+            use rand::RngCore;
+            let mut b = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut b);
+            MessageId(b)
+        };
+        let payload = ChannelPostPayload {
+            id,
+            community_id: fix.community_id,
+            channel_id: fix.channel_id,
+            author: fix.self_owner,
+            at: Hlc {
+                wall_ms: 5_002,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            content_kind: 0,
+            body: "empty mentions",
+            reply_to: None,
+            mentions: Some(vec![]),
+        };
+        let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
+        assert!(fix.engine.event_to_dto(&ev).mentions.is_none());
+    }
+
+    #[tokio::test]
     async fn list_messages_walks_tail_then_segments() {
         // Spec §14.1: with seal_threshold=4 and 10 events appended,
         // the engine ends up with 2 sealed segments + 2 events in the
@@ -2509,7 +2629,7 @@ mod tests {
 
         let body = b"hello channel".to_vec();
         let msg_id = Arc::clone(&fix.engine)
-            .publish(body.clone(), None)
+            .publish(body.clone(), None, None)
             .await
             .expect("publish");
 
@@ -2541,7 +2661,7 @@ mod tests {
 
         let body = b"emit-test-body".to_vec();
         let msg_id = Arc::clone(&fix.engine)
-            .publish(body.clone(), None)
+            .publish(body.clone(), None, None)
             .await
             .expect("publish");
 
@@ -2592,10 +2712,46 @@ mod tests {
         let fix = build_engine_fixture(8, 250, 1000).await;
         let body = vec![0u8; MAX_BODY_BYTES + 1];
         let err = Arc::clone(&fix.engine)
-            .publish(body, None)
+            .publish(body, None, None)
             .await
             .expect_err("oversized body must reject");
         assert!(matches!(err, ChannelLogEngineError::BodyTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_too_many_mentions() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let too_many: Vec<OwnerAddr> = (0..=MAX_MENTIONS)
+            .map(|i| OwnerAddr([i as u8; 16]))
+            .collect();
+        assert_eq!(too_many.len(), MAX_MENTIONS + 1);
+        let err = Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, Some(too_many))
+            .await
+            .expect_err("over-cap mentions must reject");
+        assert!(
+            matches!(err, ChannelLogEngineError::TooManyMentions { count, max }
+                if count == MAX_MENTIONS + 1 && max == MAX_MENTIONS),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_normalizes_empty_mentions_to_none() {
+        // ZEB-534: Some(vec![]) must serialize WITHOUT the mn key (omitted),
+        // so an empty mentions list is byte-identical to a mention-less post.
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, Some(vec![]))
+            .await
+            .expect("publish with empty mentions");
+        let msgs = fix.engine.list_messages(None, 100).await.expect("list");
+        assert_eq!(msgs.len(), 1);
+        let dto = fix.engine.event_to_dto(&msgs[0]);
+        assert!(
+            dto.mentions.is_none(),
+            "empty mentions must normalize to None (mn key omitted)"
+        );
     }
 
     // ── Sub-task 2C: receive loop ─────────────────────────────────────
@@ -2748,7 +2904,7 @@ mod tests {
         fix.engine.closing.store(true, Ordering::SeqCst);
 
         let err = Arc::clone(&fix.engine)
-            .publish(b"arrives-during-shutdown".to_vec(), None)
+            .publish(b"arrives-during-shutdown".to_vec(), None, None)
             .await
             .expect_err("publish on a closing engine must error");
         assert!(
@@ -3494,7 +3650,7 @@ mod tests {
         // Write one post so the log has a watermark, then stop (which
         // flushes the tail durably) and respawn — the reconnect path.
         engine
-            .publish(b"hello".to_vec(), None)
+            .publish(b"hello".to_vec(), None, None)
             .await
             .expect("publish");
         let expected = engine.log_max_hlc().await;
