@@ -154,9 +154,10 @@ pub(crate) const MAX_MENTIONS: usize = 64;
 /// fields all 2-char keys to satisfy the same-length-keys invariant.
 ///
 /// `sg` covers canonical CBOR of `(id, community_id, channel_id, author,
-/// at, content_kind, body, reply_to)` — every field minus the signature
-/// itself. v3 Edit/Delete/React variants will sign their own typed
-/// payloads with no field reuse across variants.
+/// at, content_kind, body, reply_to, mentions)` — every field minus the
+/// signature itself, so the `mentions`/`mn` list is tamper-evident like
+/// every other field. v3 Edit/Delete/React variants will sign their own
+/// typed payloads with no field reuse across variants.
 ///
 /// Per spec §5.2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
