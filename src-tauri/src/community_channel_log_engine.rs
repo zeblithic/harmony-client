@@ -22,7 +22,7 @@ use crate::community_channel_log::{
     decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, sign_channel_event,
     verify_channel_event, ChannelEventError, ChannelKey, ChannelLog, ChannelLogConfig,
     ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc,
-    MessageId, SignedChannelEvent,
+    MessageId, SignedChannelEvent, MAX_MENTIONS,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -335,11 +335,6 @@ pub struct ChannelLogEngineParams {
 /// error mapping.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// ZEB-534: hard cap on mentions per channel post. Bounds the signed-set
-/// size and each recipient's "mentions me" scan. Membership-gating of the
-/// targets is out of scope for v1.
-const MAX_MENTIONS: usize = 64;
-
 pub struct ChannelLogEngine {
     community_id: SpaceId,
     channel_id: ChannelId,
@@ -638,6 +633,12 @@ impl ChannelLogEngine {
                 });
             }
         }
+        // ZEB-534: normalize Some(empty) -> None so an empty mentions list
+        // never emits the `mn` key. Without this, `Some(vec![])` would
+        // serialize `mn: []` and change the signed bytes — defeating the
+        // "mention-less posts are byte-identical to pre-feature" invariant
+        // for callers that default to an empty list.
+        let mentions = mentions.filter(|m| !m.is_empty());
 
         // Phase 2 stores body as String inside SignedChannelEvent::Post
         // (the canonical-CBOR signature covers a `&str`). The IPC layer
@@ -2692,6 +2693,24 @@ mod tests {
             matches!(err, ChannelLogEngineError::TooManyMentions { count, max }
                 if count == MAX_MENTIONS + 1 && max == MAX_MENTIONS),
             "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_normalizes_empty_mentions_to_none() {
+        // ZEB-534: Some(vec![]) must serialize WITHOUT the mn key (omitted),
+        // so an empty mentions list is byte-identical to a mention-less post.
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, Some(vec![]))
+            .await
+            .expect("publish with empty mentions");
+        let msgs = fix.engine.list_messages(None, 100).await.expect("list");
+        assert_eq!(msgs.len(), 1);
+        let dto = fix.engine.event_to_dto(&msgs[0]);
+        assert!(
+            dto.mentions.is_none(),
+            "empty mentions must normalize to None (mn key omitted)"
         );
     }
 

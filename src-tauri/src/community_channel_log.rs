@@ -141,6 +141,14 @@ const TAG_LEN: usize = 16;
 /// before invoking the AEAD layer for a cleaner error split.
 const MIN_PACKET_LEN: usize = NONCE_LEN + TAG_LEN;
 
+/// ZEB-534: hard cap on mentions per channel post. Enforced at every
+/// entry point — local mint (`ChannelLogEngine::publish`), the IPC
+/// boundary (`post_channel_message_impl`), AND inbound verification
+/// (`verify_channel_event`) — so a remote peer can't bypass the cap by
+/// crafting a signed event with a huge `mn` array. Bounds the signed-set
+/// size and each recipient's "mentions me" scan.
+pub(crate) const MAX_MENTIONS: usize = 64;
+
 /// One signed channel event. Phase 2 ships only the `Post` variant.
 /// Wire format: 2-key adjacently-tagged outer (`tg` + `vl`); inner
 /// fields all 2-char keys to satisfy the same-length-keys invariant.
@@ -292,6 +300,8 @@ pub enum ChannelEventError {
     },
     #[error("not authorized: {0}")]
     NotAuthorized(String),
+    #[error("too many mentions: {count} (max {max})")]
+    TooManyMentions { count: usize, max: usize },
 }
 
 /// Sign a channel post payload with the author's identity key. Returns
@@ -681,8 +691,24 @@ where
         author,
         at,
         sig,
+        mentions,
         ..
     } = event;
+
+    // Step 2.5 (ZEB-534): inbound mentions cap. MAX_MENTIONS is enforced
+    // on the local mint path (publish) and at the IPC boundary; enforce it
+    // here too so a remote peer cannot bypass the cap with a signed event
+    // carrying an oversized `mn` array (which would otherwise be accepted,
+    // appended, projected to a DTO, and re-broadcast). Cheap structural
+    // check — runs before the async state materialization.
+    if let Some(m) = mentions {
+        if m.len() > MAX_MENTIONS {
+            return Err(ChannelEventError::TooManyMentions {
+                count: m.len(),
+                max: MAX_MENTIONS,
+            });
+        }
+    }
 
     // Step 3: misroute defense.
     if community_id != expected_community_id || channel_id != expected_channel_id {
@@ -1590,6 +1616,46 @@ mod tests {
         )
         .await
         .expect("verify accepts post with mentions");
+    }
+
+    #[tokio::test]
+    async fn verify_channel_event_rejects_post_over_mention_cap() {
+        // ZEB-534: a validly-signed inbound event with > MAX_MENTIONS must
+        // be rejected at verify time, so a remote peer can't bypass the cap
+        // the local publish path enforces.
+        let state = fixture_state_with_alice_joined();
+        let mut tracker = ChannelLogReplayTracker::new();
+        let (key, author, _pub64) = fixture_identity(0xa1);
+        let too_many: Vec<OwnerAddr> = (0..=MAX_MENTIONS)
+            .map(|i| fixture_owner_addr(i as u8))
+            .collect();
+        assert_eq!(too_many.len(), MAX_MENTIONS + 1);
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author,
+            at: fixture_hlc(100_000, "a-dev"),
+            content_kind: 0,
+            body: "spam",
+            reply_to: None,
+            mentions: Some(too_many),
+        };
+        let event = sign_channel_event(&payload, &key).expect("sign");
+        let err = verify_channel_event(
+            &event,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+        )
+        .await
+        .expect_err("over-cap inbound mentions must reject");
+        assert!(
+            matches!(err, ChannelEventError::TooManyMentions { count, max }
+                if count == MAX_MENTIONS + 1 && max == MAX_MENTIONS),
+            "got: {err:?}"
+        );
     }
 
     #[test]

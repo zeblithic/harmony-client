@@ -20010,6 +20010,16 @@ pub(crate) async fn post_channel_message_impl(
     // engine sees it; bounds (MAX_MENTIONS) are enforced in publish().
     let mention_addrs: Option<Vec<crate::owner_state_types::OwnerAddr>> = match mentions {
         Some(list) => {
+            // ZEB-534: cap the count BEFORE allocating/decoding so an
+            // oversized IPC payload is rejected without burning memory/CPU
+            // (the engine's publish() would reject it later anyway).
+            if list.len() > crate::community_channel_log::MAX_MENTIONS {
+                return Err(format!(
+                    "too many mentions: {} (max {})",
+                    list.len(),
+                    crate::community_channel_log::MAX_MENTIONS
+                ));
+            }
             let mut out = Vec::with_capacity(list.len());
             for s in list {
                 if s.len() != 32 {
@@ -48348,6 +48358,25 @@ mod channel_message_ipc_tests {
         .await
         .expect_err("short mention must error");
         assert!(err.contains("each mention must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_too_many_mentions() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let too_many: Vec<String> =
+            vec!["00".repeat(16); crate::community_channel_log::MAX_MENTIONS + 1];
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            Some(too_many),
+        )
+        .await
+        .expect_err("over-cap mentions must error at the IPC boundary");
+        assert!(err.contains("too many mentions"), "got: {err}");
     }
 
     #[tokio::test]

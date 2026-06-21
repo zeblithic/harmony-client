@@ -123,7 +123,10 @@ export class ChannelMessageService {
       channelId,
       body: bodyBytes,
       replyTo,
-      mentions,
+      // Send an empty mention list as undefined so the backend never emits
+      // a `mn: []` (which would change the signed bytes vs. a mention-less
+      // post). The backend also normalizes this defensively.
+      mentions: mentions && mentions.length > 0 ? mentions : undefined,
     }) as string;
     return messageId;
   }

@@ -79,6 +79,19 @@ describe('ChannelMessageService', () => {
     });
   });
 
+  it('postMessage sends empty mentions as undefined', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('mid');
+    await service.postMessage('aa'.repeat(16), 'bb'.repeat(16), 'hi', undefined, []);
+    expect(adapter.invoke).toHaveBeenCalledWith('post_channel_message', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      body: Array.from(new TextEncoder().encode('hi')),
+      replyTo: undefined,
+      mentions: undefined,
+    });
+  });
+
   it('listMessages invokes list_channel_messages with limit + optional since', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue([]);
