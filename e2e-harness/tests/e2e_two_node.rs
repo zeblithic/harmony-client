@@ -1944,20 +1944,20 @@ async fn s7_butler_deposit_recover() {
 // (ZEB-529 / ZEB-528).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Decode a `ChannelMessageDto.body` into bytes. serde serializes the DTO's
-/// `body: Vec<u8>` as a JSON ARRAY of byte numbers (NO hex wrapper — unlike the
-/// DM `dm-received` payload, which IS hex). Matching it as hex would silently
-/// never match → the poll/await would always time out and masquerade as a
-/// delivery failure (the ZEB-462 class of bug).
-fn channel_msg_body_bytes(msg: &serde_json::Value) -> Vec<u8> {
-    msg.get("body")
-        .and_then(|b| b.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|n| n.as_u64().map(|v| v as u8))
-                .collect()
-        })
-        .unwrap_or_default()
+/// Strictly decode a `ChannelMessageDto.body` into bytes. serde serializes the
+/// DTO's `body: Vec<u8>` as a JSON ARRAY of byte numbers (NO hex wrapper —
+/// unlike the DM `dm-received` payload, which IS hex), so matching it as hex
+/// would silently never match. Returns `None` on a missing/non-array body or any
+/// element that isn't an integer in `0..=255` — strict rather than
+/// coercing/truncating, so a schema regression can't false-match in a
+/// hard-assert (Qodo). Mirrors the driver's strict-schema convention
+/// (`channels_contains` / `get_relay_held`).
+fn channel_msg_body_bytes(msg: &serde_json::Value) -> Option<Vec<u8>> {
+    msg.get("body")?
+        .as_array()?
+        .iter()
+        .map(|n| n.as_u64().filter(|v| *v <= u8::MAX as u64).map(|v| v as u8))
+        .collect()
 }
 
 /// True iff `node`'s view of `(community, channel)` contains a message whose
@@ -1973,7 +1973,7 @@ async fn channel_has_message_from(
     let msgs = e2e_harness::driver::list_channel_messages(node, community_id, channel_id).await?;
     Ok(msgs.iter().any(|m| {
         m.get("author").and_then(|a| a.as_str()) == Some(author_owner)
-            && channel_msg_body_bytes(m) == want_body
+            && channel_msg_body_bytes(m).as_deref() == Some(want_body)
     }))
 }
 
@@ -2057,7 +2057,7 @@ async fn s8_channel_multi_member_message_exchange() {
                 .get("message")
                 .map(|m| {
                     m.get("author").and_then(|a| a.as_str()) == Some(alice_owner.as_str())
-                        && channel_msg_body_bytes(m) == alice_body
+                        && channel_msg_body_bytes(m).as_deref() == Some(alice_body)
                 })
                 .unwrap_or(false)
     })
@@ -2071,7 +2071,7 @@ async fn s8_channel_multi_member_message_exchange() {
                 .get("message")
                 .map(|m| {
                     m.get("author").and_then(|a| a.as_str()) == Some(bob_owner.as_str())
-                        && channel_msg_body_bytes(m) == bob_body
+                        && channel_msg_body_bytes(m).as_deref() == Some(bob_body)
                 })
                 .unwrap_or(false)
     })
