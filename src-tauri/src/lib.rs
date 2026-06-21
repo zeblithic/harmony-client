@@ -27241,6 +27241,7 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
                         author,
                         at,
                         body,
+                        mentions,
                         reply_to,
                         community_id: ev_community_id,
                         channel_id: ev_channel_id,
@@ -27261,6 +27262,9 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
                             },
                             body: body_bytes,
                             reply_to: reply_to.map(|m| hex::encode(m.0)),
+                            mentions: mentions
+                                .as_ref()
+                                .map(|v| v.iter().map(|a| hex::encode(a.0)).collect()),
                             kind,
                             poll_id,
                         })

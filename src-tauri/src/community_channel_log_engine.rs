@@ -146,6 +146,13 @@ pub struct ChannelMessageDto {
     /// of the poll-body convention).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_id: Option<String>,
+    /// ZEB-534: owner-ids (lowercase hex) this message addresses. Omitted
+    /// when the post carries no mentions so existing consumers never see
+    /// `mentions: null`. Recipients derive "mentions me" as
+    /// `self_owner_hex ∈ mentions`. `ChannelMessageReceivedPayload` carries
+    /// the full DTO, so this rides the live event automatically.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mentions: Option<Vec<String>>,
 }
 
 /// Magic-byte prefix for ZEB-291 Phase 1.5 poll-message bodies. Chosen
@@ -818,6 +825,7 @@ impl ChannelLogEngine {
             author,
             at,
             body,
+            mentions,
             reply_to,
             ..
         } = event;
@@ -836,6 +844,9 @@ impl ChannelLogEngine {
             },
             body: body_bytes,
             reply_to: reply_to.map(|m| hex::encode(m.0)),
+            mentions: mentions
+                .as_ref()
+                .map(|v| v.iter().map(|a| hex::encode(a.0)).collect()),
             kind,
             poll_id,
         }
@@ -2404,6 +2415,55 @@ mod tests {
         assert_eq!(dto.at.device_id, "device-x");
         assert_eq!(dto.body, b"hello".to_vec());
         assert!(dto.reply_to.is_none());
+    }
+
+    #[tokio::test]
+    async fn event_to_dto_projects_mentions_as_hex() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let m0 = OwnerAddr([0xb2; 16]);
+        let m1 = OwnerAddr([0xc3; 16]);
+        let id = {
+            use rand::RngCore;
+            let mut b = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut b);
+            MessageId(b)
+        };
+        let payload = ChannelPostPayload {
+            id,
+            community_id: fix.community_id,
+            channel_id: fix.channel_id,
+            author: fix.self_owner,
+            at: Hlc {
+                wall_ms: 5_000,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            content_kind: 0,
+            body: "hi @bob",
+            reply_to: None,
+            mentions: Some(vec![m0, m1]),
+        };
+        let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
+        let dto = fix.engine.event_to_dto(&ev);
+        assert_eq!(
+            dto.mentions,
+            Some(vec![hex::encode(m0.0), hex::encode(m1.0)])
+        );
+
+        // Mention-less event omits the field.
+        let ev_none = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            Hlc {
+                wall_ms: 5_001,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            "no mentions",
+            &fix.signing_key,
+        );
+        assert!(fix.engine.event_to_dto(&ev_none).mentions.is_none());
     }
 
     #[tokio::test]
