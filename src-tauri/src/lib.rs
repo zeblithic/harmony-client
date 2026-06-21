@@ -20012,7 +20012,7 @@ pub(crate) async fn post_channel_message_impl(
         .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
 
     let msg_id = engine
-        .publish(body, reply_to_msg_id)
+        .publish(body, reply_to_msg_id, None)
         .await
         .map_err(|e| e.to_string())?;
     Ok(hex::encode(msg_id.0))
@@ -32553,7 +32553,7 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
                     Vec::with_capacity(crate::community_channel_log_engine::POLL_BODY_LEN);
                 body.push(crate::community_channel_log_engine::POLL_BODY_MAGIC);
                 body.extend_from_slice(poll_id_hex.as_bytes());
-                if let Err(e) = engine.publish(body, None).await {
+                if let Err(e) = engine.publish(body, None, None).await {
                     tracing::warn!(
                         error = %e,
                         community_id = %hex::encode(space_id.0),
@@ -33188,7 +33188,7 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
                     Vec::with_capacity(crate::community_channel_log_engine::POLL_BODY_LEN);
                 body.push(crate::community_channel_log_engine::POLL_BODY_MAGIC);
                 body.extend_from_slice(poll_id_hex.as_bytes());
-                if let Err(e) = engine.publish(body, None).await {
+                if let Err(e) = engine.publish(body, None, None).await {
                     tracing::warn!(
                         error = %e,
                         community_id = %hex::encode(space_id.0),

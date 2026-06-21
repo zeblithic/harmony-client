@@ -58,6 +58,9 @@ pub enum ChannelLogEngineError {
     #[error("body too large: {len} bytes (max {max})")]
     BodyTooLarge { len: usize, max: usize },
 
+    #[error("too many mentions: {count} (max {max})")]
+    TooManyMentions { count: usize, max: usize },
+
     #[error("limit too large: {limit} (max {max})")]
     LimitTooLarge { limit: u32, max: u32 },
 
@@ -331,6 +334,11 @@ pub struct ChannelLogEngineParams {
 /// 64 KiB"; this is the active value Phase 4 will surface in the IPC
 /// error mapping.
 const MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// ZEB-534: hard cap on mentions per channel post. Bounds the signed-set
+/// size and each recipient's "mentions me" scan. Membership-gating of the
+/// targets is out of scope for v1.
+const MAX_MENTIONS: usize = 64;
 
 pub struct ChannelLogEngine {
     community_id: SpaceId,
@@ -614,12 +622,21 @@ impl ChannelLogEngine {
         self: &Arc<Self>,
         body: Vec<u8>,
         reply_to: Option<MessageId>,
+        mentions: Option<Vec<OwnerAddr>>,
     ) -> Result<MessageId, ChannelLogEngineError> {
         if body.len() > MAX_BODY_BYTES {
             return Err(ChannelLogEngineError::BodyTooLarge {
                 len: body.len(),
                 max: MAX_BODY_BYTES,
             });
+        }
+        if let Some(m) = &mentions {
+            if m.len() > MAX_MENTIONS {
+                return Err(ChannelLogEngineError::TooManyMentions {
+                    count: m.len(),
+                    max: MAX_MENTIONS,
+                });
+            }
         }
 
         // Phase 2 stores body as String inside SignedChannelEvent::Post
@@ -659,7 +676,7 @@ impl ChannelLogEngine {
             content_kind: 0,
             body: &body_str,
             reply_to,
-            mentions: None,
+            mentions,
         };
         let event = sign_channel_event(&payload, &self.signing_key)
             .map_err(ChannelLogEngineError::ChannelEvent)?;
@@ -2571,7 +2588,7 @@ mod tests {
 
         let body = b"hello channel".to_vec();
         let msg_id = Arc::clone(&fix.engine)
-            .publish(body.clone(), None)
+            .publish(body.clone(), None, None)
             .await
             .expect("publish");
 
@@ -2603,7 +2620,7 @@ mod tests {
 
         let body = b"emit-test-body".to_vec();
         let msg_id = Arc::clone(&fix.engine)
-            .publish(body.clone(), None)
+            .publish(body.clone(), None, None)
             .await
             .expect("publish");
 
@@ -2654,10 +2671,28 @@ mod tests {
         let fix = build_engine_fixture(8, 250, 1000).await;
         let body = vec![0u8; MAX_BODY_BYTES + 1];
         let err = Arc::clone(&fix.engine)
-            .publish(body, None)
+            .publish(body, None, None)
             .await
             .expect_err("oversized body must reject");
         assert!(matches!(err, ChannelLogEngineError::BodyTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_too_many_mentions() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let too_many: Vec<OwnerAddr> = (0..=MAX_MENTIONS)
+            .map(|i| OwnerAddr([i as u8; 16]))
+            .collect();
+        assert_eq!(too_many.len(), MAX_MENTIONS + 1);
+        let err = Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, Some(too_many))
+            .await
+            .expect_err("over-cap mentions must reject");
+        assert!(
+            matches!(err, ChannelLogEngineError::TooManyMentions { count, max }
+                if count == MAX_MENTIONS + 1 && max == MAX_MENTIONS),
+            "got: {err:?}"
+        );
     }
 
     // ── Sub-task 2C: receive loop ─────────────────────────────────────
@@ -2810,7 +2845,7 @@ mod tests {
         fix.engine.closing.store(true, Ordering::SeqCst);
 
         let err = Arc::clone(&fix.engine)
-            .publish(b"arrives-during-shutdown".to_vec(), None)
+            .publish(b"arrives-during-shutdown".to_vec(), None, None)
             .await
             .expect_err("publish on a closing engine must error");
         assert!(
@@ -3556,7 +3591,7 @@ mod tests {
         // Write one post so the log has a watermark, then stop (which
         // flushes the tail durably) and respawn — the reconnect path.
         engine
-            .publish(b"hello".to_vec(), None)
+            .publish(b"hello".to_vec(), None, None)
             .await
             .expect("publish");
         let expected = engine.log_max_hlc().await;
