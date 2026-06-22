@@ -74,6 +74,10 @@ pub enum ChannelLogEngineError {
     /// post did not land rather than silently losing it.
     #[error("channel engine is shutting down; publish not persisted")]
     EngineShuttingDown,
+
+    /// ZEB-536: emoji string exceeded the per-reaction byte cap.
+    #[error("reaction emoji too large: {len} bytes (max {max})")]
+    ReactionEmojiTooLarge { len: usize, max: usize },
 }
 
 // ── Transaction primitives (ZEB-271) ─────────────────────────────────────────
@@ -146,6 +150,9 @@ pub struct ChannelMessageDto {
     /// of the poll-body convention).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_id: Option<String>,
+    /// ZEB-536: materialized reactions on this message (empty when none).
+    #[serde(default)]
+    pub reactions: Vec<crate::community_channel_log::ReactionDto>,
 }
 
 /// Magic-byte prefix for ZEB-291 Phase 1.5 poll-message bodies. Chosen
@@ -202,6 +209,20 @@ pub struct ChannelBackfillProgressPayload {
     pub fetched: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_estimate: Option<u32>,
+}
+
+/// ZEB-536: emitted as `channel-reaction-received` when a React event
+/// lands (local or inbound).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelReactionReceivedPayload {
+    pub community_id: String,
+    pub channel_id: String,
+    pub message_id: String,
+    pub reactor: String,
+    pub emoji: String,
+    pub add: bool,
+    pub at: HlcDto,
 }
 
 // ── Config + params ─────────────────────────────────────────────────────────
@@ -793,6 +814,123 @@ impl ChannelLogEngine {
         crate::node_event_sink::emit_ser(&*self.sink, "channel-message-received", &payload);
     }
 
+    /// ZEB-536: react/un-react to a prior message. Mirrors `publish`:
+    /// reserve HLC → sign → encrypt → record (loopback dedup) → append
+    /// (updates the reaction index under the log lock) → broadcast →
+    /// emit. `add=false` un-reacts.
+    pub async fn react(
+        self: &Arc<Self>,
+        target: crate::community_channel_log::MessageId,
+        emoji: String,
+        add: bool,
+    ) -> Result<(), ChannelLogEngineError> {
+        if emoji.len() > crate::community_channel_log::MAX_REACTION_EMOJI_BYTES {
+            return Err(ChannelLogEngineError::ReactionEmojiTooLarge {
+                len: emoji.len(),
+                max: crate::community_channel_log::MAX_REACTION_EMOJI_BYTES,
+            });
+        }
+        let wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+            &self.hlc_tracker,
+            &self.self_device_id,
+            wall_now_ms,
+        )
+        .await;
+        let payload = crate::community_channel_log::ChannelReactPayload {
+            target,
+            community_id: self.community_id,
+            channel_id: self.channel_id,
+            author: self.self_owner,
+            at: hlc,
+            emoji,
+            add,
+        };
+        let event = crate::community_channel_log::sign_channel_react(&payload, &self.signing_key)
+            .map_err(ChannelLogEngineError::ChannelEvent)?;
+        let packet = encrypt_channel_packet(&self.channel_key, &event)
+            .map_err(ChannelLogEngineError::ChannelEvent)?;
+        {
+            let mut tracker = self.replay_tracker.lock().await;
+            tracker.record(&event);
+        }
+        {
+            let mut log = self.log.lock().await;
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(ChannelLogEngineError::EngineShuttingDown);
+            }
+            log.append(event.clone())
+                .map_err(ChannelLogEngineError::Persist)?;
+        }
+        if let Err(e) = self.publisher_tx.try_send(packet) {
+            tracing::warn!(
+                community_id = ?self.community_id,
+                channel_id = ?self.channel_id,
+                err = ?e,
+                "publisher_tx full or closed; reaction broadcast skipped"
+            );
+        }
+        self.flush_dirty.notify_one();
+        self.emit_reaction_received(&event);
+        Ok(())
+    }
+
+    fn emit_reaction_received(&self, event: &SignedChannelEvent) {
+        let SignedChannelEvent::React {
+            target,
+            author,
+            at,
+            emoji,
+            add,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let payload = ChannelReactionReceivedPayload {
+            community_id: hex::encode(self.community_id.0),
+            channel_id: hex::encode(self.channel_id.0),
+            message_id: hex::encode(target.0),
+            reactor: hex::encode(author.0),
+            emoji: emoji.clone(),
+            add: *add,
+            at: HlcDto {
+                wall_ms: at.wall_ms,
+                logical: at.logical,
+                device_id: at.device_id.clone(),
+            },
+        };
+        crate::node_event_sink::emit_ser(&*self.sink, "channel-reaction-received", &payload);
+    }
+
+    /// ZEB-536 IPC read path: messages (Post only) with reactions folded
+    /// in. Reuses `list_messages` for paging, then attaches the
+    /// materialized reaction view under one log lock. Note: `limit`
+    /// bounds events scanned, so a page dense with reactions may return
+    /// fewer than `limit` messages — acceptable for v1 (clients page via
+    /// `since`).
+    pub async fn list_message_dtos(
+        &self,
+        since: Option<Hlc>,
+        limit: usize,
+    ) -> Result<Vec<ChannelMessageDto>, ChannelLogEngineError> {
+        let events = self.list_messages(since, limit).await?;
+        let log = self.log.lock().await;
+        let mut out = Vec::with_capacity(events.len());
+        for ev in &events {
+            if !matches!(ev, SignedChannelEvent::Post { .. }) {
+                continue;
+            }
+            let mut dto = self.message_dto_for_event(ev);
+            dto.reactions = log.reactions_for(ev.id(), &self.self_owner);
+            out.push(dto);
+        }
+        Ok(out)
+    }
+
     /// Public accessor: project a `SignedChannelEvent` to the IPC
     /// `ChannelMessageDto` shape using the engine's `(community_id,
     /// channel_id)` context. The IPC layer (`list_channel_messages`)
@@ -838,6 +976,7 @@ impl ChannelLogEngine {
             reply_to: reply_to.map(|m| hex::encode(m.0)),
             kind,
             poll_id,
+            reactions: Vec::new(),
         }
     }
 
@@ -997,7 +1136,10 @@ impl ChannelLogEngine {
         }
 
         // 4. Emit + notify flush.
-        self.emit_message_received(&event);
+        match &event {
+            SignedChannelEvent::React { .. } => self.emit_reaction_received(&event),
+            _ => self.emit_message_received(&event),
+        }
         self.flush_dirty.notify_one();
     }
 
@@ -4527,5 +4669,267 @@ mod tests {
 
         fix.registry.stop(&community_id, &channels[0]).await.ok();
         fix.registry.stop(&community_id, &channels[2]).await.ok();
+    }
+
+    // ── ZEB-536 Task 4: react() + list_message_dtos ───────────────────
+
+    /// TDD RED → GREEN: react updates the reaction index and the index
+    /// is visible via `list_message_dtos`. Un-react converges to empty.
+    #[tokio::test]
+    async fn react_updates_index_and_lists_in_dto() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let msg_id = Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None)
+            .await
+            .expect("post");
+        Arc::clone(&fix.engine)
+            .react(msg_id, "👍".to_string(), true)
+            .await
+            .expect("react");
+        let dtos = fix
+            .engine
+            .list_message_dtos(None, 100)
+            .await
+            .expect("list dtos");
+        let m = dtos
+            .iter()
+            .find(|d| d.message_id == hex::encode(msg_id.0))
+            .unwrap();
+        assert_eq!(
+            m.reactions.iter().find(|r| r.emoji == "👍").unwrap().count,
+            1
+        );
+        assert!(m.reactions.iter().find(|r| r.emoji == "👍").unwrap().mine);
+
+        // un-react converges to empty
+        Arc::clone(&fix.engine)
+            .react(msg_id, "👍".to_string(), false)
+            .await
+            .expect("unreact");
+        let dtos2 = fix
+            .engine
+            .list_message_dtos(None, 100)
+            .await
+            .expect("list dtos");
+        let m2 = dtos2
+            .iter()
+            .find(|d| d.message_id == hex::encode(msg_id.0))
+            .unwrap();
+        assert!(m2.reactions.iter().all(|r| r.emoji != "👍"));
+    }
+
+    /// ZEB-536 two-node convergence: Engine A posts; Engine A react()s and
+    /// broadcasts the packet; feeding the packet into Engine B's
+    /// process_inbound_packet produces channel-reaction-received on B and
+    /// B's list_message_dtos shows the same reaction.  Un-react also
+    /// converges on both.
+    ///
+    /// Two-node approach used: both engines share the same
+    /// (community_id, channel_id, channel_key, identity) because
+    /// AlwaysJoinedState validates a single owner; the signed React packet
+    /// from A is captured from A's publisher_rx and fed directly into B's
+    /// process_inbound_packet. This avoids the Zenoh transport layer and
+    /// tests the convergence logic in isolation — the same approach used
+    /// by receive_well_formed_packet_appends_and_emits.
+    #[tokio::test]
+    async fn two_node_react_converges() {
+        // Build two independent engines on the same (community, channel, key,
+        // identity) — A posts + reacts, B receives the React packet.
+        let mut fix_a = build_engine_fixture(8, 250, 1000).await;
+        // Engine B: same community/channel/key/identity but separate dirs,
+        // channels, and sinks.
+        let tmp_b = tempfile::TempDir::new().expect("tempdir b");
+        let state_b = Arc::new(AlwaysJoinedState {
+            channel_id: fix_a.channel_id,
+            owner: fix_a.self_owner,
+            enrolled_key: fix_a.signing_key.verifying_key().to_bytes(),
+        });
+        let hlc_tracker_b: Arc<Mutex<BTreeMap<String, Hlc>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let (publisher_tx_b, _publisher_rx_b) = mpsc::channel(64);
+        let (subscriber_tx_b, subscriber_rx_b) = mpsc::channel(64);
+        let (query_tx_b, _query_rx_b) = mpsc::channel(8);
+        let (rec_b, sink_b) = recording_sink_pair();
+        let params_b = ChannelLogEngineParams {
+            community_id: fix_a.community_id,
+            channel_id: fix_a.channel_id,
+            channel_key: Arc::clone(&fix_a.channel_key),
+            root_dir: tmp_b.path().to_path_buf(),
+            state_at_hlc: state_b,
+            self_owner: fix_a.self_owner,
+            self_device_id: "device-b".to_string(),
+            signing_key: Arc::clone(&fix_a.signing_key),
+            hlc_tracker: hlc_tracker_b,
+            sink: sink_b,
+            config: ChannelLogEngineConfig {
+                log_config: ChannelLogConfig {
+                    seal_threshold_events: 8,
+                },
+                flush_debounce_ms: 250,
+                max_dirty_ms: 1000,
+                ..Default::default()
+            },
+            publisher_tx: publisher_tx_b,
+            subscriber_rx: subscriber_rx_b,
+            query_request_tx: query_tx_b,
+        };
+        // B needs to see the Post event too — first feed A's Post packet to B.
+        let engine_b = ChannelLogEngine::new(params_b).await.expect("engine b");
+
+        // A: publish a message.
+        let msg_id = Arc::clone(&fix_a.engine)
+            .publish(b"hello from A".to_vec(), None)
+            .await
+            .expect("A publish");
+
+        // Capture the Post packet from A's publisher and feed it into B.
+        let post_packet = fix_a.publisher_rx.try_recv().expect("post packet from A");
+        subscriber_tx_b
+            .send(post_packet)
+            .await
+            .expect("feed Post to B");
+
+        // Wait for B to ingest the Post.
+        wait_for(
+            || async {
+                let v = engine_b.list_messages(None, 100).await.unwrap();
+                if !v.is_empty() {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("B must see the Post");
+
+        // A: react to the message.
+        Arc::clone(&fix_a.engine)
+            .react(msg_id, "👍".to_string(), true)
+            .await
+            .expect("A react");
+
+        // Assert A sees the reaction in list_message_dtos.
+        let dtos_a = fix_a
+            .engine
+            .list_message_dtos(None, 100)
+            .await
+            .expect("A list dtos");
+        let m_a = dtos_a
+            .iter()
+            .find(|d| d.message_id == hex::encode(msg_id.0))
+            .unwrap();
+        assert_eq!(
+            m_a.reactions
+                .iter()
+                .find(|r| r.emoji == "👍")
+                .unwrap()
+                .count,
+            1,
+            "A must see count=1 after react"
+        );
+        assert!(
+            m_a.reactions.iter().find(|r| r.emoji == "👍").unwrap().mine,
+            "A must see mine=true"
+        );
+
+        // Capture the React packet from A's publisher and feed it into B.
+        let react_packet = fix_a.publisher_rx.try_recv().expect("react packet from A");
+        subscriber_tx_b
+            .send(react_packet)
+            .await
+            .expect("feed React to B");
+
+        // Wait for B to emit channel-reaction-received.
+        let reaction_emitted = wait_for(
+            || async {
+                let frames = rec_b.frames();
+                if frames
+                    .iter()
+                    .any(|(name, _)| name == "channel-reaction-received")
+                {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            reaction_emitted.is_some(),
+            "B must emit channel-reaction-received"
+        );
+
+        // Assert B's list_message_dtos shows the reaction.
+        let dtos_b = engine_b
+            .list_message_dtos(None, 100)
+            .await
+            .expect("B list dtos");
+        let m_b = dtos_b
+            .iter()
+            .find(|d| d.message_id == hex::encode(msg_id.0))
+            .unwrap();
+        assert_eq!(
+            m_b.reactions
+                .iter()
+                .find(|r| r.emoji == "👍")
+                .unwrap()
+                .count,
+            1,
+            "B must see count=1 after receiving React"
+        );
+        // mine=true on B because B has the same self_owner as A (same identity).
+        assert!(
+            m_b.reactions.iter().find(|r| r.emoji == "👍").unwrap().mine,
+            "B must see mine=true (same identity)"
+        );
+
+        // Un-react: A sends add=false; both nodes converge to no 👍.
+        Arc::clone(&fix_a.engine)
+            .react(msg_id, "👍".to_string(), false)
+            .await
+            .expect("A unreact");
+        let unreact_packet = fix_a
+            .publisher_rx
+            .try_recv()
+            .expect("unreact packet from A");
+        subscriber_tx_b
+            .send(unreact_packet)
+            .await
+            .expect("feed unreact to B");
+
+        // Wait for B to process the un-react.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // A converges to no 👍.
+        let dtos_a2 = fix_a
+            .engine
+            .list_message_dtos(None, 100)
+            .await
+            .expect("A list dtos 2");
+        let m_a2 = dtos_a2
+            .iter()
+            .find(|d| d.message_id == hex::encode(msg_id.0))
+            .unwrap();
+        assert!(
+            m_a2.reactions.iter().all(|r| r.emoji != "👍"),
+            "A must see no 👍 after unreact"
+        );
+
+        // B converges to no 👍.
+        let dtos_b2 = engine_b
+            .list_message_dtos(None, 100)
+            .await
+            .expect("B list dtos 2");
+        let m_b2 = dtos_b2
+            .iter()
+            .find(|d| d.message_id == hex::encode(msg_id.0))
+            .unwrap();
+        assert!(
+            m_b2.reactions.iter().all(|r| r.emoji != "👍"),
+            "B must see no 👍 after receiving unreact"
+        );
     }
 }

@@ -27263,6 +27263,8 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
                             reply_to: reply_to.map(|m| hex::encode(m.0)),
                             kind,
                             poll_id,
+                            // ZEB-538: pre-fork snapshots are reaction-free for v1.
+                            reactions: Vec::new(),
                         })
                     }
                     _ => None,
