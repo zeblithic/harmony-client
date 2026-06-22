@@ -20075,6 +20075,30 @@ async fn download_channel_artifact(
     .await
 }
 
+/// ZEB-539: Tauri IPC — ingest a local file as a channel artifact.
+/// Thin delegate to [`ingest_channel_artifact_impl`]; see that fn for the
+/// stat/cap, name/mime resolution, encrypt-in-memory, and serve-allowlist
+/// contract. `encrypt` defaults to `true` when the caller omits it.
+#[tauri::command]
+async fn ingest_channel_artifact(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    source_path: String,
+    name: Option<String>,
+    mime: Option<String>,
+    encrypt: Option<bool>,
+) -> Result<crate::community_channel_log_engine::ChannelAttachmentDto, String> {
+    ingest_channel_artifact_impl(
+        state_lock.inner(),
+        community_id,
+        source_path,
+        name,
+        mime,
+        encrypt.unwrap_or(true),
+    )
+    .await
+}
+
 /// ZEB-445: shared IPC/RPC seam.
 pub(crate) async fn post_channel_message_impl(
     state: &std::sync::Mutex<NodeState>,
@@ -20279,9 +20303,7 @@ async fn current_epoch_key_for(
 /// the whole file in memory — intentional for v1; the cap bounds the cost.
 ///
 /// PR1: backend impl wired to the Tauri IPC in PR2 (Task 9); exercised
-/// end-to-end by the Task 7 two-node integration test. Allow dead_code until
-/// the IPC caller lands.
-#[allow(dead_code)]
+/// end-to-end by the Task 7 two-node integration test.
 pub(crate) async fn ingest_channel_artifact_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
@@ -46696,6 +46718,7 @@ pub fn run() {
             list_channel_messages,
             post_channel_message,
             download_channel_artifact,
+            ingest_channel_artifact,
             request_channel_backfill,
             list_libraries,
             list_discovered_libraries,
@@ -49508,6 +49531,47 @@ mod channel_message_ipc_tests {
         .await
         .expect_err("missing registry must error");
         assert!(err.contains("channel_log_registry missing"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn ingest_channel_artifact_rejects_short_community_id() {
+        // A short community_id is rejected by the very first validation in the
+        // impl — before any filesystem stat or engine dependency is touched.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = ingest_channel_artifact(
+            state,
+            "deadbeef".into(),
+            "/tmp/does-not-matter.bin".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("short community_id must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn ingest_channel_artifact_rejects_missing_source_file() {
+        // Well-formed community_id, but the source file does not exist, so the
+        // stat fails. `encrypt: None` exercises the command boundary's
+        // `unwrap_or(true)` default on the way to the impl.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.bin");
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = ingest_channel_artifact(
+            state,
+            "00".repeat(16),
+            missing.to_string_lossy().into_owned(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing source file must error");
+        assert!(err.contains("stat:"), "got: {err}");
     }
 
     #[tokio::test]
