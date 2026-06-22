@@ -6,6 +6,14 @@ import type { TauriAdapter } from '../../zenoh-service';
 import { VotingAdapter } from '../../voting-adapter';
 import type { PollMeta } from '../../types/voting';
 
+// vi.mock is hoisted; vi.hoisted makes the spies available at factory-call
+// time (repo pattern — see WelcomeModal.test.ts).
+const { openMock, saveMock } = vi.hoisted(() => ({ openMock: vi.fn(), saveMock: vi.fn() }));
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+  open: openMock,
+  save: saveMock,
+}));
+
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
   const listeners = new Map<string, Function>();
   return {
@@ -493,5 +501,157 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
     // …but the identity drill-down popover gets the signed card name.
     expect(onOpenCard).toHaveBeenCalled();
     expect(onOpenCard.mock.calls[0][0].displayName).toBe('ZEBbot');
+  });
+
+  it('renders MessageAttachments for a message carrying attachments', async () => {
+    const { adapter, container } = await setup();
+    const handler = adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'cc'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('see attached')),
+          attachments: [{ cid: 'k1', mime: 'text/plain', name: 'ci.log', size: 1234, encrypted: true }],
+        },
+      },
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.attachment-chip')).not.toBeNull();
+      expect(container.textContent).toContain('ci.log');
+    });
+  });
+
+  function withIngest(adapter: any, opts: { reject?: Error } = {}) {
+    let n = 0;
+    (adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'request_channel_backfill') return Promise.resolve(undefined);
+      if (cmd === 'ingest_channel_artifact') {
+        if (opts.reject) return Promise.reject(opts.reject);
+        return Promise.resolve({ cid: 'cid' + n++, mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true });
+      }
+      if (cmd === 'post_channel_message') return Promise.resolve('mid' + 'a'.repeat(29));
+      return Promise.resolve(undefined);
+    });
+  }
+
+  it('attach button ingests picked files into pending chips', async () => {
+    openMock.mockResolvedValue(['/tmp/a.txt', '/tmp/b.txt']);
+    const { adapter, container } = await setup();
+    withIngest(adapter);
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => {
+      expect(adapter.invoke).toHaveBeenCalledWith('ingest_channel_artifact', expect.objectContaining({ sourcePath: '/tmp/a.txt' }));
+      expect(container.querySelectorAll('.pending-chip').length).toBe(2);
+    });
+  });
+
+  it('dedupes a pending attachment with a duplicate cid', async () => {
+    openMock.mockResolvedValue(['/tmp/a.txt', '/tmp/a.txt']);
+    const { adapter, container } = await setup();
+    (adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'request_channel_backfill') return Promise.resolve(undefined);
+      if (cmd === 'ingest_channel_artifact')
+        return Promise.resolve({ cid: 'samecid', mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true });
+      if (cmd === 'post_channel_message') return Promise.resolve('mid' + 'a'.repeat(29));
+      return Promise.resolve(undefined);
+    });
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
+  });
+
+  it('removing a pending attachment drops its chip', async () => {
+    openMock.mockResolvedValue('/tmp/a.txt');
+    const { adapter, container } = await setup();
+    withIngest(adapter);
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
+    await fireEvent.click(container.querySelector('.pending-remove')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(0));
+  });
+
+  it('send includes pendingAttachments and clears them', async () => {
+    openMock.mockResolvedValue('/tmp/a.txt');
+    const { adapter, container } = await setup();
+    withIngest(adapter);
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
+    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: 'here it is' } });
+    await fireEvent.keyDown(textarea, { key: 'Enter' });
+    await waitFor(() => {
+      expect(adapter.invoke).toHaveBeenCalledWith('post_channel_message', expect.objectContaining({
+        body: Array.from(new TextEncoder().encode('here it is')),
+        attachments: [{ cid: 'cid0', mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true }],
+      }));
+    });
+    expect(container.querySelectorAll('.pending-chip').length).toBe(0);
+  });
+
+  it('allows sending with empty body when an attachment is pending', async () => {
+    openMock.mockResolvedValue('/tmp/a.txt');
+    const { adapter, container } = await setup();
+    withIngest(adapter);
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
+    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
+    await fireEvent.keyDown(textarea, { key: 'Enter' });
+    await waitFor(() => {
+      expect(adapter.invoke).toHaveBeenCalledWith('post_channel_message', expect.objectContaining({
+        body: [],
+        attachments: [{ cid: 'cid0', mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true }],
+      }));
+    });
+  });
+
+  it('surfaces an ingest error on the compose error line', async () => {
+    openMock.mockResolvedValue('/tmp/a.txt');
+    const { adapter, container } = await setup();
+    withIngest(adapter, { reject: new Error('artifact too large') });
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => {
+      expect(container.querySelector('.compose-error')?.textContent).toContain('artifact too large');
+      expect(container.querySelectorAll('.pending-chip').length).toBe(0);
+    });
+  });
+
+  it('clears pending attachments when the channel changes', async () => {
+    openMock.mockResolvedValue('/tmp/a.txt');
+    const { adapter, container, props, rerender } = await setup();
+    (adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'request_channel_backfill') return Promise.resolve(undefined);
+      if (cmd === 'ingest_channel_artifact')
+        return Promise.resolve({ cid: 'c0', mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true });
+      if (cmd === 'post_channel_message') return Promise.resolve('mid' + 'a'.repeat(29));
+      return Promise.resolve(undefined);
+    });
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
+    // Re-render the SAME instance with a changed channelId; the switch $effect
+    // resets pendingAttachments so the chip must disappear.
+    await rerender({ ...props, channelId: 'dd'.repeat(16) });
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(0));
+  });
+
+  it('does not open a second file picker while one attach is in flight', async () => {
+    let resolveOpen: (v: unknown) => void = () => {};
+    // Reset call history so the count below measures only this test's clicks
+    // (openMock is module-scoped and exercised by other tests in this suite).
+    openMock.mockReset();
+    openMock.mockImplementation(() => new Promise((r) => { resolveOpen = r; }));
+    const { container } = await setup();
+    const btn = container.querySelector('.attach-btn')!;
+    await fireEvent.click(btn);
+    await fireEvent.click(btn);
+    expect(openMock).toHaveBeenCalledTimes(1);
+    resolveOpen(null); // let the first flow finish/cancel cleanly
   });
 });

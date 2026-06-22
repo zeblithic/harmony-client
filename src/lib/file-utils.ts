@@ -33,6 +33,19 @@ export function categoryIcon(category: ContentCategory): string {
   return CATEGORY_ICONS[category] ?? '\uD83D\uDCC4';
 }
 
+/** Map a MIME type to a category glyph. `categoryIcon` only accepts the
+ *  ContentCategory enum, so this bridges a raw mime (as carried on a
+ *  ChannelAttachmentDto) to the same icon set. Unknown mimes get the
+ *  generic document glyph. */
+export function mimeCategoryIcon(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m.startsWith('image/')) return CATEGORY_ICONS.image;
+  if (m.startsWith('audio/')) return CATEGORY_ICONS.music;
+  if (m.startsWith('video/')) return CATEGORY_ICONS.video;
+  if (m.startsWith('text/')) return CATEGORY_ICONS.text;
+  return CATEGORY_ICONS.text;
+}
+
 export function tierTarget(tier: ReplicationTier): number {
   return TIER_TARGETS[tier];
 }

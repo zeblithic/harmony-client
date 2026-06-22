@@ -1,11 +1,14 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import type { ChannelMessageDto, HlcDto } from '../channel-message-service';
+  import type { ChannelMessageDto, HlcDto, ChannelAttachmentDto } from '../channel-message-service';
   import type { ChannelMessageService } from '../channel-message-service';
   import type { VotingAdapter } from '../voting-adapter';
   import type { PollMeta } from '../types/voting';
   import Avatar from './Avatar.svelte';
   import PollMessage from './PollMessage.svelte';
+  import MessageAttachments from './MessageAttachments.svelte';
+  import { open } from '@tauri-apps/plugin-dialog';
+  import { formatBytes, mimeCategoryIcon } from '../file-utils';
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
   import type { ResolvedCard } from '../member-card-service';
   import { nonEmpty } from '../display-label';
@@ -85,6 +88,12 @@
   let composeError = $state<string | null>(null);
   let loadError = $state<string | null>(null);
   let posting = $state(false);
+  let pendingAttachments = $state<ChannelAttachmentDto[]>([]);
+  let ingesting = $state(false);
+  // Bumped on every channel switch so stale in-flight attach work (dialog /
+  // ingest awaits) can detect it navigated away and drop its results — mirrors
+  // the `cancelled` guard the channel-switch $effect uses for listMessages.
+  let attachEpoch = 0;
 
   let scrollEl: HTMLDivElement | undefined = $state();
   let composeEl: HTMLTextAreaElement | undefined = $state();
@@ -104,6 +113,9 @@
     composeError = null;
     loadError = null;
     backfillProgress = null;
+    pendingAttachments = [];
+    ingesting = false;
+    attachEpoch += 1;
     // Phase 4 round-1 fixup: also reset scroll/backfill state to avoid
     // bleed-over between channels (Qodo PR #97 finding).
     backfillInFlight = false;
@@ -276,17 +288,70 @@
     if (e.shiftKey) return; // newline; let browser handle
     e.preventDefault();
     const text = composeText.trim();
-    if (!text || posting) return;
+    if ((!text && pendingAttachments.length === 0) || posting || ingesting) return;
     posting = true;
     composeError = null;
     try {
-      await channelMessageService.postMessage(communityId, channelId, text);
+      await channelMessageService.postMessage(
+        communityId,
+        channelId,
+        text,
+        undefined,
+        undefined,
+        pendingAttachments.length > 0 ? pendingAttachments : undefined,
+      );
       composeText = '';
+      pendingAttachments = [];
     } catch (e) {
       composeError = e instanceof Error ? e.message : String(e);
     } finally {
       posting = false;
     }
+  }
+
+  async function pickAttachments() {
+    if (ingesting || posting) return;
+    // Set the in-flight guard BEFORE awaiting the picker so rapid repeated
+    // clicks can't open multiple dialogs / start concurrent ingest loops.
+    ingesting = true;
+    composeError = null;
+    // Capture the channel generation; if the user switches channels while the
+    // dialog or an ingest is in flight, drop the stale results so they can't
+    // land in (or be posted to) the newly-selected channel.
+    const epoch = attachEpoch;
+    let selected: string | string[] | null;
+    try {
+      selected = await open({ multiple: true });
+    } catch {
+      if (epoch === attachEpoch) ingesting = false;
+      return; // dialog backend error — treat like cancel
+    }
+    if (epoch !== attachEpoch) return; // channel switched during the dialog
+    if (!selected) {
+      ingesting = false;
+      return;
+    }
+    const paths = Array.isArray(selected) ? selected : [selected];
+    try {
+      for (const path of paths) {
+        const att = await channelMessageService.ingestArtifact(communityId, path);
+        if (epoch !== attachEpoch) return; // switched mid-ingest; drop
+        // CIDs are content-addressed: the same file yields the same cid. The
+        // keyed {#each} on cid throws on duplicate keys, so skip an already-
+        // pending cid rather than add a second chip.
+        if (!pendingAttachments.some((a) => a.cid === att.cid)) {
+          pendingAttachments = [...pendingAttachments, att];
+        }
+      }
+    } catch (e) {
+      if (epoch === attachEpoch) composeError = e instanceof Error ? e.message : String(e);
+    } finally {
+      if (epoch === attachEpoch) ingesting = false;
+    }
+  }
+
+  function removePending(cid: string) {
+    pendingAttachments = pendingAttachments.filter((a) => a.cid !== cid);
   }
 
   function retryLoad() {
@@ -427,6 +492,14 @@
             {:else}
               <p class="body">{bodyToText(msg.body)}</p>
             {/if}
+            {#if msg.attachments && msg.attachments.length > 0}
+              <MessageAttachments
+                {communityId}
+                {channelId}
+                attachments={msg.attachments}
+                {channelMessageService}
+              />
+            {/if}
           </div>
         </article>
       {/if}
@@ -437,16 +510,43 @@
     {#if composeError}
       <div class="compose-error" role="alert">{composeError}</div>
     {/if}
-    <textarea
-      bind:this={composeEl}
-      bind:value={composeText}
-      onkeydown={handleCompose}
-      class="compose-input"
-      placeholder={`Message #${channelName}`}
-      rows="2"
-      aria-label="Channel message"
-      disabled={posting}
-    ></textarea>
+    {#if pendingAttachments.length > 0}
+      <div class="pending-attachments">
+        {#each pendingAttachments as att (att.cid)}
+          <div class="pending-chip">
+            <span class="att-icon" aria-hidden="true">{mimeCategoryIcon(att.mime)}</span>
+            <span class="att-name" title={att.name}>{att.name}</span>
+            <span class="att-size">{formatBytes(att.size)}</span>
+            <button
+              type="button"
+              class="pending-remove"
+              onclick={() => removePending(att.cid)}
+              aria-label={`Remove ${att.name}`}
+            >&times;</button>
+          </div>
+        {/each}
+      </div>
+    {/if}
+    <div class="compose-row">
+      <button
+        type="button"
+        class="attach-btn"
+        onclick={pickAttachments}
+        disabled={posting || ingesting}
+        aria-label="Attach file"
+        title="Attach file"
+      >{ingesting ? '…' : '📎'}</button>
+      <textarea
+        bind:this={composeEl}
+        bind:value={composeText}
+        onkeydown={handleCompose}
+        class="compose-input"
+        placeholder={`Message #${channelName}`}
+        rows="2"
+        aria-label="Channel message"
+        disabled={posting}
+      ></textarea>
+    </div>
   </div>
 </div>
 
@@ -592,4 +692,47 @@
     margin-left: 4px;
     white-space: nowrap;
   }
+  .compose-row { display: flex; align-items: flex-end; gap: 8px; }
+  .attach-btn {
+    flex: 0 0 auto;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    cursor: pointer;
+    padding: 8px 10px;
+    font-size: 1rem;
+    line-height: 1;
+  }
+  .attach-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.06); }
+  .attach-btn:disabled { opacity: 0.6; cursor: default; }
+  .pending-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .pending-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 260px;
+    padding: 4px 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    font-size: 0.75rem;
+  }
+  .pending-chip .att-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+  }
+  .pending-chip .att-size { color: var(--text-secondary); }
+  .pending-remove {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 1rem;
+    line-height: 1;
+    padding: 0 2px;
+  }
+  .pending-remove:hover { color: var(--text-primary); }
 </style>
