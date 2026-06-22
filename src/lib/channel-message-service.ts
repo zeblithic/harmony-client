@@ -28,6 +28,11 @@ export interface ChannelMessageDto {
    */
   pollId?: string;
   /**
+   * ZEB-536 — per-emoji reaction summaries. Optional: populated by the
+   * Rust IPC boundary; consumed by the reactions UI (Spec 2).
+   */
+  reactions?: { emoji: string; count: number; mine: boolean; reactors: string[] }[];
+  /**
    * ZEB-534: owner-ids (hex) this message addresses, or absent if none.
    * Recipients derive "mentions me" as `selfOwnerHex` ∈ mentions. GUI
    * render/notify is a follow-up; this field just carries the data.

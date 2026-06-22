@@ -191,6 +191,16 @@ struct IngestChannelArtifactArgs {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SetMessageReactionArgs {
+    community_id: String,
+    channel_id: String,
+    message_id: String,
+    emoji: String,
+    add: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GenerateFriendTokenArgs {
     expires_at: Option<u64>,
 }
@@ -461,6 +471,22 @@ pub fn build_registry() -> RpcRegistry {
                 a.name,
                 a.mime,
                 a.encrypt.unwrap_or(true),
+            )
+            .await
+        }
+    );
+    rpc!(
+        m,
+        "set_message_reaction",
+        SetMessageReactionArgs,
+        |state, _sink, a| async move {
+            crate::set_message_reaction_impl(
+                state,
+                a.community_id,
+                a.channel_id,
+                a.message_id,
+                a.emoji,
+                a.add,
             )
             .await
         }
@@ -970,6 +996,7 @@ mod tests {
             "list_channels",
             "list_channel_messages",
             "post_channel_message",
+            "set_message_reaction",
             // channel artifacts (CAS)
             "ingest_channel_artifact",
             "download_channel_artifact",
@@ -1022,5 +1049,34 @@ mod tests {
         ];
         expected.sort_unstable();
         assert_eq!(names, expected, "curated v1 surface drifted");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_bad_hex() {
+        // Dispatch "set_message_reaction" with a messageId that is not valid
+        // 32-char hex — must surface RpcError::Command about hex/length.
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "set_message_reaction",
+                test_state(),
+                test_sink(),
+                serde_json::json!({
+                    "communityId": "00112233445566778899aabbccddeeff",
+                    "channelId":   "00112233445566778899aabbccddeeff",
+                    "messageId":   "zz",
+                    "emoji":       "👍",
+                    "add":         true
+                }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            RpcError::Command(msg) => assert!(
+                msg.contains("message_id") || msg.contains("hex") || msg.contains("32"),
+                "expected hex/length error for message_id, got: {msg}"
+            ),
+            other => panic!("set_message_reaction bad hex: expected Command, got {other:?}"),
+        }
     }
 }

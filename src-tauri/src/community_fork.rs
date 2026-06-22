@@ -116,8 +116,7 @@ pub fn build_snapshot(
 fn event_hlc(
     event: &crate::community_channel_log::SignedChannelEvent,
 ) -> &crate::owner_state_types::Hlc {
-    let crate::community_channel_log::SignedChannelEvent::Post { at, .. } = event;
-    at
+    event.at()
 }
 
 /// Compare two HLCs: wall_ms first, then logical, then device_id
@@ -351,13 +350,26 @@ pub async fn fork_community(
             continue;
         }
         if let Some(engine) = channel_log_registry.engine(&original_id, channel_id).await {
-            // list_messages with limit 0 → uses engine's default backfill cap.
-            // We want ALL locally known events; use SNAPSHOT_TOTAL_CAP * 2 as
-            // the generous pull cap (build_snapshot will trim further).
-            let events = engine
-                .list_messages(None, SNAPSHOT_TOTAL_CAP * 2)
-                .await
-                .unwrap_or_default();
+            // ZEB-536: the pre-fork snapshot is message-only for v1. Pull Post
+            // events via the Post-only accessor, which pages by POSTS RETURNED
+            // — a long reaction run cannot exhaust the pull budget and strand
+            // later posts (CodeRabbit PR #314). Cap at SNAPSHOT_TOTAL_CAP * 2
+            // posts (build_snapshot trims further per the §4.2 policy).
+            // Best-effort snapshot: one channel's read failure must not abort
+            // the whole fork, but it must not be silent either (CodeAnt PR
+            // #314) — surface it so an incomplete snapshot is diagnosable
+            // rather than a silent history drop.
+            let events = match engine.list_post_events(None, SNAPSHOT_TOTAL_CAP * 2).await {
+                Ok(evs) => evs,
+                Err(e) => {
+                    tracing::warn!(
+                        channel_id = ?channel_id,
+                        error = %e,
+                        "fork snapshot: channel log read failed; omitting its history from the snapshot"
+                    );
+                    Vec::new()
+                }
+            };
             if !events.is_empty() {
                 raw_channel_events.insert(*channel_id, events);
             }
@@ -368,12 +380,12 @@ pub async fn fork_community(
     // Channel-log events are signed by their `author` field (OwnerAddr), which
     // may differ from membership-event actors. Without their pubkeys in
     // identity_pubs, verify_snapshot_event would return UnknownSigner on those
-    // events. Channel events (SignedChannelEvent::Post) have no countersig.
+    // events. Channel-log events (Post and React) are author-signed, not
+    // countersigned; the snapshot is Post-only by the filter above.
     // (Fix: PR #122 round-2 bot review — CodeRabbit Major.)
     for log_events in raw_channel_events.values() {
         for event in log_events {
-            let crate::community_channel_log::SignedChannelEvent::Post { author, .. } = event;
-            signer_addrs.insert(*author);
+            signer_addrs.insert(*event.author());
         }
     }
 
@@ -1012,12 +1024,8 @@ mod tests {
         );
 
         // Verify the newest 500 were kept (wall_ms 100..599, ascending).
-        let first_wall = match &retained[0] {
-            SignedChannelEvent::Post { at, .. } => at.wall_ms,
-        };
-        let last_wall = match &retained[retained.len() - 1] {
-            SignedChannelEvent::Post { at, .. } => at.wall_ms,
-        };
+        let first_wall = retained[0].at().wall_ms;
+        let last_wall = retained[retained.len() - 1].at().wall_ms;
         assert_eq!(
             first_wall, 100,
             "oldest retained event should be wall_ms=100 (newest 500 of 600)"
