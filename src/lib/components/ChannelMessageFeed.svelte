@@ -86,6 +86,9 @@
   let loadError = $state<string | null>(null);
   let posting = $state(false);
 
+  // messageId whose picker popover is open, or null. Only one at a time.
+  let pickerOpenFor = $state<string | null>(null);
+
   let scrollEl: HTMLDivElement | undefined = $state();
   let composeEl: HTMLTextAreaElement | undefined = $state();
   let unsubChannel: (() => void) | null = null;
@@ -93,6 +96,11 @@
   let scrollAtTopTimer: ReturnType<typeof setTimeout> | null = null;
   const SCROLL_TOP_DEBOUNCE_MS = 250;
   const SCROLL_TOP_THRESHOLD_PX = 50;
+
+  // ZEB-536 reaction palette (v1). The grid is a const array — trim toward
+  // quick-react-only later if it feels bloated (spec §Design).
+  const QUICK_REACTIONS = ['👍', '👎'];
+  const PICKER_EMOJI = ['👍', '👎', '✅', '❌', '👀', '🎉', '🙏', '🚀', '❤️', '😄'];
 
   // Subscribe + initial list when channelId changes.
   $effect(() => {
@@ -349,6 +357,40 @@
       .catch((e) => console.warn('reaction toggle failed', e));
   }
 
+  function togglePicker(messageId: string): void {
+    pickerOpenFor = pickerOpenFor === messageId ? null : messageId;
+  }
+
+  // ZEB-536 — picker selection is an explicit add (spec §Design), unlike the
+  // toggle semantics of chips/quick-react. Closes the popover.
+  function pickFromPicker(msg: ChannelMessageDto, emoji: string): void {
+    pickerOpenFor = null;
+    void channelMessageService
+      .reactToMessage(communityId, channelId, msg.messageId, emoji, true)
+      .catch((e) => console.warn('reaction pick failed', e));
+  }
+
+  // Close the open reaction picker on Escape or an outside click. Listeners
+  // are scoped to "a picker is open" and cleaned up on close/teardown. The
+  // click that opened the picker targets a node inside `.reaction-toolbar`,
+  // so it does not self-close.
+  $effect(() => {
+    if (pickerOpenFor === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') pickerOpenFor = null;
+    };
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!t || !t.closest('.reaction-toolbar')) pickerOpenFor = null;
+    };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('click', onDocClick);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('click', onDocClick);
+    };
+  });
+
   // ZEB-536 — comma-joined reactor labels for a chip tooltip, reusing the
   // ZEB-432 author label ladder (nickname ► profile-card name ► short hex).
   function reactorNames(reactors: string[]): string {
@@ -470,6 +512,39 @@
               </div>
             {/if}
           </div>
+          <div class="reaction-toolbar" role="group" aria-label="Add reaction">
+            {#each QUICK_REACTIONS as emoji}
+              <button
+                type="button"
+                class="quick-react"
+                class:active={reactionMine(msg, emoji)}
+                aria-label={`React ${emoji}`}
+                aria-pressed={reactionMine(msg, emoji)}
+                onclick={() => toggleReaction(msg, emoji)}
+              >{emoji}</button>
+            {/each}
+            <button
+              type="button"
+              class="picker-toggle"
+              aria-label="More reactions"
+              aria-haspopup="true"
+              aria-expanded={pickerOpenFor === msg.messageId}
+              onclick={() => togglePicker(msg.messageId)}
+            >😊</button>
+            {#if pickerOpenFor === msg.messageId}
+              <div class="reaction-picker" role="menu" aria-label="Pick a reaction">
+                {#each PICKER_EMOJI as emoji}
+                  <button
+                    type="button"
+                    class="picker-emoji"
+                    role="menuitem"
+                    aria-label={`React ${emoji}`}
+                    onclick={() => pickFromPicker(msg, emoji)}
+                  >{emoji}</button>
+                {/each}
+              </div>
+            {/if}
+          </div>
         </article>
       {/if}
     {/each}
@@ -529,6 +604,7 @@
     display: flex;
     gap: 10px;
     padding: 6px 16px;
+    position: relative;
   }
   .channel-message:hover { background: var(--bg-tertiary); }
   .avatar-col { flex: 0 0 auto; }
@@ -583,6 +659,65 @@
   }
   .reaction-count { color: var(--text-secondary); }
   .reaction-chip.mine .reaction-count { color: var(--text-primary); }
+  .reaction-toolbar {
+    position: absolute;
+    top: -10px;
+    right: 14px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.08s ease;
+  }
+  .channel-message:hover .reaction-toolbar,
+  .reaction-toolbar:focus-within {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .quick-react,
+  .picker-toggle,
+  .picker-emoji {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 0.95rem;
+    line-height: 1;
+    padding: 3px 5px;
+    border-radius: 4px;
+  }
+  .quick-react:hover,
+  .picker-toggle:hover,
+  .picker-emoji:hover { background: var(--bg-tertiary); }
+  .quick-react:focus-visible,
+  .picker-toggle:focus-visible,
+  .picker-emoji:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .quick-react.active {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  .reaction-picker {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 4px;
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 2px;
+    padding: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    z-index: 10;
+  }
   .compose {
     border-top: 1px solid var(--border);
     padding: 8px 16px 12px;

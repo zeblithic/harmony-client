@@ -621,3 +621,96 @@ describe('ChannelMessageFeed reactions — chips (ZEB-536)', () => {
     });
   });
 });
+
+describe('ChannelMessageFeed reactions — toolbar + picker (ZEB-536)', () => {
+  beforeEach(() => { vi.useFakeTimers({ shouldAdvanceTime: true }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  async function seedPlainMessage() {
+    const ctx = await setup();
+    const handler = ctx.adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'ee'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('hi')),
+        },
+      },
+    });
+    await waitFor(() => expect(ctx.container.querySelector('.channel-message')).toBeTruthy());
+    return ctx;
+  }
+
+  it('renders the quick-react buttons 👍 👎 in the toolbar', async () => {
+    const { container } = await seedPlainMessage();
+    const quick = container.querySelectorAll('.reaction-toolbar .quick-react');
+    expect(quick.length).toBe(2);
+    expect(quick[0].textContent).toContain('👍');
+    expect(quick[1].textContent).toContain('👎');
+  });
+
+  it('clicking the 👍 quick-react adds the reaction (add:true)', async () => {
+    const { adapter, container } = await seedPlainMessage();
+    const thumb = container.querySelector('.reaction-toolbar .quick-react') as HTMLButtonElement;
+    await fireEvent.click(thumb);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      messageId: 'm1',
+      emoji: '👍',
+      add: true,
+    });
+  });
+
+  it('the picker toggle opens a grid of 10 emoji', async () => {
+    const { container } = await seedPlainMessage();
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    await waitFor(() => {
+      const picker = container.querySelector('.reaction-picker');
+      expect(picker).toBeTruthy();
+      expect(picker!.querySelectorAll('.picker-emoji').length).toBe(10);
+    });
+  });
+
+  it('selecting a picker emoji adds it (add:true) and closes the picker', async () => {
+    const { adapter, container } = await seedPlainMessage();
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    let party: HTMLButtonElement | null = null;
+    await waitFor(() => {
+      const btns = Array.from(container.querySelectorAll('.picker-emoji')) as HTMLButtonElement[];
+      party = btns.find((b) => b.textContent?.includes('🎉')) ?? null;
+      expect(party).toBeTruthy();
+    });
+    await fireEvent.click(party!);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      messageId: 'm1',
+      emoji: '🎉',
+      add: true,
+    });
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeNull());
+  });
+
+  it('Escape closes the picker', async () => {
+    const { container } = await seedPlainMessage();
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeTruthy());
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeNull());
+  });
+
+  it('clicking outside closes the picker', async () => {
+    const { container } = await seedPlainMessage();
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeTruthy());
+    await fireEvent.click(document.body);
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeNull());
+  });
+});
