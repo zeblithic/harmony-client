@@ -95,6 +95,9 @@
   // the `cancelled` guard the channel-switch $effect uses for listMessages.
   let attachEpoch = 0;
 
+  // messageId whose picker popover is open, or null. Only one at a time.
+  let pickerOpenFor = $state<string | null>(null);
+
   let scrollEl: HTMLDivElement | undefined = $state();
   let composeEl: HTMLTextAreaElement | undefined = $state();
   let unsubChannel: (() => void) | null = null;
@@ -103,13 +106,26 @@
   const SCROLL_TOP_DEBOUNCE_MS = 250;
   const SCROLL_TOP_THRESHOLD_PX = 50;
 
+  // ZEB-536 reaction palette (v1). The grid is a const array — trim toward
+  // quick-react-only later if it feels bloated (spec §Design).
+  const QUICK_REACTIONS = ['👍', '👎'];
+  const PICKER_EMOJI = ['👍', '👎', '✅', '❌', '👀', '🎉', '🙏', '🚀', '❤️', '😄'];
+
   // Subscribe + initial list when channelId changes.
   $effect(() => {
     const cid = communityId;
     const chid = channelId;
     let cancelled = false;
+    // ZEB-536: keep selfOwnerId current for live `mine` on reaction events.
+    // Set here (not just onMount) so it survives a service destroy()/reuse and
+    // channel switches; safe because there is a single local owner and
+    // list_channel_messages carries authoritative `mine` on (re)open.
+    channelMessageService.selfOwnerId = ownAddress;
     // Fresh local mirror per channel switch.
     messages = [];
+    // ZEB-536: close any open reaction picker so it doesn't linger across a
+    // channel switch (and its Escape/outside-click window listeners unwind).
+    pickerOpenFor = null;
     composeError = null;
     loadError = null;
     backfillProgress = null;
@@ -394,6 +410,73 @@
     );
   }
 
+  // ZEB-536 — is the local member currently reacting with `emoji` on `msg`?
+  function reactionMine(msg: ChannelMessageDto, emoji: string): boolean {
+    return msg.reactions?.some((r) => r.emoji === emoji && r.mine) ?? false;
+  }
+
+  // ZEB-536 — toggle the local member's reaction (chips + quick-react share
+  // this). Fire-and-forget: no component-state write after the await, so no
+  // teardown guard is needed; failures are logged, not surfaced (the chip
+  // self-heals from the authoritative event / next list).
+  function toggleReaction(msg: ChannelMessageDto, emoji: string): void {
+    const add = !reactionMine(msg, emoji);
+    void channelMessageService
+      .reactToMessage(communityId, channelId, msg.messageId, emoji, add)
+      .catch((e) => console.warn('reaction toggle failed', e instanceof Error ? e.message : String(e)));
+  }
+
+  function togglePicker(messageId: string): void {
+    pickerOpenFor = pickerOpenFor === messageId ? null : messageId;
+  }
+
+  // ZEB-536 — picker selection is an explicit add (spec §Design), unlike the
+  // toggle semantics of chips/quick-react. Closes the popover.
+  function pickFromPicker(msg: ChannelMessageDto, emoji: string): void {
+    pickerOpenFor = null;
+    void channelMessageService
+      .reactToMessage(communityId, channelId, msg.messageId, emoji, true)
+      .catch((e) => console.warn('reaction pick failed', e instanceof Error ? e.message : String(e)));
+  }
+
+  // Close the open reaction picker on Escape or an outside click. Listeners
+  // are scoped to "a picker is open" and cleaned up on close/teardown. The
+  // click that opened the picker targets a node inside `.reaction-toolbar`,
+  // so it does not self-close.
+  $effect(() => {
+    if (pickerOpenFor === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') pickerOpenFor = null;
+    };
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!t) {
+        pickerOpenFor = null;
+        return;
+      }
+      // Every message renders its own .reaction-toolbar, so matching *any*
+      // toolbar would leave the picker open when another message's toolbar is
+      // clicked. Keep it open only for clicks inside the OPEN picker's own
+      // toolbar (Greptile PR #316).
+      const toolbar = t.closest<HTMLElement>('.reaction-toolbar');
+      if (!toolbar || toolbar.dataset.messageId !== pickerOpenFor) {
+        pickerOpenFor = null;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('click', onDocClick);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('click', onDocClick);
+    };
+  });
+
+  // ZEB-536 — comma-joined reactor labels for a chip tooltip, reusing the
+  // ZEB-432 author label ladder (nickname ► profile-card name ► short hex).
+  function reactorNames(reactors: string[]): string {
+    return reactors.map((addr) => authorLabel(addr)).join(', ');
+  }
+
   function handleAuthorClick(author: string, ev: MouseEvent) {
     // Resolve once — a single map lookup and a single reactive cardVersion read.
     const card = resolveCard?.(author);
@@ -500,7 +583,58 @@
                 {channelMessageService}
               />
             {/if}
+            {#if !row.isPreFork && msg.reactions && msg.reactions.length > 0}
+              <div class="reactions">
+                {#each msg.reactions as r (r.emoji)}
+                  <button
+                    type="button"
+                    class="reaction-chip"
+                    class:mine={r.mine}
+                    title={reactorNames(r.reactors)}
+                    onclick={() => toggleReaction(msg, r.emoji)}
+                  >
+                    <span class="reaction-emoji" aria-hidden="true">{r.emoji}</span>
+                    <span class="reaction-count">{r.count}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
           </div>
+          {#if !row.isPreFork}
+          <div class="reaction-toolbar" role="group" aria-label="Add reaction" data-message-id={msg.messageId}>
+            {#each QUICK_REACTIONS as emoji}
+              <button
+                type="button"
+                class="quick-react"
+                class:active={reactionMine(msg, emoji)}
+                aria-label={`React ${emoji}`}
+                aria-pressed={reactionMine(msg, emoji)}
+                onclick={() => toggleReaction(msg, emoji)}
+              >{emoji}</button>
+            {/each}
+            <button
+              type="button"
+              class="picker-toggle"
+              aria-label="More reactions"
+              aria-haspopup="menu"
+              aria-expanded={pickerOpenFor === msg.messageId}
+              onclick={() => togglePicker(msg.messageId)}
+            >😊</button>
+            {#if pickerOpenFor === msg.messageId}
+              <div class="reaction-picker" role="menu" aria-label="Pick a reaction">
+                {#each PICKER_EMOJI as emoji}
+                  <button
+                    type="button"
+                    class="picker-emoji"
+                    role="menuitem"
+                    aria-label={`React ${emoji}`}
+                    onclick={() => pickFromPicker(msg, emoji)}
+                  >{emoji}</button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+          {/if}
         </article>
       {/if}
     {/each}
@@ -587,6 +721,7 @@
     display: flex;
     gap: 10px;
     padding: 6px 16px;
+    position: relative;
   }
   .channel-message:hover { background: var(--bg-tertiary); }
   .avatar-col { flex: 0 0 auto; }
@@ -611,6 +746,95 @@
   }
   .ts { color: var(--text-secondary); font-size: 0.7rem; }
   .body { margin: 2px 0 0; color: var(--text-primary); white-space: pre-wrap; word-wrap: break-word; }
+  .reactions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 4px;
+  }
+  .reaction-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1px 8px;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+  .reaction-chip:hover { background: var(--bg-tertiary); }
+  .reaction-chip.mine {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+  .reaction-chip:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .reaction-count { color: var(--text-secondary); }
+  .reaction-chip.mine .reaction-count { color: var(--text-primary); }
+  .reaction-toolbar {
+    position: absolute;
+    top: -10px;
+    right: 14px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.08s ease;
+  }
+  .channel-message:hover .reaction-toolbar,
+  .reaction-toolbar:focus-within {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .quick-react,
+  .picker-toggle,
+  .picker-emoji {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 0.95rem;
+    line-height: 1;
+    padding: 3px 5px;
+    border-radius: 4px;
+  }
+  .quick-react:hover,
+  .picker-toggle:hover,
+  .picker-emoji:hover { background: var(--bg-tertiary); }
+  .quick-react:focus-visible,
+  .picker-toggle:focus-visible,
+  .picker-emoji:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .quick-react.active {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  .reaction-picker {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 4px;
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 2px;
+    padding: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    z-index: 10;
+  }
   .compose {
     border-top: 1px solid var(--border);
     padding: 8px 16px 12px;
