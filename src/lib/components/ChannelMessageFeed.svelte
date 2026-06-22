@@ -201,6 +201,10 @@
   });
 
   onMount(() => {
+    // ZEB-536: live `mine` on reaction events needs the local owner id.
+    // ownAddress is the same owner-id hex as reaction reactors[].
+    channelMessageService.selfOwnerId = ownAddress;
+
     // Hook progress notifications. We chain rather than overwrite so that
     // CommunityView (which also wants progress) still gets called. Per spec
     // §8.3 the service emits per-channel progress; we filter to ours.
@@ -329,6 +333,28 @@
     );
   }
 
+  // ZEB-536 — is the local member currently reacting with `emoji` on `msg`?
+  function reactionMine(msg: ChannelMessageDto, emoji: string): boolean {
+    return msg.reactions?.some((r) => r.emoji === emoji && r.mine) ?? false;
+  }
+
+  // ZEB-536 — toggle the local member's reaction (chips + quick-react share
+  // this). Fire-and-forget: no component-state write after the await, so no
+  // teardown guard is needed; failures are logged, not surfaced (the chip
+  // self-heals from the authoritative event / next list).
+  function toggleReaction(msg: ChannelMessageDto, emoji: string): void {
+    const add = !reactionMine(msg, emoji);
+    void channelMessageService
+      .reactToMessage(communityId, channelId, msg.messageId, emoji, add)
+      .catch((e) => console.warn('reaction toggle failed', e));
+  }
+
+  // ZEB-536 — comma-joined reactor labels for a chip tooltip, reusing the
+  // ZEB-432 author label ladder (nickname ► profile-card name ► short hex).
+  function reactorNames(reactors: string[]): string {
+    return reactors.map((addr) => authorLabel(addr)).join(', ');
+  }
+
   function handleAuthorClick(author: string, ev: MouseEvent) {
     // Resolve once — a single map lookup and a single reactive cardVersion read.
     const card = resolveCard?.(author);
@@ -427,6 +453,22 @@
             {:else}
               <p class="body">{bodyToText(msg.body)}</p>
             {/if}
+            {#if msg.reactions && msg.reactions.length > 0}
+              <div class="reactions">
+                {#each msg.reactions as r (r.emoji)}
+                  <button
+                    type="button"
+                    class="reaction-chip"
+                    class:mine={r.mine}
+                    title={reactorNames(r.reactors)}
+                    onclick={() => toggleReaction(msg, r.emoji)}
+                  >
+                    <span class="reaction-emoji" aria-hidden="true">{r.emoji}</span>
+                    <span class="reaction-count">{r.count}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
           </div>
         </article>
       {/if}
@@ -511,6 +553,36 @@
   }
   .ts { color: var(--text-secondary); font-size: 0.7rem; }
   .body { margin: 2px 0 0; color: var(--text-primary); white-space: pre-wrap; word-wrap: break-word; }
+  .reactions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 4px;
+  }
+  .reaction-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1px 8px;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+  .reaction-chip:hover { background: var(--bg-tertiary); }
+  .reaction-chip.mine {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+  .reaction-chip:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .reaction-count { color: var(--text-secondary); }
+  .reaction-chip.mine .reaction-count { color: var(--text-primary); }
   .compose {
     border-top: 1px solid var(--border);
     padding: 8px 16px 12px;

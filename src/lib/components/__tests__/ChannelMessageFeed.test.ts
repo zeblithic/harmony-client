@@ -495,3 +495,129 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
     expect(onOpenCard.mock.calls[0][0].displayName).toBe('ZEBbot');
   });
 });
+
+describe('ChannelMessageFeed reactions — chips (ZEB-536)', () => {
+  beforeEach(() => { vi.useFakeTimers({ shouldAdvanceTime: true }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  // Seed one message carrying `reactions` straight from the message event.
+  async function seedMessageWithReactions(
+    reactions: Array<{ emoji: string; count: number; mine: boolean; reactors: string[] }>,
+    propOverrides: Record<string, unknown> = {},
+  ) {
+    const ctx = await setup(propOverrides);
+    const handler = ctx.adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'ee'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('hi')),
+          reactions,
+        },
+      },
+    });
+    return ctx;
+  }
+
+  it('renders a chip per reaction with emoji + count', async () => {
+    const { container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 2, mine: false, reactors: ['ee'.repeat(20), 'ff'.repeat(20)] },
+    ]);
+    await waitFor(() => {
+      const chip = container.querySelector('.reaction-chip');
+      expect(chip).toBeTruthy();
+      expect(chip?.textContent).toContain('👍');
+      expect(chip?.textContent).toContain('2');
+    });
+  });
+
+  it('adds the .mine class when reaction.mine is true', async () => {
+    const { container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 1, mine: true, reactors: ['cc'.repeat(20)] },
+    ]);
+    await waitFor(() => {
+      expect(container.querySelector('.reaction-chip.mine')).toBeTruthy();
+    });
+  });
+
+  it('clicking a mine chip toggles it off (add:false)', async () => {
+    const { adapter, container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 1, mine: true, reactors: ['cc'.repeat(20)] },
+    ]);
+    let chip: Element | null = null;
+    await waitFor(() => {
+      chip = container.querySelector('.reaction-chip');
+      expect(chip).toBeTruthy();
+    });
+    await fireEvent.click(chip!);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      messageId: 'm1',
+      emoji: '👍',
+      add: false,
+    });
+  });
+
+  it('clicking a not-mine chip adds my reaction (add:true)', async () => {
+    const { adapter, container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 1, mine: false, reactors: ['ee'.repeat(20)] },
+    ]);
+    let chip: Element | null = null;
+    await waitFor(() => {
+      chip = container.querySelector('.reaction-chip');
+      expect(chip).toBeTruthy();
+    });
+    await fireEvent.click(chip!);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      messageId: 'm1',
+      emoji: '👍',
+      add: true,
+    });
+  });
+
+  it('a live channel-reaction-received event updates the chip count', async () => {
+    const { adapter, container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 1, mine: false, reactors: ['ee'.repeat(20)] },
+    ]);
+    await waitFor(() =>
+      expect(container.querySelector('.reaction-chip')?.textContent).toContain('1'),
+    );
+    const rh = adapter.listeners.get('channel-reaction-received')!;
+    rh({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        messageId: 'm1',
+        reactor: 'ff'.repeat(20),
+        emoji: '👍',
+        add: true,
+        at: { wallMs: 2000, logical: 0, deviceId: 'd' },
+      },
+    });
+    await waitFor(() =>
+      expect(container.querySelector('.reaction-chip')?.textContent).toContain('2'),
+    );
+  });
+
+  it('chip title lists reactor display names via resolveCard', async () => {
+    const resolveCard = (hex: string) =>
+      hex === 'ee'.repeat(20) ? ({ displayName: 'Ildwyn' } as any) : undefined;
+    const { container } = await seedMessageWithReactions(
+      [{ emoji: '👍', count: 1, mine: false, reactors: ['ee'.repeat(20)] }],
+      { resolveCard },
+    );
+    await waitFor(() => {
+      const chip = container.querySelector('.reaction-chip');
+      expect(chip?.getAttribute('title')).toContain('Ildwyn');
+    });
+  });
+});
