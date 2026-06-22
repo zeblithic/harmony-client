@@ -146,14 +146,15 @@ const MIN_PACKET_LEN: usize = NONCE_LEN + TAG_LEN;
 /// reactions fail `react()` locally and `verify_channel_event` inbound.
 pub const MAX_REACTION_EMOJI_BYTES: usize = 32;
 
-/// One signed channel event. Phase 2 ships only the `Post` variant.
+/// One signed channel event. `Post` (phase 2) and `React` (ZEB-536) are
+/// live variants. `Edit`/`Delete` remain reserved for a future release.
 /// Wire format: 2-key adjacently-tagged outer (`tg` + `vl`); inner
 /// fields all 2-char keys to satisfy the same-length-keys invariant.
 ///
 /// `sg` covers canonical CBOR of `(id, community_id, channel_id, author,
 /// at, content_kind, body, reply_to)` — every field minus the signature
-/// itself. v3 Edit/Delete/React variants will sign their own typed
-/// payloads with no field reuse across variants.
+/// itself. Future Edit/Delete variants will sign their own typed payloads
+/// with no field reuse across variants.
 ///
 /// Per spec §5.2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

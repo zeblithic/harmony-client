@@ -933,13 +933,17 @@ impl ChannelLogEngine {
 
     /// Public accessor: project a `SignedChannelEvent` to the IPC
     /// `ChannelMessageDto` shape using the engine's `(community_id,
-    /// channel_id)` context. The IPC layer (`list_channel_messages`)
+    /// channel_id)` context. Returns `None` for non-message events
+    /// (e.g. `React`). The IPC layer (`list_channel_messages`)
     /// uses this to project the engine's `list_messages` output.
     /// Wraps the existing private `message_dto_for_event` so the emit
     /// helper and the IPC projection stay symmetric — change one,
     /// change both.
-    pub fn event_to_dto(&self, event: &SignedChannelEvent) -> ChannelMessageDto {
-        self.message_dto_for_event(event)
+    pub fn event_to_dto(&self, event: &SignedChannelEvent) -> Option<ChannelMessageDto> {
+        match event {
+            SignedChannelEvent::Post { .. } => Some(self.message_dto_for_event(event)),
+            _ => None,
+        }
     }
 
     fn message_dto_for_event(&self, event: &SignedChannelEvent) -> ChannelMessageDto {
@@ -2533,7 +2537,7 @@ mod tests {
             "hello",
             &fix.signing_key,
         );
-        let dto = fix.engine.event_to_dto(&ev);
+        let dto = fix.engine.event_to_dto(&ev).expect("Post projects to Some");
 
         assert_eq!(dto.community_id, hex::encode(fix.community_id.0));
         assert_eq!(dto.channel_id, hex::encode(fix.channel_id.0));

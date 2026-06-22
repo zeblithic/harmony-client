@@ -376,7 +376,8 @@ pub async fn fork_community(
     // Channel-log events are signed by their `author` field (OwnerAddr), which
     // may differ from membership-event actors. Without their pubkeys in
     // identity_pubs, verify_snapshot_event would return UnknownSigner on those
-    // events. Channel events (SignedChannelEvent::Post) have no countersig.
+    // events. Channel-log events (Post and React) are author-signed, not
+    // countersigned; the snapshot is Post-only by the filter above.
     // (Fix: PR #122 round-2 bot review — CodeRabbit Major.)
     for log_events in raw_channel_events.values() {
         for event in log_events {
