@@ -12,11 +12,15 @@
 
 use crate::community_channel_log::ChannelKey;
 use crate::community_membership::ChannelId;
+use crate::community_state_sync::CommunitySyncRegistry;
 use crate::owner_state_crypto::canonical_cbor_encode;
-use crate::owner_state_types::{Hlc, SpaceId};
+use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use crate::voice_crypto::{decrypt_voice_packet, encrypt_voice_packet, COMMUNITY_PRESENCE_AAD};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::task::JoinHandle;
 
 /// Presence has no channel, so the AEAD seam (which is `(community, channel)`
 /// scoped for voice) is bound with this all-zero sentinel channel. The
@@ -162,6 +166,34 @@ pub fn seal_presence_beacon_with_nonce(
     .map_err(|_| BeaconError::Encode)
 }
 
+// ── Beacon cadence + builder (ZEB-537 Task 4) ───────────────────────
+
+/// Heartbeat interval: a live device republishes its presence beacon every
+/// 10 s. Mirrors the voice publisher cadence (scaled up — community presence is
+/// pure liveness, not call-state, so it tolerates a slower beat).
+pub const BEACON_INTERVAL_MS: u64 = 10_000;
+
+/// TTL: a device is swept from the roster once `STALE_MS` have elapsed since its
+/// last beacon (3× the interval, so two dropped beacons don't evict a live peer).
+pub const STALE_MS: u64 = 30_000;
+
+/// Build an unsigned community-presence beacon. Pure (no I/O) so the publisher
+/// loop has exactly one construction site, unit-testable without standing up
+/// Zenoh. Community presence carries no `muted`/`left` (pure liveness).
+pub(crate) fn build_presence_beacon(
+    owner: [u8; 16],
+    device: [u8; 32],
+    started_hlc: &Hlc,
+    seq: u64,
+) -> PresenceBeacon {
+    PresenceBeacon {
+        owner,
+        device,
+        started_hlc: started_hlc.clone(),
+        seq,
+    }
+}
+
 // ── In-memory roster map (ZEB-537 Task 2) ───────────────────────────
 //
 // Community-scoped, pure-liveness presence roster. Mirrors `VoicePresenceMap`
@@ -300,6 +332,169 @@ impl CommunityPresenceMap {
     }
 }
 
+// ── pub/sub spawn helpers (ZEB-537 Task 4) ──────────────────────────
+//
+// Mirror `voice_presence::spawn_voice_presence_{publisher,subscriber}` but
+// community-scoped (no channel) and pure-liveness (no mute/kick/left). The
+// presence key is re-derived from the community's CURRENT epoch key on EVERY
+// operation (`registry.engine_arc(community).membership_key()` →
+// `derive_presence_key`), so it follows epoch rotation automatically; a missing
+// engine means we skip the tick (publisher) / drop the packet (subscriber).
+
+/// Spawn a community-presence heartbeat publisher: emit an immediate beacon,
+/// then one every `interval` (10 s in V1). Each tick re-derives the presence key
+/// from the community's current epoch key (so rotation is followed), builds →
+/// signs → seals → `session.put`s a beacon drawing a strictly-increasing `seq`
+/// from `seq_counter`. Honors `closing` for shutdown. Mirrors
+/// [`crate::voice_presence::spawn_voice_presence_publisher`], minus mute/kick.
+///
+/// `session` is an owned, cheaply-cloned `zenoh::Session` (call sites pass
+/// `session.clone()`).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_community_presence_publisher(
+    session: zenoh::Session,
+    topic: String,
+    registry: Arc<CommunitySyncRegistry>,
+    community: SpaceId,
+    signing_key: Arc<ed25519_dalek::SigningKey>,
+    self_owner: OwnerAddr,
+    self_device: [u8; 32],
+    started_hlc: Hlc,
+    seq_counter: Arc<AtomicU64>,
+    interval: std::time::Duration,
+    closing: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // `interval` fires immediately on the first `tick()`, giving the
+        // "immediate first beacon then every `interval`" cadence for free.
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            if closing.load(Ordering::SeqCst) {
+                break;
+            }
+            let seq = seq_counter.fetch_add(1, Ordering::SeqCst);
+            let beacon = build_presence_beacon(self_owner.0, self_device, &started_hlc, seq);
+            let Ok(signed) = sign_presence_beacon(beacon, &signing_key) else {
+                continue;
+            };
+            // Re-fetch the presence key per tick so it follows epoch rotation;
+            // if the engine is gone we have nothing to seal under → skip.
+            let Some(engine) = registry.engine_arc(&community).await else {
+                continue;
+            };
+            let mk = engine.membership_key();
+            let key = crate::community_channel_log::derive_presence_key(&mk, &community);
+            let Ok(sealed) = seal_presence_beacon(&key, &community, &signed) else {
+                continue;
+            };
+            if let Err(e) = session.put(&topic, sealed).await {
+                tracing::warn!(%topic, err = %e, "community presence publish failed");
+            }
+        }
+    })
+}
+
+/// Spawn a community-presence subscriber on `topic`: open the seal (under the
+/// community's current presence key) → verify the device-#2 signature → verify
+/// materialized membership → apply to the shared map → emit `presence-updated`
+/// on change. Drops on any failure. Mirrors
+/// [`crate::voice_presence::spawn_voice_presence_subscriber`], minus mute/kick.
+///
+/// `session` is an owned, cheaply-cloned `zenoh::Session`; `now_ms` is the
+/// loop's monotonic clock.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_community_presence_subscriber(
+    session: zenoh::Session,
+    topic: String,
+    registry: Arc<CommunitySyncRegistry>,
+    community: SpaceId,
+    map: Arc<tokio::sync::Mutex<CommunityPresenceMap>>,
+    app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    closing: Arc<AtomicBool>,
+    now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let sub = match session.declare_subscriber(&topic).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(%topic, err = %e, "community presence subscribe failed");
+                return;
+            }
+        };
+        while let Ok(sample) = sub.recv_async().await {
+            if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
+                tracing::warn!(
+                    len = sample.payload().len(),
+                    max = crate::voice_crypto::MAX_VOICE_PACKET_BYTES,
+                    "oversized community presence packet dropped"
+                );
+                continue;
+            }
+            let bytes = sample.payload().to_bytes().to_vec();
+            // Re-derive the presence key per packet so it follows epoch
+            // rotation; if the engine is gone we cannot open → drop.
+            let Some(engine) = registry.engine_arc(&community).await else {
+                continue;
+            };
+            let mk = engine.membership_key();
+            let key = crate::community_channel_log::derive_presence_key(&mk, &community);
+            let Some(signed) = open_presence_beacon(&key, &community, &bytes) else {
+                continue; // non-member key / wrong scope / tamper → drop
+            };
+            if verify_presence_beacon_sig(&signed).is_err() {
+                continue; // bad device-#2 signature → drop
+            }
+            let owner = OwnerAddr(signed.beacon.owner);
+            // Reuse the voice membership gate verbatim (same crate, same
+            // materialized-membership authority) — community presence shares it.
+            if !crate::voice_presence::beacon_signer_is_member(
+                &registry,
+                &community,
+                &owner,
+                &signed.beacon.device,
+            )
+            .await
+            {
+                continue; // signer not an enrolled, Joined member → drop
+            }
+            let changed = {
+                let mut g = map.lock().await;
+                g.apply(&community, &signed.beacon, (now_ms)())
+            };
+            if changed {
+                let members = {
+                    let g = map.lock().await;
+                    g.online_owners(&community)
+                };
+                // Task 6 will replace this json! with the typed PresenceUpdatedPayload struct.
+                let members_json: Vec<serde_json::Value> = members
+                    .iter()
+                    .map(|o| {
+                        serde_json::json!({
+                            "ownerIdHex": hex::encode(o.owner),
+                            "online": true,
+                            "lastSeenMs": o.last_seen_ms,
+                            "deviceCount": o.device_count,
+                        })
+                    })
+                    .collect();
+                crate::node_event_sink::emit_ser(
+                    app.as_ref(),
+                    "presence-updated",
+                    &serde_json::json!({
+                        "communityId": hex::encode(community.0),
+                        "members": members_json,
+                    }),
+                );
+            }
+        }
+        if !closing.load(Ordering::SeqCst) {
+            tracing::warn!(%topic, "community presence subscriber closed unexpectedly");
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +550,20 @@ mod tests {
         assert_eq!(open_presence_beacon(&key, &c, &sealed), Some(signed));
         let other = derive_presence_key(&EpochKey::new([0x22; 32]), &c);
         assert_eq!(open_presence_beacon(&other, &c, &sealed), None);
+    }
+
+    #[test]
+    fn build_presence_beacon_sets_fields() {
+        let h = Hlc {
+            wall_ms: 5,
+            logical: 0,
+            device_id: "aa".repeat(32),
+        };
+        let b = build_presence_beacon([1; 16], [2; 32], &h, 7);
+        assert_eq!(b.owner, [1; 16]);
+        assert_eq!(b.device, [2; 32]);
+        assert_eq!(b.seq, 7);
+        assert_eq!(b.started_hlc, h);
     }
 
     // ── CommunityPresenceMap (Task 2) ───────────────────────────────
