@@ -385,7 +385,18 @@
     };
     const onDocClick = (e: MouseEvent) => {
       const t = e.target as HTMLElement | null;
-      if (!t || !t.closest('.reaction-toolbar')) pickerOpenFor = null;
+      if (!t) {
+        pickerOpenFor = null;
+        return;
+      }
+      // Every message renders its own .reaction-toolbar, so matching *any*
+      // toolbar would leave the picker open when another message's toolbar is
+      // clicked. Keep it open only for clicks inside the OPEN picker's own
+      // toolbar (Greptile PR #316).
+      const toolbar = t.closest<HTMLElement>('.reaction-toolbar');
+      if (!toolbar || toolbar.dataset.messageId !== pickerOpenFor) {
+        pickerOpenFor = null;
+      }
     };
     window.addEventListener('keydown', onKey);
     window.addEventListener('click', onDocClick);
@@ -517,7 +528,7 @@
             {/if}
           </div>
           {#if !row.isPreFork}
-          <div class="reaction-toolbar" role="group" aria-label="Add reaction">
+          <div class="reaction-toolbar" role="group" aria-label="Add reaction" data-message-id={msg.messageId}>
             {#each QUICK_REACTIONS as emoji}
               <button
                 type="button"

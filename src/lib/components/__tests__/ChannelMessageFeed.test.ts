@@ -738,4 +738,42 @@ describe('ChannelMessageFeed reactions — toolbar + picker (ZEB-536)', () => {
     await fireEvent.click(document.body);
     await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeNull());
   });
+
+  it("clicking a DIFFERENT message's toolbar closes the open picker (Greptile #316 P1)", async () => {
+    // Every message renders its own .reaction-toolbar; the outside-click guard
+    // must close the picker when the click lands in another message's toolbar,
+    // not just leave it open because *some* toolbar was hit.
+    const ctx = await setup();
+    const handler = ctx.adapter.listeners.get('channel-message-received')!;
+    for (const [id, w] of [['m1', 1000], ['m2', 2000]] as const) {
+      handler({
+        payload: {
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          message: {
+            messageId: id,
+            communityId: 'aa'.repeat(16),
+            channelId: 'bb'.repeat(16),
+            author: 'ee'.repeat(20),
+            at: { wallMs: w, logical: 0, deviceId: 'd' },
+            body: Array.from(new TextEncoder().encode(`hi ${id}`)),
+          },
+        },
+      });
+    }
+    await waitFor(() =>
+      expect(ctx.container.querySelectorAll('.channel-message').length).toBe(2),
+    );
+    const toolbars = Array.from(ctx.container.querySelectorAll('.reaction-toolbar'));
+    expect(toolbars.length).toBe(2);
+    // Open the picker on the first message's toolbar.
+    await fireEvent.click(toolbars[0].querySelector('.picker-toggle') as HTMLButtonElement);
+    await waitFor(() => expect(ctx.container.querySelector('.reaction-picker')).toBeTruthy());
+    // The OTHER toolbar is the one that does NOT contain the open picker.
+    const otherToolbar = toolbars.find((tb) => !tb.querySelector('.reaction-picker'))!;
+    expect(otherToolbar).toBeTruthy();
+    // Clicking a control in a different message's toolbar must close the picker.
+    await fireEvent.click(otherToolbar.querySelector('.quick-react') as HTMLButtonElement);
+    await waitFor(() => expect(ctx.container.querySelector('.reaction-picker')).toBeNull());
+  });
 });
