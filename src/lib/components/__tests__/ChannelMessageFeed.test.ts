@@ -495,3 +495,285 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
     expect(onOpenCard.mock.calls[0][0].displayName).toBe('ZEBbot');
   });
 });
+
+describe('ChannelMessageFeed reactions — chips (ZEB-536)', () => {
+  beforeEach(() => { vi.useFakeTimers({ shouldAdvanceTime: true }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  // Seed one message carrying `reactions` straight from the message event.
+  async function seedMessageWithReactions(
+    reactions: Array<{ emoji: string; count: number; mine: boolean; reactors: string[] }>,
+    propOverrides: Record<string, unknown> = {},
+  ) {
+    const ctx = await setup(propOverrides);
+    const handler = ctx.adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'ee'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('hi')),
+          reactions,
+        },
+      },
+    });
+    return ctx;
+  }
+
+  it('renders a chip per reaction with emoji + count', async () => {
+    const { container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 2, mine: false, reactors: ['ee'.repeat(20), 'ff'.repeat(20)] },
+    ]);
+    await waitFor(() => {
+      const chip = container.querySelector('.reaction-chip');
+      expect(chip).toBeTruthy();
+      expect(chip?.textContent).toContain('👍');
+      expect(chip?.textContent).toContain('2');
+    });
+  });
+
+  it('adds the .mine class when reaction.mine is true', async () => {
+    const { container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 1, mine: true, reactors: ['cc'.repeat(20)] },
+    ]);
+    await waitFor(() => {
+      expect(container.querySelector('.reaction-chip.mine')).toBeTruthy();
+    });
+  });
+
+  it('clicking a mine chip toggles it off (add:false)', async () => {
+    const { adapter, container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 1, mine: true, reactors: ['cc'.repeat(20)] },
+    ]);
+    let chip: Element | null = null;
+    await waitFor(() => {
+      chip = container.querySelector('.reaction-chip');
+      expect(chip).toBeTruthy();
+    });
+    await fireEvent.click(chip!);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      messageId: 'm1',
+      emoji: '👍',
+      add: false,
+    });
+  });
+
+  it('clicking a not-mine chip adds my reaction (add:true)', async () => {
+    const { adapter, container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 1, mine: false, reactors: ['ee'.repeat(20)] },
+    ]);
+    let chip: Element | null = null;
+    await waitFor(() => {
+      chip = container.querySelector('.reaction-chip');
+      expect(chip).toBeTruthy();
+    });
+    await fireEvent.click(chip!);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      messageId: 'm1',
+      emoji: '👍',
+      add: true,
+    });
+  });
+
+  it('a live channel-reaction-received event updates the chip count', async () => {
+    const { adapter, container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 1, mine: false, reactors: ['ee'.repeat(20)] },
+    ]);
+    await waitFor(() =>
+      expect(container.querySelector('.reaction-chip')?.textContent).toContain('1'),
+    );
+    const rh = adapter.listeners.get('channel-reaction-received')!;
+    rh({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        messageId: 'm1',
+        reactor: 'ff'.repeat(20),
+        emoji: '👍',
+        add: true,
+        at: { wallMs: 2000, logical: 0, deviceId: 'd' },
+      },
+    });
+    await waitFor(() =>
+      expect(container.querySelector('.reaction-chip')?.textContent).toContain('2'),
+    );
+  });
+
+  it('chip title lists reactor display names via resolveCard', async () => {
+    const resolveCard = (hex: string) =>
+      hex === 'ee'.repeat(20) ? ({ displayName: 'Ildwyn' } as any) : undefined;
+    const { container } = await seedMessageWithReactions(
+      [{ emoji: '👍', count: 1, mine: false, reactors: ['ee'.repeat(20)] }],
+      { resolveCard },
+    );
+    await waitFor(() => {
+      const chip = container.querySelector('.reaction-chip');
+      expect(chip?.getAttribute('title')).toContain('Ildwyn');
+    });
+  });
+});
+
+describe('ChannelMessageFeed reactions — toolbar + picker (ZEB-536)', () => {
+  beforeEach(() => { vi.useFakeTimers({ shouldAdvanceTime: true }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  async function seedPlainMessage() {
+    const ctx = await setup();
+    const handler = ctx.adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'ee'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('hi')),
+        },
+      },
+    });
+    await waitFor(() => expect(ctx.container.querySelector('.channel-message')).toBeTruthy());
+    return ctx;
+  }
+
+  it('renders the quick-react buttons 👍 👎 in the toolbar', async () => {
+    const { container } = await seedPlainMessage();
+    const quick = container.querySelectorAll('.reaction-toolbar .quick-react');
+    expect(quick.length).toBe(2);
+    expect(quick[0].textContent).toContain('👍');
+    expect(quick[1].textContent).toContain('👎');
+  });
+
+  it('does not render the reaction toolbar on pre-fork snapshot messages', async () => {
+    // Pre-fork messages come from the original community's log, not the live
+    // channel — reacting would mis-target the current (community, channel),
+    // so the hover toolbar must be suppressed for them (CodeAnt PR #316).
+    const preForkMsg = {
+      messageId: 'pf1',
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      author: 'ee'.repeat(20),
+      at: { wallMs: 500, logical: 0, deviceId: 'd' },
+      body: Array.from(new TextEncoder().encode('old message')),
+    };
+    const { container } = await setup({
+      snapshotMessages: [preForkMsg],
+      originalCommunityName: 'OldCommunity',
+      forkedAtMs: 1000,
+    });
+    let preForkArticle: Element | null = null;
+    await waitFor(() => {
+      preForkArticle = container.querySelector('article.channel-message.pre-fork');
+      expect(preForkArticle).toBeTruthy();
+    });
+    expect(preForkArticle!.querySelector('.reaction-toolbar')).toBeNull();
+  });
+
+  it('clicking the 👍 quick-react adds the reaction (add:true)', async () => {
+    const { adapter, container } = await seedPlainMessage();
+    const thumb = container.querySelector('.reaction-toolbar .quick-react') as HTMLButtonElement;
+    await fireEvent.click(thumb);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      messageId: 'm1',
+      emoji: '👍',
+      add: true,
+    });
+  });
+
+  it('the picker toggle opens a grid of 10 emoji', async () => {
+    const { container } = await seedPlainMessage();
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    await waitFor(() => {
+      const picker = container.querySelector('.reaction-picker');
+      expect(picker).toBeTruthy();
+      expect(picker!.querySelectorAll('.picker-emoji').length).toBe(10);
+    });
+  });
+
+  it('selecting a picker emoji adds it (add:true) and closes the picker', async () => {
+    const { adapter, container } = await seedPlainMessage();
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    let party: HTMLButtonElement | null = null;
+    await waitFor(() => {
+      const btns = Array.from(container.querySelectorAll('.picker-emoji')) as HTMLButtonElement[];
+      party = btns.find((b) => b.textContent?.includes('🎉')) ?? null;
+      expect(party).toBeTruthy();
+    });
+    await fireEvent.click(party!);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      messageId: 'm1',
+      emoji: '🎉',
+      add: true,
+    });
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeNull());
+  });
+
+  it('Escape closes the picker', async () => {
+    const { container } = await seedPlainMessage();
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeTruthy());
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeNull());
+  });
+
+  it('clicking outside closes the picker', async () => {
+    const { container } = await seedPlainMessage();
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeTruthy());
+    await fireEvent.click(document.body);
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeNull());
+  });
+
+  it("clicking a DIFFERENT message's toolbar closes the open picker (Greptile #316 P1)", async () => {
+    // Every message renders its own .reaction-toolbar; the outside-click guard
+    // must close the picker when the click lands in another message's toolbar,
+    // not just leave it open because *some* toolbar was hit.
+    const ctx = await setup();
+    const handler = ctx.adapter.listeners.get('channel-message-received')!;
+    for (const [id, w] of [['m1', 1000], ['m2', 2000]] as const) {
+      handler({
+        payload: {
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          message: {
+            messageId: id,
+            communityId: 'aa'.repeat(16),
+            channelId: 'bb'.repeat(16),
+            author: 'ee'.repeat(20),
+            at: { wallMs: w, logical: 0, deviceId: 'd' },
+            body: Array.from(new TextEncoder().encode(`hi ${id}`)),
+          },
+        },
+      });
+    }
+    await waitFor(() =>
+      expect(ctx.container.querySelectorAll('.channel-message').length).toBe(2),
+    );
+    const toolbars = Array.from(ctx.container.querySelectorAll('.reaction-toolbar'));
+    expect(toolbars.length).toBe(2);
+    // Open the picker on the first message's toolbar.
+    await fireEvent.click(toolbars[0].querySelector('.picker-toggle') as HTMLButtonElement);
+    await waitFor(() => expect(ctx.container.querySelector('.reaction-picker')).toBeTruthy());
+    // The OTHER toolbar is the one that does NOT contain the open picker.
+    const otherToolbar = toolbars.find((tb) => !tb.querySelector('.reaction-picker'))!;
+    expect(otherToolbar).toBeTruthy();
+    // Clicking a control in a different message's toolbar must close the picker.
+    await fireEvent.click(otherToolbar.querySelector('.quick-react') as HTMLButtonElement);
+    await waitFor(() => expect(ctx.container.querySelector('.reaction-picker')).toBeNull());
+  });
+});
