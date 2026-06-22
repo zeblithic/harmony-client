@@ -20609,6 +20609,36 @@ pub(crate) async fn ingest_channel_artifact_impl(
 /// to the same dest can't clobber each other's `.partial` temp.
 static ARTIFACT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// ZEB-540: pure decrypt + plaintext-size-verify, shared by the download
+/// (writes to disk) and preview (returns bytes) paths. Decrypts with the epoch
+/// key when `encrypted` (the nonce `encrypt_blob` prepended is read back by
+/// `decrypt_blob`), then verifies the plaintext length equals the authoritative
+/// `expected_size`. No I/O — unit-testable without a `NodeState`.
+fn decrypt_and_verify_artifact(
+    bytes: Vec<u8>,
+    encrypted: bool,
+    epoch_key_opt: Option<crate::owner_state_types::EpochKey>,
+    expected_size: u64,
+) -> Result<Vec<u8>, String> {
+    let plaintext = if encrypted {
+        let epoch_key =
+            epoch_key_opt.ok_or_else(|| "encrypted artifact requires an epoch key".to_string())?;
+        crate::community_state_sync::decrypt_blob(&epoch_key, &bytes)
+            .map_err(|e| format!("decrypt: {e:?}"))?
+    } else {
+        bytes
+    };
+
+    // Verify length BEFORE any caller-side write so a mismatch never leaves a file.
+    if plaintext.len() as u64 != expected_size {
+        return Err(format!(
+            "size mismatch: got {} expected {expected_size}",
+            plaintext.len()
+        ));
+    }
+    Ok(plaintext)
+}
+
 /// ZEB-535: pure post-fetch tail of [`download_channel_artifact_impl`].
 ///
 /// Given the fetched bytes (ciphertext if `encrypted`, else plaintext):
@@ -20627,22 +20657,7 @@ async fn finalize_artifact(
     expected_size: u64,
     dest_path: &str,
 ) -> Result<u64, String> {
-    let plaintext = if encrypted {
-        let epoch_key =
-            epoch_key_opt.ok_or_else(|| "encrypted artifact requires an epoch key".to_string())?;
-        crate::community_state_sync::decrypt_blob(&epoch_key, &bytes)
-            .map_err(|e| format!("decrypt: {e:?}"))?
-    } else {
-        bytes
-    };
-
-    // Verify length BEFORE any write so a mismatch never leaves a file.
-    if plaintext.len() as u64 != expected_size {
-        return Err(format!(
-            "size mismatch: got {} expected {expected_size}",
-            plaintext.len()
-        ));
-    }
+    let plaintext = decrypt_and_verify_artifact(bytes, encrypted, epoch_key_opt, expected_size)?;
 
     // Atomic write: temp file in the dest dir, then rename over the target.
     // The temp shares dest's dir (via with_extension) so the rename is a true
@@ -20662,6 +20677,133 @@ async fn finalize_artifact(
         return Err(format!("rename: {e}"));
     }
     Ok(plaintext.len() as u64)
+}
+
+/// ZEB-540: result of [`authorize_and_fetch_artifact`] — the fetched bytes
+/// (ciphertext if `encrypted`, else plaintext) plus the metadata needed to
+/// decrypt/verify and (for download) allowlist re-serve.
+pub(crate) struct ArtifactFetch {
+    pub bytes: Vec<u8>,
+    pub encrypted: bool,
+    pub epoch_key_opt: Option<crate::owner_state_types::EpochKey>,
+    pub expected_size: u64,
+    pub content_id: harmony_content::cid::ContentId,
+}
+
+/// ZEB-540: the security-critical authorize-FIRST gate + bounded fetch, shared by
+/// `download_channel_artifact_impl` and `preview_channel_artifact_impl`. The
+/// signed channel log is the source of truth: an unmatched CID is rejected
+/// (`"unknown or unauthorized attachment"`) and the authoritative `expected_size`
+/// comes from the signed attachment, not the caller. The over-`cap` rejection
+/// happens BEFORE any byte is fetched. The fetch is issued `serveable: false`
+/// (no re-serve allowlisting during assembly — download grants that
+/// post-validation; preview never does).
+pub(crate) async fn authorize_and_fetch_artifact(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: &str,
+    channel_id: &str,
+    cid: &str,
+    cap: u64,
+) -> Result<ArtifactFetch, String> {
+    use harmony_content::cid::ContentId;
+
+    // Bound the hex length BEFORE decoding (a multi-MB hex string would allocate
+    // ~half its length before the [u8; 32] conversion fails — IPC-boundary DoS).
+    if cid.len() != 64 {
+        return Err("invalid cid hex".to_string());
+    }
+    let cid_bytes: [u8; 32] = hex::decode(cid)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| "invalid cid hex".to_string())?;
+    let content_id = ContentId::from_bytes(cid_bytes);
+    let encrypted = content_id.flags().encrypted;
+
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    if channel_id.len() != 32 {
+        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes16: [u8; 16] = hex::decode(community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let chid_bytes16: [u8; 16] = hex::decode(channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "channel_id length wrong".to_string())?;
+    let space = crate::owner_state_types::SpaceId(cid_bytes16);
+    let chid = crate::community_membership::ChannelId(chid_bytes16);
+
+    let registry = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard
+            .channel_log_registry
+            .as_ref()
+            .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?
+            .clone()
+    };
+    let engine = registry
+        .engine(&space, &chid)
+        .await
+        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+
+    let att = engine
+        .find_attachment(&cid_bytes)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "unknown or unauthorized attachment".to_string())?;
+    let expected_size = att.size; // AUTHORITATIVE — from the signed channel event.
+
+    if expected_size > cap {
+        return Err(format!("artifact size {expected_size} exceeds cap {cap}"));
+    }
+
+    let epoch_key_opt = if encrypted {
+        Some(current_epoch_key_for(state, &space).await?)
+    } else {
+        None
+    };
+
+    let fetch_tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    // Fetch `max_bytes` bounds the ASSEMBLED bytes — ciphertext for an encrypted
+    // CID, so widen by the AEAD nonce+tag overhead; plaintext is still bounded by
+    // the size check in `decrypt_and_verify_artifact`.
+    let fetch_cap = if encrypted {
+        expected_size.saturating_add(crate::community_state_sync::BLOB_ENCRYPTION_OVERHEAD as u64)
+    } else {
+        expected_size
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid.to_string(),
+            reply: reply_tx,
+            max_bytes: Some(fetch_cap as usize),
+            serveable: false,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    let bytes = reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())??;
+
+    Ok(ArtifactFetch {
+        bytes,
+        encrypted,
+        epoch_key_opt,
+        expected_size,
+        content_id,
+    })
 }
 
 /// ZEB-535 / ZEB-539: download an in-channel CAS artifact to a local path.
@@ -20711,132 +20853,25 @@ pub(crate) async fn download_channel_artifact_impl(
     dest_path: String,
     max_bytes: Option<u64>,
 ) -> Result<u64, String> {
-    use harmony_content::cid::ContentId;
-
-    // CodeAnt #1 (security): bound the hex length BEFORE decoding. A 32-byte
-    // CID is exactly 64 hex chars; without this guard a caller-supplied
-    // multi-MB hex string allocates ~half its length before the [u8; 32]
-    // conversion fails (memory/CPU DoS at the IPC boundary).
-    if cid.len() != 64 {
-        return Err("invalid cid hex".to_string());
-    }
-    let cid_bytes: [u8; 32] = hex::decode(&cid)
-        .ok()
-        .and_then(|b| <[u8; 32]>::try_from(b).ok())
-        .ok_or_else(|| "invalid cid hex".to_string())?;
-    let content_id = ContentId::from_bytes(cid_bytes);
-    let encrypted = content_id.flags().encrypted;
-
-    // ── Authorize FIRST (before any fetch). ──────────────────────────────────
-    // Parse community/channel ids + look up the engine, mirroring
-    // `post_channel_message_impl`. The signed channel log is the source of
-    // truth: an unmatched CID is neither downloadable nor re-servable.
-    if community_id.len() != 32 {
-        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    if channel_id.len() != 32 {
-        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    let cid_bytes16: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "community_id length wrong".to_string())?;
-    let chid_bytes16: [u8; 16] = hex::decode(&channel_id)
-        .map_err(|e| format!("invalid channel_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "channel_id length wrong".to_string())?;
-    let space = crate::owner_state_types::SpaceId(cid_bytes16);
-    let chid = crate::community_membership::ChannelId(chid_bytes16);
-
-    let registry = {
-        let guard = state
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        guard
-            .channel_log_registry
-            .as_ref()
-            .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?
-            .clone()
-    };
-    let engine = registry
-        .engine(&space, &chid)
-        .await
-        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
-
-    let att = engine
-        .find_attachment(&cid_bytes)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "unknown or unauthorized attachment".to_string())?;
-    // AUTHORITATIVE size — from the signed channel event, not the caller.
-    let expected_size = att.size;
-
-    // Cap check against the client ceiling.
+    // Clamp the client ceiling to the download cap; the helper does the
+    // authoritative `expected_size > cap` check.
     let cap = max_bytes
         .map(|m| m.min(MAX_ARTIFACT_BYTES))
         .unwrap_or(MAX_ARTIFACT_BYTES);
-    if expected_size > cap {
-        return Err(format!("artifact size {expected_size} exceeds cap {cap}"));
-    }
-
-    // Resolve the epoch key (only when encrypted). The community_id is already
-    // parsed above; reuse `space` rather than re-decoding.
-    let epoch_key_opt = if encrypted {
-        Some(current_epoch_key_for(state, &space).await?)
-    } else {
-        None
-    };
-
-    let fetch_tx = {
-        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
-        g.fetch_tx
-            .clone()
-            .ok_or_else(|| "not connected".to_string())?
-    };
-    // The fetch `max_bytes` bounds the ASSEMBLED bytes, which for an encrypted
-    // CID is the ciphertext — larger than the plaintext by `encrypt_blob`'s
-    // nonce+tag overhead. Bound the fetch to the SIGNED plaintext `expected_size`
-    // (+AEAD overhead when encrypted), NOT the global artifact cap: otherwise a
-    // huge interior couldn't lie past the authoritative size, but keeping the
-    // fetch bound tight to the signed size is defence-in-depth. The
-    // `expected_size > cap` guard above already proved `expected_size <= cap`.
-    let fetch_cap = if encrypted {
-        expected_size.saturating_add(crate::community_state_sync::BLOB_ENCRYPTION_OVERHEAD as u64)
-    } else {
-        expected_size
-    };
-
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    fetch_tx
-        .send(event_loop::FetchRequest {
-            cid_hex: cid,
-            reply: reply_tx,
-            max_bytes: Some(fetch_cap as usize),
-            // SECURITY (ZEB-539): never re-serve DURING the fetch. The fetch only
-            // assembles the artifact locally; re-serve is granted post-validation
-            // (below), and only for an authorized encrypted attachment.
-            serveable: false,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-    let bytes = reply_rx
-        .await
-        .map_err(|_| "event loop dropped fetch request".to_string())??;
+    let ArtifactFetch {
+        bytes,
+        encrypted,
+        epoch_key_opt,
+        expected_size,
+        content_id,
+    } = authorize_and_fetch_artifact(state, &community_id, &channel_id, &cid, cap).await?;
 
     let written =
         finalize_artifact(bytes, encrypted, epoch_key_opt, expected_size, &dest_path).await?;
 
-    // ── Post-validation re-serve (ZEB-539). ──────────────────────────────────
-    // Only encrypted artifacts need allowlisting — public CIDs are servable by
-    // the gate regardless. The artifact is now validated (decrypted + size
-    // verified) AND was confirmed an authorized attachment above, so it is safe
-    // to swarm to other members. A re-serve failure is non-fatal: the user's
-    // file is already written.
+    // Post-validation re-serve allowlist (ZEB-539) — encrypted only; non-fatal.
     if encrypted {
-        // Lock acquisition is itself non-fatal here: `finalize_artifact` already
-        // wrote the user's file, so a poisoned lock must not turn a successful
-        // download into an `Err`. Log and skip allowlisting — consistent with the
-        // `allow_serve_subtree` error arm below ("re-serve failure is non-fatal").
+        let cid_bytes = content_id.to_bytes();
         let content_store = match state.lock() {
             Ok(g) => g.content_store.clone(),
             Err(e) => {
@@ -20850,20 +20885,16 @@ pub(crate) async fn download_channel_artifact_impl(
         };
         if let Some(store) = content_store {
             match store.allow_serve_subtree(content_id).await {
-                Ok(n) => {
-                    tracing::debug!(
-                        cid = %hex::encode(cid_bytes),
-                        allowlisted = n,
-                        "ZEB-539: allowlisted downloaded artifact subtree for re-serve"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        cid = %hex::encode(cid_bytes),
-                        error = %e,
-                        "ZEB-539: failed to allowlist artifact subtree for re-serve (non-fatal; file written)"
-                    );
-                }
+                Ok(n) => tracing::debug!(
+                    cid = %hex::encode(cid_bytes),
+                    allowlisted = n,
+                    "ZEB-539: allowlisted downloaded artifact subtree for re-serve"
+                ),
+                Err(e) => tracing::warn!(
+                    cid = %hex::encode(cid_bytes),
+                    error = %e,
+                    "ZEB-539: failed to allowlist artifact subtree for re-serve (non-fatal; file written)"
+                ),
             }
         }
     }
