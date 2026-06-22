@@ -16,6 +16,7 @@ use crate::owner_state_crypto::canonical_cbor_encode;
 use crate::owner_state_types::{Hlc, SpaceId};
 use crate::voice_crypto::{decrypt_voice_packet, encrypt_voice_packet, COMMUNITY_PRESENCE_AAD};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Presence has no channel, so the AEAD seam (which is `(community, channel)`
 /// scoped for voice) is bound with this all-zero sentinel channel. The
@@ -161,6 +162,143 @@ pub fn seal_presence_beacon_with_nonce(
     .map_err(|_| BeaconError::Encode)
 }
 
+// ── In-memory roster map (ZEB-537 Task 2) ───────────────────────────
+//
+// Community-scoped, pure-liveness presence roster. Mirrors `VoicePresenceMap`
+// (ZEB-350) but SIMPLIFIED: community presence carries no `muted` and no
+// `left`/gravestone tombstone logic — it is pure liveness, so TTL eviction
+// is the only way a device leaves the roster. Keyed by `SpaceId` (community)
+// → device → entry (voice keys by `(community, channel)`).
+
+/// One live device's last-known presence state within a community.
+struct PresenceEntry {
+    owner: [u8; 16],
+    started_hlc: Hlc,
+    seq: u64,
+    last_seen_ms: u64,
+}
+
+/// One row in a community's online roster: an owner aggregated across all of
+/// their currently-live devices. This (owner-level, not device-level) is what
+/// the frontend renders, so `apply` reports change only at owner granularity.
+pub struct OwnerPresence {
+    pub owner: [u8; 16],
+    pub device_count: u32,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct CommunityPresenceMap {
+    // community → device → entry
+    inner: BTreeMap<SpaceId, BTreeMap<[u8; 32], PresenceEntry>>,
+}
+
+impl CommunityPresenceMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply a (verified, opened) beacon. `now_ms` is a monotonic clock the
+    /// caller supplies. Returns true only when the OWNER-level roster changed
+    /// (a new owner came online) — a bare liveness refresh or a second device
+    /// for an already-online owner returns false to avoid frontend event spam.
+    ///
+    /// Freshness mirrors `VoicePresenceMap::apply` (minus gravestones): a
+    /// strictly-newer `started_hlc` supersedes regardless of `seq` (seq
+    /// restarts at 0 on every (re)start of the presence publisher), an older
+    /// session is rejected, and within the same session only a strictly-newer
+    /// `seq` advances liveness.
+    pub fn apply(&mut self, c: &SpaceId, beacon: &PresenceBeacon, now_ms: u64) -> bool {
+        let community = self.inner.entry(*c).or_default();
+        match community.get_mut(&beacon.device) {
+            Some(e) if beacon.started_hlc.is_strictly_newer_than(&e.started_hlc) => {
+                // A NEW session supersedes regardless of seq. The owner already
+                // had this device online, so the owner-level roster is unchanged.
+                e.owner = beacon.owner;
+                e.started_hlc = beacon.started_hlc.clone();
+                e.seq = beacon.seq;
+                e.last_seen_ms = now_ms;
+                false
+            }
+            Some(e) if e.started_hlc.is_strictly_newer_than(&beacon.started_hlc) => false, // older session → stale
+            Some(e) if beacon.seq <= e.seq => false, // same session, stale or duplicate seq
+            Some(e) => {
+                // Same session, newer seq: advance liveness so the TTL sweep
+                // still sees this device alive, but the owner is already online
+                // → not an owner-visible change.
+                e.seq = beacon.seq;
+                e.last_seen_ms = now_ms;
+                false
+            }
+            None => {
+                // Brand-new device for this community. Whether this is an
+                // owner-visible change depends on whether the owner already had
+                // another live device here.
+                let owner_was_online = community.values().any(|e| e.owner == beacon.owner);
+                community.insert(
+                    beacon.device,
+                    PresenceEntry {
+                        owner: beacon.owner,
+                        started_hlc: beacon.started_hlc.clone(),
+                        seq: beacon.seq,
+                        last_seen_ms: now_ms,
+                    },
+                );
+                !owner_was_online
+            }
+        }
+    }
+
+    /// Evict every entry whose last beacon is older than `ttl_ms`. Returns the
+    /// `(community, owner, device)` of each evicted entry so the caller can
+    /// re-emit the affected community's roster. With no gravestones every
+    /// eviction is roster-affecting.
+    pub fn sweep(&mut self, now_ms: u64, ttl_ms: u64) -> Vec<(SpaceId, [u8; 16], [u8; 32])> {
+        let mut evicted = Vec::new();
+        for (community, devices) in self.inner.iter_mut() {
+            devices.retain(|device, e| {
+                let alive = now_ms.saturating_sub(e.last_seen_ms) < ttl_ms;
+                if !alive {
+                    evicted.push((*community, e.owner, *device));
+                }
+                alive
+            });
+        }
+        // Reclaim community sub-maps emptied by eviction so they don't linger as
+        // ghost entries every future sweep re-scans (Greptile lesson, ZEB-350).
+        self.inner.retain(|_, devices| !devices.is_empty());
+        evicted
+    }
+
+    /// The owners currently online in `c`, aggregated across their devices.
+    /// `device_count` is that owner's live device count; `last_seen_ms` is the
+    /// max over those devices. Deterministic order (sorted by owner bytes).
+    pub fn online_owners(&self, c: &SpaceId) -> Vec<OwnerPresence> {
+        let Some(devices) = self.inner.get(c) else {
+            return Vec::new();
+        };
+        let mut by_owner: BTreeMap<[u8; 16], (u32, u64)> = BTreeMap::new();
+        for e in devices.values() {
+            let agg = by_owner.entry(e.owner).or_insert((0, 0));
+            agg.0 += 1;
+            agg.1 = agg.1.max(e.last_seen_ms);
+        }
+        by_owner
+            .into_iter()
+            .map(|(owner, (device_count, last_seen_ms))| OwnerPresence {
+                owner,
+                device_count,
+                last_seen_ms,
+            })
+            .collect()
+    }
+
+    /// Drop a community's entire roster (e.g. on leave), reclaiming the sub-map.
+    pub fn remove_community(&mut self, c: &SpaceId) {
+        self.inner.remove(c);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +354,88 @@ mod tests {
         assert_eq!(open_presence_beacon(&key, &c, &sealed), Some(signed));
         let other = derive_presence_key(&EpochKey::new([0x22; 32]), &c);
         assert_eq!(open_presence_beacon(&other, &c, &sealed), None);
+    }
+
+    // ── CommunityPresenceMap (Task 2) ───────────────────────────────
+
+    fn b(owner: u8, dev: u8, wall: u64, seq: u64) -> PresenceBeacon {
+        PresenceBeacon {
+            owner: [owner; 16],
+            device: [dev; 32],
+            started_hlc: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: "aa".repeat(32),
+            },
+            seq,
+        }
+    }
+
+    #[test]
+    fn new_device_marks_online_and_reports_change() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        assert!(m.apply(&c, &b(1, 1, 100, 0), 1_000));
+        let r = m.online_owners(&c);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].owner, [1; 16]);
+        assert_eq!(r[0].device_count, 1);
+    }
+
+    #[test]
+    fn bare_refresh_does_not_report_change() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        assert!(m.apply(&c, &b(1, 1, 100, 0), 1_000));
+        assert!(!m.apply(&c, &b(1, 1, 100, 1), 2_000)); // same session, newer seq, already online
+    }
+
+    #[test]
+    fn reordered_old_beacon_rejected() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        assert!(m.apply(&c, &b(1, 1, 100, 5), 1_000));
+        assert!(!m.apply(&c, &b(1, 1, 100, 3), 2_000)); // stale seq, no change
+    }
+
+    #[test]
+    fn restart_new_session_supersedes() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        assert!(m.apply(&c, &b(1, 1, 100, 9), 1_000));
+        // newer started_hlc, seq reset to 0, accepted; owner already online so NOT a visible change:
+        assert!(!m.apply(&c, &b(1, 1, 200, 0), 2_000));
+        // but last_seen advanced — sweep at 2_000+ttl-1 keeps it:
+        assert_eq!(m.online_owners(&c).len(), 1);
+    }
+
+    #[test]
+    fn sweep_evicts_stale_and_reports() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        m.apply(&c, &b(1, 1, 100, 0), 1_000);
+        let ev = m.sweep(1_000 + 30_001, 30_000);
+        assert_eq!(ev.len(), 1);
+        assert!(m.online_owners(&c).is_empty());
+    }
+
+    #[test]
+    fn multi_device_aggregates_to_one_owner() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        m.apply(&c, &b(1, 1, 100, 0), 1_000);
+        m.apply(&c, &b(1, 2, 100, 0), 1_000);
+        let r = m.online_owners(&c);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].device_count, 2);
+    }
+
+    #[test]
+    fn remove_community_clears_roster() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        m.apply(&c, &b(1, 1, 100, 0), 1_000);
+        m.remove_community(&c);
+        assert!(m.online_owners(&c).is_empty());
     }
 }
