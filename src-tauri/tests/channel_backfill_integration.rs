@@ -291,6 +291,8 @@ fn make_signed_event(
         content_kind: 0,
         body,
         reply_to: None,
+        mentions: None,
+        attachments: None,
     };
     sign_channel_event(&payload, signing_key).expect("sign")
 }
@@ -494,7 +496,7 @@ async fn pre_join_history_backfills_to_new_member() {
     let engine_a = spawn_channel(&a, community_id, channel_id, &channel_key, &state).await;
     for body in ["pre-1", "pre-2", "pre-3"] {
         Arc::clone(&engine_a)
-            .publish(body.as_bytes().to_vec(), None)
+            .publish(body.as_bytes().to_vec(), None, None, None)
             .await
             .expect("publish");
     }
@@ -616,7 +618,7 @@ async fn reconnect_catch_up_fetches_exactly_missed_events() {
     // ── A posts 3 more while B is offline ───────────────────────────
     for body in ["miss-1", "miss-2", "miss-3"] {
         Arc::clone(&engine_a)
-            .publish(body.as_bytes().to_vec(), None)
+            .publish(body.as_bytes().to_vec(), None, None, None)
             .await
             .expect("publish offline");
     }
@@ -757,7 +759,7 @@ async fn eventual_convergence_when_holder_appears_late() {
     // already-satisfied joiner via normal live pub/sub.
     for body in ["late-1", "late-2", "late-3"] {
         Arc::clone(&engine_a)
-            .publish(body.as_bytes().to_vec(), None)
+            .publish(body.as_bytes().to_vec(), None, None, None)
             .await
             .expect("publish");
     }
@@ -822,7 +824,7 @@ async fn backfilled_event_from_non_member_at_hlc_is_rejected() {
     let engine_a = spawn_channel(&a, community_id, channel_id, &channel_key, &state_a).await;
     for body in ["legit-1", "legit-2"] {
         Arc::clone(&engine_a)
-            .publish(body.as_bytes().to_vec(), None)
+            .publish(body.as_bytes().to_vec(), None, None, None)
             .await
             .expect("publish");
     }

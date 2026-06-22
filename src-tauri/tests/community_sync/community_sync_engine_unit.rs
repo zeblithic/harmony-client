@@ -207,7 +207,9 @@ async fn engine_receives_remote_publish_and_merges_event() {
         use harmony_app::content_store::CasOp;
         while let Some(op) = cas_op_rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     cas_for_servicer.lock().await.insert(cid, blob);
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(()));
@@ -224,6 +226,9 @@ async fn engine_receives_remote_publish_and_merges_event() {
                 CasOp::GetLocal { cid, reply } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }
@@ -466,7 +471,9 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         use harmony_app::content_store::CasOp;
         while let Some(op) = cas_op_rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     cas_for_servicer.lock().await.insert(cid, blob);
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(()));
@@ -483,6 +490,9 @@ async fn engine_emits_membership_delta_on_remote_insert() {
                 CasOp::GetLocal { cid, reply } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }
@@ -1084,7 +1094,9 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
         use harmony_app::content_store::CasOp;
         while let Some(op) = cas_op_rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     cas_for_servicer.lock().await.insert(cid, blob);
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(()));
@@ -1101,6 +1113,9 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
                 CasOp::GetLocal { cid, reply } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }
@@ -1270,7 +1285,9 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
         use harmony_app::content_store::CasOp;
         while let Some(op) = cas_op_rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     cas_for_servicer.lock().await.insert(cid, blob);
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(()));
@@ -1287,6 +1304,9 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
                 CasOp::GetLocal { cid, reply } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }
@@ -1509,7 +1529,9 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
         use harmony_app::content_store::CasOp;
         while let Some(op) = cas_op_rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     cas_for_servicer.lock().await.insert(cid, blob);
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(()));
@@ -1526,6 +1548,9 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
                 CasOp::GetLocal { cid, reply } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }

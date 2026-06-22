@@ -2270,7 +2270,9 @@ mod cas_op_protocol_tests {
         tokio::spawn(async move {
             while let Some(op) = cas_op_rx.recv().await {
                 match op {
-                    CasOp::PutLocal { cid, blob, reply } => {
+                    CasOp::PutLocal {
+                        cid, blob, reply, ..
+                    } => {
                         store.lock().await.insert(cid, blob);
                         if let Some(reply) = reply {
                             let _ = reply.send(Ok(()));
@@ -2283,6 +2285,10 @@ mod cas_op_protocol_tests {
                     CasOp::GetLocal { cid, reply } => {
                         let bytes = store.lock().await.get(&cid).cloned();
                         let _ = reply.send(bytes);
+                    }
+                    CasOp::AllowServeSubtree { reply, .. } => {
+                        // Not exercised by this stub.
+                        let _ = reply.send(Ok(0));
                     }
                 }
             }
@@ -2357,7 +2363,9 @@ mod cas_op_protocol_tests {
             let mut first_get = true;
             while let Some(op) = cas_op_rx.recv().await {
                 match op {
-                    CasOp::PutLocal { cid, blob, reply } => {
+                    CasOp::PutLocal {
+                        cid, blob, reply, ..
+                    } => {
                         store_ref.lock().await.insert(cid, blob);
                         if let Some(reply) = reply {
                             let _ = reply.send(Ok(()));
@@ -2375,6 +2383,10 @@ mod cas_op_protocol_tests {
                     CasOp::GetLocal { cid, reply } => {
                         let bytes = store_ref.lock().await.get(&cid).cloned();
                         let _ = reply.send(bytes);
+                    }
+                    CasOp::AllowServeSubtree { reply, .. } => {
+                        // Not exercised by this stub.
+                        let _ = reply.send(Ok(0));
                     }
                 }
             }
@@ -2477,7 +2489,9 @@ mod cas_op_protocol_tests {
         let _stub = tokio::spawn(async move {
             while let Some(op) = cas_op_rx.recv().await {
                 match op {
-                    CasOp::PutLocal { cid, blob, reply } => {
+                    CasOp::PutLocal {
+                        cid, blob, reply, ..
+                    } => {
                         store_for_stub.lock().await.insert(cid, blob);
                         if let Some(reply) = reply {
                             let _ = reply.send(Ok(()));
@@ -2490,6 +2504,10 @@ mod cas_op_protocol_tests {
                     }
                     CasOp::GetLocal { reply, .. } => {
                         let _ = reply.send(None);
+                    }
+                    CasOp::AllowServeSubtree { reply, .. } => {
+                        // Not exercised by this stub.
+                        let _ = reply.send(Ok(0));
                     }
                 }
             }

@@ -454,8 +454,47 @@ pub async fn streaming_ingest<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    streaming_ingest_with_options(
+        reader,
+        ingest_tx,
+        chunker_config,
+        cancel,
+        IngestOptions::default(),
+    )
+    .await
+}
+
+/// ZEB-535: ingest options. Default = unencrypted, not serveable (the avatar
+/// + file-vault behavior, unchanged).
+///
+/// - `flags` is stamped onto every leaf + bundle CID via `for_book` /
+///   `build_with_flags`. An encrypted artifact sets `flags.encrypted = true`
+///   so `cid.flags().encrypted` drives decrypt-on-fetch.
+/// - `serveable` flows onto each `IngestRequest` so the event loop allowlists
+///   every CID for member-to-member serving (the serve gate silently refuses
+///   un-allowlisted encrypted CIDs).
+#[derive(Clone, Copy, Default)]
+pub struct IngestOptions {
+    pub flags: harmony_content::cid::ContentFlags,
+    pub serveable: bool,
+}
+
+/// ZEB-535: options-aware variant of [`streaming_ingest`]. Stamps `opts.flags`
+/// onto every leaf + bundle CID and propagates `opts.serveable` through each
+/// ingest hop. `streaming_ingest` delegates here with `IngestOptions::default()`
+/// (unencrypted, not serveable) so the avatar / file-vault paths are unchanged.
+pub async fn streaming_ingest_with_options<R>(
+    reader: R,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    chunker_config: harmony_content::chunker::ChunkerConfig,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    opts: IngestOptions,
+) -> Result<(harmony_content::cid::ContentId, u64), IngestError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use harmony_content::chunker::Chunker;
-    use harmony_content::cid::{ContentFlags, ContentId};
+    use harmony_content::cid::ContentId;
     use tokio::io::AsyncReadExt;
 
     let mut reader = reader;
@@ -499,11 +538,16 @@ where
                 &mut open_chunk,
                 Vec::with_capacity(chunker_config.max_chunk),
             );
-            let cid = ContentId::for_book(&chunk, ContentFlags::default())
+            let cid = ContentId::for_book(&chunk, opts.flags)
                 .map_err(|e| IngestError::other(format!("leaf CID: {e:?}")))?;
-            send_ingest(ingest_tx, hex::encode(cid.to_bytes()), chunk)
-                .await
-                .map_err(IngestError::IngestChannel)?;
+            send_ingest(
+                ingest_tx,
+                hex::encode(cid.to_bytes()),
+                chunk,
+                opts.serveable,
+            )
+            .await
+            .map_err(IngestError::IngestChannel)?;
             leaf_cids.push(cid);
             window_pos = cut;
         }
@@ -516,11 +560,16 @@ where
             &mut open_chunk,
             Vec::with_capacity(chunker_config.max_chunk),
         );
-        let cid = ContentId::for_book(&chunk, ContentFlags::default())
+        let cid = ContentId::for_book(&chunk, opts.flags)
             .map_err(|e| IngestError::other(format!("leaf CID: {e:?}")))?;
-        send_ingest(ingest_tx, hex::encode(cid.to_bytes()), chunk)
-            .await
-            .map_err(IngestError::IngestChannel)?;
+        send_ingest(
+            ingest_tx,
+            hex::encode(cid.to_bytes()),
+            chunk,
+            opts.serveable,
+        )
+        .await
+        .map_err(IngestError::IngestChannel)?;
         leaf_cids.push(cid);
     }
 
@@ -530,15 +579,20 @@ where
         // walker doesn't mis-surface 0-byte placeholder files as failures.
         // `build_bundle_tree`'s empty-input error path remains in place as a
         // defensive guard for direct callers that bypass `streaming_ingest`.
-        let cid = ContentId::for_book(&[], ContentFlags::default())
+        let cid = ContentId::for_book(&[], opts.flags)
             .map_err(|e| IngestError::other(format!("empty-file CID: {e:?}")))?;
-        send_ingest(ingest_tx, hex::encode(cid.to_bytes()), Vec::new())
-            .await
-            .map_err(IngestError::IngestChannel)?;
+        send_ingest(
+            ingest_tx,
+            hex::encode(cid.to_bytes()),
+            Vec::new(),
+            opts.serveable,
+        )
+        .await
+        .map_err(IngestError::IngestChannel)?;
         return Ok((cid, 0));
     }
 
-    let root = build_bundle_tree(leaf_cids, total_bytes, ingest_tx).await?;
+    let root = build_bundle_tree_with_options(leaf_cids, total_bytes, ingest_tx, opts).await?;
     Ok((root, total_bytes))
 }
 
@@ -555,13 +609,29 @@ where
 /// Split out from `streaming_ingest` so the tree-build logic can be
 /// unit-tested with synthetic CIDs (no chunker, no I/O).
 ///
+/// ZEB-535: the production ingest path now calls
+/// [`build_bundle_tree_with_options`] directly; this default-flags delegate is
+/// retained for the in-crate synthetic-CID unit tests (its only callers), so it
+/// is `#[cfg(test)]`-gated to avoid a dead-code warning in the lib build.
+#[cfg(test)]
 pub(crate) async fn build_bundle_tree(
     leaf_cids: Vec<harmony_content::cid::ContentId>,
     total_size: u64,
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
 ) -> Result<harmony_content::cid::ContentId, IngestError> {
+    build_bundle_tree_with_options(leaf_cids, total_size, ingest_tx, IngestOptions::default()).await
+}
+
+/// ZEB-535: options-aware variant of [`build_bundle_tree`]. Stamps `opts.flags`
+/// onto each interior bundle CID and propagates `opts.serveable` through the
+/// ingest hop. `build_bundle_tree` delegates here with `IngestOptions::default()`.
+pub(crate) async fn build_bundle_tree_with_options(
+    leaf_cids: Vec<harmony_content::cid::ContentId>,
+    total_size: u64,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    opts: IngestOptions,
+) -> Result<harmony_content::cid::ContentId, IngestError> {
     use harmony_content::bundle::{BundleBuilder, MAX_BUNDLE_ENTRIES};
-    use harmony_content::cid::ContentFlags;
 
     // Empty input is an error (matches dag::ingest's EmptyData).
     if leaf_cids.is_empty() {
@@ -599,11 +669,16 @@ pub(crate) async fn build_bundle_tree(
                 builder.with_metadata(total_size, chunk_count, 0, [0u8; 8]);
             }
             let (bundle_bytes, bundle_cid) = builder
-                .build_with_flags(ContentFlags::default())
+                .build_with_flags(opts.flags)
                 .map_err(|e| IngestError::ManifestBuild(format!("{e:?}")))?;
-            send_ingest(ingest_tx, hex::encode(bundle_cid.to_bytes()), bundle_bytes)
-                .await
-                .map_err(IngestError::IngestChannel)?;
+            send_ingest(
+                ingest_tx,
+                hex::encode(bundle_cid.to_bytes()),
+                bundle_bytes,
+                opts.serveable,
+            )
+            .await
+            .map_err(IngestError::IngestChannel)?;
             next_level.push(bundle_cid);
         }
 
@@ -12609,6 +12684,7 @@ async fn export_content(
             cid_hex: cid,
             reply: reply_tx,
             max_bytes: None,
+            serveable: false,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -13179,11 +13255,15 @@ pub async fn send_ingest(
     tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     cid_hex: String,
     data: Vec<u8>,
+    // ZEB-535: allowlist this CID for member-to-member serve (encrypted
+    // artifact subtree). Avatar / file-vault / folder callers pass `false`.
+    serveable: bool,
 ) -> Result<(), String> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send(event_loop::IngestRequest {
         cid_hex,
         data,
+        serveable,
         reply: reply_tx,
     })
     .await
@@ -13213,6 +13293,7 @@ pub(crate) async fn build_folder_manifest_only(
         ingest_tx,
         hex::encode(built.manifest_cid.to_bytes()),
         built.manifest_bytes,
+        false,
     )
     .await
     .map_err(IngestError::IngestChannel)?;
@@ -13220,6 +13301,7 @@ pub(crate) async fn build_folder_manifest_only(
         ingest_tx,
         hex::encode(built.bundle_cid.to_bytes()),
         built.bundle_bytes,
+        false,
     )
     .await
     .map_err(IngestError::IngestChannel)?;
@@ -13648,6 +13730,7 @@ pub(crate) async fn create_folder_at_root_with_children(
         ingest_tx,
         hex::encode(built.manifest_cid.to_bytes()),
         built.manifest_bytes,
+        false,
     )
     .await
     {
@@ -13660,6 +13743,7 @@ pub(crate) async fn create_folder_at_root_with_children(
         ingest_tx,
         hex::encode(built.bundle_cid.to_bytes()),
         built.bundle_bytes,
+        false,
     )
     .await
     {
@@ -13821,7 +13905,7 @@ pub(crate) async fn create_folder_nested_with_children(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(ingest_tx, cid_hex, bytes).await?;
+        send_ingest(ingest_tx, cid_hex, bytes, false).await?;
     }
 
     // 4. Rekey the top-level sidecar entry. CAS-style: pass root_old
@@ -14484,7 +14568,7 @@ pub async fn rename_content_impl(
     // Drain-then-rekey ordering — same correctness reasoning as
     // move_content and create_folder_nested.
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(&ingest_tx, cid_hex, bytes).await?;
+        send_ingest(&ingest_tx, cid_hex, bytes, false).await?;
     }
 
     let stored_at_ms = std::time::SystemTime::now()
@@ -14780,7 +14864,7 @@ async fn move_case_a(
     // strictly better than ingest-after-rekey-failure: an orphan-bytes
     // outcome on this path beats an unreachable-chain outcome).
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(ingest_tx, cid_hex, bytes).await?;
+        send_ingest(ingest_tx, cid_hex, bytes, false).await?;
     }
 
     // Single CAS rekey on the source/destination sidecar (they are the
@@ -14857,7 +14941,7 @@ async fn move_case_b(
     .await?;
 
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(ingest_tx, cid_hex, bytes).await?;
+        send_ingest(ingest_tx, cid_hex, bytes, false).await?;
     }
 
     // STAGE 1: rekey destination.
@@ -14969,7 +15053,7 @@ async fn move_case_c(
     )
     .await?;
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(ingest_tx, cid_hex, bytes).await?;
+        send_ingest(ingest_tx, cid_hex, bytes, false).await?;
     }
 
     // STAGE 1: rekey destination.
@@ -15072,7 +15156,7 @@ async fn move_case_d(
     )
     .await?;
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(ingest_tx, cid_hex, bytes).await?;
+        send_ingest(ingest_tx, cid_hex, bytes, false).await?;
     }
 
     // Size of the new top-level entry: try to read the moved child's
@@ -15758,6 +15842,7 @@ async fn fetch_content(
             cid_hex: cid,
             reply: reply_tx,
             max_bytes: None,
+            serveable: false,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -15794,6 +15879,7 @@ async fn fetch_avatar(
             cid_hex: cid,
             reply: reply_tx,
             max_bytes: Some(AVATAR_MAX_BYTES),
+            serveable: false,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -15901,6 +15987,7 @@ async fn fetch_profile_doc(
             cid_hex: cid,
             reply: reply_tx,
             max_bytes: None,
+            serveable: false,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -19952,8 +20039,66 @@ async fn post_channel_message(
     channel_id: String,
     body: Vec<u8>,
     reply_to: Option<String>,
+    mentions: Option<Vec<String>>,
+    attachments: Option<Vec<crate::community_channel_log_engine::ChannelAttachmentDto>>,
 ) -> Result<String, String> {
-    post_channel_message_impl(state_lock.inner(), community_id, channel_id, body, reply_to).await
+    post_channel_message_impl(
+        state_lock.inner(),
+        community_id,
+        channel_id,
+        body,
+        reply_to,
+        mentions,
+        attachments,
+    )
+    .await
+}
+
+/// ZEB-539: Tauri IPC — download an authorized channel artifact to `dest_path`.
+/// Thin delegate to [`download_channel_artifact_impl`]; see that fn for the
+/// authorize-first / server-derived-size / post-validation re-serve contract.
+#[tauri::command]
+async fn download_channel_artifact(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+    cid: String,
+    dest_path: String,
+    max_bytes: Option<u64>,
+) -> Result<u64, String> {
+    download_channel_artifact_impl(
+        state_lock.inner(),
+        community_id,
+        channel_id,
+        cid,
+        dest_path,
+        max_bytes,
+    )
+    .await
+}
+
+/// ZEB-539: Tauri IPC — ingest a local file as a channel artifact.
+/// Thin delegate to [`ingest_channel_artifact_impl`]; see that fn for the
+/// stat/cap, name/mime resolution, encrypt-in-memory, and serve-allowlist
+/// contract. `encrypt` defaults to `true` when the caller omits it.
+#[tauri::command]
+async fn ingest_channel_artifact(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    source_path: String,
+    name: Option<String>,
+    mime: Option<String>,
+    encrypt: Option<bool>,
+) -> Result<crate::community_channel_log_engine::ChannelAttachmentDto, String> {
+    ingest_channel_artifact_impl(
+        state_lock.inner(),
+        community_id,
+        source_path,
+        name,
+        mime,
+        encrypt.unwrap_or(true),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -19983,6 +20128,8 @@ pub(crate) async fn post_channel_message_impl(
     channel_id: String,
     body: Vec<u8>,
     reply_to: Option<String>,
+    mentions: Option<Vec<String>>,
+    attachments: Option<Vec<crate::community_channel_log_engine::ChannelAttachmentDto>>,
 ) -> Result<String, String> {
     if community_id.len() != 32 {
         return Err("community_id must be 16 bytes (32 hex chars)".to_string());
@@ -20015,6 +20162,91 @@ pub(crate) async fn post_channel_message_impl(
         None => None,
     };
 
+    // ZEB-534: parse each mention hex string -> OwnerAddr (mirrors the
+    // reply_to hex parse). Malformed/short hex is rejected before the
+    // engine sees it; bounds (MAX_MENTIONS) are enforced in publish().
+    let mention_addrs: Option<Vec<crate::owner_state_types::OwnerAddr>> = match mentions {
+        Some(list) => {
+            // ZEB-534: cap the count BEFORE allocating/decoding so an
+            // oversized IPC payload is rejected without burning memory/CPU
+            // (the engine's publish() would reject it later anyway).
+            if list.len() > crate::community_channel_log::MAX_MENTIONS {
+                return Err(format!(
+                    "too many mentions: {} (max {})",
+                    list.len(),
+                    crate::community_channel_log::MAX_MENTIONS
+                ));
+            }
+            let mut out = Vec::with_capacity(list.len());
+            for s in list {
+                if s.len() != 32 {
+                    return Err("each mention must be 16 bytes (32 hex chars)".to_string());
+                }
+                let bytes: [u8; 16] = hex::decode(&s)
+                    .map_err(|e| format!("invalid mention hex: {e}"))?
+                    .try_into()
+                    .map_err(|_| "mention length wrong".to_string())?;
+                out.push(crate::owner_state_types::OwnerAddr(bytes));
+            }
+            Some(out)
+        }
+        None => None,
+    };
+
+    // ZEB-535: convert the IPC-facing attachment DTOs (hex cid + metadata) into
+    // signed `ChannelAttachment`s. Cap the count and field lengths BEFORE
+    // decoding/allocating so an oversized IPC payload is rejected cheaply
+    // (the engine's publish() and inbound verification enforce the same caps).
+    let attachment_vals: Option<Vec<crate::community_channel_log::ChannelAttachment>> =
+        match attachments {
+            Some(list) => {
+                if list.len() > crate::community_channel_log::MAX_ATTACHMENTS {
+                    return Err(format!(
+                        "too many attachments: {} (max {})",
+                        list.len(),
+                        crate::community_channel_log::MAX_ATTACHMENTS
+                    ));
+                }
+                let mut out = Vec::with_capacity(list.len());
+                for a in list {
+                    // CodeAnt #1 (security): bound the hex length BEFORE decoding.
+                    // A 32-byte CID is exactly 64 hex chars; without this guard a
+                    // multi-MB hex string allocates ~half its length before the
+                    // [u8; 32] conversion fails (memory/CPU DoS at the IPC edge).
+                    if a.cid.len() != 64 {
+                        return Err("invalid attachment cid hex".to_string());
+                    }
+                    let cid: [u8; 32] = hex::decode(&a.cid)
+                        .ok()
+                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                        .ok_or_else(|| "invalid attachment cid hex".to_string())?;
+                    if a.name.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+                        || a.mime.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+                    {
+                        return Err("attachment name/mime too long".to_string());
+                    }
+                    // ZEB-539: reject an over-cap size at the IPC mint boundary —
+                    // such an attachment could never be downloaded (the download
+                    // path rejects size > cap), mirroring the verify-side guard.
+                    if a.size > crate::community_channel_log::MAX_ATTACHMENT_SIZE {
+                        return Err(format!(
+                            "attachment too large: {} (max {})",
+                            a.size,
+                            crate::community_channel_log::MAX_ATTACHMENT_SIZE
+                        ));
+                    }
+                    out.push(crate::community_channel_log::ChannelAttachment {
+                        cid,
+                        mime: a.mime,
+                        name: a.name,
+                        size: a.size,
+                    });
+                }
+                Some(out)
+            }
+            None => None,
+        };
+
     let registry = {
         let guard = state
             .lock()
@@ -20032,7 +20264,7 @@ pub(crate) async fn post_channel_message_impl(
         .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
 
     let msg_id = engine
-        .publish(body, reply_to_msg_id)
+        .publish(body, reply_to_msg_id, mention_addrs, attachment_vals)
         .await
         .map_err(|e| e.to_string())?;
     Ok(hex::encode(msg_id.0))
@@ -20091,6 +20323,512 @@ pub(crate) async fn set_message_reaction_impl(
         .react(target, emoji, add)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// ZEB-535: default plaintext cap for a single channel artifact (1 GiB).
+/// Community/operator-configurable later; the wire structure supports far more.
+pub(crate) const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// ZEB-535: minimal extension -> MIME map for channel artifacts. Content
+/// sniffing is intentionally out of scope; an unknown extension falls back to
+/// `application/octet-stream` (the frontend treats that as a generic download).
+pub(crate) fn detect_mime(name: &str) -> String {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "txt" => "text/plain",
+        "json" => "application/json",
+        "png" => "image/png",
+        "diff" | "patch" => "text/x-diff",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// ZEB-535: pure cap + name/mime resolution for a channel artifact. Factored
+/// out of [`ingest_channel_artifact_impl`] so the cap and field-length
+/// validation are unit-testable without standing up a `NodeState` /
+/// event loop. Returns `(name, mime)`.
+///
+/// - Rejects `path_meta_len > MAX_ARTIFACT_BYTES` before any read happens — a
+///   cheap fast-reject on the pre-ingest stat. The AUTHORITATIVE artifact size
+///   (and the size re-check against the cap) is computed by the caller from the
+///   *actual* ingested byte count, not from this stat: a file changing between
+///   the stat and the read/stream would otherwise sign a `size` that doesn't
+///   match the content (breaking download size-verification) and could slip
+///   past the cap if it grows after the stat.
+/// - Defaults `name` from the source path's file name (`"artifact"` if the
+///   path has no usable file-name component).
+/// - Defaults `mime` from the resolved name's extension via [`detect_mime`].
+/// - Rejects an over-long name/mime (`> MAX_ATTACHMENT_FIELD_BYTES`) so the
+///   signed `attachments` field can never exceed the engine's bound.
+pub(crate) fn prepare_artifact_meta(
+    path_meta_len: u64,
+    source_path: &str,
+    name: Option<String>,
+    mime: Option<String>,
+) -> Result<(String, String), String> {
+    if path_meta_len > MAX_ARTIFACT_BYTES {
+        return Err(format!(
+            "artifact too large: {path_meta_len} > {MAX_ARTIFACT_BYTES}"
+        ));
+    }
+    let name = name.unwrap_or_else(|| {
+        std::path::Path::new(source_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("artifact")
+            .to_string()
+    });
+    let mime = mime.unwrap_or_else(|| detect_mime(&name));
+    if name.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+        || mime.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+    {
+        return Err("attachment name/mime too long".to_string());
+    }
+    Ok((name, mime))
+}
+
+/// ZEB-535: read the live community epoch key for `community_id`.
+///
+/// Mirrors `community_state_sync::live_epoch_key`'s `Some(crdt_state)` arm:
+/// clone the `Arc<Mutex<OwnerState>>` out from under the std `NodeState`
+/// lock, then read `guard.spaces.get(community_id)` -> `current_epoch_key`
+/// from the owner-state CRDT. `live_epoch_key` itself is private to
+/// `community_state_sync` and threads a spawn-time fallback we deliberately
+/// don't want here (substituting the fallback would reopen the §10.6
+/// backward-secrecy gap), so the lookup is inlined rather than reused.
+async fn current_epoch_key_for(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: &crate::owner_state_types::SpaceId,
+) -> Result<crate::owner_state_types::EpochKey, String> {
+    let crdt = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.crdt_state.clone().ok_or_else(|| {
+            "no live epoch key for community (not joined / epoch not established)".to_string()
+        })?
+    };
+    let guard = crdt.lock().await;
+    guard
+        .spaces
+        .get(community_id)
+        .and_then(|space| space.current_epoch_key.clone())
+        .ok_or_else(|| {
+            "no live epoch key for community (not joined / epoch not established)".to_string()
+        })
+}
+
+/// ZEB-535: ingest a file as an in-channel CAS artifact.
+///
+/// Stat + cap the file, optionally encrypt the whole file with the live
+/// community epoch key, chunk the (cipher | plain) bytes through
+/// [`streaming_ingest_with_options`], and return a `ChannelAttachmentDto`
+/// for the caller to attach to a channel message.
+///
+/// Encrypted artifacts set `flags.encrypted = true` (so `cid.flags().encrypted`
+/// drives decrypt-on-fetch) and `serveable = true` (so the event loop
+/// allowlists every CID for member-to-member serving; the serve gate silently
+/// refuses un-allowlisted encrypted CIDs). The encrypt path reads + encrypts
+/// the whole file in memory — intentional for v1; the cap bounds the cost.
+///
+/// PR1: backend impl wired to the Tauri IPC in PR2 (Task 9); exercised
+/// end-to-end by the Task 7 two-node integration test.
+pub(crate) async fn ingest_channel_artifact_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    source_path: String,
+    name: Option<String>,
+    mime: Option<String>,
+    encrypt: bool,
+) -> Result<crate::community_channel_log_engine::ChannelAttachmentDto, String> {
+    use harmony_content::chunker::ChunkerConfig;
+    use harmony_content::cid::{ContentFlags, ContentId};
+
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes16: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let space = crate::owner_state_types::SpaceId(cid_bytes16);
+
+    // 1. Stat + cap (cheap fast-reject before reading). Name/mime resolution +
+    //    field-length validation live in the pure `prepare_artifact_meta`. The
+    //    DTO `size` is NOT taken from this stat — it's the actual ingested byte
+    //    count computed below, re-checked against the cap, so a file changing
+    //    between the stat and the read/stream can't sign a mismatched `size`
+    //    (which would break download size-verification) or grow past the cap.
+    let meta = tokio::fs::metadata(&source_path)
+        .await
+        .map_err(|e| format!("stat: {e}"))?;
+    // Reject special files (FIFOs, /dev/zero, sockets, dirs). They report
+    // `len() == 0` and so sail past the stat cap, then the encrypted path's read
+    // would stream until OOM and the public path could ingest unbounded data
+    // before the post-stream cap check. Only a regular file has a trustworthy
+    // length and a bounded read.
+    if !meta.is_file() {
+        return Err("artifact source must be a regular file".to_string());
+    }
+    let (name, mime) = prepare_artifact_meta(meta.len(), &source_path, name, mime)?;
+
+    let ingest_tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.ingest_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    // Authoritative artifact size = the bytes actually read + ingested (the
+    // plaintext length the download side size-verifies against), not the
+    // pre-ingest stat. Re-checked against the cap after the read.
+    let (root, size): (ContentId, u64) = if encrypt {
+        // Bounded read: cap the in-memory plaintext at MAX_ARTIFACT_BYTES + 1 so a
+        // file that grows after the stat (or a special file slipping past the
+        // is_file guard) can't read until OOM. The +1 sentinel makes the post-read
+        // cap check below catch the overflow case.
+        use tokio::io::AsyncReadExt as _;
+        let file = tokio::fs::File::open(&source_path)
+            .await
+            .map_err(|e| format!("open: {e}"))?;
+        let mut limited =
+            tokio::io::BufReader::new(file).take(MAX_ARTIFACT_BYTES.saturating_add(1));
+        let mut plaintext = Vec::new();
+        limited
+            .read_to_end(&mut plaintext)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        // Re-check the cap against the bytes we actually read (a file that grew
+        // after the stat could otherwise exceed it; the +1 sentinel above lands
+        // here too).
+        if plaintext.len() as u64 > MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "artifact too large: {} > {MAX_ARTIFACT_BYTES}",
+                plaintext.len()
+            ));
+        }
+        let size = plaintext.len() as u64;
+        let epoch_key = current_epoch_key_for(state, &space).await?;
+        let ciphertext = crate::community_state_sync::encrypt_blob(&epoch_key, &plaintext)
+            .map_err(|e| format!("encrypt: {e:?}"))?;
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(ciphertext));
+        let (root, _n) = streaming_ingest_with_options(
+            reader,
+            &ingest_tx,
+            ChunkerConfig::DEFAULT,
+            None,
+            IngestOptions {
+                flags: ContentFlags {
+                    encrypted: true,
+                    ..Default::default()
+                },
+                serveable: true,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        (root, size)
+    } else {
+        // Public: stream plaintext from disk (no whole-file buffer), default flags.
+        // fast-follow: deterministic-CID reuse of an already-public copy is deferred;
+        // for v1 we re-ingest — dedup happens book-granular in CAS.
+        let file = tokio::fs::File::open(&source_path)
+            .await
+            .map_err(|e| format!("open: {e}"))?;
+        let (root, n) = streaming_ingest_with_options(
+            tokio::io::BufReader::new(file),
+            &ingest_tx,
+            ChunkerConfig::DEFAULT,
+            None,
+            IngestOptions::default(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        // `n` is the actually-streamed byte count. Re-check the cap against it
+        // (a file that grew after the stat could otherwise exceed it).
+        if n > MAX_ARTIFACT_BYTES {
+            return Err(format!("artifact too large: {n} > {MAX_ARTIFACT_BYTES}"));
+        }
+        (root, n)
+    };
+
+    Ok(crate::community_channel_log_engine::ChannelAttachmentDto {
+        cid: hex::encode(root.to_bytes()),
+        mime,
+        name,
+        size,
+        encrypted: root.flags().encrypted,
+    })
+}
+
+/// ZEB-535: monotonic counter making each artifact download's temp file name
+/// unique within this process (combined with the pid), so concurrent downloads
+/// to the same dest can't clobber each other's `.partial` temp.
+static ARTIFACT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// ZEB-535: pure post-fetch tail of [`download_channel_artifact_impl`].
+///
+/// Given the fetched bytes (ciphertext if `encrypted`, else plaintext):
+/// 1. Decrypt with the supplied epoch key when `encrypted` (the nonce that
+///    `encrypt_blob` prepended is read back by `decrypt_blob`).
+/// 2. Verify the **plaintext** length equals `expected_size` BEFORE writing —
+///    a mismatch errors and leaves no file on disk.
+/// 3. Write atomically: a unique-per-call temp file in the dest dir, then rename.
+///
+/// Factored out so the decrypt/verify/atomic-write contract is unit-testable
+/// without a `NodeState` / event loop. Returns the bytes written.
+async fn finalize_artifact(
+    bytes: Vec<u8>,
+    encrypted: bool,
+    epoch_key_opt: Option<crate::owner_state_types::EpochKey>,
+    expected_size: u64,
+    dest_path: &str,
+) -> Result<u64, String> {
+    let plaintext = if encrypted {
+        let epoch_key =
+            epoch_key_opt.ok_or_else(|| "encrypted artifact requires an epoch key".to_string())?;
+        crate::community_state_sync::decrypt_blob(&epoch_key, &bytes)
+            .map_err(|e| format!("decrypt: {e:?}"))?
+    } else {
+        bytes
+    };
+
+    // Verify length BEFORE any write so a mismatch never leaves a file.
+    if plaintext.len() as u64 != expected_size {
+        return Err(format!(
+            "size mismatch: got {} expected {expected_size}",
+            plaintext.len()
+        ));
+    }
+
+    // Atomic write: temp file in the dest dir, then rename over the target.
+    // The temp shares dest's dir (via with_extension) so the rename is a true
+    // same-filesystem atomic swap. The temp name is UNIQUE per call (pid + a
+    // process-wide atomic counter), so concurrent downloads to the same dest
+    // and any pre-existing `<dest>.partial` can't collide or interfere with
+    // each other's temp.
+    let dest = std::path::Path::new(dest_path);
+    let seq = ARTIFACT_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dest.with_extension(format!("partial.{}.{}", std::process::id(), seq));
+    tokio::fs::write(&tmp, &plaintext)
+        .await
+        .map_err(|e| format!("write tmp: {e}"))?;
+    if let Err(e) = tokio::fs::rename(&tmp, dest).await {
+        // Best-effort: don't leave the temp behind if the rename fails.
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(format!("rename: {e}"));
+    }
+    Ok(plaintext.len() as u64)
+}
+
+/// ZEB-535 / ZEB-539: download an in-channel CAS artifact to a local path.
+///
+/// Counterpart to [`ingest_channel_artifact_impl`]. The download is
+/// **authorize-first**: before any byte is fetched, the `(community_id,
+/// channel_id)` engine's signed channel log is scanned for a `ChannelAttachment`
+/// whose CID matches `cid` ([`ChannelLogEngine::find_attachment`]). An unmatched
+/// CID is rejected (`"unknown or unauthorized attachment"`) — this both stops the
+/// command being a fetch-arbitrary-CID gadget and yields the **authoritative
+/// `expected_size`** (the signed attachment record, not a client-supplied value).
+///
+/// After authorization: fetch the (possibly chunked, encrypted) bytes via the
+/// existing `FetchRequest` path, then hand off to the pure [`finalize_artifact`]
+/// tail (decrypt-if-flagged, size-verify against the authoritative size, atomic
+/// temp+rename). Returns the number of plaintext bytes written.
+///
+/// The decrypt path reads the live community epoch key via
+/// `current_epoch_key_for` only when `cid.flags().encrypted` — a public artifact
+/// never touches the CRDT.
+///
+/// # SECURITY (ZEB-539): re-serve is granted only post-validation
+///
+/// The fetch is issued with `serveable: false`, so a fetched encrypted book is
+/// NEVER allowlisted for member-to-member re-serve *during* the fetch (the
+/// pre-fix path allowlisted on the fetch admit, before the artifact was
+/// assembled/validated and without checking the CID was a real attachment). Only
+/// after [`finalize_artifact`] succeeds — i.e. the artifact decrypted and its
+/// length matched the signed size — AND only for an authorized encrypted
+/// attachment, is the artifact's full local CID subtree allowlisted for re-serve
+/// via [`ContentStore::allow_serve_subtree`]. Public CIDs are served by the gate
+/// regardless of the allowlist, so they need no post-validation step. A failure
+/// to register re-serve is logged and ignored — the user's file is already on
+/// disk; degraded swarming is non-fatal.
+///
+/// The fetch + decrypt are whole-artifact-in-memory (~2× at decrypt) —
+/// intentional for v1; the cap bounds the cost. The `FetchRequest` `max_bytes`
+/// bounds the *assembled* bytes: for an encrypted CID that's the ciphertext, so
+/// the plaintext cap is widened by `BLOB_ENCRYPTION_OVERHEAD` (nonce+tag) so a
+/// near-cap encrypted artifact still fetches; the plaintext is still bounded by
+/// the size check inside `finalize_artifact`.
+pub(crate) async fn download_channel_artifact_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    channel_id: String,
+    cid: String,
+    dest_path: String,
+    max_bytes: Option<u64>,
+) -> Result<u64, String> {
+    use harmony_content::cid::ContentId;
+
+    // CodeAnt #1 (security): bound the hex length BEFORE decoding. A 32-byte
+    // CID is exactly 64 hex chars; without this guard a caller-supplied
+    // multi-MB hex string allocates ~half its length before the [u8; 32]
+    // conversion fails (memory/CPU DoS at the IPC boundary).
+    if cid.len() != 64 {
+        return Err("invalid cid hex".to_string());
+    }
+    let cid_bytes: [u8; 32] = hex::decode(&cid)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| "invalid cid hex".to_string())?;
+    let content_id = ContentId::from_bytes(cid_bytes);
+    let encrypted = content_id.flags().encrypted;
+
+    // ── Authorize FIRST (before any fetch). ──────────────────────────────────
+    // Parse community/channel ids + look up the engine, mirroring
+    // `post_channel_message_impl`. The signed channel log is the source of
+    // truth: an unmatched CID is neither downloadable nor re-servable.
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    if channel_id.len() != 32 {
+        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes16: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let chid_bytes16: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "channel_id length wrong".to_string())?;
+    let space = crate::owner_state_types::SpaceId(cid_bytes16);
+    let chid = crate::community_membership::ChannelId(chid_bytes16);
+
+    let registry = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard
+            .channel_log_registry
+            .as_ref()
+            .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?
+            .clone()
+    };
+    let engine = registry
+        .engine(&space, &chid)
+        .await
+        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+
+    let att = engine
+        .find_attachment(&cid_bytes)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "unknown or unauthorized attachment".to_string())?;
+    // AUTHORITATIVE size — from the signed channel event, not the caller.
+    let expected_size = att.size;
+
+    // Cap check against the client ceiling.
+    let cap = max_bytes
+        .map(|m| m.min(MAX_ARTIFACT_BYTES))
+        .unwrap_or(MAX_ARTIFACT_BYTES);
+    if expected_size > cap {
+        return Err(format!("artifact size {expected_size} exceeds cap {cap}"));
+    }
+
+    // Resolve the epoch key (only when encrypted). The community_id is already
+    // parsed above; reuse `space` rather than re-decoding.
+    let epoch_key_opt = if encrypted {
+        Some(current_epoch_key_for(state, &space).await?)
+    } else {
+        None
+    };
+
+    let fetch_tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    // The fetch `max_bytes` bounds the ASSEMBLED bytes, which for an encrypted
+    // CID is the ciphertext — larger than the plaintext by `encrypt_blob`'s
+    // nonce+tag overhead. Bound the fetch to the SIGNED plaintext `expected_size`
+    // (+AEAD overhead when encrypted), NOT the global artifact cap: otherwise a
+    // huge interior couldn't lie past the authoritative size, but keeping the
+    // fetch bound tight to the signed size is defence-in-depth. The
+    // `expected_size > cap` guard above already proved `expected_size <= cap`.
+    let fetch_cap = if encrypted {
+        expected_size.saturating_add(crate::community_state_sync::BLOB_ENCRYPTION_OVERHEAD as u64)
+    } else {
+        expected_size
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid,
+            reply: reply_tx,
+            max_bytes: Some(fetch_cap as usize),
+            // SECURITY (ZEB-539): never re-serve DURING the fetch. The fetch only
+            // assembles the artifact locally; re-serve is granted post-validation
+            // (below), and only for an authorized encrypted attachment.
+            serveable: false,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    let bytes = reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())??;
+
+    let written =
+        finalize_artifact(bytes, encrypted, epoch_key_opt, expected_size, &dest_path).await?;
+
+    // ── Post-validation re-serve (ZEB-539). ──────────────────────────────────
+    // Only encrypted artifacts need allowlisting — public CIDs are servable by
+    // the gate regardless. The artifact is now validated (decrypted + size
+    // verified) AND was confirmed an authorized attachment above, so it is safe
+    // to swarm to other members. A re-serve failure is non-fatal: the user's
+    // file is already written.
+    if encrypted {
+        // Lock acquisition is itself non-fatal here: `finalize_artifact` already
+        // wrote the user's file, so a poisoned lock must not turn a successful
+        // download into an `Err`. Log and skip allowlisting — consistent with the
+        // `allow_serve_subtree` error arm below ("re-serve failure is non-fatal").
+        let content_store = match state.lock() {
+            Ok(g) => g.content_store.clone(),
+            Err(e) => {
+                tracing::warn!(
+                    cid = %hex::encode(cid_bytes),
+                    error = %e,
+                    "ZEB-539: lock poisoned during re-serve allowlisting (non-fatal; file written)"
+                );
+                None
+            }
+        };
+        if let Some(store) = content_store {
+            match store.allow_serve_subtree(content_id).await {
+                Ok(n) => {
+                    tracing::debug!(
+                        cid = %hex::encode(cid_bytes),
+                        allowlisted = n,
+                        "ZEB-539: allowlisted downloaded artifact subtree for re-serve"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        cid = %hex::encode(cid_bytes),
+                        error = %e,
+                        "ZEB-539: failed to allowlist artifact subtree for re-serve (non-fatal; file written)"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(written)
 }
 
 /// Tauri IPC: list locally-known messages in a channel.
@@ -21973,6 +22711,127 @@ mod create_community_inner_tests {
                 .is_some(),
             "the newly-created channel's log engine must be registered immediately so an \
              immediate post_channel_message finds it instead of returning 500"
+        );
+    }
+
+    /// ZEB-539: `download_channel_artifact_impl` must REJECT a CID that is not a
+    /// published attachment in the named channel — the authorize-first guard
+    /// (`find_attachment` returns `None`) fires before any fetch is issued, so a
+    /// caller cannot use the command to pull an arbitrary CID off the wire.
+    ///
+    /// This stands up a real community + channel-log engine (so the registry
+    /// lookup + `find_attachment` scan run against an actual signed log), posts a
+    /// plain message (no attachments), then asks to download an UNRELATED
+    /// (public, never-attached) CID and asserts the unauthorized rejection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn download_channel_artifact_rejects_unauthorized_cid() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "auth-guard-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        // Wait until the #general channel-log engine is registered.
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned"
+        );
+
+        // Build an owner-loaded NodeState with both registries (mirrors the
+        // eager-spawn test) so create_channel_impl + the download path work.
+        let retic = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let device_hash = crate::owner_state_types::DeviceIdentityHash(retic.identity.address_hash);
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                fixture.device_id.clone(),
+                fixture.self_owner,
+                device_hash,
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x11; 32])),
+                std::sync::Arc::new(retic),
+                std::sync::Arc::clone(&fixture.signing_key),
+                fixture.enrollment_cert.clone(),
+            ),
+        ));
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(std::sync::Arc::clone(&dm_outbox)),
+            ..NodeState::default()
+        });
+
+        // Create a channel through the production seam (eager spawn → engine
+        // exists immediately).
+        let channel_id_hex = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "logs".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("create_channel_impl must succeed");
+
+        // Post a plain message (no attachments) so the channel log is non-empty
+        // but contains NO attachment records.
+        post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            b"hello, no attachments".to_vec(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("post_channel_message_impl must succeed");
+
+        // A public (unencrypted-flagged) CID that was never attached. The header
+        // nibble is 0 (mode_bits = 0 → not encrypted), so the download path
+        // wouldn't even reach epoch-key resolution — but authorization fails
+        // first, before any fetch.
+        let unattached_cid = format!("{}{}", "00".repeat(4), "ab".repeat(28));
+        assert_eq!(
+            unattached_cid.len(),
+            64,
+            "cid must be 32 bytes (64 hex chars)"
+        );
+        let err = download_channel_artifact_impl(
+            &node_state,
+            community_id_hex,
+            channel_id_hex,
+            unattached_cid,
+            "/tmp/should-never-be-written.bin".to_string(),
+            None,
+        )
+        .await
+        .expect_err("unauthorized cid must be rejected before any fetch");
+        assert!(
+            err.contains("unknown or unauthorized attachment"),
+            "got: {err}"
         );
     }
 
@@ -27313,6 +28172,8 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
                         author,
                         at,
                         body,
+                        mentions,
+                        attachments,
                         reply_to,
                         community_id: ev_community_id,
                         channel_id: ev_channel_id,
@@ -27333,6 +28194,29 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
                             },
                             body: body_bytes,
                             reply_to: reply_to.map(|m| hex::encode(m.0)),
+                            mentions: mentions
+                                .as_ref()
+                                .map(|v| v.iter().map(|a| hex::encode(a.0)).collect()),
+                            // ZEB-535: project attachments identically to
+                            // message_dto_for_event (hex cid + derived encrypted
+                            // flag); empty list -> None.
+                            attachments: attachments.as_ref().filter(|v| !v.is_empty()).map(|v| {
+                                v.iter()
+                                    .map(|a| {
+                                        crate::community_channel_log_engine::ChannelAttachmentDto {
+                                            cid: hex::encode(a.cid),
+                                            mime: a.mime.clone(),
+                                            name: a.name.clone(),
+                                            size: a.size,
+                                            encrypted: harmony_content::cid::ContentId::from_bytes(
+                                                a.cid,
+                                            )
+                                            .flags()
+                                            .encrypted,
+                                        }
+                                    })
+                                    .collect()
+                            }),
                             kind,
                             poll_id,
                             // ZEB-538: pre-fork snapshots are reaction-free for v1.
@@ -32623,7 +33507,7 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
                     Vec::with_capacity(crate::community_channel_log_engine::POLL_BODY_LEN);
                 body.push(crate::community_channel_log_engine::POLL_BODY_MAGIC);
                 body.extend_from_slice(poll_id_hex.as_bytes());
-                if let Err(e) = engine.publish(body, None).await {
+                if let Err(e) = engine.publish(body, None, None, None).await {
                     tracing::warn!(
                         error = %e,
                         community_id = %hex::encode(space_id.0),
@@ -33258,7 +34142,7 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
                     Vec::with_capacity(crate::community_channel_log_engine::POLL_BODY_LEN);
                 body.push(crate::community_channel_log_engine::POLL_BODY_MAGIC);
                 body.extend_from_slice(poll_id_hex.as_bytes());
-                if let Err(e) = engine.publish(body, None).await {
+                if let Err(e) = engine.publish(body, None, None, None).await {
                     tracing::warn!(
                         error = %e,
                         community_id = %hex::encode(space_id.0),
@@ -45984,6 +46868,8 @@ pub fn run() {
             list_channel_messages,
             post_channel_message,
             set_message_reaction,
+            download_channel_artifact,
+            ingest_channel_artifact,
             request_channel_backfill,
             list_libraries,
             list_discovered_libraries,
@@ -47220,6 +48106,137 @@ mod streaming_ingest_tests {
             assert_eq!(a_data, b_data, "leaf/bundle bytes must match");
         }
     }
+
+    /// ZEB-535: drain that also captures each request's `serveable` flag and
+    /// the parsed CID, so a test can assert encrypted+serveable propagation.
+    fn spawn_ingest_drain_with_flags(
+        mut rx: mpsc::Receiver<IngestRequest>,
+    ) -> tokio::task::JoinHandle<Vec<(String, bool)>> {
+        tokio::spawn(async move {
+            let mut captured = Vec::new();
+            while let Some(req) = rx.recv().await {
+                captured.push((req.cid_hex.clone(), req.serveable));
+                let _ = req.reply.send(Ok(()));
+            }
+            captured
+        })
+    }
+
+    /// ZEB-535: an encrypted + serveable multi-chunk ingest must produce, for
+    /// EVERY emitted `IngestRequest`, `serveable == true` and a CID whose
+    /// `flags().encrypted` is true (leaves AND interior bundles). This is the
+    /// subtree-authorization contract: a chunked encrypted artifact is many
+    /// CIDs, and the serve gate refuses any encrypted CID not allowlisted.
+    #[tokio::test]
+    async fn streaming_ingest_with_options_encrypted_serveable_flags_every_cid() {
+        // 2 KiB at small_chunker_config (max_chunk=256) → many leaves + a root
+        // bundle → exercises both for_book leaves and build_with_flags bundles.
+        let bytes: Vec<u8> = (0..2048).map(|i| ((i * 37) % 251) as u8).collect();
+        let (tx, rx) = mpsc::channel::<IngestRequest>(64);
+        let drain = spawn_ingest_drain_with_flags(rx);
+
+        let opts = IngestOptions {
+            flags: ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+            serveable: true,
+        };
+        let (root, _total) = streaming_ingest_with_options(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+            opts,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        // Multi-chunk: at least leaves + 1 root bundle were sent.
+        assert!(
+            captured.len() >= 2,
+            "expected leaves + root, got {}",
+            captured.len()
+        );
+        assert!(root.flags().encrypted, "root CID must be encrypted-flagged");
+        for (cid_hex, serveable) in &captured {
+            assert!(
+                serveable,
+                "every IngestRequest must be serveable; cid={cid_hex}"
+            );
+            let arr: [u8; 32] = hex::decode(cid_hex)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .expect("cid hex parses to 32 bytes");
+            assert!(
+                ContentId::from_bytes(arr).flags().encrypted,
+                "every emitted CID must be encrypted-flagged; cid={cid_hex}"
+            );
+        }
+    }
+
+    /// ZEB-535: the single-chunk encrypted path also yields an encrypted root.
+    #[tokio::test]
+    async fn streaming_ingest_with_options_single_chunk_encrypted_root() {
+        let bytes: Vec<u8> = (0..32u8).collect(); // below min_chunk → one leaf
+        let (tx, rx) = mpsc::channel::<IngestRequest>(8);
+        let drain = spawn_ingest_drain_with_flags(rx);
+
+        let opts = IngestOptions {
+            flags: ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+            serveable: true,
+        };
+        let (root, total) = streaming_ingest_with_options(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+            opts,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        assert_eq!(total, 32);
+        assert_eq!(root.cid_type(), CidType::Book);
+        assert!(root.flags().encrypted, "single-chunk root is encrypted");
+        assert_eq!(captured.len(), 1, "one leaf, no bundle");
+        assert!(captured[0].1, "the single leaf is serveable");
+    }
+
+    /// ZEB-535: the legacy `streaming_ingest` delegate keeps the unchanged
+    /// default behavior — unencrypted CIDs, not serveable.
+    #[tokio::test]
+    async fn streaming_ingest_delegate_defaults_unencrypted_not_serveable() {
+        let bytes: Vec<u8> = (0..2048).map(|i| ((i * 37) % 251) as u8).collect();
+        let (tx, rx) = mpsc::channel::<IngestRequest>(64);
+        let drain = spawn_ingest_drain_with_flags(rx);
+
+        let (root, _total) = streaming_ingest(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        assert!(!root.flags().encrypted, "default root is unencrypted");
+        for (cid_hex, serveable) in &captured {
+            assert!(
+                !serveable,
+                "default ingest must NOT be serveable; cid={cid_hex}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -48301,13 +49318,187 @@ mod channel_message_ipc_tests {
         app
     }
 
+    // ── ZEB-535: channel artifact ingest cap + meta resolution ──────────
+    #[tokio::test]
+    async fn ingest_channel_artifact_rejects_oversized() {
+        // Exercise the cap via the pure helper so no NodeState/event loop is
+        // needed: a stat length one byte over the cap must be rejected.
+        let err = prepare_artifact_meta(MAX_ARTIFACT_BYTES + 1, "/tmp/whatever.bin", None, None)
+            .expect_err("oversized artifact must error");
+        assert!(err.contains("artifact too large"), "got: {err}");
+    }
+
+    // ── ZEB-535: channel artifact download — finalize tail ──────────────
+    #[tokio::test]
+    async fn finalize_artifact_writes_public_and_verifies_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let n = finalize_artifact(b"hello".to_vec(), false, None, 5, dest.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn finalize_artifact_rejects_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let err = finalize_artifact(b"hello".to_vec(), false, None, 99, dest.to_str().unwrap())
+            .await
+            .expect_err("size mismatch");
+        assert!(err.contains("size mismatch"), "got: {err}");
+        assert!(!dest.exists(), "no file written on mismatch");
+    }
+
+    #[tokio::test]
+    async fn finalize_artifact_decrypts_encrypted() {
+        let key = crate::owner_state_types::EpochKey::new([7u8; 32]);
+        let ct = crate::community_state_sync::encrypt_blob(&key, b"secret-log").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let n = finalize_artifact(ct, true, Some(key), 10, dest.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"secret-log");
+    }
+
+    #[tokio::test]
+    async fn finalize_artifact_encrypted_without_key_errs() {
+        // The encrypted => Some(key) guard must reject with a clean error (no
+        // panic, no file) when an encrypted artifact arrives with no epoch key.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let err = finalize_artifact(b"x".to_vec(), true, None, 1, dest.to_str().unwrap())
+            .await
+            .expect_err("encrypted without key must error");
+        assert!(err.contains("requires an epoch key"), "got: {err}");
+        assert!(!dest.exists(), "no file written on missing key");
+    }
+
+    #[tokio::test]
+    async fn finalize_artifact_wrong_key_errs_not_panics() {
+        // Ciphertext decrypted with the wrong epoch key must surface as a clean
+        // AEAD error (never a panic or a silent garbage write).
+        let key = crate::owner_state_types::EpochKey::new([7u8; 32]);
+        let wrong = crate::owner_state_types::EpochKey::new([9u8; 32]);
+        let ct = crate::community_state_sync::encrypt_blob(&key, b"secret-log").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let err = finalize_artifact(ct, true, Some(wrong), 10, dest.to_str().unwrap())
+            .await
+            .expect_err("wrong key must error");
+        assert!(err.contains("decrypt"), "got: {err}");
+        assert!(!dest.exists(), "no file written on decrypt failure");
+    }
+
+    #[tokio::test]
+    async fn finalize_artifact_ignores_stale_fixed_partial() {
+        // ZEB-535: the temp file is now unique per call (pid + counter), so a
+        // pre-existing file at the OLD fixed `<dest>.partial` path must NOT
+        // interfere — finalize still succeeds and writes the right bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        // Plant a stale file exactly where the old fixed temp name would land.
+        let stale = dest.with_extension("partial");
+        tokio::fs::write(&stale, b"STALE GARBAGE").await.unwrap();
+
+        let n = finalize_artifact(b"hello".to_vec(), false, None, 5, dest.to_str().unwrap())
+            .await
+            .expect("finalize must succeed despite the stale fixed-name temp");
+        assert_eq!(n, 5);
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"hello");
+        // The stale fixed-name file is untouched — we no longer collide with it.
+        assert_eq!(tokio::fs::read(&stale).await.unwrap(), b"STALE GARBAGE");
+    }
+
+    #[test]
+    fn detect_mime_maps_known_extensions() {
+        assert_eq!(detect_mime("a.txt"), "text/plain");
+        assert_eq!(detect_mime("a.json"), "application/json");
+        assert_eq!(detect_mime("a.png"), "image/png");
+        assert_eq!(detect_mime("a.diff"), "text/x-diff");
+        assert_eq!(detect_mime("a.patch"), "text/x-diff");
+        assert_eq!(detect_mime("a.unknownext"), "application/octet-stream");
+        // No extension at all also falls back to the generic type.
+        assert_eq!(detect_mime("noext"), "application/octet-stream");
+    }
+
+    #[test]
+    fn prepare_artifact_meta_defaults_name_and_mime_from_path() {
+        // Neither name nor mime supplied: name defaults from the file_name,
+        // mime defaults from that name's extension. (Size is no longer produced
+        // here — it comes from the actual ingested byte count in
+        // `ingest_channel_artifact_impl`; this helper only validates the cap +
+        // resolves name/mime.)
+        let (name, mime) =
+            prepare_artifact_meta(42, "/some/dir/report.json", None, None).expect("under cap");
+        assert_eq!(name, "report.json");
+        assert_eq!(mime, "application/json");
+    }
+
+    #[test]
+    fn prepare_artifact_meta_honors_explicit_name_and_mime() {
+        let (name, mime) = prepare_artifact_meta(
+            7,
+            "/some/dir/report.json",
+            Some("custom.bin".to_string()),
+            Some("application/x-custom".to_string()),
+        )
+        .expect("under cap");
+        assert_eq!(name, "custom.bin");
+        assert_eq!(mime, "application/x-custom");
+    }
+
+    #[test]
+    fn prepare_artifact_meta_rejects_overlong_name() {
+        let long = "x".repeat(crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES + 1);
+        let err = prepare_artifact_meta(1, "/p/a.txt", Some(long), None)
+            .expect_err("over-long name must error");
+        assert!(err.contains("name/mime too long"), "got: {err}");
+    }
+
+    #[test]
+    fn prepare_artifact_meta_rejects_overlong_mime() {
+        let long = "y".repeat(crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES + 1);
+        let err = prepare_artifact_meta(1, "/p/a.txt", None, Some(long))
+            .expect_err("over-long mime must error");
+        assert!(err.contains("name/mime too long"), "got: {err}");
+    }
+
+    #[test]
+    fn prepare_artifact_meta_accepts_at_boundaries() {
+        // The cap and field-length checks use `>` (strictly greater), so values
+        // EXACTLY at the limit must be accepted. Pins the `>` boundary against a
+        // future `>=` typo on either check (the reject tests only cover MAX+1).
+        let (name, _mime) = prepare_artifact_meta(MAX_ARTIFACT_BYTES, "/p/a.bin", None, None)
+            .expect("stat len exactly at the cap must be accepted");
+        assert_eq!(name, "a.bin");
+
+        let max = crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES;
+        let (name, mime) =
+            prepare_artifact_meta(1, "/p/a.bin", Some("n".repeat(max)), Some("m".repeat(max)))
+                .expect("name/mime exactly at the field cap must be accepted");
+        assert_eq!(name.len(), max);
+        assert_eq!(mime.len(), max);
+    }
+
     #[tokio::test]
     async fn post_channel_message_rejects_short_community_id() {
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err = post_channel_message(state, "deadbeef".into(), "00".repeat(16), vec![1], None)
-            .await
-            .expect_err("short cid must error");
+        let err = post_channel_message(
+            state,
+            "deadbeef".into(),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("short cid must error");
         assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
     }
 
@@ -48315,9 +49506,17 @@ mod channel_message_ipc_tests {
     async fn post_channel_message_rejects_short_channel_id() {
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err = post_channel_message(state, "00".repeat(16), "ab".into(), vec![1], None)
-            .await
-            .expect_err("short chid must error");
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "ab".into(),
+            vec![1],
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("short chid must error");
         assert!(err.contains("channel_id must be 16 bytes"), "got: {err}");
     }
 
@@ -48325,9 +49524,17 @@ mod channel_message_ipc_tests {
     async fn post_channel_message_rejects_bad_hex() {
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err = post_channel_message(state, "zz".repeat(16), "00".repeat(16), vec![1], None)
-            .await
-            .expect_err("bad hex must error");
+        let err = post_channel_message(
+            state,
+            "zz".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("bad hex must error");
         assert!(err.contains("invalid community_id hex"), "got: {err}");
     }
 
@@ -48341,10 +49548,68 @@ mod channel_message_ipc_tests {
             "00".repeat(16),
             vec![1],
             Some("ab".into()),
+            None,
+            None,
         )
         .await
         .expect_err("short reply_to must error");
         assert!(err.contains("reply_to must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_bad_mention_hex() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            Some(vec!["zz".repeat(16)]),
+            None,
+        )
+        .await
+        .expect_err("bad mention hex must error");
+        assert!(err.contains("invalid mention hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_short_mention() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            Some(vec!["ab".into()]),
+            None,
+        )
+        .await
+        .expect_err("short mention must error");
+        assert!(err.contains("each mention must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_too_many_mentions() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let too_many: Vec<String> =
+            vec!["00".repeat(16); crate::community_channel_log::MAX_MENTIONS + 1];
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            Some(too_many),
+            None,
+        )
+        .await
+        .expect_err("over-cap mentions must error at the IPC boundary");
+        assert!(err.contains("too many mentions"), "got: {err}");
     }
 
     #[tokio::test]
@@ -48357,10 +49622,266 @@ mod channel_message_ipc_tests {
             "11".repeat(16),
             vec![104, 105],
             None,
+            None,
+            None,
         )
         .await
         .expect_err("missing registry must error");
         assert!(err.contains("channel_log_registry missing"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_bad_attachment_cid_hex() {
+        // ZEB-535: a non-hex (or wrong-length) attachment cid must be rejected at
+        // the IPC boundary, before any engine/event-loop dependency is touched.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+            Some(vec![
+                crate::community_channel_log_engine::ChannelAttachmentDto {
+                    cid: "zz".repeat(32), // 64 chars, non-hex -> decode fails
+                    mime: "text/plain".into(),
+                    name: "note.txt".into(),
+                    size: 12,
+                    encrypted: false,
+                },
+            ]),
+        )
+        .await
+        .expect_err("bad attachment cid hex must error");
+        assert!(err.contains("invalid attachment cid hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_too_many_attachments() {
+        // ZEB-535: an over-cap attachment list must be rejected at the IPC
+        // boundary (mirrors the mentions cap), before decoding/allocating.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let too_many: Vec<crate::community_channel_log_engine::ChannelAttachmentDto> = (0
+            ..=crate::community_channel_log::MAX_ATTACHMENTS)
+            .map(
+                |_| crate::community_channel_log_engine::ChannelAttachmentDto {
+                    cid: "00".repeat(32),
+                    mime: "text/plain".into(),
+                    name: "note.txt".into(),
+                    size: 12,
+                    encrypted: false,
+                },
+            )
+            .collect();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+            Some(too_many),
+        )
+        .await
+        .expect_err("over-cap attachments must error at the IPC boundary");
+        assert!(err.contains("too many attachments"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_oversized_attachment() {
+        // ZEB-539: an attachment whose `size` exceeds MAX_ATTACHMENT_SIZE must be
+        // rejected at the IPC mint boundary — such an attachment could never be
+        // downloaded (the download path rejects size > cap), mirroring the
+        // verify-side guard.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+            Some(vec![
+                crate::community_channel_log_engine::ChannelAttachmentDto {
+                    cid: "00".repeat(32),
+                    mime: "text/plain".into(),
+                    name: "huge.bin".into(),
+                    size: crate::community_channel_log::MAX_ATTACHMENT_SIZE + 1,
+                    encrypted: false,
+                },
+            ]),
+        )
+        .await
+        .expect_err("oversized attachment must error at the IPC boundary");
+        assert!(err.contains("attachment too large"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_overlong_attachment_cid_hex() {
+        // CodeAnt #1 (security): an attachment cid hex string longer than 64
+        // chars must be rejected by the length precheck BEFORE hex::decode runs,
+        // so a multi-MB hex string can't force a large allocation.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+            Some(vec![
+                crate::community_channel_log_engine::ChannelAttachmentDto {
+                    cid: "00".repeat(64), // 128 chars: valid hex but wrong length
+                    mime: "text/plain".into(),
+                    name: "note.txt".into(),
+                    size: 12,
+                    encrypted: false,
+                },
+            ]),
+        )
+        .await
+        .expect_err("over-long attachment cid hex must error");
+        assert!(err.contains("invalid attachment cid hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn download_channel_artifact_rejects_overlong_cid_hex() {
+        // CodeAnt #1 (security): a cid hex string longer than 64 chars must be
+        // rejected by the length precheck BEFORE hex::decode runs.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = download_channel_artifact(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            "00".repeat(64), // 128 chars: valid hex but wrong length
+            "/tmp/out.bin".to_string(),
+            None,
+        )
+        .await
+        .expect_err("over-long cid hex must error");
+        assert!(err.contains("invalid cid hex"), "got: {err}");
+    }
+
+    // ── ZEB-539: download_channel_artifact IPC boundary rejections ──────────
+    #[tokio::test]
+    async fn download_channel_artifact_rejects_bad_cid_hex() {
+        // Invalid cid hex must fail at decode — before any engine/event-loop
+        // dependency is touched (the cid decode is the very first step).
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = download_channel_artifact(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            "zz".repeat(32), // 64 chars, but non-hex -> decode fails
+            "/tmp/out.bin".to_string(),
+            None,
+        )
+        .await
+        .expect_err("bad cid hex must error");
+        assert!(err.contains("invalid cid hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn download_channel_artifact_rejects_short_community_id() {
+        // A valid 32-byte cid passes the first decode; a short community_id
+        // is then rejected during authorization parsing.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = download_channel_artifact(
+            state,
+            "deadbeef".into(),
+            "00".repeat(16),
+            "00".repeat(32),
+            "/tmp/out.bin".to_string(),
+            None,
+        )
+        .await
+        .expect_err("short community_id must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn download_channel_artifact_rejects_short_channel_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = download_channel_artifact(
+            state,
+            "00".repeat(16),
+            "ab".into(),
+            "00".repeat(32),
+            "/tmp/out.bin".to_string(),
+            None,
+        )
+        .await
+        .expect_err("short channel_id must error");
+        assert!(err.contains("channel_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn download_channel_artifact_errors_when_registry_missing() {
+        // Well-formed ids + cid, but the default NodeState has no registry —
+        // authorization can't proceed, so the command rejects before fetching.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = download_channel_artifact(
+            state,
+            "00".repeat(16),
+            "11".repeat(16),
+            "00".repeat(32),
+            "/tmp/out.bin".to_string(),
+            None,
+        )
+        .await
+        .expect_err("missing registry must error");
+        assert!(err.contains("channel_log_registry missing"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn ingest_channel_artifact_rejects_short_community_id() {
+        // A short community_id is rejected by the very first validation in the
+        // impl — before any filesystem stat or engine dependency is touched.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = ingest_channel_artifact(
+            state,
+            "deadbeef".into(),
+            "/tmp/does-not-matter.bin".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("short community_id must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn ingest_channel_artifact_rejects_missing_source_file() {
+        // Well-formed community_id, but the source file does not exist, so the
+        // stat fails. `encrypt: None` exercises the command boundary's
+        // `unwrap_or(true)` default on the way to the impl.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.bin");
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = ingest_channel_artifact(
+            state,
+            "00".repeat(16),
+            missing.to_string_lossy().into_owned(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing source file must error");
+        assert!(err.contains("stat:"), "got: {err}");
     }
 
     #[tokio::test]

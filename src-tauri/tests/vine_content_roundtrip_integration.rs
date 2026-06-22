@@ -341,6 +341,7 @@ async fn creator_ingests_video_recipient_fetches_bytes() {
         .send(IngestRequest {
             cid_hex: cid_hex.clone(),
             data: video_bytes.clone(),
+            serveable: false,
             reply: ack_tx,
         })
         .await
@@ -522,6 +523,7 @@ async fn descriptor_arrives_before_video_cid_resolves_fetch_content_retry() {
         .send(IngestRequest {
             cid_hex: cid_hex.clone(),
             data: video_bytes.clone(),
+            serveable: false,
             reply: ack_tx,
         })
         .await

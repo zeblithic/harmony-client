@@ -224,6 +224,7 @@ async fn ingest_list_pin_burn_roundtrip() {
         .send(IngestRequest {
             cid_hex: cid_hex.clone(),
             data: bytes.clone(),
+            serveable: false,
             reply: ack_tx,
         })
         .await
@@ -541,6 +542,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                 .send(IngestRequest {
                     cid_hex: req.cid_hex,
                     data: req.data,
+                    serveable: false,
                     reply: ack_tx,
                 })
                 .await
@@ -920,6 +922,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
         .send(IngestRequest {
             cid_hex: cid_hex.clone(),
             data: bytes.clone(),
+            serveable: false,
             reply: ack_tx,
         })
         .await
@@ -1180,6 +1183,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
         .send(IngestRequest {
             cid_hex: cid_a_hex.clone(),
             data: leaf_bytes.clone(),
+            serveable: false,
             reply: ack_tx,
         })
         .await
@@ -1192,6 +1196,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
         .send(IngestRequest {
             cid_hex: cid_c_hex.clone(),
             data: folder_payload.clone(),
+            serveable: false,
             reply: ack_tx,
         })
         .await
@@ -1503,6 +1508,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
         .send(IngestRequest {
             cid_hex: cid_hex.clone(),
             data: bytes.clone(),
+            serveable: false,
             reply: ack_tx,
         })
         .await

@@ -32,6 +32,22 @@ export interface ChannelMessageDto {
    * Rust IPC boundary; consumed by the reactions UI (Spec 2).
    */
   reactions?: { emoji: string; count: number; mine: boolean; reactors: string[] }[];
+  /**
+   * ZEB-534: owner-ids (hex) this message addresses, or absent if none.
+   * Recipients derive "mentions me" as `selfOwnerHex` ∈ mentions. GUI
+   * render/notify is a follow-up; this field just carries the data.
+   */
+  mentions?: string[];
+  /** CAS artifacts this message references; absent if none. */
+  attachments?: ChannelAttachmentDto[];
+}
+
+export interface ChannelAttachmentDto {
+  cid: string;       // hex-encoded 32-byte ContentId
+  mime: string;
+  name: string;
+  size: number;
+  encrypted: boolean;
 }
 
 interface ChannelMessageReceivedPayload {
@@ -142,16 +158,83 @@ export class ChannelMessageService {
     channelId: string,
     body: string,
     replyTo?: string,
+    mentions?: string[],
+    attachments?: ChannelAttachmentDto[],
   ): Promise<string> {
     if (!this.adapter) throw new Error('ChannelMessageService.postMessage: adapter not connected');
     const bodyBytes = Array.from(new TextEncoder().encode(body));
-    const messageId = await this.adapter.invoke('post_channel_message', {
-      communityId,
-      channelId,
-      body: bodyBytes,
-      replyTo,
-    }) as string;
-    return messageId;
+    try {
+      const messageId = await this.adapter.invoke('post_channel_message', {
+        communityId,
+        channelId,
+        body: bodyBytes,
+        replyTo,
+        // Send an empty mention list as undefined so the backend never emits
+        // a `mn: []` (which would change the signed bytes vs. a mention-less
+        // post). The backend also normalizes this defensively.
+        mentions: mentions && mentions.length > 0 ? mentions : undefined,
+        // Same empty-as-undefined rule as mentions: an empty array would
+        // change the signed bytes vs. an attachment-less post.
+        attachments: attachments && attachments.length > 0 ? attachments : undefined,
+      }) as string;
+      return messageId;
+    } catch (e: unknown) {
+      // Tauri IPC rejections are raw strings in production (Error objects
+      // only in tests). Normalize so callers reading `.message` keep the
+      // validation detail (e.g. "too many mentions: N (max 64)" or a bad-hex
+      // rejection from the new mentions path). Mirrors MessageService.send.
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
+  }
+
+  /** Ingest a local file into CAS as a channel artifact. Returns the
+   *  attachment descriptor (cid/mime/name/size/encrypted) to attach to a
+   *  subsequent postMessage. `encrypt` defaults to true. */
+  async ingestArtifact(
+    communityId: string,
+    sourcePath: string,
+    opts?: { name?: string; mime?: string; encrypt?: boolean },
+  ): Promise<ChannelAttachmentDto> {
+    if (!this.adapter) throw new Error('ChannelMessageService.ingestArtifact: adapter not connected');
+    try {
+      return await this.adapter.invoke('ingest_channel_artifact', {
+        communityId,
+        sourcePath,
+        name: opts?.name,
+        mime: opts?.mime,
+        encrypt: opts?.encrypt ?? true,
+      }) as ChannelAttachmentDto;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
+  }
+
+  /** Download a channel artifact from CAS to `destPath`. Returns the number
+   *  of bytes written. `channelId` is required: the backend authorizes the
+   *  CID against that channel's log and derives the authoritative size from
+   *  the signed attachment (so there is no expectedSize param). */
+  async downloadArtifact(
+    communityId: string,
+    channelId: string,
+    attachment: ChannelAttachmentDto,
+    destPath: string,
+    maxBytes?: number,
+  ): Promise<number> {
+    if (!this.adapter) throw new Error('ChannelMessageService.downloadArtifact: adapter not connected');
+    try {
+      return await this.adapter.invoke('download_channel_artifact', {
+        communityId,
+        channelId,
+        cid: attachment.cid,
+        destPath,
+        maxBytes,
+      }) as number;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
   }
 
   /** Page through locally-known messages. Caches results + notifies

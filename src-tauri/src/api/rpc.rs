@@ -147,6 +147,28 @@ struct PostChannelMessageArgs {
     channel_id: String,
     body: Vec<u8>,
     reply_to: Option<String>,
+    mentions: Option<Vec<String>>,
+    attachments: Option<Vec<crate::community_channel_log_engine::ChannelAttachmentDto>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadChannelArtifactArgs {
+    community_id: String,
+    channel_id: String,
+    cid: String,
+    dest_path: String,
+    max_bytes: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestChannelArtifactArgs {
+    community_id: String,
+    source_path: String,
+    name: Option<String>,
+    mime: Option<String>,
+    encrypt: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -397,6 +419,40 @@ pub fn build_registry() -> RpcRegistry {
                 a.channel_id,
                 a.body,
                 a.reply_to,
+                a.mentions,
+                a.attachments,
+            )
+            .await
+        }
+    );
+    rpc!(
+        m,
+        "download_channel_artifact",
+        DownloadChannelArtifactArgs,
+        |state, _sink, a| async move {
+            crate::download_channel_artifact_impl(
+                state,
+                a.community_id,
+                a.channel_id,
+                a.cid,
+                a.dest_path,
+                a.max_bytes,
+            )
+            .await
+        }
+    );
+    rpc!(
+        m,
+        "ingest_channel_artifact",
+        IngestChannelArtifactArgs,
+        |state, _sink, a| async move {
+            crate::ingest_channel_artifact_impl(
+                state,
+                a.community_id,
+                a.source_path,
+                a.name,
+                a.mime,
+                a.encrypt.unwrap_or(true),
             )
             .await
         }
@@ -899,6 +955,9 @@ mod tests {
             "list_channel_messages",
             "post_channel_message",
             "set_message_reaction",
+            // channel artifacts (CAS)
+            "ingest_channel_artifact",
+            "download_channel_artifact",
             // friends
             "list_friends",
             "generate_friend_token",

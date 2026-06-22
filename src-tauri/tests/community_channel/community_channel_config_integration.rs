@@ -68,7 +68,9 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
     tokio::spawn(async move {
         while let Some(op) = cas_op_rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     cas_for_servicer.lock().await.insert(cid, blob);
                     if let Some(r) = reply {
                         let _ = r.send(Ok(()));
@@ -85,6 +87,9 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
                 CasOp::GetLocal { cid, reply } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }
