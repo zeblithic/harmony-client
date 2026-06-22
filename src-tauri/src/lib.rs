@@ -51172,15 +51172,13 @@ mod channel_message_ipc_tests {
     }
 
     /// ZEB-541: the bytes path caps at the generic 1 GiB artifact cap
-    /// (`MAX_ARTIFACT_BYTES`), NOT the 256 KiB emoji cap — the per-emoji cap is
+    /// (`MAX_ARTIFACT_BYTES`), NOT the 256 KiB emoji cap. The per-emoji cap is
     /// enforced separately at react time and serve time. Allocating a real
-    /// >1 GiB buffer is infeasible in a unit test, so this pins the const and the
-    /// exact `> MAX_ARTIFACT_BYTES` boundary the impl applies.
+    /// 1 GiB-plus buffer is infeasible in a unit test, so this pins the const
+    /// that the bytes-ingest cap check compares the input length against.
     #[test]
     fn ingest_channel_artifact_bytes_cap_is_max_artifact_bytes() {
         assert_eq!(MAX_ARTIFACT_BYTES, 1024 * 1024 * 1024);
-        assert!(MAX_ARTIFACT_BYTES + 1 > MAX_ARTIFACT_BYTES);
-        assert!(!(MAX_ARTIFACT_BYTES > MAX_ARTIFACT_BYTES));
     }
 
     /// ZEB-541 happy path: ingest small bytes (public, `encrypt=false`) returns
