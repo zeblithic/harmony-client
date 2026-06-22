@@ -1466,7 +1466,7 @@ impl ChannelLog {
             root,
             reaction_index: ReactionIndex::default(),
         };
-        log.rebuild_reaction_index()?;
+        log.rebuild_reaction_index();
         Ok((log, total))
     }
 
@@ -1565,18 +1565,33 @@ impl ChannelLog {
     /// segment), then folds the in-memory tail. One-time boot cost;
     /// acceptable for v1 (reactions are sparse, segments small). A
     /// persisted/summary index is a future optimization (out of scope).
-    fn rebuild_reaction_index(&mut self) -> Result<(), ChannelLogPersistError> {
+    ///
+    /// Segment read errors are non-fatal (ZEB-536): reactions are a
+    /// derived, non-critical view. A missing or corrupt old segment
+    /// emits a tracing::warn and is skipped — the channel still loads.
+    fn rebuild_reaction_index(&mut self) {
         let mut idx = ReactionIndex::default();
         for seg in &self.manifest.segments {
-            for ev in self.read_segment(seg)? {
-                idx.apply(&ev);
+            match self.read_segment(seg) {
+                Ok(events) => {
+                    for ev in events {
+                        idx.apply(&ev);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        zeb = "ZEB-536",
+                        segment = ?seg.handle,
+                        error = %e,
+                        "rebuild_reaction_index: skipping unreadable segment"
+                    );
+                }
             }
         }
         for ev in &self.tail {
             idx.apply(ev);
         }
         self.reaction_index = idx;
-        Ok(())
     }
 }
 
@@ -3152,15 +3167,6 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("segments")).expect("mkdir segments");
-        // Write stub segment files (empty event arrays) so rebuild_reaction_index
-        // can read them. Content is irrelevant to the sort-order test.
-        let empty_seg: Vec<SignedChannelEvent> = vec![];
-        for name in &["segments/00000000.cbor", "segments/00000001.cbor"] {
-            let mut seg_bytes = vec![CHANNEL_LOG_SEGMENT_V1];
-            ciborium::into_writer(&empty_seg, &mut seg_bytes).expect("encode stub seg");
-            crate::owner_state_persist::save_atomically(&root.join(name), &seg_bytes)
-                .expect("save stub seg");
-        }
         // Hand-craft a manifest with segments in WRONG order
         // (range.0 wall=200 first, range.0 wall=100 second).
         let manifest = ChannelLogManifest {
@@ -3809,5 +3815,57 @@ mod tests {
         let (reloaded, _n) = ChannelLog::reload(cid, chid, dir.path().to_path_buf(), cfg).unwrap();
         let r = reloaded.reactions_for(&target, &me);
         assert_eq!(r.iter().find(|d| d.emoji == "👍").unwrap().count, 1);
+    }
+
+    /// ZEB-536 robustness regression: reload must succeed even when a sealed
+    /// segment file is missing from disk. Reactions are a non-critical derived
+    /// view; a hard-fail on an unreadable segment would break channel load
+    /// for channels with any missing/corrupt historical segment file.
+    #[test]
+    fn channel_log_reload_tolerates_unreadable_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cid, chid) = (SpaceId([5; 16]), ChannelId([6; 16]));
+        // Small threshold so we can force a seal with few events.
+        let cfg = ChannelLogConfig {
+            seal_threshold_events: 2,
+        };
+        let mut log = ChannelLog::new(cid, chid, dir.path().to_path_buf(), cfg.clone());
+        let me = OwnerAddr([0xCC; 16]);
+        let target = MessageId([0xDD; 16]);
+
+        // Append enough events to hit the seal threshold.
+        log.append(post_event(target, me, cid, chid, 1_000))
+            .unwrap();
+        let needs_seal = log
+            .append(post_event(MessageId([0xEE; 16]), me, cid, chid, 2_000))
+            .unwrap();
+        assert!(needs_seal, "threshold=2 must signal seal after 2nd append");
+        // Seal: writes segments/00000000.cbor and updates the manifest.
+        log.seal_and_persist().unwrap();
+        // Append a tail React (post-seal) so we can assert it survives reload.
+        log.append(react_event_for(target, me, cid, chid, "✅", true, 3_000))
+            .unwrap();
+        log.flush_tail().unwrap();
+
+        // Delete the sealed segment file — simulates a missing/corrupt segment.
+        let seg_path = dir.path().join("segments").join("00000000.cbor");
+        std::fs::remove_file(&seg_path).expect("segment file must exist before we delete it");
+
+        // reload MUST succeed despite the missing segment (non-critical reactions).
+        let result = ChannelLog::reload(cid, chid, dir.path().to_path_buf(), cfg);
+        assert!(
+            result.is_ok(),
+            "reload must tolerate a missing sealed segment; got: {:?}",
+            result.err()
+        );
+
+        // Tail reactions (post-seal) must still be present after reload.
+        let (reloaded, _) = result.unwrap();
+        let reactions = reloaded.reactions_for(&target, &me);
+        assert_eq!(
+            reactions.iter().find(|d| d.emoji == "✅").map(|d| d.count),
+            Some(1),
+            "tail React must survive reload even when a sealed segment is missing"
+        );
     }
 }
