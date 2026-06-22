@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { categoryIcon, tierTarget, formatBytes, relativeTime } from './file-utils';
+import { categoryIcon, mimeCategoryIcon, tierTarget, formatBytes, relativeTime } from './file-utils';
 
 describe('categoryIcon', () => {
   it('returns music note for music', () => {
@@ -44,6 +44,20 @@ describe('formatBytes', () => {
 
   it('formats gigabytes', () => {
     expect(formatBytes(1_500_000_000)).toBe('1.5 GB');
+  });
+});
+
+describe('mimeCategoryIcon', () => {
+  it('maps mime prefixes to category glyphs', () => {
+    expect(mimeCategoryIcon('image/png')).toBe('🖼');      // 🖼
+    expect(mimeCategoryIcon('IMAGE/JPEG')).toBe('🖼');     // case-insensitive
+    expect(mimeCategoryIcon('text/plain')).toBe('📄');     // 📄
+    expect(mimeCategoryIcon('audio/mpeg')).toBe('♪');           // ♪
+    expect(mimeCategoryIcon('video/mp4')).toBe('▶');            // ▶
+  });
+  it('falls back to the document glyph for unknown mimes', () => {
+    expect(mimeCategoryIcon('application/octet-stream')).toBe('📄');
+    expect(mimeCategoryIcon('')).toBe('📄');
   });
 });
 
