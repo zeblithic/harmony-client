@@ -245,6 +245,10 @@ fn spawn_event_loop(
                     None, // ZEB-281 Sub-D Phase 4: profile_broadcast_request_rx not exercised in this test
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
+                    None, // ZEB-537: community_presence_request_rx not exercised in this test
+                    std::sync::Arc::new(tokio::sync::Mutex::new(
+                        harmony_app::community_presence::CommunityPresenceMap::new(),
+                    )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
