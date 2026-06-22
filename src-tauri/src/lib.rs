@@ -20052,6 +20052,29 @@ async fn post_channel_message(
     .await
 }
 
+/// ZEB-539: Tauri IPC — download an authorized channel artifact to `dest_path`.
+/// Thin delegate to [`download_channel_artifact_impl`]; see that fn for the
+/// authorize-first / server-derived-size / post-validation re-serve contract.
+#[tauri::command]
+async fn download_channel_artifact(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+    cid: String,
+    dest_path: String,
+    max_bytes: Option<u64>,
+) -> Result<u64, String> {
+    download_channel_artifact_impl(
+        state_lock.inner(),
+        community_id,
+        channel_id,
+        cid,
+        dest_path,
+        max_bytes,
+    )
+    .await
+}
+
 /// ZEB-445: shared IPC/RPC seam.
 pub(crate) async fn post_channel_message_impl(
     state: &std::sync::Mutex<NodeState>,
@@ -20447,38 +20470,51 @@ async fn finalize_artifact(
     Ok(plaintext.len() as u64)
 }
 
-/// ZEB-535: download an in-channel CAS artifact to a local path.
+/// ZEB-535 / ZEB-539: download an in-channel CAS artifact to a local path.
 ///
-/// Counterpart to [`ingest_channel_artifact_impl`]: fetch the (possibly
-/// chunked, encrypted) bytes for `cid` via the existing `FetchRequest` path,
-/// then hand off to the pure [`finalize_artifact`] tail (decrypt-if-flagged,
-/// size-verify against `expected_size`, atomic temp+rename). Returns the
-/// number of plaintext bytes written.
+/// Counterpart to [`ingest_channel_artifact_impl`]. The download is
+/// **authorize-first**: before any byte is fetched, the `(community_id,
+/// channel_id)` engine's signed channel log is scanned for a `ChannelAttachment`
+/// whose CID matches `cid` ([`ChannelLogEngine::find_attachment`]). An unmatched
+/// CID is rejected (`"unknown or unauthorized attachment"`) — this both stops the
+/// command being a fetch-arbitrary-CID gadget and yields the **authoritative
+/// `expected_size`** (the signed attachment record, not a client-supplied value).
+///
+/// After authorization: fetch the (possibly chunked, encrypted) bytes via the
+/// existing `FetchRequest` path, then hand off to the pure [`finalize_artifact`]
+/// tail (decrypt-if-flagged, size-verify against the authoritative size, atomic
+/// temp+rename). Returns the number of plaintext bytes written.
 ///
 /// The decrypt path reads the live community epoch key via
-/// `current_epoch_key_for` only when `cid.flags().encrypted` — a public
-/// artifact never touches the CRDT. `serveable` is set to `encrypted` so a
-/// fetched encrypted artifact's books are re-allowlisted for member-to-member
-/// serving (mirrors the ingest side; the serve gate refuses un-allowlisted
-/// encrypted CIDs).
+/// `current_epoch_key_for` only when `cid.flags().encrypted` — a public artifact
+/// never touches the CRDT.
+///
+/// # SECURITY (ZEB-539): re-serve is granted only post-validation
+///
+/// The fetch is issued with `serveable: false`, so a fetched encrypted book is
+/// NEVER allowlisted for member-to-member re-serve *during* the fetch (the
+/// pre-fix path allowlisted on the fetch admit, before the artifact was
+/// assembled/validated and without checking the CID was a real attachment). Only
+/// after [`finalize_artifact`] succeeds — i.e. the artifact decrypted and its
+/// length matched the signed size — AND only for an authorized encrypted
+/// attachment, is the artifact's full local CID subtree allowlisted for re-serve
+/// via [`ContentStore::allow_serve_subtree`]. Public CIDs are served by the gate
+/// regardless of the allowlist, so they need no post-validation step. A failure
+/// to register re-serve is logged and ignored — the user's file is already on
+/// disk; degraded swarming is non-fatal.
 ///
 /// The fetch + decrypt are whole-artifact-in-memory (~2× at decrypt) —
 /// intentional for v1; the cap bounds the cost. The `FetchRequest` `max_bytes`
 /// bounds the *assembled* bytes: for an encrypted CID that's the ciphertext, so
-/// the plaintext `cap` is widened by `BLOB_ENCRYPTION_OVERHEAD` (nonce+tag) so a
+/// the plaintext cap is widened by `BLOB_ENCRYPTION_OVERHEAD` (nonce+tag) so a
 /// near-cap encrypted artifact still fetches; the plaintext is still bounded by
-/// the `expected_size > cap` check.
-///
-/// PR1: backend impl wired to the Tauri IPC in PR2 (Task 9); exercised
-/// end-to-end by the Task 7 two-node integration test. Allow until the IPC
-/// caller lands.
-#[allow(dead_code)]
+/// the size check inside `finalize_artifact`.
 pub(crate) async fn download_channel_artifact_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
+    channel_id: String,
     cid: String,
     dest_path: String,
-    expected_size: u64,
     max_bytes: Option<u64>,
 ) -> Result<u64, String> {
     use harmony_content::cid::ContentId;
@@ -20490,26 +20526,61 @@ pub(crate) async fn download_channel_artifact_impl(
     let content_id = ContentId::from_bytes(cid_bytes);
     let encrypted = content_id.flags().encrypted;
 
+    // ── Authorize FIRST (before any fetch). ──────────────────────────────────
+    // Parse community/channel ids + look up the engine, mirroring
+    // `post_channel_message_impl`. The signed channel log is the source of
+    // truth: an unmatched CID is neither downloadable nor re-servable.
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    if channel_id.len() != 32 {
+        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes16: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let chid_bytes16: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "channel_id length wrong".to_string())?;
+    let space = crate::owner_state_types::SpaceId(cid_bytes16);
+    let chid = crate::community_membership::ChannelId(chid_bytes16);
+
+    let registry = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard
+            .channel_log_registry
+            .as_ref()
+            .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?
+            .clone()
+    };
+    let engine = registry
+        .engine(&space, &chid)
+        .await
+        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+
+    let att = engine
+        .find_attachment(&cid_bytes)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "unknown or unauthorized attachment".to_string())?;
+    // AUTHORITATIVE size — from the signed channel event, not the caller.
+    let expected_size = att.size;
+
+    // Cap check against the client ceiling.
     let cap = max_bytes
         .map(|m| m.min(MAX_ARTIFACT_BYTES))
         .unwrap_or(MAX_ARTIFACT_BYTES);
     if expected_size > cap {
-        return Err(format!("expected_size {expected_size} exceeds cap {cap}"));
+        return Err(format!("artifact size {expected_size} exceeds cap {cap}"));
     }
 
-    // Resolve the epoch key up front (only when encrypted) so the fetch and
-    // CRDT read don't interleave under the same lock. Mirrors the inlined
-    // hex-16 community-id decode from `ingest_channel_artifact_impl` /
-    // `post_channel_message_impl` (no `decode_hex16` helper exists).
+    // Resolve the epoch key (only when encrypted). The community_id is already
+    // parsed above; reuse `space` rather than re-decoding.
     let epoch_key_opt = if encrypted {
-        if community_id.len() != 32 {
-            return Err("community_id must be 16 bytes (32 hex chars)".to_string());
-        }
-        let cid_bytes16: [u8; 16] = hex::decode(&community_id)
-            .map_err(|e| format!("invalid community_id hex: {e}"))?
-            .try_into()
-            .map_err(|_| "community_id length wrong".to_string())?;
-        let space = crate::owner_state_types::SpaceId(cid_bytes16);
         Some(current_epoch_key_for(state, &space).await?)
     } else {
         None
@@ -20524,9 +20595,9 @@ pub(crate) async fn download_channel_artifact_impl(
     // The fetch `max_bytes` bounds the ASSEMBLED bytes, which for an encrypted
     // CID is the ciphertext — larger than the plaintext by `encrypt_blob`'s
     // nonce+tag overhead. Bound the fetch to the SIGNED plaintext `expected_size`
-    // (+AEAD overhead when encrypted), NOT the global artifact cap: otherwise an
-    // attachment lying with a tiny `expected_size` could still pull up to
-    // MAX_ARTIFACT_BYTES off the wire before the assembled size is verified. The
+    // (+AEAD overhead when encrypted), NOT the global artifact cap: otherwise a
+    // huge interior couldn't lie past the authoritative size, but keeping the
+    // fetch bound tight to the signed size is defence-in-depth. The
     // `expected_size > cap` guard above already proved `expected_size <= cap`.
     let fetch_cap = if encrypted {
         expected_size.saturating_add(crate::community_state_sync::BLOB_ENCRYPTION_OVERHEAD as u64)
@@ -20540,11 +20611,10 @@ pub(crate) async fn download_channel_artifact_impl(
             cid_hex: cid,
             reply: reply_tx,
             max_bytes: Some(fetch_cap as usize),
-            // SECURITY (ZEB-539): re-serve is currently granted from the CID's encrypted flag
-            // during the fetch, before the assembled artifact is validated. PR2 (which wires the
-            // IPC caller) must instead allowlist for re-serving only AFTER successful validation
-            // and after confirming the CID is an authorized channel attachment for the community.
-            serveable: encrypted, // re-serve encrypted artifact books
+            // SECURITY (ZEB-539): never re-serve DURING the fetch. The fetch only
+            // assembles the artifact locally; re-serve is granted post-validation
+            // (below), and only for an authorized encrypted attachment.
+            serveable: false,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
@@ -20552,7 +20622,41 @@ pub(crate) async fn download_channel_artifact_impl(
         .await
         .map_err(|_| "event loop dropped fetch request".to_string())??;
 
-    finalize_artifact(bytes, encrypted, epoch_key_opt, expected_size, &dest_path).await
+    let written =
+        finalize_artifact(bytes, encrypted, epoch_key_opt, expected_size, &dest_path).await?;
+
+    // ── Post-validation re-serve (ZEB-539). ──────────────────────────────────
+    // Only encrypted artifacts need allowlisting — public CIDs are servable by
+    // the gate regardless. The artifact is now validated (decrypted + size
+    // verified) AND was confirmed an authorized attachment above, so it is safe
+    // to swarm to other members. A re-serve failure is non-fatal: the user's
+    // file is already written.
+    if encrypted {
+        let content_store = {
+            let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+            g.content_store.clone()
+        };
+        if let Some(store) = content_store {
+            match store.allow_serve_subtree(content_id).await {
+                Ok(n) => {
+                    tracing::debug!(
+                        cid = %hex::encode(cid_bytes),
+                        allowlisted = n,
+                        "ZEB-539: allowlisted downloaded artifact subtree for re-serve"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        cid = %hex::encode(cid_bytes),
+                        error = %e,
+                        "ZEB-539: failed to allowlist artifact subtree for re-serve (non-fatal; file written)"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(written)
 }
 
 /// Tauri IPC: list locally-known messages in a channel.
@@ -22438,6 +22542,126 @@ mod create_community_inner_tests {
                 .is_some(),
             "the newly-created channel's log engine must be registered immediately so an \
              immediate post_channel_message finds it instead of returning 500"
+        );
+    }
+
+    /// ZEB-539: `download_channel_artifact_impl` must REJECT a CID that is not a
+    /// published attachment in the named channel — the authorize-first guard
+    /// (`find_attachment` returns `None`) fires before any fetch is issued, so a
+    /// caller cannot use the command to pull an arbitrary CID off the wire.
+    ///
+    /// This stands up a real community + channel-log engine (so the registry
+    /// lookup + `find_attachment` scan run against an actual signed log), posts a
+    /// plain message (no attachments), then asks to download an UNRELATED
+    /// (public, never-attached) CID and asserts the unauthorized rejection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn download_channel_artifact_rejects_unauthorized_cid() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "auth-guard-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        // Wait until the #general channel-log engine is registered.
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned"
+        );
+
+        // Build an owner-loaded NodeState with both registries (mirrors the
+        // eager-spawn test) so create_channel_impl + the download path work.
+        let retic = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let device_hash = crate::owner_state_types::DeviceIdentityHash(retic.identity.address_hash);
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                fixture.device_id.clone(),
+                fixture.self_owner,
+                device_hash,
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x11; 32])),
+                std::sync::Arc::new(retic),
+                std::sync::Arc::clone(&fixture.signing_key),
+                fixture.enrollment_cert.clone(),
+            ),
+        ));
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(std::sync::Arc::clone(&dm_outbox)),
+            ..NodeState::default()
+        });
+
+        // Create a channel through the production seam (eager spawn → engine
+        // exists immediately).
+        let channel_id_hex = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "logs".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("create_channel_impl must succeed");
+
+        // Post a plain message (no attachments) so the channel log is non-empty
+        // but contains NO attachment records.
+        post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            b"hello, no attachments".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("post_channel_message_impl must succeed");
+
+        // A public (unencrypted-flagged) CID that was never attached. The header
+        // nibble is 0 (mode_bits = 0 → not encrypted), so the download path
+        // wouldn't even reach epoch-key resolution — but authorization fails
+        // first, before any fetch.
+        let unattached_cid = format!("{}{}", "00".repeat(4), "ab".repeat(28));
+        assert_eq!(
+            unattached_cid.len(),
+            64,
+            "cid must be 32 bytes (64 hex chars)"
+        );
+        let err = download_channel_artifact_impl(
+            &node_state,
+            community_id_hex,
+            channel_id_hex,
+            unattached_cid,
+            "/tmp/should-never-be-written.bin".to_string(),
+            None,
+        )
+        .await
+        .expect_err("unauthorized cid must be rejected before any fetch");
+        assert!(
+            err.contains("unknown or unauthorized attachment"),
+            "got: {err}"
         );
     }
 
@@ -46471,6 +46695,7 @@ pub fn run() {
             list_channels,
             list_channel_messages,
             post_channel_message,
+            download_channel_artifact,
             request_channel_backfill,
             list_libraries,
             list_discovered_libraries,
@@ -49203,6 +49428,81 @@ mod channel_message_ipc_tests {
             "11".repeat(16),
             vec![104, 105],
             None,
+            None,
+        )
+        .await
+        .expect_err("missing registry must error");
+        assert!(err.contains("channel_log_registry missing"), "got: {err}");
+    }
+
+    // ── ZEB-539: download_channel_artifact IPC boundary rejections ──────────
+    #[tokio::test]
+    async fn download_channel_artifact_rejects_bad_cid_hex() {
+        // Invalid cid hex must fail at decode — before any engine/event-loop
+        // dependency is touched (the cid decode is the very first step).
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = download_channel_artifact(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            "zz".repeat(32), // 64 chars, but non-hex -> decode fails
+            "/tmp/out.bin".to_string(),
+            None,
+        )
+        .await
+        .expect_err("bad cid hex must error");
+        assert!(err.contains("invalid cid hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn download_channel_artifact_rejects_short_community_id() {
+        // A valid 32-byte cid passes the first decode; a short community_id
+        // is then rejected during authorization parsing.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = download_channel_artifact(
+            state,
+            "deadbeef".into(),
+            "00".repeat(16),
+            "00".repeat(32),
+            "/tmp/out.bin".to_string(),
+            None,
+        )
+        .await
+        .expect_err("short community_id must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn download_channel_artifact_rejects_short_channel_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = download_channel_artifact(
+            state,
+            "00".repeat(16),
+            "ab".into(),
+            "00".repeat(32),
+            "/tmp/out.bin".to_string(),
+            None,
+        )
+        .await
+        .expect_err("short channel_id must error");
+        assert!(err.contains("channel_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn download_channel_artifact_errors_when_registry_missing() {
+        // Well-formed ids + cid, but the default NodeState has no registry —
+        // authorization can't proceed, so the command rejects before fetching.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = download_channel_artifact(
+            state,
+            "00".repeat(16),
+            "11".repeat(16),
+            "00".repeat(32),
+            "/tmp/out.bin".to_string(),
             None,
         )
         .await

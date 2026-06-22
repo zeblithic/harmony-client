@@ -152,6 +152,16 @@ struct PostChannelMessageArgs {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct DownloadChannelArtifactArgs {
+    community_id: String,
+    channel_id: String,
+    cid: String,
+    dest_path: String,
+    max_bytes: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GenerateFriendTokenArgs {
     expires_at: Option<u64>,
 }
@@ -389,6 +399,22 @@ pub fn build_registry() -> RpcRegistry {
                 a.body,
                 a.reply_to,
                 a.mentions,
+            )
+            .await
+        }
+    );
+    rpc!(
+        m,
+        "download_channel_artifact",
+        DownloadChannelArtifactArgs,
+        |state, _sink, a| async move {
+            crate::download_channel_artifact_impl(
+                state,
+                a.community_id,
+                a.channel_id,
+                a.cid,
+                a.dest_path,
+                a.max_bytes,
             )
             .await
         }
