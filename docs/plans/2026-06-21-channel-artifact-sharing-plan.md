@@ -1302,3 +1302,83 @@ EOF
 - Public-copy deterministic-CID reuse (re-stream for now; book-dedup mitigates).
 - "Configurable" cap surface (ship the 1 GiB constant; community/operator knob later).
 - Rich MIME detection (small extension map for v1).
+
+---
+
+# PR 2 — ZEB-539 hardening (design addendum, added at PR2 time)
+
+> Surfaced by CodeAnt/CodeRabbit/Greptile on PR1 (#312). Folded into PR2 because PR2 Task 9 wires
+> `download_channel_artifact` as a live command, removing the `#[allow(dead_code)]` boundary that kept
+> the unhardened re-serve path unreachable. Landing the fix in the same PR means no released build ever
+> carries the gap. This addendum **supersedes** the original Task 5 / Task 9 download signature.
+
+## Problem (recap)
+`download_channel_artifact_impl` issued `FetchRequest { serveable: encrypted }`, so every fetched
+encrypted book was allowlisted for member-to-member re-serve **during** the fetch — i.e. *before* the
+assembled artifact was validated, and with no check that the CID is a legitimate channel attachment.
+The serve gate is `content_cid_servable = !cid.flags().encrypted || serve_allowlist.contains(cid)`
+(event_loop.rs:7583); the allowlist (`CommunityServeAllowlist`, content_store.rs:30) is a per-node
+`HashSet<ContentId>` mutated only inside the event loop via `CasOp::PutLocal { serveable: true }`.
+
+## Design
+
+**Revised download contract (supersedes Task 5/9):**
+```rust
+pub(crate) async fn download_channel_artifact_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    channel_id: String,   // NEW — required for attachment authorization
+    cid: String,
+    dest_path: String,
+    max_bytes: Option<u64>,
+    // expected_size REMOVED — derived from the signed ChannelAttachment (source of truth)
+) -> Result<u64, String>
+```
+
+**Step 1 — Authorize before fetching.** New channel-log-engine accessor (encapsulates the scan so a
+future in-memory index is a drop-in):
+```rust
+// community_channel_log_engine.rs — scans ALL stored events (segments + tail), not a recent window,
+// so an attachment shared long ago is still authorizable. Returns the signed record (authoritative).
+pub async fn find_attachment(&self, cid: &[u8; 32])
+    -> Result<Option<crate::community_channel_log::ChannelAttachment>, ChannelLogEngineError>;
+```
+The impl looks up the `(community_id, channel_id)` engine, calls `find_attachment(&cid_bytes)`; `None`
+⇒ reject (`"unknown or unauthorized attachment"`). The returned attachment's `size` is the
+**authoritative `expected_size`** for the fetch cap and the `finalize_artifact` size verify. Applies to
+public *and* encrypted downloads (cheap hygiene: stops the command being a fetch-arbitrary-CID gadget).
+
+**Step 2 — Fetch with `serveable: false`.** Never allowlist during the fetch. `fetch_cap` math is
+unchanged but uses the authoritative size (`+ BLOB_ENCRYPTION_OVERHEAD` when encrypted).
+
+**Step 3 — Validate, then allowlist the subtree.** After `finalize_artifact` returns `Ok` (decrypt +
+size verify) **and only for encrypted artifacts** (public is servable by the gate regardless), register
+the artifact's full local CID subtree for re-serve so this node can swarm it to other members
+(preserving PR1's member-to-member re-serve property). New CasOp:
+```rust
+// content_store.rs CasOp:
+AllowServeSubtree {
+    root: ContentId,
+    reply: tokio::sync::oneshot::Sender<Result<usize, ContentStoreError>>, // # CIDs allowlisted
+},
+```
+Event-loop handler (event_loop.rs, near the PutLocal arm): spawn a task (do not block the select loop)
+that walks the DAG **locally** from `root` — `CasOp::GetLocal` for each node (never `GetOrFetch`; all
+books are already local post-fetch) + `harmony_content::bundle::parse_bundle` to extract children —
+and calls `serve_allowlist.allow(cid)` for every CID including the root. Bounded by the artifact's chunk
+count (≤ ~1 GiB / 1 MiB ≈ 1k books). The walk reuses the same DAG-traversal shape as
+`tests/cas_serve_two_node_integration.rs::walk_cross_node`, but local-only.
+
+## Task slicing (supersedes "PR 2 Tasks 9–12")
+- **T1 — ZEB-539 primitives:** `find_attachment` engine accessor (+ unit test over segments+tail) and
+  `CasOp::AllowServeSubtree` + the event-loop local-walk handler (+ coverage). No download behavior
+  change yet.
+- **T2 — download rework + wire:** rework `download_channel_artifact_impl` to the revised contract
+  (channel_id, authorize via `find_attachment`, authoritative size, `serveable:false`, post-finalize
+  `AllowServeSubtree` for encrypted); rewrite the ZEB-539 SECURITY comment to describe the *fix*; add
+  the `download_channel_artifact` Tauri command + RPC with the new signature; update download tests.
+- **T3 — ingest wire:** `ingest_channel_artifact` Tauri command + RPC (original Task 9 ingest half).
+- **T4 — post_channel_message attachments:** original Task 10, unchanged.
+- **T5 — frontend service:** original Task 11, except `downloadArtifact(communityId, channelId,
+  attachment, destPath, maxBytes)` (channelId added, expectedSize dropped; size is server-derived).
+- **T6 — full gate + open PR2.**
