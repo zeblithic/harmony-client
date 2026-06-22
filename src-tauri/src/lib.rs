@@ -27835,6 +27835,130 @@ pub(crate) async fn get_cached_member_card_impl(
     Ok(cache.get_cached(subscription_id).await)
 }
 
+/// IPC: ZEB-537. Subscribe to a community's presence roster (keyed by the
+/// 16-byte `community_id`). The event loop spawns the per-community
+/// publisher/subscriber pair and emits `presence-updated` events as peers'
+/// beacons arrive. Mirrors `subscribe_member_card` but community-scoped.
+#[tauri::command]
+async fn subscribe_community_presence(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<(), String> {
+    subscribe_community_presence_impl(state_lock.inner(), community_id).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn subscribe_community_presence_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<(), String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let request_tx = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.community_presence_request_tx
+            .clone()
+            .ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    request_tx
+        .send(crate::event_loop::CommunityPresenceRequest::Subscribe {
+            community_id: cid_bytes,
+        })
+        .await
+        .map_err(|e| format!("community_presence_request_tx send: {e}"))?;
+    Ok(())
+}
+
+/// IPC: ZEB-537. Unsubscribe from a community's presence roster. The event
+/// loop aborts the per-community publisher/subscriber pair and emits a final
+/// empty roster. Mirrors `unsubscribe_member_card` but community-scoped.
+#[tauri::command]
+async fn unsubscribe_community_presence(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<(), String> {
+    unsubscribe_community_presence_impl(state_lock.inner(), community_id).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn unsubscribe_community_presence_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<(), String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let request_tx = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.community_presence_request_tx
+            .clone()
+            .ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    request_tx
+        .send(crate::event_loop::CommunityPresenceRequest::Unsubscribe {
+            community_id: cid_bytes,
+        })
+        .await
+        .map_err(|e| format!("community_presence_request_tx send: {e}"))?;
+    Ok(())
+}
+
+/// IPC: ZEB-537. Snapshot the current online roster for a community without
+/// waiting for the next `presence-updated` event (e.g. on first paint).
+#[tauri::command]
+async fn get_community_presence(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<crate::community_presence::PresenceMemberDto>, String> {
+    get_community_presence_impl(state_lock.inner(), community_id).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn get_community_presence_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<Vec<crate::community_presence::PresenceMemberDto>, String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    // Pull the Arc out from under the std::sync::Mutex guard, then DROP the
+    // guard before awaiting the tokio map lock (never hold a std guard across
+    // an .await). Same lock discipline as the member-card get impl.
+    let map = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.community_presence_map
+            .clone()
+            .ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    let owners = map
+        .lock()
+        .await
+        .online_owners(&crate::owner_state_types::SpaceId(cid_bytes));
+    Ok(owners
+        .iter()
+        .map(crate::community_presence::PresenceMemberDto::from_owner_presence)
+        .collect())
+}
+
 #[cfg(test)]
 mod member_card_ipc_tests {
     //! ZEB-341: contract test for the hex parser the subscribe IPC relies on.
@@ -46850,6 +46974,10 @@ pub fn run() {
             subscribe_member_card,
             unsubscribe_member_card,
             get_cached_member_card,
+            // ZEB-537: community-presence roster IPC trio.
+            subscribe_community_presence,
+            unsubscribe_community_presence,
+            get_community_presence,
             // ZEB-290 Phase 1 Task 11: Tier 1 voting IPCs.
             voting_create_tier1_poll,
             voting_cast_tier1_ballot,
@@ -49954,6 +50082,51 @@ mod channel_message_ipc_tests {
                 .is_err_and(|e: &String| e.contains("invalid CID hex")),
             "expected invalid-hex rejection, got {got:?}"
         );
+    }
+
+    // ── ZEB-537: community-presence IPC guard paths ─────────────────────
+
+    #[tokio::test]
+    async fn subscribe_community_presence_rejects_short_community_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = subscribe_community_presence(state, "deadbeef".into())
+            .await
+            .expect_err("short cid must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn get_community_presence_rejects_non_hex_community_id() {
+        // 32-char but non-hex: passes the length check, fails the hex decode.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = get_community_presence(state, "z".repeat(32))
+            .await
+            .expect_err("non-hex cid must error");
+        assert!(err.contains("invalid community_id hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn get_community_presence_errs_when_owner_not_loaded() {
+        // Valid 32-hex cid against a default NodeState (presence map = None):
+        // must surface the owner-not-loaded message, not panic.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = get_community_presence(state, "ab".repeat(16))
+            .await
+            .expect_err("no presence map → owner-not-loaded");
+        assert_eq!(err, OWNER_NOT_LOADED_MSG);
+    }
+
+    #[tokio::test]
+    async fn subscribe_community_presence_errs_when_owner_not_loaded() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = subscribe_community_presence(state, "ab".repeat(16))
+            .await
+            .expect_err("no request_tx → owner-not-loaded");
+        assert_eq!(err, OWNER_NOT_LOADED_MSG);
     }
 }
 

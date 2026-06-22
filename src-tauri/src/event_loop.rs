@@ -3115,10 +3115,10 @@ pub async fn run(
                             crate::node_event_sink::emit_ser(
                                 app_for_presence.as_ref(),
                                 "presence-updated",
-                                &serde_json::json!({
-                                    "communityId": hex::encode(community_id),
-                                    "members": [],
-                                }),
+                                &crate::community_presence::PresenceUpdatedPayload::new(
+                                    community_id,
+                                    &[],
+                                ),
                             );
                         }
                         CommunityPresenceRequest::Unsubscribe { community_id } => {
@@ -3133,10 +3133,10 @@ pub async fn run(
                             crate::node_event_sink::emit_ser(
                                 app_for_presence.as_ref(),
                                 "presence-updated",
-                                &serde_json::json!({
-                                    "communityId": hex::encode(community_id),
-                                    "members": [],
-                                }),
+                                &crate::community_presence::PresenceUpdatedPayload::new(
+                                    community_id,
+                                    &[],
+                                ),
                             );
                         }
                     }
@@ -3176,24 +3176,13 @@ pub async fn run(
                             let g = map_for_sweep.lock().await;
                             g.online_owners(&community)
                         };
-                        let members_json: Vec<serde_json::Value> = members
-                            .iter()
-                            .map(|o| {
-                                serde_json::json!({
-                                    "ownerIdHex": hex::encode(o.owner),
-                                    "online": true,
-                                    "lastSeenMs": o.last_seen_ms,
-                                    "deviceCount": o.device_count,
-                                })
-                            })
-                            .collect();
                         crate::node_event_sink::emit_ser(
                             app_for_sweep.as_ref(),
                             "presence-updated",
-                            &serde_json::json!({
-                                "communityId": hex::encode(community.0),
-                                "members": members_json,
-                            }),
+                            &crate::community_presence::PresenceUpdatedPayload::new(
+                                community.0,
+                                &members,
+                            ),
                         );
                     }
                 }

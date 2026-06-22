@@ -220,6 +220,51 @@ pub struct OwnerPresence {
     pub last_seen_ms: u64,
 }
 
+/// ZEB-537: one online member as serialized to the frontend in a
+/// `presence-updated` event (or returned by the `get_community_presence` IPC).
+/// `online` is always `true` — the roster only ever contains live owners; an
+/// owner dropping off is communicated by their absence from a fresh `members`
+/// list. The camelCase wire shape is contract-pinned (frontend depends on it).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresenceMemberDto {
+    pub owner_id_hex: String,
+    pub online: bool,
+    pub last_seen_ms: u64,
+    pub device_count: u32,
+}
+
+/// ZEB-537: the full `presence-updated` event payload for one community.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresenceUpdatedPayload {
+    pub community_id: String,
+    pub members: Vec<PresenceMemberDto>,
+}
+
+impl PresenceMemberDto {
+    pub fn from_owner_presence(o: &OwnerPresence) -> Self {
+        Self {
+            owner_id_hex: hex::encode(o.owner),
+            online: true,
+            last_seen_ms: o.last_seen_ms,
+            device_count: o.device_count,
+        }
+    }
+}
+
+impl PresenceUpdatedPayload {
+    pub fn new(community_id: [u8; 16], members: &[OwnerPresence]) -> Self {
+        Self {
+            community_id: hex::encode(community_id),
+            members: members
+                .iter()
+                .map(PresenceMemberDto::from_owner_presence)
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct CommunityPresenceMap {
     // community → device → entry
@@ -467,25 +512,10 @@ pub fn spawn_community_presence_subscriber(
                     let g = map.lock().await;
                     g.online_owners(&community)
                 };
-                // Task 6 will replace this json! with the typed PresenceUpdatedPayload struct.
-                let members_json: Vec<serde_json::Value> = members
-                    .iter()
-                    .map(|o| {
-                        serde_json::json!({
-                            "ownerIdHex": hex::encode(o.owner),
-                            "online": true,
-                            "lastSeenMs": o.last_seen_ms,
-                            "deviceCount": o.device_count,
-                        })
-                    })
-                    .collect();
                 crate::node_event_sink::emit_ser(
                     app.as_ref(),
                     "presence-updated",
-                    &serde_json::json!({
-                        "communityId": hex::encode(community.0),
-                        "members": members_json,
-                    }),
+                    &PresenceUpdatedPayload::new(community.0, &members),
                 );
             }
         }
