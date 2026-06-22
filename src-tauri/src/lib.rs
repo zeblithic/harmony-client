@@ -978,6 +978,16 @@ pub struct NodeState {
     /// ZEB-341: monotonic subscription-id allocator for card subscriptions.
     /// Reset on stop_node.
     profile_card_next_subscription_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// ZEB-537: control channel into the event-loop's community-presence
+    /// subscriber/publisher pool. IPC handlers send `Subscribe`/`Unsubscribe`;
+    /// the event loop owns the per-community task pair. `None` until a node with
+    /// an owner identity is running.
+    community_presence_request_tx:
+        Option<tokio::sync::mpsc::Sender<crate::event_loop::CommunityPresenceRequest>>,
+    /// ZEB-537: the live community-presence roster map, shared with the event
+    /// loop's subscriber + sweeper tasks. IPC reads the roster from here.
+    community_presence_map:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::community_presence::CommunityPresenceMap>>>,
     /// ZEB-290 Phase 1 Task 11 (+ ZEB-291 Phase 2 Task 19 shape migration):
     /// per-community voting-event logs. Holds an `Arc<tokio::Mutex<VotingLog>>`
     /// per `SpaceId`; lazily populated on first local
@@ -1600,6 +1610,8 @@ impl Default for NodeState {
             profile_card_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
+            community_presence_request_tx: None,
+            community_presence_map: None,
             // ZEB-290 Phase 1 Task 11 + ZEB-291 Task 19 migration: voting
             // log registry starts empty and survives stop_node (in-memory
             // only; cleared on process exit). Outer Mutex is tokio so the
@@ -2124,6 +2136,8 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.profile_card_request_tx = None;
         guard.profile_card_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        guard.community_presence_request_tx = None;
+        guard.community_presence_map = None;
         // Mint Phase 2 sync: take before releasing the lock so a concurrent
         // IPC doesn't race to call notify_dirty on a shutting-down engine.
         mint_sync_for_shutdown = guard.mint_sync.take();
@@ -3098,6 +3112,8 @@ pub async fn start_node_inner(
         guard.profile_card_request_tx = None;
         guard.profile_card_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        guard.community_presence_request_tx = None;
+        guard.community_presence_map = None;
         // Mint Phase 2 sync: take the prior identity's engine so it can be
         // shut down outside the lock below (same pattern as sync_engine).
         old_mint_sync_engine = guard.mint_sync.take();
@@ -3667,6 +3683,16 @@ pub async fn start_node_inner(
             std::sync::Arc::new(crate::profile_card_broadcast::ProfileCardCache::default());
         let (profile_card_request_tx, profile_card_request_rx) =
             tokio::sync::mpsc::channel::<crate::event_loop::ProfileCardRequest>(64);
+        // ZEB-537: community-presence request channel + the shared roster map.
+        // The map is shared between the event loop (subscriber + sweeper write it)
+        // and NodeState (IPC reads it); the loop gets its own clone, NodeState
+        // keeps `community_presence_map_for_state`.
+        let (community_presence_request_tx, community_presence_request_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::CommunityPresenceRequest>(64);
+        let community_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::community_presence::CommunityPresenceMap::new(),
+        ));
+        let community_presence_map_for_state = std::sync::Arc::clone(&community_presence_map);
 
         // ── ZEB-323 Phase 2b: pkarr lifted state holders ─────────────────
         //
@@ -8512,6 +8538,12 @@ pub async fn start_node_inner(
                 let profile_card_cache_for_loop =
                     Some(std::sync::Arc::clone(&profile_card_cache_arc));
                 let profile_card_request_rx_for_loop = Some(profile_card_request_rx);
+                // ZEB-537: thread the community-presence request rx + shared map
+                // into event_loop::run (the loop gets its own map clone; the
+                // NodeState assignment below keeps `..._for_state`).
+                let community_presence_request_rx_for_loop = Some(community_presence_request_rx);
+                let community_presence_map_for_loop =
+                    std::sync::Arc::clone(&community_presence_map);
                 // Mint Phase 2 sync: thread handles into event_loop::run.
                 let mint_sync_handles_for_loop = mint_sync_handles_opt;
                 // ZEB-417 SP1: thread the Notes adapter handles into
@@ -8629,6 +8661,8 @@ pub async fn start_node_inner(
                                 profile_broadcast_request_rx_for_loop,
                                 profile_card_cache_for_loop,
                                 profile_card_request_rx_for_loop,
+                                community_presence_request_rx_for_loop,
+                                community_presence_map_for_loop,
                                 mint_sync_handles_for_loop,
                                 notes_sync_handles_for_loop,
                                 dm_inbox_sync_handles_for_loop,
@@ -8814,6 +8848,11 @@ pub async fn start_node_inner(
                         guard.profile_card_request_tx = Some(profile_card_request_tx);
                         guard.profile_card_next_subscription_id =
                             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+                        // ZEB-537: store the community-presence request_tx + the
+                        // shared roster map so presence IPC handlers can drive the
+                        // pool and read the live roster.
+                        guard.community_presence_request_tx = Some(community_presence_request_tx);
+                        guard.community_presence_map = Some(community_presence_map_for_state);
                         // Mint Phase 2 sync: store the engine Arc so IPC handlers
                         // can call notify_dirty() after mutations.
                         guard.mint_sync = mint_sync_engine_opt.clone();
@@ -51290,6 +51329,8 @@ mod start_node_race_tests {
             profile_card_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
+            community_presence_request_tx: None,
+            community_presence_map: None,
             voting_logs: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
