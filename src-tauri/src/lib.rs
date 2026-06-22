@@ -20928,7 +20928,7 @@ pub(crate) async fn download_channel_artifact_impl(
     Ok(written)
 }
 
-/// ZEB-445 shared IPC/RPC seam for [`preview_channel_artifact`].
+/// ZEB-540 IPC seam for [`preview_channel_artifact`] (no headless RPC verb).
 pub(crate) async fn preview_channel_artifact_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
@@ -23066,6 +23066,118 @@ mod create_community_inner_tests {
                 || err.contains("channel_log_registry"),
             "got: {err}"
         );
+    }
+
+    /// ZEB-540: `preview_channel_artifact_impl` must REJECT an attachment whose
+    /// signed size exceeds the 4 MiB preview cap (`MAX_PREVIEW_BYTES`) — BEFORE
+    /// any fetch is issued. No real bytes are needed: `post_channel_message_impl`
+    /// signs the descriptor's `size` verbatim (it only rejects > the 1 GiB
+    /// `MAX_ATTACHMENT_SIZE`), and the cap check in `authorize_and_fetch_artifact`
+    /// fires on that authoritative signed size before any `FetchRequest`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preview_channel_artifact_rejects_oversized() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "preview-cap-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned"
+        );
+
+        let retic = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let device_hash = crate::owner_state_types::DeviceIdentityHash(retic.identity.address_hash);
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                fixture.device_id.clone(),
+                fixture.self_owner,
+                device_hash,
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x11; 32])),
+                std::sync::Arc::new(retic),
+                std::sync::Arc::clone(&fixture.signing_key),
+                fixture.enrollment_cert.clone(),
+            ),
+        ));
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(std::sync::Arc::clone(&dm_outbox)),
+            ..NodeState::default()
+        });
+
+        let channel_id_hex = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "logs".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("create_channel_impl must succeed");
+
+        // A public (unencrypted-flagged, header nibble 0) CID. Its bytes are never
+        // fetched — the cap rejection fires on the signed size first.
+        let big_cid = format!("{}{}", "00".repeat(4), "cd".repeat(28));
+        assert_eq!(big_cid.len(), 64, "cid must be 32 bytes (64 hex chars)");
+
+        // Post a message carrying an attachment whose signed size is one byte over
+        // the preview cap.
+        post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            b"here is a big artifact".to_vec(),
+            None,
+            None,
+            Some(vec![
+                crate::community_channel_log_engine::ChannelAttachmentDto {
+                    cid: big_cid.clone(),
+                    mime: "image/png".to_string(),
+                    name: "big.png".to_string(),
+                    size: MAX_PREVIEW_BYTES + 1,
+                    encrypted: false,
+                },
+            ]),
+        )
+        .await
+        .expect("post_channel_message_impl must succeed");
+
+        let err = preview_channel_artifact_impl(
+            &node_state,
+            community_id_hex,
+            channel_id_hex,
+            big_cid,
+            None,
+        )
+        .await
+        .expect_err("an attachment over the preview cap must be rejected before fetch");
+        assert!(err.contains("exceeds cap"), "got: {err}");
     }
 
     /// Failure path — fence abort after default-channel insert: the guard
