@@ -155,4 +155,19 @@ describe('PresenceService', () => {
     (adapter.invoke as any).mockRejectedValue('no engine for community');
     await expect(service.unsubscribe(CID_A)).rejects.toThrow('no engine for community');
   });
+
+  it('no-adapter instance no-ops without throwing (subscribe/getPresence/unsubscribe/isOnline)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const noAdapter = new PresenceService();
+    const onUpdate = vi.fn();
+
+    await expect(noAdapter.subscribe(CID_A, onUpdate)).resolves.toBeUndefined();
+    await expect(noAdapter.getPresence(CID_A)).resolves.toEqual([]);
+    await expect(noAdapter.unsubscribe(CID_A)).resolves.toBeUndefined();
+    // subscribe was a no-op, so nothing seeded → onUpdate never fired, isOnline false.
+    expect(onUpdate).not.toHaveBeenCalled();
+    expect(noAdapter.isOnline(OWNER_1)).toBe(false);
+
+    warn.mockRestore();
+  });
 });

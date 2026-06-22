@@ -47,7 +47,19 @@ export class PresenceService {
   /** communityId -> the caller's onUpdate callback. */
   private callbacks = new Map<string, (members: PresenceMemberDto[]) => void>();
 
-  constructor(private adapter: TauriAdapter) {}
+  /**
+   * Adapter is optional so callers can construct the service at boot (before
+   * the Tauri runtime is wired) and inject the adapter later via
+   * {@link setAdapter}. Network methods no-op (with a `console.warn`) when the
+   * adapter is absent — mirrors MemberCardService so a non-connected boot
+   * never crashes. (ZEB-537.)
+   */
+  constructor(private adapter?: TauriAdapter) {}
+
+  /** Wire the Tauri adapter after it becomes available (post-boot). */
+  setAdapter(adapter: TauriAdapter): void {
+    this.adapter = adapter;
+  }
 
   /**
    * Start beaconing/subscribing for `communityId`, install the
@@ -61,6 +73,10 @@ export class PresenceService {
     communityId: string,
     onUpdate: (members: PresenceMemberDto[]) => void,
   ): Promise<void> {
+    if (!this.adapter) {
+      console.warn('PresenceService.subscribe: no adapter wired; ignoring');
+      return;
+    }
     this.callbacks.set(communityId, onUpdate);
     try {
       await this.adapter.invoke('subscribe_community_presence', { communityId });
@@ -89,6 +105,10 @@ export class PresenceService {
    * listener, and drop its cached state. Idempotent.
    */
   async unsubscribe(communityId: string): Promise<void> {
+    if (!this.adapter) {
+      console.warn('PresenceService.unsubscribe: no adapter wired; ignoring');
+      return;
+    }
     const unlisten = this.unlisteners.get(communityId);
     if (unlisten) {
       unlisten();
@@ -105,6 +125,10 @@ export class PresenceService {
 
   /** Fetch the current online members for `communityId` (one-shot snapshot). */
   async getPresence(communityId: string): Promise<PresenceMemberDto[]> {
+    if (!this.adapter) {
+      console.warn('PresenceService.getPresence: no adapter wired; returning empty');
+      return [];
+    }
     try {
       return (await this.adapter.invoke('get_community_presence', {
         communityId,

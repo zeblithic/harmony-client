@@ -31,6 +31,7 @@
     onaction,
     resolveCard,
     resolveNickname,
+    isOnline,
     onOpenCard,
   }: {
     member: CommunityMember;
@@ -42,6 +43,9 @@
      *  precedence over the broadcast profile-card name, matching the Friends
      *  panel's label ladder. */
     resolveNickname?: (ownerIdHex: string) => string | undefined;
+    /** ZEB-537: optional online-presence resolver. Reads through a parent
+     *  PresenceService; undefined → no dot (treated as offline). */
+    isOnline?: (ownerIdHex: string) => boolean;
     /** ZEB-341: open the owner_id card popover for this member. */
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
@@ -136,6 +140,10 @@
       ? new Date(member.joinedAt).toLocaleDateString()
       : '—'
   );
+  // ZEB-537: online status. Read through the resolver inside $derived so a
+  // presence-updated counter bump (in App.svelte) re-evaluates the dot live —
+  // mirrors the displayName/label ladder. Undefined resolver → offline.
+  let online = $derived(isOnline ? isOnline(member.address) : false);
 
   function handleMenuItemClick(action: KebabAction) {
     menuOpen = false;
@@ -167,6 +175,12 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <li class="member-row" onkeydown={handleKeydown}>
+  <span
+    class="presence-dot"
+    class:online
+    title={online ? 'Online' : 'Offline'}
+    aria-label={online ? 'Online' : 'Offline'}
+  ></span>
   <Avatar
     address={member.address}
     displayName={displayName}
@@ -232,6 +246,21 @@
   }
   .member-row:last-child {
     border-bottom: none;
+  }
+  /* ZEB-537: online-presence indicator. Muted/hollow when offline, solid
+     green when online. Sized to align with the row's avatar/text. */
+  .presence-dot {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    box-sizing: border-box;
+  }
+  .presence-dot.online {
+    background: #3ba55d;
+    border-color: #3ba55d;
   }
   .member-info {
     flex: 1;

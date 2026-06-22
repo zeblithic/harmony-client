@@ -44,6 +44,7 @@
     votingAdapter,
     resolveCard,
     resolveNickname,
+    isOnline,
     subscribeVisibleCards,
     unsubscribeCards,
     onOpenCard,
@@ -66,6 +67,10 @@
     /** ZEB-432: optional local friend-nickname resolver (ZEB-419), preferred
      *  over the profile-card name in the roster and on message authors. */
     resolveNickname?: (ownerIdHex: string) => string | undefined;
+    /** ZEB-537: optional online-presence resolver for the members roster.
+     *  Pure consumer of the parent's PresenceService (same contract as
+     *  resolveCard). Undefined until the presence subscription is wired. */
+    isOnline?: (ownerIdHex: string) => boolean;
     /** ZEB-341 Task 8: subscribe to cross-peer cards for the visible member set. */
     subscribeVisibleCards?: (ownerIdHexes: string[]) => void;
     /** ZEB-341 Task 8: tear down all card subscriptions when the panel unmounts. */
@@ -558,6 +563,7 @@
         ownAddress={ownAddress}
         {resolveCard}
         {resolveNickname}
+        {isOnline}
         {onOpenCard}
       />
     </div>
