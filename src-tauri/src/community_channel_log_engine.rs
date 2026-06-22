@@ -198,19 +198,29 @@ pub const POLL_BODY_MAGIC: u8 = 0x00;
 /// hex encoding of a 32-byte `PollId`). Total 65 bytes.
 pub const POLL_BODY_LEN: usize = 1 + 64;
 
-/// ZEB-539: if `event` is a `Post` carrying an attachment whose CID equals
-/// `cid`, return a clone of that `ChannelAttachment`. Used by
-/// `find_attachment` to scan the log for a re-serve authorization record.
+/// ZEB-539 / ZEB-541: if `event` references a `ChannelAttachment` whose CID
+/// equals `cid`, return a clone of that descriptor. Used by `find_attachment`
+/// to scan the log for a re-serve authorization record.
+///
+/// Two authorizing event shapes:
+/// - `Post` — any of its `attachments` (ZEB-539).
+/// - `React` — its optional custom-emoji `emoji_attachment` (ZEB-541). A signed
+///   React referencing an emoji CID makes that CID serve-authorizable to anyone
+///   who can read the channel, exactly like a Post attachment (same power gate).
 fn attachment_with_cid(event: &SignedChannelEvent, cid: &[u8; 32]) -> Option<ChannelAttachment> {
-    // React events carry no attachments — only Post can authorize a re-serve.
-    let SignedChannelEvent::Post { attachments, .. } = event else {
-        return None;
-    };
-    attachments
-        .as_ref()?
-        .iter()
-        .find(|att| &att.cid == cid)
-        .cloned()
+    match event {
+        SignedChannelEvent::Post { attachments, .. } => attachments
+            .as_ref()?
+            .iter()
+            .find(|att| &att.cid == cid)
+            .cloned(),
+        SignedChannelEvent::React {
+            emoji_attachment, ..
+        } => emoji_attachment
+            .as_ref()
+            .filter(|att| &att.cid == cid)
+            .cloned(),
+    }
 }
 
 /// Inspect a channel-message body for the ZEB-291 Phase 1.5 poll
@@ -270,6 +280,21 @@ pub struct ChannelReactionReceivedPayload {
     pub emoji: String,
     pub add: bool,
     pub at: HlcDto,
+    /// ZEB-541: hex CID of the custom emoji this React references, when the
+    /// reaction is a CAS-backed image emoji. `None` for unicode reactions.
+    /// Lets a peer render the custom chip immediately from the live event,
+    /// instead of staying blank until a `list_channel_messages`
+    /// re-materialization. Additive optional field — omitted on the wire for
+    /// unicode reactions, so it doesn't perturb the existing event shape.
+    /// (`default` is omitted: this payload is `Serialize`-only — it is only
+    /// emitted, never deserialized — so a deserialize default would be dead.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emoji_cid: Option<String>,
+    /// ZEB-541: advisory plaintext byte size of the custom emoji (from the
+    /// signed descriptor). `None` for unicode reactions. Pairs with
+    /// `emoji_cid`; the authoritative size is re-derived at serve time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emoji_size: Option<u64>,
 }
 
 // ── Config + params ─────────────────────────────────────────────────────────
@@ -1086,11 +1111,18 @@ impl ChannelLogEngine {
             author,
             at,
             emoji,
+            emoji_attachment,
             add,
             ..
         } = event
         else {
             return;
+        };
+        // ZEB-541: surface the custom-emoji CID/size on the live event so a peer
+        // can render the chip immediately. Both are `None` for unicode reactions.
+        let (emoji_cid, emoji_size) = match emoji_attachment {
+            Some(att) => (Some(hex::encode(att.cid)), Some(att.size)),
+            None => (None, None),
         };
         let payload = ChannelReactionReceivedPayload {
             community_id: hex::encode(self.community_id.0),
@@ -1104,6 +1136,8 @@ impl ChannelLogEngine {
                 logical: at.logical,
                 device_id: at.device_id.clone(),
             },
+            emoji_cid,
+            emoji_size,
         };
         crate::node_event_sink::emit_ser(&*self.sink, "channel-reaction-received", &payload);
     }
@@ -5439,6 +5473,78 @@ mod tests {
             .find(|d| d.message_id == hex::encode(msg_id.0))
             .unwrap();
         assert!(m2.reactions.iter().all(|r| r.emoji != "👍"));
+    }
+
+    /// ZEB-541: the live `channel-reaction-received` event carries the custom
+    /// emoji CID + size so a peer can render the chip immediately (instead of
+    /// staying blank until a `list_channel_messages` re-materialization). A
+    /// custom-emoji React emits `emojiCid`/`emojiSize`; a unicode React emits
+    /// neither (the optional fields are skipped on serialize).
+    #[tokio::test]
+    async fn reaction_received_event_carries_custom_emoji_cid() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let msg_id = Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, None, None)
+            .await
+            .expect("post");
+
+        // Custom-emoji React → the emitted event must surface emojiCid/emojiSize.
+        let emoji_cid = [0xB2u8; 32];
+        let att = crate::community_channel_log::ChannelAttachment {
+            cid: emoji_cid,
+            mime: "image/png".to_string(),
+            name: String::new(),
+            size: 1024,
+        };
+        Arc::clone(&fix.engine)
+            .react(msg_id, String::new(), true, Some(att))
+            .await
+            .expect("custom-emoji react");
+
+        let frames = fix.sink.frames();
+        let (_, custom) = frames
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "channel-reaction-received")
+            .expect("a channel-reaction-received frame must be emitted");
+        assert_eq!(
+            custom.get("emojiCid").and_then(|v| v.as_str()),
+            Some(hex::encode(emoji_cid).as_str()),
+            "custom React must carry the hex emoji CID"
+        );
+        assert_eq!(
+            custom.get("emojiSize").and_then(|v| v.as_u64()),
+            Some(1024),
+            "custom React must carry the emoji size"
+        );
+        assert_eq!(
+            custom.get("emoji").and_then(|v| v.as_str()),
+            Some(""),
+            "custom React uses an empty unicode emoji field"
+        );
+
+        // Unicode React → neither field is present (skip_serializing_if).
+        Arc::clone(&fix.engine)
+            .react(msg_id, "👍".to_string(), true, None)
+            .await
+            .expect("unicode react");
+        let frames = fix.sink.frames();
+        let (_, unicode) = frames
+            .iter()
+            .rev()
+            .find(|(name, v)| {
+                name == "channel-reaction-received"
+                    && v.get("emoji").and_then(|e| e.as_str()) == Some("👍")
+            })
+            .expect("the unicode reaction frame must be emitted");
+        assert!(
+            unicode.get("emojiCid").is_none(),
+            "unicode React must omit emojiCid"
+        );
+        assert!(
+            unicode.get("emojiSize").is_none(),
+            "unicode React must omit emojiSize"
+        );
     }
 
     /// ZEB-536 regression (Qodo/CodeAnt on PR #314): `list_message_dtos` must
