@@ -81,6 +81,7 @@
   import type { MintIpcResult, OwnerStateView } from './lib/owner-service';
   import type { StartNodeResponse } from './lib/types/onboarding';
   import { MemberCardService } from './lib/member-card-service';
+  import { PresenceService } from './lib/presence-service';
   import { selfCommunityPower } from './lib/community-self-power';
   import { getVoiceSession, type VoiceSession } from './lib/voice-session';
   import { getCallSession, type CallSession } from './lib/call-session';
@@ -130,6 +131,20 @@
   memberCardService.onUpdate = () => {
     cardVersion++;
   };
+  // ZEB-537: per-community online presence. Mirrors MemberCardService's
+  // optional-adapter + reactivity-seam pattern: constructed early so it's
+  // available at boot, the adapter is wired in Tauri-init, and a $state
+  // version counter bumped on every presence update re-runs the inline
+  // isOnline() resolver read in MemberRow's $derived so the online dot
+  // repaints live.
+  const presenceService = new PresenceService();
+  let presenceVersion = $state(0);
+  // ZEB-537: generation guard for the fire-and-forget presence switch in
+  // changeSelectedCommunity. Rapid community switches interleave their async
+  // unsubscribe/subscribe; a superseded switch must bail after each await so it
+  // never resubscribes to (or clobbers state for) a community the user has
+  // already left. Plain (non-$state) — read only inside the IIFE.
+  let presenceSwitchGen = 0;
   // selfOwnerId is the OwnerAddr hex (32 chars) obtained from get_owner_state.
   // Set at startup (after start_node) and kept stable for the session.
   let selfOwnerId = $state<string | null>(null);
@@ -537,6 +552,14 @@
   // friend ownerIdHex are both lowercase owner_id, but normalize defensively.
   function resolveNickname(ownerIdHex: string): string | undefined {
     return friendNicknames.get(ownerIdHex.toLowerCase()) || undefined;
+  }
+
+  // ZEB-537: online-presence resolver threaded into the members roster, mirroring
+  // resolveCard. Reading presenceVersion registers the reactive dependency so
+  // consumers re-run when a presence-updated event mutates the service's map.
+  function isOnline(ownerIdHex: string): boolean {
+    presenceVersion; // reactive dep: re-run derived consumers when presence changes
+    return presenceService.isOnline(ownerIdHex);
   }
 
   // ZEB-341 Task 8: lifecycle hooks threaded down to CommunityMembersPanel,
@@ -1020,6 +1043,35 @@
       communityMembers = [];
       // ZEB-404: new community session → reset the refetch throttle.
       lastMessageRosterRefetchAt = 0;
+      // ZEB-537: follow the selected community with the presence subscription —
+      // tear down the previous community's subscription, then start the new
+      // one. The onUpdate bumps presenceVersion → App re-renders → the inline
+      // isOnline resolver gets a fresh identity → MemberRow's $derived re-reads.
+      // No-ops cleanly before the adapter is wired. Fire-and-forget (IPC errors
+      // are non-blocking for selection).
+      const prevPresenceId = selectedCommunityId;
+      const myGen = ++presenceSwitchGen;
+      void (async () => {
+        try {
+          if (prevPresenceId != null) await presenceService.unsubscribe(prevPresenceId);
+          // A newer switch superseded us while awaiting — stop before
+          // resubscribing/clobbering the now-active community's state.
+          if (myGen !== presenceSwitchGen) return;
+          if (id != null) {
+            await presenceService.subscribe(id, () => {
+              presenceVersion++;
+            });
+            if (myGen !== presenceSwitchGen) {
+              // A newer switch superseded us mid-subscribe; undo our now-stale
+              // subscription before bailing.
+              await presenceService.unsubscribe(id);
+              return;
+            }
+          }
+        } catch (e) {
+          console.error('presence subscription switch failed:', e instanceof Error ? e.message : String(e));
+        }
+      })();
     }
     // ZEB-334 (Cursor PR #180): selecting a real community leaves the Notes
     // space, so the nav highlights the community and the feed shows it. Passing
@@ -1252,6 +1304,11 @@
   $effect(() => () => void friendCardService.unsubscribeAll());
   const channelMessageService = new ChannelMessageService();
   $effect(() => () => channelMessageService.destroy());
+  // ZEB-537: on app teardown, drop the presence subscription for whatever
+  // community is currently selected (no-ops cleanly if none / adapter absent).
+  $effect(() => () => {
+    if (selectedCommunityId != null) void presenceService.unsubscribe(selectedCommunityId);
+  });
 
   let navNodes = $state([...navService.nodes]);
 
@@ -1535,6 +1592,9 @@
       // seedSelf/resolve work at boot before Tauri-init); wire the adapter
       // now so cross-peer subscriptions can start.
       memberCardService.setAdapter(adapter);
+      // ZEB-537: wire the same adapter into the community-presence service so
+      // subscribe/get/unsubscribe can reach the backend IPCs.
+      presenceService.setAdapter(adapter);
       // ZEB-419: wire the same adapter into the friends-panel card service.
       friendCardService.setAdapter(adapter);
 
@@ -2881,6 +2941,7 @@
         }}
         {resolveCard}
         {resolveNickname}
+        {isOnline}
         {subscribeVisibleCards}
         {unsubscribeCards}
         onOpenCard={openMemberCard}

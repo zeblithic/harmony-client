@@ -80,6 +80,20 @@ pub fn derive_channel_key(
     ChannelKey(*out)
 }
 
+/// ZEB-537: derive the per-community presence key from the community epoch
+/// (membership) key. Mirrors `derive_channel_key` but binds only the community
+/// (presence is community-scoped, not per-channel) with a distinct `info` label
+/// so the presence key is independent of every channel key.
+pub fn derive_presence_key(mk: &EpochKey, community_id: &SpaceId) -> ChannelKey {
+    let salt = community_id.0;
+    let info = b"presence:";
+    let mut out = zeroize::Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(&salt), mk.as_bytes())
+        .expand(info, out.as_mut())
+        .expect("32 <= 8160");
+    ChannelKey(*out)
+}
+
 /// HKDF-SHA256 derivation of a per-call DM voice key from the DM space's
 /// `DmContentKey`. Mirrors `derive_channel_key`: any party holding the DM
 /// content key derives the same per-call subkey from the (caller-generated)
@@ -1512,6 +1526,19 @@ mod tests {
         let k1 = derive_channel_key(&mk, &cid, &chid);
         let k2 = derive_channel_key(&mk, &cid, &chid);
         assert_eq!(k1.as_bytes(), k2.as_bytes());
+    }
+
+    #[test]
+    fn derive_presence_key_is_deterministic_and_distinct() {
+        let mk = EpochKey::new([0x55; 32]);
+        let c = SpaceId([0xc0; 16]);
+        let p1 = derive_presence_key(&mk, &c);
+        let p2 = derive_presence_key(&mk, &c);
+        assert_eq!(p1.as_bytes(), p2.as_bytes(), "deterministic");
+        let ch = derive_channel_key(&mk, &c, &ChannelId([0xc1; 16]));
+        assert_ne!(p1.as_bytes(), ch.as_bytes(), "presence key != channel key");
+        let other = derive_presence_key(&mk, &SpaceId([0xc2; 16]));
+        assert_ne!(p1.as_bytes(), other.as_bytes(), "per-community");
     }
 
     #[test]

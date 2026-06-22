@@ -124,6 +124,7 @@ pub mod community_dfrost_types;
 pub mod community_fork;
 pub mod community_invite;
 pub mod community_membership;
+pub mod community_presence;
 pub mod community_relay;
 pub mod community_relay_announce;
 pub mod community_relay_hold_crdt;
@@ -977,6 +978,16 @@ pub struct NodeState {
     /// ZEB-341: monotonic subscription-id allocator for card subscriptions.
     /// Reset on stop_node.
     profile_card_next_subscription_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// ZEB-537: control channel into the event-loop's community-presence
+    /// subscriber/publisher pool. IPC handlers send `Subscribe`/`Unsubscribe`;
+    /// the event loop owns the per-community task pair. `None` until a node with
+    /// an owner identity is running.
+    community_presence_request_tx:
+        Option<tokio::sync::mpsc::Sender<crate::event_loop::CommunityPresenceRequest>>,
+    /// ZEB-537: the live community-presence roster map, shared with the event
+    /// loop's subscriber + sweeper tasks. IPC reads the roster from here.
+    community_presence_map:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::community_presence::CommunityPresenceMap>>>,
     /// ZEB-290 Phase 1 Task 11 (+ ZEB-291 Phase 2 Task 19 shape migration):
     /// per-community voting-event logs. Holds an `Arc<tokio::Mutex<VotingLog>>`
     /// per `SpaceId`; lazily populated on first local
@@ -1599,6 +1610,8 @@ impl Default for NodeState {
             profile_card_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
+            community_presence_request_tx: None,
+            community_presence_map: None,
             // ZEB-290 Phase 1 Task 11 + ZEB-291 Task 19 migration: voting
             // log registry starts empty and survives stop_node (in-memory
             // only; cleared on process exit). Outer Mutex is tokio so the
@@ -2123,6 +2136,8 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.profile_card_request_tx = None;
         guard.profile_card_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        guard.community_presence_request_tx = None;
+        guard.community_presence_map = None;
         // Mint Phase 2 sync: take before releasing the lock so a concurrent
         // IPC doesn't race to call notify_dirty on a shutting-down engine.
         mint_sync_for_shutdown = guard.mint_sync.take();
@@ -3097,6 +3112,8 @@ pub async fn start_node_inner(
         guard.profile_card_request_tx = None;
         guard.profile_card_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        guard.community_presence_request_tx = None;
+        guard.community_presence_map = None;
         // Mint Phase 2 sync: take the prior identity's engine so it can be
         // shut down outside the lock below (same pattern as sync_engine).
         old_mint_sync_engine = guard.mint_sync.take();
@@ -3666,6 +3683,16 @@ pub async fn start_node_inner(
             std::sync::Arc::new(crate::profile_card_broadcast::ProfileCardCache::default());
         let (profile_card_request_tx, profile_card_request_rx) =
             tokio::sync::mpsc::channel::<crate::event_loop::ProfileCardRequest>(64);
+        // ZEB-537: community-presence request channel + the shared roster map.
+        // The map is shared between the event loop (subscriber + sweeper write it)
+        // and NodeState (IPC reads it); the loop gets its own clone, NodeState
+        // keeps `community_presence_map_for_state`.
+        let (community_presence_request_tx, community_presence_request_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::CommunityPresenceRequest>(64);
+        let community_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::community_presence::CommunityPresenceMap::new(),
+        ));
+        let community_presence_map_for_state = std::sync::Arc::clone(&community_presence_map);
 
         // ── ZEB-323 Phase 2b: pkarr lifted state holders ─────────────────
         //
@@ -8511,6 +8538,12 @@ pub async fn start_node_inner(
                 let profile_card_cache_for_loop =
                     Some(std::sync::Arc::clone(&profile_card_cache_arc));
                 let profile_card_request_rx_for_loop = Some(profile_card_request_rx);
+                // ZEB-537: thread the community-presence request rx + shared map
+                // into event_loop::run (the loop gets its own map clone; the
+                // NodeState assignment below keeps `..._for_state`).
+                let community_presence_request_rx_for_loop = Some(community_presence_request_rx);
+                let community_presence_map_for_loop =
+                    std::sync::Arc::clone(&community_presence_map);
                 // Mint Phase 2 sync: thread handles into event_loop::run.
                 let mint_sync_handles_for_loop = mint_sync_handles_opt;
                 // ZEB-417 SP1: thread the Notes adapter handles into
@@ -8628,6 +8661,8 @@ pub async fn start_node_inner(
                                 profile_broadcast_request_rx_for_loop,
                                 profile_card_cache_for_loop,
                                 profile_card_request_rx_for_loop,
+                                community_presence_request_rx_for_loop,
+                                community_presence_map_for_loop,
                                 mint_sync_handles_for_loop,
                                 notes_sync_handles_for_loop,
                                 dm_inbox_sync_handles_for_loop,
@@ -8813,6 +8848,11 @@ pub async fn start_node_inner(
                         guard.profile_card_request_tx = Some(profile_card_request_tx);
                         guard.profile_card_next_subscription_id =
                             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+                        // ZEB-537: store the community-presence request_tx + the
+                        // shared roster map so presence IPC handlers can drive the
+                        // pool and read the live roster.
+                        guard.community_presence_request_tx = Some(community_presence_request_tx);
+                        guard.community_presence_map = Some(community_presence_map_for_state);
                         // Mint Phase 2 sync: store the engine Arc so IPC handlers
                         // can call notify_dirty() after mutations.
                         guard.mint_sync = mint_sync_engine_opt.clone();
@@ -27793,6 +27833,130 @@ pub(crate) async fn get_cached_member_card_impl(
         g.profile_card_cache.clone().ok_or(OWNER_NOT_LOADED_MSG)?
     };
     Ok(cache.get_cached(subscription_id).await)
+}
+
+/// IPC: ZEB-537. Subscribe to a community's presence roster (keyed by the
+/// 16-byte `community_id`). The event loop spawns the per-community
+/// publisher/subscriber pair and emits `presence-updated` events as peers'
+/// beacons arrive. Mirrors `subscribe_member_card` but community-scoped.
+#[tauri::command]
+async fn subscribe_community_presence(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<(), String> {
+    subscribe_community_presence_impl(state_lock.inner(), community_id).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn subscribe_community_presence_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<(), String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let request_tx = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.community_presence_request_tx
+            .clone()
+            .ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    request_tx
+        .send(crate::event_loop::CommunityPresenceRequest::Subscribe {
+            community_id: cid_bytes,
+        })
+        .await
+        .map_err(|e| format!("community_presence_request_tx send: {e}"))?;
+    Ok(())
+}
+
+/// IPC: ZEB-537. Unsubscribe from a community's presence roster. The event
+/// loop aborts the per-community publisher/subscriber pair and emits a final
+/// empty roster. Mirrors `unsubscribe_member_card` but community-scoped.
+#[tauri::command]
+async fn unsubscribe_community_presence(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<(), String> {
+    unsubscribe_community_presence_impl(state_lock.inner(), community_id).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn unsubscribe_community_presence_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<(), String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let request_tx = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.community_presence_request_tx
+            .clone()
+            .ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    request_tx
+        .send(crate::event_loop::CommunityPresenceRequest::Unsubscribe {
+            community_id: cid_bytes,
+        })
+        .await
+        .map_err(|e| format!("community_presence_request_tx send: {e}"))?;
+    Ok(())
+}
+
+/// IPC: ZEB-537. Snapshot the current online roster for a community without
+/// waiting for the next `presence-updated` event (e.g. on first paint).
+#[tauri::command]
+async fn get_community_presence(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<crate::community_presence::PresenceMemberDto>, String> {
+    get_community_presence_impl(state_lock.inner(), community_id).await
+}
+
+/// ZEB-464: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn get_community_presence_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<Vec<crate::community_presence::PresenceMemberDto>, String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    // Pull the Arc out from under the std::sync::Mutex guard, then DROP the
+    // guard before awaiting the tokio map lock (never hold a std guard across
+    // an .await). Same lock discipline as the member-card get impl.
+    let map = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.community_presence_map
+            .clone()
+            .ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    let owners = map
+        .lock()
+        .await
+        .online_owners(&crate::owner_state_types::SpaceId(cid_bytes));
+    Ok(owners
+        .iter()
+        .map(crate::community_presence::PresenceMemberDto::from_owner_presence)
+        .collect())
 }
 
 #[cfg(test)]
@@ -46810,6 +46974,10 @@ pub fn run() {
             subscribe_member_card,
             unsubscribe_member_card,
             get_cached_member_card,
+            // ZEB-537: community-presence roster IPC trio.
+            subscribe_community_presence,
+            unsubscribe_community_presence,
+            get_community_presence,
             // ZEB-290 Phase 1 Task 11: Tier 1 voting IPCs.
             voting_create_tier1_poll,
             voting_cast_tier1_ballot,
@@ -49915,6 +50083,51 @@ mod channel_message_ipc_tests {
             "expected invalid-hex rejection, got {got:?}"
         );
     }
+
+    // ── ZEB-537: community-presence IPC guard paths ─────────────────────
+
+    #[tokio::test]
+    async fn subscribe_community_presence_rejects_short_community_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = subscribe_community_presence(state, "deadbeef".into())
+            .await
+            .expect_err("short cid must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn get_community_presence_rejects_non_hex_community_id() {
+        // 32-char but non-hex: passes the length check, fails the hex decode.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = get_community_presence(state, "z".repeat(32))
+            .await
+            .expect_err("non-hex cid must error");
+        assert!(err.contains("invalid community_id hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn get_community_presence_errs_when_owner_not_loaded() {
+        // Valid 32-hex cid against a default NodeState (presence map = None):
+        // must surface the owner-not-loaded message, not panic.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = get_community_presence(state, "ab".repeat(16))
+            .await
+            .expect_err("no presence map → owner-not-loaded");
+        assert_eq!(err, OWNER_NOT_LOADED_MSG);
+    }
+
+    #[tokio::test]
+    async fn subscribe_community_presence_errs_when_owner_not_loaded() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = subscribe_community_presence(state, "ab".repeat(16))
+            .await
+            .expect_err("no request_tx → owner-not-loaded");
+        assert_eq!(err, OWNER_NOT_LOADED_MSG);
+    }
 }
 
 #[cfg(test)]
@@ -51289,6 +51502,8 @@ mod start_node_race_tests {
             profile_card_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
+            community_presence_request_tx: None,
+            community_presence_map: None,
             voting_logs: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),

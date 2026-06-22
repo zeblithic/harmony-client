@@ -1,0 +1,700 @@
+//! ZEB-537 community presence: ephemeral signed+sealed liveness beacons,
+//! generalizing the per-call `voice_presence` (ZEB-350) pattern to a
+//! per-community scope. Beacons ride a dedicated Zenoh topic (never the CRDT);
+//! the seal under the per-community presence key (`derive_presence_key`) gates
+//! non-members, and the device-#2 signature + materialized-membership check
+//! prevents intra-member spoofing.
+//!
+//! Presence here is community-scoped (not per-channel): the seal binds only the
+//! community, via a sentinel all-zero `ChannelId` passed to the audited
+//! `encrypt_voice_packet` / `decrypt_voice_packet` AEAD seam, under the distinct
+//! `COMMUNITY_PRESENCE_AAD` domain.
+
+use crate::community_channel_log::ChannelKey;
+use crate::community_membership::ChannelId;
+use crate::community_state_sync::CommunitySyncRegistry;
+use crate::owner_state_crypto::canonical_cbor_encode;
+use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use crate::voice_crypto::{decrypt_voice_packet, encrypt_voice_packet, COMMUNITY_PRESENCE_AAD};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+
+/// Presence has no channel, so the AEAD seam (which is `(community, channel)`
+/// scoped for voice) is bound with this all-zero sentinel channel. The
+/// `COMMUNITY_PRESENCE_AAD` domain already separates community presence from
+/// every voice/channel-log artifact, so the sentinel only needs to be stable.
+const PRESENCE_SENTINEL_CHANNEL: ChannelId = ChannelId([0u8; 16]);
+
+/// The unsigned community-presence claim. Canonical CBOR, 2-char keys
+/// (same-length invariant for deterministic encoding).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceBeacon {
+    #[serde(
+        rename = "ow",
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub owner: [u8; 16],
+    #[serde(
+        rename = "dv",
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub device: [u8; 32],
+    #[serde(rename = "sh")]
+    pub started_hlc: Hlc,
+    #[serde(rename = "sq")]
+    pub seq: u64,
+}
+
+/// Beacon + detached device-#2 signature over `canonical_cbor_encode(beacon)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedPresenceBeacon {
+    #[serde(rename = "bc")]
+    pub beacon: PresenceBeacon,
+    #[serde(
+        rename = "sg",
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub sig: [u8; 64],
+}
+
+// Register both beacon types as `CanonicalPayload` so `canonical_cbor_encode`
+// (the sealed-trait encoder) can sign/seal them. Mirrors `voice_presence`.
+impl crate::owner_state_crypto::sealed::CanonicalPayloadSealed for PresenceBeacon {}
+impl crate::owner_state_crypto::CanonicalPayload for PresenceBeacon {}
+impl crate::owner_state_crypto::sealed::CanonicalPayloadSealed for SignedPresenceBeacon {}
+impl crate::owner_state_crypto::CanonicalPayload for SignedPresenceBeacon {}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BeaconError {
+    #[error("beacon CBOR encode failed")]
+    Encode,
+    #[error("beacon signature invalid")]
+    BadSig,
+    /// `session.put` failed — a transport/runtime fault, distinct from an
+    /// encode/seal fault, so callers can diagnose (and one day retry) network
+    /// failures without conflating them with CBOR bugs.
+    #[error("beacon transport publish failed")]
+    Publish,
+}
+
+/// Sign a beacon with the device-#2 ed25519 key. The signature covers the
+/// canonical CBOR of the unsigned beacon (sig field excluded by construction).
+pub fn sign_presence_beacon(
+    beacon: PresenceBeacon,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<SignedPresenceBeacon, BeaconError> {
+    use ed25519_dalek::Signer;
+    let bytes = canonical_cbor_encode(&beacon).map_err(|_| BeaconError::Encode)?;
+    let sig = signing_key.sign(&bytes).to_bytes();
+    Ok(SignedPresenceBeacon { beacon, sig })
+}
+
+/// Verify the detached signature against the verifying key embedded in
+/// `beacon.device`. This proves the holder of `device`'s private key signed it;
+/// the membership check additionally requires `device ∈ owner.enrolled_device_keys`.
+pub fn verify_presence_beacon_sig(signed: &SignedPresenceBeacon) -> Result<(), BeaconError> {
+    let bytes = canonical_cbor_encode(&signed.beacon).map_err(|_| BeaconError::Encode)?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&signed.beacon.device)
+        .map_err(|_| BeaconError::BadSig)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&signed.sig);
+    vk.verify_strict(&bytes, &sig)
+        .map_err(|_| BeaconError::BadSig)
+}
+
+/// Seal a signed beacon under the per-community presence key for transport.
+/// Output framing matches the voice media packet (`[12B nonce][ct+tag]`) but
+/// binds the sentinel channel + `COMMUNITY_PRESENCE_AAD` so it can only ever be
+/// opened as a community-presence beacon for `community`.
+pub fn seal_presence_beacon(
+    key: &ChannelKey,
+    community: &SpaceId,
+    signed: &SignedPresenceBeacon,
+) -> Result<Vec<u8>, BeaconError> {
+    let plain = canonical_cbor_encode(signed).map_err(|_| BeaconError::Encode)?;
+    encrypt_voice_packet(
+        key,
+        community,
+        &PRESENCE_SENTINEL_CHANNEL,
+        COMMUNITY_PRESENCE_AAD,
+        &plain,
+    )
+    .map_err(|_| BeaconError::Encode)
+}
+
+/// Open + decode a sealed beacon. Returns `None` on any failure (drop).
+pub fn open_presence_beacon(
+    key: &ChannelKey,
+    community: &SpaceId,
+    packet: &[u8],
+) -> Option<SignedPresenceBeacon> {
+    let plain = decrypt_voice_packet(
+        key,
+        community,
+        &PRESENCE_SENTINEL_CHANNEL,
+        COMMUNITY_PRESENCE_AAD,
+        packet,
+    )
+    .ok()?;
+    ciborium::from_reader(plain.as_slice()).ok()
+}
+
+/// Deterministic-nonce seal for wire-format fixtures. NEVER call from
+/// production — a fixed nonce with a reused key is catastrophic nonce reuse.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub fn seal_presence_beacon_with_nonce(
+    key: &ChannelKey,
+    community: &SpaceId,
+    signed: &SignedPresenceBeacon,
+    nonce: [u8; 12],
+) -> Result<Vec<u8>, BeaconError> {
+    let plain = canonical_cbor_encode(signed).map_err(|_| BeaconError::Encode)?;
+    crate::voice_crypto::encrypt_voice_packet_with_nonce(
+        key,
+        community,
+        &PRESENCE_SENTINEL_CHANNEL,
+        COMMUNITY_PRESENCE_AAD,
+        &plain,
+        nonce,
+    )
+    .map_err(|_| BeaconError::Encode)
+}
+
+// ── Beacon cadence + builder (ZEB-537 Task 4) ───────────────────────
+
+/// Heartbeat interval: a live device republishes its presence beacon every
+/// 10 s. Mirrors the voice publisher cadence (scaled up — community presence is
+/// pure liveness, not call-state, so it tolerates a slower beat).
+pub const BEACON_INTERVAL_MS: u64 = 10_000;
+
+/// TTL: a device is swept from the roster once `STALE_MS` have elapsed since its
+/// last beacon (3× the interval, so two dropped beacons don't evict a live peer).
+pub const STALE_MS: u64 = 30_000;
+
+/// Build an unsigned community-presence beacon. Pure (no I/O) so the publisher
+/// loop has exactly one construction site, unit-testable without standing up
+/// Zenoh. Community presence carries no `muted`/`left` (pure liveness).
+pub(crate) fn build_presence_beacon(
+    owner: [u8; 16],
+    device: [u8; 32],
+    started_hlc: &Hlc,
+    seq: u64,
+) -> PresenceBeacon {
+    PresenceBeacon {
+        owner,
+        device,
+        started_hlc: started_hlc.clone(),
+        seq,
+    }
+}
+
+// ── In-memory roster map (ZEB-537 Task 2) ───────────────────────────
+//
+// Community-scoped, pure-liveness presence roster. Mirrors `VoicePresenceMap`
+// (ZEB-350) but SIMPLIFIED: community presence carries no `muted` and no
+// `left`/gravestone tombstone logic — it is pure liveness, so TTL eviction
+// is the only way a device leaves the roster. Keyed by `SpaceId` (community)
+// → device → entry (voice keys by `(community, channel)`).
+
+/// One live device's last-known presence state within a community.
+#[derive(Debug)]
+struct PresenceEntry {
+    owner: [u8; 16],
+    started_hlc: Hlc,
+    seq: u64,
+    last_seen_ms: u64,
+}
+
+/// One row in a community's online roster: an owner aggregated across all of
+/// their currently-live devices. This (owner-level, not device-level) is what
+/// the frontend renders, so `apply` reports change only at owner granularity.
+pub struct OwnerPresence {
+    pub owner: [u8; 16],
+    pub device_count: u32,
+    pub last_seen_ms: u64,
+}
+
+/// ZEB-537: one online member as serialized to the frontend in a
+/// `presence-updated` event (or returned by the `get_community_presence` IPC).
+/// `online` is always `true` — the roster only ever contains live owners; an
+/// owner dropping off is communicated by their absence from a fresh `members`
+/// list. The camelCase wire shape is contract-pinned (frontend depends on it).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresenceMemberDto {
+    pub owner_id_hex: String,
+    pub online: bool,
+    pub last_seen_ms: u64,
+    pub device_count: u32,
+}
+
+/// ZEB-537: the full `presence-updated` event payload for one community.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresenceUpdatedPayload {
+    pub community_id: String,
+    pub members: Vec<PresenceMemberDto>,
+}
+
+impl PresenceMemberDto {
+    pub fn from_owner_presence(o: &OwnerPresence) -> Self {
+        Self {
+            owner_id_hex: hex::encode(o.owner),
+            online: true,
+            last_seen_ms: o.last_seen_ms,
+            device_count: o.device_count,
+        }
+    }
+}
+
+impl PresenceUpdatedPayload {
+    pub fn new(community_id: [u8; 16], members: &[OwnerPresence]) -> Self {
+        Self {
+            community_id: hex::encode(community_id),
+            members: members
+                .iter()
+                .map(PresenceMemberDto::from_owner_presence)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CommunityPresenceMap {
+    // community → device → entry
+    inner: BTreeMap<SpaceId, BTreeMap<[u8; 32], PresenceEntry>>,
+}
+
+impl CommunityPresenceMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply a (verified, opened) beacon. `now_ms` is a monotonic clock the
+    /// caller supplies. Returns true when the device set changes — i.e. a new
+    /// device is inserted (a fresh owner OR an additional device for an
+    /// already-online owner, since `deviceCount` is part of the emitted DTO and
+    /// so is roster-visible). A bare liveness refresh of an existing device
+    /// (same/newer-session or newer-seq for a device we already track) returns
+    /// false to avoid frontend event spam.
+    ///
+    /// Freshness mirrors `VoicePresenceMap::apply` (minus gravestones): a
+    /// strictly-newer `started_hlc` supersedes regardless of `seq` (seq
+    /// restarts at 0 on every (re)start of the presence publisher), an older
+    /// session is rejected, and within the same session only a strictly-newer
+    /// `seq` advances liveness.
+    pub fn apply(&mut self, c: &SpaceId, beacon: &PresenceBeacon, now_ms: u64) -> bool {
+        let community = self.inner.entry(*c).or_default();
+        match community.get_mut(&beacon.device) {
+            Some(e) if beacon.started_hlc.is_strictly_newer_than(&e.started_hlc) => {
+                // A NEW session supersedes regardless of seq. The owner already
+                // had this device online, so the owner-level roster is unchanged.
+                e.owner = beacon.owner;
+                e.started_hlc = beacon.started_hlc.clone();
+                e.seq = beacon.seq;
+                e.last_seen_ms = now_ms;
+                false
+            }
+            Some(e) if e.started_hlc.is_strictly_newer_than(&beacon.started_hlc) => false, // older session → stale
+            Some(e) if beacon.seq <= e.seq => false, // same session, stale or duplicate seq
+            Some(e) => {
+                // Same session, newer seq: advance liveness so the TTL sweep
+                // still sees this device alive, but the owner is already online
+                // → not an owner-visible change.
+                e.seq = beacon.seq;
+                e.last_seen_ms = now_ms;
+                false
+            }
+            None => {
+                // Brand-new device for this community. A new device always
+                // changes the roster's device set (the owner's `deviceCount` /
+                // `last_seen_ms` is part of the emitted DTO), so this is always
+                // a roster-visible change — whether or not the owner already had
+                // another live device here.
+                community.insert(
+                    beacon.device,
+                    PresenceEntry {
+                        owner: beacon.owner,
+                        started_hlc: beacon.started_hlc.clone(),
+                        seq: beacon.seq,
+                        last_seen_ms: now_ms,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Evict every entry whose last beacon is older than `ttl_ms`. Returns the
+    /// `(community, owner, device)` of each evicted entry so the caller can
+    /// re-emit the affected community's roster. With no gravestones every
+    /// eviction is roster-affecting.
+    pub fn sweep(&mut self, now_ms: u64, ttl_ms: u64) -> Vec<(SpaceId, [u8; 16], [u8; 32])> {
+        let mut evicted = Vec::new();
+        for (community, devices) in self.inner.iter_mut() {
+            devices.retain(|device, e| {
+                let alive = now_ms.saturating_sub(e.last_seen_ms) < ttl_ms;
+                if !alive {
+                    evicted.push((*community, e.owner, *device));
+                }
+                alive
+            });
+        }
+        // Reclaim community sub-maps emptied by eviction so they don't linger as
+        // ghost entries every future sweep re-scans (Greptile lesson, ZEB-350).
+        self.inner.retain(|_, devices| !devices.is_empty());
+        evicted
+    }
+
+    /// The owners currently online in `c`, aggregated across their devices.
+    /// `device_count` is that owner's live device count; `last_seen_ms` is the
+    /// max over those devices. Deterministic order (sorted by owner bytes).
+    pub fn online_owners(&self, c: &SpaceId) -> Vec<OwnerPresence> {
+        let Some(devices) = self.inner.get(c) else {
+            return Vec::new();
+        };
+        let mut by_owner: BTreeMap<[u8; 16], (u32, u64)> = BTreeMap::new();
+        for e in devices.values() {
+            let agg = by_owner.entry(e.owner).or_insert((0, 0));
+            agg.0 += 1;
+            agg.1 = agg.1.max(e.last_seen_ms);
+        }
+        by_owner
+            .into_iter()
+            .map(|(owner, (device_count, last_seen_ms))| OwnerPresence {
+                owner,
+                device_count,
+                last_seen_ms,
+            })
+            .collect()
+    }
+
+    /// Drop a community's entire roster (e.g. on leave), reclaiming the sub-map.
+    pub fn remove_community(&mut self, c: &SpaceId) {
+        self.inner.remove(c);
+    }
+}
+
+// ── pub/sub spawn helpers (ZEB-537 Task 4) ──────────────────────────
+//
+// Mirror `voice_presence::spawn_voice_presence_{publisher,subscriber}` but
+// community-scoped (no channel) and pure-liveness (no mute/kick/left). The
+// presence key is re-derived from the community's CURRENT epoch key on EVERY
+// operation (`registry.engine_arc(community).membership_key()` →
+// `derive_presence_key`), so it follows epoch rotation automatically; a missing
+// engine means we skip the tick (publisher) / drop the packet (subscriber).
+
+/// Spawn a community-presence heartbeat publisher: emit an immediate beacon,
+/// then one every `interval` (10 s in V1). Each tick re-derives the presence key
+/// from the community's current epoch key (so rotation is followed), builds →
+/// signs → seals → `session.put`s a beacon drawing a strictly-increasing `seq`
+/// from `seq_counter`. Honors `closing` for shutdown. Mirrors
+/// [`crate::voice_presence::spawn_voice_presence_publisher`], minus mute/kick.
+///
+/// `session` is an owned, cheaply-cloned `zenoh::Session` (call sites pass
+/// `session.clone()`).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_community_presence_publisher(
+    session: zenoh::Session,
+    topic: String,
+    registry: Arc<CommunitySyncRegistry>,
+    community: SpaceId,
+    signing_key: Arc<ed25519_dalek::SigningKey>,
+    self_owner: OwnerAddr,
+    self_device: [u8; 32],
+    started_hlc: Hlc,
+    seq_counter: Arc<AtomicU64>,
+    interval: std::time::Duration,
+    closing: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // `interval` fires immediately on the first `tick()`, giving the
+        // "immediate first beacon then every `interval`" cadence for free.
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            if closing.load(Ordering::SeqCst) {
+                break;
+            }
+            let seq = seq_counter.fetch_add(1, Ordering::SeqCst);
+            let beacon = build_presence_beacon(self_owner.0, self_device, &started_hlc, seq);
+            let Ok(signed) = sign_presence_beacon(beacon, &signing_key) else {
+                continue;
+            };
+            // Re-fetch the presence key per tick so it follows epoch rotation;
+            // if the engine is gone we have nothing to seal under → skip.
+            let Some(engine) = registry.engine_arc(&community).await else {
+                continue;
+            };
+            let mk = engine.membership_key();
+            let key = crate::community_channel_log::derive_presence_key(&mk, &community);
+            let Ok(sealed) = seal_presence_beacon(&key, &community, &signed) else {
+                continue;
+            };
+            if let Err(e) = session.put(&topic, sealed).await {
+                tracing::warn!(%topic, err = %e, "community presence publish failed");
+            }
+        }
+    })
+}
+
+/// Spawn a community-presence subscriber on `topic`: open the seal (under the
+/// community's current presence key) → verify the device-#2 signature → verify
+/// materialized membership → apply to the shared map → emit `presence-updated`
+/// on change. Drops on any failure. Mirrors
+/// [`crate::voice_presence::spawn_voice_presence_subscriber`], minus mute/kick.
+///
+/// `session` is an owned, cheaply-cloned `zenoh::Session`; `now_ms` is the
+/// loop's monotonic clock.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_community_presence_subscriber(
+    session: zenoh::Session,
+    topic: String,
+    registry: Arc<CommunitySyncRegistry>,
+    community: SpaceId,
+    map: Arc<tokio::sync::Mutex<CommunityPresenceMap>>,
+    app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    closing: Arc<AtomicBool>,
+    now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let sub = match session.declare_subscriber(&topic).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(%topic, err = %e, "community presence subscribe failed");
+                return;
+            }
+        };
+        while let Ok(sample) = sub.recv_async().await {
+            if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
+                tracing::warn!(
+                    len = sample.payload().len(),
+                    max = crate::voice_crypto::MAX_VOICE_PACKET_BYTES,
+                    "oversized community presence packet dropped"
+                );
+                continue;
+            }
+            let bytes = sample.payload().to_bytes().to_vec();
+            // Re-derive the presence key per packet so it follows epoch
+            // rotation; if the engine is gone we cannot open → drop.
+            let Some(engine) = registry.engine_arc(&community).await else {
+                continue;
+            };
+            let mk = engine.membership_key();
+            let key = crate::community_channel_log::derive_presence_key(&mk, &community);
+            let Some(signed) = open_presence_beacon(&key, &community, &bytes) else {
+                continue; // non-member key / wrong scope / tamper → drop
+            };
+            if verify_presence_beacon_sig(&signed).is_err() {
+                continue; // bad device-#2 signature → drop
+            }
+            let owner = OwnerAddr(signed.beacon.owner);
+            // Reuse the voice membership gate verbatim (same crate, same
+            // materialized-membership authority) — community presence shares it.
+            if !crate::voice_presence::beacon_signer_is_member(
+                &registry,
+                &community,
+                &owner,
+                &signed.beacon.device,
+            )
+            .await
+            {
+                continue; // signer not an enrolled, Joined member → drop
+            }
+            let changed = {
+                let mut g = map.lock().await;
+                g.apply(&community, &signed.beacon, (now_ms)())
+            };
+            if changed {
+                let members = {
+                    let g = map.lock().await;
+                    g.online_owners(&community)
+                };
+                crate::node_event_sink::emit_ser(
+                    app.as_ref(),
+                    "presence-updated",
+                    &PresenceUpdatedPayload::new(community.0, &members),
+                );
+            }
+        }
+        if !closing.load(Ordering::SeqCst) {
+            tracing::warn!(%topic, "community presence subscriber closed unexpectedly");
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::community_channel_log::derive_presence_key;
+    use crate::owner_state_types::EpochKey;
+    use ed25519_dalek::SigningKey;
+
+    fn beacon(seq: u64) -> PresenceBeacon {
+        PresenceBeacon {
+            owner: [0xa1; 16],
+            device: [0u8; 32], // overwritten by the signer in real use
+            started_hlc: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "aa".repeat(32),
+            },
+            seq,
+        }
+    }
+
+    #[test]
+    fn sign_then_verify_ok() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut b = beacon(1);
+        b.device = sk.verifying_key().to_bytes();
+        let signed = sign_presence_beacon(b.clone(), &sk).unwrap();
+        assert_eq!(signed.beacon, b);
+        verify_presence_beacon_sig(&signed).expect("valid sig");
+    }
+
+    #[test]
+    fn tampered_sig_rejected() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut b = beacon(1);
+        b.device = sk.verifying_key().to_bytes();
+        let mut signed = sign_presence_beacon(b, &sk).unwrap();
+        signed.beacon.seq = 99; // tamper after signing
+        assert_eq!(
+            verify_presence_beacon_sig(&signed),
+            Err(BeaconError::BadSig)
+        );
+    }
+
+    #[test]
+    fn seal_open_roundtrip_and_wrong_key_drops() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut b = beacon(3);
+        b.device = sk.verifying_key().to_bytes();
+        let signed = sign_presence_beacon(b, &sk).unwrap();
+        let c = SpaceId([0xc0; 16]);
+        let key = derive_presence_key(&EpochKey::new([0x11; 32]), &c);
+        let sealed = seal_presence_beacon(&key, &c, &signed).unwrap();
+        assert_eq!(open_presence_beacon(&key, &c, &sealed), Some(signed));
+        let other = derive_presence_key(&EpochKey::new([0x22; 32]), &c);
+        assert_eq!(open_presence_beacon(&other, &c, &sealed), None);
+    }
+
+    #[test]
+    fn build_presence_beacon_sets_fields() {
+        let h = Hlc {
+            wall_ms: 5,
+            logical: 0,
+            device_id: "aa".repeat(32),
+        };
+        let b = build_presence_beacon([1; 16], [2; 32], &h, 7);
+        assert_eq!(b.owner, [1; 16]);
+        assert_eq!(b.device, [2; 32]);
+        assert_eq!(b.seq, 7);
+        assert_eq!(b.started_hlc, h);
+    }
+
+    // ── CommunityPresenceMap (Task 2) ───────────────────────────────
+
+    fn b(owner: u8, dev: u8, wall: u64, seq: u64) -> PresenceBeacon {
+        PresenceBeacon {
+            owner: [owner; 16],
+            device: [dev; 32],
+            started_hlc: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: "aa".repeat(32),
+            },
+            seq,
+        }
+    }
+
+    #[test]
+    fn new_device_marks_online_and_reports_change() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        assert!(m.apply(&c, &b(1, 1, 100, 0), 1_000));
+        let r = m.online_owners(&c);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].owner, [1; 16]);
+        assert_eq!(r[0].device_count, 1);
+    }
+
+    #[test]
+    fn bare_refresh_does_not_report_change() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        assert!(m.apply(&c, &b(1, 1, 100, 0), 1_000));
+        assert!(!m.apply(&c, &b(1, 1, 100, 1), 2_000)); // same session, newer seq, already online
+    }
+
+    #[test]
+    fn reordered_old_beacon_rejected() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        assert!(m.apply(&c, &b(1, 1, 100, 5), 1_000));
+        assert!(!m.apply(&c, &b(1, 1, 100, 3), 2_000)); // stale seq, no change
+    }
+
+    #[test]
+    fn restart_new_session_supersedes() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        assert!(m.apply(&c, &b(1, 1, 100, 9), 1_000));
+        // newer started_hlc, seq reset to 0, accepted; owner already online so NOT a visible change:
+        assert!(!m.apply(&c, &b(1, 1, 200, 0), 2_000));
+        // but last_seen advanced — sweep at 2_000+ttl-1 keeps it:
+        assert_eq!(m.online_owners(&c).len(), 1);
+    }
+
+    #[test]
+    fn sweep_evicts_stale_and_reports() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        m.apply(&c, &b(1, 1, 100, 0), 1_000);
+        let ev = m.sweep(1_000 + 30_001, 30_000);
+        assert_eq!(ev.len(), 1);
+        assert!(m.online_owners(&c).is_empty());
+    }
+
+    #[test]
+    fn multi_device_aggregates_to_one_owner() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        m.apply(&c, &b(1, 1, 100, 0), 1_000);
+        m.apply(&c, &b(1, 2, 100, 0), 1_000);
+        let r = m.online_owners(&c);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].device_count, 2);
+    }
+
+    #[test]
+    fn second_device_for_online_owner_reports_change() {
+        // A new device for an ALREADY-online owner changes the owner's
+        // device_count (part of the emitted DTO) → must report a change so the
+        // subscriber re-emits `presence-updated` (ZEB-537 apply device-count fix).
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        assert!(m.apply(&c, &b(1, 1, 100, 0), 1_000)); // first device → change
+        assert!(m.apply(&c, &b(1, 2, 100, 0), 2_000)); // second device, same owner → change
+        let r = m.online_owners(&c);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].owner, [1; 16]);
+        assert_eq!(r[0].device_count, 2);
+    }
+
+    #[test]
+    fn remove_community_clears_roster() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        m.apply(&c, &b(1, 1, 100, 0), 1_000);
+        m.remove_community(&c);
+        assert!(m.online_owners(&c).is_empty());
+    }
+}

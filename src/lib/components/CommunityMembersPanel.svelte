@@ -16,6 +16,7 @@
     ownAddress,
     resolveCard,
     resolveNickname,
+    isOnline,
     onOpenCard,
   }: {
     communityId: string;
@@ -31,6 +32,9 @@
     /** ZEB-432: optional local friend-nickname resolver (ZEB-419), preferred
      *  over the profile-card name. Same pure-consumer contract as resolveCard. */
     resolveNickname?: (ownerIdHex: string) => string | undefined;
+    /** ZEB-537: optional online-presence resolver. Pure consumer of the
+     *  parent's PresenceService — same contract as resolveCard. */
+    isOnline?: (ownerIdHex: string) => boolean;
     /** ZEB-341: open the owner_id card popover for a clicked member. */
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
@@ -300,6 +304,7 @@
           {viewer}
           {resolveCard}
           {resolveNickname}
+          {isOnline}
           {onOpenCard}
           onaction={(detail) => onMemberAction(detail)}
         />
@@ -319,6 +324,7 @@
               {viewer}
               {resolveCard}
               {resolveNickname}
+              {isOnline}
               {onOpenCard}
               onaction={(detail) => onMemberAction(detail)}
             />

@@ -187,6 +187,10 @@ async fn ingest_list_pin_burn_roundtrip() {
                     None, // ZEB-281 Sub-D Phase 4: profile_broadcast_request_rx not exercised in this test
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
+                    None, // ZEB-537: community_presence_request_rx not exercised in this test
+                    std::sync::Arc::new(tokio::sync::Mutex::new(
+                        harmony_app::community_presence::CommunityPresenceMap::new(),
+                    )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
@@ -484,6 +488,10 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     None, // ZEB-281 Sub-D Phase 4: profile_broadcast_request_rx not exercised in this test
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
+                    None, // ZEB-537: community_presence_request_rx not exercised in this test
+                    std::sync::Arc::new(tokio::sync::Mutex::new(
+                        harmony_app::community_presence::CommunityPresenceMap::new(),
+                    )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
@@ -888,6 +896,10 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     None, // ZEB-281 Sub-D Phase 4: profile_broadcast_request_rx not exercised in this test
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
+                    None, // ZEB-537: community_presence_request_rx not exercised in this test
+                    std::sync::Arc::new(tokio::sync::Mutex::new(
+                        harmony_app::community_presence::CommunityPresenceMap::new(),
+                    )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
@@ -1150,6 +1162,10 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     None,
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
+                    None, // ZEB-537: community_presence_request_rx not exercised in this test
+                    std::sync::Arc::new(tokio::sync::Mutex::new(
+                        harmony_app::community_presence::CommunityPresenceMap::new(),
+                    )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
@@ -1475,6 +1491,10 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     None,
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
+                    None, // ZEB-537: community_presence_request_rx not exercised in this test
+                    std::sync::Arc::new(tokio::sync::Mutex::new(
+                        harmony_app::community_presence::CommunityPresenceMap::new(),
+                    )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test

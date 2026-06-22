@@ -362,6 +362,16 @@ pub enum ProfileCardRequest {
     },
 }
 
+/// ZEB-537 community-presence subscriber/publisher pool requests. Mirrors
+/// `ProfileCardRequest` but keyed by the 16-byte `community_id` (presence is
+/// community-scoped). IPC handlers send `Subscribe` when the user opens a
+/// community and `Unsubscribe` when they leave it; the event loop owns the
+/// per-community (publisher, subscriber) task pair.
+pub enum CommunityPresenceRequest {
+    Subscribe { community_id: [u8; 16] },
+    Unsubscribe { community_id: [u8; 16] },
+}
+
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
 enum ZenohEvent {
     Query {
@@ -761,6 +771,15 @@ pub async fn run(
     // loaded; always `Some` when started by production `start_node`.
     profile_card_cache: Option<Arc<crate::profile_card_broadcast::ProfileCardCache>>,
     profile_card_request_rx: Option<mpsc::Receiver<ProfileCardRequest>>,
+    // ZEB-537: community-presence request receiver (paired with NodeState's
+    // `community_presence_request_tx`) + the shared roster map (shared with
+    // NodeState so IPC reads + the loop's subscriber/sweeper write the same
+    // source of truth). `community_presence_request_rx` is `None` in test
+    // callers that bypass `start_node`; the map is always provided.
+    community_presence_request_rx: Option<mpsc::Receiver<CommunityPresenceRequest>>,
+    community_presence_map: std::sync::Arc<
+        tokio::sync::Mutex<crate::community_presence::CommunityPresenceMap>,
+    >,
     // Mint Phase 2 sync: channel pair bridging MintSyncEngine to Zenoh.
     // `None` when no owner identity is loaded.
     mut mint_sync_handles: Option<MintSyncHandles>,
@@ -2993,6 +3012,212 @@ pub async fn run(
         ),
         u64,
     > = std::collections::HashMap::new();
+
+    // ── ZEB-537: community-presence pool + global sweeper ─────────────
+    // One (publisher, subscriber) task pair per subscribed community, keyed off
+    // CommunityPresenceRequest::{Subscribe, Unsubscribe} from NodeState (mirrors
+    // the ZEB-341 profile-card pool above). The publisher heartbeats our own
+    // device-#2-signed beacon; the subscriber opens/verifies peers' beacons into
+    // the shared roster map. A single global sweeper task TTL-evicts stale
+    // entries across every community and re-emits the affected rosters.
+    //
+    // Gated on the community registry + an owner identity (dm_outbox) being
+    // present — both required to derive presence keys and to mint our own
+    // beacons. When either is absent (test callers bypassing `start_node`) the
+    // pool stays unwired, exactly like the voice/profile-card pools.
+    if let (Some(mut request_rx), Some(registry), Some(dm_outbox)) = (
+        community_presence_request_rx,
+        community_registry.clone(),
+        dm_outbox.as_ref(),
+    ) {
+        // Self identity for our OWN presence beacons. `self_device` MUST be the
+        // enrolled device key #2 (== community_signing_key.verifying_key()) or
+        // `beacon_signer_is_member` rejects our own beacons; `signing_key` signs
+        // with that same key. (See lib.rs:5138.) Read once under the outbox
+        // (tokio) lock before spawning the long-lived task.
+        let (self_owner, signing_key, self_device) = {
+            let g = dm_outbox.lock().await;
+            let sk = std::sync::Arc::clone(&g.community_signing_key);
+            let dev = sk.verifying_key().to_bytes();
+            (g.self_owner, sk, dev)
+        };
+
+        // ── presence-request task: owns the rx + the per-community handles ──
+        {
+            let session_for_presence = Arc::clone(&session_arc);
+            let registry_for_presence = Arc::clone(&registry);
+            let app_for_presence = app.clone();
+            let closing_for_presence = Arc::clone(&closing);
+            let map_for_presence = std::sync::Arc::clone(&community_presence_map);
+            let now_ms_for_presence = std::sync::Arc::clone(&voice_now_ms);
+            tokio::spawn(async move {
+                use std::collections::HashMap;
+                let mut handles: HashMap<
+                    [u8; 16],
+                    (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
+                > = HashMap::new();
+                // ZEB-537: monotonic per-subscribe session counter. This task
+                // processes Subscribes sequentially, so a strictly-increasing
+                // `logical` makes each new subscribe's `started_hlc` strictly
+                // newer than the previous one — even within the same `wall_ms`.
+                // Without it, a rapid unsubscribe→resubscribe inside one ms
+                // produces an identical `(started_hlc, seq=0)` prefix and peers
+                // reject the new session's beacons as stale until TTL.
+                let mut session_logical: u32 = 0;
+                while let Some(req) = request_rx.recv().await {
+                    match req {
+                        CommunityPresenceRequest::Subscribe { community_id } => {
+                            // Self-heal: a pair is healthy only if BOTH tasks are
+                            // alive. If either has exited, abort the survivor and
+                            // drop the entry so the Subscribe below can restart
+                            // both cleanly.
+                            handles.retain(|_, (p, s)| {
+                                let alive = !p.is_finished() && !s.is_finished();
+                                if !alive {
+                                    p.abort();
+                                    s.abort();
+                                }
+                                alive
+                            });
+                            if handles.contains_key(&community_id) {
+                                tracing::warn!(
+                                    community_id = %hex::encode(community_id),
+                                    "CommunityPresenceRequest::Subscribe duplicate — ignoring"
+                                );
+                                continue;
+                            }
+                            let topic =
+                                format!("harmony/presence/{}/beacons", hex::encode(community_id));
+                            let community = crate::owner_state_types::SpaceId(community_id);
+                            // Fresh session HLC (seq restarts at 0 on every
+                            // (re)subscribe; the map's freshness rules treat a
+                            // strictly-newer started_hlc as a new session).
+                            // Bump `logical` per subscribe so the HLC is
+                            // strictly-increasing even when `wall_ms` is
+                            // unchanged across a rapid resubscribe.
+                            session_logical = session_logical.wrapping_add(1);
+                            let started_hlc = crate::owner_state_types::Hlc {
+                                wall_ms: crate::iroh_friend_acceptor::wall_now_ms(),
+                                logical: session_logical,
+                                device_id: hex::encode(self_device),
+                            };
+                            let seq_counter =
+                                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                            let pub_handle =
+                                crate::community_presence::spawn_community_presence_publisher(
+                                    (*session_for_presence).clone(),
+                                    topic.clone(),
+                                    Arc::clone(&registry_for_presence),
+                                    community,
+                                    std::sync::Arc::clone(&signing_key),
+                                    self_owner,
+                                    self_device,
+                                    started_hlc,
+                                    seq_counter,
+                                    Duration::from_millis(
+                                        crate::community_presence::BEACON_INTERVAL_MS,
+                                    ),
+                                    Arc::clone(&closing_for_presence),
+                                );
+                            let sub_handle =
+                                crate::community_presence::spawn_community_presence_subscriber(
+                                    (*session_for_presence).clone(),
+                                    topic,
+                                    Arc::clone(&registry_for_presence),
+                                    community,
+                                    std::sync::Arc::clone(&map_for_presence),
+                                    app_for_presence.clone(),
+                                    Arc::clone(&closing_for_presence),
+                                    std::sync::Arc::clone(&now_ms_for_presence),
+                                );
+                            handles.insert(community_id, (pub_handle, sub_handle));
+                            // Emit an INITIAL empty roster so the UI has a
+                            // baseline immediately (peers populate it as their
+                            // beacons arrive).
+                            crate::node_event_sink::emit_ser(
+                                app_for_presence.as_ref(),
+                                "presence-updated",
+                                &crate::community_presence::PresenceUpdatedPayload::new(
+                                    community_id,
+                                    &[],
+                                ),
+                            );
+                        }
+                        CommunityPresenceRequest::Unsubscribe { community_id } => {
+                            if let Some((p, s)) = handles.remove(&community_id) {
+                                p.abort();
+                                s.abort();
+                            }
+                            map_for_presence
+                                .lock()
+                                .await
+                                .remove_community(&crate::owner_state_types::SpaceId(community_id));
+                            crate::node_event_sink::emit_ser(
+                                app_for_presence.as_ref(),
+                                "presence-updated",
+                                &crate::community_presence::PresenceUpdatedPayload::new(
+                                    community_id,
+                                    &[],
+                                ),
+                            );
+                        }
+                    }
+                }
+                // Request channel closed: abort any still-running per-community
+                // pub/sub pairs (they otherwise rely solely on `closing`, which
+                // may not be set on this path).
+                for (_cid, (p, s)) in handles.drain() {
+                    p.abort();
+                    s.abort();
+                }
+            });
+        }
+
+        // ── global TTL sweeper: evict stale devices + re-emit rosters ──
+        {
+            let app_for_sweep = app.clone();
+            let closing_for_sweep = Arc::clone(&closing);
+            let map_for_sweep = std::sync::Arc::clone(&community_presence_map);
+            let now_ms_for_sweep = std::sync::Arc::clone(&voice_now_ms);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_millis(
+                    crate::community_presence::BEACON_INTERVAL_MS,
+                ));
+                loop {
+                    tick.tick().await;
+                    if closing_for_sweep.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let evicted = {
+                        let mut g = map_for_sweep.lock().await;
+                        g.sweep((now_ms_for_sweep)(), crate::community_presence::STALE_MS)
+                    };
+                    if evicted.is_empty() {
+                        continue;
+                    }
+                    // Distinct communities whose roster changed this sweep.
+                    let mut communities: Vec<crate::owner_state_types::SpaceId> =
+                        evicted.into_iter().map(|(c, _, _)| c).collect();
+                    communities.sort();
+                    communities.dedup();
+                    for community in communities {
+                        let members = {
+                            let g = map_for_sweep.lock().await;
+                            g.online_owners(&community)
+                        };
+                        crate::node_event_sink::emit_ser(
+                            app_for_sweep.as_ref(),
+                            "presence-updated",
+                            &crate::community_presence::PresenceUpdatedPayload::new(
+                                community.0,
+                                &members,
+                            ),
+                        );
+                    }
+                }
+            });
+        }
+    }
 
     tracing::info!("event loop running");
 

@@ -15,6 +15,10 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 pub const VOICE_PACKET_AAD: &[u8] = b"harmony-voice-pkt-v1";
 /// Domain separator for sealed presence beacons.
 pub const VOICE_PRESENCE_AAD: &[u8] = b"harmony-voice-presence-v1";
+/// ZEB-537 community-presence beacon AEAD domain. Distinct from
+/// `VOICE_PRESENCE_AAD` so a community-presence packet can never be opened in
+/// (or confused with) a voice-presence or channel-log context.
+pub const COMMUNITY_PRESENCE_AAD: &[u8] = b"harmony-community-presence-v1";
 /// Domain separator for sealed DM-call voice media packets.
 pub const VOICE_DM_PACKET_AAD: &[u8] = b"harmony-voice-dm-pkt-v1";
 /// Domain tag for sealed voice-moderation directives (ZEB-358). Distinct from

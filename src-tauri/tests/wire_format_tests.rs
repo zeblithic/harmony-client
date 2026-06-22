@@ -33,6 +33,8 @@ mod library_announce_fixtures;
 mod library_directory_fixtures;
 #[path = "wire_format/pkarr_routing_record_fixtures.rs"]
 mod pkarr_routing_record_fixtures;
+#[path = "wire_format/presence_fixtures.rs"]
+mod presence_fixtures;
 #[path = "wire_format/profile_broadcast_fixtures.rs"]
 mod profile_broadcast_fixtures;
 #[path = "wire_format/profile_card_avatar_fixtures.rs"]
