@@ -6,6 +6,14 @@ import type { TauriAdapter } from '../../zenoh-service';
 import { VotingAdapter } from '../../voting-adapter';
 import type { PollMeta } from '../../types/voting';
 
+// vi.mock is hoisted; vi.hoisted makes the spies available at factory-call
+// time (repo pattern — see WelcomeModal.test.ts).
+const { openMock, saveMock } = vi.hoisted(() => ({ openMock: vi.fn(), saveMock: vi.fn() }));
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+  open: openMock,
+  save: saveMock,
+}));
+
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
   const listeners = new Map<string, Function>();
   return {
@@ -493,5 +501,29 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
     // …but the identity drill-down popover gets the signed card name.
     expect(onOpenCard).toHaveBeenCalled();
     expect(onOpenCard.mock.calls[0][0].displayName).toBe('ZEBbot');
+  });
+
+  it('renders MessageAttachments for a message carrying attachments', async () => {
+    const { adapter, container } = await setup();
+    const handler = adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'cc'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('see attached')),
+          attachments: [{ cid: 'k1', mime: 'text/plain', name: 'ci.log', size: 1234, encrypted: true }],
+        },
+      },
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.attachment-chip')).not.toBeNull();
+      expect(container.textContent).toContain('ci.log');
+    });
   });
 });

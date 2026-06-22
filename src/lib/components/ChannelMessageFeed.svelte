@@ -6,6 +6,7 @@
   import type { PollMeta } from '../types/voting';
   import Avatar from './Avatar.svelte';
   import PollMessage from './PollMessage.svelte';
+  import MessageAttachments from './MessageAttachments.svelte';
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
   import type { ResolvedCard } from '../member-card-service';
   import { nonEmpty } from '../display-label';
@@ -426,6 +427,14 @@
               {/if}
             {:else}
               <p class="body">{bodyToText(msg.body)}</p>
+            {/if}
+            {#if msg.attachments && msg.attachments.length > 0}
+              <MessageAttachments
+                {communityId}
+                {channelId}
+                attachments={msg.attachments}
+                {channelMessageService}
+              />
             {/if}
           </div>
         </article>
