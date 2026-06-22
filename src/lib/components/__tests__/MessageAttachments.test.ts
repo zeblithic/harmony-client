@@ -65,6 +65,15 @@ describe('MessageAttachments', () => {
     expect(service.downloadArtifact).not.toHaveBeenCalled();
   });
 
+  it('sanitizes a path-traversal name to a basename for the save dialog', async () => {
+    saveMock.mockResolvedValue(null); // cancel — we only assert the dialog args
+    const { container } = render(MessageAttachments, {
+      props: props({ attachments: [att({ name: '../../etc/passwd' })], channelMessageService: makeService() }),
+    });
+    await fireEvent.click(container.querySelector('.att-download')!);
+    expect(saveMock).toHaveBeenCalledWith(expect.objectContaining({ defaultPath: 'passwd' }));
+  });
+
   it('download error → error message + retry re-invokes', async () => {
     saveMock.mockResolvedValue('/tmp/out.txt');
     const downloadArtifact = vi.fn()

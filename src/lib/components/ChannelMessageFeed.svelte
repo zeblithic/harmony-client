@@ -90,6 +90,10 @@
   let posting = $state(false);
   let pendingAttachments = $state<ChannelAttachmentDto[]>([]);
   let ingesting = $state(false);
+  // Bumped on every channel switch so stale in-flight attach work (dialog /
+  // ingest awaits) can detect it navigated away and drop its results — mirrors
+  // the `cancelled` guard the channel-switch $effect uses for listMessages.
+  let attachEpoch = 0;
 
   let scrollEl: HTMLDivElement | undefined = $state();
   let composeEl: HTMLTextAreaElement | undefined = $state();
@@ -109,6 +113,9 @@
     composeError = null;
     loadError = null;
     backfillProgress = null;
+    pendingAttachments = [];
+    ingesting = false;
+    attachEpoch += 1;
     // Phase 4 round-1 fixup: also reset scroll/backfill state to avoid
     // bleed-over between channels (Qodo PR #97 finding).
     backfillInFlight = false;
@@ -304,19 +311,31 @@
 
   async function pickAttachments() {
     if (ingesting || posting) return;
+    // Set the in-flight guard BEFORE awaiting the picker so rapid repeated
+    // clicks can't open multiple dialogs / start concurrent ingest loops.
+    ingesting = true;
+    composeError = null;
+    // Capture the channel generation; if the user switches channels while the
+    // dialog or an ingest is in flight, drop the stale results so they can't
+    // land in (or be posted to) the newly-selected channel.
+    const epoch = attachEpoch;
     let selected: string | string[] | null;
     try {
       selected = await open({ multiple: true });
     } catch {
+      if (epoch === attachEpoch) ingesting = false;
       return; // dialog backend error — treat like cancel
     }
-    if (!selected) return;
+    if (epoch !== attachEpoch) return; // channel switched during the dialog
+    if (!selected) {
+      ingesting = false;
+      return;
+    }
     const paths = Array.isArray(selected) ? selected : [selected];
-    ingesting = true;
-    composeError = null;
     try {
       for (const path of paths) {
         const att = await channelMessageService.ingestArtifact(communityId, path);
+        if (epoch !== attachEpoch) return; // switched mid-ingest; drop
         // CIDs are content-addressed: the same file yields the same cid. The
         // keyed {#each} on cid throws on duplicate keys, so skip an already-
         // pending cid rather than add a second chip.
@@ -325,9 +344,9 @@
         }
       }
     } catch (e) {
-      composeError = e instanceof Error ? e.message : String(e);
+      if (epoch === attachEpoch) composeError = e instanceof Error ? e.message : String(e);
     } finally {
-      ingesting = false;
+      if (epoch === attachEpoch) ingesting = false;
     }
   }
 

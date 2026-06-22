@@ -621,4 +621,37 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
       expect(container.querySelectorAll('.pending-chip').length).toBe(0);
     });
   });
+
+  it('clears pending attachments when the channel changes', async () => {
+    openMock.mockResolvedValue('/tmp/a.txt');
+    const { adapter, container, props, rerender } = await setup();
+    (adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'request_channel_backfill') return Promise.resolve(undefined);
+      if (cmd === 'ingest_channel_artifact')
+        return Promise.resolve({ cid: 'c0', mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true });
+      if (cmd === 'post_channel_message') return Promise.resolve('mid' + 'a'.repeat(29));
+      return Promise.resolve(undefined);
+    });
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
+    // Re-render the SAME instance with a changed channelId; the switch $effect
+    // resets pendingAttachments so the chip must disappear.
+    await rerender({ ...props, channelId: 'dd'.repeat(16) });
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(0));
+  });
+
+  it('does not open a second file picker while one attach is in flight', async () => {
+    let resolveOpen: (v: unknown) => void = () => {};
+    // Reset call history so the count below measures only this test's clicks
+    // (openMock is module-scoped and exercised by other tests in this suite).
+    openMock.mockReset();
+    openMock.mockImplementation(() => new Promise((r) => { resolveOpen = r; }));
+    const { container } = await setup();
+    const btn = container.querySelector('.attach-btn')!;
+    await fireEvent.click(btn);
+    await fireEvent.click(btn);
+    expect(openMock).toHaveBeenCalledTimes(1);
+    resolveOpen(null); // let the first flow finish/cancel cleanly
+  });
 });

@@ -35,9 +35,12 @@
 
   async function download(att: ChannelAttachmentDto) {
     if (stateOf(att.cid) === 'downloading') return;
+    // att.name is sender-supplied; strip any path components so the dialog's
+    // default is a plain basename, never a traversal or absolute path.
+    const base = att.name.split(/[/\\]/).pop() || 'attachment';
     let destPath: string | null;
     try {
-      destPath = await save({ defaultPath: att.name, ...filtersFor(att.name) });
+      destPath = await save({ defaultPath: base, ...filtersFor(base) });
     } catch {
       // Treat a dialog backend error like a cancel — nothing downloaded.
       return;
