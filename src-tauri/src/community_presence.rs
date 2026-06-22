@@ -171,6 +171,7 @@ pub fn seal_presence_beacon_with_nonce(
 // → device → entry (voice keys by `(community, channel)`).
 
 /// One live device's last-known presence state within a community.
+#[derive(Debug)]
 struct PresenceEntry {
     owner: [u8; 16],
     started_hlc: Hlc,
