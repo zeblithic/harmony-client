@@ -359,6 +359,7 @@ async fn pin_folder_cascades_to_nested_leaf() {
         &harness.ingest_tx,
         hex::encode(leaf_cid.to_bytes()),
         leaf_bytes,
+        false,
     )
     .await
     .unwrap();
@@ -366,6 +367,7 @@ async fn pin_folder_cascades_to_nested_leaf() {
         &harness.ingest_tx,
         hex::encode(folder.manifest_cid.to_bytes()),
         folder.manifest_bytes,
+        false,
     )
     .await
     .unwrap();
@@ -373,6 +375,7 @@ async fn pin_folder_cascades_to_nested_leaf() {
         &harness.ingest_tx,
         hex::encode(folder.bundle_cid.to_bytes()),
         folder.bundle_bytes,
+        false,
     )
     .await
     .unwrap();
@@ -476,16 +479,27 @@ async fn list_folder_end_to_end_with_two_children() {
     .expect("build");
 
     let harness = spawn_test_runtime().await;
-    harmony_app::send_ingest(&harness.ingest_tx, hex::encode(cid_a.to_bytes()), bytes_a)
-        .await
-        .unwrap();
-    harmony_app::send_ingest(&harness.ingest_tx, hex::encode(cid_b.to_bytes()), bytes_b)
-        .await
-        .unwrap();
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(cid_a.to_bytes()),
+        bytes_a,
+        false,
+    )
+    .await
+    .unwrap();
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(cid_b.to_bytes()),
+        bytes_b,
+        false,
+    )
+    .await
+    .unwrap();
     harmony_app::send_ingest(
         &harness.ingest_tx,
         hex::encode(folder.manifest_cid.to_bytes()),
         folder.manifest_bytes,
+        false,
     )
     .await
     .unwrap();
@@ -493,6 +507,7 @@ async fn list_folder_end_to_end_with_two_children() {
         &harness.ingest_tx,
         hex::encode(folder.bundle_cid.to_bytes()),
         folder.bundle_bytes,
+        false,
     )
     .await
     .unwrap();
@@ -526,6 +541,7 @@ async fn list_folder_empty_returns_empty_vec() {
         &harness.ingest_tx,
         hex::encode(folder.manifest_cid.to_bytes()),
         folder.manifest_bytes,
+        false,
     )
     .await
     .unwrap();
@@ -533,6 +549,7 @@ async fn list_folder_empty_returns_empty_vec() {
         &harness.ingest_tx,
         hex::encode(folder.bundle_cid.to_bytes()),
         folder.bundle_bytes,
+        false,
     )
     .await
     .unwrap();
@@ -586,6 +603,7 @@ async fn list_folder_malformed_manifest_returns_error() {
         &harness.ingest_tx,
         hex::encode(leaf_cid.to_bytes()),
         leaf_bytes,
+        false,
     )
     .await
     .unwrap();
@@ -593,6 +611,7 @@ async fn list_folder_malformed_manifest_returns_error() {
         &harness.ingest_tx,
         hex::encode(bad_manifest_cid.to_bytes()),
         bad_manifest,
+        false,
     )
     .await
     .unwrap();
@@ -600,6 +619,7 @@ async fn list_folder_malformed_manifest_returns_error() {
         &harness.ingest_tx,
         hex::encode(bundle_cid.to_bytes()),
         bundle_bytes,
+        false,
     )
     .await
     .unwrap();

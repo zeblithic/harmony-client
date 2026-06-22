@@ -19,10 +19,11 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::community_channel_log::{
-    decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, sign_channel_event,
-    verify_channel_event, ChannelEventError, ChannelKey, ChannelLog, ChannelLogConfig,
-    ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc,
-    MessageId, SignedChannelEvent,
+    decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, read_segment_at,
+    sign_channel_event, verify_channel_event, ChannelAttachment, ChannelEventError, ChannelKey,
+    ChannelLog, ChannelLogConfig, ChannelLogPersistError, ChannelLogReplayTracker,
+    ChannelPostPayload, CommunityStateAtHlc, MessageId, SegmentDescriptor, SignedChannelEvent,
+    MAX_ATTACHMENTS, MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -57,6 +58,15 @@ pub enum ChannelLogEngineError {
 
     #[error("body too large: {len} bytes (max {max})")]
     BodyTooLarge { len: usize, max: usize },
+
+    #[error("too many mentions: {count} (max {max})")]
+    TooManyMentions { count: usize, max: usize },
+
+    #[error("too many attachments: {count} (max {max})")]
+    TooManyAttachments { count: usize, max: usize },
+
+    #[error("attachment name/mime too long (max {max})")]
+    AttachmentFieldTooLong { max: usize },
 
     #[error("limit too large: {limit} (max {max})")]
     LimitTooLarge { limit: u32, max: u32 },
@@ -153,6 +163,28 @@ pub struct ChannelMessageDto {
     /// ZEB-536: materialized reactions on this message (empty when none).
     #[serde(default)]
     pub reactions: Vec<crate::community_channel_log::ReactionDto>,
+    /// ZEB-534: owner-ids (lowercase hex) this message addresses. Omitted
+    /// when the post carries no mentions so existing consumers never see
+    /// `mentions: null`. Recipients derive "mentions me" as
+    /// `self_owner_hex ∈ mentions`. `ChannelMessageReceivedPayload` carries
+    /// the full DTO, so this rides the live event automatically.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mentions: Option<Vec<String>>,
+    /// ZEB-535: CAS artifacts this message references; omitted when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<ChannelAttachmentDto>>,
+}
+
+/// ZEB-535: IPC-facing attachment (hex cid + metadata). `encrypted` is
+/// derived from the CID flag so the frontend can label members-only vs
+/// public without re-parsing the CID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelAttachmentDto {
+    pub cid: String,
+    pub mime: String,
+    pub name: String,
+    pub size: u64,
+    pub encrypted: bool,
 }
 
 /// Magic-byte prefix for ZEB-291 Phase 1.5 poll-message bodies. Chosen
@@ -165,6 +197,21 @@ pub const POLL_BODY_MAGIC: u8 = 0x00;
 /// Poll-message body length: 1 magic byte + 64 ASCII hex chars (the
 /// hex encoding of a 32-byte `PollId`). Total 65 bytes.
 pub const POLL_BODY_LEN: usize = 1 + 64;
+
+/// ZEB-539: if `event` is a `Post` carrying an attachment whose CID equals
+/// `cid`, return a clone of that `ChannelAttachment`. Used by
+/// `find_attachment` to scan the log for a re-serve authorization record.
+fn attachment_with_cid(event: &SignedChannelEvent, cid: &[u8; 32]) -> Option<ChannelAttachment> {
+    // React events carry no attachments — only Post can authorize a re-serve.
+    let SignedChannelEvent::Post { attachments, .. } = event else {
+        return None;
+    };
+    attachments
+        .as_ref()?
+        .iter()
+        .find(|att| &att.cid == cid)
+        .cloned()
+}
 
 /// Inspect a channel-message body for the ZEB-291 Phase 1.5 poll
 /// convention. Returns `(Some("poll"), Some(hex))` when the body is
@@ -608,6 +655,74 @@ impl ChannelLogEngine {
         Ok(out)
     }
 
+    /// ZEB-539: returns the first verified `ChannelAttachment` in this
+    /// channel's log whose CID matches `cid`, or `None`.
+    ///
+    /// Scans ALL stored events — every persisted segment plus the
+    /// in-memory tail — NOT a bounded recent window, so an attachment
+    /// shared long ago is still authorizable for re-serve. The returned
+    /// record is the signed source of truth (use its `size` as
+    /// authoritative). Encapsulated as an accessor so a future in-memory
+    /// CID→attachment index is a drop-in replacement for this linear scan.
+    ///
+    /// Matches are unique by content (a CID names exactly one byte
+    /// stream), so returning the first hit in oldest-first order is
+    /// well-defined regardless of which event referenced it.
+    pub async fn find_attachment(
+        &self,
+        cid: &[u8; 32],
+    ) -> Result<Option<crate::community_channel_log::ChannelAttachment>, ChannelLogEngineError>
+    {
+        // Qodo (High): do NOT hold the async mutex across disk I/O, and do NOT
+        // run synchronous `std::fs::read` on a Tokio worker. Snapshot the
+        // segment descriptors + the in-memory tail + the root path UNDER the
+        // lock, drop the lock, then read the segments off the executor via
+        // `spawn_blocking`. Behavior is identical: scan persisted segments
+        // (oldest first) then the tail, returning the first matching
+        // `ChannelAttachment`, else `None`.
+        let (segments, tail, root): (Vec<SegmentDescriptor>, Vec<SignedChannelEvent>, _) = {
+            let log = self.log.lock().await;
+            (
+                log.manifest.segments.clone(),
+                log.tail.clone(),
+                log.root().to_path_buf(),
+            )
+        };
+
+        // Read + scan the persisted segments off the async executor — the
+        // reads use blocking `std::fs::read`. Early-exit on the first match.
+        let cid = *cid;
+        let seg_hit = tokio::task::spawn_blocking(move || {
+            for seg in &segments {
+                let events = read_segment_at(&root, seg)?;
+                for ev in &events {
+                    if let Some(att) = attachment_with_cid(ev, &cid) {
+                        return Ok::<_, ChannelLogPersistError>(Some(att));
+                    }
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|e| {
+            ChannelLogEngineError::Persist(ChannelLogPersistError::Io(format!(
+                "find_attachment segment-read task panicked: {e}"
+            )))
+        })?
+        .map_err(ChannelLogEngineError::Persist)?;
+        if seg_hit.is_some() {
+            return Ok(seg_hit);
+        }
+
+        // Then the in-memory tail (already snapshotted; no I/O).
+        for ev in &tail {
+            if let Some(att) = attachment_with_cid(ev, &cid) {
+                return Ok(Some(att));
+            }
+        }
+        Ok(None)
+    }
+
     /// ZEB-418 P3a: max HLC currently in the verified log (segments +
     /// tail). The backfill driver's watermark source — only verified
     /// events land in the log, so a hostile holder serving garbage
@@ -626,6 +741,8 @@ impl ChannelLogEngine {
         self: &Arc<Self>,
         body: Vec<u8>,
         reply_to: Option<MessageId>,
+        mentions: Option<Vec<OwnerAddr>>,
+        attachments: Option<Vec<ChannelAttachment>>,
     ) -> Result<MessageId, ChannelLogEngineError> {
         if body.len() > MAX_BODY_BYTES {
             return Err(ChannelLogEngineError::BodyTooLarge {
@@ -633,6 +750,48 @@ impl ChannelLogEngine {
                 max: MAX_BODY_BYTES,
             });
         }
+        if let Some(m) = &mentions {
+            if m.len() > MAX_MENTIONS {
+                return Err(ChannelLogEngineError::TooManyMentions {
+                    count: m.len(),
+                    max: MAX_MENTIONS,
+                });
+            }
+        }
+        // ZEB-535: bound the attachment fan-out at mint, mirroring the
+        // mentions cap. Inbound verification enforces the same cap.
+        if let Some(a) = &attachments {
+            if a.len() > MAX_ATTACHMENTS {
+                return Err(ChannelLogEngineError::TooManyAttachments {
+                    count: a.len(),
+                    max: MAX_ATTACHMENTS,
+                });
+            }
+            // ZEB-535: bound each attachment's name/mime length at mint to
+            // match `verify_channel_event`'s field-length cap. Without this a
+            // local publisher could mint a post that every remote peer drops at
+            // verification (`AttachmentFieldTooLong`) — a cross-node
+            // inconsistency. Mirrors the MAX_MENTIONS precedent.
+            for att in a {
+                if att.name.len() > MAX_ATTACHMENT_FIELD_BYTES
+                    || att.mime.len() > MAX_ATTACHMENT_FIELD_BYTES
+                {
+                    return Err(ChannelLogEngineError::AttachmentFieldTooLong {
+                        max: MAX_ATTACHMENT_FIELD_BYTES,
+                    });
+                }
+            }
+        }
+        // ZEB-534: normalize Some(empty) -> None so an empty mentions list
+        // never emits the `mn` key. Without this, `Some(vec![])` would
+        // serialize `mn: []` and change the signed bytes — defeating the
+        // "mention-less posts are byte-identical to pre-feature" invariant
+        // for callers that default to an empty list.
+        let mentions = mentions.filter(|m| !m.is_empty());
+        // ZEB-535: same Some(empty) -> None normalization for attachments so
+        // an empty list never emits the `pa` key (byte-identical to a post
+        // with no attachments).
+        let attachments = attachments.filter(|a| !a.is_empty());
 
         // Phase 2 stores body as String inside SignedChannelEvent::Post
         // (the canonical-CBOR signature covers a `&str`). The IPC layer
@@ -671,6 +830,8 @@ impl ChannelLogEngine {
             content_kind: 0,
             body: &body_str,
             reply_to,
+            mentions,
+            attachments,
         };
         let event = sign_channel_event(&payload, &self.signing_key)
             .map_err(ChannelLogEngineError::ChannelEvent)?;
@@ -957,6 +1118,8 @@ impl ChannelLogEngine {
             author,
             at,
             body,
+            mentions,
+            attachments,
             reply_to,
             ..
         } = event
@@ -978,6 +1141,34 @@ impl ChannelLogEngine {
             },
             body: body_bytes,
             reply_to: reply_to.map(|m| hex::encode(m.0)),
+            // Omit an empty mentions list to honor the DTO contract
+            // (no-mention posts have no `mentions` field). `publish()`
+            // normalizes `Some([])` -> `None` at mint time, but this
+            // projection also runs on arbitrary inbound/persisted events,
+            // where a remote peer could sign `mn: []` (empty passes the
+            // cap check). Filter here so the DTO is consistent regardless.
+            mentions: mentions
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .map(|v| v.iter().map(|a| hex::encode(a.0)).collect()),
+            // ZEB-535: project the signed attachment list to DTOs. `encrypted`
+            // is derived from the CID header flag so the frontend can label
+            // members-only vs public without re-parsing the CID. An empty list
+            // (a remote peer could sign `pa: []`) projects to None for a
+            // consistent DTO, mirroring the mentions normalization above.
+            attachments: attachments.as_ref().filter(|v| !v.is_empty()).map(|v| {
+                v.iter()
+                    .map(|a| ChannelAttachmentDto {
+                        cid: hex::encode(a.cid),
+                        mime: a.mime.clone(),
+                        name: a.name.clone(),
+                        size: a.size,
+                        encrypted: harmony_content::cid::ContentId::from_bytes(a.cid)
+                            .flags()
+                            .encrypted,
+                    })
+                    .collect()
+            }),
             kind,
             poll_id,
             reactions: Vec::new(),
@@ -2405,6 +2596,8 @@ mod tests {
             content_kind: 0,
             body,
             reply_to: None,
+            mentions: None,
+            attachments: None,
         };
         sign_channel_event(&payload, signing_key).expect("sign")
     }
@@ -2551,6 +2744,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_to_dto_projects_mentions_as_hex() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let m0 = OwnerAddr([0xb2; 16]);
+        let m1 = OwnerAddr([0xc3; 16]);
+        let id = {
+            use rand::RngCore;
+            let mut b = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut b);
+            MessageId(b)
+        };
+        let payload = ChannelPostPayload {
+            id,
+            community_id: fix.community_id,
+            channel_id: fix.channel_id,
+            author: fix.self_owner,
+            at: Hlc {
+                wall_ms: 5_000,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            content_kind: 0,
+            body: "hi @bob",
+            reply_to: None,
+            mentions: Some(vec![m0, m1]),
+            attachments: None,
+        };
+        let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
+        let dto = fix.engine.event_to_dto(&ev).expect("Post projects to a DTO");
+        assert_eq!(
+            dto.mentions,
+            Some(vec![hex::encode(m0.0), hex::encode(m1.0)])
+        );
+
+        // Mention-less event omits the field.
+        let ev_none = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            Hlc {
+                wall_ms: 5_001,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            "no mentions",
+            &fix.signing_key,
+        );
+        assert!(fix
+            .engine
+            .event_to_dto(&ev_none)
+            .expect("Post projects to a DTO")
+            .mentions
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn event_to_dto_omits_empty_mentions() {
+        // A signed event carrying `Some(vec![])` (reachable inbound: a
+        // remote peer can sign `mn: []`, which passes the cap check) must
+        // still project to a DTO with no `mentions` field, matching the
+        // no-mention contract. `sign_channel_event` does not normalize, so
+        // this builds the empty-vec event directly.
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let id = {
+            use rand::RngCore;
+            let mut b = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut b);
+            MessageId(b)
+        };
+        let payload = ChannelPostPayload {
+            id,
+            community_id: fix.community_id,
+            channel_id: fix.channel_id,
+            author: fix.self_owner,
+            at: Hlc {
+                wall_ms: 5_002,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            content_kind: 0,
+            body: "empty mentions",
+            reply_to: None,
+            mentions: Some(vec![]),
+            attachments: None,
+        };
+        let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
+        assert!(fix
+            .engine
+            .event_to_dto(&ev)
+            .expect("Post projects to a DTO")
+            .mentions
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn event_to_dto_projects_attachments() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        // Build an attachment with an ENCRYPTED-flagged CID so `encrypted` is true.
+        let enc_cid = harmony_content::cid::ContentId::for_book(
+            b"ct",
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid")
+        .to_bytes();
+        let att = crate::community_channel_log::ChannelAttachment {
+            cid: enc_cid,
+            mime: "text/plain".into(),
+            name: "log.txt".into(),
+            size: 9,
+        };
+        let id = {
+            use rand::RngCore;
+            let mut b = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut b);
+            MessageId(b)
+        };
+        let payload = ChannelPostPayload {
+            id,
+            community_id: fix.community_id,
+            channel_id: fix.channel_id,
+            author: fix.self_owner,
+            at: Hlc {
+                wall_ms: 5_000,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            content_kind: 0,
+            body: "see log",
+            reply_to: None,
+            mentions: None,
+            attachments: Some(vec![att.clone()]),
+        };
+        let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
+        let dto = fix.engine.event_to_dto(&ev).expect("Post projects to a DTO");
+        let got = dto.attachments.expect("attachments present");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].cid, hex::encode(enc_cid));
+        assert_eq!(got[0].name, "log.txt");
+        assert_eq!(got[0].mime, "text/plain");
+        assert_eq!(got[0].size, 9);
+        assert!(
+            got[0].encrypted,
+            "encrypted-flagged cid projects encrypted=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_to_dto_projects_unencrypted_attachment() {
+        // Companion to event_to_dto_projects_attachments: a CID built with
+        // default (non-encrypted) flags must project encrypted=false. The
+        // positive-only test would still pass if the projection inverted the
+        // flag, so this negative case is what actually pins the derivation.
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let pub_cid = harmony_content::cid::ContentId::for_book(
+            b"ct",
+            harmony_content::cid::ContentFlags::default(),
+        )
+        .expect("cid")
+        .to_bytes();
+        let att = crate::community_channel_log::ChannelAttachment {
+            cid: pub_cid,
+            mime: "text/plain".into(),
+            name: "public.txt".into(),
+            size: 9,
+        };
+        let id = {
+            use rand::RngCore;
+            let mut b = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut b);
+            MessageId(b)
+        };
+        let payload = ChannelPostPayload {
+            id,
+            community_id: fix.community_id,
+            channel_id: fix.channel_id,
+            author: fix.self_owner,
+            at: Hlc {
+                wall_ms: 5_000,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            content_kind: 0,
+            body: "see log",
+            reply_to: None,
+            mentions: None,
+            attachments: Some(vec![att]),
+        };
+        let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
+        let dto = fix.engine.event_to_dto(&ev).expect("Post projects to a DTO");
+        let got = dto.attachments.expect("attachments present");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].cid, hex::encode(pub_cid));
+        assert_eq!(got[0].name, "public.txt");
+        assert_eq!(got[0].mime, "text/plain");
+        assert_eq!(got[0].size, 9);
+        assert!(
+            !got[0].encrypted,
+            "default-flag cid projects encrypted=false"
+        );
+    }
+
+    #[tokio::test]
     async fn list_messages_walks_tail_then_segments() {
         // Spec §14.1: with seal_threshold=4 and 10 events appended,
         // the engine ends up with 2 sealed segments + 2 events in the
@@ -2644,6 +3041,121 @@ mod tests {
         assert_eq!(listed.len(), 2, "limit must cap result count");
     }
 
+    // ── ZEB-539: find_attachment ──────────────────────────────────────
+
+    /// Build a signed Post carrying `attachments` (fixture identity, so the
+    /// signature verifies). Mirrors `make_signed_event` but populates `pa`.
+    fn make_signed_event_with_attachments(
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        author: OwnerAddr,
+        at: Hlc,
+        body: &str,
+        attachments: Option<Vec<ChannelAttachment>>,
+        signing_key: &SigningKey,
+    ) -> SignedChannelEvent {
+        use rand::RngCore;
+        let mut id_bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut id_bytes);
+        let payload = ChannelPostPayload {
+            id: MessageId(id_bytes),
+            community_id,
+            channel_id,
+            author,
+            at,
+            content_kind: 0,
+            body,
+            reply_to: None,
+            mentions: None,
+            attachments,
+        };
+        sign_channel_event(&payload, signing_key).expect("sign")
+    }
+
+    #[tokio::test]
+    async fn find_attachment_scans_segments_and_tail() {
+        // seal_threshold=4 with 10 events => 2 sealed segments + 2 tail
+        // events (matching list_messages_walks_tail_then_segments), so this
+        // exercises BOTH the persisted-segment scan and the in-memory tail.
+        let fix = build_engine_fixture(4, 250, 1000).await;
+
+        // Attachment in the very first event (lands in the OLDEST sealed
+        // segment) — proves the scan is unbounded, not a recent window.
+        let seg_att = ChannelAttachment {
+            cid: [0xb2; 32],
+            mime: "text/plain".to_string(),
+            name: "old-log.txt".to_string(),
+            size: 4242,
+        };
+        // Attachment in the last event (stays in the tail).
+        let tail_att = ChannelAttachment {
+            cid: [0xc3; 32],
+            mime: "application/json".to_string(),
+            name: "recent.json".to_string(),
+            size: 99,
+        };
+
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            for i in 0..10u64 {
+                let hlc = Hlc {
+                    wall_ms: 100 + i,
+                    logical: 0,
+                    device_id: "test-device".to_string(),
+                };
+                let attachments = match i {
+                    0 => Some(vec![seg_att.clone()]),
+                    9 => Some(vec![tail_att.clone()]),
+                    // One event with no attachments to prove the scan skips
+                    // `None` posts cleanly.
+                    _ => None,
+                };
+                let ev = make_signed_event_with_attachments(
+                    fix.community_id,
+                    fix.channel_id,
+                    fix.self_owner,
+                    hlc,
+                    &format!("msg-{i}"),
+                    attachments,
+                    &fix.signing_key,
+                );
+                log.append(ev).expect("append");
+                if (i + 1) % 4 == 0 {
+                    log.seal_and_persist().expect("seal");
+                }
+            }
+            // Sanity: the layout actually splits across segments + tail.
+            assert_eq!(log.manifest.segments.len(), 2, "expected 2 sealed segments");
+            assert_eq!(log.tail.len(), 2, "expected 2 tail events");
+        }
+
+        // Present CID in the oldest persisted segment.
+        let got = fix
+            .engine
+            .find_attachment(&[0xb2; 32])
+            .await
+            .expect("find ok")
+            .expect("segment attachment present");
+        assert_eq!(got, seg_att, "returns the signed segment record");
+
+        // Present CID in the in-memory tail.
+        let got = fix
+            .engine
+            .find_attachment(&[0xc3; 32])
+            .await
+            .expect("find ok")
+            .expect("tail attachment present");
+        assert_eq!(got, tail_att, "returns the signed tail record");
+
+        // Absent CID → None.
+        let none = fix
+            .engine
+            .find_attachment(&[0xff; 32])
+            .await
+            .expect("find ok");
+        assert!(none.is_none(), "absent cid must return None");
+    }
+
     // ── Sub-task 2B: publish ──────────────────────────────────────────
 
     #[tokio::test]
@@ -2652,7 +3164,7 @@ mod tests {
 
         let body = b"hello channel".to_vec();
         let msg_id = Arc::clone(&fix.engine)
-            .publish(body.clone(), None)
+            .publish(body.clone(), None, None, None)
             .await
             .expect("publish");
 
@@ -2684,7 +3196,7 @@ mod tests {
 
         let body = b"emit-test-body".to_vec();
         let msg_id = Arc::clone(&fix.engine)
-            .publish(body.clone(), None)
+            .publish(body.clone(), None, None, None)
             .await
             .expect("publish");
 
@@ -2735,10 +3247,112 @@ mod tests {
         let fix = build_engine_fixture(8, 250, 1000).await;
         let body = vec![0u8; MAX_BODY_BYTES + 1];
         let err = Arc::clone(&fix.engine)
-            .publish(body, None)
+            .publish(body, None, None, None)
             .await
             .expect_err("oversized body must reject");
         assert!(matches!(err, ChannelLogEngineError::BodyTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_too_many_mentions() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let too_many: Vec<OwnerAddr> = (0..=MAX_MENTIONS)
+            .map(|i| OwnerAddr([i as u8; 16]))
+            .collect();
+        assert_eq!(too_many.len(), MAX_MENTIONS + 1);
+        let err = Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, Some(too_many), None)
+            .await
+            .expect_err("over-cap mentions must reject");
+        assert!(
+            matches!(err, ChannelLogEngineError::TooManyMentions { count, max }
+                if count == MAX_MENTIONS + 1 && max == MAX_MENTIONS),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_too_many_attachments() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let too_many: Vec<crate::community_channel_log::ChannelAttachment> = (0
+            ..=crate::community_channel_log::MAX_ATTACHMENTS)
+            .map(|i| crate::community_channel_log::ChannelAttachment {
+                cid: [i as u8; 32],
+                mime: "x".into(),
+                name: "n".into(),
+                size: 1,
+            })
+            .collect();
+        let err = Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, None, Some(too_many))
+            .await
+            .expect_err("over-cap must error");
+        assert!(
+            matches!(err, ChannelLogEngineError::TooManyAttachments { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_overlong_attachment_field() {
+        // ZEB-535: an attachment with a name/mime longer than
+        // MAX_ATTACHMENT_FIELD_BYTES must be rejected at publish() time, so a
+        // locally-minted post can't be dropped by remote peers at
+        // verify_channel_event (which enforces the same cap).
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let overlong = vec![crate::community_channel_log::ChannelAttachment {
+            cid: [1u8; 32],
+            mime: "text/plain".into(),
+            name: "x".repeat(MAX_ATTACHMENT_FIELD_BYTES + 1),
+            size: 1,
+        }];
+        let err = Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, None, Some(overlong))
+            .await
+            .expect_err("over-long attachment field must error");
+        assert!(
+            matches!(err, ChannelLogEngineError::AttachmentFieldTooLong { max }
+                if max == MAX_ATTACHMENT_FIELD_BYTES),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_normalizes_empty_mentions_to_none() {
+        // ZEB-534: Some(vec![]) must serialize WITHOUT the mn key (omitted),
+        // so an empty mentions list is byte-identical to a mention-less post.
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, Some(vec![]), None)
+            .await
+            .expect("publish with empty mentions");
+        let msgs = fix.engine.list_messages(None, 100).await.expect("list");
+        assert_eq!(msgs.len(), 1);
+        let dto = fix.engine.event_to_dto(&msgs[0]).expect("Post projects to a DTO");
+        assert!(
+            dto.mentions.is_none(),
+            "empty mentions must normalize to None (mn key omitted)"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_normalizes_empty_attachments_to_none() {
+        // Mirrors publish_normalizes_empty_mentions_to_none: Some(vec![])
+        // attachments must serialize WITHOUT the pa key (omitted), so an
+        // empty attachment list is byte-identical to an attachment-less post.
+        // Load-bearing for signature stability (sig is over canonical CBOR).
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, None, Some(vec![]))
+            .await
+            .expect("publish with empty attachments");
+        let msgs = fix.engine.list_messages(None, 100).await.expect("list");
+        assert_eq!(msgs.len(), 1);
+        let dto = fix.engine.event_to_dto(&msgs[0]).expect("Post projects to a DTO");
+        assert!(
+            dto.attachments.is_none(),
+            "empty attachments must normalize to None (pa key omitted)"
+        );
     }
 
     // ── Sub-task 2C: receive loop ─────────────────────────────────────
@@ -2891,7 +3505,7 @@ mod tests {
         fix.engine.closing.store(true, Ordering::SeqCst);
 
         let err = Arc::clone(&fix.engine)
-            .publish(b"arrives-during-shutdown".to_vec(), None)
+            .publish(b"arrives-during-shutdown".to_vec(), None, None, None)
             .await
             .expect_err("publish on a closing engine must error");
         assert!(
@@ -3637,7 +4251,7 @@ mod tests {
         // Write one post so the log has a watermark, then stop (which
         // flushes the tail durably) and respawn — the reconnect path.
         engine
-            .publish(b"hello".to_vec(), None)
+            .publish(b"hello".to_vec(), None, None, None)
             .await
             .expect("publish");
         let expected = engine.log_max_hlc().await;
@@ -4683,7 +5297,7 @@ mod tests {
     async fn react_updates_index_and_lists_in_dto() {
         let fix = build_engine_fixture(8, 250, 1000).await;
         let msg_id = Arc::clone(&fix.engine)
-            .publish(b"hi".to_vec(), None)
+            .publish(b"hi".to_vec(), None, None, None)
             .await
             .expect("post");
         Arc::clone(&fix.engine)
@@ -4782,7 +5396,7 @@ mod tests {
 
         // A: publish a message.
         let msg_id = Arc::clone(&fix_a.engine)
-            .publish(b"hello from A".to_vec(), None)
+            .publish(b"hello from A".to_vec(), None, None, None)
             .await
             .expect("A publish");
 

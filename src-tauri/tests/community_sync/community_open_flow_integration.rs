@@ -93,7 +93,9 @@ async fn open_community_create_redeem_leave_round_trip() {
     tokio::spawn(async move {
         while let Some(op) = cas_op_rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     cas_for_servicer.lock().await.insert(cid, blob);
                     if let Some(r) = reply {
                         let _ = r.send(Ok(()));
@@ -110,6 +112,9 @@ async fn open_community_create_redeem_leave_round_trip() {
                 CasOp::GetLocal { cid, reply } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }
@@ -441,7 +446,9 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
     tokio::spawn(async move {
         while let Some(op) = cas_op_rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     cas_for_servicer.lock().await.insert(cid, blob);
                     if let Some(r) = reply {
                         let _ = r.send(Ok(()));
@@ -458,6 +465,9 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
                 CasOp::GetLocal { cid, reply } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }

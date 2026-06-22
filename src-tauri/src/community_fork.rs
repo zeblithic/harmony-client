@@ -994,6 +994,8 @@ mod tests {
             community_id: crate::owner_state_types::SpaceId([0u8; 16]),
             id: crate::community_channel_log::MessageId([0u8; 16]),
             content_kind: 0,
+            mentions: None,
+            attachments: None,
             reply_to: None,
             sig: [0u8; 64],
         }

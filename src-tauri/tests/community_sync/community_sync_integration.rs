@@ -124,7 +124,9 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
     tokio::spawn(async move {
         while let Some(op) = rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     store.lock().await.insert(cid, blob);
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(()));
@@ -141,6 +143,9 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
                 CasOp::GetLocal { cid, reply } => {
                     let v = store.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }
@@ -2236,7 +2241,9 @@ mod task3_kick_setpower_round_trip {
         tokio::spawn(async move {
             while let Some(op) = cas_op_rx.recv().await {
                 match op {
-                    CasOp::PutLocal { cid, blob, reply } => {
+                    CasOp::PutLocal {
+                        cid, blob, reply, ..
+                    } => {
                         cas_for_servicer.lock().await.insert(cid, blob);
                         if let Some(r) = reply {
                             let _ = r.send(Ok(()));
@@ -2253,6 +2260,9 @@ mod task3_kick_setpower_round_trip {
                     CasOp::GetLocal { cid, reply } => {
                         let v = cas_for_servicer.lock().await.get(&cid).cloned();
                         let _ = reply.send(v);
+                    }
+                    CasOp::AllowServeSubtree { reply, .. } => {
+                        let _ = reply.send(Ok(0));
                     }
                 }
             }
@@ -2824,6 +2834,9 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
                 }
                 CasOp::GetLocal { reply, .. } => {
                     let _ = reply.send(None);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }
