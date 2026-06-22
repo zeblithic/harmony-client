@@ -350,14 +350,16 @@ pub async fn fork_community(
             continue;
         }
         if let Some(engine) = channel_log_registry.engine(&original_id, channel_id).await {
-            // list_messages with limit 0 → uses engine's default backfill cap.
-            // We want ALL locally known events; use SNAPSHOT_TOTAL_CAP * 2 as
-            // the generous pull cap (build_snapshot will trim further).
+            // ZEB-536: the pre-fork snapshot is message-only for v1. Pull Post
+            // events via the Post-only accessor, which pages by POSTS RETURNED
+            // — a long reaction run cannot exhaust the pull budget and strand
+            // later posts (CodeRabbit PR #314). Cap at SNAPSHOT_TOTAL_CAP * 2
+            // posts (build_snapshot trims further per the §4.2 policy).
             // Best-effort snapshot: one channel's read failure must not abort
             // the whole fork, but it must not be silent either (CodeAnt PR
             // #314) — surface it so an incomplete snapshot is diagnosable
             // rather than a silent history drop.
-            let raw = match engine.list_messages(None, SNAPSHOT_TOTAL_CAP * 2).await {
+            let events = match engine.list_post_events(None, SNAPSHOT_TOTAL_CAP * 2).await {
                 Ok(evs) => evs,
                 Err(e) => {
                     tracing::warn!(
@@ -368,16 +370,6 @@ pub async fn fork_community(
                     Vec::new()
                 }
             };
-            let events = raw
-                .into_iter()
-                // ZEB-536: pre-fork snapshot is message-only for v1.
-                .filter(|e| {
-                    matches!(
-                        e,
-                        crate::community_channel_log::SignedChannelEvent::Post { .. }
-                    )
-                })
-                .collect::<Vec<_>>();
             if !events.is_empty() {
                 raw_channel_events.insert(*channel_id, events);
             }

@@ -93,7 +93,7 @@ HashMap<MessageId, HashMap<String, HashMap<OwnerAddr, (Hlc, bool)>>>
 
 On apply, update the `(target, emoji, author)` slot only if the new event's HLC is greater than the stored one (LWW guard). Projection for a message reads its entry and emits, per emoji with ≥1 present reactor:
 
-```
+```text
 ReactionDto { emoji: String, count: u32, mine: bool, reactors: Vec<String /*hex OwnerAddr*/> }
 ```
 
