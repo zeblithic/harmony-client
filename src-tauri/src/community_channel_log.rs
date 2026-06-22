@@ -1044,6 +1044,9 @@ pub struct ChannelLog {
     /// Manifest at `root/manifest.cbor`, tail at `root/tail.cbor`,
     /// sealed segments at `root/segments/{N:08x}.cbor`.
     root: PathBuf,
+    /// ZEB-536: derived LWW reaction view. Maintained in `append`;
+    /// rebuilt from the persisted log in `reload`.
+    reaction_index: ReactionIndex,
 }
 
 /// On-disk index of sealed segments + the path to the active tail.
@@ -1123,6 +1126,7 @@ impl ChannelLog {
             tail: Vec::new(),
             config,
             root,
+            reaction_index: ReactionIndex::default(),
         }
     }
 
@@ -1155,6 +1159,11 @@ impl ChannelLog {
                 ),
                 got: format!("{:?}/{:?}", community_id, channel_id),
             });
+        }
+        // ZEB-536: maintain the derived reaction view at the single
+        // append choke point (covers local react, inbound, backfill).
+        if matches!(&event, SignedChannelEvent::React { .. }) {
+            self.reaction_index.apply(&event);
         }
         self.tail.push(event);
         Ok(self.tail.len() >= self.config.seal_threshold_events)
@@ -1450,15 +1459,15 @@ impl ChannelLog {
             Vec::new()
         };
         let total = segment_count + tail.len();
-        Ok((
-            Self {
-                manifest,
-                tail,
-                config,
-                root,
-            },
-            total,
-        ))
+        let mut log = Self {
+            manifest,
+            tail,
+            config,
+            root,
+            reaction_index: ReactionIndex::default(),
+        };
+        log.rebuild_reaction_index()?;
+        Ok((log, total))
     }
 
     /// Return the highest locally-persisted event HLC for this channel.
@@ -1544,6 +1553,30 @@ impl ChannelLog {
                 "segment file is empty".into(),
             )),
         }
+    }
+
+    /// Materialized reactions for a message (ZEB-536).
+    pub fn reactions_for(&self, target: &MessageId, me: &OwnerAddr) -> Vec<ReactionDto> {
+        self.reaction_index.reactions_for(target, me)
+    }
+
+    /// Rebuild the reaction index from the persisted log. Reads each
+    /// sealed segment once (transiently — peak extra memory is one
+    /// segment), then folds the in-memory tail. One-time boot cost;
+    /// acceptable for v1 (reactions are sparse, segments small). A
+    /// persisted/summary index is a future optimization (out of scope).
+    fn rebuild_reaction_index(&mut self) -> Result<(), ChannelLogPersistError> {
+        let mut idx = ReactionIndex::default();
+        for seg in &self.manifest.segments {
+            for ev in self.read_segment(seg)? {
+                idx.apply(&ev);
+            }
+        }
+        for ev in &self.tail {
+            idx.apply(ev);
+        }
+        self.reaction_index = idx;
+        Ok(())
     }
 }
 
@@ -3119,6 +3152,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("segments")).expect("mkdir segments");
+        // Write stub segment files (empty event arrays) so rebuild_reaction_index
+        // can read them. Content is irrelevant to the sort-order test.
+        let empty_seg: Vec<SignedChannelEvent> = vec![];
+        for name in &["segments/00000000.cbor", "segments/00000001.cbor"] {
+            let mut seg_bytes = vec![CHANNEL_LOG_SEGMENT_V1];
+            ciborium::into_writer(&empty_seg, &mut seg_bytes).expect("encode stub seg");
+            crate::owner_state_persist::save_atomically(&root.join(name), &seg_bytes)
+                .expect("save stub seg");
+        }
         // Hand-craft a manifest with segments in WRONG order
         // (range.0 wall=200 first, range.0 wall=100 second).
         let manifest = ChannelLogManifest {
@@ -3682,5 +3724,90 @@ mod tests {
         let me = OwnerAddr([0xAA; 16]);
         let r = idx.reactions_for(&payload.id, &me);
         assert!(r.is_empty(), "Post events must be ignored by ReactionIndex");
+    }
+
+    // ── Task 3: ChannelLog reaction index (append-maintained + boot rebuild) ──
+
+    /// Build an unsigned Post event bound to the given (cid, chid) so
+    /// `ChannelLog::append`'s misroute check passes.
+    fn post_event(
+        id: MessageId,
+        author: OwnerAddr,
+        cid: SpaceId,
+        chid: ChannelId,
+        wall: u64,
+    ) -> SignedChannelEvent {
+        SignedChannelEvent::Post {
+            id,
+            community_id: cid,
+            channel_id: chid,
+            author,
+            at: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: "test-dev".to_string(),
+            },
+            content_kind: 0,
+            body: "test body".to_string(),
+            reply_to: None,
+            sig: [0u8; 64],
+        }
+    }
+
+    /// Build an unsigned React event bound to the given (cid, chid) so
+    /// `ChannelLog::append`'s misroute check passes.
+    fn react_event_for(
+        target: MessageId,
+        author: OwnerAddr,
+        cid: SpaceId,
+        chid: ChannelId,
+        emoji: &str,
+        add: bool,
+        wall: u64,
+    ) -> SignedChannelEvent {
+        SignedChannelEvent::React {
+            target,
+            author,
+            community_id: cid,
+            channel_id: chid,
+            emoji: emoji.to_string(),
+            add,
+            at: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: "test-dev".to_string(),
+            },
+            sig: [0u8; 64],
+        }
+    }
+
+    #[test]
+    fn channel_log_reactions_survive_seal_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cid, chid) = (SpaceId([3; 16]), ChannelId([4; 16]));
+        let cfg = ChannelLogConfig {
+            seal_threshold_events: 4,
+        };
+        let mut log = ChannelLog::new(cid, chid, dir.path().to_path_buf(), cfg.clone());
+        // append a Post, then a React to it, enough to force a seal, then more
+        let target = MessageId([9; 16]);
+        let me = OwnerAddr([0xAA; 16]);
+        log.append(post_event(target, me, cid, chid, 10)).unwrap();
+        log.append(react_event_for(target, me, cid, chid, "👍", true, 11))
+            .unwrap();
+        // drive a seal
+        log.append(post_event(MessageId([8; 16]), me, cid, chid, 12))
+            .unwrap();
+        if log
+            .append(post_event(MessageId([7; 16]), me, cid, chid, 13))
+            .unwrap()
+        {
+            log.seal_and_persist().unwrap();
+        }
+        log.flush_tail().unwrap();
+        // reload from disk — index must be rebuilt from the sealed segment
+        let (reloaded, _n) = ChannelLog::reload(cid, chid, dir.path().to_path_buf(), cfg).unwrap();
+        let r = reloaded.reactions_for(&target, &me);
+        assert_eq!(r.iter().find(|d| d.emoji == "👍").unwrap().count, 1);
     }
 }
