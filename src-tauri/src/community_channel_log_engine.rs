@@ -597,6 +597,37 @@ impl ChannelLogEngine {
         since: Option<Hlc>,
         limit: usize,
     ) -> Result<Vec<SignedChannelEvent>, ChannelLogEngineError> {
+        self.collect_events(since, limit, |_| true).await
+    }
+
+    /// ZEB-536: Post-only variant of `list_messages`. Backs the pre-fork
+    /// snapshot (message-only for v1) — pages by POSTS RETURNED so a long
+    /// reaction run cannot exhaust the pull budget before later posts
+    /// (CodeRabbit PR #314). React (and any future non-Post) events are
+    /// skipped and do NOT count toward `limit`.
+    pub async fn list_post_events(
+        &self,
+        since: Option<Hlc>,
+        limit: usize,
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogEngineError> {
+        self.collect_events(since, limit, |ev| {
+            matches!(ev, SignedChannelEvent::Post { .. })
+        })
+        .await
+    }
+
+    /// Shared backing for `list_messages` / `list_post_events`: walk sealed
+    /// segments (oldest-first) then the in-memory tail in HLC order, keeping
+    /// only events for which `keep` returns true and counting ONLY kept
+    /// events toward `limit`. Paging by retained events means a filtered-out
+    /// run (e.g. a long reaction streak) cannot exhaust the budget before
+    /// later kept events (CodeRabbit PR #314).
+    async fn collect_events(
+        &self,
+        since: Option<Hlc>,
+        limit: usize,
+        keep: impl Fn(&SignedChannelEvent) -> bool,
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogEngineError> {
         let effective_limit = if limit == 0 {
             self.config.backfill_default_limit
         } else {
@@ -632,6 +663,9 @@ impl ChannelLogEngine {
                         continue;
                     }
                 }
+                if !keep(&ev) {
+                    continue;
+                }
                 out.push(ev);
                 if out.len() >= effective_limit {
                     return Ok(out);
@@ -645,6 +679,9 @@ impl ChannelLogEngine {
                 if !ev.at().is_strictly_newer_than(since_hlc) {
                     continue;
                 }
+            }
+            if !keep(ev) {
+                continue;
             }
             out.push(ev.clone());
             if out.len() >= effective_limit {
@@ -5446,6 +5483,47 @@ mod tests {
         assert_eq!(page2[0].body, b"Q".to_vec());
     }
 
+    /// ZEB-536 (CodeRabbit PR #314): the Post-only accessor that backs the
+    /// pre-fork snapshot must page by POSTS, not raw events — a long reaction
+    /// run between two posts must not consume the budget and strand the later
+    /// post. P, then 5 reactions, then Q; a 2-POST budget returns [P, Q].
+    #[tokio::test]
+    async fn list_post_events_pages_by_posts_not_reactions() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let p = Arc::clone(&fix.engine)
+            .publish(b"P".to_vec(), None, None, None)
+            .await
+            .expect("post P");
+        for i in 0..5u8 {
+            Arc::clone(&fix.engine)
+                .react(p, format!("e{i}"), true)
+                .await
+                .expect("react");
+        }
+        let q = Arc::clone(&fix.engine)
+            .publish(b"Q".to_vec(), None, None, None)
+            .await
+            .expect("post Q");
+
+        let posts = fix
+            .engine
+            .list_post_events(None, 2)
+            .await
+            .expect("list post events");
+        assert!(
+            posts
+                .iter()
+                .all(|e| matches!(e, SignedChannelEvent::Post { .. })),
+            "Post-only accessor must not return React events"
+        );
+        let ids: Vec<&MessageId> = posts.iter().map(|e| e.id()).collect();
+        assert_eq!(
+            ids,
+            vec![&p, &q],
+            "both posts returned despite the 5 intervening reactions"
+        );
+    }
+
     /// ZEB-536 two-node convergence: Engine A posts; Engine A react()s and
     /// broadcasts the packet; feeding the packet into Engine B's
     /// process_inbound_packet produces channel-reaction-received on B and
@@ -5628,8 +5706,26 @@ mod tests {
             .await
             .expect("feed unreact to B");
 
-        // Wait for B to process the un-react.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Wait for B to process the un-react — poll its DTO state rather than
+        // sleeping a fixed interval, which can flake under load while B
+        // decrypts/verifies/appends and rebuilds its reaction index
+        // (CodeRabbit PR #314).
+        wait_for(
+            || async {
+                let dtos = engine_b.list_message_dtos(None, 100).await.ok()?;
+                let m = dtos
+                    .iter()
+                    .find(|d| d.message_id == hex::encode(msg_id.0))?;
+                if m.reactions.iter().all(|r| r.emoji != "👍") {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("B must process the un-react");
 
         // A converges to no 👍.
         let dtos_a2 = fix_a

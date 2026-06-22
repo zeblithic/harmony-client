@@ -466,6 +466,8 @@ pub enum ChannelEventError {
     TooManyMentions { count: usize, max: usize },
     #[error("too many attachments: {count} (max {max})")]
     TooManyAttachments { count: usize, max: usize },
+    #[error("reaction emoji too large: {len} bytes (max {max})")]
+    EmojiTooLarge { len: usize, max: usize },
     #[error("attachment name/mime too long (max {max} bytes)")]
     AttachmentFieldTooLong { max: usize },
     #[error("attachment too large: {size} bytes (max {max})")]
@@ -1044,14 +1046,17 @@ where
         });
     }
 
-    // ZEB-536: bound reaction emoji size (cheap, pre-auth).
+    // ZEB-536: bound reaction emoji size (cheap, pre-auth). Use a dedicated
+    // error variant (mirrors TooManyMentions/TooManyAttachments) so an inbound
+    // emoji-cap rejection is distinguishable from a membership/authorization
+    // failure without string-parsing — logging, metrics, and error-mapping can
+    // tell the two apart (Greptile PR #314).
     if let SignedChannelEvent::React { emoji, .. } = event {
         if emoji.len() > MAX_REACTION_EMOJI_BYTES {
-            return Err(ChannelEventError::NotAuthorized(format!(
-                "reaction emoji {} bytes exceeds max {}",
-                emoji.len(),
-                MAX_REACTION_EMOJI_BYTES
-            )));
+            return Err(ChannelEventError::EmojiTooLarge {
+                len: emoji.len(),
+                max: MAX_REACTION_EMOJI_BYTES,
+            });
         }
     }
 
@@ -4097,8 +4102,12 @@ mod tests {
             .await
             .expect_err("oversized emoji must fail verify");
         assert!(
-            matches!(err, ChannelEventError::NotAuthorized(_)),
-            "expected NotAuthorized for oversized emoji, got {err:?}"
+            matches!(
+                err,
+                ChannelEventError::EmojiTooLarge { len, max }
+                    if len == MAX_REACTION_EMOJI_BYTES + 1 && max == MAX_REACTION_EMOJI_BYTES
+            ),
+            "expected EmojiTooLarge {{ len, max }} for oversized emoji, got {err:?}"
         );
     }
 

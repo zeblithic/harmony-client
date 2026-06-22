@@ -1132,7 +1132,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 - [ ] **Step 3: Push + open PR** — `git push -u origin zeb-536-message-reactions`; open a PR (`gh pr create`) titled `feat(zeb-536): message reactions (Spec 1, backend/headless)`, body summarizing the design + linking ZEB-536 and the spec, with the footer:
 
-```
+```text
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 ```
 
