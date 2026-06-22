@@ -8,7 +8,11 @@ import type { ChannelAttachmentDto } from './channel-message-service';
 export const PREVIEW_MAX_BYTES = 4 * 1024 * 1024;
 
 export function isImage(att: ChannelAttachmentDto): boolean {
-  return att.mime.toLowerCase().startsWith('image/');
+  const m = att.mime.toLowerCase();
+  // Exclude SVG: it's vector (not raster), so the raster decode-bomb guards
+  // (`assertHeaderDimsOk` parses only PNG/JPEG headers) don't meaningfully bound
+  // it, and SVG is a known XSS / external-reference vector. Keep it download-only.
+  return m.startsWith('image/') && !m.startsWith('image/svg');
 }
 
 export function isText(att: ChannelAttachmentDto): boolean {

@@ -33,6 +33,15 @@ describe('artifact-preview', () => {
     expect(isText(att({ mime: 'image/png' }))).toBe(false);
   });
 
+  it('excludes SVG from image preview (download-only)', () => {
+    expect(isImage(att({ mime: 'image/svg+xml' }))).toBe(false);
+    expect(isImage(att({ mime: 'image/svg+xml; charset=utf-8' }))).toBe(false);
+    expect(isPreviewable(att({ mime: 'image/svg+xml', size: 1000 }))).toBe(false);
+    // raster images are still previewable
+    expect(isImage(att({ mime: 'image/png' }))).toBe(true);
+    expect(isImage(att({ mime: 'image/webp' }))).toBe(true);
+  });
+
   it('decodeTextHead returns head + full + truncated flag', () => {
     const lines = Array.from({ length: 100 }, (_, i) => `line ${i}`).join('\n');
     const bytes = new TextEncoder().encode(lines);
