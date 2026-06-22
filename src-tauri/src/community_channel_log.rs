@@ -150,8 +150,10 @@ const MIN_PACKET_LEN: usize = NONCE_LEN + TAG_LEN;
 pub(crate) const MAX_MENTIONS: usize = 64;
 
 /// ZEB-535: hard cap on attachments per channel post. Bounds the signed-set
-/// size and the per-message fetch fan-out. Enforced at mint (`publish`), the
-/// IPC boundary, AND inbound verification (`verify_channel_event`).
+/// size and the per-message fetch fan-out. Enforced at mint (`publish`) AND
+/// inbound verification (`verify_channel_event`) in PR1; the IPC-boundary
+/// enforcement point (`post_channel_message_impl`) lands with the IPC surface
+/// in PR2.
 pub(crate) const MAX_ATTACHMENTS: usize = 16;
 
 /// ZEB-535: max bytes for an attachment's `name`/`mime` string fields (each).

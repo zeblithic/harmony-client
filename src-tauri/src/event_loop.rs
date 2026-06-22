@@ -3287,6 +3287,18 @@ pub async fn run(
                         let _ = req.reply.send(Err(format!("invalid CID hex: {}", req.cid_hex)));
                     }
                     Some(cid) => {
+                        // ZEB-535: a serveable ingest allowlists its CID for
+                        // member-to-member serving. Confirm the bytes actually hash
+                        // to that CID FIRST — junk bytes are silently dropped by
+                        // StorageTier, but allowlisting them anyway would poison the
+                        // encrypted-CID serve allowlist with un-servable entries.
+                        if req.serveable && !cid.verify_hash(&req.data) {
+                            let _ = req.reply.send(Err(format!(
+                                "serveable ingest CID hash mismatch: {}",
+                                req.cid_hex
+                            )));
+                            continue;
+                        }
                         let key_expr = format!("harmony/content/publish/{}", req.cid_hex);
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
                             key_expr,
@@ -3299,7 +3311,8 @@ pub async fn run(
                         }
                         // ZEB-535: allowlist this CID for member-to-member serving so a
                         // chunked encrypted artifact's CIDs are servable (the serve gate
-                        // refuses encrypted CIDs that aren't allowlisted).
+                        // refuses encrypted CIDs that aren't allowlisted). Hash-verified
+                        // above for serveable requests.
                         if req.serveable {
                             serve_allowlist.allow(cid);
                         }
@@ -3320,6 +3333,19 @@ pub async fn run(
                 match op {
                     CasOp::PutLocal { cid, blob, serveable, reply } => {
                         let cid_hex = hex::encode(cid.to_bytes());
+                        // ZEB-535: a serveable PutLocal allowlists its CID for
+                        // re-serving. Confirm the bytes hash to the CID FIRST so junk
+                        // bytes can't poison the encrypted-CID serve allowlist (the
+                        // StorageTier ingest below silently drops corrupted bytes).
+                        if serveable && !cid.verify_hash(&blob) {
+                            tracing::warn!(cid=%cid_hex, "serveable PutLocal bytes failed hash==cid; not allowlisting");
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(crate::content_store::ContentStoreError::Io(
+                                    format!("serveable PutLocal CID hash mismatch: {cid_hex}"),
+                                )));
+                            }
+                            continue;
+                        }
                         let key_expr = format!("harmony/content/publish/{cid_hex}");
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
                             key_expr,

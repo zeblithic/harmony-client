@@ -55,6 +55,8 @@ pub struct ChannelAttachment {
 
 **Nested CBOR keys (own map, canonical order):** `cid`→`"cd"` (0x6364), `mime`→`"mi"` (0x6d69), `name`→`"nm"` (0x6e6d), `size`→`"sz"` (0x737a). Declaration order **cid, mime, name, size** matches RFC 8949 §4.2.1 bytewise order (`6364 < 6d69 < 6e6d < 737a`). All fields required (no `skip_serializing_if`). `cid` serializes as a fixed 32-byte byte string.
 
+**Canonical `cid` representation:** `cid` is the 32-byte `ContentId` everywhere internally. It is serialized as a 32-byte CBOR byte string on the wire (under `pa`→`cd`) and surfaced as a 64-char lowercase hex string in the `ChannelAttachmentDto` that crosses the IPC boundary to the frontend.
+
 **Post-level field** added to `ChannelPostPayload`, `SignedChannelEvent::Post`, and `ChannelPostSignedSet`:
 
 ```rust
@@ -98,9 +100,14 @@ A new helper `put_serveable_subtree(root_cid)` (allowlist + persist all reachabl
 
 ## 7. Public vs. encrypted policy & deterministic-CID reuse
 
+**PR1 scope: default members-only encryption.** Every share in PR1 is encrypted (members-only):
+
 - **Default: encrypt (members-only), always.** Even if an identical public copy exists, an explicit-private share produces/serves the encrypted copy (different CID); we never leak that a public copy exists.
-- **Public path** triggers only on explicit user choice **or** when the user forwards content that is already a public CAS CID. Implementation: compute the deterministic **unencrypted** root CID for the plaintext (via `streaming_ingest` with default flags, or an in-memory `dag::ingest`), probe CAS (`ContentStore::get` / a bounded Zenoh GET) for existence; if present, the `ChannelAttachment.cid` references that public CID (zero re-upload, zero re-encryption, dedup); if absent, publish the unencrypted tree (public class — served freely by the gate, no allowlist needed).
 - **Honest dedup caveat:** cross-sender dedup for *encrypted* artifacts converges only among members sharing the epoch key + the deterministic-nonce scheme (which fleet members do). Cross-key encrypted dedup is impossible by design (and correct).
+
+**Deferred to fast-follow (not in PR1).** The public path and deterministic-CID reuse below are designed but deferred; PR1 ingests every share as encrypted (the public branch in `ingest_channel_artifact_impl` re-ingests rather than dedup-probing):
+
+- **Public path** triggers only on explicit user choice **or** when the user forwards content that is already a public CAS CID. Implementation: compute the deterministic **unencrypted** root CID for the plaintext (via `streaming_ingest` with default flags, or an in-memory `dag::ingest`), probe CAS (`ContentStore::get` / a bounded Zenoh GET) for existence; if present, the `ChannelAttachment.cid` references that public CID (zero re-upload, zero re-encryption, dedup); if absent, publish the unencrypted tree (public class — served freely by the gate, no allowlist needed).
 
 ## 8. Share path (end to end)
 

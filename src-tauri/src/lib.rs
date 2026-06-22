@@ -20288,6 +20288,14 @@ pub(crate) async fn ingest_channel_artifact_impl(
     let meta = tokio::fs::metadata(&source_path)
         .await
         .map_err(|e| format!("stat: {e}"))?;
+    // Reject special files (FIFOs, /dev/zero, sockets, dirs). They report
+    // `len() == 0` and so sail past the stat cap, then the encrypted path's read
+    // would stream until OOM and the public path could ingest unbounded data
+    // before the post-stream cap check. Only a regular file has a trustworthy
+    // length and a bounded read.
+    if !meta.is_file() {
+        return Err("artifact source must be a regular file".to_string());
+    }
     let (name, mime) = prepare_artifact_meta(meta.len(), &source_path, name, mime)?;
 
     let ingest_tx = {
@@ -20301,11 +20309,24 @@ pub(crate) async fn ingest_channel_artifact_impl(
     // plaintext length the download side size-verifies against), not the
     // pre-ingest stat. Re-checked against the cap after the read.
     let (root, size): (ContentId, u64) = if encrypt {
-        let plaintext = tokio::fs::read(&source_path)
+        // Bounded read: cap the in-memory plaintext at MAX_ARTIFACT_BYTES + 1 so a
+        // file that grows after the stat (or a special file slipping past the
+        // is_file guard) can't read until OOM. The +1 sentinel makes the post-read
+        // cap check below catch the overflow case.
+        use tokio::io::AsyncReadExt as _;
+        let file = tokio::fs::File::open(&source_path)
+            .await
+            .map_err(|e| format!("open: {e}"))?;
+        let mut limited =
+            tokio::io::BufReader::new(file).take(MAX_ARTIFACT_BYTES.saturating_add(1));
+        let mut plaintext = Vec::new();
+        limited
+            .read_to_end(&mut plaintext)
             .await
             .map_err(|e| format!("read: {e}"))?;
         // Re-check the cap against the bytes we actually read (a file that grew
-        // after the stat could otherwise exceed it).
+        // after the stat could otherwise exceed it; the +1 sentinel above lands
+        // here too).
         if plaintext.len() as u64 > MAX_ARTIFACT_BYTES {
             return Err(format!(
                 "artifact too large: {} > {MAX_ARTIFACT_BYTES}",
@@ -20502,13 +20523,15 @@ pub(crate) async fn download_channel_artifact_impl(
     };
     // The fetch `max_bytes` bounds the ASSEMBLED bytes, which for an encrypted
     // CID is the ciphertext — larger than the plaintext by `encrypt_blob`'s
-    // nonce+tag overhead. Add that overhead to the cap so an encrypted artifact
-    // sized near the plaintext cap doesn't fail `fetch_recursive`. The
-    // `expected_size > cap` check above still bounds the plaintext.
+    // nonce+tag overhead. Bound the fetch to the SIGNED plaintext `expected_size`
+    // (+AEAD overhead when encrypted), NOT the global artifact cap: otherwise an
+    // attachment lying with a tiny `expected_size` could still pull up to
+    // MAX_ARTIFACT_BYTES off the wire before the assembled size is verified. The
+    // `expected_size > cap` guard above already proved `expected_size <= cap`.
     let fetch_cap = if encrypted {
-        cap.saturating_add(crate::community_state_sync::BLOB_ENCRYPTION_OVERHEAD as u64)
+        expected_size.saturating_add(crate::community_state_sync::BLOB_ENCRYPTION_OVERHEAD as u64)
     } else {
-        cap
+        expected_size
     };
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();

@@ -2645,6 +2645,8 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].cid, hex::encode(enc_cid));
         assert_eq!(got[0].name, "log.txt");
+        assert_eq!(got[0].mime, "text/plain");
+        assert_eq!(got[0].size, 9);
         assert!(
             got[0].encrypted,
             "encrypted-flagged cid projects encrypted=true"
@@ -2697,6 +2699,9 @@ mod tests {
         let got = dto.attachments.expect("attachments present");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].cid, hex::encode(pub_cid));
+        assert_eq!(got[0].name, "public.txt");
+        assert_eq!(got[0].mime, "text/plain");
+        assert_eq!(got[0].size, 9);
         assert!(
             !got[0].encrypted,
             "default-flag cid projects encrypted=false"

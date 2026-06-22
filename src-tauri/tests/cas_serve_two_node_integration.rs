@@ -496,6 +496,28 @@ mod task7 {
             leaves.len()
         );
 
+        // Every DESCENDANT CID — interior bundles (keys of `fetched`) and the
+        // Book leaves — must also carry the encrypted flag, not just the root. A
+        // regression that stamped `encrypted` only on the root bundle would leave
+        // children unservable (the serve gate refuses un-allowlisted encrypted
+        // CIDs and treats unflagged CIDs as public). InlineData leaves are
+        // content-derived sentinels that don't carry the flag, so skip them.
+        for bundle_cid in fetched.keys() {
+            assert!(
+                bundle_cid.flags().encrypted,
+                "interior bundle CID must carry the encrypted flag: {bundle_cid:?}"
+            );
+        }
+        for leaf in &leaves {
+            if leaf.cid_type() == CidType::InlineData {
+                continue;
+            }
+            assert!(
+                leaf.flags().encrypted,
+                "leaf CID must carry the encrypted flag: {leaf:?}"
+            );
+        }
+
         // Fetch each leaf (bundles were fetched during the walk) and reassemble
         // in leaf order — mirrors harmony_content::dag::reassemble.
         let mut reassembled: Vec<u8> = Vec::with_capacity(ciphertext.len());
@@ -604,11 +626,13 @@ mod task7 {
 
         // Now the gate check: the channel is provably live, so a missing reply
         // for the encrypted ROOT BUNDLE can ONLY be the serve gate refusing it
-        // (not allowlisted). 5s is well clear of the observed control latency
-        // (single GET landed inside the retry loop, typically <1s once
-        // discovery completed), so a 5s timeout is not flaky — it's >5× the
-        // normal single-hop fetch time. A served reply would arrive immediately.
-        let root_reply = fetch_one(&session_b, &root, Duration::from_secs(5)).await;
+        // (not allowlisted). The control GET above landed inside the retry loop,
+        // typically <1s once discovery completed; 8s is >8× that normal single-hop
+        // fetch time, so a served reply would arrive well within the window. The
+        // extra headroom over the original 5s absorbs load-induced latency on a
+        // busy CI box (Greptile flake note) without changing what the test proves:
+        // a served reply arrives immediately; a stall means the gate refused it.
+        let root_reply = fetch_one(&session_b, &root, Duration::from_secs(8)).await;
         assert!(
             root_reply.is_none(),
             "encrypted root bundle must NOT be served when serveable=false \

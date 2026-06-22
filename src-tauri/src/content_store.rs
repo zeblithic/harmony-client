@@ -579,6 +579,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_serveable_sends_serveable_bit_put_does_not() {
+        // ZEB-535: pin the authorization bit on the emitted CasOp::PutLocal —
+        // `put_serveable` must send `serveable: true` (the event-loop arm
+        // allowlists it) and plain `put` must send `serveable: false` (never
+        // allowlisted). The allowlist-registration test above covers the
+        // RuntimeContentStore-side effect; this one pins the wire bit the event
+        // loop actually keys its hash-verify-then-allowlist decision off.
+        let (cas_op_tx, mut cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500));
+
+        // Stub: record the serveable flag of each PutLocal, then ack.
+        let (flag_tx, mut flag_rx) = tokio::sync::mpsc::channel::<bool>(8);
+        let stub = tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                if let CasOp::PutLocal {
+                    serveable,
+                    reply: Some(reply),
+                    ..
+                } = op
+                {
+                    let _ = flag_tx.send(serveable).await;
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        });
+
+        store
+            .put_serveable(ContentId::from_bytes([0x11; 32]), vec![1])
+            .await
+            .unwrap();
+        assert_eq!(
+            flag_rx.recv().await,
+            Some(true),
+            "put_serveable emits serveable: true"
+        );
+
+        store
+            .put(ContentId::from_bytes([0x22; 32]), vec![2])
+            .await
+            .unwrap();
+        assert_eq!(
+            flag_rx.recv().await,
+            Some(false),
+            "put emits serveable: false"
+        );
+
+        drop(store);
+        stub.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn put_serveable_default_impl_routes_to_put() {
         // The default trait impl (InMemoryStub) routes put_serveable to put with no
         // allowlist concept and no panic.
