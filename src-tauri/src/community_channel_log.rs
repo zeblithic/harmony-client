@@ -444,7 +444,7 @@ struct ChannelReactSignedSet<'a> {
     channel_id: &'a ChannelId,
     #[serde(rename = "ci")]
     community_id: &'a SpaceId,
-    #[serde(rename = "ea", skip_serializing_if = "Option::is_none", default)]
+    #[serde(rename = "ea", skip_serializing_if = "Option::is_none")]
     emoji_attachment: &'a Option<ChannelAttachment>,
     #[serde(rename = "em")]
     emoji: &'a str,
