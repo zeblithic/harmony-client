@@ -526,4 +526,84 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
       expect(container.textContent).toContain('ci.log');
     });
   });
+
+  function withIngest(adapter: any, opts: { reject?: Error } = {}) {
+    let n = 0;
+    (adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'request_channel_backfill') return Promise.resolve(undefined);
+      if (cmd === 'ingest_channel_artifact') {
+        if (opts.reject) return Promise.reject(opts.reject);
+        return Promise.resolve({ cid: 'cid' + n++, mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true });
+      }
+      if (cmd === 'post_channel_message') return Promise.resolve('mid' + 'a'.repeat(29));
+      return Promise.resolve(undefined);
+    });
+  }
+
+  it('attach button ingests picked files into pending chips', async () => {
+    openMock.mockResolvedValue(['/tmp/a.txt', '/tmp/b.txt']);
+    const { adapter, container } = await setup();
+    withIngest(adapter);
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => {
+      expect(adapter.invoke).toHaveBeenCalledWith('ingest_channel_artifact', expect.objectContaining({ sourcePath: '/tmp/a.txt' }));
+      expect(container.querySelectorAll('.pending-chip').length).toBe(2);
+    });
+  });
+
+  it('removing a pending attachment drops its chip', async () => {
+    openMock.mockResolvedValue('/tmp/a.txt');
+    const { adapter, container } = await setup();
+    withIngest(adapter);
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
+    await fireEvent.click(container.querySelector('.pending-remove')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(0));
+  });
+
+  it('send includes pendingAttachments and clears them', async () => {
+    openMock.mockResolvedValue('/tmp/a.txt');
+    const { adapter, container } = await setup();
+    withIngest(adapter);
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
+    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: 'here it is' } });
+    await fireEvent.keyDown(textarea, { key: 'Enter' });
+    await waitFor(() => {
+      expect(adapter.invoke).toHaveBeenCalledWith('post_channel_message', expect.objectContaining({
+        body: Array.from(new TextEncoder().encode('here it is')),
+        attachments: [{ cid: 'cid0', mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true }],
+      }));
+    });
+    expect(container.querySelectorAll('.pending-chip').length).toBe(0);
+  });
+
+  it('allows sending with empty body when an attachment is pending', async () => {
+    openMock.mockResolvedValue('/tmp/a.txt');
+    const { adapter, container } = await setup();
+    withIngest(adapter);
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
+    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
+    await fireEvent.keyDown(textarea, { key: 'Enter' });
+    await waitFor(() => {
+      expect(adapter.invoke).toHaveBeenCalledWith('post_channel_message', expect.objectContaining({
+        body: [],
+        attachments: [{ cid: 'cid0', mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true }],
+      }));
+    });
+  });
+
+  it('surfaces an ingest error on the compose error line', async () => {
+    openMock.mockResolvedValue('/tmp/a.txt');
+    const { adapter, container } = await setup();
+    withIngest(adapter, { reject: new Error('artifact too large') });
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => {
+      expect(container.querySelector('.compose-error')?.textContent).toContain('artifact too large');
+      expect(container.querySelectorAll('.pending-chip').length).toBe(0);
+    });
+  });
 });
