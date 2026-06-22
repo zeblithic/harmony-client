@@ -1177,6 +1177,17 @@ where
         // `emoji_attachment` (it's in the signed set), so a peer cannot rebind
         // a reaction to a different emoji CID without invalidating `sg`.
         if let Some(att) = emoji_attachment {
+            // Per-field length cap, parity with the Post-attachment path: a
+            // remote peer can sign a React with an over-long `name`/`mime`
+            // (our own mint forces `name=""`, but verify must bound a hostile
+            // descriptor) that would bloat the log and every projected DTO.
+            if att.name.len() > MAX_ATTACHMENT_FIELD_BYTES
+                || att.mime.len() > MAX_ATTACHMENT_FIELD_BYTES
+            {
+                return Err(ChannelEventError::AttachmentFieldTooLong {
+                    max: MAX_ATTACHMENT_FIELD_BYTES,
+                });
+            }
             if att.size > crate::MAX_CUSTOM_EMOJI_BYTES {
                 return Err(ChannelEventError::CustomEmojiTooLarge {
                     size: att.size,
@@ -4396,6 +4407,35 @@ mod tests {
                 ChannelEventError::CustomEmojiNotImage { ref mime } if mime == "application/zip"
             ),
             "expected CustomEmojiNotImage, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_react_rejects_overlong_custom_emoji_field() {
+        let state = fixture_state_with_alice_joined();
+        let (signing_key, author, _pub64) = fixture_identity(0xa1);
+        let community_id = fixture_community(0xc0);
+        let channel_id = fixture_channel(0x01);
+        // An over-long mime that still starts with "image/": the field-length
+        // cap must fire BEFORE the image-mime check, parity with the Post path.
+        let att = ChannelAttachment {
+            cid: [0xB2; 32],
+            mime: format!("image/{}", "x".repeat(MAX_ATTACHMENT_FIELD_BYTES)),
+            name: String::new(),
+            size: 1024,
+        };
+        let payload = custom_emoji_react_payload(community_id, channel_id, author, Some(att));
+        let event = sign_channel_react(&payload, &signing_key).expect("sign react");
+        let mut tracker = ChannelLogReplayTracker::new();
+        let err = verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+            .await
+            .expect_err("over-long custom emoji field must fail verify");
+        assert!(
+            matches!(
+                err,
+                ChannelEventError::AttachmentFieldTooLong { max } if max == MAX_ATTACHMENT_FIELD_BYTES
+            ),
+            "expected AttachmentFieldTooLong, got {err:?}"
         );
     }
 
