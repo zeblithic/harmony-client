@@ -85,6 +85,15 @@ pub trait ContentStore: Send + Sync {
     async fn put_serveable(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {
         self.put(cid, blob).await
     }
+
+    /// ZEB-539: after a download validates, allowlist the artifact's whole local
+    /// CID subtree for member-to-member re-serve. Sends CasOp::AllowServeSubtree
+    /// and returns the number of CIDs allowlisted.
+    async fn allow_serve_subtree(&self, root: ContentId) -> Result<usize, ContentStoreError> {
+        // default: no-op for stub impls; only the runtime store re-serves.
+        let _ = root;
+        Ok(0)
+    }
 }
 
 #[derive(Default)]
@@ -165,6 +174,16 @@ pub enum CasOp {
     GetLocal {
         cid: ContentId,
         reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+    },
+    /// ZEB-539: allowlist an artifact's full local CID subtree for
+    /// member-to-member re-serve, AFTER the download has been validated.
+    /// Walks the Merkle DAG locally (no network fetch — every node is already
+    /// in the local cache post-fetch) starting from `root`, and calls
+    /// `serve_allowlist.allow(cid)` for `root` plus every descendant. Reply is
+    /// the count of CIDs allowlisted, or an error if `root` is missing locally.
+    AllowServeSubtree {
+        root: ContentId,
+        reply: tokio::sync::oneshot::Sender<Result<usize, ContentStoreError>>,
     },
 }
 
@@ -285,6 +304,23 @@ impl ContentStore for RuntimeContentStore {
             allowlist.allow(cid);
         }
         Ok(())
+    }
+
+    async fn allow_serve_subtree(&self, root: ContentId) -> Result<usize, ContentStoreError> {
+        // ZEB-539: hand the local DAG walk to the event loop (it owns the
+        // StorageTier cache + the serve_allowlist). Mirrors `put` /
+        // `put_serveable`'s send-then-await-oneshot shape.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cas_op_tx
+            .send(CasOp::AllowServeSubtree {
+                root,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ContentStoreError::Io("event loop unavailable (send)".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ContentStoreError::Io("event loop unavailable (reply)".into()))?
     }
 }
 

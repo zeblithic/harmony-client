@@ -114,6 +114,9 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
                 }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
+                }
             }
         }
     });

@@ -159,6 +159,19 @@ pub(crate) const MAX_ATTACHMENTS: usize = 16;
 /// ZEB-535: max bytes for an attachment's `name`/`mime` string fields (each).
 pub(crate) const MAX_ATTACHMENT_FIELD_BYTES: usize = 255;
 
+/// ZEB-539: hard cap on a single attachment's signed `size` (1 GiB). An
+/// attachment whose `size` exceeds the artifact download/ingest cap could
+/// never be downloaded (the download path rejects `size > cap`), so a peer
+/// could otherwise sign permanently-undownloadable attachments. Reject at
+/// verify time and at the IPC mint path.
+///
+/// Defined as an alias of `crate::MAX_ARTIFACT_BYTES` (the download/ingest
+/// plaintext cap in lib.rs, 1 GiB) so the two are a single source of truth and
+/// can never drift. If they did — e.g. `MAX_ARTIFACT_BYTES` is tightened for a
+/// v2 cap but this isn't — a peer could sign an attachment in the gap that
+/// passes verify-time checks yet is permanently un-downloadable.
+pub(crate) const MAX_ATTACHMENT_SIZE: u64 = crate::MAX_ARTIFACT_BYTES;
+
 /// ZEB-535: a CAS artifact referenced by a channel post. `cid` is the root
 /// (Book or Bundle) of the stored bytes; `cid.flags().encrypted` tells the
 /// receiver whether to decrypt with the community epoch key. `name`/`mime`/
@@ -349,6 +362,8 @@ pub enum ChannelEventError {
     TooManyAttachments { count: usize, max: usize },
     #[error("attachment name/mime too long (max {max} bytes)")]
     AttachmentFieldTooLong { max: usize },
+    #[error("attachment too large: {size} bytes (max {max})")]
+    AttachmentTooLarge { size: u64, max: u64 },
 }
 
 /// Sign a channel post payload with the author's identity key. Returns
@@ -778,6 +793,15 @@ where
             {
                 return Err(ChannelEventError::AttachmentFieldTooLong {
                     max: MAX_ATTACHMENT_FIELD_BYTES,
+                });
+            }
+            // ZEB-539: reject an attachment whose signed size exceeds the
+            // artifact cap — it could never be downloaded (the download path
+            // rejects size > cap), so a peer must not be able to commit one.
+            if att.size > MAX_ATTACHMENT_SIZE {
+                return Err(ChannelEventError::AttachmentTooLarge {
+                    size: att.size,
+                    max: MAX_ATTACHMENT_SIZE,
                 });
             }
         }
@@ -1402,43 +1426,65 @@ impl ChannelLog {
             .cloned()
     }
 
+    /// The channel log's root directory. Exposed so off-lock readers
+    /// (e.g. `ChannelLogEngine::find_attachment`, which snapshots segment
+    /// descriptors under the async mutex and then reads files via
+    /// `read_segment_at` in `spawn_blocking`) can locate segment files
+    /// without holding the lock across `std::fs` I/O.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Read all events from a sealed segment. Used by Phase 3 backfill.
     /// Phase 2 ships this for tests (verify seal/reload byte-equality).
     pub fn read_segment(
         &self,
         descriptor: &SegmentDescriptor,
     ) -> Result<Vec<SignedChannelEvent>, ChannelLogPersistError> {
-        let SegmentHandle::LocalFile { rel_path } = &descriptor.handle;
-        // Validate before joining: rel_path comes from deserialized
-        // manifest.cbor, which a Phase 3 backfill peer could ship.
-        // Reject absolute paths, parent-directory escapes, and
-        // current-directory tricks; require the path to start with
-        // the segments/ prefix where seal_and_persist writes them.
-        let rel_path_p = std::path::Path::new(rel_path);
-        let valid = !rel_path_p.is_absolute()
-            && rel_path_p
-                .components()
-                .all(|c| matches!(c, std::path::Component::Normal(_)))
-            && rel_path_p.starts_with("segments");
-        if !valid {
-            return Err(ChannelLogPersistError::Io(format!(
-                "invalid segment path {:?} (must be a normalized relative path under segments/)",
-                rel_path
-            )));
-        }
-        let abs_path = self.root.join(rel_path_p);
-        let bytes = std::fs::read(&abs_path)?;
-        match bytes.split_first() {
-            Some((&CHANNEL_LOG_SEGMENT_V1, rest)) => ciborium::from_reader(rest)
-                .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string())),
-            Some((v, _)) => Err(ChannelLogPersistError::CborDecode(format!(
-                "segment schema version {} not supported (expected {})",
-                v, CHANNEL_LOG_SEGMENT_V1
-            ))),
-            None => Err(ChannelLogPersistError::CborDecode(
-                "segment file is empty".into(),
-            )),
-        }
+        read_segment_at(&self.root, descriptor)
+    }
+}
+
+/// Read all events from a sealed segment given an explicit root dir.
+///
+/// Factored out of `ChannelLog::read_segment` so callers that have snapshotted
+/// the root + descriptors under a lock can read off the async executor (via
+/// `tokio::task::spawn_blocking`) WITHOUT holding the lock across the
+/// synchronous `std::fs::read`. Pure / sync / no shared state.
+pub fn read_segment_at(
+    root: &std::path::Path,
+    descriptor: &SegmentDescriptor,
+) -> Result<Vec<SignedChannelEvent>, ChannelLogPersistError> {
+    let SegmentHandle::LocalFile { rel_path } = &descriptor.handle;
+    // Validate before joining: rel_path comes from deserialized
+    // manifest.cbor, which a Phase 3 backfill peer could ship.
+    // Reject absolute paths, parent-directory escapes, and
+    // current-directory tricks; require the path to start with
+    // the segments/ prefix where seal_and_persist writes them.
+    let rel_path_p = std::path::Path::new(rel_path);
+    let valid = !rel_path_p.is_absolute()
+        && rel_path_p
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        && rel_path_p.starts_with("segments");
+    if !valid {
+        return Err(ChannelLogPersistError::Io(format!(
+            "invalid segment path {:?} (must be a normalized relative path under segments/)",
+            rel_path
+        )));
+    }
+    let abs_path = root.join(rel_path_p);
+    let bytes = std::fs::read(&abs_path)?;
+    match bytes.split_first() {
+        Some((&CHANNEL_LOG_SEGMENT_V1, rest)) => ciborium::from_reader(rest)
+            .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string())),
+        Some((v, _)) => Err(ChannelLogPersistError::CborDecode(format!(
+            "segment schema version {} not supported (expected {})",
+            v, CHANNEL_LOG_SEGMENT_V1
+        ))),
+        None => Err(ChannelLogPersistError::CborDecode(
+            "segment file is empty".into(),
+        )),
     }
 }
 
@@ -1872,6 +1918,46 @@ mod tests {
         assert!(
             matches!(err, ChannelEventError::AttachmentFieldTooLong { max }
                 if max == MAX_ATTACHMENT_FIELD_BYTES),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_channel_event_rejects_post_over_attachment_size() {
+        // ZEB-539: a validly-signed inbound event whose attachment `size`
+        // exceeds MAX_ATTACHMENT_SIZE must be rejected at verify time — such an
+        // attachment could never be downloaded (the download path rejects
+        // size > cap), so a peer must not be able to commit one.
+        let state = fixture_state_with_alice_joined();
+        let mut tracker = ChannelLogReplayTracker::new();
+        let (key, author, _pub64) = fixture_identity(0xa1);
+        let mut oversized = fixture_attachment(0xb2);
+        oversized.size = MAX_ATTACHMENT_SIZE + 1;
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author,
+            at: fixture_hlc(100_000, "a-dev"),
+            content_kind: 0,
+            body: "x",
+            reply_to: None,
+            mentions: None,
+            attachments: Some(vec![oversized]),
+        };
+        let event = sign_channel_event(&payload, &key).expect("sign");
+        let err = verify_channel_event(
+            &event,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+        )
+        .await
+        .expect_err("over-size attachment must be rejected");
+        assert!(
+            matches!(err, ChannelEventError::AttachmentTooLarge { size, max }
+                if size == MAX_ATTACHMENT_SIZE + 1 && max == MAX_ATTACHMENT_SIZE),
             "got: {err:?}"
         );
     }

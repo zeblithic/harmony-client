@@ -6226,6 +6226,10 @@ mod tests {
                         let v = cas_for_servicer.lock().await.get(&cid).cloned();
                         let _ = reply.send(v);
                     }
+                    CasOp::AllowServeSubtree { reply, .. } => {
+                        // Not exercised by these state-sync fixtures.
+                        let _ = reply.send(Ok(0));
+                    }
                 }
             }
         });

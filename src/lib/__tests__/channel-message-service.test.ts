@@ -43,6 +43,7 @@ describe('ChannelMessageService', () => {
       body: Array.from(new TextEncoder().encode('hello')),
       replyTo: undefined,
       mentions: undefined,
+      attachments: undefined,
     });
     expect(msgId).toBe('aabb' + 'cc'.repeat(14));
   });
@@ -57,6 +58,7 @@ describe('ChannelMessageService', () => {
       body: Array.from(new TextEncoder().encode('hi')),
       replyTo: 'cc'.repeat(16),
       mentions: undefined,
+      attachments: undefined,
     });
   });
 
@@ -76,6 +78,7 @@ describe('ChannelMessageService', () => {
       body: Array.from(new TextEncoder().encode('hi')),
       replyTo: undefined,
       mentions: ['cc'.repeat(16), 'dd'.repeat(16)],
+      attachments: undefined,
     });
   });
 
@@ -89,7 +92,118 @@ describe('ChannelMessageService', () => {
       body: Array.from(new TextEncoder().encode('hi')),
       replyTo: undefined,
       mentions: undefined,
+      attachments: undefined,
     });
+  });
+
+  it('postMessage forwards attachments when provided', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('mid');
+    const att = [
+      { cid: 'ab'.repeat(32), mime: 'text/plain', name: 'a.txt', size: 12, encrypted: true },
+      { cid: 'cd'.repeat(32), mime: 'image/png', name: 'b.png', size: 99, encrypted: false },
+    ];
+    await service.postMessage('aa'.repeat(16), 'bb'.repeat(16), 'hi', undefined, undefined, att);
+    expect(adapter.invoke).toHaveBeenCalledWith('post_channel_message', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      body: Array.from(new TextEncoder().encode('hi')),
+      replyTo: undefined,
+      mentions: undefined,
+      attachments: att,
+    });
+  });
+
+  it('postMessage sends empty attachments as undefined', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('mid');
+    await service.postMessage('aa'.repeat(16), 'bb'.repeat(16), 'hi', undefined, undefined, []);
+    expect(adapter.invoke).toHaveBeenCalledWith('post_channel_message', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      body: Array.from(new TextEncoder().encode('hi')),
+      replyTo: undefined,
+      mentions: undefined,
+      attachments: undefined,
+    });
+  });
+
+  it('ingestArtifact forwards args + defaults encrypt=true', async () => {
+    await service.connectAdapter(adapter);
+    const dto = { cid: 'ab'.repeat(32), mime: 'text/plain', name: 'l.txt', size: 42, encrypted: true };
+    (adapter.invoke as any).mockResolvedValue(dto);
+    const out = await service.ingestArtifact('aa'.repeat(16), '/tmp/l.txt', { name: 'l.txt', mime: 'text/plain' });
+    expect(out).toEqual(dto);
+    expect(adapter.invoke).toHaveBeenCalledWith('ingest_channel_artifact', {
+      communityId: 'aa'.repeat(16),
+      sourcePath: '/tmp/l.txt',
+      name: 'l.txt',
+      mime: 'text/plain',
+      encrypt: true,
+    });
+  });
+
+  it('ingestArtifact respects encrypt=false', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({ cid: 'ab'.repeat(32), mime: 'text/plain', name: 'l.txt', size: 42, encrypted: false });
+    await service.ingestArtifact('aa'.repeat(16), '/tmp/l.txt', { encrypt: false });
+    expect(adapter.invoke).toHaveBeenCalledWith('ingest_channel_artifact', {
+      communityId: 'aa'.repeat(16),
+      sourcePath: '/tmp/l.txt',
+      name: undefined,
+      mime: undefined,
+      encrypt: false,
+    });
+  });
+
+  it('ingestArtifact normalizes a raw-string rejection into an Error', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockRejectedValue('artifact too large: 5MB (max 4MB)');
+    await expect(
+      service.ingestArtifact('aa'.repeat(16), '/tmp/l.txt'),
+    ).rejects.toThrow('artifact too large: 5MB (max 4MB)');
+  });
+
+  it('downloadArtifact forwards channelId + cid and omits expectedSize', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(42);
+    const att = { cid: 'ab'.repeat(32), mime: 'text/plain', name: 'l.txt', size: 42, encrypted: true };
+    const n = await service.downloadArtifact('aa'.repeat(16), 'cc'.repeat(16), att, '/tmp/l.txt');
+    expect(n).toBe(42);
+    expect(adapter.invoke).toHaveBeenCalledWith('download_channel_artifact', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'cc'.repeat(16),
+      cid: att.cid,
+      destPath: '/tmp/l.txt',
+      maxBytes: undefined,
+    });
+  });
+
+  it('downloadArtifact forwards maxBytes when provided', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(7);
+    const att = { cid: 'ab'.repeat(32), mime: 'text/plain', name: 'l.txt', size: 7, encrypted: true };
+    await service.downloadArtifact('aa'.repeat(16), 'cc'.repeat(16), att, '/tmp/l.txt', 1024);
+    expect(adapter.invoke).toHaveBeenCalledWith('download_channel_artifact', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'cc'.repeat(16),
+      cid: att.cid,
+      destPath: '/tmp/l.txt',
+      maxBytes: 1024,
+    });
+  });
+
+  it('downloadArtifact throws when adapter not connected', async () => {
+    const att = { cid: 'ab'.repeat(32), mime: 'text/plain', name: 'l.txt', size: 42, encrypted: true };
+    await expect(
+      service.downloadArtifact('aa'.repeat(16), 'cc'.repeat(16), att, '/tmp/l.txt'),
+    ).rejects.toThrow(/adapter not connected/);
+  });
+
+  it('ingestArtifact throws when adapter not connected', async () => {
+    await expect(
+      service.ingestArtifact('aa'.repeat(16), '/tmp/l.txt'),
+    ).rejects.toThrow(/adapter not connected/);
   });
 
   it('listMessages invokes list_channel_messages with limit + optional since', async () => {
