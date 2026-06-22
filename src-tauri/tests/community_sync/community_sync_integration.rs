@@ -144,6 +144,9 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
                     let v = store.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
                 }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
+                }
             }
         }
     });
@@ -2258,6 +2261,9 @@ mod task3_kick_setpower_round_trip {
                         let v = cas_for_servicer.lock().await.get(&cid).cloned();
                         let _ = reply.send(v);
                     }
+                    CasOp::AllowServeSubtree { reply, .. } => {
+                        let _ = reply.send(Ok(0));
+                    }
                 }
             }
         });
@@ -2828,6 +2834,9 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
                 }
                 CasOp::GetLocal { reply, .. } => {
                     let _ = reply.send(None);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }

@@ -2286,6 +2286,10 @@ mod cas_op_protocol_tests {
                         let bytes = store.lock().await.get(&cid).cloned();
                         let _ = reply.send(bytes);
                     }
+                    CasOp::AllowServeSubtree { reply, .. } => {
+                        // Not exercised by this stub.
+                        let _ = reply.send(Ok(0));
+                    }
                 }
             }
         })
@@ -2379,6 +2383,10 @@ mod cas_op_protocol_tests {
                     CasOp::GetLocal { cid, reply } => {
                         let bytes = store_ref.lock().await.get(&cid).cloned();
                         let _ = reply.send(bytes);
+                    }
+                    CasOp::AllowServeSubtree { reply, .. } => {
+                        // Not exercised by this stub.
+                        let _ = reply.send(Ok(0));
                     }
                 }
             }
@@ -2496,6 +2504,10 @@ mod cas_op_protocol_tests {
                     }
                     CasOp::GetLocal { reply, .. } => {
                         let _ = reply.send(None);
+                    }
+                    CasOp::AllowServeSubtree { reply, .. } => {
+                        // Not exercised by this stub.
+                        let _ = reply.send(Ok(0));
                     }
                 }
             }

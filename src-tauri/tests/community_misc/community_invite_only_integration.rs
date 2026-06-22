@@ -190,6 +190,9 @@ async fn alice_redeems_invite_only_against_bob_admin() {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
                 }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
+                }
             }
         }
     });

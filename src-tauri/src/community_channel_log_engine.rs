@@ -191,6 +191,18 @@ pub const POLL_BODY_MAGIC: u8 = 0x00;
 /// hex encoding of a 32-byte `PollId`). Total 65 bytes.
 pub const POLL_BODY_LEN: usize = 1 + 64;
 
+/// ZEB-539: if `event` is a `Post` carrying an attachment whose CID equals
+/// `cid`, return a clone of that `ChannelAttachment`. Used by
+/// `find_attachment` to scan the log for a re-serve authorization record.
+fn attachment_with_cid(event: &SignedChannelEvent, cid: &[u8; 32]) -> Option<ChannelAttachment> {
+    let SignedChannelEvent::Post { attachments, .. } = event;
+    attachments
+        .as_ref()?
+        .iter()
+        .find(|att| &att.cid == cid)
+        .cloned()
+}
+
 /// Inspect a channel-message body for the ZEB-291 Phase 1.5 poll
 /// convention. Returns `(Some("poll"), Some(hex))` when the body is
 /// exactly `0x00` + 64 ASCII hex chars; `(None, None)` otherwise.
@@ -619,6 +631,47 @@ impl ChannelLogEngine {
         }
 
         Ok(out)
+    }
+
+    /// ZEB-539: returns the first verified `ChannelAttachment` in this
+    /// channel's log whose CID matches `cid`, or `None`.
+    ///
+    /// Scans ALL stored events — every persisted segment plus the
+    /// in-memory tail — NOT a bounded recent window, so an attachment
+    /// shared long ago is still authorizable for re-serve. The returned
+    /// record is the signed source of truth (use its `size` as
+    /// authoritative). Encapsulated as an accessor so a future in-memory
+    /// CID→attachment index is a drop-in replacement for this linear scan.
+    ///
+    /// Matches are unique by content (a CID names exactly one byte
+    /// stream), so returning the first hit in oldest-first order is
+    /// well-defined regardless of which event referenced it.
+    pub async fn find_attachment(
+        &self,
+        cid: &[u8; 32],
+    ) -> Result<Option<crate::community_channel_log::ChannelAttachment>, ChannelLogEngineError>
+    {
+        let log = self.log.lock().await;
+
+        // Walk persisted segments (oldest first), then the in-memory
+        // tail — the same segments-then-tail order `list_messages` uses,
+        // but unbounded (no `since`/`limit`) so no attachment is missed.
+        for seg in &log.manifest.segments {
+            let events = log
+                .read_segment(seg)
+                .map_err(ChannelLogEngineError::Persist)?;
+            for ev in &events {
+                if let Some(att) = attachment_with_cid(ev, cid) {
+                    return Ok(Some(att));
+                }
+            }
+        }
+        for ev in &log.tail {
+            if let Some(att) = attachment_with_cid(ev, cid) {
+                return Ok(Some(att));
+            }
+        }
+        Ok(None)
     }
 
     /// ZEB-418 P3a: max HLC currently in the verified log (segments +
@@ -2803,6 +2856,121 @@ mod tests {
 
         let listed = fix.engine.list_messages(None, 2).await.expect("list");
         assert_eq!(listed.len(), 2, "limit must cap result count");
+    }
+
+    // ── ZEB-539: find_attachment ──────────────────────────────────────
+
+    /// Build a signed Post carrying `attachments` (fixture identity, so the
+    /// signature verifies). Mirrors `make_signed_event` but populates `pa`.
+    fn make_signed_event_with_attachments(
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        author: OwnerAddr,
+        at: Hlc,
+        body: &str,
+        attachments: Option<Vec<ChannelAttachment>>,
+        signing_key: &SigningKey,
+    ) -> SignedChannelEvent {
+        use rand::RngCore;
+        let mut id_bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut id_bytes);
+        let payload = ChannelPostPayload {
+            id: MessageId(id_bytes),
+            community_id,
+            channel_id,
+            author,
+            at,
+            content_kind: 0,
+            body,
+            reply_to: None,
+            mentions: None,
+            attachments,
+        };
+        sign_channel_event(&payload, signing_key).expect("sign")
+    }
+
+    #[tokio::test]
+    async fn find_attachment_scans_segments_and_tail() {
+        // seal_threshold=4 with 10 events => 2 sealed segments + 2 tail
+        // events (matching list_messages_walks_tail_then_segments), so this
+        // exercises BOTH the persisted-segment scan and the in-memory tail.
+        let fix = build_engine_fixture(4, 250, 1000).await;
+
+        // Attachment in the very first event (lands in the OLDEST sealed
+        // segment) — proves the scan is unbounded, not a recent window.
+        let seg_att = ChannelAttachment {
+            cid: [0xb2; 32],
+            mime: "text/plain".to_string(),
+            name: "old-log.txt".to_string(),
+            size: 4242,
+        };
+        // Attachment in the last event (stays in the tail).
+        let tail_att = ChannelAttachment {
+            cid: [0xc3; 32],
+            mime: "application/json".to_string(),
+            name: "recent.json".to_string(),
+            size: 99,
+        };
+
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            for i in 0..10u64 {
+                let hlc = Hlc {
+                    wall_ms: 100 + i,
+                    logical: 0,
+                    device_id: "test-device".to_string(),
+                };
+                let attachments = match i {
+                    0 => Some(vec![seg_att.clone()]),
+                    9 => Some(vec![tail_att.clone()]),
+                    // One event with no attachments to prove the scan skips
+                    // `None` posts cleanly.
+                    _ => None,
+                };
+                let ev = make_signed_event_with_attachments(
+                    fix.community_id,
+                    fix.channel_id,
+                    fix.self_owner,
+                    hlc,
+                    &format!("msg-{i}"),
+                    attachments,
+                    &fix.signing_key,
+                );
+                log.append(ev).expect("append");
+                if (i + 1) % 4 == 0 {
+                    log.seal_and_persist().expect("seal");
+                }
+            }
+            // Sanity: the layout actually splits across segments + tail.
+            assert_eq!(log.manifest.segments.len(), 2, "expected 2 sealed segments");
+            assert_eq!(log.tail.len(), 2, "expected 2 tail events");
+        }
+
+        // Present CID in the oldest persisted segment.
+        let got = fix
+            .engine
+            .find_attachment(&[0xb2; 32])
+            .await
+            .expect("find ok")
+            .expect("segment attachment present");
+        assert_eq!(got, seg_att, "returns the signed segment record");
+
+        // Present CID in the in-memory tail.
+        let got = fix
+            .engine
+            .find_attachment(&[0xc3; 32])
+            .await
+            .expect("find ok")
+            .expect("tail attachment present");
+        assert_eq!(got, tail_att, "returns the signed tail record");
+
+        // Absent CID → None.
+        let none = fix
+            .engine
+            .find_attachment(&[0xff; 32])
+            .await
+            .expect("find ok");
+        assert!(none.is_none(), "absent cid must return None");
     }
 
     // ── Sub-task 2B: publish ──────────────────────────────────────────

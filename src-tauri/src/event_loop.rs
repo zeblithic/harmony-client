@@ -3387,6 +3387,54 @@ pub async fn run(
                             .map(|b| b.to_vec());
                         let _ = reply.send(bytes);
                     }
+                    CasOp::AllowServeSubtree { root, reply } => {
+                        // ZEB-539: allowlist a validated artifact's whole local
+                        // CID subtree for member-to-member re-serve. The DAG walk
+                        // could read many nodes, so spawn it OFF the select loop
+                        // (never block the loop for the walk's duration).
+                        //
+                        // Local reads route through CasOp::GetLocal on a cloned
+                        // cas_op_tx — read-only cache lookups that NEVER trigger a
+                        // network fetch (the GetLocal arm only inspects the local
+                        // StorageTier cache). Every node is already local because
+                        // the caller walks only AFTER a successful download
+                        // admitted the full tree.
+                        let cas_op_tx_for_walk = cas_op_tx.clone();
+                        let serve_allowlist_for_walk = serve_allowlist.clone();
+                        tokio::spawn(async move {
+                            let read_local = |cid: ContentId| {
+                                let tx = cas_op_tx_for_walk.clone();
+                                async move {
+                                    let (rtx, rrx) = tokio::sync::oneshot::channel();
+                                    if tx
+                                        .send(crate::content_store::CasOp::GetLocal {
+                                            cid,
+                                            reply: rtx,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return None;
+                                    }
+                                    rrx.await.unwrap_or(None)
+                                }
+                            };
+                            match collect_local_subtree_cids(root, read_local).await {
+                                Ok(cids) => {
+                                    let count = cids.len();
+                                    for cid in cids {
+                                        serve_allowlist_for_walk.allow(cid);
+                                    }
+                                    let _ = reply.send(Ok(count));
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(
+                                        crate::content_store::ContentStoreError::Io(e),
+                                    ));
+                                }
+                            }
+                        });
+                    }
                     CasOp::GetOrFetch { cid, timeout, reply } => {
                         // 1. Cache check first (fast path).
                         if let Some(bytes) = runtime.storage_tier().cache().get(&cid).map(|b| b.to_vec()) {
@@ -5648,6 +5696,85 @@ pub(crate) fn collect_descendants<S: BookStore>(
     out
 }
 
+/// ZEB-539: collect `root` + every descendant CID by walking the Merkle DAG
+/// using LOCAL reads only (never a network fetch). `read_local(cid)` returns
+/// the node's bytes if present in the local cache, else `None`.
+///
+/// Returns `Err` if the ROOT is missing locally — the caller (the
+/// `AllowServeSubtree` handler) only walks after a successful download, so a
+/// missing root means the post-fetch invariant was violated. Missing *interior*
+/// descendants are logged and skipped (their subtree is unreachable; the
+/// allowlist entries we can produce are still useful). A visited set prevents
+/// infinite loops / redundant work on shared subtrees, and a `MAX_BUNDLE_DEPTH`
+/// cap bounds adversarial nesting (parity with `collect_descendants` /
+/// `fetch_recursive`).
+///
+/// Only bundle nodes (`CidType::Bundle`) have children worth parsing; leaf data
+/// books are terminal. The walk is async because the local-read seam is async
+/// (production routes it through a `CasOp::GetLocal` round-trip; tests pass a
+/// `HashMap`-backed closure).
+async fn collect_local_subtree_cids<R, Fut>(
+    root: ContentId,
+    read_local: R,
+) -> Result<Vec<ContentId>, String>
+where
+    R: Fn(ContentId) -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    use harmony_content::cid::MAX_BUNDLE_DEPTH;
+
+    let mut out: Vec<ContentId> = Vec::new();
+    let mut visited: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
+    let mut stack: Vec<(ContentId, u8)> = vec![(root, 0)];
+    let mut is_root = true;
+
+    while let Some((cid, depth)) = stack.pop() {
+        if !visited.insert(cid) {
+            // Already collected via another path through a shared subtree.
+            continue;
+        }
+        if depth > MAX_BUNDLE_DEPTH {
+            tracing::warn!(
+                cid_depth = depth,
+                max = MAX_BUNDLE_DEPTH,
+                "collect_local_subtree_cids aborting subtree past MAX_BUNDLE_DEPTH; data is corrupt"
+            );
+            continue;
+        }
+        out.push(cid);
+        if matches!(cid.cid_type(), CidType::Bundle(_)) {
+            match read_local(cid).await {
+                Some(bytes) => match bundle::parse_bundle(&bytes) {
+                    Ok(children) => {
+                        for child in children.iter().copied() {
+                            stack.push((child, depth + 1));
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        cid = %hex::encode(cid.to_bytes()),
+                        err = ?e,
+                        "collect_local_subtree_cids: malformed bundle payload; subtree skipped"
+                    ),
+                },
+                None => {
+                    if is_root {
+                        return Err(format!(
+                            "root bundle {} missing locally; cannot authorize subtree",
+                            hex::encode(cid.to_bytes())
+                        ));
+                    }
+                    tracing::warn!(
+                        cid = %hex::encode(cid.to_bytes()),
+                        "collect_local_subtree_cids: interior bundle missing locally; subtree skipped"
+                    );
+                }
+            }
+        }
+        is_root = false;
+    }
+    Ok(out)
+}
+
 /// Build the set of CIDs that must stay pinned because they are reachable
 /// from one of `pin_intent`'s remaining roots.
 ///
@@ -6210,6 +6337,168 @@ mod fetch_recursive_tests {
 }
 
 #[cfg(test)]
+mod collect_local_subtree_tests {
+    use super::collect_local_subtree_cids;
+    use harmony_content::bundle::BundleBuilder;
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use std::collections::HashMap;
+
+    /// Encrypted flags so the produced CIDs mirror a real channel-artifact
+    /// subtree (the gate only consults the allowlist for encrypted CIDs).
+    fn enc_flags() -> ContentFlags {
+        ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        }
+    }
+
+    /// Build a 2-level multi-book bundle: a root bundle over [L1, L2] plus a
+    /// nested bundle child to exercise the recursive descent + a shared leaf.
+    /// Returns (root, all_expected_cids, local_store).
+    fn build_multi_book_tree() -> (ContentId, Vec<ContentId>, HashMap<ContentId, Vec<u8>>) {
+        let f = enc_flags();
+        let l1_bytes = b"leaf-one-bytes".to_vec();
+        let l2_bytes = b"leaf-two-bytes".to_vec();
+        let l3_bytes = b"leaf-three-bytes".to_vec();
+        let l1 = ContentId::for_book(&l1_bytes, f).unwrap();
+        let l2 = ContentId::for_book(&l2_bytes, f).unwrap();
+        let l3 = ContentId::for_book(&l3_bytes, f).unwrap();
+
+        // Inner bundle over [l2, l3].
+        let mut inner = BundleBuilder::new();
+        inner.add(l2).add(l3);
+        let (inner_payload, inner_root) = inner.build_with_flags(f).unwrap();
+
+        // Root bundle over [l1, inner_root].
+        let mut outer = BundleBuilder::new();
+        outer.add(l1).add(inner_root);
+        let (outer_payload, root) = outer.build_with_flags(f).unwrap();
+
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        store.insert(l1, l1_bytes);
+        store.insert(l2, l2_bytes);
+        store.insert(l3, l3_bytes);
+        store.insert(inner_root, inner_payload);
+        store.insert(root, outer_payload);
+
+        let expected = vec![root, l1, inner_root, l2, l3];
+        (root, expected, store)
+    }
+
+    #[tokio::test]
+    async fn collects_root_plus_every_descendant_once() {
+        let (root, expected, store) = build_multi_book_tree();
+        let read_local = move |cid: ContentId| std::future::ready(store.get(&cid).cloned());
+
+        let got = collect_local_subtree_cids(root, read_local)
+            .await
+            .expect("walk ok");
+
+        // Every expected CID present, and each exactly once (no dup on the
+        // shared-subtree visited-set guard).
+        let got_set: std::collections::HashSet<ContentId> = got.iter().copied().collect();
+        assert_eq!(got_set.len(), got.len(), "no CID collected twice");
+        let expected_set: std::collections::HashSet<ContentId> = expected.iter().copied().collect();
+        assert_eq!(got_set, expected_set, "root + every descendant collected");
+    }
+
+    #[tokio::test]
+    async fn single_leaf_root_collects_just_itself() {
+        let leaf = ContentId::for_book(b"solo", enc_flags()).unwrap();
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        store.insert(leaf, b"solo".to_vec());
+        let read_local = move |cid: ContentId| std::future::ready(store.get(&cid).cloned());
+
+        let got = collect_local_subtree_cids(leaf, read_local)
+            .await
+            .expect("walk ok");
+        assert_eq!(got, vec![leaf], "a leaf root collects only itself");
+    }
+
+    #[tokio::test]
+    async fn missing_root_is_err() {
+        // Root is a bundle whose bytes are absent locally.
+        let l1 = ContentId::for_book(b"x", enc_flags()).unwrap();
+        let l2 = ContentId::for_book(b"y", enc_flags()).unwrap();
+        let mut builder = BundleBuilder::new();
+        builder.add(l1).add(l2);
+        let (_payload, root) = builder.build_with_flags(enc_flags()).unwrap();
+
+        // Empty store → root bundle bytes missing.
+        let store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        let read_local = move |cid: ContentId| std::future::ready(store.get(&cid).cloned());
+
+        let err = collect_local_subtree_cids(root, read_local)
+            .await
+            .expect_err("missing root must error");
+        assert!(err.contains("missing locally"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn missing_interior_bundle_is_skipped_not_fatal() {
+        // Root present, but an interior bundle's bytes are absent. The walk
+        // collects what it can reach (root + the available leaf + the missing
+        // interior CID itself) and does NOT error.
+        let (root, _expected, mut store) = build_multi_book_tree();
+        // Find and drop the inner bundle payload (a Bundle CID that is not the
+        // root) so its children become unreachable.
+        let inner_root = *store
+            .keys()
+            .find(|c| {
+                matches!(c.cid_type(), harmony_content::cid::CidType::Bundle(_)) && **c != root
+            })
+            .expect("an interior bundle exists");
+        store.remove(&inner_root);
+        let read_local = move |cid: ContentId| std::future::ready(store.get(&cid).cloned());
+
+        let got = collect_local_subtree_cids(root, read_local)
+            .await
+            .expect("missing interior must NOT be fatal");
+        // root, l1, and inner_root (named but unwalkable) are reachable;
+        // inner_root's children are not.
+        assert!(got.contains(&root), "root collected");
+        assert!(
+            got.contains(&inner_root),
+            "missing interior CID still named"
+        );
+        assert!(
+            got.len() >= 3,
+            "root + leaf + interior-CID at minimum (got {})",
+            got.len()
+        );
+    }
+
+    /// ZEB-539: the allowlist's own allow/contains drive `content_cid_servable`
+    /// false→true for an encrypted CID. The end-to-end CasOp-flips-the-gate
+    /// assertion is left to PR2's two-node integration test (T2) — wiring a full
+    /// `event_loop::run` here is heavy; the collector test above + this gate
+    /// check together cover the handler's two halves (walk + allowlist).
+    #[test]
+    fn allowlist_flips_serve_gate_for_encrypted_cid() {
+        use crate::content_store::CommunityServeAllowlist;
+        use harmony_content::cid::{ContentFlags, ContentId};
+        let cid = ContentId::for_book(
+            b"encrypted-artifact-root",
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let allow = CommunityServeAllowlist::new();
+        assert!(
+            !super::content_cid_servable(&cid, &allow),
+            "encrypted CID not servable before allowlisting"
+        );
+        allow.allow(cid);
+        assert!(
+            super::content_cid_servable(&cid, &allow),
+            "encrypted CID servable after allowlisting (the AllowServeSubtree effect)"
+        );
+    }
+}
+
+#[cfg(test)]
 mod fetch_one_wrapper_tests {
     use super::{fetch_recursive, wrap_fetch_one_with_admission};
     use crate::content_store::CasOp;
@@ -6238,6 +6527,9 @@ mod fetch_one_wrapper_tests {
                 }
                 CasOp::GetLocal { .. } => {
                     panic!("wrapper must not send GetLocal");
+                }
+                CasOp::AllowServeSubtree { .. } => {
+                    panic!("wrapper must not send AllowServeSubtree");
                 }
             }
         }
@@ -6281,6 +6573,9 @@ mod fetch_one_wrapper_tests {
                 }
                 CasOp::GetLocal { .. } => {
                     panic!("wrapper must not send GetLocal");
+                }
+                CasOp::AllowServeSubtree { .. } => {
+                    panic!("wrapper must not send AllowServeSubtree");
                 }
             }
         }

@@ -804,6 +804,9 @@ async fn click_to_join_redeem_invite_smoke() {
                 harmony_app::content_store::CasOp::GetLocal { reply, .. } => {
                     let _ = reply.send(None);
                 }
+                harmony_app::content_store::CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
+                }
             }
         }
     });

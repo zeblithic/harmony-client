@@ -166,6 +166,16 @@ pub enum CasOp {
         cid: ContentId,
         reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
     },
+    /// ZEB-539: allowlist an artifact's full local CID subtree for
+    /// member-to-member re-serve, AFTER the download has been validated.
+    /// Walks the Merkle DAG locally (no network fetch — every node is already
+    /// in the local cache post-fetch) starting from `root`, and calls
+    /// `serve_allowlist.allow(cid)` for `root` plus every descendant. Reply is
+    /// the count of CIDs allowlisted, or an error if `root` is missing locally.
+    AllowServeSubtree {
+        root: ContentId,
+        reply: tokio::sync::oneshot::Sender<Result<usize, ContentStoreError>>,
+    },
 }
 
 /// Default fetch budget for `RuntimeContentStore::get`. Wraps the

@@ -227,6 +227,9 @@ async fn engine_receives_remote_publish_and_merges_event() {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
                 }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
+                }
             }
         }
     });
@@ -487,6 +490,9 @@ async fn engine_emits_membership_delta_on_remote_insert() {
                 CasOp::GetLocal { cid, reply } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }
@@ -1108,6 +1114,9 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
                 }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
+                }
             }
         }
     });
@@ -1295,6 +1304,9 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
                 CasOp::GetLocal { cid, reply } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }
@@ -1536,6 +1548,9 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
                 CasOp::GetLocal { cid, reply } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
                 }
             }
         }
