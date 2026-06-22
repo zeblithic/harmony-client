@@ -3389,37 +3389,38 @@ pub async fn run(
                     }
                     CasOp::AllowServeSubtree { root, reply } => {
                         // ZEB-539: allowlist a validated artifact's whole local CID
-                        // subtree for member-to-member re-serve. Walk the local DAG
-                        // inline via `collect_descendants` (parity with the
-                        // Unpin/Burn arms below): the walk reads only interior
-                        // *bundle* nodes from the in-memory cache — leaf CIDs are
-                        // enumerated without a read — and it NEVER triggers a
-                        // network fetch. Every node is already local because the
-                        // caller only invokes this AFTER a successful download
-                        // admitted the full tree.
-                        if runtime.storage_tier().cache().get(&root).is_none() {
-                            // A missing root means the post-download invariant was
-                            // violated; refuse rather than allowlist a partial tree.
-                            let _ = reply.send(Err(crate::content_store::ContentStoreError::Io(
-                                format!(
-                                    "root {} missing locally; cannot authorize subtree",
-                                    hex::encode(root.to_bytes())
-                                ),
-                            )));
-                        } else {
-                            // dedup: `collect_descendants` can revisit shared
-                            // subtrees; `allow` is idempotent but we want an
-                            // accurate count.
-                            let cids: std::collections::HashSet<ContentId> =
-                                collect_descendants(runtime.storage_tier().cache(), root)
-                                    .into_iter()
-                                    .collect();
-                            let count = cids.len();
-                            for cid in cids {
-                                serve_allowlist.allow(cid);
-                            }
-                            let _ = reply.send(Ok(count));
-                        }
+                        // subtree for member-to-member re-serve.
+                        //
+                        // Qodo (High): do NOT walk the DAG + allowlist inline in
+                        // the `select!` arm — a deep tree would delay every other
+                        // CAS/network event. The `ContentStore` is not
+                        // `Clone + Send + 'static`, so it can't be moved into a
+                        // `spawn_blocking`; instead spawn an async task that walks
+                        // via read-only `CasOp::GetLocal` round-trips (which never
+                        // trigger a network fetch) and allowlists off-loop. The
+                        // arm returns immediately. `serve_allowlist` is `Clone`
+                        // (shared handle); the walk reuses
+                        // `collect_descendants_via_cas` (no duplicated walk).
+                        let cas_op_tx_for_walk = cas_op_tx.clone();
+                        let serve_allowlist_for_walk = serve_allowlist.clone();
+                        tokio::spawn(async move {
+                            let result =
+                                collect_descendants_via_cas(&cas_op_tx_for_walk, root)
+                                    .await
+                                    .map(|all| {
+                                        // dedup: the walk can revisit shared
+                                        // subtrees; `allow` is idempotent but we
+                                        // want an accurate count.
+                                        let cids: std::collections::HashSet<ContentId> =
+                                            all.into_iter().collect();
+                                        let count = cids.len();
+                                        for cid in cids {
+                                            serve_allowlist_for_walk.allow(cid);
+                                        }
+                                        count
+                                    });
+                            let _ = reply.send(result);
+                        });
                     }
                     CasOp::GetOrFetch { cid, timeout, reply } => {
                         // 1. Cache check first (fast path).
@@ -5680,6 +5681,81 @@ pub(crate) fn collect_descendants<S: BookStore>(
         }
     }
     out
+}
+
+/// Async sibling of [`collect_descendants`] for callers that don't hold a
+/// `&ContentStore` (the event loop owns it exclusively): walk the local DAG
+/// rooted at `root` by reading interior *bundle* nodes via read-only
+/// `CasOp::GetLocal` round-trips on `cas_op_tx`. Returns root + every
+/// descendant in DFS order, or `Err` if the root itself is missing locally.
+///
+/// `GetLocal` never triggers a network fetch (spec: it answers from the
+/// in-memory cache only), so this is safe to spawn off the event-loop
+/// `select!` arm — it can't recurse into a fetch or invert the serve
+/// relationship. Used by the `AllowServeSubtree` handler so the walk +
+/// allowlist run in a spawned task instead of inline in the loop. The
+/// `ContentStore` is not `Clone + Send + 'static`, so it can't be moved into
+/// a `spawn_blocking`; this channel-round-trip walk is the off-loop path.
+///
+/// Mirrors `collect_descendants`'s DFS/depth-guard/bundle-parse exactly; the
+/// only difference is the node source (channel round-trip vs. `&store.get`).
+async fn collect_descendants_via_cas(
+    cas_op_tx: &tokio::sync::mpsc::Sender<crate::content_store::CasOp>,
+    root: ContentId,
+) -> Result<Vec<ContentId>, crate::content_store::ContentStoreError> {
+    use crate::content_store::{CasOp, ContentStoreError};
+    use harmony_content::cid::MAX_BUNDLE_DEPTH;
+
+    // Read-only local-cache lookup via the event loop. `None` => not local.
+    async fn get_local(
+        tx: &tokio::sync::mpsc::Sender<CasOp>,
+        cid: ContentId,
+    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tx.send(CasOp::GetLocal { cid, reply })
+            .await
+            .map_err(|_| ContentStoreError::Io("cas_op channel closed".to_string()))?;
+        rx.await
+            .map_err(|_| ContentStoreError::Io("GetLocal reply dropped".to_string()))
+    }
+
+    // Root-missing invariant: refuse rather than allowlist a partial tree.
+    if get_local(cas_op_tx, root).await?.is_none() {
+        return Err(ContentStoreError::Io(format!(
+            "root {} missing locally; cannot authorize subtree",
+            hex::encode(root.to_bytes())
+        )));
+    }
+
+    let mut out = Vec::new();
+    let mut stack: Vec<(ContentId, u8)> = vec![(root, 0)];
+    while let Some((id, depth)) = stack.pop() {
+        if depth > MAX_BUNDLE_DEPTH {
+            tracing::warn!(
+                cid_depth = depth,
+                max = MAX_BUNDLE_DEPTH,
+                "collect_descendants_via_cas aborting subtree past MAX_BUNDLE_DEPTH; data is corrupt"
+            );
+            continue;
+        }
+        out.push(id);
+        if matches!(id.cid_type(), CidType::Bundle(_)) {
+            if let Some(bytes) = get_local(cas_op_tx, id).await? {
+                match bundle::parse_bundle(&bytes) {
+                    Ok(children) => {
+                        for child in children.iter().copied() {
+                            stack.push((child, depth + 1));
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        err = ?e,
+                        "malformed bundle payload; subtree skipped"
+                    ),
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Build the set of CIDs that must stay pinned because they are reachable

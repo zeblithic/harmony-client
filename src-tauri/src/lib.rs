@@ -20189,6 +20189,13 @@ pub(crate) async fn post_channel_message_impl(
                 }
                 let mut out = Vec::with_capacity(list.len());
                 for a in list {
+                    // CodeAnt #1 (security): bound the hex length BEFORE decoding.
+                    // A 32-byte CID is exactly 64 hex chars; without this guard a
+                    // multi-MB hex string allocates ~half its length before the
+                    // [u8; 32] conversion fails (memory/CPU DoS at the IPC edge).
+                    if a.cid.len() != 64 {
+                        return Err("invalid attachment cid hex".to_string());
+                    }
                     let cid: [u8; 32] = hex::decode(&a.cid)
                         .ok()
                         .and_then(|b| <[u8; 32]>::try_from(b).ok())
@@ -20197,6 +20204,16 @@ pub(crate) async fn post_channel_message_impl(
                         || a.mime.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
                     {
                         return Err("attachment name/mime too long".to_string());
+                    }
+                    // ZEB-539: reject an over-cap size at the IPC mint boundary —
+                    // such an attachment could never be downloaded (the download
+                    // path rejects size > cap), mirroring the verify-side guard.
+                    if a.size > crate::community_channel_log::MAX_ATTACHMENT_SIZE {
+                        return Err(format!(
+                            "attachment too large: {} (max {})",
+                            a.size,
+                            crate::community_channel_log::MAX_ATTACHMENT_SIZE
+                        ));
                     }
                     out.push(crate::community_channel_log::ChannelAttachment {
                         cid,
@@ -20581,6 +20598,13 @@ pub(crate) async fn download_channel_artifact_impl(
 ) -> Result<u64, String> {
     use harmony_content::cid::ContentId;
 
+    // CodeAnt #1 (security): bound the hex length BEFORE decoding. A 32-byte
+    // CID is exactly 64 hex chars; without this guard a caller-supplied
+    // multi-MB hex string allocates ~half its length before the [u8; 32]
+    // conversion fails (memory/CPU DoS at the IPC boundary).
+    if cid.len() != 64 {
+        return Err("invalid cid hex".to_string());
+    }
     let cid_bytes: [u8; 32] = hex::decode(&cid)
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
@@ -49578,6 +49602,84 @@ mod channel_message_ipc_tests {
         .await
         .expect_err("over-cap attachments must error at the IPC boundary");
         assert!(err.contains("too many attachments"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_oversized_attachment() {
+        // ZEB-539: an attachment whose `size` exceeds MAX_ATTACHMENT_SIZE must be
+        // rejected at the IPC mint boundary — such an attachment could never be
+        // downloaded (the download path rejects size > cap), mirroring the
+        // verify-side guard.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+            Some(vec![
+                crate::community_channel_log_engine::ChannelAttachmentDto {
+                    cid: "00".repeat(32),
+                    mime: "text/plain".into(),
+                    name: "huge.bin".into(),
+                    size: crate::community_channel_log::MAX_ATTACHMENT_SIZE + 1,
+                    encrypted: false,
+                },
+            ]),
+        )
+        .await
+        .expect_err("oversized attachment must error at the IPC boundary");
+        assert!(err.contains("attachment too large"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_overlong_attachment_cid_hex() {
+        // CodeAnt #1 (security): an attachment cid hex string longer than 64
+        // chars must be rejected by the length precheck BEFORE hex::decode runs,
+        // so a multi-MB hex string can't force a large allocation.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+            Some(vec![
+                crate::community_channel_log_engine::ChannelAttachmentDto {
+                    cid: "00".repeat(64), // 128 chars: valid hex but wrong length
+                    mime: "text/plain".into(),
+                    name: "note.txt".into(),
+                    size: 12,
+                    encrypted: false,
+                },
+            ]),
+        )
+        .await
+        .expect_err("over-long attachment cid hex must error");
+        assert!(err.contains("invalid attachment cid hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn download_channel_artifact_rejects_overlong_cid_hex() {
+        // CodeAnt #1 (security): a cid hex string longer than 64 chars must be
+        // rejected by the length precheck BEFORE hex::decode runs.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = download_channel_artifact(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            "00".repeat(64), // 128 chars: valid hex but wrong length
+            "/tmp/out.bin".to_string(),
+            None,
+        )
+        .await
+        .expect_err("over-long cid hex must error");
+        assert!(err.contains("invalid cid hex"), "got: {err}");
     }
 
     // ── ZEB-539: download_channel_artifact IPC boundary rejections ──────────

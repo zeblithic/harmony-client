@@ -19,11 +19,11 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::community_channel_log::{
-    decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, sign_channel_event,
-    verify_channel_event, ChannelAttachment, ChannelEventError, ChannelKey, ChannelLog,
-    ChannelLogConfig, ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload,
-    CommunityStateAtHlc, MessageId, SignedChannelEvent, MAX_ATTACHMENTS,
-    MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
+    decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, read_segment_at,
+    sign_channel_event, verify_channel_event, ChannelAttachment, ChannelEventError, ChannelKey,
+    ChannelLog, ChannelLogConfig, ChannelLogPersistError, ChannelLogReplayTracker,
+    ChannelPostPayload, CommunityStateAtHlc, MessageId, SegmentDescriptor, SignedChannelEvent,
+    MAX_ATTACHMENTS, MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -651,23 +651,50 @@ impl ChannelLogEngine {
         cid: &[u8; 32],
     ) -> Result<Option<crate::community_channel_log::ChannelAttachment>, ChannelLogEngineError>
     {
-        let log = self.log.lock().await;
+        // Qodo (High): do NOT hold the async mutex across disk I/O, and do NOT
+        // run synchronous `std::fs::read` on a Tokio worker. Snapshot the
+        // segment descriptors + the in-memory tail + the root path UNDER the
+        // lock, drop the lock, then read the segments off the executor via
+        // `spawn_blocking`. Behavior is identical: scan persisted segments
+        // (oldest first) then the tail, returning the first matching
+        // `ChannelAttachment`, else `None`.
+        let (segments, tail, root): (Vec<SegmentDescriptor>, Vec<SignedChannelEvent>, _) = {
+            let log = self.log.lock().await;
+            (
+                log.manifest.segments.clone(),
+                log.tail.clone(),
+                log.root().to_path_buf(),
+            )
+        };
 
-        // Walk persisted segments (oldest first), then the in-memory
-        // tail — the same segments-then-tail order `list_messages` uses,
-        // but unbounded (no `since`/`limit`) so no attachment is missed.
-        for seg in &log.manifest.segments {
-            let events = log
-                .read_segment(seg)
-                .map_err(ChannelLogEngineError::Persist)?;
-            for ev in &events {
-                if let Some(att) = attachment_with_cid(ev, cid) {
-                    return Ok(Some(att));
+        // Read + scan the persisted segments off the async executor — the
+        // reads use blocking `std::fs::read`. Early-exit on the first match.
+        let cid = *cid;
+        let seg_hit = tokio::task::spawn_blocking(move || {
+            for seg in &segments {
+                let events = read_segment_at(&root, seg)?;
+                for ev in &events {
+                    if let Some(att) = attachment_with_cid(ev, &cid) {
+                        return Ok::<_, ChannelLogPersistError>(Some(att));
+                    }
                 }
             }
+            Ok(None)
+        })
+        .await
+        .map_err(|e| {
+            ChannelLogEngineError::Persist(ChannelLogPersistError::Io(format!(
+                "find_attachment segment-read task panicked: {e}"
+            )))
+        })?
+        .map_err(ChannelLogEngineError::Persist)?;
+        if seg_hit.is_some() {
+            return Ok(seg_hit);
         }
-        for ev in &log.tail {
-            if let Some(att) = attachment_with_cid(ev, cid) {
+
+        // Then the in-memory tail (already snapshotted; no I/O).
+        for ev in &tail {
+            if let Some(att) = attachment_with_cid(ev, &cid) {
                 return Ok(Some(att));
             }
         }
