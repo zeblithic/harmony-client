@@ -302,9 +302,9 @@ async fn list_bodies(engine: &MockEngine) -> Vec<String> {
         .await
         .expect("list_messages")
         .into_iter()
-        .map(|ev| {
-            let SignedChannelEvent::Post { body, .. } = ev;
-            body
+        .filter_map(|ev| match ev {
+            SignedChannelEvent::Post { body, .. } => Some(body),
+            _ => None,
         })
         .collect()
 }
@@ -458,7 +458,7 @@ async fn put_until_in_logs(
 fn assert_unique_message_ids(events: &[SignedChannelEvent]) {
     let mut seen = HashSet::new();
     for ev in events {
-        let SignedChannelEvent::Post { id, .. } = ev;
+        let id = ev.id();
         assert!(seen.insert(*id), "duplicate message_id in log: {id:?}");
     }
 }

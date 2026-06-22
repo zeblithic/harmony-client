@@ -11,7 +11,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use harmony_app::community_channel_log::{
     derive_channel_key, encrypt_channel_packet, ChannelLogConfig, CommunityStateAtHlc,
-    CommunityStateSnapshot, SignedChannelEvent,
+    CommunityStateSnapshot,
 };
 use harmony_app::community_channel_log_engine::{
     ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig, SpawnOutcome,
@@ -629,10 +629,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         .await
         .expect("list a")
         .into_iter()
-        .find(|ev| {
-            let SignedChannelEvent::Post { id, .. } = ev;
-            *id == first_id
-        });
+        .find(|ev| *ev.id() == first_id);
     let first_event = first_event_opt.expect("first event");
     let replay_packet = encrypt_channel_packet(&channel_key, &first_event).expect("re-encrypt");
     let topic = format!(
@@ -680,8 +677,8 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
 
     // Verify HLC ordering across the entire log.
     for window in final_listed.windows(2) {
-        let SignedChannelEvent::Post { at: prev_at, .. } = &window[0];
-        let SignedChannelEvent::Post { at: next_at, .. } = &window[1];
+        let prev_at = window[0].at();
+        let next_at = window[1].at();
         assert!(
             next_at.is_strictly_newer_than(prev_at),
             "log out of HLC order: {prev_at:?} → {next_at:?}",
@@ -691,7 +688,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     // Verify no duplicates by message_id.
     let mut seen_ids = std::collections::HashSet::new();
     for ev in &final_listed {
-        let SignedChannelEvent::Post { id, .. } = ev;
+        let id = ev.id();
         assert!(
             seen_ids.insert(*id),
             "duplicate message_id in final log: {id:?}"

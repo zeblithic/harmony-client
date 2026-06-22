@@ -116,8 +116,7 @@ pub fn build_snapshot(
 fn event_hlc(
     event: &crate::community_channel_log::SignedChannelEvent,
 ) -> &crate::owner_state_types::Hlc {
-    let crate::community_channel_log::SignedChannelEvent::Post { at, .. } = event;
-    at
+    event.at()
 }
 
 /// Compare two HLCs: wall_ms first, then logical, then device_id
@@ -357,7 +356,16 @@ pub async fn fork_community(
             let events = engine
                 .list_messages(None, SNAPSHOT_TOTAL_CAP * 2)
                 .await
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                // ZEB-536: pre-fork snapshot is message-only for v1.
+                .filter(|e| {
+                    matches!(
+                        e,
+                        crate::community_channel_log::SignedChannelEvent::Post { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
             if !events.is_empty() {
                 raw_channel_events.insert(*channel_id, events);
             }
@@ -372,8 +380,7 @@ pub async fn fork_community(
     // (Fix: PR #122 round-2 bot review — CodeRabbit Major.)
     for log_events in raw_channel_events.values() {
         for event in log_events {
-            let crate::community_channel_log::SignedChannelEvent::Post { author, .. } = event;
-            signer_addrs.insert(*author);
+            signer_addrs.insert(*event.author());
         }
     }
 
@@ -1010,12 +1017,8 @@ mod tests {
         );
 
         // Verify the newest 500 were kept (wall_ms 100..599, ascending).
-        let first_wall = match &retained[0] {
-            SignedChannelEvent::Post { at, .. } => at.wall_ms,
-        };
-        let last_wall = match &retained[retained.len() - 1] {
-            SignedChannelEvent::Post { at, .. } => at.wall_ms,
-        };
+        let first_wall = retained[0].at().wall_ms;
+        let last_wall = retained[retained.len() - 1].at().wall_ms;
         assert_eq!(
             first_wall, 100,
             "oldest retained event should be wall_ms=100 (newest 500 of 600)"

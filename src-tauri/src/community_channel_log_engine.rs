@@ -560,8 +560,7 @@ impl ChannelLogEngine {
                 .map_err(ChannelLogEngineError::Persist)?;
             for ev in events {
                 if let Some(since_hlc) = &since {
-                    let SignedChannelEvent::Post { at, .. } = &ev;
-                    if !at.is_strictly_newer_than(since_hlc) {
+                    if !ev.at().is_strictly_newer_than(since_hlc) {
                         continue;
                     }
                 }
@@ -575,8 +574,7 @@ impl ChannelLogEngine {
         // Then walk the in-memory tail.
         for ev in &log.tail {
             if let Some(since_hlc) = &since {
-                let SignedChannelEvent::Post { at, .. } = ev;
-                if !at.is_strictly_newer_than(since_hlc) {
+                if !ev.at().is_strictly_newer_than(since_hlc) {
                     continue;
                 }
             }
@@ -819,7 +817,10 @@ impl ChannelLogEngine {
             body,
             reply_to,
             ..
-        } = event;
+        } = event
+        else {
+            unreachable!("message_dto_for_event called on non-Post event; callers filter to Post");
+        };
 
         let body_bytes = body.as_bytes().to_vec();
         let (kind, poll_id) = detect_poll_kind(&body_bytes);
@@ -2281,8 +2282,7 @@ mod tests {
     }
 
     fn extract_id(ev: &SignedChannelEvent) -> MessageId {
-        let SignedChannelEvent::Post { id, .. } = ev;
-        *id
+        *ev.id()
     }
 
     // ── Sub-task 2A: list_messages ────────────────────────────────────
@@ -2457,20 +2457,17 @@ mod tests {
 
         // HLC-ascending order across the segment+tail boundary.
         for (i, ev) in listed.iter().enumerate() {
-            let SignedChannelEvent::Post { at, .. } = ev;
+            let wall_ms = ev.at().wall_ms;
             assert_eq!(
-                at.wall_ms,
+                wall_ms,
                 100 + i as u64,
-                "event {i} out of HLC order (got wall_ms={})",
-                at.wall_ms,
+                "event {i} out of HLC order (got wall_ms={wall_ms})",
             );
         }
 
         // First/last bookend checks per spec §14.1.
-        let SignedChannelEvent::Post { at: first_at, .. } = &listed[0];
-        let SignedChannelEvent::Post { at: last_at, .. } = &listed[9];
-        assert_eq!(first_at.wall_ms, 100);
-        assert_eq!(last_at.wall_ms, 109);
+        assert_eq!(listed[0].at().wall_ms, 100);
+        assert_eq!(listed[9].at().wall_ms, 109);
         assert_eq!(extract_id(&listed[0]), extract_id(&events[0]));
         assert_eq!(extract_id(&listed[9]), extract_id(&events[9]));
     }

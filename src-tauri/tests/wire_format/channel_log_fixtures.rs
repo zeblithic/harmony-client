@@ -25,7 +25,8 @@
 //! 4. Re-run without the env var to confirm the pin holds.
 
 use harmony_app::community_channel_log::{
-    sign_channel_event, ChannelPostPayload, MessageId, SignedChannelEvent,
+    sign_channel_event, sign_channel_react, ChannelPostPayload, ChannelReactPayload, MessageId,
+    SignedChannelEvent,
 };
 use harmony_app::community_membership::ChannelId;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
@@ -139,4 +140,41 @@ fn backfill_reply_packet_wire_bytes_pinned() {
         "backfill reply wire format drifted; re-pin via \
          UPDATE_BACKFILL_FIXTURE=1 (see file header for procedure)"
     );
+}
+
+/// ZEB-536: wire-format pin for a React packet. Ensures that
+/// `sign_channel_react` + `encrypt_channel_packet_with_nonce` produce
+/// byte-stable output under fixed inputs so a future field reorder
+/// or key-rename is caught immediately.
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn react_packet_is_byte_stable() {
+    let community_id = SpaceId([0xc0; 16]);
+    let channel_id = ChannelId([0x01; 16]);
+    let owner = OwnerAddr([0xa1; 16]);
+    let mk = EpochKey::new([0x77; 32]);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xa1; 32]);
+    let key = derive_channel_key(&mk, &community_id, &channel_id);
+
+    let payload = ChannelReactPayload {
+        target: MessageId([0x07; 16]),
+        community_id,
+        channel_id,
+        author: owner,
+        at: Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".to_string(),
+        },
+        emoji: "👍".to_string(),
+        add: true,
+    };
+    let event = sign_channel_react(&payload, &signing_key).expect("sign react");
+    let packet = encrypt_channel_packet_with_nonce(&key, &event, [0x11; 12]).expect("encrypt");
+    let decoded =
+        harmony_app::community_channel_log::decrypt_channel_packet(&key, &packet).expect("decrypt");
+    assert_eq!(decoded, event, "react packet must round-trip");
+    let actual_hex = hex::encode(&packet);
+    let expected_hex = "1111111111111111111111119618335845c3f3e24629060f5af3f24bd4331d0747e919016e09d1472032a8eab95676ee115eb12d80766a500a3f69625469e13cc8a46734d7169d786378966ca04448604e8c3677404dcf27098557528ad90067215217db4e6ecf3d7e188e54c3432c2f9ca42d2991171d07b220c2b858204148fea1507c92acf5ccf5f8d6ce3a300b3a030607747180964c63b7751e222e46326772edb982a1ebd1b94811d27501bcd6484d927fd472dab74bd447f76923206c109044f66cfaf1f3fd66320a6cd26cfd60d95c7c33d4ad359988c7599a";
+    assert_eq!(actual_hex, expected_hex, "react packet wire format drifted");
 }

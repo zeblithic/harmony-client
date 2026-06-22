@@ -141,6 +141,11 @@ const TAG_LEN: usize = 16;
 /// before invoking the AEAD layer for a cleaner error split.
 const MIN_PACKET_LEN: usize = NONCE_LEN + TAG_LEN;
 
+/// ZEB-536: max byte length of a reaction emoji string. Room for a ZWJ
+/// emoji sequence plus a short custom shortcode (Spec 3). Over-long
+/// reactions fail `react()` locally and `verify_channel_event` inbound.
+pub const MAX_REACTION_EMOJI_BYTES: usize = 32;
+
 /// One signed channel event. Phase 2 ships only the `Post` variant.
 /// Wire format: 2-key adjacently-tagged outer (`tg` + `vl`); inner
 /// fields all 2-char keys to satisfy the same-length-keys invariant.
@@ -188,7 +193,74 @@ pub enum SignedChannelEvent {
     // v3 reserved (additive — no v2 wire-format break):
     // Edit { id, ci, ch, au, at, kd, bd, sg }
     // Delete { id, ci, ch, au, at, sg }
-    // React { id, ci, ch, au, at, em, sg }
+    /// ZEB-536: a reaction/ack targeting a prior message in this channel.
+    /// Append-only — un-reacting is a fresh React with `add=false`, never
+    /// a mutation. `id` is the TARGET message id (reactions sharing a
+    /// target are deduped by the per-(channel,author,device) HLC lane,
+    /// not by id). Convergence is LWW per (target, author, emoji) by HLC.
+    #[serde(rename = "r")]
+    React {
+        #[serde(rename = "ad")]
+        add: bool,
+        #[serde(rename = "at")]
+        at: Hlc,
+        #[serde(rename = "au")]
+        author: OwnerAddr,
+        #[serde(rename = "ch")]
+        channel_id: ChannelId,
+        #[serde(rename = "ci")]
+        community_id: SpaceId,
+        #[serde(rename = "em")]
+        emoji: String,
+        #[serde(rename = "id")]
+        target: MessageId,
+        #[serde(
+            rename = "sg",
+            serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+            deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+        )]
+        sig: [u8; 64],
+    },
+}
+
+impl SignedChannelEvent {
+    /// Community id (both variants).
+    pub fn community_id(&self) -> &SpaceId {
+        match self {
+            SignedChannelEvent::Post { community_id, .. }
+            | SignedChannelEvent::React { community_id, .. } => community_id,
+        }
+    }
+    pub fn channel_id(&self) -> &ChannelId {
+        match self {
+            SignedChannelEvent::Post { channel_id, .. }
+            | SignedChannelEvent::React { channel_id, .. } => channel_id,
+        }
+    }
+    pub fn author(&self) -> &OwnerAddr {
+        match self {
+            SignedChannelEvent::Post { author, .. } | SignedChannelEvent::React { author, .. } => {
+                author
+            }
+        }
+    }
+    pub fn at(&self) -> &Hlc {
+        match self {
+            SignedChannelEvent::Post { at, .. } | SignedChannelEvent::React { at, .. } => at,
+        }
+    }
+    /// Post → message id; React → target message id.
+    pub fn id(&self) -> &MessageId {
+        match self {
+            SignedChannelEvent::Post { id, .. } => id,
+            SignedChannelEvent::React { target, .. } => target,
+        }
+    }
+    pub fn sig(&self) -> &[u8; 64] {
+        match self {
+            SignedChannelEvent::Post { sig, .. } | SignedChannelEvent::React { sig, .. } => sig,
+        }
+    }
 }
 
 /// Pre-signature payload used to derive `event_id` and the signed-set
@@ -241,6 +313,38 @@ struct ChannelPostSignedSet<'a> {
     content_kind: u8,
     #[serde(rename = "rt", skip_serializing_if = "Option::is_none")]
     reply_to: &'a Option<MessageId>,
+}
+
+/// Caller-filled pre-signature payload for a reaction. Hand to
+/// `sign_channel_react` to get a wire-ready `SignedChannelEvent::React`.
+pub struct ChannelReactPayload {
+    pub target: MessageId,
+    pub community_id: SpaceId,
+    pub channel_id: ChannelId,
+    pub author: OwnerAddr,
+    pub at: Hlc,
+    pub emoji: String,
+    pub add: bool,
+}
+
+/// Pre-signature signed-set for a React (everything except `sg`).
+/// 2-char keys in RFC-8949 bytewise order: ad, at, au, ch, ci, em, id.
+#[derive(Serialize)]
+struct ChannelReactSignedSet<'a> {
+    #[serde(rename = "ad")]
+    add: bool,
+    #[serde(rename = "at")]
+    at: &'a Hlc,
+    #[serde(rename = "au")]
+    author: &'a OwnerAddr,
+    #[serde(rename = "ch")]
+    channel_id: &'a ChannelId,
+    #[serde(rename = "ci")]
+    community_id: &'a SpaceId,
+    #[serde(rename = "em")]
+    emoji: &'a str,
+    #[serde(rename = "id")]
+    target: &'a MessageId,
 }
 
 /// Errors produced by the channel-event chain (sign, encrypt/decrypt,
@@ -327,48 +431,90 @@ pub fn sign_channel_event(
     };
     let canon = signed_set_canonical_cbor(&event)?;
     let new_sig = signing_key.sign(&canon).to_bytes();
-    // SignedChannelEvent::Post is the only variant in v2; v3 adds
-    // Edit/Delete/React. When those variants land, this destructure
-    // becomes refutable and must be rewritten as `if let` (or this
-    // function gains a per-variant signing path).
-    let SignedChannelEvent::Post { sig, .. } = &mut event;
-    *sig = new_sig;
+    if let SignedChannelEvent::Post { sig, .. } = &mut event {
+        *sig = new_sig;
+    }
     Ok(event)
 }
 
-/// Recompute the signed-set canonical CBOR for a SignedChannelEvent::Post.
-/// The single source of truth for what bytes the signature covers — used
-/// by both `sign_channel_event` (above, via a placeholder-sig event) and
-/// `verify_channel_event` (on the deserialized event). Routing both
-/// callers through this function means a future field added to
-/// `ChannelPostSignedSet` automatically affects sign and verify together;
-/// inlining either side risks producing different bytes and silent
-/// signature-verification failures.
-fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, ChannelEventError> {
-    let SignedChannelEvent::Post {
-        at,
-        author,
-        body,
-        channel_id,
-        community_id,
-        id,
-        content_kind,
-        reply_to,
-        sig: _,
-    } = event;
-    let signed_set = ChannelPostSignedSet {
-        at,
-        author,
-        body,
-        channel_id,
-        community_id,
-        id,
-        content_kind: *content_kind,
-        reply_to,
+/// Sign a reaction payload. Mirrors `sign_channel_event`. Pure / sync.
+pub fn sign_channel_react(
+    payload: &ChannelReactPayload,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<SignedChannelEvent, ChannelEventError> {
+    use ed25519_dalek::Signer;
+    let mut event = SignedChannelEvent::React {
+        add: payload.add,
+        at: payload.at.clone(),
+        author: payload.author,
+        channel_id: payload.channel_id,
+        community_id: payload.community_id,
+        emoji: payload.emoji.clone(),
+        target: payload.target,
+        sig: [0u8; 64],
     };
+    let canon = signed_set_canonical_cbor(&event)?;
+    let new_sig = signing_key.sign(&canon).to_bytes();
+    if let SignedChannelEvent::React { sig, .. } = &mut event {
+        *sig = new_sig;
+    }
+    Ok(event)
+}
+
+/// Recompute the signed-set canonical CBOR for a SignedChannelEvent.
+/// The single source of truth for what bytes the signature covers — used
+/// by both sign functions (via a placeholder-sig event) and
+/// `verify_channel_event` (on the deserialized event).
+fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, ChannelEventError> {
     let mut canon = Vec::with_capacity(256);
-    ciborium::into_writer(&signed_set, &mut canon)
-        .map_err(|e| ChannelEventError::CborEncode(e.to_string()))?;
+    match event {
+        SignedChannelEvent::Post {
+            at,
+            author,
+            body,
+            channel_id,
+            community_id,
+            id,
+            content_kind,
+            reply_to,
+            sig: _,
+        } => {
+            let signed_set = ChannelPostSignedSet {
+                at,
+                author,
+                body,
+                channel_id,
+                community_id,
+                id,
+                content_kind: *content_kind,
+                reply_to,
+            };
+            ciborium::into_writer(&signed_set, &mut canon)
+                .map_err(|e| ChannelEventError::CborEncode(e.to_string()))?;
+        }
+        SignedChannelEvent::React {
+            add,
+            at,
+            author,
+            channel_id,
+            community_id,
+            emoji,
+            target,
+            sig: _,
+        } => {
+            let signed_set = ChannelReactSignedSet {
+                add: *add,
+                at,
+                author,
+                channel_id,
+                community_id,
+                emoji,
+                target,
+            };
+            ciborium::into_writer(&signed_set, &mut canon)
+                .map_err(|e| ChannelEventError::CborEncode(e.to_string()))?;
+        }
+    }
     Ok(canon)
 }
 
@@ -503,13 +649,9 @@ impl ChannelLogReplayTracker {
     /// `would_accept` / `record` split — same rationale (advance only
     /// after the full chain succeeds).
     pub fn would_accept(&self, event: &SignedChannelEvent) -> Result<(), ChannelEventError> {
-        let SignedChannelEvent::Post {
-            channel_id,
-            author,
-            at,
-            id,
-            ..
-        } = event;
+        let channel_id = event.channel_id();
+        let author = event.author();
+        let at = event.at();
         let key = (*channel_id, *author, at.device_id.clone());
         if let Some(prev) = self.last_seen.get(&key) {
             // Use the canonical Hlc sort-key comparator from
@@ -519,7 +661,7 @@ impl ChannelLogReplayTracker {
             // behaves as if comparing (wall_ms, logical) only.
             if !at.is_strictly_newer_than(prev) {
                 return Err(ChannelEventError::Replay {
-                    event_id: *id,
+                    event_id: *event.id(),
                     author: *author,
                     device_id: at.device_id.clone(),
                     at: at.clone(),
@@ -535,14 +677,12 @@ impl ChannelLogReplayTracker {
     /// twice with the same event will overwrite with an identical
     /// value but doesn't error.
     pub fn record(&mut self, event: &SignedChannelEvent) {
-        let SignedChannelEvent::Post {
-            channel_id,
-            author,
-            at,
-            ..
-        } = event;
-        let key = (*channel_id, *author, at.device_id.clone());
-        self.last_seen.insert(key, at.clone());
+        let key = (
+            *event.channel_id(),
+            *event.author(),
+            event.at().device_id.clone(),
+        );
+        self.last_seen.insert(key, event.at().clone());
     }
 
     /// Combined check + advance for callers that already serialize
@@ -663,14 +803,11 @@ pub async fn verify_channel_event<S>(
 where
     S: CommunityStateAtHlc + Sync + ?Sized,
 {
-    let SignedChannelEvent::Post {
-        community_id,
-        channel_id,
-        author,
-        at,
-        sig,
-        ..
-    } = event;
+    let community_id = event.community_id();
+    let channel_id = event.channel_id();
+    let author = event.author();
+    let at = event.at();
+    let sig = event.sig();
 
     // Step 3: misroute defense.
     if community_id != expected_community_id || channel_id != expected_channel_id {
@@ -680,6 +817,17 @@ where
             got_community: *community_id,
             got_channel: *channel_id,
         });
+    }
+
+    // ZEB-536: bound reaction emoji size (cheap, pre-auth).
+    if let SignedChannelEvent::React { emoji, .. } = event {
+        if emoji.len() > MAX_REACTION_EMOJI_BYTES {
+            return Err(ChannelEventError::NotAuthorized(format!(
+                "reaction emoji {} bytes exceeds max {}",
+                emoji.len(),
+                MAX_REACTION_EMOJI_BYTES
+            )));
+        }
     }
 
     // Step 3b (precondition — moved earlier per cheapest-first ordering):
@@ -917,11 +1065,8 @@ impl ChannelLog {
     /// threshold has now been reached (caller should call
     /// `seal_and_persist`); `Ok(false)` otherwise.
     pub fn append(&mut self, event: SignedChannelEvent) -> Result<bool, ChannelLogPersistError> {
-        let SignedChannelEvent::Post {
-            community_id,
-            channel_id,
-            ..
-        } = &event;
+        let community_id = event.community_id();
+        let channel_id = event.channel_id();
         if *community_id != self.manifest.community_id || *channel_id != self.manifest.channel_id {
             return Err(ChannelLogPersistError::Manifest {
                 expected: format!(
@@ -1040,10 +1185,7 @@ impl ChannelLog {
         let first_at = self
             .tail
             .iter()
-            .map(|e| {
-                let SignedChannelEvent::Post { at, .. } = e;
-                at
-            })
+            .map(|e| e.at())
             .min_by(|a, b| {
                 if a.is_strictly_newer_than(b) {
                     std::cmp::Ordering::Greater
@@ -1058,10 +1200,7 @@ impl ChannelLog {
         let last_at = self
             .tail
             .iter()
-            .map(|e| {
-                let SignedChannelEvent::Post { at, .. } = e;
-                at
-            })
+            .map(|e| e.at())
             .max_by(|a, b| {
                 if a.is_strictly_newer_than(b) {
                     std::cmp::Ordering::Greater
@@ -1275,10 +1414,7 @@ impl ChannelLog {
             .segments
             .iter()
             .map(|seg| &seg.range.1)
-            .chain(self.tail.iter().map(|e| {
-                let SignedChannelEvent::Post { at, .. } = e;
-                at
-            }))
+            .chain(self.tail.iter().map(|e| e.at()))
             .max_by(|a, b| {
                 if a.is_strictly_newer_than(b) {
                     std::cmp::Ordering::Greater
@@ -1467,17 +1603,31 @@ mod tests {
     fn sign_channel_event_round_trip() {
         let (payload, key) = fixture_payload("hello, world!");
         let signed = sign_channel_event(&payload, &key).expect("sign");
-        let SignedChannelEvent::Post {
-            id,
-            community_id,
-            channel_id,
-            author,
-            at,
-            content_kind,
-            body,
-            reply_to,
-            sig,
-        } = signed;
+        let (id, community_id, channel_id, author, at, content_kind, body, reply_to, sig) =
+            match signed {
+                SignedChannelEvent::Post {
+                    id,
+                    community_id,
+                    channel_id,
+                    author,
+                    at,
+                    content_kind,
+                    body,
+                    reply_to,
+                    sig,
+                } => (
+                    id,
+                    community_id,
+                    channel_id,
+                    author,
+                    at,
+                    content_kind,
+                    body,
+                    reply_to,
+                    sig,
+                ),
+                _ => panic!("expected Post"),
+            };
         assert_eq!(id, payload.id);
         assert_eq!(community_id, payload.community_id);
         assert_eq!(channel_id, payload.channel_id);
@@ -1495,7 +1645,10 @@ mod tests {
         let (payload, key) = fixture_payload("verify me");
         let signed = sign_channel_event(&payload, &key).expect("sign");
         let canon = signed_set_canonical_cbor(&signed).expect("canon");
-        let SignedChannelEvent::Post { sig, .. } = &signed;
+        let sig = match &signed {
+            SignedChannelEvent::Post { sig, .. } => sig,
+            _ => panic!("expected Post"),
+        };
         let pubkey = key.verifying_key();
         // Note: in production the author addr would be derived from
         // the identity pubkey via the resolver; here we just verify
@@ -2190,10 +2343,10 @@ mod tests {
         let state = fixture_state_with_alice_joined();
         let mut tracker = ChannelLogReplayTracker::new();
         let mut event = fixture_signed_event(100_000, 0, "a-dev");
-        // Flip a byte in the signature. Only one variant currently —
-        // pattern is irrefutable.
-        let SignedChannelEvent::Post { sig, .. } = &mut event;
-        sig[0] ^= 0xff;
+        // Flip a byte in the signature.
+        if let SignedChannelEvent::Post { sig, .. } = &mut event {
+            sig[0] ^= 0xff;
+        }
         let err = verify_channel_event(
             &event,
             &fixture_community(0xc0),
@@ -2288,13 +2441,11 @@ mod tests {
         // advanced — otherwise a future legitimate event on the same
         // lane would be wrongly rejected as a replay. (Regression
         // guard for the advance-before-auth bug.)
-        let SignedChannelEvent::Post {
-            at,
-            channel_id,
-            author,
-            ..
-        } = &event;
-        let key = (*channel_id, *author, at.device_id.clone());
+        let key = (
+            *event.channel_id(),
+            *event.author(),
+            event.at().device_id.clone(),
+        );
         assert!(
             !tracker.last_seen().contains_key(&key),
             "tracker must NOT advance on failed authorization (was advance-before-auth bug)"
@@ -2361,13 +2512,11 @@ mod tests {
         // advanced — otherwise a future legitimate event on the same
         // lane would be wrongly rejected as a replay. (Regression
         // guard for the advance-before-auth bug.)
-        let SignedChannelEvent::Post {
-            at,
-            channel_id,
-            author,
-            ..
-        } = &event;
-        let key = (*channel_id, *author, at.device_id.clone());
+        let key = (
+            *event.channel_id(),
+            *event.author(),
+            event.at().device_id.clone(),
+        );
         assert!(
             !tracker.last_seen().contains_key(&key),
             "tracker must NOT advance on failed authorization (was advance-before-auth bug)"
@@ -2511,8 +2660,8 @@ mod tests {
             descriptor.count, 4,
             "descriptor count must equal seal batch"
         );
-        let SignedChannelEvent::Post { at: first_at, .. } = &originals[0];
-        let SignedChannelEvent::Post { at: last_at, .. } = &originals[3];
+        let first_at = originals[0].at();
+        let last_at = originals[3].at();
         assert_eq!(
             &descriptor.range.0, first_at,
             "range.0 must equal first event HLC"
@@ -3182,5 +3331,184 @@ mod tests {
             watermark.wall_ms, 300_000,
             "max_hlc must take the max across tail events, not the last-appended"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_react_rejects_tampered_emoji() {
+        let state = fixture_state_with_alice_joined();
+        let (signing_key, author, _pub64) = fixture_identity(0xa1);
+        let community_id = fixture_community(0xc0);
+        let channel_id = fixture_channel(0x01);
+        let at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".into(),
+        };
+        let payload = ChannelReactPayload {
+            target: MessageId([7u8; 16]),
+            community_id,
+            channel_id,
+            author,
+            at,
+            emoji: "👍".to_string(),
+            add: true,
+        };
+        let mut event = sign_channel_react(&payload, &signing_key).expect("sign react");
+        if let SignedChannelEvent::React { emoji, .. } = &mut event {
+            *emoji = "👎".into();
+        }
+        let mut tracker = ChannelLogReplayTracker::new();
+        let err = verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+            .await
+            .expect_err("tampered emoji must fail verify");
+        assert!(
+            matches!(err, ChannelEventError::BadSignature),
+            "expected BadSignature, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_react_rejects_non_member() {
+        let community_id = fixture_community(0xc0);
+        let channel_id = fixture_channel(0x01);
+        let (signing_key, author, _pub64) = fixture_identity(0xa1);
+        let creator_hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: "creator".into(),
+        };
+        let mut channels = HashMap::new();
+        channels.insert(
+            channel_id,
+            vec![(
+                creator_hlc.clone(),
+                ChannelInfo {
+                    name: "general".into(),
+                    write_power: 0,
+                    kind: crate::community_membership::ChannelKind::Text,
+                    created_at: creator_hlc,
+                    deleted_at: None,
+                },
+            )],
+        );
+        let state = MockState {
+            channels,
+            members: HashMap::new(),
+            left_at: HashMap::new(),
+            enrolled: HashMap::new(),
+        };
+        let at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".into(),
+        };
+        let payload = ChannelReactPayload {
+            target: MessageId([7u8; 16]),
+            community_id,
+            channel_id,
+            author,
+            at,
+            emoji: "👍".to_string(),
+            add: true,
+        };
+        let event = sign_channel_react(&payload, &signing_key).expect("sign react");
+        let mut tracker = ChannelLogReplayTracker::new();
+        let err = verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+            .await
+            .expect_err("non-member react must fail");
+        assert!(
+            matches!(err, ChannelEventError::NotAuthorized(_)),
+            "expected NotAuthorized, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_react_rejects_oversized_emoji() {
+        let state = fixture_state_with_alice_joined();
+        let (signing_key, author, _pub64) = fixture_identity(0xa1);
+        let community_id = fixture_community(0xc0);
+        let channel_id = fixture_channel(0x01);
+        let at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".into(),
+        };
+        let oversized = "x".repeat(MAX_REACTION_EMOJI_BYTES + 1);
+        let payload = ChannelReactPayload {
+            target: MessageId([7u8; 16]),
+            community_id,
+            channel_id,
+            author,
+            at,
+            emoji: oversized,
+            add: true,
+        };
+        let event = sign_channel_react(&payload, &signing_key).expect("sign react");
+        let mut tracker = ChannelLogReplayTracker::new();
+        let err = verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+            .await
+            .expect_err("oversized emoji must fail verify");
+        assert!(
+            matches!(err, ChannelEventError::NotAuthorized(_)),
+            "expected NotAuthorized for oversized emoji, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_react_accepts_unknown_target() {
+        let state = fixture_state_with_alice_joined();
+        let (signing_key, author, _pub64) = fixture_identity(0xa1);
+        let community_id = fixture_community(0xc0);
+        let channel_id = fixture_channel(0x01);
+        let at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".into(),
+        };
+        let payload = ChannelReactPayload {
+            target: MessageId([0xde; 16]),
+            community_id,
+            channel_id,
+            author,
+            at,
+            emoji: "✅".to_string(),
+            add: true,
+        };
+        let event = sign_channel_react(&payload, &signing_key).expect("sign react");
+        let mut tracker = ChannelLogReplayTracker::new();
+        verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+            .await
+            .expect("react with unknown target must pass verify (orphan tolerance)");
+    }
+
+    #[tokio::test]
+    async fn sign_and_verify_react_round_trips() {
+        let state = fixture_state_with_alice_joined();
+        let (signing_key, author, _pub64) = fixture_identity(0xa1);
+        let community_id = fixture_community(0xc0);
+        let channel_id = fixture_channel(0x01);
+        let at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".into(),
+        };
+        let payload = ChannelReactPayload {
+            target: MessageId([7u8; 16]),
+            community_id,
+            channel_id,
+            author,
+            at: at.clone(),
+            emoji: "👍".to_string(),
+            add: true,
+        };
+        let event = sign_channel_react(&payload, &signing_key).expect("sign react");
+        let key = derive_channel_key(&fixture_mk(), &community_id, &channel_id);
+        let packet = encrypt_channel_packet(&key, &event).expect("encrypt");
+        let decoded = decrypt_channel_packet(&key, &packet).expect("decrypt");
+        assert_eq!(decoded, event);
+        let mut tracker = ChannelLogReplayTracker::new();
+        verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+            .await
+            .expect("verify react");
     }
 }
