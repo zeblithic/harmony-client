@@ -853,6 +853,27 @@ describe('ChannelMessageFeed reactions — toolbar + picker (ZEB-536)', () => {
     });
   });
 
+  it('rapid double-click on a quick-react sends only one set_message_reaction (CodeAnt #318)', async () => {
+    const { adapter, container } = await seedPlainMessage();
+    // Hold the reaction IPC in flight so the second click lands within the
+    // in-flight window — the realistic rapid double-click. Without a guard both
+    // clicks compute add:true from the still-stale `mine` and double-send.
+    let resolveReact: () => void = () => {};
+    (adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'set_message_reaction') return new Promise<void>((r) => { resolveReact = () => r(); });
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    const thumb = container.querySelector('.reaction-toolbar .quick-react') as HTMLButtonElement;
+    await fireEvent.click(thumb);
+    await fireEvent.click(thumb);
+    const reactCalls = (adapter.invoke as any).mock.calls.filter(
+      (c: any[]) => c[0] === 'set_message_reaction',
+    );
+    expect(reactCalls.length).toBe(1);
+    resolveReact();
+  });
+
   it('the picker toggle opens a grid of 10 emoji', async () => {
     const { container } = await seedPlainMessage();
     await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);

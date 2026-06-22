@@ -110,11 +110,27 @@ export class ChannelMessageService {
   ) => void;
   /**
    * Owner-id hex of the local member, used to compute `mine` for live
-   * reaction events. Set by the feed from its `ownAddress` prop. `null`
-   * until set — live `mine` is then false (list supplies authoritative
-   * `mine` on load).
+   * reaction events. Set by the feed from its `ownAddress` prop.
+   *
+   * Normalized so an empty/whitespace string (the feed passes `''` while
+   * identity is still loading) is treated as "unknown" (`null`), NOT as a
+   * real owner id. While unknown, `applyReaction` preserves the authoritative
+   * `mine` that `list_channel_messages` supplied rather than clobbering it to
+   * false (Qodo PR #318). When it transitions from unknown to a real id, the
+   * cached reaction `mine` flags self-heal so the UI needs no reload.
    */
-  selfOwnerId: string | null = null;
+  private _selfOwnerId: string | null = null;
+
+  get selfOwnerId(): string | null {
+    return this._selfOwnerId;
+  }
+
+  set selfOwnerId(value: string | null) {
+    const next = value && value.trim().length > 0 ? value : null;
+    if (next === this._selfOwnerId) return;
+    this._selfOwnerId = next;
+    if (next) this.recomputeMineFlags(next);
+  }
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
@@ -414,7 +430,8 @@ export class ChannelMessageService {
         entry.reactors.push(p.reactor);
       }
       entry.count = entry.reactors.length;
-      entry.mine = this.selfOwnerId !== null && entry.reactors.includes(this.selfOwnerId);
+      // Preserve authoritative `mine` while the owner id is unknown (Qodo #318).
+      if (this.selfOwnerId) entry.mine = entry.reactors.includes(this.selfOwnerId);
     } else {
       if (idx < 0) return; // unknown emoji — nothing to remove
       const entry = reactions[idx];
@@ -423,11 +440,34 @@ export class ChannelMessageService {
         reactions.splice(idx, 1);
       } else {
         entry.count = entry.reactors.length;
-        entry.mine = this.selfOwnerId !== null && entry.reactors.includes(this.selfOwnerId);
+        // Preserve authoritative `mine` while the owner id is unknown (Qodo #318).
+        if (this.selfOwnerId) entry.mine = entry.reactors.includes(this.selfOwnerId);
       }
     }
 
     this.notifyChannelSubscribers(key, msg);
+  }
+
+  /**
+   * Recompute cached reaction `mine` flags against `self` and notify affected
+   * channels, so a late-loading identity heals already-rendered reactions
+   * without a channel reload (Qodo PR #318).
+   */
+  private recomputeMineFlags(self: string): void {
+    for (const [key, arr] of this.byChannel) {
+      for (const msg of arr) {
+        if (!msg.reactions) continue;
+        let changed = false;
+        for (const r of msg.reactions) {
+          const mine = r.reactors.includes(self);
+          if (r.mine !== mine) {
+            r.mine = mine;
+            changed = true;
+          }
+        }
+        if (changed) this.notifyChannelSubscribers(key, msg);
+      }
+    }
   }
 
   /**

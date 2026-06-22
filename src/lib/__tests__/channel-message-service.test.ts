@@ -656,4 +656,48 @@ describe('ChannelMessageService reactions (ZEB-536 Spec 2)', () => {
     expect(msg.reactions?.[0].mine).toBe(false);
     expect(msg.reactions?.[0].reactors).toEqual([OTHER]);
   });
+
+  // Seed m1 carrying an authoritative reactions[] (as list_channel_messages does).
+  async function seedMessageWithReaction(
+    reaction: { emoji: string; count: number; mine: boolean; reactors: string[] },
+  ): Promise<void> {
+    (adapter.invoke as any).mockResolvedValue([
+      {
+        messageId: 'm1',
+        communityId: CID,
+        channelId: CHID,
+        author: OTHER,
+        at: { wallMs: 100, logical: 0, deviceId: 'd' },
+        body: [],
+        reactions: [reaction],
+      },
+    ]);
+    await service.listMessages(CID, CHID, undefined, 100);
+  }
+
+  it('does NOT clobber authoritative mine=true when selfOwnerId is empty (Qodo #318)', async () => {
+    // App.svelte passes ownAddress='' while identity is still loading, so the
+    // feed may set selfOwnerId=''. A live reaction event must NOT recompute and
+    // clobber the authoritative mine=true carried by list_channel_messages.
+    service.selfOwnerId = '';
+    await service.connectAdapter(adapter);
+    await seedMessageWithReaction({ emoji: '👍', count: 1, mine: true, reactors: [OWN] });
+    fireReaction({ reactor: OTHER, emoji: '👍', add: true });
+    const msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0].mine).toBe(true); // preserved, not clobbered
+    expect(msg.reactions?.[0].reactors).toEqual([OWN, OTHER]);
+  });
+
+  it('self-heals cached mine when selfOwnerId transitions empty -> set (Qodo #318)', async () => {
+    service.selfOwnerId = '';
+    await service.connectAdapter(adapter);
+    // mine was computed false during the empty-id window even though OWN reacted.
+    await seedMessageWithReaction({ emoji: '👍', count: 1, mine: false, reactors: [OWN] });
+    const cb = vi.fn();
+    service.subscribeToChannel(CID, CHID, cb);
+    service.selfOwnerId = OWN; // identity finishes loading
+    const msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0].mine).toBe(true); // self-healed without a reload
+    expect(cb).toHaveBeenCalled(); // subscribers notified so the feed re-renders
+  });
 });

@@ -415,15 +415,24 @@
     return msg.reactions?.some((r) => r.emoji === emoji && r.mine) ?? false;
   }
 
+  // ZEB-536 — per-(message,emoji) in-flight guard so a rapid second click does
+  // not recompute `add` from the still-stale `mine` and double-send (CodeAnt
+  // PR #318). Plain Set — internal click-dedup, no UI reactivity needed.
+  const reactionPending = new Set<string>();
+
   // ZEB-536 — toggle the local member's reaction (chips + quick-react share
-  // this). Fire-and-forget: no component-state write after the await, so no
-  // teardown guard is needed; failures are logged, not surfaced (the chip
-  // self-heals from the authoritative event / next list).
+  // this). Fire-and-forget: the only post-await write clears the non-reactive
+  // guard Set (safe after teardown); failures are logged, not surfaced (the
+  // chip self-heals from the authoritative event / next list).
   function toggleReaction(msg: ChannelMessageDto, emoji: string): void {
+    const key = `${msg.messageId}:${emoji}`;
+    if (reactionPending.has(key)) return;
     const add = !reactionMine(msg, emoji);
+    reactionPending.add(key);
     void channelMessageService
       .reactToMessage(communityId, channelId, msg.messageId, emoji, add)
-      .catch((e) => console.warn('reaction toggle failed', e instanceof Error ? e.message : String(e)));
+      .catch((e) => console.warn('reaction toggle failed', e instanceof Error ? e.message : String(e)))
+      .finally(() => reactionPending.delete(key));
   }
 
   function togglePicker(messageId: string): void {
