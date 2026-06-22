@@ -1021,6 +1021,7 @@ impl ChannelLogEngine {
         target: crate::community_channel_log::MessageId,
         emoji: String,
         add: bool,
+        emoji_attachment: Option<crate::community_channel_log::ChannelAttachment>,
     ) -> Result<(), ChannelLogEngineError> {
         if emoji.len() > crate::community_channel_log::MAX_REACTION_EMOJI_BYTES {
             return Err(ChannelLogEngineError::ReactionEmojiTooLarge {
@@ -1044,9 +1045,9 @@ impl ChannelLogEngine {
             channel_id: self.channel_id,
             author: self.self_owner,
             at: hlc,
-            // ZEB-541: unicode reaction — no custom emoji descriptor (Task 3
-            // threads a real one through the engine signature).
-            emoji_attachment: None,
+            // ZEB-541: custom-emoji CAS descriptor (None for unicode). Carried
+            // into the signed set so the reaction→emoji binding is tamper-proof.
+            emoji_attachment,
             emoji,
             add,
         };
@@ -5405,7 +5406,7 @@ mod tests {
             .await
             .expect("post");
         Arc::clone(&fix.engine)
-            .react(msg_id, "👍".to_string(), true)
+            .react(msg_id, "👍".to_string(), true, None)
             .await
             .expect("react");
         let dtos = fix
@@ -5425,7 +5426,7 @@ mod tests {
 
         // un-react converges to empty
         Arc::clone(&fix.engine)
-            .react(msg_id, "👍".to_string(), false)
+            .react(msg_id, "👍".to_string(), false, None)
             .await
             .expect("unreact");
         let dtos2 = fix
@@ -5454,7 +5455,7 @@ mod tests {
         // More reactions than the page limit, all landing between P and Q.
         for i in 0..5u8 {
             Arc::clone(&fix.engine)
-                .react(p, format!("e{i}"), true)
+                .react(p, format!("e{i}"), true, None)
                 .await
                 .expect("react");
         }
@@ -5499,7 +5500,7 @@ mod tests {
             .expect("post P");
         for i in 0..5u8 {
             Arc::clone(&fix.engine)
-                .react(p, format!("e{i}"), true)
+                .react(p, format!("e{i}"), true, None)
                 .await
                 .expect("react");
         }
@@ -5615,7 +5616,7 @@ mod tests {
 
         // A: react to the message.
         Arc::clone(&fix_a.engine)
-            .react(msg_id, "👍".to_string(), true)
+            .react(msg_id, "👍".to_string(), true, None)
             .await
             .expect("A react");
 
@@ -5697,7 +5698,7 @@ mod tests {
 
         // Un-react: A sends add=false; both nodes converge to no 👍.
         Arc::clone(&fix_a.engine)
-            .react(msg_id, "👍".to_string(), false)
+            .react(msg_id, "👍".to_string(), false, None)
             .await
             .expect("A unreact");
         let unreact_packet = fix_a

@@ -20160,6 +20160,18 @@ async fn ingest_channel_artifact(
     .await
 }
 
+/// ZEB-541: optional custom-emoji descriptor a `set_message_reaction` caller
+/// supplies to bind a reaction to a CAS-backed image emoji. The `cid` is hex
+/// (32 bytes); `mime`/`size` mirror the verify-time caps. Serializes from JS
+/// as `{ cid, mime, size }` (camelCase fields are already lowercase here).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReactionEmojiInput {
+    pub cid: String,
+    pub mime: String,
+    pub size: u64,
+}
+
 #[tauri::command]
 async fn set_message_reaction(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
@@ -20168,6 +20180,7 @@ async fn set_message_reaction(
     message_id: String,
     emoji: String,
     add: bool,
+    custom_emoji: Option<ReactionEmojiInput>,
 ) -> Result<(), String> {
     set_message_reaction_impl(
         state_lock.inner(),
@@ -20176,6 +20189,7 @@ async fn set_message_reaction(
         message_id,
         emoji,
         add,
+        custom_emoji,
     )
     .await
 }
@@ -20337,6 +20351,7 @@ pub(crate) async fn set_message_reaction_impl(
     message_id: String,
     emoji: String,
     add: bool,
+    custom_emoji: Option<ReactionEmojiInput>,
 ) -> Result<(), String> {
     if community_id.len() != 32 {
         return Err("community_id must be 16 bytes (32 hex chars)".to_string());
@@ -20363,6 +20378,35 @@ pub(crate) async fn set_message_reaction_impl(
     let chid = crate::community_membership::ChannelId(chid_bytes);
     let target = crate::community_channel_log::MessageId(mid_bytes);
 
+    // ZEB-541: decode + validate the optional custom-emoji descriptor before
+    // signing. These caps mirror `verify_channel_event` (defense-in-depth — the
+    // descriptor is also re-verified on receipt, and the bytes are content-bound
+    // by the CID).
+    let emoji_attachment = match custom_emoji {
+        None => None,
+        Some(input) => {
+            let emoji_cid: [u8; 32] = hex::decode(&input.cid)
+                .map_err(|e| format!("invalid custom emoji cid hex: {e}"))?
+                .try_into()
+                .map_err(|_| "custom emoji cid must be 32 bytes (64 hex chars)".to_string())?;
+            if !input.mime.starts_with("image/") {
+                return Err(format!("custom emoji must be an image, got {}", input.mime));
+            }
+            if input.size > MAX_CUSTOM_EMOJI_BYTES {
+                return Err(format!(
+                    "custom emoji exceeds cap: {} > {MAX_CUSTOM_EMOJI_BYTES}",
+                    input.size
+                ));
+            }
+            Some(crate::community_channel_log::ChannelAttachment {
+                cid: emoji_cid,
+                mime: input.mime,
+                name: String::new(),
+                size: input.size,
+            })
+        }
+    };
+
     let registry = {
         let guard = state
             .lock()
@@ -20379,7 +20423,7 @@ pub(crate) async fn set_message_reaction_impl(
         .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
 
     engine
-        .react(target, emoji, add)
+        .react(target, emoji, add, emoji_attachment)
         .await
         .map_err(|e| e.to_string())
 }
@@ -22955,6 +22999,227 @@ mod create_community_inner_tests {
             err.contains("unknown or unauthorized attachment"),
             "got: {err}"
         );
+    }
+
+    // ── ZEB-541: set_message_reaction_impl custom-emoji descriptor (Task 3) ──
+
+    /// The custom-emoji validation in `set_message_reaction_impl` runs before
+    /// the registry is read, so these error paths need no running node — a bare
+    /// `NodeState::default()` suffices. Valid 32-byte hex ids keep us past the
+    /// id-format gates so the custom-emoji checks are the ones that fire.
+    fn reaction_error_path_state() -> std::sync::Mutex<NodeState> {
+        std::sync::Mutex::new(NodeState::default())
+    }
+
+    const VALID_HEX_32: &str = "00112233445566778899aabbccddeeff";
+    const VALID_CID_64: &str = "0011223344556677001122334455667700112233445566770011223344556677";
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_invalid_custom_emoji_cid_hex() {
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: "zz".to_string(), // not valid hex
+                mime: "image/png".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("invalid cid hex must be rejected");
+        assert!(err.contains("invalid custom emoji cid hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_overlong_custom_emoji_cid() {
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: format!("{VALID_CID_64}00"), // valid hex but 33 bytes
+                mime: "image/png".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("overlong cid must be rejected");
+        assert!(err.contains("must be 32 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_non_image_custom_emoji() {
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: VALID_CID_64.to_string(),
+                mime: "application/zip".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("non-image mime must be rejected");
+        assert!(err.contains("must be an image"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_oversize_custom_emoji() {
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: VALID_CID_64.to_string(),
+                mime: "image/png".to_string(),
+                size: MAX_CUSTOM_EMOJI_BYTES + 1,
+            }),
+        )
+        .await
+        .expect_err("oversize custom emoji must be rejected");
+        assert!(err.contains("exceeds cap"), "got: {err}");
+    }
+
+    /// Happy path: a valid `customEmoji` appends a React carrying the emoji
+    /// attachment; the materialized DTO surfaces `emojiCid`. Stands up a real
+    /// community + channel-log engine (mirrors the artifact-authorize tests) so
+    /// the signed React flows through the engine and the reaction index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_message_reaction_happy_path_custom_emoji_surfaces_cid() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "emoji-react-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned"
+        );
+
+        let retic = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let device_hash = crate::owner_state_types::DeviceIdentityHash(retic.identity.address_hash);
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                fixture.device_id.clone(),
+                fixture.self_owner,
+                device_hash,
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x11; 32])),
+                std::sync::Arc::new(retic),
+                std::sync::Arc::clone(&fixture.signing_key),
+                fixture.enrollment_cert.clone(),
+            ),
+        ));
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(std::sync::Arc::clone(&dm_outbox)),
+            ..NodeState::default()
+        });
+
+        let channel_id_hex = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "logs".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("create_channel_impl must succeed");
+
+        let message_id_hex = post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            b"react to me".to_vec(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("post_channel_message_impl must succeed");
+
+        // React with a valid custom emoji descriptor.
+        let emoji_cid_hex = "b2".repeat(32);
+        set_message_reaction_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            message_id_hex.clone(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: emoji_cid_hex.clone(),
+                mime: "image/png".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect("custom-emoji react must succeed");
+
+        // Materialize: the message DTO's reactions must carry the custom emoji
+        // with emojiCid set and an empty unicode emoji string.
+        let dtos =
+            list_channel_messages_impl(&node_state, community_id_hex, channel_id_hex, None, 100)
+                .await
+                .expect("list_channel_messages_impl must succeed");
+        let msg = dtos
+            .iter()
+            .find(|d| d.message_id == message_id_hex)
+            .expect("the posted message must be present");
+        assert_eq!(msg.reactions.len(), 1, "exactly one reaction chip");
+        let r = &msg.reactions[0];
+        assert_eq!(r.count, 1);
+        assert!(r.mine, "the local owner reacted");
+        assert_eq!(r.emoji, "", "custom emoji uses an empty unicode field");
+        assert_eq!(
+            r.emoji_cid.as_deref(),
+            Some(emoji_cid_hex.as_str()),
+            "the materialized DTO must surface the custom emoji CID"
+        );
+        assert_eq!(r.emoji_size, Some(1024));
     }
 
     /// ZEB-540: `preview_channel_artifact_impl` must REJECT an unauthorized CID
