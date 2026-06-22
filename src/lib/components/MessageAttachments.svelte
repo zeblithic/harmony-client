@@ -10,6 +10,13 @@
     channelMessageService: ChannelMessageService;
   } = $props();
 
+  // Defense in depth: a message can carry duplicate CIDs (same file attached
+  // twice, or a malformed/old-client message). The keyed {#each} on cid throws
+  // on duplicate keys — even in production — so render each cid once.
+  let uniqueAttachments = $derived(
+    attachments.filter((a, i) => attachments.findIndex((b) => b.cid === a.cid) === i),
+  );
+
   type DownloadState = 'idle' | 'downloading' | 'saved' | 'error';
   // Per-cid state so each attachment downloads independently.
   let states = $state<Record<string, DownloadState>>({});
@@ -50,7 +57,7 @@
 </script>
 
 <div class="attachments">
-  {#each attachments as att (att.cid)}
+  {#each uniqueAttachments as att (att.cid)}
     <div class="attachment-chip" class:error={stateOf(att.cid) === 'error'}>
       <span class="att-icon" aria-hidden="true">{mimeCategoryIcon(att.mime)}</span>
       <span class="att-name" title={att.name}>{att.name}</span>

@@ -317,7 +317,12 @@
     try {
       for (const path of paths) {
         const att = await channelMessageService.ingestArtifact(communityId, path);
-        pendingAttachments = [...pendingAttachments, att];
+        // CIDs are content-addressed: the same file yields the same cid. The
+        // keyed {#each} on cid throws on duplicate keys, so skip an already-
+        // pending cid rather than add a second chip.
+        if (!pendingAttachments.some((a) => a.cid === att.cid)) {
+          pendingAttachments = [...pendingAttachments, att];
+        }
       }
     } catch (e) {
       composeError = e instanceof Error ? e.message : String(e);

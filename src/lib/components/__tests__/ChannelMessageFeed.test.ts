@@ -552,6 +552,21 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
     });
   });
 
+  it('dedupes a pending attachment with a duplicate cid', async () => {
+    openMock.mockResolvedValue(['/tmp/a.txt', '/tmp/a.txt']);
+    const { adapter, container } = await setup();
+    (adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'request_channel_backfill') return Promise.resolve(undefined);
+      if (cmd === 'ingest_channel_artifact')
+        return Promise.resolve({ cid: 'samecid', mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true });
+      if (cmd === 'post_channel_message') return Promise.resolve('mid' + 'a'.repeat(29));
+      return Promise.resolve(undefined);
+    });
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
+  });
+
   it('removing a pending attachment drops its chip', async () => {
     openMock.mockResolvedValue('/tmp/a.txt');
     const { adapter, container } = await setup();

@@ -37,6 +37,14 @@ describe('MessageAttachments', () => {
     expect(container.querySelector('.att-lock')).toBeNull();
   });
 
+  it('renders one chip and does not throw for duplicate CIDs', () => {
+    const dup = att({ cid: 'dup' });
+    const { container } = render(MessageAttachments, {
+      props: props({ attachments: [dup, { ...dup }], channelMessageService: makeService() }),
+    });
+    expect(container.querySelectorAll('.attachment-chip').length).toBe(1);
+  });
+
   it('download: save → downloadArtifact called with chosen path', async () => {
     saveMock.mockResolvedValue('/tmp/out.txt');
     const service = makeService();
