@@ -153,6 +153,24 @@ struct PostChannelMessageArgs {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SubscribeCommunityPresenceArgs {
+    community_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnsubscribeCommunityPresenceArgs {
+    community_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetCommunityPresenceArgs {
+    community_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DownloadChannelArtifactArgs {
     community_id: String,
     channel_id: String,
@@ -446,6 +464,30 @@ pub fn build_registry() -> RpcRegistry {
             )
             .await
         }
+    );
+
+    // Community presence (ZEB-537).
+    rpc!(
+        m,
+        "subscribe_community_presence",
+        SubscribeCommunityPresenceArgs,
+        |state, _sink, a| async move {
+            crate::subscribe_community_presence_impl(state, a.community_id).await
+        }
+    );
+    rpc!(
+        m,
+        "unsubscribe_community_presence",
+        UnsubscribeCommunityPresenceArgs,
+        |state, _sink, a| async move {
+            crate::unsubscribe_community_presence_impl(state, a.community_id).await
+        }
+    );
+    rpc!(
+        m,
+        "get_community_presence",
+        GetCommunityPresenceArgs,
+        |state, _sink, a| async move { crate::get_community_presence_impl(state, a.community_id).await }
     );
 
     // Friends.
@@ -931,6 +973,10 @@ mod tests {
             // channel artifacts (CAS)
             "ingest_channel_artifact",
             "download_channel_artifact",
+            // community presence (ZEB-537)
+            "subscribe_community_presence",
+            "unsubscribe_community_presence",
+            "get_community_presence",
             // friends
             "list_friends",
             "generate_friend_token",
