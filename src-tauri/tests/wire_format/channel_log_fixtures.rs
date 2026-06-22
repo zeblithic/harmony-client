@@ -248,6 +248,10 @@ fn react_packet_is_byte_stable() {
             logical: 0,
             device_id: "a-dev".to_string(),
         },
+        // ZEB-541: a unicode reaction carries no custom-emoji descriptor. The
+        // `skip_serializing_if`/`default` on `ea` keeps these bytes identical
+        // to the pre-feature React — this fixture is the additive-field canary.
+        emoji_attachment: None,
         emoji: "👍".to_string(),
         add: true,
     };
@@ -259,4 +263,57 @@ fn react_packet_is_byte_stable() {
     let actual_hex = hex::encode(&packet);
     let expected_hex = "1111111111111111111111119618335845c3f3e24629060f5af3f24bd4331d0747e919016e09d1472032a8eab95676ee115eb12d80766a500a3f69625469e13cc8a46734d7169d786378966ca04448604e8c3677404dcf27098557528ad90067215217db4e6ecf3d7e188e54c3432c2f9ca42d2991171d07b220c2b858204148fea1507c92acf5ccf5f8d6ce3a300b3a030607747180964c63b7751e222e46326772edb982a1ebd1b94811d27501bcd6484d927fd472dab74bd447f76923206c109044f66cfaf1f3fd66320a6cd26cfd60d95c7c33d4ad359988c7599a";
     assert_eq!(actual_hex, expected_hex, "react packet wire format drifted");
+}
+
+/// ZEB-541: wire-format pin for a React packet carrying a custom-emoji CAS
+/// descriptor (`ea`). Mirrors `react_packet_is_byte_stable`'s deterministic
+/// seeds + fixed nonce, the only difference being `emoji_attachment: Some(..)`,
+/// so this pin isolates the additive `ea` key's encoding (it sorts between `ci`
+/// and `em`). To regenerate the hex after an intentional schema change, run with
+/// `UPDATE_BACKFILL_FIXTURE=1` (see file header) and paste the printed value.
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn react_packet_with_emoji_attachment_is_byte_stable() {
+    let community_id = SpaceId([0xc0; 16]);
+    let channel_id = ChannelId([0x01; 16]);
+    let owner = OwnerAddr([0xa1; 16]);
+    let mk = EpochKey::new([0x77; 32]);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xa1; 32]);
+    let key = derive_channel_key(&mk, &community_id, &channel_id);
+
+    let payload = ChannelReactPayload {
+        target: MessageId([0x07; 16]),
+        community_id,
+        channel_id,
+        author: owner,
+        at: Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".to_string(),
+        },
+        emoji_attachment: Some(ChannelAttachment {
+            cid: [0xB2; 32],
+            mime: "image/png".to_string(),
+            name: String::new(),
+            size: 1024,
+        }),
+        // A custom-emoji React may carry an empty unicode grouping key.
+        emoji: String::new(),
+        add: true,
+    };
+    let event = sign_channel_react(&payload, &signing_key).expect("sign react");
+    let packet = encrypt_channel_packet_with_nonce(&key, &event, [0x11; 12]).expect("encrypt");
+    let decoded =
+        harmony_app::community_channel_log::decrypt_channel_packet(&key, &packet).expect("decrypt");
+    assert_eq!(decoded, event, "custom-emoji react packet must round-trip");
+    let actual_hex = hex::encode(&packet);
+    if std::env::var("UPDATE_BACKFILL_FIXTURE").is_ok() {
+        eprintln!("UPDATE_BACKFILL_FIXTURE (custom emoji react): {actual_hex}");
+    }
+    let expected_hex = "1111111111111111111111119618335845c3f3e24628060f5af3f24bd4331d0747e919016e09d1472032a8eab95676ee115eb12d80766a500a3f69625469e13cc8a46734d7169d786378966ca04448604e8c3677404dcf27098557528ad90067215217db4e6ecf3d7e188e54c34320ef0e58d8fcd3cccbe50795770ded95f4fd4b14e5c92719407925390324c89951aaa4817682f44a71b7abd8e6c000451247e7dfa6742bcc2f2dd615340154222b27b0fab32a5056a3710a7c200aa5131ac6b90e966e458ad6cead6c031d3c485b7d2567ce3c2d495cb9347deb149c056c756136b6417d5de21153f30294c7bb64b0635caa0822fd712bb84c706947293b288271b5548613c5422a7a8079a1516085182797e48111c5a1db";
+    assert_eq!(
+        actual_hex, expected_hex,
+        "custom-emoji react packet wire format drifted; re-pin via \
+         UPDATE_BACKFILL_FIXTURE=1 (see file header for procedure)"
+    );
 }

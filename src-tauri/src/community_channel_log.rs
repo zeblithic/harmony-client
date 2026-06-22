@@ -287,6 +287,14 @@ pub enum SignedChannelEvent {
         channel_id: ChannelId,
         #[serde(rename = "ci")]
         community_id: SpaceId,
+        /// ZEB-541: optional custom-emoji CAS descriptor. Key `ea` sorts
+        /// between `ci` and `em` in RFC 8949 bytewise key order. The
+        /// `skip_serializing_if` plus `default` keeps a unicode reaction
+        /// (`None`) byte-identical to a pre-feature React, so old and new
+        /// peers interop and the existing `react_packet_is_byte_stable`
+        /// fixture stays green.
+        #[serde(rename = "ea", skip_serializing_if = "Option::is_none", default)]
+        emoji_attachment: Option<ChannelAttachment>,
         #[serde(rename = "em")]
         emoji: String,
         #[serde(rename = "id")]
@@ -412,12 +420,18 @@ pub struct ChannelReactPayload {
     pub channel_id: ChannelId,
     pub author: OwnerAddr,
     pub at: Hlc,
+    /// ZEB-541: optional custom-emoji CAS descriptor. Carried into the signed
+    /// set (tamper-evident reaction→emoji binding). `None` for unicode
+    /// reactions, which stay wire-identical to a pre-feature React.
+    pub emoji_attachment: Option<ChannelAttachment>,
     pub emoji: String,
     pub add: bool,
 }
 
 /// Pre-signature signed-set for a React (everything except `sg`).
-/// 2-char keys in RFC-8949 bytewise order: ad, at, au, ch, ci, em, id.
+/// 2-char keys in RFC-8949 bytewise order: ad, at, au, ch, ci, ea, em, id.
+/// `ea` (ZEB-541 custom-emoji descriptor) sorts between `ci` and `em`; it is
+/// skipped when `None` so a unicode reaction's signed bytes are unchanged.
 #[derive(Serialize)]
 struct ChannelReactSignedSet<'a> {
     #[serde(rename = "ad")]
@@ -430,6 +444,8 @@ struct ChannelReactSignedSet<'a> {
     channel_id: &'a ChannelId,
     #[serde(rename = "ci")]
     community_id: &'a SpaceId,
+    #[serde(rename = "ea", skip_serializing_if = "Option::is_none", default)]
+    emoji_attachment: &'a Option<ChannelAttachment>,
     #[serde(rename = "em")]
     emoji: &'a str,
     #[serde(rename = "id")]
@@ -482,6 +498,10 @@ pub enum ChannelEventError {
     TooManyAttachments { count: usize, max: usize },
     #[error("reaction emoji too large: {len} bytes (max {max})")]
     EmojiTooLarge { len: usize, max: usize },
+    #[error("custom emoji exceeds cap: {size} bytes (max {max})")]
+    CustomEmojiTooLarge { size: u64, max: u64 },
+    #[error("custom emoji must be an image (mime: {mime})")]
+    CustomEmojiNotImage { mime: String },
     #[error("attachment name/mime too long (max {max} bytes)")]
     AttachmentFieldTooLong { max: usize },
     #[error("attachment too large: {size} bytes (max {max})")]
@@ -550,6 +570,7 @@ pub fn sign_channel_react(
         author: payload.author,
         channel_id: payload.channel_id,
         community_id: payload.community_id,
+        emoji_attachment: payload.emoji_attachment.clone(),
         emoji: payload.emoji.clone(),
         target: payload.target,
         sig: [0u8; 64],
@@ -603,6 +624,7 @@ fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, Chan
             author,
             channel_id,
             community_id,
+            emoji_attachment,
             emoji,
             target,
             sig: _,
@@ -613,6 +635,7 @@ fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, Chan
                 author,
                 channel_id,
                 community_id,
+                emoji_attachment,
                 emoji,
                 target,
             };
@@ -1065,12 +1088,38 @@ where
     // emoji-cap rejection is distinguishable from a membership/authorization
     // failure without string-parsing — logging, metrics, and error-mapping can
     // tell the two apart (Greptile PR #314).
-    if let SignedChannelEvent::React { emoji, .. } = event {
+    if let SignedChannelEvent::React {
+        emoji,
+        emoji_attachment,
+        ..
+    } = event
+    {
         if emoji.len() > MAX_REACTION_EMOJI_BYTES {
             return Err(ChannelEventError::EmojiTooLarge {
                 len: emoji.len(),
                 max: MAX_REACTION_EMOJI_BYTES,
             });
+        }
+        // ZEB-541: a React may carry at most ONE custom-emoji CAS descriptor
+        // (structurally guaranteed by the `Option` type). When present, apply
+        // the same cheap pre-auth caps the artifact path uses: a signed blob
+        // larger than the serve cap could never be previewed, and a non-image
+        // mime can't render in the emoji chip — reject both before the async
+        // membership/signature gate. The signature already covers
+        // `emoji_attachment` (it's in the signed set), so a peer cannot rebind
+        // a reaction to a different emoji CID without invalidating `sg`.
+        if let Some(att) = emoji_attachment {
+            if att.size > crate::MAX_CUSTOM_EMOJI_BYTES {
+                return Err(ChannelEventError::CustomEmojiTooLarge {
+                    size: att.size,
+                    max: crate::MAX_CUSTOM_EMOJI_BYTES,
+                });
+            }
+            if !att.mime.starts_with("image/") {
+                return Err(ChannelEventError::CustomEmojiNotImage {
+                    mime: att.mime.clone(),
+                });
+            }
         }
     }
 
@@ -4030,6 +4079,7 @@ mod tests {
             channel_id,
             author,
             at,
+            emoji_attachment: None,
             emoji: "👍".to_string(),
             add: true,
         };
@@ -4088,6 +4138,7 @@ mod tests {
             channel_id,
             author,
             at,
+            emoji_attachment: None,
             emoji: "👍".to_string(),
             add: true,
         };
@@ -4120,6 +4171,7 @@ mod tests {
             channel_id,
             author,
             at,
+            emoji_attachment: None,
             emoji: oversized,
             add: true,
         };
@@ -4155,6 +4207,7 @@ mod tests {
             channel_id,
             author,
             at,
+            emoji_attachment: None,
             emoji: "✅".to_string(),
             add: true,
         };
@@ -4182,6 +4235,7 @@ mod tests {
             channel_id,
             author,
             at: at.clone(),
+            emoji_attachment: None,
             emoji: "👍".to_string(),
             add: true,
         };
@@ -4194,6 +4248,145 @@ mod tests {
         verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
             .await
             .expect("verify react");
+    }
+
+    // ── ZEB-541: custom-emoji React verify caps ─────────────────────────────
+
+    /// Helper: build a custom-emoji React payload with a given emoji descriptor.
+    fn custom_emoji_react_payload(
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        author: OwnerAddr,
+        emoji_attachment: Option<ChannelAttachment>,
+    ) -> ChannelReactPayload {
+        ChannelReactPayload {
+            target: MessageId([7u8; 16]),
+            community_id,
+            channel_id,
+            author,
+            at: Hlc {
+                wall_ms: 100_000,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+            emoji_attachment,
+            // customs carry an empty unicode grouping key
+            emoji: String::new(),
+            add: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_react_rejects_oversized_custom_emoji() {
+        let state = fixture_state_with_alice_joined();
+        let (signing_key, author, _pub64) = fixture_identity(0xa1);
+        let community_id = fixture_community(0xc0);
+        let channel_id = fixture_channel(0x01);
+        let att = ChannelAttachment {
+            cid: [0xB2; 32],
+            mime: "image/png".to_string(),
+            name: String::new(),
+            size: crate::MAX_CUSTOM_EMOJI_BYTES + 1,
+        };
+        let payload = custom_emoji_react_payload(community_id, channel_id, author, Some(att));
+        let event = sign_channel_react(&payload, &signing_key).expect("sign react");
+        let mut tracker = ChannelLogReplayTracker::new();
+        let err = verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+            .await
+            .expect_err("oversized custom emoji must fail verify");
+        assert!(
+            matches!(
+                err,
+                ChannelEventError::CustomEmojiTooLarge { size, max }
+                    if size == crate::MAX_CUSTOM_EMOJI_BYTES + 1 && max == crate::MAX_CUSTOM_EMOJI_BYTES
+            ),
+            "expected CustomEmojiTooLarge, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_react_rejects_non_image_custom_emoji() {
+        let state = fixture_state_with_alice_joined();
+        let (signing_key, author, _pub64) = fixture_identity(0xa1);
+        let community_id = fixture_community(0xc0);
+        let channel_id = fixture_channel(0x01);
+        let att = ChannelAttachment {
+            cid: [0xB2; 32],
+            mime: "application/zip".to_string(),
+            name: String::new(),
+            size: 1024,
+        };
+        let payload = custom_emoji_react_payload(community_id, channel_id, author, Some(att));
+        let event = sign_channel_react(&payload, &signing_key).expect("sign react");
+        let mut tracker = ChannelLogReplayTracker::new();
+        let err = verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+            .await
+            .expect_err("non-image custom emoji must fail verify");
+        assert!(
+            matches!(
+                err,
+                ChannelEventError::CustomEmojiNotImage { ref mime } if mime == "application/zip"
+            ),
+            "expected CustomEmojiNotImage, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_react_accepts_valid_custom_emoji() {
+        let state = fixture_state_with_alice_joined();
+        let (signing_key, author, _pub64) = fixture_identity(0xa1);
+        let community_id = fixture_community(0xc0);
+        let channel_id = fixture_channel(0x01);
+        let att = ChannelAttachment {
+            cid: [0xB2; 32],
+            mime: "image/png".to_string(),
+            name: String::new(),
+            size: 1024,
+        };
+        let payload = custom_emoji_react_payload(community_id, channel_id, author, Some(att));
+        let event = sign_channel_react(&payload, &signing_key).expect("sign react");
+        let mut tracker = ChannelLogReplayTracker::new();
+        verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+            .await
+            .expect("a valid custom-emoji react must verify");
+    }
+
+    #[tokio::test]
+    async fn verify_react_rejects_tampered_custom_emoji_cid() {
+        // The signature covers `emoji_attachment` (it's in the signed set), so
+        // rebinding a reaction to a different emoji CID after signing must
+        // invalidate `sg`.
+        let state = fixture_state_with_alice_joined();
+        let (signing_key, author, _pub64) = fixture_identity(0xa1);
+        let community_id = fixture_community(0xc0);
+        let channel_id = fixture_channel(0x01);
+        let att = ChannelAttachment {
+            cid: [0xB2; 32],
+            mime: "image/png".to_string(),
+            name: String::new(),
+            size: 1024,
+        };
+        let payload = custom_emoji_react_payload(community_id, channel_id, author, Some(att));
+        let mut event = sign_channel_react(&payload, &signing_key).expect("sign react");
+        if let SignedChannelEvent::React {
+            emoji_attachment: Some(att),
+            ..
+        } = &mut event
+        {
+            // flip the CID after signing — the descriptor is still a valid
+            // image under cap, so only the signature check can catch this.
+            att.cid = [0xC3; 32];
+        } else {
+            panic!("expected a custom-emoji React");
+        }
+        let mut tracker = ChannelLogReplayTracker::new();
+        let err = verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+            .await
+            .expect_err("tampered emoji CID must fail verify");
+        assert!(
+            matches!(err, ChannelEventError::BadSignature),
+            "expected BadSignature, got {err:?}"
+        );
     }
 
     // ── ReactionIndex + ReactionDto tests (Task 2) ──────────────────────────
@@ -4211,6 +4404,7 @@ mod tests {
             add,
             author,
             target,
+            emoji_attachment: None,
             emoji: emoji.to_string(),
             community_id: SpaceId([0u8; 16]),
             channel_id: ChannelId([0u8; 16]),
@@ -4334,6 +4528,7 @@ mod tests {
             author,
             community_id: cid,
             channel_id: chid,
+            emoji_attachment: None,
             emoji: emoji.to_string(),
             add,
             at: Hlc {

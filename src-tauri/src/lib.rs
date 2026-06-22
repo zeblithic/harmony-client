@@ -20395,6 +20395,10 @@ pub(crate) const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 /// this command also rejects defensively.
 pub(crate) const MAX_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Hard cap on a custom reaction emoji blob (plaintext). Tiny by design; a 128x128
+/// PNG is well under this. Enforced at verify (write) and at preview (serve).
+pub(crate) const MAX_CUSTOM_EMOJI_BYTES: u64 = 256 * 1024;
+
 /// ZEB-535: minimal extension -> MIME map for channel artifacts. Content
 /// sniffing is intentionally out of scope; an unknown extension falls back to
 /// `application/octet-stream` (the frontend treats that as a generic download).

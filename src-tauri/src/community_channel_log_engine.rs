@@ -1044,6 +1044,9 @@ impl ChannelLogEngine {
             channel_id: self.channel_id,
             author: self.self_owner,
             at: hlc,
+            // ZEB-541: unicode reaction — no custom emoji descriptor (Task 3
+            // threads a real one through the engine signature).
+            emoji_attachment: None,
             emoji,
             add,
         };
