@@ -107,6 +107,11 @@
     const cid = communityId;
     const chid = channelId;
     let cancelled = false;
+    // ZEB-536: keep selfOwnerId current for live `mine` on reaction events.
+    // Set here (not just onMount) so it survives a service destroy()/reuse and
+    // channel switches; safe because there is a single local owner and
+    // list_channel_messages carries authoritative `mine` on (re)open.
+    channelMessageService.selfOwnerId = ownAddress;
     // Fresh local mirror per channel switch.
     messages = [];
     composeError = null;
@@ -209,10 +214,6 @@
   });
 
   onMount(() => {
-    // ZEB-536: live `mine` on reaction events needs the local owner id.
-    // ownAddress is the same owner-id hex as reaction reactors[].
-    channelMessageService.selfOwnerId = ownAddress;
-
     // Hook progress notifications. We chain rather than overwrite so that
     // CommunityView (which also wants progress) still gets called. Per spec
     // §8.3 the service emits per-channel progress; we filter to ours.
@@ -527,7 +528,7 @@
               type="button"
               class="picker-toggle"
               aria-label="More reactions"
-              aria-haspopup="true"
+              aria-haspopup="menu"
               aria-expanded={pickerOpenFor === msg.messageId}
               onclick={() => togglePicker(msg.messageId)}
             >😊</button>

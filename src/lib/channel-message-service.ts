@@ -347,9 +347,11 @@ export class ChannelMessageService {
     this.notifyChannelSubscribers(key, msg);
   }
 
-  /** Set or clear the local member's reaction on a message. Fire-and-the
-   *  result returns to the feed via the channel-reaction-received event
-   *  (the backend echoes local React events back through the same path). */
+  /**
+   * Set or clear the local member's reaction on a message. Fire-and-forget;
+   * the result returns to the feed via the channel-reaction-received event
+   * (the backend echoes local React events back through the same path).
+   */
   async reactToMessage(
     communityId: string,
     channelId: string,

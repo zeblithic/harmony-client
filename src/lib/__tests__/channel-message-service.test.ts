@@ -471,4 +471,19 @@ describe('ChannelMessageService reactions (ZEB-536 Spec 2)', () => {
     service.destroy();
     expect(adapter.listeners.has('channel-reaction-received')).toBe(false);
   });
+
+  it('mine goes false when the local owner removes their own reaction (non-zero remainder)', async () => {
+    service.selfOwnerId = OWN;
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    fireReaction({ reactor: OTHER, add: true });
+    fireReaction({ reactor: OWN, add: true });
+    let msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0].mine).toBe(true);
+    fireReaction({ reactor: OWN, add: false });
+    msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0].count).toBe(1);
+    expect(msg.reactions?.[0].mine).toBe(false);
+    expect(msg.reactions?.[0].reactors).toEqual([OTHER]);
+  });
 });
