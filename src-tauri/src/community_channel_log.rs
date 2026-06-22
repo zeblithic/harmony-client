@@ -859,7 +859,10 @@ pub struct ReactionDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emoji_cid: Option<String>,
     /// ZEB-541: stored blob size (bytes) of the custom emoji. `None` for
-    /// unicode reactions. Serializes as `emojiSize`.
+    /// unicode reactions. Serializes as `emojiSize`. Advisory render hint only,
+    /// NOT a trust boundary — it is the signer-asserted descriptor size (first
+    /// seen wins per key). The serve path hard-caps the fetch server-side
+    /// regardless, so a wrong/hostile value cannot enlarge the render.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emoji_size: Option<u64>,
 }
@@ -893,8 +896,9 @@ fn custom_emoji_key(cid: &[u8; 32]) -> String {
 }
 
 /// In-memory LWW materialization of reactions over a channel's events.
-/// Keyed target → emoji → author → (latest HLC, present). Derived view —
-/// always reconstructable by folding the log through `apply`.
+/// Keyed target → key → author → (latest HLC, present), where `key` is the
+/// unicode emoji string or a CID-derived sentinel key for custom emoji. Derived
+/// view — always reconstructable by folding the log through `apply`.
 #[derive(Debug, Default, Clone)]
 pub struct ReactionIndex {
     by_target: BTreeMap<MessageId, ReactionEmojiMap>,
