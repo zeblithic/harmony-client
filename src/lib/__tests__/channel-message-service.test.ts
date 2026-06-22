@@ -485,3 +485,219 @@ describe('ChannelMessageService', () => {
     ).rejects.toThrow(/adapter not connected/);
   });
 });
+
+describe('ChannelMessageService reactions (ZEB-536 Spec 2)', () => {
+  let service: ChannelMessageService;
+  let adapter: ReturnType<typeof makeAdapter>;
+  const CID = 'aa'.repeat(16);
+  const CHID = 'bb'.repeat(16);
+  const OWN = 'cc'.repeat(16);
+  const OTHER = 'dd'.repeat(16);
+
+  beforeEach(() => {
+    service = new ChannelMessageService();
+    adapter = makeAdapter();
+  });
+
+  // Seed one message ('m1') into the per-channel cache via listMessages.
+  async function seedMessage(): Promise<void> {
+    (adapter.invoke as any).mockResolvedValue([
+      {
+        messageId: 'm1',
+        communityId: CID,
+        channelId: CHID,
+        author: OTHER,
+        at: { wallMs: 100, logical: 0, deviceId: 'd' },
+        body: [],
+      },
+    ]);
+    await service.listMessages(CID, CHID, undefined, 100);
+  }
+
+  function fireReaction(over: Record<string, unknown> = {}): void {
+    const handler = adapter.listeners.get('channel-reaction-received')!;
+    handler({
+      payload: {
+        communityId: CID,
+        channelId: CHID,
+        messageId: 'm1',
+        reactor: OTHER,
+        emoji: '👍',
+        add: true,
+        at: { wallMs: 200, logical: 0, deviceId: 'd' },
+        ...over,
+      },
+    });
+  }
+
+  it('connectAdapter installs the channel-reaction-received listener', async () => {
+    await service.connectAdapter(adapter);
+    expect(adapter.listeners.has('channel-reaction-received')).toBe(true);
+  });
+
+  it('applyReaction add creates a chip entry with count 1', async () => {
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    fireReaction();
+    const msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions).toEqual([
+      { emoji: '👍', count: 1, mine: false, reactors: [OTHER] },
+    ]);
+  });
+
+  it('a second distinct reactor increments count to 2', async () => {
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    fireReaction({ reactor: OTHER });
+    fireReaction({ reactor: OWN });
+    const msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0].count).toBe(2);
+    expect(msg.reactions?.[0].reactors).toEqual([OTHER, OWN]);
+  });
+
+  it('mine reflects selfOwnerId membership in reactors', async () => {
+    service.selfOwnerId = OWN;
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    fireReaction({ reactor: OWN });
+    const msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0].mine).toBe(true);
+  });
+
+  it('remove decrements and drops the entry at zero reactors', async () => {
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    fireReaction({ reactor: OTHER, add: true });
+    fireReaction({ reactor: OTHER, add: false });
+    const msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions).toEqual([]);
+  });
+
+  it('duplicate add (idempotent redelivery) does not double-count', async () => {
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    fireReaction({ reactor: OTHER, add: true });
+    fireReaction({ reactor: OTHER, add: true });
+    const msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0].count).toBe(1);
+  });
+
+  it('a reaction for an unloaded message is a no-op (no throw, no cache entry)', async () => {
+    await service.connectAdapter(adapter);
+    expect(() => fireReaction({ messageId: 'ghost' })).not.toThrow();
+    expect(service.getMessages(CID, CHID)).toEqual([]);
+  });
+
+  it('applyReaction notifies channel subscribers (feed re-render hook)', async () => {
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    const cb = vi.fn();
+    service.subscribeToChannel(CID, CHID, cb);
+    fireReaction();
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('applyReaction does NOT fire onMessage (no spurious roster refetch)', async () => {
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    const onMessage = vi.fn();
+    service.onMessage = onMessage;
+    fireReaction();
+    expect(onMessage).not.toHaveBeenCalled();
+  });
+
+  it('reactToMessage invokes set_message_reaction with camelCase args', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.reactToMessage(CID, CHID, 'm1', '👍', true);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+      communityId: CID,
+      channelId: CHID,
+      messageId: 'm1',
+      emoji: '👍',
+      add: true,
+    });
+  });
+
+  it('reactToMessage throws when the adapter is not connected', async () => {
+    await expect(
+      service.reactToMessage(CID, CHID, 'm1', '👍', true),
+    ).rejects.toThrow(/adapter not connected/);
+  });
+
+  it('reactToMessage normalizes a raw-string IPC rejection into an Error', async () => {
+    // Production IPC rejections are raw strings (Error objects only in tests);
+    // reactToMessage must wrap them so callers reading `.message` keep the
+    // detail. Mirrors postMessage / ingestArtifact.
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockRejectedValue('message_id must be 16 bytes (32 hex chars)');
+    await expect(
+      service.reactToMessage(CID, CHID, 'm1', '👍', true),
+    ).rejects.toThrow('message_id must be 16 bytes (32 hex chars)');
+  });
+
+  it('destroy removes the reaction listener', async () => {
+    await service.connectAdapter(adapter);
+    service.destroy();
+    expect(adapter.listeners.has('channel-reaction-received')).toBe(false);
+  });
+
+  it('mine goes false when the local owner removes their own reaction (non-zero remainder)', async () => {
+    service.selfOwnerId = OWN;
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    fireReaction({ reactor: OTHER, add: true });
+    fireReaction({ reactor: OWN, add: true });
+    let msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0].mine).toBe(true);
+    fireReaction({ reactor: OWN, add: false });
+    msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0].count).toBe(1);
+    expect(msg.reactions?.[0].mine).toBe(false);
+    expect(msg.reactions?.[0].reactors).toEqual([OTHER]);
+  });
+
+  // Seed m1 carrying an authoritative reactions[] (as list_channel_messages does).
+  async function seedMessageWithReaction(
+    reaction: { emoji: string; count: number; mine: boolean; reactors: string[] },
+  ): Promise<void> {
+    (adapter.invoke as any).mockResolvedValue([
+      {
+        messageId: 'm1',
+        communityId: CID,
+        channelId: CHID,
+        author: OTHER,
+        at: { wallMs: 100, logical: 0, deviceId: 'd' },
+        body: [],
+        reactions: [reaction],
+      },
+    ]);
+    await service.listMessages(CID, CHID, undefined, 100);
+  }
+
+  it('does NOT clobber authoritative mine=true when selfOwnerId is empty (Qodo #318)', async () => {
+    // App.svelte passes ownAddress='' while identity is still loading, so the
+    // feed may set selfOwnerId=''. A live reaction event must NOT recompute and
+    // clobber the authoritative mine=true carried by list_channel_messages.
+    service.selfOwnerId = '';
+    await service.connectAdapter(adapter);
+    await seedMessageWithReaction({ emoji: '👍', count: 1, mine: true, reactors: [OWN] });
+    fireReaction({ reactor: OTHER, emoji: '👍', add: true });
+    const msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0].mine).toBe(true); // preserved, not clobbered
+    expect(msg.reactions?.[0].reactors).toEqual([OWN, OTHER]);
+  });
+
+  it('self-heals cached mine when selfOwnerId transitions empty -> set (Qodo #318)', async () => {
+    service.selfOwnerId = '';
+    await service.connectAdapter(adapter);
+    // mine was computed false during the empty-id window even though OWN reacted.
+    await seedMessageWithReaction({ emoji: '👍', count: 1, mine: false, reactors: [OWN] });
+    const cb = vi.fn();
+    service.subscribeToChannel(CID, CHID, cb);
+    service.selfOwnerId = OWN; // identity finishes loading
+    const msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0].mine).toBe(true); // self-healed without a reload
+    expect(cb).toHaveBeenCalled(); // subscribers notified so the feed re-renders
+  });
+});

@@ -63,6 +63,22 @@ interface ChannelBackfillProgressPayload {
   totalEstimate?: number;
 }
 
+/**
+ * ZEB-536 Spec 2 — payload of the `channel-reaction-received` event.
+ * `reactor` and the message's reaction `reactors[]` are owner-id hex
+ * (same space as `ChannelMessageDto.author`). `at` is ignored in v1
+ * (no frontend LWW-by-HLC; list reseeds on channel open).
+ */
+interface ChannelReactionReceivedPayload {
+  communityId: string;
+  channelId: string;
+  messageId: string;
+  reactor: string;
+  emoji: string;
+  add: boolean;
+  at: HlcDto;
+}
+
 function chKey(communityId: string, channelId: string): string {
   return `${communityId}:${channelId}`;
 }
@@ -92,6 +108,29 @@ export class ChannelMessageService {
     fetched: number,
     totalEstimate?: number,
   ) => void;
+  /**
+   * Owner-id hex of the local member, used to compute `mine` for live
+   * reaction events. Set by the feed from its `ownAddress` prop.
+   *
+   * Normalized so an empty/whitespace string (the feed passes `''` while
+   * identity is still loading) is treated as "unknown" (`null`), NOT as a
+   * real owner id. While unknown, `applyReaction` preserves the authoritative
+   * `mine` that `list_channel_messages` supplied rather than clobbering it to
+   * false (Qodo PR #318). When it transitions from unknown to a real id, the
+   * cached reaction `mine` flags self-heal so the UI needs no reload.
+   */
+  private _selfOwnerId: string | null = null;
+
+  get selfOwnerId(): string | null {
+    return this._selfOwnerId;
+  }
+
+  set selfOwnerId(value: string | null) {
+    const next = value && value.trim().length > 0 ? value : null;
+    if (next === this._selfOwnerId) return;
+    this._selfOwnerId = next;
+    if (next) this.recomputeMineFlags(next);
+  }
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
@@ -121,6 +160,12 @@ export class ChannelMessageService {
       this.onBackfillProgress?.(p.communityId, p.channelId, p.fetched, p.totalEstimate);
     });
     this.unlisteners.push(unlistenProgress);
+
+    const unlistenReaction = await adapter.listen('channel-reaction-received', (event) => {
+      const p = event.payload as ChannelReactionReceivedPayload;
+      this.applyReaction(p);
+    });
+    this.unlisteners.push(unlistenReaction);
   }
 
   /** Post a message. Returns the engine-minted messageId hex. */
@@ -308,6 +353,7 @@ export class ChannelMessageService {
     this.subscribers.clear();
     this.inFlightBackfill.clear();
     this.seenIds.clear();
+    this.selfOwnerId = null;
     this.adapter = null;
   }
 
@@ -337,6 +383,13 @@ export class ChannelMessageService {
     } catch (e) {
       console.error(`ChannelMessageService onMessage failed for ${key}:`, e);
     }
+    this.notifyChannelSubscribers(key, message);
+  }
+
+  /** Fan out to this channel's subscribers only (no onMessage — used by
+   *  both ingest and applyReaction; the latter must not trigger the
+   *  onMessage roster-refetch path). */
+  private notifyChannelSubscribers(key: string, message: ChannelMessageDto): void {
     const subs = this.subscribers.get(key);
     if (subs) {
       for (const cb of subs) {
@@ -346,6 +399,104 @@ export class ChannelMessageService {
           console.error(`ChannelMessageService subscriber failed for ${key}:`, e);
         }
       }
+    }
+  }
+
+  /**
+   * ZEB-536 Spec 2 — apply a live reaction event in place. Finds the
+   * cached message by id (drops if not loaded — list will carry the
+   * materialized reactions when it loads), then add/removes the reactor
+   * from the emoji's `reactors` set, recomputes `count`/`mine`, and
+   * notifies the channel's subscribers so the feed re-renders. Plain set
+   * semantics — `at` is ignored (no frontend LWW in v1).
+   */
+  private applyReaction(p: ChannelReactionReceivedPayload): void {
+    const key = chKey(p.communityId, p.channelId);
+    const arr = this.byChannel.get(key);
+    if (!arr) return;
+    const msg = arr.find((m) => m.messageId === p.messageId);
+    if (!msg) return;
+
+    const reactions = msg.reactions ?? (msg.reactions = []);
+    const idx = reactions.findIndex((r) => r.emoji === p.emoji);
+
+    if (p.add) {
+      let entry = idx >= 0 ? reactions[idx] : undefined;
+      if (!entry) {
+        entry = { emoji: p.emoji, count: 0, mine: false, reactors: [] };
+        reactions.push(entry);
+      }
+      if (!entry.reactors.includes(p.reactor)) {
+        entry.reactors.push(p.reactor);
+      }
+      entry.count = entry.reactors.length;
+      // Preserve authoritative `mine` while the owner id is unknown (Qodo #318).
+      if (this.selfOwnerId) entry.mine = entry.reactors.includes(this.selfOwnerId);
+    } else {
+      if (idx < 0) return; // unknown emoji — nothing to remove
+      const entry = reactions[idx];
+      entry.reactors = entry.reactors.filter((a) => a !== p.reactor);
+      if (entry.reactors.length === 0) {
+        reactions.splice(idx, 1);
+      } else {
+        entry.count = entry.reactors.length;
+        // Preserve authoritative `mine` while the owner id is unknown (Qodo #318).
+        if (this.selfOwnerId) entry.mine = entry.reactors.includes(this.selfOwnerId);
+      }
+    }
+
+    this.notifyChannelSubscribers(key, msg);
+  }
+
+  /**
+   * Recompute cached reaction `mine` flags against `self` and notify affected
+   * channels, so a late-loading identity heals already-rendered reactions
+   * without a channel reload (Qodo PR #318).
+   */
+  private recomputeMineFlags(self: string): void {
+    for (const [key, arr] of this.byChannel) {
+      for (const msg of arr) {
+        if (!msg.reactions) continue;
+        let changed = false;
+        for (const r of msg.reactions) {
+          const mine = r.reactors.includes(self);
+          if (r.mine !== mine) {
+            r.mine = mine;
+            changed = true;
+          }
+        }
+        if (changed) this.notifyChannelSubscribers(key, msg);
+      }
+    }
+  }
+
+  /**
+   * Set or clear the local member's reaction on a message. Fire-and-forget;
+   * the result returns to the feed via the channel-reaction-received event
+   * (the backend echoes local React events back through the same path).
+   */
+  async reactToMessage(
+    communityId: string,
+    channelId: string,
+    messageId: string,
+    emoji: string,
+    add: boolean,
+  ): Promise<void> {
+    if (!this.adapter) throw new Error('ChannelMessageService.reactToMessage: adapter not connected');
+    try {
+      await this.adapter.invoke('set_message_reaction', {
+        communityId,
+        channelId,
+        messageId,
+        emoji,
+        add,
+      });
+    } catch (e: unknown) {
+      // Tauri IPC rejections are raw strings in production (Error objects only
+      // in tests). Normalize so callers reading `.message` keep the rejection
+      // detail. Mirrors postMessage / MessageService.send.
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
     }
   }
 }
