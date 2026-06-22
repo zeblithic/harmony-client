@@ -19956,6 +19956,26 @@ async fn post_channel_message(
     post_channel_message_impl(state_lock.inner(), community_id, channel_id, body, reply_to).await
 }
 
+#[tauri::command]
+async fn set_message_reaction(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+    message_id: String,
+    emoji: String,
+    add: bool,
+) -> Result<(), String> {
+    set_message_reaction_impl(
+        state_lock.inner(),
+        community_id,
+        channel_id,
+        message_id,
+        emoji,
+        add,
+    )
+    .await
+}
+
 /// ZEB-445: shared IPC/RPC seam.
 pub(crate) async fn post_channel_message_impl(
     state: &std::sync::Mutex<NodeState>,
@@ -20016,6 +20036,61 @@ pub(crate) async fn post_channel_message_impl(
         .await
         .map_err(|e| e.to_string())?;
     Ok(hex::encode(msg_id.0))
+}
+
+/// ZEB-536: shared IPC/RPC seam — set/clear a reaction on a channel message.
+pub(crate) async fn set_message_reaction_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    channel_id: String,
+    message_id: String,
+    emoji: String,
+    add: bool,
+) -> Result<(), String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    if channel_id.len() != 32 {
+        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    if message_id.len() != 32 {
+        return Err("message_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "channel_id length wrong".to_string())?;
+    let mid_bytes: [u8; 16] = hex::decode(&message_id)
+        .map_err(|e| format!("invalid message_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "message_id length wrong".to_string())?;
+    let cid = crate::owner_state_types::SpaceId(cid_bytes);
+    let chid = crate::community_membership::ChannelId(chid_bytes);
+    let target = crate::community_channel_log::MessageId(mid_bytes);
+
+    let registry = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard
+            .channel_log_registry
+            .as_ref()
+            .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?
+            .clone()
+    };
+    let engine = registry
+        .engine(&cid, &chid)
+        .await
+        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+
+    engine
+        .react(target, emoji, add)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Tauri IPC: list locally-known messages in a channel.
@@ -20097,15 +20172,12 @@ pub(crate) async fn list_channel_messages_impl(
         device_id: h.device_id,
     });
 
-    let events = engine
-        .list_messages(since_hlc, limit as usize)
+    let dtos = engine
+        .list_message_dtos(since_hlc, limit as usize)
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(events
-        .into_iter()
-        .map(|ev| engine.event_to_dto(&ev))
-        .collect())
+    Ok(dtos)
 }
 
 /// Tauri IPC: fire a backfill request via the channel's Zenoh queryable.
@@ -45911,6 +45983,7 @@ pub fn run() {
             list_channels,
             list_channel_messages,
             post_channel_message,
+            set_message_reaction,
             request_channel_backfill,
             list_libraries,
             list_discovered_libraries,
