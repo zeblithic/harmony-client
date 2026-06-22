@@ -7,6 +7,8 @@
   import Avatar from './Avatar.svelte';
   import PollMessage from './PollMessage.svelte';
   import MessageAttachments from './MessageAttachments.svelte';
+  import ReactionEmojiImage from './ReactionEmojiImage.svelte';
+  import { normalizeEmoji } from '../emoji-normalize';
   import { open } from '@tauri-apps/plugin-dialog';
   import { formatBytes, mimeCategoryIcon } from '../file-utils';
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
@@ -128,9 +130,13 @@
     pickerOpenFor = null;
     composeError = null;
     loadError = null;
+    reactionError = null;
     backfillProgress = null;
     pendingAttachments = [];
     ingesting = false;
+    // ZEB-541: drop any in-flight custom-emoji pick target so a late ingest
+    // can't react on the new channel (the epoch bump below is the hard guard).
+    customEmojiFor = null;
     attachEpoch += 1;
     // Phase 4 round-1 fixup: also reset scroll/backfill state to avoid
     // bleed-over between channels (Qodo PR #97 finding).
@@ -448,6 +454,78 @@
       .catch((e) => console.warn('reaction pick failed', e instanceof Error ? e.message : String(e)));
   }
 
+  // ZEB-541 — custom (CAS-backed image) emoji reaction. The hidden file input is
+  // shared across messages; `customEmojiFor` records which message the in-flight
+  // pick targets (cleared on channel switch via the $effect below). A surfaced
+  // error message for the most recent custom-emoji pick attempt.
+  let customEmojiInput: HTMLInputElement | undefined = $state();
+  let customEmojiFor: string | null = null;
+  let reactionError = $state<string | null>(null);
+
+  // Open the OS file picker for a custom emoji on `msg`. Mirrors the avatar
+  // File-acquisition flow (ProfileEditor): a native <input type="file"> whose
+  // change handler reads `files[0]` — a real web `File`, which `normalizeEmoji`
+  // requires (the attachment compose path's plugin-dialog returns a path, not a
+  // File, so it is NOT reused here).
+  function startCustomEmojiPick(msg: ChannelMessageDto): void {
+    pickerOpenFor = null;
+    reactionError = null;
+    customEmojiFor = msg.messageId;
+    customEmojiInput?.click();
+  }
+
+  // normalize → ingest → react with the minted CID. Guard the async pipeline
+  // against a channel switch with the SAME `attachEpoch` epoch the attachment
+  // compose path uses: a switch bumps `attachEpoch`, so an ingest completing
+  // after the user navigated away drops its result instead of reacting on the
+  // wrong (community, channel).
+  async function handleCustomEmojiPick(e: Event): Promise<void> {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    const messageId = customEmojiFor;
+    // Reset the input + the target so a repeated pick of the same file re-fires
+    // change, and a stale target can't leak into a later pick.
+    input.value = '';
+    customEmojiFor = null;
+    if (!file || !messageId) return;
+    const epoch = attachEpoch;
+    const cid = communityId;
+    const chid = channelId;
+    try {
+      const bytes = await normalizeEmoji(file);
+      if (epoch !== attachEpoch) return; // channel switched mid-normalize
+      const { cid: emojiCid, size } = await channelMessageService.ingestEmojiBytes(cid, bytes);
+      if (epoch !== attachEpoch) return; // channel switched mid-ingest
+      await channelMessageService.reactToMessage(cid, chid, messageId, '', true, {
+        cid: emojiCid,
+        mime: 'image/png',
+        size,
+      });
+    } catch (err) {
+      if (epoch !== attachEpoch) return; // don't surface on a stale channel
+      reactionError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // ZEB-541 — toggle the local member's CUSTOM reaction for a chip's CID.
+  // Mirrors toggleReaction (unicode) but keys/sends by `emojiCid` with the
+  // descriptor the backend needs to re-authorize. Shares the reactionPending
+  // in-flight guard (keyed by the CID).
+  function toggleCustomReaction(msg: ChannelMessageDto, r: NonNullable<ChannelMessageDto['reactions']>[number]): void {
+    if (!r.emojiCid) return;
+    const key = `${msg.messageId}:${r.emojiCid}`;
+    if (reactionPending.has(key)) return;
+    reactionPending.add(key);
+    void channelMessageService
+      .reactToMessage(communityId, channelId, msg.messageId, '', !r.mine, {
+        cid: r.emojiCid,
+        mime: 'image/png',
+        size: r.emojiSize ?? 0,
+      })
+      .catch((e) => console.warn('custom reaction toggle failed', e instanceof Error ? e.message : String(e)))
+      .finally(() => reactionPending.delete(key));
+  }
+
   // Close the open reaction picker on Escape or an outside click. Listeners
   // are scoped to "a picker is open" and cleaned up on close/teardown. The
   // click that opened the picker targets a node inside `.reaction-toolbar`,
@@ -594,15 +672,21 @@
             {/if}
             {#if !row.isPreFork && msg.reactions && msg.reactions.length > 0}
               <div class="reactions">
-                {#each msg.reactions as r (r.emoji)}
+                {#each msg.reactions as r (r.emojiCid ?? r.emoji)}
                   <button
                     type="button"
                     class="reaction-chip"
                     class:mine={r.mine}
                     title={reactorNames(r.reactors)}
-                    onclick={() => toggleReaction(msg, r.emoji)}
+                    onclick={() => (r.emojiCid ? toggleCustomReaction(msg, r) : toggleReaction(msg, r.emoji))}
                   >
-                    <span class="reaction-emoji" aria-hidden="true">{r.emoji}</span>
+                    {#if r.emojiCid}
+                      <span class="reaction-emoji" aria-hidden="true">
+                        <ReactionEmojiImage {communityId} {channelId} cid={r.emojiCid} {channelMessageService} />
+                      </span>
+                    {:else}
+                      <span class="reaction-emoji" aria-hidden="true">{r.emoji}</span>
+                    {/if}
                     <span class="reaction-count">{r.count}</span>
                   </button>
                 {/each}
@@ -640,6 +724,16 @@
                     onclick={() => pickFromPicker(msg, emoji)}
                   >{emoji}</button>
                 {/each}
+                <!-- ZEB-541: upload a custom (CAS-backed) image emoji. Distinct
+                     class (not .picker-emoji) so it is not counted as a unicode
+                     palette entry; shares the picker-emoji styling via CSS. -->
+                <button
+                  type="button"
+                  class="picker-custom"
+                  role="menuitem"
+                  aria-label="Custom emoji"
+                  onclick={() => startCustomEmojiPick(msg)}
+                >&#x2795;</button>
               </div>
             {/if}
           </div>
@@ -648,6 +742,22 @@
       {/if}
     {/each}
   </div>
+
+  <!-- ZEB-541: shared hidden file input for custom-emoji reactions. A native
+       <input type="file"> yields a real web File (what normalizeEmoji needs),
+       mirroring the avatar pick in ProfileEditor. -->
+  <input
+    bind:this={customEmojiInput}
+    type="file"
+    accept="image/*"
+    class="custom-emoji-input"
+    aria-hidden="true"
+    tabindex="-1"
+    onchange={handleCustomEmojiPick}
+  />
+  {#if reactionError}
+    <div class="reaction-error" role="alert">{reactionError}</div>
+  {/if}
 
   <div class="compose">
     {#if composeError}
@@ -785,6 +895,25 @@
   }
   .reaction-count { color: var(--text-secondary); }
   .reaction-chip.mine .reaction-count { color: var(--text-primary); }
+  /* ZEB-541: keep the inline custom-emoji image vertically centered in the chip. */
+  .reaction-emoji { display: inline-flex; align-items: center; }
+  /* ZEB-541: visually-hidden file input (offscreen but focusable-by-click). */
+  .custom-emoji-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .reaction-error {
+    color: #d83c3e;
+    font-size: 0.75rem;
+    padding: 4px 12px;
+  }
   .reaction-toolbar {
     position: absolute;
     top: -10px;
@@ -808,7 +937,8 @@
   }
   .quick-react,
   .picker-toggle,
-  .picker-emoji {
+  .picker-emoji,
+  .picker-custom {
     background: transparent;
     border: none;
     cursor: pointer;
@@ -819,10 +949,12 @@
   }
   .quick-react:hover,
   .picker-toggle:hover,
-  .picker-emoji:hover { background: var(--bg-tertiary); }
+  .picker-emoji:hover,
+  .picker-custom:hover { background: var(--bg-tertiary); }
   .quick-react:focus-visible,
   .picker-toggle:focus-visible,
-  .picker-emoji:focus-visible {
+  .picker-emoji:focus-visible,
+  .picker-custom:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
