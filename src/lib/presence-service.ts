@@ -95,21 +95,21 @@ export class PresenceService {
     // Backend subscribe succeeded → this is now the active community for isOnline.
     this.activeCommunityId = communityId;
 
-    if (!this.unlisteners.has(communityId)) {
-      const unlisten = await this.adapter.listen('presence-updated', (event) => {
-        const p = event.payload as PresenceUpdatedPayload;
-        // Filter to this community; events for others share the channel.
-        if (p.communityId !== communityId) return;
-        this.applyMembers(communityId, p.members);
-      });
-      this.unlisteners.set(communityId, unlisten);
-    }
-
-    // Seed initial state (and fire onUpdate) from the authoritative snapshot.
-    // If the seed fetch rejects, roll back the partial subscription (listener +
+    // Install the push listener and seed initial state (firing onUpdate) from
+    // the authoritative snapshot. If EITHER the `listen` install OR the seed
+    // fetch rejects, roll back the partial subscription (listener if installed +
     // backend subscription + cached state) before rethrowing, so a failed
     // subscribe never leaves an orphaned listener/backend subscription behind.
     try {
+      if (!this.unlisteners.has(communityId)) {
+        const unlisten = await this.adapter.listen('presence-updated', (event) => {
+          const p = event.payload as PresenceUpdatedPayload;
+          // Filter to this community; events for others share the channel.
+          if (p.communityId !== communityId) return;
+          this.applyMembers(communityId, p.members);
+        });
+        this.unlisteners.set(communityId, unlisten);
+      }
       const seed = await this.getPresence(communityId);
       this.applyMembers(communityId, seed);
     } catch (e: unknown) {

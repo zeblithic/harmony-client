@@ -3067,8 +3067,18 @@ pub async fn run(
                 while let Some(req) = request_rx.recv().await {
                     match req {
                         CommunityPresenceRequest::Subscribe { community_id } => {
-                            // Self-heal: prune pairs that have fully exited.
-                            handles.retain(|_, (p, s)| !p.is_finished() || !s.is_finished());
+                            // Self-heal: a pair is healthy only if BOTH tasks are
+                            // alive. If either has exited, abort the survivor and
+                            // drop the entry so the Subscribe below can restart
+                            // both cleanly.
+                            handles.retain(|_, (p, s)| {
+                                let alive = !p.is_finished() && !s.is_finished();
+                                if !alive {
+                                    p.abort();
+                                    s.abort();
+                                }
+                                alive
+                            });
                             if handles.contains_key(&community_id) {
                                 tracing::warn!(
                                     community_id = %hex::encode(community_id),
@@ -3152,6 +3162,13 @@ pub async fn run(
                             );
                         }
                     }
+                }
+                // Request channel closed: abort any still-running per-community
+                // pub/sub pairs (they otherwise rely solely on `closing`, which
+                // may not be set on this path).
+                for (_cid, (p, s)) in handles.drain() {
+                    p.abort();
+                    s.abort();
                 }
             });
         }

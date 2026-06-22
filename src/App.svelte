@@ -1061,7 +1061,12 @@
             await presenceService.subscribe(id, () => {
               presenceVersion++;
             });
-            if (myGen !== presenceSwitchGen) return;
+            if (myGen !== presenceSwitchGen) {
+              // A newer switch superseded us mid-subscribe; undo our now-stale
+              // subscription before bailing.
+              await presenceService.unsubscribe(id);
+              return;
+            }
           }
         } catch (e) {
           console.error('presence subscription switch failed:', e instanceof Error ? e.message : String(e));

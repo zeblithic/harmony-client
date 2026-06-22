@@ -174,6 +174,26 @@ describe('PresenceService', () => {
     expect(service.isOnline(OWNER_1)).toBe(false);
   });
 
+  it('listen(presence-updated) rejection rolls back the backend subscription and rethrows', async () => {
+    (adapter.invoke as any).mockImplementation(async (cmd: string) => {
+      if (cmd === 'subscribe_community_presence') return undefined;
+      if (cmd === 'get_community_presence') return [member(OWNER_1, true)];
+      if (cmd === 'unsubscribe_community_presence') return undefined;
+      return undefined;
+    });
+    // The backend subscribe succeeds, but installing the push listener fails.
+    (adapter.listen as any).mockRejectedValue('listen boom');
+
+    await expect(service.subscribe(CID_A, vi.fn())).rejects.toThrow('listen boom');
+
+    // No listener was installed (listen rejected), so nothing to unlisten.
+    expect(adapter.listeners.has('presence-updated')).toBe(false);
+    // Best-effort backend unsubscribe was issued to undo the orphaned subscribe.
+    expect(adapter.invoke).toHaveBeenCalledWith('unsubscribe_community_presence', { communityId: CID_A });
+    // No active community / cached state left behind.
+    expect(service.isOnline(OWNER_1)).toBe(false);
+  });
+
   it('seed rollback rethrows even when the best-effort backend unsubscribe also fails', async () => {
     (adapter.invoke as any).mockImplementation(async (cmd: string) => {
       if (cmd === 'subscribe_community_presence') return undefined;
