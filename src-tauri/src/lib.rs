@@ -124,6 +124,7 @@ pub mod community_dfrost_types;
 pub mod community_fork;
 pub mod community_invite;
 pub mod community_membership;
+pub mod community_presence;
 pub mod community_relay;
 pub mod community_relay_announce;
 pub mod community_relay_hold_crdt;
