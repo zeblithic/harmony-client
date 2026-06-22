@@ -20630,6 +20630,11 @@ pub(crate) async fn ingest_channel_artifact_impl(
     // ingested byte count (the plaintext length the download side size-verifies
     // against), not the pre-ingest stat — so a file changing between the stat
     // and the read can't sign a mismatched `size` or grow past the cap.
+    //
+    // Note: the file is fully buffered (not streamed) before the shared inner.
+    // The encrypted path must buffer to encrypt; the public path is unified onto
+    // the same buffered model so both share one ingest core. MAX_ARTIFACT_BYTES
+    // bounds the buffer either way.
     let file = tokio::fs::File::open(&source_path)
         .await
         .map_err(|e| format!("open: {e}"))?;
