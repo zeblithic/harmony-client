@@ -1067,28 +1067,77 @@ impl ChannelLogEngine {
         crate::node_event_sink::emit_ser(&*self.sink, "channel-reaction-received", &payload);
     }
 
-    /// ZEB-536 IPC read path: messages (Post only) with reactions folded
-    /// in. Reuses `list_messages` for paging, then attaches the
-    /// materialized reaction view under one log lock. Note: `limit`
-    /// bounds events scanned, so a page dense with reactions may return
-    /// fewer than `limit` messages — acceptable for v1 (clients page via
-    /// `since`).
+    /// ZEB-536 IPC read path: messages (Post only) with reactions folded in.
+    ///
+    /// Pages by POSTS returned, not raw events scanned: a `React` event never
+    /// consumes the page budget. This guarantees forward progress for a client
+    /// paging by `since` even across a long run of reactions between two posts.
+    /// Counting reactions toward `limit` (the prior behavior) could return an
+    /// empty page whose `since` cursor can't advance — the client never
+    /// receives the skipped reaction HLCs, so it re-requests the same page
+    /// forever (Qodo/CodeAnt finding on PR #314). Walks segments (oldest-first)
+    /// then the in-memory tail under one log lock, mirroring `list_messages`,
+    /// and attaches the materialized reaction view per post. A pathological
+    /// all-reactions tail scans to the end of the log (bounded by log size,
+    /// like `find_attachment`).
     pub async fn list_message_dtos(
         &self,
         since: Option<Hlc>,
         limit: usize,
     ) -> Result<Vec<ChannelMessageDto>, ChannelLogEngineError> {
-        let events = self.list_messages(since, limit).await?;
+        let effective_limit = if limit == 0 {
+            self.config.backfill_default_limit
+        } else {
+            limit
+        };
+
         let log = self.log.lock().await;
-        let mut out = Vec::with_capacity(events.len());
-        for ev in &events {
+        let mut out: Vec<ChannelMessageDto> = Vec::new();
+
+        for seg in &log.manifest.segments {
+            if let Some(since_hlc) = &since {
+                if !seg.range.1.is_strictly_newer_than(since_hlc) {
+                    continue;
+                }
+            }
+            let events = log
+                .read_segment(seg)
+                .map_err(ChannelLogEngineError::Persist)?;
+            for ev in &events {
+                if let Some(since_hlc) = &since {
+                    if !ev.at().is_strictly_newer_than(since_hlc) {
+                        continue;
+                    }
+                }
+                if !matches!(ev, SignedChannelEvent::Post { .. }) {
+                    continue;
+                }
+                let mut dto = self.message_dto_for_event(ev);
+                dto.reactions = log.reactions_for(ev.id(), &self.self_owner);
+                out.push(dto);
+                if out.len() >= effective_limit {
+                    return Ok(out);
+                }
+            }
+        }
+
+        for ev in &log.tail {
+            if let Some(since_hlc) = &since {
+                if !ev.at().is_strictly_newer_than(since_hlc) {
+                    continue;
+                }
+            }
             if !matches!(ev, SignedChannelEvent::Post { .. }) {
                 continue;
             }
             let mut dto = self.message_dto_for_event(ev);
             dto.reactions = log.reactions_for(ev.id(), &self.self_owner);
             out.push(dto);
+            if out.len() >= effective_limit {
+                return Ok(out);
+            }
         }
+
         Ok(out)
     }
 
@@ -2771,7 +2820,10 @@ mod tests {
             attachments: None,
         };
         let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
-        let dto = fix.engine.event_to_dto(&ev).expect("Post projects to a DTO");
+        let dto = fix
+            .engine
+            .event_to_dto(&ev)
+            .expect("Post projects to a DTO");
         assert_eq!(
             dto.mentions,
             Some(vec![hex::encode(m0.0), hex::encode(m1.0)])
@@ -2879,7 +2931,10 @@ mod tests {
             attachments: Some(vec![att.clone()]),
         };
         let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
-        let dto = fix.engine.event_to_dto(&ev).expect("Post projects to a DTO");
+        let dto = fix
+            .engine
+            .event_to_dto(&ev)
+            .expect("Post projects to a DTO");
         let got = dto.attachments.expect("attachments present");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].cid, hex::encode(enc_cid));
@@ -2934,7 +2989,10 @@ mod tests {
             attachments: Some(vec![att]),
         };
         let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
-        let dto = fix.engine.event_to_dto(&ev).expect("Post projects to a DTO");
+        let dto = fix
+            .engine
+            .event_to_dto(&ev)
+            .expect("Post projects to a DTO");
         let got = dto.attachments.expect("attachments present");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].cid, hex::encode(pub_cid));
@@ -3328,7 +3386,10 @@ mod tests {
             .expect("publish with empty mentions");
         let msgs = fix.engine.list_messages(None, 100).await.expect("list");
         assert_eq!(msgs.len(), 1);
-        let dto = fix.engine.event_to_dto(&msgs[0]).expect("Post projects to a DTO");
+        let dto = fix
+            .engine
+            .event_to_dto(&msgs[0])
+            .expect("Post projects to a DTO");
         assert!(
             dto.mentions.is_none(),
             "empty mentions must normalize to None (mn key omitted)"
@@ -3348,7 +3409,10 @@ mod tests {
             .expect("publish with empty attachments");
         let msgs = fix.engine.list_messages(None, 100).await.expect("list");
         assert_eq!(msgs.len(), 1);
-        let dto = fix.engine.event_to_dto(&msgs[0]).expect("Post projects to a DTO");
+        let dto = fix
+            .engine
+            .event_to_dto(&msgs[0])
+            .expect("Post projects to a DTO");
         assert!(
             dto.attachments.is_none(),
             "empty attachments must normalize to None (pa key omitted)"
@@ -5334,6 +5398,52 @@ mod tests {
             .find(|d| d.message_id == hex::encode(msg_id.0))
             .unwrap();
         assert!(m2.reactions.iter().all(|r| r.emoji != "👍"));
+    }
+
+    /// ZEB-536 regression (Qodo/CodeAnt on PR #314): `list_message_dtos` must
+    /// page by POSTS returned, not raw events scanned. A run of reactions
+    /// longer than `limit` between two posts must NOT drop the later post (and
+    /// strand a `since`-paging client on reaction HLCs it never receives).
+    #[tokio::test]
+    async fn list_message_dtos_pages_by_posts_not_reactions() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let p = Arc::clone(&fix.engine)
+            .publish(b"P".to_vec(), None, None, None)
+            .await
+            .expect("post P");
+        // More reactions than the page limit, all landing between P and Q.
+        for i in 0..5u8 {
+            Arc::clone(&fix.engine)
+                .react(p, format!("e{i}"), true)
+                .await
+                .expect("react");
+        }
+        Arc::clone(&fix.engine)
+            .publish(b"Q".to_vec(), None, None, None)
+            .await
+            .expect("post Q");
+
+        // limit=2 posts: both P and Q come back despite the 5 intervening
+        // reactions that would fill an event-scanned page (old code: [P] only).
+        let page = fix.engine.list_message_dtos(None, 2).await.expect("list");
+        let bodies: Vec<Vec<u8>> = page.iter().map(|d| d.body.clone()).collect();
+        assert_eq!(bodies, vec![b"P".to_vec(), b"Q".to_vec()]);
+
+        // Progress check: page-by-1 from P's HLC advances past the reaction run
+        // to Q rather than returning an empty, cursor-stranding page.
+        let events = fix.engine.list_messages(None, 100).await.expect("evs");
+        let p_hlc = events
+            .iter()
+            .find(|e| matches!(e, SignedChannelEvent::Post { .. }) && e.id() == &p)
+            .map(|e| e.at().clone())
+            .expect("P in log");
+        let page2 = fix
+            .engine
+            .list_message_dtos(Some(p_hlc), 1)
+            .await
+            .expect("p2");
+        assert_eq!(page2.len(), 1, "paging past reactions reaches Q (no stall)");
+        assert_eq!(page2[0].body, b"Q".to_vec());
     }
 
     /// ZEB-536 two-node convergence: Engine A posts; Engine A react()s and

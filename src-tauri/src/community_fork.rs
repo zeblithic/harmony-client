@@ -353,10 +353,22 @@ pub async fn fork_community(
             // list_messages with limit 0 → uses engine's default backfill cap.
             // We want ALL locally known events; use SNAPSHOT_TOTAL_CAP * 2 as
             // the generous pull cap (build_snapshot will trim further).
-            let events = engine
-                .list_messages(None, SNAPSHOT_TOTAL_CAP * 2)
-                .await
-                .unwrap_or_default()
+            // Best-effort snapshot: one channel's read failure must not abort
+            // the whole fork, but it must not be silent either (CodeAnt PR
+            // #314) — surface it so an incomplete snapshot is diagnosable
+            // rather than a silent history drop.
+            let raw = match engine.list_messages(None, SNAPSHOT_TOTAL_CAP * 2).await {
+                Ok(evs) => evs,
+                Err(e) => {
+                    tracing::warn!(
+                        channel_id = ?channel_id,
+                        error = %e,
+                        "fork snapshot: channel log read failed; omitting its history from the snapshot"
+                    );
+                    Vec::new()
+                }
+            };
+            let events = raw
                 .into_iter()
                 // ZEB-536: pre-fork snapshot is message-only for v1.
                 .filter(|e| {
