@@ -253,6 +253,32 @@ export class ChannelMessageService {
     }
   }
 
+  /** Fetch a channel artifact into memory for inline preview (image/text).
+   *  Returns the decrypted plaintext bytes. The backend authorizes the CID
+   *  against the channel's signed log and rejects anything over the preview cap
+   *  (default 4 MiB), so callers should only preview `isPreviewable` attachments.
+   *  `maxBytes` further lowers the cap (clamped to the backend ceiling). */
+  async previewArtifact(
+    communityId: string,
+    channelId: string,
+    attachment: ChannelAttachmentDto,
+    maxBytes?: number,
+  ): Promise<Uint8Array> {
+    if (!this.adapter) throw new Error('ChannelMessageService.previewArtifact: adapter not connected');
+    try {
+      const bytes = await this.adapter.invoke('preview_channel_artifact', {
+        communityId,
+        channelId,
+        cid: attachment.cid,
+        maxBytes,
+      }) as number[];
+      return new Uint8Array(bytes);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
+  }
+
   /** Page through locally-known messages. Caches results + notifies
    *  subscribers (so callers don't double-render — list-then-subscribe
    *  is the standard pattern). */

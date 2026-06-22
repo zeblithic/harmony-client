@@ -200,6 +200,48 @@ describe('ChannelMessageService', () => {
     ).rejects.toThrow(/adapter not connected/);
   });
 
+  it('previewArtifact invokes preview_channel_artifact and returns Uint8Array', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue([1, 2, 3]);
+    const att = { cid: 'cc', mime: 'image/png', name: 'p.png', size: 3, encrypted: true };
+    const bytes = await service.previewArtifact('00', '11', att, 4096);
+    expect(adapter.invoke).toHaveBeenCalledWith('preview_channel_artifact', {
+      communityId: '00',
+      channelId: '11',
+      cid: 'cc',
+      maxBytes: 4096,
+    });
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(Array.from(bytes)).toEqual([1, 2, 3]);
+  });
+
+  it('previewArtifact omits maxBytes when not provided', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue([9]);
+    const att = { cid: 'cc', mime: 'text/plain', name: 'l.txt', size: 1, encrypted: false };
+    await service.previewArtifact('00', '11', att);
+    expect(adapter.invoke).toHaveBeenCalledWith('preview_channel_artifact', {
+      communityId: '00',
+      channelId: '11',
+      cid: 'cc',
+      maxBytes: undefined,
+    });
+  });
+
+  it('previewArtifact normalizes a rejection to an Error with the message', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockRejectedValue('peer offline');
+    const att = { cid: 'cc', mime: 'image/png', name: 'p.png', size: 3, encrypted: true };
+    await expect(service.previewArtifact('00', '11', att)).rejects.toThrow('peer offline');
+  });
+
+  it('previewArtifact throws when adapter not connected', async () => {
+    const att = { cid: 'cc', mime: 'image/png', name: 'p.png', size: 3, encrypted: true };
+    await expect(
+      service.previewArtifact('00', '11', att),
+    ).rejects.toThrow(/adapter not connected/);
+  });
+
   it('ingestArtifact throws when adapter not connected', async () => {
     await expect(
       service.ingestArtifact('aa'.repeat(16), '/tmp/l.txt'),
