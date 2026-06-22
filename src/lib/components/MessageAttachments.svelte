@@ -47,6 +47,17 @@
     return previewStates[cid] ?? 'idle';
   }
 
+  // Set true in the unmount cleanup so preview work that resolves AFTER teardown
+  // never creates or stores state on a dead component (mirrors AvatarResolver's
+  // `destroyed` re-check after its async decode gap).
+  let destroyed = false;
+  // A preview result is only still wanted if the component is mounted AND the cid
+  // is still in the current attachment set (the feed reuses instances positionally
+  // under an unkeyed {#each}, so the prop can change mid-fetch).
+  function isLive(cid: string): boolean {
+    return !destroyed && uniqueAttachments.some((a) => a.cid === cid);
+  }
+
   function revokeUrl(cid: string) {
     const url = previewUrls[cid];
     if (url) {
@@ -72,6 +83,8 @@
     previewErrors = { ...previewErrors, [att.cid]: '' };
     try {
       const bytes = await channelMessageService.previewArtifact(communityId, channelId, att);
+      // Bail if torn down / reused during the IPC — nothing was created yet.
+      if (!isLive(att.cid)) return;
       if (isImage(att)) {
         // Decode-bomb guards mirror avatar-resolver: header dims BEFORE decode,
         // decoded dims AFTER (8192px limit). A throw lands in catch → error.
@@ -83,12 +96,17 @@
         } finally {
           bmp.close();
         }
+        // Re-check after the decode await, BEFORE creating the blob URL, so a
+        // late-resolving preview can't leak a URL onto a dead/stale component.
+        if (!isLive(att.cid)) return;
         previewUrls = { ...previewUrls, [att.cid]: URL.createObjectURL(blob) };
       } else {
         previewTexts = { ...previewTexts, [att.cid]: decodeTextHead(bytes) };
       }
       previewStates = { ...previewStates, [att.cid]: 'shown' };
     } catch (e) {
+      // Don't resurrect state on a torn-down / reused component.
+      if (!isLive(att.cid)) return;
       previewStates = { ...previewStates, [att.cid]: 'error' };
       previewErrors = { ...previewErrors, [att.cid]: e instanceof Error ? e.message : String(e) };
     }
@@ -98,6 +116,7 @@
   // AvatarResolver.destroy().
   $effect(() => {
     return () => {
+      destroyed = true;
       for (const url of Object.values(previewUrls)) URL.revokeObjectURL(url);
     };
   });

@@ -235,4 +235,21 @@ describe('MessageAttachments — inline preview (ZEB-540)', () => {
     // The orphaned image preview is gone (instance reused for the new attachment).
     expect(container.querySelector('img.att-preview-img')).toBeNull();
   });
+
+  it('does not create a blob URL when torn down during the preview fetch (teardown race)', async () => {
+    // Qodo/CodeAnt teardown race: the IPC resolves AFTER unmount. The post-await
+    // liveness guard must prevent creating a blob URL on a dead component.
+    let resolveFetch!: (value: Uint8Array | PromiseLike<Uint8Array>) => void;
+    const previewArtifact = vi.fn(() => new Promise<Uint8Array>((r) => { resolveFetch = r; }));
+    const img = att({ cid: 'img', mime: 'image/png', name: 'a.png', size: 1000 });
+    const { container, unmount } = render(MessageAttachments, {
+      props: props({ attachments: [img], channelMessageService: previewService(previewArtifact) }),
+    });
+    await fireEvent.click(container.querySelector('.att-preview-btn')!);
+    expect(previewArtifact).toHaveBeenCalled();
+    unmount(); // teardown while the fetch is in flight
+    resolveFetch(PNG_BYTES);
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+  });
 });
