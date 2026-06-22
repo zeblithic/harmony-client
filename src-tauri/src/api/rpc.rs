@@ -928,6 +928,9 @@ mod tests {
             "list_channels",
             "list_channel_messages",
             "post_channel_message",
+            // channel artifacts (CAS)
+            "ingest_channel_artifact",
+            "download_channel_artifact",
             // friends
             "list_friends",
             "generate_friend_token",
