@@ -114,6 +114,9 @@
     channelMessageService.selfOwnerId = ownAddress;
     // Fresh local mirror per channel switch.
     messages = [];
+    // ZEB-536: close any open reaction picker so it doesn't linger across a
+    // channel switch (and its Escape/outside-click window listeners unwind).
+    pickerOpenFor = null;
     composeError = null;
     loadError = null;
     backfillProgress = null;
@@ -355,7 +358,7 @@
     const add = !reactionMine(msg, emoji);
     void channelMessageService
       .reactToMessage(communityId, channelId, msg.messageId, emoji, add)
-      .catch((e) => console.warn('reaction toggle failed', e));
+      .catch((e) => console.warn('reaction toggle failed', e instanceof Error ? e.message : String(e)));
   }
 
   function togglePicker(messageId: string): void {
@@ -368,7 +371,7 @@
     pickerOpenFor = null;
     void channelMessageService
       .reactToMessage(communityId, channelId, msg.messageId, emoji, true)
-      .catch((e) => console.warn('reaction pick failed', e));
+      .catch((e) => console.warn('reaction pick failed', e instanceof Error ? e.message : String(e)));
   }
 
   // Close the open reaction picker on Escape or an outside click. Listeners
@@ -496,7 +499,7 @@
             {:else}
               <p class="body">{bodyToText(msg.body)}</p>
             {/if}
-            {#if msg.reactions && msg.reactions.length > 0}
+            {#if !row.isPreFork && msg.reactions && msg.reactions.length > 0}
               <div class="reactions">
                 {#each msg.reactions as r (r.emoji)}
                   <button
@@ -513,6 +516,7 @@
               </div>
             {/if}
           </div>
+          {#if !row.isPreFork}
           <div class="reaction-toolbar" role="group" aria-label="Add reaction">
             {#each QUICK_REACTIONS as emoji}
               <button
@@ -546,6 +550,7 @@
               </div>
             {/if}
           </div>
+          {/if}
         </article>
       {/if}
     {/each}

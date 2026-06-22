@@ -655,6 +655,31 @@ describe('ChannelMessageFeed reactions — toolbar + picker (ZEB-536)', () => {
     expect(quick[1].textContent).toContain('👎');
   });
 
+  it('does not render the reaction toolbar on pre-fork snapshot messages', async () => {
+    // Pre-fork messages come from the original community's log, not the live
+    // channel — reacting would mis-target the current (community, channel),
+    // so the hover toolbar must be suppressed for them (CodeAnt PR #316).
+    const preForkMsg = {
+      messageId: 'pf1',
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      author: 'ee'.repeat(20),
+      at: { wallMs: 500, logical: 0, deviceId: 'd' },
+      body: Array.from(new TextEncoder().encode('old message')),
+    };
+    const { container } = await setup({
+      snapshotMessages: [preForkMsg],
+      originalCommunityName: 'OldCommunity',
+      forkedAtMs: 1000,
+    });
+    let preForkArticle: Element | null = null;
+    await waitFor(() => {
+      preForkArticle = container.querySelector('article.channel-message.pre-fork');
+      expect(preForkArticle).toBeTruthy();
+    });
+    expect(preForkArticle!.querySelector('.reaction-toolbar')).toBeNull();
+  });
+
   it('clicking the 👍 quick-react adds the reaction (add:true)', async () => {
     const { adapter, container } = await seedPlainMessage();
     const thumb = container.querySelector('.reaction-toolbar .quick-react') as HTMLButtonElement;

@@ -625,6 +625,17 @@ describe('ChannelMessageService reactions (ZEB-536 Spec 2)', () => {
     ).rejects.toThrow(/adapter not connected/);
   });
 
+  it('reactToMessage normalizes a raw-string IPC rejection into an Error', async () => {
+    // Production IPC rejections are raw strings (Error objects only in tests);
+    // reactToMessage must wrap them so callers reading `.message` keep the
+    // detail. Mirrors postMessage / ingestArtifact.
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockRejectedValue('message_id must be 16 bytes (32 hex chars)');
+    await expect(
+      service.reactToMessage(CID, CHID, 'm1', '👍', true),
+    ).rejects.toThrow('message_id must be 16 bytes (32 hex chars)');
+  });
+
   it('destroy removes the reaction listener', async () => {
     await service.connectAdapter(adapter);
     service.destroy();

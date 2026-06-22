@@ -443,13 +443,21 @@ export class ChannelMessageService {
     add: boolean,
   ): Promise<void> {
     if (!this.adapter) throw new Error('ChannelMessageService.reactToMessage: adapter not connected');
-    await this.adapter.invoke('set_message_reaction', {
-      communityId,
-      channelId,
-      messageId,
-      emoji,
-      add,
-    });
+    try {
+      await this.adapter.invoke('set_message_reaction', {
+        communityId,
+        channelId,
+        messageId,
+        emoji,
+        add,
+      });
+    } catch (e: unknown) {
+      // Tauri IPC rejections are raw strings in production (Error objects only
+      // in tests). Normalize so callers reading `.message` keep the rejection
+      // detail. Mirrors postMessage / MessageService.send.
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
   }
 }
 
