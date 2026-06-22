@@ -165,9 +165,12 @@ pub(crate) const MAX_ATTACHMENT_FIELD_BYTES: usize = 255;
 /// could otherwise sign permanently-undownloadable attachments. Reject at
 /// verify time and at the IPC mint path.
 ///
-/// MUST stay consistent with `crate::MAX_ARTIFACT_BYTES` (the download/ingest
-/// plaintext cap in lib.rs) — both are 1 GiB. If one changes, change both.
-pub(crate) const MAX_ATTACHMENT_SIZE: u64 = 1 << 30;
+/// Defined as an alias of `crate::MAX_ARTIFACT_BYTES` (the download/ingest
+/// plaintext cap in lib.rs, 1 GiB) so the two are a single source of truth and
+/// can never drift. If they did — e.g. `MAX_ARTIFACT_BYTES` is tightened for a
+/// v2 cap but this isn't — a peer could sign an attachment in the gap that
+/// passes verify-time checks yet is permanently un-downloadable.
+pub(crate) const MAX_ATTACHMENT_SIZE: u64 = crate::MAX_ARTIFACT_BYTES;
 
 /// ZEB-535: a CAS artifact referenced by a channel post. `cid` is the root
 /// (Book or Bundle) of the stored bytes; `cid.flags().encrypted` tells the

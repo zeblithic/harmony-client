@@ -3408,13 +3408,13 @@ pub async fn run(
                                 collect_descendants_via_cas(&cas_op_tx_for_walk, root)
                                     .await
                                     .map(|all| {
-                                        // dedup: the walk can revisit shared
-                                        // subtrees; `allow` is idempotent but we
-                                        // want an accurate count.
-                                        let cids: std::collections::HashSet<ContentId> =
-                                            all.into_iter().collect();
-                                        let count = cids.len();
-                                        for cid in cids {
+                                        // `collect_descendants_via_cas` dedups
+                                        // during traversal, so `all` is already
+                                        // unique — `len()` is the true count and
+                                        // no post-hoc HashSet is needed. `allow`
+                                        // is idempotent regardless.
+                                        let count = all.len();
+                                        for cid in all {
                                             serve_allowlist_for_walk.allow(cid);
                                         }
                                         count
@@ -5697,8 +5697,12 @@ pub(crate) fn collect_descendants<S: BookStore>(
 /// `ContentStore` is not `Clone + Send + 'static`, so it can't be moved into
 /// a `spawn_blocking`; this channel-round-trip walk is the off-loop path.
 ///
-/// Mirrors `collect_descendants`'s DFS/depth-guard/bundle-parse exactly; the
-/// only difference is the node source (channel round-trip vs. `&store.get`).
+/// Mirrors `collect_descendants`'s DFS/depth-guard/bundle-parse, with two
+/// adaptations for the channel-round-trip node source: the fetched root payload
+/// is threaded into the walk so a Bundle root isn't fetched twice, and CIDs are
+/// deduplicated *during* traversal (each node here is a GetLocal round-trip, so
+/// revisiting shared subtrees is far costlier than in the sync `&store.get`
+/// version). Returns a duplicate-free CID list.
 async fn collect_descendants_via_cas(
     cas_op_tx: &tokio::sync::mpsc::Sender<crate::content_store::CasOp>,
     root: ContentId,
@@ -5720,16 +5724,28 @@ async fn collect_descendants_via_cas(
     }
 
     // Root-missing invariant: refuse rather than allowlist a partial tree.
-    if get_local(cas_op_tx, root).await?.is_none() {
-        return Err(ContentStoreError::Io(format!(
+    // Keep the fetched root bytes in hand so a Bundle root isn't fetched a
+    // second time when it is popped below (Greptile P2: a multi-chunk artifact
+    // would otherwise pay an extra GetLocal round-trip on every allowlisting).
+    let root_bytes = get_local(cas_op_tx, root).await?.ok_or_else(|| {
+        ContentStoreError::Io(format!(
             "root {} missing locally; cannot authorize subtree",
             hex::encode(root.to_bytes())
-        )));
-    }
+        ))
+    })?;
 
     let mut out = Vec::new();
-    let mut stack: Vec<(ContentId, u8)> = vec![(root, 0)];
-    while let Some((id, depth)) = stack.pop() {
+    // Traversal-time dedup (CodeRabbit, Major): a crafted bundle DAG can aim
+    // many edges at the same shared subtree. Skipping already-seen CIDs *before*
+    // fetching/parsing their children bounds the GetLocal round-trips + bundle
+    // parsing to O(unique nodes) instead of O(edges), and also backstops cycles.
+    // Because every CID pushed to `out` is unique, the caller needs no post-hoc
+    // dedup pass.
+    let mut seen: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
+    // The stack carries optional bytes so the root's already-fetched payload is
+    // reused; interior nodes carry `None` and are fetched on demand.
+    let mut stack: Vec<(ContentId, Option<Vec<u8>>, u8)> = vec![(root, Some(root_bytes), 0)];
+    while let Some((id, maybe_bytes, depth)) = stack.pop() {
         if depth > MAX_BUNDLE_DEPTH {
             tracing::warn!(
                 cid_depth = depth,
@@ -5738,13 +5754,21 @@ async fn collect_descendants_via_cas(
             );
             continue;
         }
+        if !seen.insert(id) {
+            continue;
+        }
         out.push(id);
         if matches!(id.cid_type(), CidType::Bundle(_)) {
-            if let Some(bytes) = get_local(cas_op_tx, id).await? {
+            // Reuse the root bytes already in hand; fetch interior bundle nodes.
+            let bytes_opt = match maybe_bytes {
+                Some(b) => Some(b),
+                None => get_local(cas_op_tx, id).await?,
+            };
+            if let Some(bytes) = bytes_opt {
                 match bundle::parse_bundle(&bytes) {
                     Ok(children) => {
                         for child in children.iter().copied() {
-                            stack.push((child, depth + 1));
+                            stack.push((child, None, depth + 1));
                         }
                     }
                     Err(e) => tracing::warn!(
@@ -6321,12 +6345,14 @@ mod fetch_recursive_tests {
 
 #[cfg(test)]
 mod allow_serve_subtree_tests {
-    /// ZEB-539: the allowlist's own allow/contains drive `content_cid_servable`
-    /// false→true for an encrypted CID. The DAG walk itself is covered by the
-    /// `collect_descendants` tests; the end-to-end CasOp-flips-the-gate assertion
-    /// is left to PR2's two-node integration test (T2) — wiring a full
-    /// `event_loop::run` here is heavy. Together they cover the handler's two
-    /// halves (walk + allowlist).
+    /// ZEB-539: covers the two halves of the `AllowServeSubtree` handler.
+    /// `allowlist_flips_serve_gate_for_encrypted_cid` proves the allowlist's
+    /// allow/contains drive `content_cid_servable` false→true for an encrypted
+    /// CID. `walker_*` exercise the off-loop `collect_descendants_via_cas`
+    /// contract directly over an mpsc-backed `GetLocal` responder — full subtree
+    /// collection with traversal-time dedup, and the missing-root error — without
+    /// booting `event_loop::run`. The end-to-end CasOp-flips-the-gate path is
+    /// additionally covered by PR2's two-node integration test (T2).
     #[test]
     fn allowlist_flips_serve_gate_for_encrypted_cid() {
         use crate::content_store::CommunityServeAllowlist;
@@ -6349,6 +6375,102 @@ mod allow_serve_subtree_tests {
             super::content_cid_servable(&cid, &allow),
             "encrypted CID servable after allowlisting (the AllowServeSubtree effect)"
         );
+    }
+
+    /// The off-loop walker collects root + every descendant over a `GetLocal`
+    /// responder, and returns each CID exactly once even when a leaf is reachable
+    /// via two paths (traversal-time dedup). DAG: root → [sub, a]; sub → [a, b],
+    /// so `a` is shared between the root and the inner bundle.
+    #[tokio::test]
+    async fn walker_collects_subtree_and_dedups_shared_leaves() {
+        use super::collect_descendants_via_cas;
+        use crate::content_store::CasOp;
+        use harmony_content::bundle::BundleBuilder;
+        use harmony_content::cid::{ContentFlags, ContentId};
+        use std::collections::{HashMap, HashSet};
+        use tokio::sync::mpsc;
+
+        let a_bytes = b"aaa".to_vec();
+        let b_bytes = b"bbbb".to_vec();
+        let a = ContentId::for_book(&a_bytes, ContentFlags::default()).unwrap();
+        let b = ContentId::for_book(&b_bytes, ContentFlags::default()).unwrap();
+
+        let mut sub_builder = BundleBuilder::new();
+        sub_builder.add(a).add(b);
+        let (sub_payload, sub) = sub_builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+
+        // Root references `a` directly AND via `sub` → `a` is reached twice.
+        let mut root_builder = BundleBuilder::new();
+        root_builder.add(sub).add(a);
+        let (root_payload, root) = root_builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        store.insert(a, a_bytes);
+        store.insert(b, b_bytes);
+        store.insert(sub, sub_payload);
+        store.insert(root, root_payload);
+
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(16);
+        // Responder answers GetLocal from the store; the walker sends nothing else.
+        let responder = tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                match op {
+                    CasOp::GetLocal { cid, reply } => {
+                        let _ = reply.send(store.get(&cid).cloned());
+                    }
+                    _ => panic!("walker must only send GetLocal"),
+                }
+            }
+        });
+
+        let got = collect_descendants_via_cas(&cas_op_tx, root)
+            .await
+            .expect("walk succeeds when root is present");
+
+        let unique: HashSet<ContentId> = got.iter().copied().collect();
+        assert_eq!(unique.len(), got.len(), "walker returned duplicate CIDs");
+        assert_eq!(
+            unique,
+            [root, sub, a, b].into_iter().collect::<HashSet<_>>(),
+            "walk must yield root + all descendants exactly once"
+        );
+
+        drop(cas_op_tx);
+        responder.await.unwrap();
+    }
+
+    /// A missing root is a hard error (refuse rather than allowlist a partial
+    /// tree): the responder reports every CID absent, so the upfront root fetch
+    /// returns `None`.
+    #[tokio::test]
+    async fn walker_errors_when_root_missing_locally() {
+        use super::collect_descendants_via_cas;
+        use crate::content_store::CasOp;
+        use harmony_content::cid::{ContentFlags, ContentId};
+        use tokio::sync::mpsc;
+
+        let root = ContentId::for_book(b"absent-root", ContentFlags::default()).unwrap();
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(16);
+        let responder = tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                if let CasOp::GetLocal { reply, .. } = op {
+                    let _ = reply.send(None);
+                }
+            }
+        });
+
+        let err = collect_descendants_via_cas(&cas_op_tx, root)
+            .await
+            .expect_err("missing root must error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("missing locally"), "got: {msg}");
+
+        drop(cas_op_tx);
+        responder.await.unwrap();
     }
 }
 

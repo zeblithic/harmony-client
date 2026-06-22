@@ -20718,9 +20718,20 @@ pub(crate) async fn download_channel_artifact_impl(
     // to swarm to other members. A re-serve failure is non-fatal: the user's
     // file is already written.
     if encrypted {
-        let content_store = {
-            let g = state.lock().map_err(|e| format!("lock: {e}"))?;
-            g.content_store.clone()
+        // Lock acquisition is itself non-fatal here: `finalize_artifact` already
+        // wrote the user's file, so a poisoned lock must not turn a successful
+        // download into an `Err`. Log and skip allowlisting — consistent with the
+        // `allow_serve_subtree` error arm below ("re-serve failure is non-fatal").
+        let content_store = match state.lock() {
+            Ok(g) => g.content_store.clone(),
+            Err(e) => {
+                tracing::warn!(
+                    cid = %hex::encode(cid_bytes),
+                    error = %e,
+                    "ZEB-539: lock poisoned during re-serve allowlisting (non-fatal; file written)"
+                );
+                None
+            }
         };
         if let Some(store) = content_store {
             match store.allow_serve_subtree(content_id).await {
