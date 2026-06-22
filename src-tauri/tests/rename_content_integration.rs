@@ -246,6 +246,7 @@ async fn ingest_folder(harness: &TestHarness, built: &folders::BuiltFolder) {
         &harness.ingest_tx,
         hex::encode(built.manifest_cid.to_bytes()),
         built.manifest_bytes.clone(),
+        false,
     )
     .await
     .unwrap();
@@ -253,13 +254,14 @@ async fn ingest_folder(harness: &TestHarness, built: &folders::BuiltFolder) {
         &harness.ingest_tx,
         hex::encode(built.bundle_cid.to_bytes()),
         built.bundle_bytes.clone(),
+        false,
     )
     .await
     .unwrap();
 }
 
 async fn ingest_leaf(harness: &TestHarness, cid: [u8; 32], bytes: Vec<u8>) {
-    harmony_app::send_ingest(&harness.ingest_tx, hex::encode(cid), bytes)
+    harmony_app::send_ingest(&harness.ingest_tx, hex::encode(cid), bytes, false)
         .await
         .unwrap();
 }

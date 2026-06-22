@@ -131,6 +131,12 @@ pub enum CasOp {
     PutLocal {
         cid: ContentId,
         blob: Vec<u8>,
+        /// ZEB-535: allowlist this CID for member-to-member serve once admitted.
+        /// `true` for encrypted-artifact subtree authorization (the sharer's
+        /// ingest hop and the fetcher's re-serve hop); `false` for the avatar /
+        /// file-vault / GetOrFetch fire-and-forget paths, which never serve
+        /// encrypted CIDs (avatars are unencrypted) or never re-serve.
+        serveable: bool,
         /// `Some` for synchronous round-trip callers (e.g.
         /// `RuntimeContentStore::put`); `None` for fire-and-forget
         /// admit hops from the spawned-fetch task in `event_loop.rs`'s
@@ -211,6 +217,7 @@ impl ContentStore for RuntimeContentStore {
             .send(CasOp::PutLocal {
                 cid,
                 blob,
+                serveable: false,
                 reply: Some(reply_tx),
             })
             .await
@@ -256,7 +263,24 @@ impl ContentStore for RuntimeContentStore {
 
     async fn put_serveable(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {
         // Admit first; only record as serveable after a successful put.
-        self.put(cid, blob).await?;
+        // ZEB-535: send `serveable: true` so the event-loop PutLocal arm
+        // allowlists the CID even when this store has no local `serve_allowlist`
+        // (e.g. legacy/test constructions). The direct `allowlist.allow(cid)`
+        // below stays for the SyncEngine path that DOES hold a `serve_allowlist`
+        // (community-root sharing) — both writes target the same shared set.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cas_op_tx
+            .send(CasOp::PutLocal {
+                cid,
+                blob,
+                serveable: true,
+                reply: Some(reply_tx),
+            })
+            .await
+            .map_err(|_| ContentStoreError::Io("event loop unavailable (send)".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ContentStoreError::Io("event loop unavailable (reply)".into()))??;
         if let Some(allowlist) = &self.serve_allowlist {
             allowlist.allow(cid);
         }
@@ -359,6 +383,7 @@ mod tests {
                 cid,
                 blob,
                 reply: Some(reply),
+                ..
             }) = cas_op_rx.recv().await
             {
                 assert_eq!(cid, ContentId::from_bytes([0x42; 32]));
@@ -549,6 +574,57 @@ mod tests {
             !allowlist.contains(&private),
             "plain put does NOT register the CID"
         );
+        drop(store);
+        stub.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_serveable_sends_serveable_bit_put_does_not() {
+        // ZEB-535: pin the authorization bit on the emitted CasOp::PutLocal —
+        // `put_serveable` must send `serveable: true` (the event-loop arm
+        // allowlists it) and plain `put` must send `serveable: false` (never
+        // allowlisted). The allowlist-registration test above covers the
+        // RuntimeContentStore-side effect; this one pins the wire bit the event
+        // loop actually keys its hash-verify-then-allowlist decision off.
+        let (cas_op_tx, mut cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500));
+
+        // Stub: record the serveable flag of each PutLocal, then ack.
+        let (flag_tx, mut flag_rx) = tokio::sync::mpsc::channel::<bool>(8);
+        let stub = tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                if let CasOp::PutLocal {
+                    serveable,
+                    reply: Some(reply),
+                    ..
+                } = op
+                {
+                    let _ = flag_tx.send(serveable).await;
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        });
+
+        store
+            .put_serveable(ContentId::from_bytes([0x11; 32]), vec![1])
+            .await
+            .unwrap();
+        assert_eq!(
+            flag_rx.recv().await,
+            Some(true),
+            "put_serveable emits serveable: true"
+        );
+
+        store
+            .put(ContentId::from_bytes([0x22; 32]), vec![2])
+            .await
+            .unwrap();
+        assert_eq!(
+            flag_rx.recv().await,
+            Some(false),
+            "put emits serveable: false"
+        );
+
         drop(store);
         stub.await.unwrap();
     }

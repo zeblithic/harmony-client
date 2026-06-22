@@ -170,7 +170,9 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     tokio::spawn(async move {
         while let Some(op) = cas_op_rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, blob, reply } => {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
                     cas_for_servicer.lock().await.insert(cid, blob);
                     if let Some(r) = reply {
                         let _ = r.send(Ok(()));

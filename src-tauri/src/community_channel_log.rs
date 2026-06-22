@@ -149,15 +149,50 @@ const MIN_PACKET_LEN: usize = NONCE_LEN + TAG_LEN;
 /// size and each recipient's "mentions me" scan.
 pub(crate) const MAX_MENTIONS: usize = 64;
 
+/// ZEB-535: hard cap on attachments per channel post. Bounds the signed-set
+/// size and the per-message fetch fan-out. Enforced at mint (`publish`) AND
+/// inbound verification (`verify_channel_event`) in PR1; the IPC-boundary
+/// enforcement point (`post_channel_message_impl`) lands with the IPC surface
+/// in PR2.
+pub(crate) const MAX_ATTACHMENTS: usize = 16;
+
+/// ZEB-535: max bytes for an attachment's `name`/`mime` string fields (each).
+pub(crate) const MAX_ATTACHMENT_FIELD_BYTES: usize = 255;
+
+/// ZEB-535: a CAS artifact referenced by a channel post. `cid` is the root
+/// (Book or Bundle) of the stored bytes; `cid.flags().encrypted` tells the
+/// receiver whether to decrypt with the community epoch key. `name`/`mime`/
+/// `size` are signed (tamper-evident) and packet-encrypted (confidential).
+/// `size` is the PLAINTEXT length, cross-checked on fetch.
+///
+/// Nested CBOR keys sort `cd`(cid) < `mi`(mime) < `nm`(name) < `sz`(size)
+/// per RFC 8949 §4.2.1 — declare fields in that exact order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelAttachment {
+    #[serde(
+        rename = "cd",
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub cid: [u8; 32],
+    #[serde(rename = "mi")]
+    pub mime: String,
+    #[serde(rename = "nm")]
+    pub name: String,
+    #[serde(rename = "sz")]
+    pub size: u64,
+}
+
 /// One signed channel event. Phase 2 ships only the `Post` variant.
 /// Wire format: 2-key adjacently-tagged outer (`tg` + `vl`); inner
 /// fields all 2-char keys to satisfy the same-length-keys invariant.
 ///
 /// `sg` covers canonical CBOR of `(id, community_id, channel_id, author,
-/// at, content_kind, body, reply_to, mentions)` — every field minus the
-/// signature itself, so the `mentions`/`mn` list is tamper-evident like
-/// every other field. v3 Edit/Delete/React variants will sign their own
-/// typed payloads with no field reuse across variants.
+/// at, content_kind, body, reply_to, mentions, attachments)` — every field
+/// minus the signature itself, so the `mentions`/`mn` and `attachments`/`pa`
+/// lists are tamper-evident like every other field. v3 Edit/Delete/React
+/// variants will sign their own typed payloads with no field reuse across
+/// variants.
 ///
 /// Per spec §5.2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,7 +202,7 @@ pub enum SignedChannelEvent {
     Post {
         // Field order matches RFC 8949 §4.2.1 canonical CBOR ordering
         // for our 2-char keys: bytewise lexicographic sort of
-        // at, au, bd, ch, ci, id, kd, mn, rt, sg. ciborium emits map keys
+        // at, au, bd, ch, ci, id, kd, mn, pa, rt, sg. ciborium emits map keys
         // in declaration order, so this declaration is what a strict
         // RFC 8949 reader would produce. See ChannelPostSignedSet's
         // doc comment for the full rationale.
@@ -187,6 +222,8 @@ pub enum SignedChannelEvent {
         content_kind: u8,
         #[serde(rename = "mn", skip_serializing_if = "Option::is_none", default)]
         mentions: Option<Vec<OwnerAddr>>,
+        #[serde(rename = "pa", skip_serializing_if = "Option::is_none", default)]
+        attachments: Option<Vec<ChannelAttachment>>,
         #[serde(rename = "rt", skip_serializing_if = "Option::is_none", default)]
         reply_to: Option<MessageId>,
         #[serde(
@@ -219,6 +256,9 @@ pub struct ChannelPostPayload<'a> {
     /// evident), mirroring `reply_to`. Owned `Vec` (not a borrow) because
     /// `sign_channel_event` moves it into the owned event variant.
     pub mentions: Option<Vec<OwnerAddr>>,
+    /// ZEB-535: CAS artifacts this post references. `None` is wire-identical
+    /// to a pre-feature post. Carried into the signed set (tamper-evident).
+    pub attachments: Option<Vec<ChannelAttachment>>,
 }
 
 /// Pre-signature payload (everything except the signature itself).
@@ -230,7 +270,7 @@ pub struct ChannelPostPayload<'a> {
 ///
 /// Field order matches RFC 8949 §4.2.1 canonical CBOR ordering
 /// (length-first, then bytewise lexicographic — for same-length keys
-/// this reduces to bytewise sort): at, au, bd, ch, ci, id, kd, mn, rt.
+/// this reduces to bytewise sort): at, au, bd, ch, ci, id, kd, mn, pa, rt.
 /// ciborium emits map keys in declaration order, so this declaration
 /// matches what a strict RFC 8949 reader would produce, ensuring
 /// cross-language signature compatibility.
@@ -257,6 +297,8 @@ struct ChannelPostSignedSet<'a> {
     content_kind: u8,
     #[serde(rename = "mn", skip_serializing_if = "Option::is_none")]
     mentions: &'a Option<Vec<OwnerAddr>>,
+    #[serde(rename = "pa", skip_serializing_if = "Option::is_none")]
+    attachments: &'a Option<Vec<ChannelAttachment>>,
     #[serde(rename = "rt", skip_serializing_if = "Option::is_none")]
     reply_to: &'a Option<MessageId>,
 }
@@ -303,6 +345,10 @@ pub enum ChannelEventError {
     NotAuthorized(String),
     #[error("too many mentions: {count} (max {max})")]
     TooManyMentions { count: usize, max: usize },
+    #[error("too many attachments: {count} (max {max})")]
+    TooManyAttachments { count: usize, max: usize },
+    #[error("attachment name/mime too long (max {max} bytes)")]
+    AttachmentFieldTooLong { max: usize },
 }
 
 /// Sign a channel post payload with the author's identity key. Returns
@@ -343,6 +389,7 @@ pub fn sign_channel_event(
         id: payload.id,
         content_kind: payload.content_kind,
         mentions: payload.mentions.clone(),
+        attachments: payload.attachments.clone(),
         reply_to: payload.reply_to,
         sig: [0u8; 64], // placeholder — overwritten below
     };
@@ -375,6 +422,7 @@ fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, Chan
         id,
         content_kind,
         mentions,
+        attachments,
         reply_to,
         sig: _,
     } = event;
@@ -387,6 +435,7 @@ fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, Chan
         id,
         content_kind: *content_kind,
         mentions,
+        attachments,
         reply_to,
     };
     let mut canon = Vec::with_capacity(256);
@@ -693,6 +742,7 @@ where
         at,
         sig,
         mentions,
+        attachments,
         ..
     } = event;
 
@@ -708,6 +758,28 @@ where
                 count: m.len(),
                 max: MAX_MENTIONS,
             });
+        }
+    }
+
+    // Step 2.6 (ZEB-535): inbound attachments cap + per-field length cap.
+    // Same rationale as the mentions cap above — a remote peer can sign an
+    // oversized `pa` array or over-long name/mime; reject before the event is
+    // appended, projected to a DTO, and re-broadcast. Cheap structural check.
+    if let Some(a) = attachments {
+        if a.len() > MAX_ATTACHMENTS {
+            return Err(ChannelEventError::TooManyAttachments {
+                count: a.len(),
+                max: MAX_ATTACHMENTS,
+            });
+        }
+        for att in a {
+            if att.name.len() > MAX_ATTACHMENT_FIELD_BYTES
+                || att.mime.len() > MAX_ATTACHMENT_FIELD_BYTES
+            {
+                return Err(ChannelEventError::AttachmentFieldTooLong {
+                    max: MAX_ATTACHMENT_FIELD_BYTES,
+                });
+            }
         }
     }
 
@@ -1499,6 +1571,7 @@ mod tests {
             body,
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         (payload, key)
     }
@@ -1516,6 +1589,7 @@ mod tests {
             content_kind,
             body,
             mentions,
+            attachments,
             reply_to,
             sig,
         } = signed;
@@ -1528,6 +1602,7 @@ mod tests {
         assert_eq!(body, payload.body);
         assert_eq!(mentions, payload.mentions);
         assert_eq!(reply_to, payload.reply_to);
+        assert_eq!(attachments, payload.attachments);
         assert_eq!(sig.len(), 64);
     }
 
@@ -1545,10 +1620,69 @@ mod tests {
             body: "ping",
             reply_to: None,
             mentions: Some(m.clone()),
+            attachments: None,
         };
         let signed = sign_channel_event(&payload, &key).expect("sign");
         let SignedChannelEvent::Post { mentions, .. } = signed;
         assert_eq!(mentions, Some(m));
+    }
+
+    fn fixture_attachment(tag: u8) -> ChannelAttachment {
+        ChannelAttachment {
+            cid: [tag; 32],
+            mime: "text/plain".to_string(),
+            name: format!("log-{tag}.txt"),
+            size: 1234,
+        }
+    }
+
+    #[test]
+    fn sign_channel_event_carries_attachments() {
+        let key = fixture_signing_key(0xa1);
+        let atts = vec![fixture_attachment(0xb2), fixture_attachment(0xc3)];
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author: fixture_owner_addr(0xa1),
+            at: fixture_hlc(100_000, "a-dev"),
+            content_kind: 0,
+            body: "see log",
+            reply_to: None,
+            mentions: None,
+            attachments: Some(atts.clone()),
+        };
+        let signed = sign_channel_event(&payload, &key).expect("sign");
+        let SignedChannelEvent::Post { attachments, .. } = signed;
+        assert_eq!(attachments, Some(atts));
+    }
+
+    #[test]
+    fn attachments_none_omits_pa_key_some_includes_it() {
+        // CBOR text key "pa" encodes as 62 70 61 (text-str len-2 + 'p','a').
+        const PA_KEY_HEX: &str = "627061";
+        let key = fixture_signing_key(0xa1);
+
+        let (none_payload, _k) = fixture_payload("no attachments");
+        let none_event = sign_channel_event(&none_payload, &key).expect("sign");
+        let mut none_bytes = Vec::new();
+        ciborium::into_writer(&none_event, &mut none_bytes).expect("encode");
+        assert!(
+            !hex::encode(&none_bytes).contains(PA_KEY_HEX),
+            "attachments:None must omit the pa key"
+        );
+
+        let some_payload = ChannelPostPayload {
+            attachments: Some(vec![fixture_attachment(0xb2)]),
+            ..none_payload
+        };
+        let some_event = sign_channel_event(&some_payload, &key).expect("sign");
+        let mut some_bytes = Vec::new();
+        ciborium::into_writer(&some_event, &mut some_bytes).expect("encode");
+        assert!(
+            hex::encode(&some_bytes).contains(PA_KEY_HEX),
+            "attachments:Some must include the pa key"
+        );
     }
 
     #[test]
@@ -1578,6 +1712,7 @@ mod tests {
             body: "x",
             reply_to: None,
             mentions: Some(vec![fixture_owner_addr(0xb2)]),
+            attachments: None,
         };
         let some_event = sign_channel_event(&some_payload, &key).expect("sign");
         let mut some_bytes = Vec::new();
@@ -1606,6 +1741,7 @@ mod tests {
             body: "hi @bob",
             reply_to: None,
             mentions: Some(vec![fixture_owner_addr(0xb2)]),
+            attachments: None,
         };
         let event = sign_channel_event(&payload, &key).expect("sign");
         verify_channel_event(
@@ -1641,6 +1777,7 @@ mod tests {
             body: "spam",
             reply_to: None,
             mentions: Some(too_many),
+            attachments: None,
         };
         let event = sign_channel_event(&payload, &key).expect("sign");
         let err = verify_channel_event(
@@ -1655,6 +1792,86 @@ mod tests {
         assert!(
             matches!(err, ChannelEventError::TooManyMentions { count, max }
                 if count == MAX_MENTIONS + 1 && max == MAX_MENTIONS),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_channel_event_rejects_post_over_attachment_cap() {
+        // ZEB-535: a validly-signed inbound event with > MAX_ATTACHMENTS must
+        // be rejected at verify time, so a remote peer can't bypass the cap
+        // the local publish path enforces.
+        let state = fixture_state_with_alice_joined();
+        let mut tracker = ChannelLogReplayTracker::new();
+        let (key, author, _pub64) = fixture_identity(0xa1);
+        let too_many: Vec<ChannelAttachment> = (0..=MAX_ATTACHMENTS)
+            .map(|i| fixture_attachment(i as u8))
+            .collect();
+        assert_eq!(too_many.len(), MAX_ATTACHMENTS + 1);
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author,
+            at: fixture_hlc(100_000, "a-dev"),
+            content_kind: 0,
+            body: "x",
+            reply_to: None,
+            mentions: None,
+            attachments: Some(too_many),
+        };
+        let event = sign_channel_event(&payload, &key).expect("sign");
+        let err = verify_channel_event(
+            &event,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+        )
+        .await
+        .expect_err("over-cap attachments must be rejected");
+        assert!(
+            matches!(err, ChannelEventError::TooManyAttachments { count, max }
+                if count == MAX_ATTACHMENTS + 1 && max == MAX_ATTACHMENTS),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_channel_event_rejects_post_over_attachment_field_len() {
+        // ZEB-535: a validly-signed inbound event whose attachment name/mime
+        // exceeds MAX_ATTACHMENT_FIELD_BYTES must be rejected at verify time,
+        // so a remote peer can't ship unbounded metadata strings.
+        let state = fixture_state_with_alice_joined();
+        let mut tracker = ChannelLogReplayTracker::new();
+        let (key, author, _pub64) = fixture_identity(0xa1);
+        let mut oversized = fixture_attachment(0xb2);
+        oversized.name = "x".repeat(MAX_ATTACHMENT_FIELD_BYTES + 1);
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author,
+            at: fixture_hlc(100_000, "a-dev"),
+            content_kind: 0,
+            body: "x",
+            reply_to: None,
+            mentions: None,
+            attachments: Some(vec![oversized]),
+        };
+        let event = sign_channel_event(&payload, &key).expect("sign");
+        let err = verify_channel_event(
+            &event,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+        )
+        .await
+        .expect_err("over-length attachment field must be rejected");
+        assert!(
+            matches!(err, ChannelEventError::AttachmentFieldTooLong { max }
+                if max == MAX_ATTACHMENT_FIELD_BYTES),
             "got: {err:?}"
         );
     }
@@ -1767,6 +1984,7 @@ mod tests {
             body: "test",
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         sign_channel_event(&payload, &key).expect("sign")
     }
@@ -1845,6 +2063,7 @@ mod tests {
             body: "x",
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         let payload_b = ChannelPostPayload {
             id: MessageId([0x22; 16]),
@@ -1860,6 +2079,7 @@ mod tests {
             body: "y",
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         let event_a = sign_channel_event(&payload_a, &key).expect("sign a");
         let event_b = sign_channel_event(&payload_b, &key).expect("sign b");
@@ -1890,6 +2110,7 @@ mod tests {
             body: "x",
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         let payload_b = ChannelPostPayload {
             id: MessageId([0x22; 16]),
@@ -1905,6 +2126,7 @@ mod tests {
             body: "y",
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         let event_a = sign_channel_event(&payload_a, &key_a).expect("sign a");
         let event_b = sign_channel_event(&payload_b, &key_b).expect("sign b");
@@ -2143,6 +2365,7 @@ mod tests {
             body: "hello from device key",
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         let event = sign_channel_event(&payload, &device_key).expect("sign");
 
@@ -2215,6 +2438,7 @@ mod tests {
             body: "imposter",
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         let event = sign_channel_event(&payload, &imposter).expect("sign");
 
@@ -2344,6 +2568,7 @@ mod tests {
             body: "signed by a key enrolled later",
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         let event = sign_channel_event(&payload, &device_key).expect("sign");
 
@@ -3013,6 +3238,7 @@ mod tests {
             body: "wrong community",
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         let foreign_event = sign_channel_event(&payload, &key).expect("sign");
         let err = log
@@ -3047,6 +3273,7 @@ mod tests {
             body: "wrong channel",
             reply_to: None,
             mentions: None,
+            attachments: None,
         };
         let foreign_event = sign_channel_event(&payload, &key).expect("sign");
         let err = log
