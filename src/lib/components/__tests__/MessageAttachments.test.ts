@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import MessageAttachments from '../MessageAttachments.svelte';
 import type { ChannelAttachmentDto } from '../../channel-message-service';
@@ -14,12 +14,18 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 function att(over: Partial<ChannelAttachmentDto> = {}): ChannelAttachmentDto {
   return { cid: 'cid1', mime: 'text/plain', name: 'log.txt', size: 2048, encrypted: true, ...over };
 }
-function makeService(downloadArtifact = vi.fn().mockResolvedValue(2048)) {
-  return { downloadArtifact } as any;
+function makeService(
+  downloadArtifact: any = vi.fn().mockResolvedValue(2048),
+  previewArtifact: any = vi.fn().mockResolvedValue(new Uint8Array()),
+) {
+  return { downloadArtifact, previewArtifact } as any;
 }
 function props(over: Record<string, unknown> = {}) {
   return { communityId: 'c', channelId: 'ch', attachments: [att()], channelMessageService: makeService(), ...over };
 }
+
+// PNG magic bytes so the header-dim guard recognises the format.
+const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 describe('MessageAttachments', () => {
   beforeEach(() => { saveMock.mockReset(); });
@@ -84,5 +90,129 @@ describe('MessageAttachments', () => {
     await waitFor(() => expect(container.querySelector('.att-error')?.textContent).toContain('peer offline'));
     await fireEvent.click(container.querySelector('.att-download')!);
     await waitFor(() => expect(downloadArtifact).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe('MessageAttachments — inline preview (ZEB-540)', () => {
+  let createImageBitmapMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    saveMock.mockReset();
+    createImageBitmapMock = vi.fn().mockResolvedValue({ width: 800, height: 600, close: vi.fn() });
+    vi.stubGlobal('createImageBitmap', createImageBitmapMock);
+    // jsdom lacks URL.createObjectURL / revokeObjectURL.
+    vi.stubGlobal('URL', {
+      ...URL,
+      createObjectURL: vi.fn(() => 'blob:mock'),
+      revokeObjectURL: vi.fn(),
+    });
+  });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  function previewService(previewArtifact: any) {
+    return makeService(vi.fn().mockResolvedValue(0), previewArtifact);
+  }
+
+  it('shows a Preview button only for previewable (image/text ≤ cap) attachments', () => {
+    const img = att({ cid: 'img', mime: 'image/png', name: 'a.png', size: 1000 });
+    const zip = att({ cid: 'zip', mime: 'application/zip', name: 'a.zip', size: 1000 });
+    const { container } = render(MessageAttachments, {
+      props: props({ attachments: [img, zip], channelMessageService: makeService() }),
+    });
+    const buttons = container.querySelectorAll('.att-preview-btn');
+    expect(buttons.length).toBe(1);
+  });
+
+  it('hides Preview for an over-cap previewable attachment (download chip only)', () => {
+    const huge = att({ cid: 'big', mime: 'image/png', name: 'a.png', size: 5 * 1024 * 1024 });
+    const { container } = render(MessageAttachments, {
+      props: props({ attachments: [huge], channelMessageService: makeService() }),
+    });
+    expect(container.querySelector('.att-preview-btn')).toBeNull();
+    expect(container.querySelector('.att-download')).not.toBeNull();
+  });
+
+  it('previews an image: click fetches, creates a blob URL, renders <img>', async () => {
+    const previewArtifact = vi.fn().mockResolvedValue(PNG_BYTES);
+    const img = att({ cid: 'img', mime: 'image/png', name: 'a.png', size: 1000 });
+    const { container } = render(MessageAttachments, {
+      props: props({ attachments: [img], channelMessageService: previewService(previewArtifact) }),
+    });
+    await fireEvent.click(container.querySelector('.att-preview-btn')!);
+    await waitFor(() => {
+      expect(previewArtifact).toHaveBeenCalledWith('c', 'ch', img);
+      expect(URL.createObjectURL).toHaveBeenCalled();
+      const el = container.querySelector('img.att-preview-img') as HTMLImageElement | null;
+      expect(el).not.toBeNull();
+      expect(el!.getAttribute('src')).toBe('blob:mock');
+      expect(el!.getAttribute('alt')).toBe('a.png');
+    });
+  });
+
+  it('previews text: click renders the decoded head in a <pre>', async () => {
+    const previewArtifact = vi.fn().mockResolvedValue(new TextEncoder().encode('hello\nworld'));
+    const txt = att({ cid: 'txt', mime: 'text/plain', name: 'l.txt', size: 11 });
+    const { container } = render(MessageAttachments, {
+      props: props({ attachments: [txt], channelMessageService: previewService(previewArtifact) }),
+    });
+    await fireEvent.click(container.querySelector('.att-preview-btn')!);
+    await waitFor(() => {
+      const pre = container.querySelector('pre.att-preview-text');
+      expect(pre).not.toBeNull();
+      expect(pre!.textContent).toContain('hello');
+    });
+  });
+
+  it('collapse revokes the image blob URL and hides the <img>', async () => {
+    const previewArtifact = vi.fn().mockResolvedValue(PNG_BYTES);
+    const img = att({ cid: 'img', mime: 'image/png', name: 'a.png', size: 1000 });
+    const { container } = render(MessageAttachments, {
+      props: props({ attachments: [img], channelMessageService: previewService(previewArtifact) }),
+    });
+    await fireEvent.click(container.querySelector('.att-preview-btn')!);
+    await waitFor(() => expect(container.querySelector('img.att-preview-img')).not.toBeNull());
+    await fireEvent.click(container.querySelector('.att-preview-btn')!);
+    await waitFor(() => {
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:mock');
+      expect(container.querySelector('img.att-preview-img')).toBeNull();
+    });
+  });
+
+  it('surfaces a preview error with a retry', async () => {
+    const previewArtifact = vi.fn()
+      .mockRejectedValueOnce(new Error('peer offline'))
+      .mockResolvedValueOnce(new TextEncoder().encode('ok'));
+    const txt = att({ cid: 'txt', mime: 'text/plain', name: 'l.txt', size: 2 });
+    const { container } = render(MessageAttachments, {
+      props: props({ attachments: [txt], channelMessageService: previewService(previewArtifact) }),
+    });
+    await fireEvent.click(container.querySelector('.att-preview-btn')!);
+    await waitFor(() => expect(container.querySelector('.att-error')?.textContent).toContain('peer offline'));
+    await fireEvent.click(container.querySelector('.att-preview-btn')!);
+    await waitFor(() => expect(previewArtifact).toHaveBeenCalledTimes(2));
+  });
+
+  it('rejects an over-dimension image (decode bomb) without rendering <img>', async () => {
+    createImageBitmapMock.mockResolvedValue({ width: 9000, height: 9000, close: vi.fn() });
+    const previewArtifact = vi.fn().mockResolvedValue(PNG_BYTES);
+    const img = att({ cid: 'img', mime: 'image/png', name: 'a.png', size: 1000 });
+    const { container } = render(MessageAttachments, {
+      props: props({ attachments: [img], channelMessageService: previewService(previewArtifact) }),
+    });
+    await fireEvent.click(container.querySelector('.att-preview-btn')!);
+    await waitFor(() => expect(container.querySelector('.att-error')).not.toBeNull());
+    expect(container.querySelector('img.att-preview-img')).toBeNull();
+  });
+
+  it('revokes blob URLs on unmount', async () => {
+    const previewArtifact = vi.fn().mockResolvedValue(PNG_BYTES);
+    const img = att({ cid: 'img', mime: 'image/png', name: 'a.png', size: 1000 });
+    const { container, unmount } = render(MessageAttachments, {
+      props: props({ attachments: [img], channelMessageService: previewService(previewArtifact) }),
+    });
+    await fireEvent.click(container.querySelector('.att-preview-btn')!);
+    await waitFor(() => expect(container.querySelector('img.att-preview-img')).not.toBeNull());
+    unmount();
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:mock');
   });
 });

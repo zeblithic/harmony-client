@@ -2,6 +2,8 @@
   import { save } from '@tauri-apps/plugin-dialog';
   import type { ChannelAttachmentDto, ChannelMessageService } from '../channel-message-service';
   import { formatBytes, mimeCategoryIcon } from '../file-utils';
+  import { isPreviewable, isImage, isText, decodeTextHead, type TextHead } from '../artifact-preview';
+  import { assertHeaderDimsOk, assertDecodedDimsOk } from '../avatar-normalize';
 
   let { communityId, channelId, attachments, channelMessageService }: {
     communityId: string;
@@ -32,6 +34,71 @@
     const ext = name.slice(dot + 1).toLowerCase();
     return { filters: [{ name: ext.toUpperCase(), extensions: [ext] }] };
   }
+
+  type PreviewState = 'idle' | 'loading' | 'shown' | 'error';
+  let previewStates = $state<Record<string, PreviewState>>({});
+  let previewUrls = $state<Record<string, string>>({});   // image blob URLs
+  let previewTexts = $state<Record<string, TextHead>>({});
+  let previewExpanded = $state<Record<string, boolean>>({}); // text "show more"
+  let previewErrors = $state<Record<string, string>>({});
+
+  function previewStateOf(cid: string): PreviewState {
+    return previewStates[cid] ?? 'idle';
+  }
+
+  function revokeUrl(cid: string) {
+    const url = previewUrls[cid];
+    if (url) {
+      URL.revokeObjectURL(url);
+      const { [cid]: _drop, ...rest } = previewUrls;
+      previewUrls = rest;
+    }
+  }
+
+  async function togglePreview(att: ChannelAttachmentDto) {
+    const st = previewStateOf(att.cid);
+    if (st === 'loading') return;
+    if (st === 'shown') {
+      // collapse + free
+      revokeUrl(att.cid);
+      const { [att.cid]: _t, ...t } = previewTexts; previewTexts = t;
+      previewStates = { ...previewStates, [att.cid]: 'idle' };
+      return;
+    }
+    previewStates = { ...previewStates, [att.cid]: 'loading' };
+    previewErrors = { ...previewErrors, [att.cid]: '' };
+    try {
+      const bytes = await channelMessageService.previewArtifact(communityId, channelId, att);
+      if (isImage(att)) {
+        // Decode-bomb guards mirror avatar-resolver: header dims BEFORE decode,
+        // decoded dims AFTER (8192px limit). A throw lands in catch → error.
+        assertHeaderDimsOk(bytes);
+        const blob = new Blob([bytes], { type: att.mime });
+        const bmp = await createImageBitmap(blob);
+        try {
+          assertDecodedDimsOk(bmp.width, bmp.height);
+        } finally {
+          bmp.close();
+        }
+        previewUrls = { ...previewUrls, [att.cid]: URL.createObjectURL(blob) };
+      } else {
+        previewTexts = { ...previewTexts, [att.cid]: decodeTextHead(bytes) };
+      }
+      previewStates = { ...previewStates, [att.cid]: 'shown' };
+    } catch (e) {
+      previewStates = { ...previewStates, [att.cid]: 'error' };
+      previewErrors = { ...previewErrors, [att.cid]: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  // Leak safety net: revoke every blob URL when this component unmounts (the feed
+  // unmounts these children on channel switch / message churn). Mirrors
+  // AvatarResolver.destroy().
+  $effect(() => {
+    return () => {
+      for (const url of Object.values(previewUrls)) URL.revokeObjectURL(url);
+    };
+  });
 
   async function download(att: ChannelAttachmentDto) {
     if (stateOf(att.cid) === 'downloading') return;
@@ -68,6 +135,20 @@
       {#if att.encrypted}
         <span class="att-lock" title="Encrypted" aria-label="Encrypted">&#x1F512;</span>
       {/if}
+      {#if isPreviewable(att)}
+        <button
+          type="button"
+          class="att-preview-btn"
+          onclick={() => togglePreview(att)}
+          disabled={previewStateOf(att.cid) === 'loading'}
+          aria-label={previewStateOf(att.cid) === 'shown' ? `Hide preview ${att.name}` : `Preview ${att.name}`}
+        >
+          {#if previewStateOf(att.cid) === 'loading'}&#x2026;
+          {:else if previewStateOf(att.cid) === 'shown'}&#x2715;
+          {:else if previewStateOf(att.cid) === 'error'}&#x21BB;
+          {:else}&#x1F441;{/if}
+        </button>
+      {/if}
       <button
         type="button"
         class="att-download"
@@ -83,6 +164,23 @@
     </div>
     {#if stateOf(att.cid) === 'error'}
       <div class="att-error" role="alert">{errors[att.cid]}</div>
+    {/if}
+    {#if previewStateOf(att.cid) === 'shown'}
+      {#if isImage(att) && previewUrls[att.cid]}
+        <img class="att-preview-img" src={previewUrls[att.cid]} alt={att.name} />
+      {:else if isText(att) && previewTexts[att.cid]}
+        <pre class="att-preview-text">{previewExpanded[att.cid] ? previewTexts[att.cid].full : previewTexts[att.cid].head}</pre>
+        {#if previewTexts[att.cid].truncated}
+          <button
+            type="button"
+            class="att-preview-more"
+            onclick={() => (previewExpanded = { ...previewExpanded, [att.cid]: !previewExpanded[att.cid] })}
+          >{previewExpanded[att.cid] ? 'Show less' : 'Show more'}</button>
+        {/if}
+      {/if}
+    {/if}
+    {#if previewStateOf(att.cid) === 'error'}
+      <div class="att-error" role="alert">{previewErrors[att.cid]}</div>
     {/if}
   {/each}
 </div>
@@ -125,4 +223,42 @@
   .att-download:hover:not(:disabled) { background: rgba(255, 255, 255, 0.06); }
   .att-download:disabled { opacity: 0.6; cursor: default; }
   .att-error { color: #d83c3e; font-size: 0.72rem; padding: 0 8px; max-width: 420px; }
+  .att-preview-btn {
+    flex: 0 0 auto;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    cursor: pointer;
+    padding: 2px 8px;
+    font: inherit;
+  }
+  .att-preview-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.06); }
+  .att-preview-btn:disabled { opacity: 0.6; cursor: default; }
+  .att-preview-img {
+    display: block;
+    max-width: 420px;
+    max-height: 320px;
+    margin-top: 4px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    object-fit: contain;
+  }
+  .att-preview-text {
+    max-width: 420px;
+    max-height: 320px;
+    overflow: auto;
+    margin-top: 4px;
+    padding: 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.75rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .att-preview-more {
+    background: transparent; border: none; color: var(--text-secondary);
+    cursor: pointer; font: inherit; font-size: 0.72rem; padding: 2px 0;
+  }
 </style>
