@@ -27,6 +27,7 @@ export interface ChannelMessageDto {
    * IPC boundary. UI dispatches to `<PollMessage>` keyed on this.
    */
   pollId?: string;
+  /**
    * ZEB-536 — per-emoji reaction summaries. Optional: populated by the
    * Rust IPC boundary; consumed by the reactions UI (Spec 2).
    */
