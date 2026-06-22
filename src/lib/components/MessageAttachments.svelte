@@ -4,6 +4,7 @@
   import { formatBytes, mimeCategoryIcon } from '../file-utils';
   import { isPreviewable, isImage, isText, decodeTextHead, type TextHead } from '../artifact-preview';
   import { assertHeaderDimsOk, assertDecodedDimsOk } from '../avatar-normalize';
+  import { untrack } from 'svelte';
 
   let { communityId, channelId, attachments, channelMessageService }: {
     communityId: string;
@@ -59,9 +60,11 @@
     const st = previewStateOf(att.cid);
     if (st === 'loading') return;
     if (st === 'shown') {
-      // collapse + free
+      // collapse + free (drop all per-cid preview state so a re-preview starts clean)
       revokeUrl(att.cid);
       const { [att.cid]: _t, ...t } = previewTexts; previewTexts = t;
+      const { [att.cid]: _x, ...x } = previewExpanded; previewExpanded = x;
+      const { [att.cid]: _e, ...e } = previewErrors; previewErrors = e;
       previewStates = { ...previewStates, [att.cid]: 'idle' };
       return;
     }
@@ -91,13 +94,45 @@
     }
   }
 
-  // Leak safety net: revoke every blob URL when this component unmounts (the feed
-  // unmounts these children on channel switch / message churn). Mirrors
+  // Leak safety net: revoke every blob URL when this component unmounts. Mirrors
   // AvatarResolver.destroy().
   $effect(() => {
     return () => {
       for (const url of Object.values(previewUrls)) URL.revokeObjectURL(url);
     };
+  });
+
+  // Drop per-cid preview state for attachments no longer present, revoking any
+  // orphaned blob URL. The feed renders MessageAttachments under an UNKEYED
+  // {#each}, so on a channel switch / message churn Svelte reuses this instance
+  // positionally with a DIFFERENT `attachments` prop instead of unmounting it —
+  // without this, an open image preview's blob URL would leak (the unmount
+  // cleanup above only fires on a real teardown). Depend on `uniqueAttachments`
+  // only; read/write the preview records under untrack so this never self-loops.
+  function pruneRecord<T>(rec: Record<string, T>, live: Set<string>): Record<string, T> {
+    const keys = Object.keys(rec);
+    if (keys.every((k) => live.has(k))) return rec; // nothing orphaned — same ref
+    const next: Record<string, T> = {};
+    for (const k of keys) if (live.has(k)) next[k] = rec[k];
+    return next;
+  }
+  $effect(() => {
+    const live = new Set(uniqueAttachments.map((a) => a.cid));
+    untrack(() => {
+      for (const cid of Object.keys(previewUrls)) {
+        if (!live.has(cid)) URL.revokeObjectURL(previewUrls[cid]);
+      }
+      const nextUrls = pruneRecord(previewUrls, live);
+      if (nextUrls !== previewUrls) previewUrls = nextUrls;
+      const nextTexts = pruneRecord(previewTexts, live);
+      if (nextTexts !== previewTexts) previewTexts = nextTexts;
+      const nextStates = pruneRecord(previewStates, live);
+      if (nextStates !== previewStates) previewStates = nextStates;
+      const nextErrors = pruneRecord(previewErrors, live);
+      if (nextErrors !== previewErrors) previewErrors = nextErrors;
+      const nextExpanded = pruneRecord(previewExpanded, live);
+      if (nextExpanded !== previewExpanded) previewExpanded = nextExpanded;
+    });
   });
 
   async function download(att: ChannelAttachmentDto) {

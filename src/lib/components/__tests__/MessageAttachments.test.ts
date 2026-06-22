@@ -215,4 +215,24 @@ describe('MessageAttachments — inline preview (ZEB-540)', () => {
     unmount();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:mock');
   });
+
+  it('revokes an orphaned blob URL when the attachments prop changes (positional reuse)', async () => {
+    // The feed renders MessageAttachments under an unkeyed {#each}, so a channel
+    // switch reuses this instance with a DIFFERENT attachments prop instead of
+    // unmounting it. An open image preview's blob URL must not leak.
+    const previewArtifact = vi.fn().mockResolvedValue(PNG_BYTES);
+    const img = att({ cid: 'img', mime: 'image/png', name: 'a.png', size: 1000 });
+    const { container, rerender } = render(MessageAttachments, {
+      props: props({ attachments: [img], channelMessageService: previewService(previewArtifact) }),
+    });
+    await fireEvent.click(container.querySelector('.att-preview-btn')!);
+    await waitFor(() => expect(container.querySelector('img.att-preview-img')).not.toBeNull());
+
+    const other = att({ cid: 'other', mime: 'text/plain', name: 'b.txt', size: 5 });
+    await rerender(props({ attachments: [other], channelMessageService: previewService(previewArtifact) }));
+
+    await waitFor(() => expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:mock'));
+    // The orphaned image preview is gone (instance reused for the new attachment).
+    expect(container.querySelector('img.att-preview-img')).toBeNull();
+  });
 });
