@@ -713,6 +713,86 @@ impl ChannelLogReplayTracker {
     }
 }
 
+/// IPC-facing materialized reaction summary for one emoji on one message.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionDto {
+    pub emoji: String,
+    pub count: u32,
+    /// True iff the local owner currently reacts with this emoji.
+    pub mine: bool,
+    /// Hex `OwnerAddr` of every member currently reacting with this emoji.
+    pub reactors: Vec<String>,
+}
+
+/// Inner map type for `ReactionIndex`: emoji → author → (latest HLC, present).
+type ReactionEmojiMap = BTreeMap<String, BTreeMap<OwnerAddr, (Hlc, bool)>>;
+
+/// In-memory LWW materialization of reactions over a channel's events.
+/// Keyed target → emoji → author → (latest HLC, present). Derived view —
+/// always reconstructable by folding the log through `apply`.
+#[derive(Debug, Default, Clone)]
+pub struct ReactionIndex {
+    by_target: BTreeMap<MessageId, ReactionEmojiMap>,
+}
+
+impl ReactionIndex {
+    /// Fold one event in. Non-React events are ignored. LWW per
+    /// (target, emoji, author): only the strictly-newest HLC wins.
+    pub fn apply(&mut self, event: &SignedChannelEvent) {
+        let SignedChannelEvent::React {
+            target,
+            author,
+            at,
+            emoji,
+            add,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let authors = self
+            .by_target
+            .entry(*target)
+            .or_default()
+            .entry(emoji.clone())
+            .or_default();
+        match authors.get(author) {
+            Some((prev_hlc, _)) if !at.is_strictly_newer_than(prev_hlc) => { /* stale — ignore */
+            }
+            _ => {
+                authors.insert(*author, (at.clone(), *add));
+            }
+        }
+    }
+
+    /// Materialize the reaction summary for a message. Emoji with zero
+    /// present reactors are omitted. Deterministic order (BTreeMap).
+    pub fn reactions_for(&self, target: &MessageId, me: &OwnerAddr) -> Vec<ReactionDto> {
+        let Some(by_emoji) = self.by_target.get(target) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (emoji, authors) in by_emoji {
+            let present: Vec<&OwnerAddr> = authors
+                .iter()
+                .filter(|(_, (_, add))| *add)
+                .map(|(a, _)| a)
+                .collect();
+            if present.is_empty() {
+                continue;
+            }
+            out.push(ReactionDto {
+                emoji: emoji.clone(),
+                count: present.len() as u32,
+                mine: present.contains(&me),
+                reactors: present.iter().map(|a| hex::encode(a.0)).collect(),
+            });
+        }
+        out
+    }
+}
+
 /// Snapshot of community state at a particular HLC, exposing just
 /// what `verify_channel_event` needs. Phase 3's engine produces this
 /// by materializing the community-state CRDT to `event.at`.
@@ -3510,5 +3590,97 @@ mod tests {
         verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
             .await
             .expect("verify react");
+    }
+
+    // ── ReactionIndex + ReactionDto tests (Task 2) ──────────────────────────
+
+    /// Build an unsigned React event directly — apply() only reads fields,
+    /// no signing needed.
+    fn react_event(
+        target: MessageId,
+        author: OwnerAddr,
+        emoji: &str,
+        add: bool,
+        wall: u64,
+    ) -> SignedChannelEvent {
+        SignedChannelEvent::React {
+            add,
+            author,
+            target,
+            emoji: emoji.to_string(),
+            community_id: SpaceId([0u8; 16]),
+            channel_id: ChannelId([0u8; 16]),
+            at: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: format!("dev-{}", hex::encode(author.0)),
+            },
+            sig: [0u8; 64],
+        }
+    }
+
+    #[test]
+    fn reaction_index_lww_toggle_and_counts() {
+        let target = MessageId([1u8; 16]);
+        let a = OwnerAddr([0xAA; 16]);
+        let b = OwnerAddr([0xBB; 16]);
+        let mut idx = ReactionIndex::default();
+        let mk = |author, emoji: &str, add, wall| react_event(target, author, emoji, add, wall);
+        idx.apply(&mk(a, "👍", true, 10));
+        idx.apply(&mk(b, "👍", true, 11));
+        idx.apply(&mk(a, "🎉", true, 12));
+        // out-of-order + LWW: a's older un-react (wall 9) must NOT override the wall-10 react
+        idx.apply(&mk(a, "👍", false, 9));
+        let r = idx.reactions_for(&target, &a);
+        // 👍 -> {a,b} present; 🎉 -> {a}
+        let thumbs = r.iter().find(|d| d.emoji == "👍").unwrap();
+        assert_eq!(thumbs.count, 2);
+        assert!(thumbs.mine);
+        assert_eq!(thumbs.reactors.len(), 2);
+        // now a un-reacts 👍 with a NEWER hlc → count drops to 1, mine=false
+        idx.apply(&mk(a, "👍", false, 20));
+        let r2 = idx.reactions_for(&target, &a);
+        let thumbs2 = r2.iter().find(|d| d.emoji == "👍").unwrap();
+        assert_eq!(thumbs2.count, 1);
+        assert!(!thumbs2.mine);
+    }
+
+    #[test]
+    fn reaction_index_apply_is_idempotent() {
+        let target = MessageId([2u8; 16]);
+        let a = OwnerAddr([0xAA; 16]);
+        let mut idx = ReactionIndex::default();
+        let ev = react_event(target, a, "👍", true, 10);
+        // Apply the same event twice — only one reactor should appear
+        idx.apply(&ev);
+        idx.apply(&ev);
+        let r = idx.reactions_for(&target, &a);
+        let thumbs = r.iter().find(|d| d.emoji == "👍").unwrap();
+        assert_eq!(thumbs.count, 1, "idempotent apply must not double-count");
+        assert!(thumbs.mine);
+        assert_eq!(thumbs.reactors.len(), 1);
+    }
+
+    #[test]
+    fn reaction_index_empty_for_unknown_target() {
+        let idx = ReactionIndex::default();
+        let unknown = MessageId([0xFF; 16]);
+        let me = OwnerAddr([0xAA; 16]);
+        let r = idx.reactions_for(&unknown, &me);
+        assert!(r.is_empty(), "unknown target must return empty vec");
+    }
+
+    #[test]
+    fn reaction_index_ignores_non_react_events() {
+        let mut idx = ReactionIndex::default();
+        // Build a Post event and apply it — should be silently ignored
+        let key = fixture_signing_key(0xa1);
+        let (payload, _) = fixture_payload("hello");
+        let post_event = sign_channel_event(&payload, &key).expect("sign");
+        idx.apply(&post_event);
+        // The target message id is payload.id
+        let me = OwnerAddr([0xAA; 16]);
+        let r = idx.reactions_for(&payload.id, &me);
+        assert!(r.is_empty(), "Post events must be ignored by ReactionIndex");
     }
 }
