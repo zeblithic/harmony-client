@@ -136,6 +136,56 @@ describe('PresenceService', () => {
     expect(service.isOnline(OWNER_1.toUpperCase())).toBe(true);
   });
 
+  it('isOnline is scoped to the ACTIVE community: a non-active community does not leak online', async () => {
+    // Subscribe to CID_A (OWNER_1 online there), then subscribe to CID_B
+    // (no members). CID_B is now the active community, so OWNER_1 — online only
+    // in the lingering CID_A map — must NOT read as online.
+    (adapter.invoke as any).mockImplementation(async (cmd: string, args: { communityId: string }) => {
+      if (cmd === 'get_community_presence') {
+        return args.communityId === CID_A ? [member(OWNER_1, true)] : [];
+      }
+      return undefined;
+    });
+    await service.subscribe(CID_A, vi.fn());
+    expect(service.isOnline(OWNER_1)).toBe(true); // CID_A is active
+    await service.subscribe(CID_B, vi.fn());
+    // CID_B is now active and has no members → OWNER_1 must not leak from CID_A.
+    expect(service.isOnline(OWNER_1)).toBe(false);
+  });
+
+  it('seed (get_community_presence) rejection rolls back the partial subscription and rethrows', async () => {
+    const unlistenSpy = adapter.unlistens;
+    (adapter.invoke as any).mockImplementation(async (cmd: string) => {
+      if (cmd === 'subscribe_community_presence') return undefined;
+      if (cmd === 'get_community_presence') throw 'seed boom';
+      if (cmd === 'unsubscribe_community_presence') return undefined;
+      return undefined;
+    });
+
+    await expect(service.subscribe(CID_A, vi.fn())).rejects.toThrow('seed boom');
+
+    // Listener was installed then rolled back via unlisten.
+    const unlisten = unlistenSpy.get('presence-updated')!;
+    expect(unlisten).toHaveBeenCalled();
+    expect(adapter.listeners.has('presence-updated')).toBe(false);
+    // Best-effort backend unsubscribe was issued.
+    expect(adapter.invoke).toHaveBeenCalledWith('unsubscribe_community_presence', { communityId: CID_A });
+    // No active community / cached state left behind.
+    expect(service.isOnline(OWNER_1)).toBe(false);
+  });
+
+  it('seed rollback rethrows even when the best-effort backend unsubscribe also fails', async () => {
+    (adapter.invoke as any).mockImplementation(async (cmd: string) => {
+      if (cmd === 'subscribe_community_presence') return undefined;
+      if (cmd === 'get_community_presence') throw 'seed boom';
+      if (cmd === 'unsubscribe_community_presence') throw 'unsub boom';
+      return undefined;
+    });
+    // The seed error is what surfaces; the swallowed unsubscribe failure must not mask it.
+    await expect(service.subscribe(CID_A, vi.fn())).rejects.toThrow('seed boom');
+    expect(adapter.listeners.has('presence-updated')).toBe(false);
+  });
+
   it('normalizes a raw-string IPC rejection into an Error (subscribe)', async () => {
     (adapter.invoke as any).mockRejectedValue('no engine for community');
     await expect(service.subscribe(CID_A, vi.fn())).rejects.toThrow('no engine for community');

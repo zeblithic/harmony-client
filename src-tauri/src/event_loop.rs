@@ -3056,6 +3056,14 @@ pub async fn run(
                     [u8; 16],
                     (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
                 > = HashMap::new();
+                // ZEB-537: monotonic per-subscribe session counter. This task
+                // processes Subscribes sequentially, so a strictly-increasing
+                // `logical` makes each new subscribe's `started_hlc` strictly
+                // newer than the previous one — even within the same `wall_ms`.
+                // Without it, a rapid unsubscribe→resubscribe inside one ms
+                // produces an identical `(started_hlc, seq=0)` prefix and peers
+                // reject the new session's beacons as stale until TTL.
+                let mut session_logical: u32 = 0;
                 while let Some(req) = request_rx.recv().await {
                     match req {
                         CommunityPresenceRequest::Subscribe { community_id } => {
@@ -3074,9 +3082,13 @@ pub async fn run(
                             // Fresh session HLC (seq restarts at 0 on every
                             // (re)subscribe; the map's freshness rules treat a
                             // strictly-newer started_hlc as a new session).
+                            // Bump `logical` per subscribe so the HLC is
+                            // strictly-increasing even when `wall_ms` is
+                            // unchanged across a rapid resubscribe.
+                            session_logical = session_logical.wrapping_add(1);
                             let started_hlc = crate::owner_state_types::Hlc {
                                 wall_ms: crate::iroh_friend_acceptor::wall_now_ms(),
-                                logical: 0,
+                                logical: session_logical,
                                 device_id: hex::encode(self_device),
                             };
                             let seq_counter =

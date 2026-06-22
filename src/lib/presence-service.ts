@@ -37,7 +37,8 @@ interface PresenceUpdatedPayload {
  * State is a per-community map of `ownerIdHex(lc) -> PresenceMemberDto`, seeded
  * on {@link subscribe} from `get_community_presence` and kept live by the
  * `presence-updated` event (filtered to the subscribed community). {@link isOnline}
- * answers across all subscribed communities (lowercased owner_id lookup).
+ * answers for the ACTIVE community only (the most recently subscribed one;
+ * lowercased owner_id lookup), so a lingering old-community map never leaks.
  */
 export class PresenceService {
   /** communityId -> (ownerIdHex(lc) -> presence). */
@@ -46,6 +47,13 @@ export class PresenceService {
   private unlisteners = new Map<string, () => void>();
   /** communityId -> the caller's onUpdate callback. */
   private callbacks = new Map<string, (members: PresenceMemberDto[]) => void>();
+  /**
+   * The community whose roster {@link isOnline} consults. Set on a successful
+   * {@link subscribe}; cleared when that community is unsubscribed. Scoping
+   * isOnline to the active community prevents a lingering old-community map
+   * (e.g. mid community-switch) from leaking a stale "online" answer.
+   */
+  private activeCommunityId: string | null = null;
 
   /**
    * Adapter is optional so callers can construct the service at boot (before
@@ -84,6 +92,8 @@ export class PresenceService {
       this.callbacks.delete(communityId);
       throw new Error(e instanceof Error ? e.message : String(e));
     }
+    // Backend subscribe succeeded → this is now the active community for isOnline.
+    this.activeCommunityId = communityId;
 
     if (!this.unlisteners.has(communityId)) {
       const unlisten = await this.adapter.listen('presence-updated', (event) => {
@@ -96,8 +106,26 @@ export class PresenceService {
     }
 
     // Seed initial state (and fire onUpdate) from the authoritative snapshot.
-    const seed = await this.getPresence(communityId);
-    this.applyMembers(communityId, seed);
+    // If the seed fetch rejects, roll back the partial subscription (listener +
+    // backend subscription + cached state) before rethrowing, so a failed
+    // subscribe never leaves an orphaned listener/backend subscription behind.
+    try {
+      const seed = await this.getPresence(communityId);
+      this.applyMembers(communityId, seed);
+    } catch (e: unknown) {
+      const unlisten = this.unlisteners.get(communityId);
+      if (unlisten) {
+        unlisten();
+        this.unlisteners.delete(communityId);
+      }
+      this.callbacks.delete(communityId);
+      this.byCommunity.delete(communityId);
+      if (this.activeCommunityId === communityId) this.activeCommunityId = null;
+      await this.adapter
+        .invoke('unsubscribe_community_presence', { communityId })
+        .catch(() => {});
+      throw new Error(e instanceof Error ? e.message : String(e));
+    }
   }
 
   /**
@@ -116,6 +144,7 @@ export class PresenceService {
     }
     this.callbacks.delete(communityId);
     this.byCommunity.delete(communityId);
+    if (this.activeCommunityId === communityId) this.activeCommunityId = null;
     try {
       await this.adapter.invoke('unsubscribe_community_presence', { communityId });
     } catch (e: unknown) {
@@ -139,15 +168,16 @@ export class PresenceService {
   }
 
   /**
-   * True iff `ownerIdHex` is currently online in any subscribed community.
-   * owner_id lookup is case-insensitive (keys are stored lowercased).
+   * True iff `ownerIdHex` is currently online in the ACTIVE community (the most
+   * recently subscribed one). Scoped to the active community so a lingering
+   * old-community map (e.g. during a community switch) can't leak a stale
+   * answer. owner_id lookup is case-insensitive (keys are stored lowercased).
    */
   isOnline(ownerIdHex: string): boolean {
-    const key = ownerIdHex.toLowerCase();
-    for (const members of this.byCommunity.values()) {
-      if (members.get(key)?.online) return true;
-    }
-    return false;
+    if (!this.activeCommunityId) return false;
+    return (
+      this.byCommunity.get(this.activeCommunityId)?.get(ownerIdHex.toLowerCase())?.online ?? false
+    );
   }
 
   /** Replace a community's cached presence map and notify its subscriber. */

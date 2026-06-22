@@ -186,7 +186,11 @@ async fn seeded_registry(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn community_presence_two_engine_online_and_sweep() {
     // Outer guard so a hang surfaces as a failure, not an indefinite stall.
-    tokio::time::timeout(Duration::from_secs(30), run_inner())
+    // The outer guard must comfortably exceed the SUM of the inner readiness +
+    // convergence + drain waits — `run_inner`'s worst-case (slow CI Zenoh
+    // discovery) can approach 30s, so a 30s outer budget produced flaky false
+    // timeouts. 90s leaves ample headroom while still catching a true hang.
+    tokio::time::timeout(Duration::from_secs(90), run_inner())
         .await
         .expect("community presence two-engine test timed out");
 }

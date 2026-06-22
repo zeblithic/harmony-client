@@ -139,6 +139,12 @@
   // repaints live.
   const presenceService = new PresenceService();
   let presenceVersion = $state(0);
+  // ZEB-537: generation guard for the fire-and-forget presence switch in
+  // changeSelectedCommunity. Rapid community switches interleave their async
+  // unsubscribe/subscribe; a superseded switch must bail after each await so it
+  // never resubscribes to (or clobbers state for) a community the user has
+  // already left. Plain (non-$state) — read only inside the IIFE.
+  let presenceSwitchGen = 0;
   // selfOwnerId is the OwnerAddr hex (32 chars) obtained from get_owner_state.
   // Set at startup (after start_node) and kept stable for the session.
   let selfOwnerId = $state<string | null>(null);
@@ -1044,13 +1050,18 @@
       // No-ops cleanly before the adapter is wired. Fire-and-forget (IPC errors
       // are non-blocking for selection).
       const prevPresenceId = selectedCommunityId;
+      const myGen = ++presenceSwitchGen;
       void (async () => {
         try {
           if (prevPresenceId != null) await presenceService.unsubscribe(prevPresenceId);
+          // A newer switch superseded us while awaiting — stop before
+          // resubscribing/clobbering the now-active community's state.
+          if (myGen !== presenceSwitchGen) return;
           if (id != null) {
             await presenceService.subscribe(id, () => {
               presenceVersion++;
             });
+            if (myGen !== presenceSwitchGen) return;
           }
         } catch (e) {
           console.error('presence subscription switch failed:', e instanceof Error ? e.message : String(e));

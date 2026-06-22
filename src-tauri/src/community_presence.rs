@@ -277,9 +277,12 @@ impl CommunityPresenceMap {
     }
 
     /// Apply a (verified, opened) beacon. `now_ms` is a monotonic clock the
-    /// caller supplies. Returns true only when the OWNER-level roster changed
-    /// (a new owner came online) — a bare liveness refresh or a second device
-    /// for an already-online owner returns false to avoid frontend event spam.
+    /// caller supplies. Returns true when the device set changes — i.e. a new
+    /// device is inserted (a fresh owner OR an additional device for an
+    /// already-online owner, since `deviceCount` is part of the emitted DTO and
+    /// so is roster-visible). A bare liveness refresh of an existing device
+    /// (same/newer-session or newer-seq for a device we already track) returns
+    /// false to avoid frontend event spam.
     ///
     /// Freshness mirrors `VoicePresenceMap::apply` (minus gravestones): a
     /// strictly-newer `started_hlc` supersedes regardless of `seq` (seq
@@ -309,10 +312,11 @@ impl CommunityPresenceMap {
                 false
             }
             None => {
-                // Brand-new device for this community. Whether this is an
-                // owner-visible change depends on whether the owner already had
+                // Brand-new device for this community. A new device always
+                // changes the roster's device set (the owner's `deviceCount` /
+                // `last_seen_ms` is part of the emitted DTO), so this is always
+                // a roster-visible change — whether or not the owner already had
                 // another live device here.
-                let owner_was_online = community.values().any(|e| e.owner == beacon.owner);
                 community.insert(
                     beacon.device,
                     PresenceEntry {
@@ -322,7 +326,7 @@ impl CommunityPresenceMap {
                         last_seen_ms: now_ms,
                     },
                 );
-                !owner_was_online
+                true
             }
         }
     }
@@ -667,6 +671,21 @@ mod tests {
         m.apply(&c, &b(1, 2, 100, 0), 1_000);
         let r = m.online_owners(&c);
         assert_eq!(r.len(), 1);
+        assert_eq!(r[0].device_count, 2);
+    }
+
+    #[test]
+    fn second_device_for_online_owner_reports_change() {
+        // A new device for an ALREADY-online owner changes the owner's
+        // device_count (part of the emitted DTO) → must report a change so the
+        // subscriber re-emits `presence-updated` (ZEB-537 apply device-count fix).
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        assert!(m.apply(&c, &b(1, 1, 100, 0), 1_000)); // first device → change
+        assert!(m.apply(&c, &b(1, 2, 100, 0), 2_000)); // second device, same owner → change
+        let r = m.online_owners(&c);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].owner, [1; 16]);
         assert_eq!(r[0].device_count, 2);
     }
 
