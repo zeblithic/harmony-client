@@ -20040,6 +20040,7 @@ async fn post_channel_message(
     body: Vec<u8>,
     reply_to: Option<String>,
     mentions: Option<Vec<String>>,
+    attachments: Option<Vec<crate::community_channel_log_engine::ChannelAttachmentDto>>,
 ) -> Result<String, String> {
     post_channel_message_impl(
         state_lock.inner(),
@@ -20048,6 +20049,7 @@ async fn post_channel_message(
         body,
         reply_to,
         mentions,
+        attachments,
     )
     .await
 }
@@ -20107,6 +20109,7 @@ pub(crate) async fn post_channel_message_impl(
     body: Vec<u8>,
     reply_to: Option<String>,
     mentions: Option<Vec<String>>,
+    attachments: Option<Vec<crate::community_channel_log_engine::ChannelAttachmentDto>>,
 ) -> Result<String, String> {
     if community_id.len() != 32 {
         return Err("community_id must be 16 bytes (32 hex chars)".to_string());
@@ -20170,6 +20173,43 @@ pub(crate) async fn post_channel_message_impl(
         None => None,
     };
 
+    // ZEB-535: convert the IPC-facing attachment DTOs (hex cid + metadata) into
+    // signed `ChannelAttachment`s. Cap the count and field lengths BEFORE
+    // decoding/allocating so an oversized IPC payload is rejected cheaply
+    // (the engine's publish() and inbound verification enforce the same caps).
+    let attachment_vals: Option<Vec<crate::community_channel_log::ChannelAttachment>> =
+        match attachments {
+            Some(list) => {
+                if list.len() > crate::community_channel_log::MAX_ATTACHMENTS {
+                    return Err(format!(
+                        "too many attachments: {} (max {})",
+                        list.len(),
+                        crate::community_channel_log::MAX_ATTACHMENTS
+                    ));
+                }
+                let mut out = Vec::with_capacity(list.len());
+                for a in list {
+                    let cid: [u8; 32] = hex::decode(&a.cid)
+                        .ok()
+                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                        .ok_or_else(|| "invalid attachment cid hex".to_string())?;
+                    if a.name.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+                        || a.mime.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+                    {
+                        return Err("attachment name/mime too long".to_string());
+                    }
+                    out.push(crate::community_channel_log::ChannelAttachment {
+                        cid,
+                        mime: a.mime,
+                        name: a.name,
+                        size: a.size,
+                    });
+                }
+                Some(out)
+            }
+            None => None,
+        };
+
     let registry = {
         let guard = state
             .lock()
@@ -20187,7 +20227,7 @@ pub(crate) async fn post_channel_message_impl(
         .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
 
     let msg_id = engine
-        .publish(body, reply_to_msg_id, mention_addrs, None)
+        .publish(body, reply_to_msg_id, mention_addrs, attachment_vals)
         .await
         .map_err(|e| e.to_string())?;
     Ok(hex::encode(msg_id.0))
@@ -22655,6 +22695,7 @@ mod create_community_inner_tests {
             community_id_hex.clone(),
             channel_id_hex.clone(),
             b"hello, no attachments".to_vec(),
+            None,
             None,
             None,
         )
@@ -49344,6 +49385,7 @@ mod channel_message_ipc_tests {
             vec![1],
             None,
             None,
+            None,
         )
         .await
         .expect_err("short cid must error");
@@ -49354,9 +49396,17 @@ mod channel_message_ipc_tests {
     async fn post_channel_message_rejects_short_channel_id() {
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err = post_channel_message(state, "00".repeat(16), "ab".into(), vec![1], None, None)
-            .await
-            .expect_err("short chid must error");
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "ab".into(),
+            vec![1],
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("short chid must error");
         assert!(err.contains("channel_id must be 16 bytes"), "got: {err}");
     }
 
@@ -49364,10 +49414,17 @@ mod channel_message_ipc_tests {
     async fn post_channel_message_rejects_bad_hex() {
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err =
-            post_channel_message(state, "zz".repeat(16), "00".repeat(16), vec![1], None, None)
-                .await
-                .expect_err("bad hex must error");
+        let err = post_channel_message(
+            state,
+            "zz".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("bad hex must error");
         assert!(err.contains("invalid community_id hex"), "got: {err}");
     }
 
@@ -49381,6 +49438,7 @@ mod channel_message_ipc_tests {
             "00".repeat(16),
             vec![1],
             Some("ab".into()),
+            None,
             None,
         )
         .await
@@ -49399,6 +49457,7 @@ mod channel_message_ipc_tests {
             vec![1],
             None,
             Some(vec!["zz".repeat(16)]),
+            None,
         )
         .await
         .expect_err("bad mention hex must error");
@@ -49416,6 +49475,7 @@ mod channel_message_ipc_tests {
             vec![1],
             None,
             Some(vec!["ab".into()]),
+            None,
         )
         .await
         .expect_err("short mention must error");
@@ -49435,6 +49495,7 @@ mod channel_message_ipc_tests {
             vec![1],
             None,
             Some(too_many),
+            None,
         )
         .await
         .expect_err("over-cap mentions must error at the IPC boundary");
@@ -49452,10 +49513,71 @@ mod channel_message_ipc_tests {
             vec![104, 105],
             None,
             None,
+            None,
         )
         .await
         .expect_err("missing registry must error");
         assert!(err.contains("channel_log_registry missing"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_bad_attachment_cid_hex() {
+        // ZEB-535: a non-hex (or wrong-length) attachment cid must be rejected at
+        // the IPC boundary, before any engine/event-loop dependency is touched.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+            Some(vec![
+                crate::community_channel_log_engine::ChannelAttachmentDto {
+                    cid: "zz".repeat(32), // 64 chars, non-hex -> decode fails
+                    mime: "text/plain".into(),
+                    name: "note.txt".into(),
+                    size: 12,
+                    encrypted: false,
+                },
+            ]),
+        )
+        .await
+        .expect_err("bad attachment cid hex must error");
+        assert!(err.contains("invalid attachment cid hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_too_many_attachments() {
+        // ZEB-535: an over-cap attachment list must be rejected at the IPC
+        // boundary (mirrors the mentions cap), before decoding/allocating.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let too_many: Vec<crate::community_channel_log_engine::ChannelAttachmentDto> = (0
+            ..=crate::community_channel_log::MAX_ATTACHMENTS)
+            .map(
+                |_| crate::community_channel_log_engine::ChannelAttachmentDto {
+                    cid: "00".repeat(32),
+                    mime: "text/plain".into(),
+                    name: "note.txt".into(),
+                    size: 12,
+                    encrypted: false,
+                },
+            )
+            .collect();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            None,
+            None,
+            Some(too_many),
+        )
+        .await
+        .expect_err("over-cap attachments must error at the IPC boundary");
+        assert!(err.contains("too many attachments"), "got: {err}");
     }
 
     // ── ZEB-539: download_channel_artifact IPC boundary rejections ──────────

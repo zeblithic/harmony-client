@@ -148,6 +148,7 @@ struct PostChannelMessageArgs {
     body: Vec<u8>,
     reply_to: Option<String>,
     mentions: Option<Vec<String>>,
+    attachments: Option<Vec<crate::community_channel_log_engine::ChannelAttachmentDto>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -409,6 +410,7 @@ pub fn build_registry() -> RpcRegistry {
                 a.body,
                 a.reply_to,
                 a.mentions,
+                a.attachments,
             )
             .await
         }
