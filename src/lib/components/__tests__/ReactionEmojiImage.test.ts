@@ -67,6 +67,15 @@ describe('ReactionEmojiImage (ZEB-541)', () => {
     });
   });
 
+  it('uses previewNamedEmoji when communityId/channelId are absent', async () => {
+    const previewNamedEmoji = vi.fn().mockResolvedValue(PNG_BYTES);
+    const previewReactionEmoji = vi.fn();
+    const svc = { previewNamedEmoji, previewReactionEmoji } as any;
+    render(ReactionEmojiImage, { props: { cid: 'aa', channelMessageService: svc } });
+    await waitFor(() => expect(previewNamedEmoji).toHaveBeenCalledWith('aa'));
+    expect(previewReactionEmoji).not.toHaveBeenCalled();
+  });
+
   it('shows a neutral placeholder until the blob resolves', async () => {
     let resolveFetch!: (v: Uint8Array) => void;
     const previewReactionEmoji = vi.fn(() => new Promise<Uint8Array>((r) => { resolveFetch = r; }));

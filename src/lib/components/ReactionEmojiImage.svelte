@@ -10,8 +10,8 @@
   // decode-bomb guards (header dims pre-decode, decoded dims post-decode), and a
   // neutral placeholder while pending / on error.
   let { communityId, channelId, cid, channelMessageService }: {
-    communityId: string;
-    channelId: string;
+    communityId?: string;
+    channelId?: string;
     cid: string;
     channelMessageService: ChannelMessageService;
   } = $props();
@@ -39,7 +39,9 @@
 
   async function load(forCid: string) {
     try {
-      const bytes = await channelMessageService.previewReactionEmoji(communityId, channelId, forCid);
+      const bytes = communityId && channelId
+        ? await channelMessageService.previewReactionEmoji(communityId, channelId, forCid)
+        : await channelMessageService.previewNamedEmoji(forCid);
       // Bail if torn down / cid swapped during the IPC — nothing created yet.
       if (!isLive(forCid)) return;
       // Decode-bomb guards (ZEB-540/541 parity): these bytes are UNTRUSTED —
