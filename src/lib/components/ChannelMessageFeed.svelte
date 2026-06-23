@@ -138,6 +138,13 @@
     // ZEB-541: drop any in-flight custom-emoji pick target so a late ingest
     // can't react on the new channel (the epoch bump below is the hard guard).
     customEmojiFor = null;
+    // Drop named-picker popover, inline-naming input, and upload-name field so
+    // they don't carry stale state across a channel switch (symmetric with the
+    // resets above).
+    namedPickerFor = null;
+    namingCid = null;
+    namingValue = '';
+    uploadName = '';
     attachEpoch += 1;
     // Phase 4 round-1 fixup: also reset scroll/backfill state to avoid
     // bleed-over between channels (Qodo PR #97 finding).

@@ -21364,9 +21364,6 @@ pub(crate) async fn set_emoji_name_impl(
         store.set(&cid, trimmed, &mime, size, now_ms);
         store.save(&path)?;
     }
-    if trimmed.is_some() {
-        pin_public_emoji_best_effort(state, &cid).await;
-    }
     Ok(())
 }
 
@@ -21403,8 +21400,23 @@ async fn set_emoji_name(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    set_emoji_name_impl(state_lock.inner(), cid, name, mime, size, now_ms).await?;
+    // Retain-on-name pin runs DETACHED so the IPC never blocks on fetch latency
+    // (best-effort; pin errors are logged + swallowed inside the helper).
+    let is_setting = name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    set_emoji_name_impl(state_lock.inner(), cid.clone(), name, mime, size, now_ms).await?;
     let _ = app.emit("emoji-names-changed", ());
+    if is_setting {
+        let app_bg = app.clone();
+        tauri::async_runtime::spawn(async move {
+            use tauri::Manager as _;
+            let state = app_bg.state::<std::sync::Mutex<NodeState>>();
+            pin_public_emoji_best_effort(state.inner(), &cid).await;
+        });
+    }
     Ok(())
 }
 
