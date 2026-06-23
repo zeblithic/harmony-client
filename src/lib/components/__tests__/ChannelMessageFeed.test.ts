@@ -992,7 +992,17 @@ describe('ChannelMessageFeed reactions — custom (CAS) emoji (ZEB-541)', () => 
     const ctx = await setup();
     (ctx.adapter.invoke as any).mockImplementation((cmd: string) => {
       if (cmd === 'list_channel_messages') return Promise.resolve([]);
-      if (cmd === 'preview_reaction_emoji') return Promise.resolve([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      if (cmd === 'preview_reaction_emoji')
+        // A full PNG header (signature + IHDR declaring 64x64). The render path
+        // now parses dims BEFORE decode and rejects unparseable headers, so an
+        // 8-byte signature alone is (correctly) refused — must carry the IHDR.
+        return Promise.resolve([
+          0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // signature
+          0x00, 0x00, 0x00, 0x0d, // IHDR length = 13
+          0x49, 0x48, 0x44, 0x52, // "IHDR"
+          0x00, 0x00, 0x00, 0x40, // width = 64
+          0x00, 0x00, 0x00, 0x40, // height = 64
+        ]);
       if (cmd === 'set_message_reaction') return Promise.resolve(undefined);
       if (cmd === 'ingest_channel_artifact_bytes') {
         return Promise.resolve({ cid: 'newcid', mime: 'image/png', name: '', size: 321, encrypted: true });
