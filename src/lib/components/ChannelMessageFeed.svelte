@@ -8,6 +8,7 @@
   import PollMessage from './PollMessage.svelte';
   import MessageAttachments from './MessageAttachments.svelte';
   import ReactionEmojiImage from './ReactionEmojiImage.svelte';
+  import NamedEmojiPicker from './NamedEmojiPicker.svelte';
   import { normalizeEmoji } from '../emoji-normalize';
   import { open } from '@tauri-apps/plugin-dialog';
   import { formatBytes, mimeCategoryIcon } from '../file-utils';
@@ -454,6 +455,39 @@
       .catch((e) => console.warn('reaction pick failed', e instanceof Error ? e.message : String(e)));
   }
 
+  // Task 10 — react with a stored named emoji's descriptor (CID + mime + size),
+  // mirroring pickFromPicker's explicit-add semantics. Closes both popovers.
+  function pickNamedEmoji(msg: ChannelMessageDto, d: { cid: string; mime: string; size: number }): void {
+    namedPickerFor = null;
+    pickerOpenFor = null;
+    void channelMessageService
+      .reactToMessage(communityId, channelId, msg.messageId, '', true, d)
+      .catch((e) => console.warn('named-emoji pick failed', e instanceof Error ? e.message : String(e)));
+  }
+
+  // Task 10 — open the tiny inline name input on a PUBLIC custom reaction chip.
+  function startNameThis(r: NonNullable<ChannelMessageDto['reactions']>[number]): void {
+    if (!r.emojiCid) return;
+    namingCid = r.emojiCid;
+    namingValue = '';
+    namingMime = 'image/png';
+    namingSize = r.emojiSize ?? 0;
+  }
+
+  // Task 10 — commit the typed name to the local emoji-name map. Reuses the
+  // existing `reactionError` surfaced-error state on failure.
+  async function commitNameThis(): Promise<void> {
+    const cid = namingCid;
+    const name = namingValue.trim();
+    namingCid = null;
+    if (!cid || !name) return;
+    try {
+      await channelMessageService.setEmojiName(cid, name, namingMime, namingSize);
+    } catch (e) {
+      reactionError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
   // ZEB-541 — custom (CAS-backed image) emoji reaction. The hidden file input is
   // shared across messages; `customEmojiFor` records which message the in-flight
   // pick targets (cleared on channel switch via the $effect below). A surfaced
@@ -466,6 +500,18 @@
   // This per-upload toggle opts a single emoji into the encrypted/private path.
   // Reset to public after each pick so the safe default never silently sticks.
   let customEmojiPrivate = $state(false);
+
+  // Task 10 — named-emoji integrations. `namedPickerFor` records which message's
+  // toolbar currently shows the <NamedEmojiPicker> popover. `naming*` drives the
+  // tiny inline "name this" input on a PUBLIC custom reaction chip. `uploadName`
+  // is the optional name typed at upload time, routed to setEmojiName after the
+  // emoji is ingested + reacted with.
+  let namedPickerFor = $state<string | null>(null);
+  let namingCid = $state<string | null>(null);
+  let namingValue = $state('');
+  let namingMime = '';
+  let namingSize = 0;
+  let uploadName = $state('');
 
   // Open the OS file picker for a custom emoji on `msg`. Mirrors the avatar
   // File-acquisition flow (ProfileEditor): a native <input type="file"> whose
@@ -491,6 +537,11 @@
     // Capture the per-upload privacy choice, then reset to the public default.
     const makePrivate = customEmojiPrivate;
     customEmojiPrivate = false;
+    // Task 10 — capture + reset the optional upload-time name. Only PUBLIC emoji
+    // are nameable (the name map keys by the public CID), so a private upload
+    // discards any typed name.
+    const nameAtUpload = uploadName.trim();
+    uploadName = '';
     // Reset the input + the target so a repeated pick of the same file re-fires
     // change, and a stale target can't leak into a later pick.
     input.value = '';
@@ -512,6 +563,10 @@
         mime: 'image/png',
         size,
       });
+      // Task 10 — if a name was typed at upload (PUBLIC emoji only), bind it now.
+      if (nameAtUpload && !makePrivate) {
+        await channelMessageService.setEmojiName(emojiCid, nameAtUpload, 'image/png', size);
+      }
     } catch (err) {
       if (epoch !== attachEpoch) return; // don't surface on a stale channel
       reactionError = err instanceof Error ? err.message : String(err);
@@ -700,6 +755,23 @@
                     {/if}
                     <span class="reaction-count">{r.count}</span>
                   </button>
+                  <!-- Task 10: name-this affordance — only on PUBLIC custom chips
+                       (the name map keys by the public CID; encrypted emoji aren't
+                       nameable). Opens a tiny inline input → setEmojiName. -->
+                  {#if r.emojiCid && r.encrypted !== true}
+                    {#if namingCid === r.emojiCid}
+                      <input
+                        class="name-this-input"
+                        type="text"
+                        aria-label="Emoji name"
+                        bind:value={namingValue}
+                        onkeydown={(ev) => ev.key === 'Enter' && commitNameThis()}
+                      />
+                      <button type="button" class="name-this-save" aria-label="Save emoji name" onclick={() => commitNameThis()}>✓</button>
+                    {:else}
+                      <button type="button" class="name-this" aria-label="Name this emoji" onclick={() => startNameThis(r)}>✎</button>
+                    {/if}
+                  {/if}
                 {/each}
               </div>
             {/if}
@@ -755,6 +827,23 @@
                   <span>Keep private</span>
                 </label>
                 <span class="picker-private-hint" id="picker-private-hint-{msg.messageId}">Public emoji can't be deleted later.</span>
+                <!-- Task 10: open the saved named-emoji popover; pick reacts on this message. -->
+                <button
+                  type="button"
+                  class="picker-named"
+                  role="menuitem"
+                  aria-label="Named emoji"
+                  onclick={() => (namedPickerFor = namedPickerFor === msg.messageId ? null : msg.messageId)}
+                >🔖</button>
+                <label class="picker-upload-name">
+                  <span>Name (optional)</span>
+                  <input type="text" aria-label="Name new emoji" bind:value={uploadName} placeholder="catjam" />
+                </label>
+                {#if namedPickerFor === msg.messageId}
+                  <div class="named-popover">
+                    <NamedEmojiPicker {channelMessageService} onpick={(d) => pickNamedEmoji(msg, d)} />
+                  </div>
+                {/if}
               </div>
             {/if}
           </div>
@@ -959,7 +1048,8 @@
   .quick-react,
   .picker-toggle,
   .picker-emoji,
-  .picker-custom {
+  .picker-custom,
+  .picker-named {
     background: transparent;
     border: none;
     cursor: pointer;
@@ -971,11 +1061,13 @@
   .quick-react:hover,
   .picker-toggle:hover,
   .picker-emoji:hover,
-  .picker-custom:hover { background: var(--bg-tertiary); }
+  .picker-custom:hover,
+  .picker-named:hover { background: var(--bg-tertiary); }
   .quick-react:focus-visible,
   .picker-toggle:focus-visible,
   .picker-emoji:focus-visible,
-  .picker-custom:focus-visible {
+  .picker-custom:focus-visible,
+  .picker-named:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
@@ -1011,6 +1103,31 @@
     font-size: 0.7rem;
     opacity: 0.6;
   }
+  /* Task 10: the upload-name label + the named-emoji popover are full-width rows
+     in the 5-col picker grid (same idiom as .picker-private / its hint). */
+  .picker-upload-name {
+    display: flex;
+    flex-direction: column;
+    grid-column: 1 / -1;
+    font-size: 0.75em;
+    gap: 0.1rem;
+  }
+  .named-popover {
+    grid-column: 1 / -1;
+    position: relative;
+    z-index: 10;
+  }
+  /* Task 10: in-context "name this" affordance + its inline input on a chip. */
+  .name-this {
+    opacity: 0.4;
+    cursor: pointer;
+    font-size: 0.85em;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+  }
+  .name-this:hover { opacity: 1; }
+  .name-this-input { width: 7rem; }
   .compose {
     border-top: 1px solid var(--border);
     padding: 8px 16px 12px;

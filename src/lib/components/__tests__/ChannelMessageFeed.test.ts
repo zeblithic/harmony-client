@@ -1181,4 +1181,113 @@ describe('ChannelMessageFeed reactions — custom (CAS) emoji (ZEB-541)', () => 
       );
     });
   });
+
+  // Task 10: seed a plain (no reactions) message + an emoji-name map; the feed
+  // renders <NamedEmojiPicker>, which lists from `list_emoji_names`.
+  async function seedWithNamedEmoji() {
+    const ctx = await setup();
+    (ctx.adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'list_emoji_names')
+        return Promise.resolve([{ cid: 'aa', name: 'catjam', mime: 'image/png', size: 7 }]);
+      if (cmd === 'preview_named_emoji') return Promise.resolve([0x89, 0x50, 0x4e, 0x47]);
+      if (cmd === 'set_emoji_name') return Promise.resolve(undefined);
+      if (cmd === 'set_message_reaction') return Promise.resolve(undefined);
+      return Promise.resolve(undefined);
+    });
+    const handler = ctx.adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'ee'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('hi')),
+        },
+      },
+    });
+    await waitFor(() => expect(ctx.container.querySelector('.channel-message')).toBeTruthy());
+    return ctx;
+  }
+
+  it('picking from the named-emoji popover reacts with the stored descriptor', async () => {
+    const ctx = await seedWithNamedEmoji();
+    const reactSpy = vi.spyOn(ctx.service, 'reactToMessage');
+
+    // Open the reaction picker, then the named-emoji popover.
+    await fireEvent.click(ctx.container.querySelector('.picker-toggle') as HTMLButtonElement);
+    const namedBtn = await ctx.findByLabelText('Named emoji');
+    await fireEvent.click(namedBtn);
+
+    // The popover lists the named emoji; click its tile (title = the name).
+    const tile = await ctx.findByTitle('catjam');
+    await fireEvent.click(tile);
+
+    expect(reactSpy).toHaveBeenCalledWith(
+      'aa'.repeat(16),
+      'bb'.repeat(16),
+      'm1',
+      '',
+      true,
+      { cid: 'aa', mime: 'image/png', size: 7 },
+    );
+  });
+
+  // Seed a message with a single PUBLIC custom reaction chip (encrypted unset).
+  async function seedPublicChip(encrypted = false) {
+    const ctx = await setup();
+    (ctx.adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'list_emoji_names') return Promise.resolve([]);
+      if (cmd === 'preview_reaction_emoji')
+        return Promise.resolve([
+          0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+          0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+          0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40,
+        ]);
+      if (cmd === 'set_emoji_name') return Promise.resolve(undefined);
+      return Promise.resolve(undefined);
+    });
+    const handler = ctx.adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'ee'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('hi')),
+          reactions: [
+            { emoji: '', count: 1, mine: false, reactors: ['ee'.repeat(20)], emojiCid: 'aa', emojiSize: 7, encrypted },
+          ],
+        },
+      },
+    });
+    await waitFor(() => expect(ctx.container.querySelector('.reaction-chip')).toBeTruthy());
+    return ctx;
+  }
+
+  it('name-this on a public custom chip calls setEmojiName with the chip descriptor', async () => {
+    const ctx = await seedPublicChip(false);
+    const nameSpy = vi.spyOn(ctx.service, 'setEmojiName');
+
+    await fireEvent.click(await ctx.findByLabelText('Name this emoji'));
+    const input = (await ctx.findByLabelText('Emoji name')) as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: 'catjam' } });
+    await fireEvent.click(await ctx.findByLabelText('Save emoji name'));
+
+    expect(nameSpy).toHaveBeenCalledWith('aa', 'catjam', 'image/png', 7);
+  });
+
+  it('name-this affordance is absent on an encrypted custom chip', async () => {
+    const ctx = await seedPublicChip(true);
+    expect(ctx.queryByLabelText('Name this emoji')).toBeNull();
+  });
 });
