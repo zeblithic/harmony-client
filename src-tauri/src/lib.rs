@@ -32697,7 +32697,13 @@ pub(crate) async fn list_recent_counter_signs_impl(
         .try_into()
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
-    let cap = if limit == 0 { 20 } else { limit as usize };
+    // Bound the caller-supplied limit (parity with list_recent_moderation_events;
+    // this verb is reachable over the headless API). 0 keeps the legacy default.
+    let cap = if limit == 0 {
+        20
+    } else {
+        limit.clamp(1, 100) as usize
+    };
 
     let (registry, self_owner) = {
         let g = state
@@ -44031,12 +44037,17 @@ pub(crate) async fn connectivity_set_identity_discoverable_impl(
         return Err("pkarr_settings_path missing".into());
     };
 
-    // Persist the preference.
-    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
-    settings.identity_discoverable = enabled;
-    settings
-        .save(&path)
-        .map_err(|e| format!("save connectivity-settings: {e}"))?;
+    // Persist the preference. Offload the sync std::fs load+save off the Tokio
+    // worker — this seam is reachable over the async headless API surface.
+    tokio::task::spawn_blocking(move || {
+        let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
+        settings.identity_discoverable = enabled;
+        settings
+            .save(&path)
+            .map_err(|e| format!("save connectivity-settings: {e}"))
+    })
+    .await
+    .map_err(|e| format!("save connectivity-settings task: {e}"))??;
 
     // Toggle the publication.
     if enabled {
@@ -44084,7 +44095,13 @@ pub(crate) async fn connectivity_get_identity_discoverable_impl(
         // Node not running or pkarr not initialized — return the default (off).
         return Ok(false);
     };
-    Ok(pkarr_settings::PkarrSettings::load_or_default(&path).identity_discoverable)
+    // Offload the sync std::fs read off the Tokio worker — this seam is reachable
+    // over the async headless API surface.
+    tokio::task::spawn_blocking(move || {
+        pkarr_settings::PkarrSettings::load_or_default(&path).identity_discoverable
+    })
+    .await
+    .map_err(|e| format!("load connectivity-settings task: {e}"))
 }
 
 #[tauri::command]
