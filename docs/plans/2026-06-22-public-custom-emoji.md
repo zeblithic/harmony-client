@@ -582,6 +582,7 @@ cd src-tauri && cargo fmt --all -- --check \
   && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings \
   && cargo nextest run --locked --workspace --all-targets --features test-fixtures
 ```
+
 Expected: fmt clean, clippy 0 warnings, all tests pass.
 
 - [ ] **Full frontend gate sweep (from repo root):**
@@ -589,6 +590,7 @@ Expected: fmt clean, clippy 0 warnings, all tests pass.
 ```bash
 npx tsc --noEmit && npx vitest run
 ```
+
 Expected: type-check clean, all tests pass.
 
 - [ ] **Manual smoke (optional, if a dev build is handy):** upload a custom emoji reaction (leave "keep private" unchecked) → it reacts and renders for peers; the minted CID is unencrypted (verify via the public flag). Check "keep private" on a second upload → it takes the encrypted path.
@@ -604,4 +606,3 @@ Expected: type-check clean, all tests pass.
 - After removing `CustomEmojiNotEncrypted`, confirm `grep -rn CustomEmojiNotEncrypted src/` returns nothing before the clippy run, or `-D warnings` will fail on a dangling reference.
 - No new IPC, no protocol/wire change, no migration: existing encrypted emoji keep rendering via the unchanged encrypted branch.
 - **Scope call on the spec's "two-engine integration test" (no silent cap):** the spec listed a two-engine test proving a public emoji reacted in community A is fetchable by a peer. This plan deliberately does **not** add a dedicated two-engine *emoji* test, because the render/fetch path (`authorize_and_fetch_artifact` → `decrypt_and_verify_artifact`) is byte-identical for public artifacts and is already exercised cross-engine by the existing public-*artifact* integration coverage; public emoji travel that same unchanged path. The dedup determinism (Task 5) plus the public accept-at-mint/verify tests (Tasks 1–2) cover what is new. If a reviewer wants belt-and-suspenders, extend the nearest existing two-engine emoji test (e.g. the `set_message_reaction_happy_path_custom_emoji_surfaces_cid` lineage) with a public CID — but it is not required for correctness here.
-```
