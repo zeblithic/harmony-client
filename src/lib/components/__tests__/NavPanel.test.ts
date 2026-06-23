@@ -1,5 +1,5 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 
 vi.mock('@tauri-apps/api/webviewWindow', () => ({
   WebviewWindow: class {
@@ -10,6 +10,13 @@ vi.mock('@tauri-apps/api/webviewWindow', () => ({
 
 import NavPanel from '../NavPanel.svelte';
 import type { NavNode, ContentItem, StorageBuddy } from '../../types';
+import { setNavModeOverride } from '../../feature-flags';
+
+// ZEB-544: nav gating reads localStorage overrides — reset between tests so a
+// re-enable in one test can't leak the rail state into another.
+afterEach(() => {
+  localStorage.clear();
+});
 
 const testNodes: NavNode[] = [
   {
@@ -195,12 +202,25 @@ describe('NavPanel', () => {
     });
   });
 
-  it('renders Spellbook mode button', () => {
+  // ZEB-544: alpha surface gating — deferred/experimental modes are hidden from
+  // the rail by default; the core Communities-first set stays.
+  it('hides the deferred mode buttons (spellbook/mail/mint/network) by default', () => {
     render(NavPanel, { props: { nodes: testNodes, collapsed: false } });
-    expect(screen.getByRole('button', { name: /spellbook/i })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /spellbook/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^mail$/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /mint/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^network$/i })).toBeNull();
   });
 
-  it('calls onModeChange with spellbook when clicked', async () => {
+  it('shows the core Communities-first rail buttons by default', () => {
+    render(NavPanel, { props: { nodes: testNodes, collapsed: false } });
+    expect(screen.getByRole('button', { name: /messages/i })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /vines/i })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /^files$/i })).toBeTruthy();
+  });
+
+  it('reveals a deferred mode button when an override re-enables it, and routes on click', async () => {
+    setNavModeOverride('spellbook', true);
     const onModeChange = vi.fn();
     render(NavPanel, { props: { nodes: testNodes, collapsed: false, onModeChange } });
     await fireEvent.click(screen.getByRole('button', { name: /spellbook/i }));
