@@ -52,7 +52,13 @@
       const header = parseImageHeaderDims(bytes);
       if (!header) throw new Error('unsupported emoji image format; use PNG or JPEG');
       assertDecodedDimsOk(header.width, header.height);
-      const blob = new Blob([bytes], { type: 'image/png' });
+      // Label the blob with the format the header parser actually detected, not
+      // a hardcoded image/png — the verifier accepts any image/* so a peer's
+      // emoji could be JPEG; a contradictory MIME hint to createImageBitmap is
+      // avoided (Greptile PR #320).
+      const blob = new Blob([bytes], {
+        type: header.format === 'jpeg' ? 'image/jpeg' : 'image/png',
+      });
       const bmp = await createImageBitmap(blob);
       try {
         assertDecodedDimsOk(bmp.width, bmp.height);

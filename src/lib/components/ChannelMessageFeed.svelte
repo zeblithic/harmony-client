@@ -489,14 +489,17 @@
     customEmojiFor = null;
     if (!file || !messageId) return;
     const epoch = attachEpoch;
-    const cid = communityId;
+    // `commId`/`chid` (not `cid`): in this codebase `cid` means a CAS content
+    // identifier, and `ingestEmojiBytes` returns one as `emojiCid` below —
+    // naming the community id `cid` here would shadow that meaning (Greptile).
+    const commId = communityId;
     const chid = channelId;
     try {
       const bytes = await normalizeEmoji(file);
       if (epoch !== attachEpoch) return; // channel switched mid-normalize
-      const { cid: emojiCid, size } = await channelMessageService.ingestEmojiBytes(cid, bytes);
+      const { cid: emojiCid, size } = await channelMessageService.ingestEmojiBytes(commId, bytes);
       if (epoch !== attachEpoch) return; // channel switched mid-ingest
-      await channelMessageService.reactToMessage(cid, chid, messageId, '', true, {
+      await channelMessageService.reactToMessage(commId, chid, messageId, '', true, {
         cid: emojiCid,
         mime: 'image/png',
         size,

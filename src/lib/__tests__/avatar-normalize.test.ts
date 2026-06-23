@@ -95,9 +95,17 @@ describe('avatar-normalize header-dimension guard (ZEB-408)', () => {
     expect(() => assertHeaderDimsOk(new Uint8Array([]))).not.toThrow();
   });
 
-  it('parses exact PNG / JPEG header dims and returns null for unparseable input', () => {
-    expect(parseImageHeaderDims(pngWithDims(640, 480))).toEqual({ width: 640, height: 480 });
-    expect(parseImageHeaderDims(jpegWithDims(640, 480))).toEqual({ width: 640, height: 480 });
+  it('parses exact PNG / JPEG header dims (with format) and returns null for unparseable input', () => {
+    expect(parseImageHeaderDims(pngWithDims(640, 480))).toEqual({
+      width: 640,
+      height: 480,
+      format: 'png',
+    });
+    expect(parseImageHeaderDims(jpegWithDims(640, 480))).toEqual({
+      width: 640,
+      height: 480,
+      format: 'jpeg',
+    });
     expect(parseImageHeaderDims(new Uint8Array([0x47, 0x49, 0x46]))).toBeNull();
   });
 

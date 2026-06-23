@@ -45,7 +45,7 @@ export function assertDecodedDimsOk(width: number, height: number): void {
  */
 export function parseImageHeaderDims(
   bytes: Uint8Array,
-): { width: number; height: number } | null {
+): { width: number; height: number; format: 'png' | 'jpeg' } | null {
   // ── PNG ──
   if (
     bytes.length >= 24 &&
@@ -70,7 +70,7 @@ export function parseImageHeaderDims(
     if (!ihdrLenOk || !ihdrTypeOk) return null;
     const width = ((bytes[16] << 24) | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19]) >>> 0;
     const height = ((bytes[20] << 24) | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23]) >>> 0;
-    return { width, height };
+    return { width, height, format: 'png' };
   }
 
   // ── JPEG ──
@@ -107,7 +107,7 @@ export function parseImageHeaderDims(
         if (segLen < 7) return null;
         const height = (bytes[offset + 3] << 8) | bytes[offset + 4];
         const width = (bytes[offset + 5] << 8) | bytes[offset + 6];
-        return { width, height };
+        return { width, height, format: 'jpeg' };
       }
       offset += segLen;
     }
