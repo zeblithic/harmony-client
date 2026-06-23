@@ -296,6 +296,199 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
         "community id is 16 bytes as 32 hex chars; got: {community_id}"
     );
 
+    // ── Phase 6f-mod: the nine ZEB-512/520/527 verbs are REACHABLE ──────
+    // Tasks 1–4 exposed these on the headless RPC surface; each previously
+    // returned 404 `unknown command`. The non-negotiable proof for all nine
+    // is reachability (status != 404) through the real axum server; where
+    // node state permits, we make a stronger positive assertion. The owner
+    // minted above is this community's admin (full power), so the read verbs
+    // are authorized and a freshly-created community yields empty audit feeds.
+
+    // ZEB-520: identity pub hex is Some (128 hex chars) after mint.
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "connectivity_get_my_identity_pub_hex",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        200,
+        "connectivity_get_my_identity_pub_hex must be 200 after mint"
+    );
+    let pub_hex: Option<String> = r.json().await.expect("identity pub hex body is JSON");
+    assert_eq!(
+        pub_hex.expect("identity pub present after mint").len(),
+        128,
+        "identity pub is 64 bytes as 128 hex chars"
+    );
+
+    // ZEB-512: discoverable defaults false.
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "connectivity_get_identity_discoverable",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        200,
+        "connectivity_get_identity_discoverable must be 200"
+    );
+    assert!(
+        !r.json::<bool>().await.expect("discoverable body is JSON"),
+        "discoverable must default false"
+    );
+    // ZEB-512: setter is reachable. It needs a pkarr identity publisher in
+    // NodeState; this headless boot may not install one (no relay config),
+    // so the floor is reachability (status != 404). When the harness DOES
+    // carry a publisher and the set succeeds (200), the getter must then
+    // report true.
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "connectivity_set_identity_discoverable",
+        serde_json::json!({ "enabled": true }),
+    )
+    .await;
+    let set_status = r.status();
+    assert_ne!(
+        set_status, 404,
+        "connectivity_set_identity_discoverable must be reachable (not 404)"
+    );
+    if set_status == 200 {
+        let r = rpc(
+            &http,
+            &base,
+            &bearer,
+            "connectivity_get_identity_discoverable",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(r.status(), 200, "getter after a successful set must be 200");
+        assert!(
+            r.json::<bool>().await.expect("discoverable body is JSON"),
+            "discoverable must reflect the set (true) after a 200 set"
+        );
+    }
+
+    // ZEB-527 read verbs: a freshly-created community has no pending joins,
+    // counter-signs, or moderation events → 200 with an empty list.
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "list_pending_joins",
+        serde_json::json!({ "communityId": community_id }),
+    )
+    .await;
+    assert_eq!(r.status(), 200, "list_pending_joins must be 200 for admin");
+    assert_eq!(
+        r.json::<serde_json::Value>()
+            .await
+            .expect("pending joins body is JSON"),
+        serde_json::json!([]),
+        "a freshly-created community has no pending joins"
+    );
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "list_recent_counter_signs",
+        serde_json::json!({ "communityId": community_id, "limit": 20 }),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        200,
+        "list_recent_counter_signs must be 200 for admin"
+    );
+    assert_eq!(
+        r.json::<serde_json::Value>()
+            .await
+            .expect("counter signs body is JSON"),
+        serde_json::json!([]),
+        "a freshly-created community has no counter-signs"
+    );
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "list_recent_moderation_events",
+        serde_json::json!({ "communityId": community_id, "limit": 20 }),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        200,
+        "list_recent_moderation_events must be 200 for admin"
+    );
+    assert_eq!(
+        r.json::<serde_json::Value>()
+            .await
+            .expect("moderation events body is JSON"),
+        serde_json::json!([]),
+        "a freshly-created community has no moderation events"
+    );
+
+    // ZEB-527 action verbs: reach the handler. A bogus-but-valid 32-hex
+    // target/proposal parses, then the impl returns a Command error (the
+    // target is not a member / the proposal does not exist) → HTTP 500,
+    // never 404. The floor is reachability (status != 404).
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "kick_from_community",
+        serde_json::json!({
+            "communityId": community_id,
+            "targetAddr": "ffffffffffffffffffffffffffffffff"
+        }),
+    )
+    .await;
+    assert_ne!(
+        r.status(),
+        404,
+        "kick_from_community must be reachable (not 404)"
+    );
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "unban_from_community",
+        serde_json::json!({
+            "communityId": community_id,
+            "targetAddr": "ffffffffffffffffffffffffffffffff"
+        }),
+    )
+    .await;
+    assert_ne!(
+        r.status(),
+        404,
+        "unban_from_community must be reachable (not 404)"
+    );
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "countersign_admin_proposal",
+        serde_json::json!({
+            "communityId": community_id,
+            "proposalEventId": "ffffffffffffffffffffffffffffffff"
+        }),
+    )
+    .await;
+    assert_ne!(
+        r.status(),
+        404,
+        "countersign_admin_proposal must be reachable (not 404)"
+    );
+
     // ── Phase 6g: create_channel → channel id ───────────────────────────
     // Args mirror CreateChannelArgs exactly: communityId, name, writePower,
     // kind (optional, "text").
