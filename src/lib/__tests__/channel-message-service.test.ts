@@ -777,6 +777,22 @@ describe('ChannelMessageService reactions (ZEB-536 Spec 2)', () => {
     });
   });
 
+  it('a live custom-emoji reaction-received event carries encrypted into the chip entry', async () => {
+    // ZEB-541: the LIVE event must carry `encrypted` so the UI gates the
+    // "name this emoji" affordance correctly without waiting for a reseed.
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    const encCid = 'aa'.repeat(32);
+    const pubCid = 'bb'.repeat(32);
+    fireReaction({ reactor: OTHER, emoji: '', add: true, emojiCid: encCid, emojiSize: 256, encrypted: true });
+    fireReaction({ reactor: OTHER, emoji: '', add: true, emojiCid: pubCid, emojiSize: 256, encrypted: false });
+    const msg = service.getMessages(CID, CHID)[0];
+    const enc = msg.reactions?.find((r) => r.emojiCid === encCid);
+    const pub = msg.reactions?.find((r) => r.emojiCid === pubCid);
+    expect(enc?.encrypted).toBe(true);
+    expect(pub?.encrypted).toBe(false);
+  });
+
   it('reactToMessage throws when the adapter is not connected', async () => {
     await expect(
       service.reactToMessage(CID, CHID, 'm1', '👍', true),
@@ -857,5 +873,95 @@ describe('ChannelMessageService reactions (ZEB-536 Spec 2)', () => {
     const msg = service.getMessages(CID, CHID)[0];
     expect(msg.reactions?.[0].mine).toBe(true); // self-healed without a reload
     expect(cb).toHaveBeenCalled(); // subscribers notified so the feed re-renders
+  });
+});
+
+describe('ChannelMessageService emoji names', () => {
+  let service: ChannelMessageService;
+  let adapter: ReturnType<typeof makeAdapter>;
+
+  beforeEach(() => {
+    service = new ChannelMessageService();
+    adapter = makeAdapter();
+  });
+
+  it('setEmojiName invokes set_emoji_name with cid/name/mime/size', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.setEmojiName('aa', 'catjam', 'image/png', 200);
+    expect(adapter.invoke).toHaveBeenLastCalledWith('set_emoji_name', {
+      cid: 'aa',
+      name: 'catjam',
+      mime: 'image/png',
+      size: 200,
+    });
+    await service.setEmojiName('aa', null, 'image/png', 200);
+    const [, args] = (adapter.invoke as any).mock.calls.at(-1);
+    expect(args.name).toBeNull();
+  });
+
+  it('setEmojiName normalizes a raw-string rejection into an Error', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockRejectedValue('emoji name too long: 65 (max 64)');
+    await expect(
+      service.setEmojiName('aa', 'x'.repeat(65), 'image/png', 200),
+    ).rejects.toThrow('emoji name too long: 65 (max 64)');
+  });
+
+  it('setEmojiName throws when the adapter is not connected', async () => {
+    await expect(
+      service.setEmojiName('aa', 'catjam', 'image/png', 200),
+    ).rejects.toThrow(/adapter not connected/);
+  });
+
+  it('listEmojiNames returns the DTO array from the IPC', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue([
+      { cid: 'aa', name: 'catjam', mime: 'image/png', size: 200 },
+    ]);
+    expect(await service.listEmojiNames()).toEqual([
+      { cid: 'aa', name: 'catjam', mime: 'image/png', size: 200 },
+    ]);
+    expect(adapter.invoke).toHaveBeenCalledWith('list_emoji_names', {});
+  });
+
+  it('listEmojiNames throws when the adapter is not connected', async () => {
+    await expect(service.listEmojiNames()).rejects.toThrow(/adapter not connected/);
+  });
+
+  it('previewNamedEmoji invokes preview_named_emoji and returns Uint8Array', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue([1, 2, 3]);
+    const bytes = await service.previewNamedEmoji('aa');
+    expect(adapter.invoke).toHaveBeenCalledWith('preview_named_emoji', { cid: 'aa' });
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(Array.from(bytes)).toEqual([1, 2, 3]);
+  });
+
+  it('previewNamedEmoji throws when the adapter is not connected', async () => {
+    await expect(service.previewNamedEmoji('aa')).rejects.toThrow(/adapter not connected/);
+  });
+
+  it('connectAdapter installs the emoji-names-changed listener', async () => {
+    await service.connectAdapter(adapter);
+    expect(adapter.listeners.has('emoji-names-changed')).toBe(true);
+  });
+
+  it('onEmojiNamesChanged fires registered callbacks on the event + unsubscribes', async () => {
+    await service.connectAdapter(adapter);
+    const cb = vi.fn();
+    const unsub = service.onEmojiNamesChanged(cb);
+    const handler = adapter.listeners.get('emoji-names-changed')!;
+    handler({ payload: undefined });
+    expect(cb).toHaveBeenCalledTimes(1);
+    unsub();
+    handler({ payload: undefined });
+    expect(cb).toHaveBeenCalledTimes(1); // not fired again after unsubscribe
+  });
+
+  it('destroy removes the emoji-names-changed listener', async () => {
+    await service.connectAdapter(adapter);
+    service.destroy();
+    expect(adapter.listeners.has('emoji-names-changed')).toBe(false);
   });
 });

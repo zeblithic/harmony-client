@@ -869,6 +869,11 @@ pub struct ReactionDto {
     /// regardless, so a wrong/hostile value cannot enlarge the render.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emoji_size: Option<u64>,
+    /// True/false for a custom (CAS-backed) emoji: whether its CID is encrypted.
+    /// `None` for unicode reactions. Serializes as `encrypted`. Lets the UI hide
+    /// the "name this emoji" affordance on encrypted chips (naming is public-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted: Option<bool>,
 }
 
 /// Per-author LWW cell for a reaction: (latest HLC, currently-present).
@@ -976,9 +981,18 @@ impl ReactionIndex {
             if present.is_empty() {
                 continue;
             }
-            let (emoji, emoji_cid, emoji_size) = match &state.descriptor {
-                Some(att) => (String::new(), Some(hex::encode(att.cid)), Some(att.size)),
-                None => (key.clone(), None, None),
+            let (emoji, emoji_cid, emoji_size, encrypted) = match &state.descriptor {
+                Some(att) => (
+                    String::new(),
+                    Some(hex::encode(att.cid)),
+                    Some(att.size),
+                    Some(
+                        harmony_content::cid::ContentId::from_bytes(att.cid)
+                            .flags()
+                            .encrypted,
+                    ),
+                ),
+                None => (key.clone(), None, None, None),
             };
             out.push(ReactionDto {
                 emoji,
@@ -987,6 +1001,7 @@ impl ReactionIndex {
                 reactors: present.iter().map(|a| hex::encode(a.0)).collect(),
                 emoji_cid,
                 emoji_size,
+                encrypted,
             });
         }
         out
@@ -4821,6 +4836,44 @@ mod tests {
         assert_eq!(db.count, 1);
         assert_eq!(db.emoji_size, Some(200));
         assert!(!db.mine);
+    }
+
+    #[test]
+    fn reactions_for_surfaces_encrypted_flag_for_custom_emoji() {
+        use harmony_content::cid::ContentId;
+        // Two custom emoji CIDs: one with the encrypted flag unset, one set.
+        let public_cid = [0x42u8; 32]; // encrypted flag unset
+        let encrypted_cid = [0xB2u8; 32]; // encrypted flag set
+        assert!(!ContentId::from_bytes(public_cid).flags().encrypted);
+        assert!(ContentId::from_bytes(encrypted_cid).flags().encrypted);
+
+        // Record one public-custom and one encrypted-custom reaction by the same
+        // author on the same target. Distinct CIDs → distinct keys → two DTOs,
+        // mirroring `reaction_index_different_custom_emoji_are_distinct`.
+        let target = MessageId([7u8; 16]);
+        let me = OwnerAddr([0xAA; 16]);
+        let mut idx = ReactionIndex::default();
+        idx.apply(&custom_react_event(target, me, public_cid, 200, true, 10));
+        idx.apply(&custom_react_event(
+            target,
+            me,
+            encrypted_cid,
+            200,
+            true,
+            11,
+        ));
+
+        let dtos = idx.reactions_for(&target, &me);
+        let pub_dto = dtos
+            .iter()
+            .find(|d| d.emoji_cid.as_deref() == Some(hex::encode(public_cid).as_str()))
+            .expect("public reaction present");
+        let enc_dto = dtos
+            .iter()
+            .find(|d| d.emoji_cid.as_deref() == Some(hex::encode(encrypted_cid).as_str()))
+            .expect("encrypted reaction present");
+        assert_eq!(pub_dto.encrypted, Some(false));
+        assert_eq!(enc_dto.encrypted, Some(true));
     }
 
     // ── Task 3: ChannelLog reaction index (append-maintained + boot rebuild) ──

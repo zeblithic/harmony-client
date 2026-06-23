@@ -325,6 +325,13 @@ pub struct ChannelReactionReceivedPayload {
     /// `emoji_cid`; the authoritative size is re-derived at serve time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emoji_size: Option<u64>,
+    /// True/false for a custom (CAS-backed) emoji: whether its CID is
+    /// encrypted. `None` for unicode reactions. Mirrors `ReactionDto.encrypted`
+    /// so a LIVE custom chip carries the same flag a channel reseed would,
+    /// letting the UI hide the "name this emoji" affordance on encrypted chips
+    /// (naming is public-only) without waiting for a reseed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted: Option<bool>,
 }
 
 // ── Config + params ─────────────────────────────────────────────────────────
@@ -1150,10 +1157,21 @@ impl ChannelLogEngine {
             return;
         };
         // ZEB-541: surface the custom-emoji CID/size on the live event so a peer
-        // can render the chip immediately. Both are `None` for unicode reactions.
-        let (emoji_cid, emoji_size) = match emoji_attachment {
-            Some(att) => (Some(hex::encode(att.cid)), Some(att.size)),
-            None => (None, None),
+        // can render the chip immediately. All three are `None` for unicode
+        // reactions. `encrypted` is derived the same way `reactions_for` does
+        // (`ContentId::from_bytes(att.cid).flags().encrypted`) so a LIVE custom
+        // chip carries the flag a reseed would, gating the "name this" UI.
+        let (emoji_cid, emoji_size, encrypted) = match emoji_attachment {
+            Some(att) => (
+                Some(hex::encode(att.cid)),
+                Some(att.size),
+                Some(
+                    harmony_content::cid::ContentId::from_bytes(att.cid)
+                        .flags()
+                        .encrypted,
+                ),
+            ),
+            None => (None, None, None),
         };
         let payload = ChannelReactionReceivedPayload {
             community_id: hex::encode(self.community_id.0),
@@ -1169,6 +1187,7 @@ impl ChannelLogEngine {
             },
             emoji_cid,
             emoji_size,
+            encrypted,
         };
         crate::node_event_sink::emit_ser(&*self.sink, "channel-reaction-received", &payload);
     }
@@ -5614,10 +5633,13 @@ mod tests {
     }
 
     /// ZEB-541: the live `channel-reaction-received` event carries the custom
-    /// emoji CID + size so a peer can render the chip immediately (instead of
-    /// staying blank until a `list_channel_messages` re-materialization). A
-    /// custom-emoji React emits `emojiCid`/`emojiSize`; a unicode React emits
-    /// neither (the optional fields are skipped on serialize).
+    /// emoji CID + size + encrypted flag so a peer can render the chip
+    /// immediately (instead of staying blank until a `list_channel_messages`
+    /// re-materialization) AND gate the "name this emoji" affordance correctly
+    /// on the live chip (naming is public-only). A custom-emoji React emits
+    /// `emojiCid`/`emojiSize`/`encrypted`; a unicode React emits none of them
+    /// (the optional fields are skipped on serialize). `encrypted` is derived
+    /// the same way `reactions_for` does, so a LIVE chip matches a reseed.
     #[tokio::test]
     async fn reaction_received_event_carries_custom_emoji_cid() {
         let fix = build_engine_fixture(8, 250, 1000).await;
@@ -5626,8 +5648,15 @@ mod tests {
             .await
             .expect("post");
 
-        // Custom-emoji React → the emitted event must surface emojiCid/emojiSize.
+        // ENCRYPTED custom-emoji React (`[0xB2; 32]` → encrypted bit set) → the
+        // emitted event surfaces emojiCid/emojiSize and `encrypted: true`.
         let emoji_cid = [0xB2u8; 32];
+        assert!(
+            harmony_content::cid::ContentId::from_bytes(emoji_cid)
+                .flags()
+                .encrypted,
+            "fixture CID must have the encrypted flag set"
+        );
         let att = crate::community_channel_log::ChannelAttachment {
             cid: emoji_cid,
             mime: "image/png".to_string(),
@@ -5656,12 +5685,52 @@ mod tests {
             "custom React must carry the emoji size"
         );
         assert_eq!(
+            custom.get("encrypted").and_then(|v| v.as_bool()),
+            Some(true),
+            "encrypted custom React must carry encrypted: true"
+        );
+        assert_eq!(
             custom.get("emoji").and_then(|v| v.as_str()),
             Some(""),
             "custom React uses an empty unicode emoji field"
         );
 
-        // Unicode React → neither field is present (skip_serializing_if).
+        // PUBLIC custom-emoji React (`[0x42; 32]` → encrypted bit clear) →
+        // `encrypted: false`, so the UI shows the "name this" affordance live.
+        let public_cid = [0x42u8; 32];
+        assert!(
+            !harmony_content::cid::ContentId::from_bytes(public_cid)
+                .flags()
+                .encrypted,
+            "fixture CID must have the encrypted flag clear"
+        );
+        let pub_att = crate::community_channel_log::ChannelAttachment {
+            cid: public_cid,
+            mime: "image/png".to_string(),
+            name: String::new(),
+            size: 2048,
+        };
+        Arc::clone(&fix.engine)
+            .react(msg_id, String::new(), true, Some(pub_att))
+            .await
+            .expect("public custom-emoji react");
+        let frames = fix.sink.frames();
+        let (_, public) = frames
+            .iter()
+            .rev()
+            .find(|(name, v)| {
+                name == "channel-reaction-received"
+                    && v.get("emojiCid").and_then(|c| c.as_str())
+                        == Some(hex::encode(public_cid).as_str())
+            })
+            .expect("the public custom reaction frame must be emitted");
+        assert_eq!(
+            public.get("encrypted").and_then(|v| v.as_bool()),
+            Some(false),
+            "public custom React must carry encrypted: false"
+        );
+
+        // Unicode React → none of the optional fields are present.
         Arc::clone(&fix.engine)
             .react(msg_id, "👍".to_string(), true, None)
             .await
@@ -5682,6 +5751,10 @@ mod tests {
         assert!(
             unicode.get("emojiSize").is_none(),
             "unicode React must omit emojiSize"
+        );
+        assert!(
+            unicode.get("encrypted").is_none(),
+            "unicode React must omit encrypted"
         );
     }
 
