@@ -21230,6 +21230,45 @@ pub(crate) async fn preview_reaction_emoji_impl(
     decrypt_and_verify_artifact(bytes, encrypted, epoch_key_opt, expected_size)
 }
 
+pub(crate) async fn preview_named_emoji_impl(
+    state: &std::sync::Mutex<NodeState>,
+    cid: String,
+) -> Result<Vec<u8>, String> {
+    // Public-only (also validates the hex). Named emoji are always public, so a
+    // non-channel-scoped fetch-by-CID is legitimate and never decrypts.
+    ensure_public_cid(&cid)?;
+    let fetch_tx = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        g.fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid,
+            reply: reply_tx,
+            max_bytes: Some(MAX_CUSTOM_EMOJI_BYTES as usize),
+            serveable: false,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())?
+}
+
+/// Fetch a NAMED (public) custom emoji's plaintext bytes by CID with NO channel
+/// scope — for the picker, where the emoji may not appear in the current channel.
+/// Public-only + capped at `MAX_CUSTOM_EMOJI_BYTES`. Mirrors `fetch_avatar`.
+#[tauri::command]
+async fn preview_named_emoji(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    cid: String,
+) -> Result<Vec<u8>, String> {
+    preview_named_emoji_impl(state_lock.inner(), cid).await
+}
+
 /// Validate that `cid` is a well-formed 64-hex ContentId whose `encrypted` flag
 /// is UNSET. Naming is public-only: an encrypted emoji can't render outside its
 /// origin community, so it can't be a globally reusable named emoji.
@@ -24180,6 +24219,62 @@ mod create_community_inner_tests {
 
         // Drop the senders so the drainers exit cleanly.
         drop(node_state);
+        ingest_drainer.abort();
+        fetch_drainer.abort();
+    }
+
+    #[tokio::test]
+    async fn preview_named_emoji_fetches_public_bytes_no_channel_scope() {
+        let cas: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (ingest_tx, mut ingest_rx) =
+            tokio::sync::mpsc::channel::<event_loop::IngestRequest>(16);
+        let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::channel::<event_loop::FetchRequest>(16);
+        let cas_i = std::sync::Arc::clone(&cas);
+        let ingest_drainer = tokio::spawn(async move {
+            while let Some(req) = ingest_rx.recv().await {
+                cas_i.lock().unwrap().insert(req.cid_hex, req.data);
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+        let cas_f = std::sync::Arc::clone(&cas);
+        let fetch_drainer = tokio::spawn(async move {
+            while let Some(req) = fetch_rx.recv().await {
+                let got = cas_f.lock().unwrap().get(&req.cid_hex).cloned();
+                let _ = req.reply.send(got.ok_or_else(|| "not found".to_string()));
+            }
+        });
+
+        let state = std::sync::Mutex::new(NodeState {
+            ingest_tx: Some(ingest_tx),
+            fetch_tx: Some(fetch_tx),
+            ..NodeState::default()
+        });
+
+        let plaintext: Vec<u8> = (0u8..200).collect();
+        let dto = ingest_channel_artifact_bytes_inner(
+            &state,
+            crate::owner_state_types::SpaceId([0u8; 16]),
+            plaintext.clone(),
+            String::new(),
+            "image/png".to_string(),
+            false,
+        )
+        .await
+        .expect("public ingest");
+        assert!(!dto.encrypted);
+
+        let bytes = preview_named_emoji_impl(&state, dto.cid.clone())
+            .await
+            .expect("preview must fetch the public bytes");
+        assert_eq!(bytes, plaintext);
+
+        let err = preview_named_emoji_impl(&state, hex::encode([0xB2u8; 32]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("encrypted"), "got: {err}");
+
+        drop(state);
         ingest_drainer.abort();
         fetch_drainer.abort();
     }
