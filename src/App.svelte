@@ -9,13 +9,9 @@
   import VineFeed from './lib/components/VineFeed.svelte';
   import FileBrowser from './lib/components/FileBrowser.svelte';
   import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
-  import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
-  import NetworkDiscoverabilitySettings from './lib/components/NetworkDiscoverabilitySettings.svelte';
-  import FriendsPanel from './lib/components/FriendsPanel.svelte';
-  import ProfileEditor from './lib/components/ProfileEditor.svelte';
-  import IdentityPanel from './lib/components/IdentityPanel.svelte';
+  import SettingsPanel from './lib/components/SettingsPanel.svelte';
   import BackupStalenessWarning from './lib/components/BackupStalenessWarning.svelte';
-  import DevicesPanel from './lib/components/DevicesPanel.svelte';
+  import { backupExportRequest } from './lib/backup-export-request.svelte';
   import SpellbookMode from './lib/components/SpellbookMode.svelte';
   import FlashcardStats from './lib/components/FlashcardStats.svelte';
   import MailInbox from './lib/components/MailInbox.svelte';
@@ -106,6 +102,12 @@
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
   let showSettings = $state(false);
+  // ZEB-545: which Settings tab is active. Held here (not just inside
+  // SettingsPanel) so the app can route to a specific section — see
+  // handleExportRequested, which opens Settings → Account for the backup wizard.
+  let settingsTab = $state<'profile' | 'account' | 'notifications' | 'network' | 'friends'>(
+    'profile',
+  );
   let appMode = $state<AppMode>('messages');
 
   // ZEB-405 (WS-C): user-controlled reveal + width of the messages-mode media
@@ -2743,9 +2745,15 @@
   });
 
   function handleExportRequested() {
-    // Surface the existing IdentityPanel backup flow via an event bus.
-    // IdentityPanel listens for this on window in its onMount.
-    window.dispatchEvent(new CustomEvent('harmony:backup-export-requested'));
+    // The backup wizard lives in IdentityPanel (Settings → Account). Mark the
+    // request reactively (not a fire-and-forget event) so it survives until that
+    // panel observes it — robust to the Account tab not being open, or to
+    // collapsed/mobile layout where Settings only renders once the window is
+    // widened — then route there so the wizard is visible when it opens.
+    backupExportRequest.pending = true;
+    appMode = 'messages';
+    showSettings = true;
+    settingsTab = 'account';
   }
 </script>
 
@@ -3015,22 +3023,19 @@
     />
   {/snippet}
   {#snippet settingsPanel()}
-    <ProfileEditor profile={myProfile} onSave={handleProfileSave} />
-    <IdentityPanel />
-    <DevicesPanel />
-    <NotificationSettingsPanel
-      service={notificationService}
+    <SettingsPanel
+      profile={myProfile}
+      onProfileSave={handleProfileSave}
+      {notificationService}
       {trustService}
       peers={knownPeers}
       {communities}
       onClose={() => { showSettings = false; }}
       onTrustChange={handleTrustChange}
-    />
-    <NetworkDiscoverabilitySettings />
-    <FriendsPanel
-      service={friendService}
-      cardService={friendCardService}
+      {friendService}
+      {friendCardService}
       onOpenCard={openMemberCard}
+      bind:activeTab={settingsTab}
     />
   {/snippet}
   {#snippet vineFeed()}
