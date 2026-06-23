@@ -18,8 +18,7 @@ pub const MAX_EMOJI_NAME_LEN: usize = 32;
 /// True iff `name` is a valid emoji nickname: 1..=32 chars of `[A-Za-z0-9_-]`.
 pub fn valid_emoji_name(name: &str) -> bool {
     let n = name.chars().count();
-    n >= 1
-        && n <= MAX_EMOJI_NAME_LEN
+    (1..=MAX_EMOJI_NAME_LEN).contains(&n)
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
