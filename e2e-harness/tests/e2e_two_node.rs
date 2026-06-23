@@ -2254,3 +2254,142 @@ async fn s9_three_member_channel_convergence() {
     run.mark_success();
     drop((a, b, c, ah, bh, ch));
 }
+
+/// Headless two-node Vines round-trip over REAL transport: A publishes → it
+/// lands in B's feed → B marks it viewed (idempotent) → B reshares → the
+/// reshare, carrying origin attribution, lands back in A's feed. Both nodes are
+/// real engines on real Zenoh, so this IS the live descriptor-propagation
+/// round-trip (publish leg A→B, reshare-attribution leg B→A).
+///
+/// Zenoh `put` is not retained, so a single publish before subscriber-match is
+/// lost. Both legs therefore republish-until-observed against a bounded
+/// deadline (no fixed sleeps) — robust to the one genuine race (pub before
+/// sub-match) rather than asserting a single put lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s_vines_publish_feed_view_reshare() {
+    use e2e_harness::driver::*;
+    use serde_json::Value;
+    use std::time::Duration;
+
+    let (mut run, ah, bh, alice, bob) = two_minted_nodes("vines").await;
+    let alice_owner = owner_id(&alice).await;
+
+    // Unique-per-run title so we can pick our descriptor out of a feed
+    // unambiguously (feeds start empty — the Rust cache has no mock seed).
+    let title = format!("e2e-vine-{}", &alice_owner[..8.min(alice_owner.len())]);
+
+    // ── Leg 1: A publishes → it lands in B's feed (republish-until-seen). ──
+    // Each publish mints a fresh id; we match on the shared unique title.
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let mut descriptor: Option<Value> = None;
+    'a_to_b: while std::time::Instant::now() < deadline {
+        publish_vine(&alice, &title, "alice")
+            .await
+            .expect("alice publishes a vine");
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let feed = list_vine_videos(&bob).await.expect("bob feed");
+            if let Some(d) = feed
+                .into_iter()
+                .find(|d| d.get("title").and_then(Value::as_str) == Some(title.as_str()))
+            {
+                descriptor = Some(d);
+                break 'a_to_b;
+            }
+        }
+    }
+    let descriptor = descriptor.expect("alice's vine reached bob's feed over real Zenoh");
+
+    let vine_id = descriptor
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("descriptor id")
+        .to_string();
+    // A vine's `creatorAddress` is the publishing node's `node_addr` (a
+    // device/transport address), NOT the owner identity id from
+    // `get_owner_state`. Capture whatever address it published under so leg 3
+    // can verify the reshare preserves that exact address (attribution
+    // consistency end-to-end), without assuming which identifier vines use.
+    let alice_addr = descriptor
+        .get("creatorAddress")
+        .and_then(Value::as_str)
+        .expect("creatorAddress")
+        .to_string();
+    assert!(
+        !alice_addr.is_empty(),
+        "descriptor carries a creatorAddress"
+    );
+    assert_eq!(
+        descriptor.get("creatorName").and_then(Value::as_str),
+        Some("alice")
+    );
+    assert!(
+        descriptor
+            .get("videoCid")
+            .and_then(Value::as_str)
+            .is_some_and(|c| !c.is_empty()),
+        "descriptor carries a non-empty videoCid"
+    );
+    assert_eq!(
+        descriptor.get("viewed").and_then(Value::as_bool),
+        Some(false),
+        "a freshly received vine is unviewed"
+    );
+
+    // ── Leg 2: view round-trip (local, idempotent). ──
+    assert!(
+        mark_vine_viewed(&bob, &vine_id).await.expect("mark viewed"),
+        "first mark_viewed returns true"
+    );
+    assert!(
+        !mark_vine_viewed(&bob, &vine_id)
+            .await
+            .expect("mark viewed 2"),
+        "repeat mark_viewed is idempotent (false)"
+    );
+    let after = list_vine_videos(&bob).await.expect("bob feed after view");
+    assert_eq!(
+        after
+            .iter()
+            .find(|d| d.get("id").and_then(Value::as_str) == Some(vine_id.as_str()))
+            .and_then(|d| d.get("viewed").and_then(Value::as_bool)),
+        Some(true),
+        "the vine now reads as viewed in bob's feed"
+    );
+
+    // ── Leg 3: B reshares → reshare (with attribution) lands in A's feed. ──
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let mut reshare: Option<Value> = None;
+    'b_to_a: while std::time::Instant::now() < deadline {
+        reshare_vine(&bob, &vine_id, "bob")
+            .await
+            .expect("bob reshares the vine");
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let feed = list_vine_videos(&alice).await.expect("alice feed");
+            if let Some(d) = feed
+                .into_iter()
+                .find(|d| d.get("reshareOf").and_then(Value::as_str) == Some(vine_id.as_str()))
+            {
+                reshare = Some(d);
+                break 'b_to_a;
+            }
+        }
+    }
+    let reshare = reshare.expect("bob's reshare reached alice's feed over real Zenoh");
+    assert_eq!(
+        reshare
+            .get("originalCreatorAddress")
+            .and_then(Value::as_str),
+        Some(alice_addr.as_str()),
+        "reshare preserves the original creator's address through the round-trip"
+    );
+    assert_eq!(
+        reshare.get("originalCreatorName").and_then(Value::as_str),
+        Some("alice"),
+        "reshare attributes the original to alice's name"
+    );
+
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}

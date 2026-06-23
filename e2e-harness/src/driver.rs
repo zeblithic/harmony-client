@@ -403,6 +403,74 @@ pub async fn list_channel_messages(
         .ok_or_else(|| anyhow::anyhow!("list_channel_messages expected a JSON array, got: {v}"))
 }
 
+// ── Vines (publish → feed → view → reshare) ──────────────────────────────────
+//
+// A node subscribes to `harmony/vines/*` at startup, so a peer's descriptor
+// lands in the local feed over real Zenoh with no GUI. These wrap the headless
+// vine verbs the two-node Vines scenario drives.
+
+/// Publish a (non-reshare) vine. With no `videoCid` the impl ingests synthetic
+/// bytes to mint a real CID. Returns `(vineId, videoCid)`.
+pub async fn publish_vine(
+    node: &NodeHandle,
+    title: &str,
+    creator_name: &str,
+) -> anyhow::Result<(String, String)> {
+    let v = node
+        .rpc(
+            "publish_vine",
+            json!({ "title": title, "creatorName": creator_name }),
+        )
+        .await?;
+    let vine_id = v
+        .get("vineId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("publish_vine: missing vineId in {v}"))?
+        .to_string();
+    let video_cid = v
+        .get("videoCid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("publish_vine: missing videoCid in {v}"))?
+        .to_string();
+    Ok((vine_id, video_cid))
+}
+
+/// The local vine feed (flat, newest-first). A non-array response is a broken
+/// DTO contract, not "empty feed" — surface it loudly (the ZEB-462 masking trap).
+pub async fn list_vine_videos(node: &NodeHandle) -> anyhow::Result<Vec<Value>> {
+    let v = node.rpc("list_vine_videos", json!({})).await?;
+    v.as_array()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("list_vine_videos expected a JSON array, got: {v}"))
+}
+
+/// Mark a vine viewed; `true` if newly marked, `false` if already viewed.
+pub async fn mark_vine_viewed(node: &NodeHandle, vine_id: &str) -> anyhow::Result<bool> {
+    Ok(node
+        .rpc("mark_vine_viewed", json!({ "vineId": vine_id }))
+        .await?
+        .as_bool()
+        .unwrap_or(false))
+}
+
+/// Reshare a vine by id; returns the published reshare's `reshareOf`.
+pub async fn reshare_vine(
+    node: &NodeHandle,
+    vine_id: &str,
+    creator_name: &str,
+) -> anyhow::Result<String> {
+    let v = node
+        .rpc(
+            "reshare_vine",
+            json!({ "vineId": vine_id, "creatorName": creator_name }),
+        )
+        .await?;
+    v.get("reshareOf")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("reshare_vine: missing reshareOf in {v}"))
+        .map(str::to_string)
+}
+
 // ── Profile cards (ZEB-341) + peer-profile broadcast (ZEB-281) — ZEB-464 ──────
 //
 // Card propagation rides a Zenoh broadcast topic keyed by the owner's 16-byte
