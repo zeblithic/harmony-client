@@ -406,6 +406,160 @@ async fn creator_ingests_video_recipient_fetches_bytes() {
     assert_eq!(dtos[0].id, vine_id, "descriptor id must match vine_id");
 }
 
+// ── Test 1b: the full vine round-trip in one flow ────────────────────────────
+
+/// ZEB-546: walks the whole Vine round-trip a real user exercises, as one
+/// deterministic flow — publish (creator ingests the video into CAS) → the
+/// descriptor lands in the recipient's feed → the recipient marks it viewed
+/// (persists, local-only, idempotent) → the recipient fetches the video bytes
+/// via CAS → the recipient reshares it and the reshare carries reshare-of +
+/// original-creator attribution. The descriptor hop is modeled in-process (no
+/// live Zenoh transport — see the module header); the content and cache paths
+/// are the real production channels. This is a single named guard for the
+/// integration of legs otherwise asserted in isolation across the vine suite.
+/// (A live two-engine Zenoh descriptor-propagation run is tracked separately.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vine_full_round_trip_publish_feed_view_fetch_reshare() {
+    let video_bytes: Vec<u8> = (0..32 * 1024).map(|i| ((i * 17) % 251) as u8).collect();
+    let cid = ContentId::for_book(&video_bytes, ContentFlags::default())
+        .expect("CID for vine fixture bytes");
+    let cid_bytes: [u8; 32] = cid.to_bytes();
+    let cid_hex = hex::encode(cid_bytes);
+
+    let recipient_cache = Arc::new(Mutex::new(VineFeedCache::new()));
+    let handles = spawn_event_loop(
+        "vine-full-round-trip-test",
+        make_node_config(),
+        Arc::clone(&recipient_cache),
+    );
+    await_ready(handles.ready_rx).await;
+
+    // ── 1. Publish: creator ingests the video into CAS ───────────────────
+    let (ack_tx, ack_rx) = oneshot::channel();
+    handles
+        .ingest_tx
+        .send(IngestRequest {
+            cid_hex: cid_hex.clone(),
+            data: video_bytes.clone(),
+            serveable: false,
+            reply: ack_tx,
+        })
+        .await
+        .unwrap();
+    ack_rx
+        .await
+        .expect("event loop dropped ingest reply")
+        .expect("ingest failed");
+
+    // ── 2. Feed: the descriptor lands in the recipient's feed ────────────
+    let vine_id = "rt-vine-001";
+    let creator_addr = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+    let followed: HashSet<String> = HashSet::new(); // creator not followed → discover bucket
+    let outcome = recipient_cache.lock().unwrap().on_descriptor_sample(
+        &format!("harmony/vines/{creator_addr}"),
+        &make_vine_descriptor(vine_id, creator_addr, &cid_hex),
+        &followed,
+        1_700_000_001_000,
+    );
+    assert!(
+        matches!(outcome, Some(DescriptorOutcome::Inserted { .. })),
+        "descriptor should insert on first arrival; got {outcome:?}"
+    );
+    {
+        let dtos = recipient_cache.lock().unwrap().list_descriptors();
+        assert_eq!(dtos.len(), 1, "exactly the published vine is in the feed");
+        assert_eq!(dtos[0].id, vine_id);
+        assert_eq!(dtos[0].video_cid, cid_hex);
+        assert!(!dtos[0].viewed, "freshly arrived vine starts unviewed");
+    }
+
+    // ── 3. View: mark-viewed persists, idempotent, local-only ────────────
+    assert!(
+        recipient_cache
+            .lock()
+            .unwrap()
+            .mark_viewed(vine_id.to_string()),
+        "first mark_viewed returns true"
+    );
+    assert!(
+        !recipient_cache
+            .lock()
+            .unwrap()
+            .mark_viewed(vine_id.to_string()),
+        "repeat mark_viewed is idempotent (no double-count)"
+    );
+    assert!(
+        recipient_cache.lock().unwrap().list_descriptors()[0].viewed,
+        "viewed state persists on the descriptor"
+    );
+
+    // ── 4. Fetch: the recipient reads the video bytes back via CAS ───────
+    let (read_tx, read_rx) = oneshot::channel();
+    handles
+        .content_verb_tx
+        .send(ContentVerbRequest::ReadBytes {
+            cid: cid_bytes,
+            reply: read_tx,
+        })
+        .await
+        .unwrap();
+    let fetched = read_rx
+        .await
+        .expect("event loop dropped ReadBytes reply")
+        .expect("CID absent after ingest — CAS round-trip failed");
+    assert_eq!(
+        fetched, video_bytes,
+        "fetched bytes must match the published video"
+    );
+
+    // ── 5. Reshare: the reshare descriptor carries attribution to origin ─
+    let resharer_addr = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00";
+    let reshare_id = "rt-vine-reshare-001";
+    let reshare_payload = VineDescriptorPayload {
+        id: reshare_id.to_string(),
+        creator_address: resharer_addr.to_string(),
+        creator_name: "Resharer".to_string(),
+        created_at: 1_700_000_002_000,
+        video_cid: cid_hex.clone(), // a reshare points at the same video CID
+        title: None,
+        reshare_of: Some(vine_id.to_string()),
+        original_creator_address: Some(creator_addr.to_string()),
+        original_creator_name: Some("Test Creator".to_string()),
+    };
+    let reshare_outcome = recipient_cache.lock().unwrap().on_descriptor_sample(
+        &format!("harmony/vines/{resharer_addr}"),
+        &serde_json::to_vec(&reshare_payload).expect("reshare descriptor serialization"),
+        &followed,
+        1_700_000_002_000,
+    );
+    assert!(
+        matches!(reshare_outcome, Some(DescriptorOutcome::Inserted { .. })),
+        "reshare descriptor should insert; got {reshare_outcome:?}"
+    );
+
+    let dtos = recipient_cache.lock().unwrap().list_descriptors();
+    assert_eq!(dtos.len(), 2, "original + reshare both present in the feed");
+    let reshare = dtos
+        .iter()
+        .find(|d| d.id == reshare_id)
+        .expect("reshare present in feed");
+    assert_eq!(
+        reshare.reshare_of.as_deref(),
+        Some(vine_id),
+        "reshare links back to the original vine id"
+    );
+    assert_eq!(
+        reshare.original_creator_address.as_deref(),
+        Some(creator_addr),
+        "reshare attributes the original creator's address"
+    );
+    assert_eq!(
+        reshare.original_creator_name.as_deref(),
+        Some("Test Creator"),
+        "reshare carries the original creator's display name"
+    );
+}
+
 // ── Test 2: fetch for unknown CID returns Err (bounded timeout) ──────────────
 
 /// Verifies that requesting bytes for a CID that was never ingested does NOT
