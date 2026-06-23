@@ -43958,10 +43958,8 @@ mod friend_redeem_expiry_tests {
 /// Toggle case-B "Make me discoverable" setting. Persists the toggle to
 /// `connectivity-settings.json` and registers / unregisters the pkarr
 /// identity publication accordingly.
-#[tauri::command]
-async fn connectivity_set_identity_discoverable(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Mutex<NodeState>>,
+pub(crate) async fn connectivity_set_identity_discoverable_impl(
+    state: &std::sync::Mutex<NodeState>,
     enabled: bool,
 ) -> Result<(), String> {
     let (id_pub, settings_path) = {
@@ -43998,6 +43996,17 @@ async fn connectivity_set_identity_discoverable(
         id_pub.disable().await;
     }
 
+    Ok(())
+}
+
+#[tauri::command]
+async fn connectivity_set_identity_discoverable(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    connectivity_set_identity_discoverable_impl(state.inner(), enabled).await?;
+
     // Emit change event to the frontend.
     if let Err(e) = app.emit(
         "connectivity-identity-discoverable-changed",
@@ -44012,9 +44021,8 @@ async fn connectivity_set_identity_discoverable(
 /// Read the current case-B "Make me discoverable" toggle state from the
 /// persisted settings file. Returns `false` when the file is missing or
 /// the pkarr settings path is not initialized.
-#[tauri::command]
-async fn connectivity_get_identity_discoverable(
-    state: tauri::State<'_, Mutex<NodeState>>,
+pub(crate) async fn connectivity_get_identity_discoverable_impl(
+    state: &std::sync::Mutex<NodeState>,
 ) -> Result<bool, String> {
     let path = {
         state
@@ -44028,6 +44036,13 @@ async fn connectivity_get_identity_discoverable(
         return Ok(false);
     };
     Ok(pkarr_settings::PkarrSettings::load_or_default(&path).identity_discoverable)
+}
+
+#[tauri::command]
+async fn connectivity_get_identity_discoverable(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    connectivity_get_identity_discoverable_impl(state.inner()).await
 }
 
 /// ZEB-380: resolve `connectivity-settings.json` even when the node is stopped.

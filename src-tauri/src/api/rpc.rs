@@ -316,6 +316,12 @@ struct RepublishOwnerCardArgs {
     profile_page_root: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetIdentityDiscoverableArgs {
+    enabled: bool,
+}
+
 // ── Registry ─────────────────────────────────────────────────────────
 
 /// Build the curated v1 RPC surface (49 commands). Every handler calls
@@ -644,6 +650,22 @@ pub fn build_registry() -> RpcRegistry {
         "connectivity_list_peer_reachability",
         EmptyArgs,
         |state, _sink, _a| async move { crate::connectivity_list_peer_reachability_impl(state).await }
+    );
+    rpc!(
+        m,
+        "connectivity_set_identity_discoverable",
+        SetIdentityDiscoverableArgs,
+        |state, _sink, a| {
+            async move { crate::connectivity_set_identity_discoverable_impl(state, a.enabled).await }
+        }
+    );
+    rpc!(
+        m,
+        "connectivity_get_identity_discoverable",
+        EmptyArgs,
+        |state, _sink, _a| {
+            async move { crate::connectivity_get_identity_discoverable_impl(state).await }
+        }
     );
 
     // Network health.
@@ -993,6 +1015,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connectivity_get_identity_discoverable_defaults_false() {
+        let reg = build_registry();
+        let out = reg
+            .dispatch(
+                "connectivity_get_identity_discoverable",
+                test_state(),
+                test_sink(),
+                serde_json::Value::Null,
+            )
+            .await
+            .expect("verb registered");
+        assert_eq!(out, serde_json::Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn connectivity_set_identity_discoverable_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "connectivity_set_identity_discoverable",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "enabled": true }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::Command(_)),
+            "expected Command, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connectivity_set_identity_discoverable_rejects_missing_enabled() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "connectivity_set_identity_discoverable",
+                test_state(),
+                test_sink(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::BadArgs(_)),
+            "expected BadArgs, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn registry_has_exactly_the_curated_v1_surface() {
         let reg = build_registry();
         let mut names = reg.command_names();
@@ -1053,6 +1126,8 @@ mod tests {
             "connectivity_get_my_reachability_record",
             "connectivity_get_my_identity_pub_hex",
             "connectivity_list_peer_reachability",
+            "connectivity_set_identity_discoverable",
+            "connectivity_get_identity_discoverable",
             "connectivity_redeem_invite_iroh",
             // network health
             "network_health_snapshot",
