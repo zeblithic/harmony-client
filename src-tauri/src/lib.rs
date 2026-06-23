@@ -47511,6 +47511,14 @@ pub(crate) async fn connectivity_get_my_reachability_record_impl(
 async fn connectivity_get_my_identity_pub_hex(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Option<String>, String> {
+    connectivity_get_my_identity_pub_hex_impl(state.inner()).await
+}
+
+/// Seam for `connectivity_get_my_identity_pub_hex` — shared by the Tauri IPC
+/// and the headless `api` surface.
+pub(crate) async fn connectivity_get_my_identity_pub_hex_impl(
+    state: &std::sync::Mutex<NodeState>,
+) -> Result<Option<String>, String> {
     let g = state
         .lock()
         .map_err(|e| format!("NodeState poisoned: {e}"))?;

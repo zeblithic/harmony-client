@@ -635,6 +635,12 @@ pub fn build_registry() -> RpcRegistry {
     );
     rpc!(
         m,
+        "connectivity_get_my_identity_pub_hex",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::connectivity_get_my_identity_pub_hex_impl(state).await }
+    );
+    rpc!(
+        m,
         "connectivity_list_peer_reachability",
         EmptyArgs,
         |state, _sink, _a| async move { crate::connectivity_list_peer_reachability_impl(state).await }
@@ -972,6 +978,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connectivity_get_my_identity_pub_hex_returns_null_pre_owner() {
+        let reg = build_registry();
+        let out = reg
+            .dispatch(
+                "connectivity_get_my_identity_pub_hex",
+                test_state(),
+                test_sink(),
+                serde_json::Value::Null,
+            )
+            .await
+            .expect("verb registered + dispatches");
+        assert_eq!(out, serde_json::Value::Null); // Option<String>::None → JSON null
+    }
+
+    #[tokio::test]
     async fn registry_has_exactly_the_curated_v1_surface() {
         let reg = build_registry();
         let mut names = reg.command_names();
@@ -1030,6 +1051,7 @@ mod tests {
             "get_butler_held",
             // connectivity
             "connectivity_get_my_reachability_record",
+            "connectivity_get_my_identity_pub_hex",
             "connectivity_list_peer_reachability",
             "connectivity_redeem_invite_iroh",
             // network health
