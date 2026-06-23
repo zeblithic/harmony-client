@@ -563,14 +563,18 @@ export class ChannelMessageService {
 
   /**
    * Ingest already-normalized PNG bytes (from {@link normalizeEmoji}) into CAS
-   * as an encrypted channel artifact for use as a custom reaction emoji
-   * (ZEB-541). Returns the minted CID (hex) + plaintext size to pass to
-   * {@link reactToMessage} as the `customEmoji` descriptor. The backend enforces
-   * a 256 KiB cap; an over-cap input rejects.
+   * for use as a custom reaction emoji. Public by default — a custom emoji is
+   * `hash(plaintext)`-addressed so the same image is one CID network-wide
+   * (deduplicated and freely served, never expiring). Pass `encrypted = true` to
+   * keep this emoji private to the community (access-controlled, but the
+   * permanence/epoch caveats of the encrypted path apply). Returns the minted CID
+   * (hex) + plaintext size to pass to {@link reactToMessage} as the `customEmoji`
+   * descriptor. The backend enforces a 256 KiB cap; an over-cap input rejects.
    */
   async ingestEmojiBytes(
     communityId: string,
     bytes: Uint8Array,
+    encrypted: boolean = false,
   ): Promise<{ cid: string; size: number }> {
     if (!this.adapter) throw new Error('ChannelMessageService.ingestEmojiBytes: adapter not connected');
     try {
@@ -579,7 +583,7 @@ export class ChannelMessageService {
         bytes: Array.from(bytes),
         name: '',
         mime: 'image/png',
-        encrypt: true,
+        encrypt: encrypted,
       }) as ChannelAttachmentDto;
       return { cid: dto.cid, size: dto.size };
     } catch (e: unknown) {

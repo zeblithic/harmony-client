@@ -20459,18 +20459,6 @@ pub(crate) async fn set_message_reaction_impl(
                     input.size
                 ));
             }
-            // A custom emoji is a channel-private (encrypted) CAS blob — the
-            // serve/preview gate keys off the CID's encrypted flag. Reject a
-            // public CID at the mint boundary so an emoji image can't be made
-            // world-fetchable (verify enforces the same on receipt). CodeRabbit
-            // PR #320. Checked last so a malformed mime/size surfaces its own
-            // (more specific) error first.
-            if !harmony_content::cid::ContentId::from_bytes(emoji_cid)
-                .flags()
-                .encrypted
-            {
-                return Err("custom emoji cid must reference an encrypted CAS blob".to_string());
-            }
             Some(crate::community_channel_log::ChannelAttachment {
                 cid: emoji_cid,
                 mime: input.mime,
@@ -23358,11 +23346,12 @@ mod create_community_inner_tests {
     }
 
     #[tokio::test]
-    async fn set_message_reaction_rejects_unencrypted_custom_emoji_cid() {
-        // CodeRabbit PR #320: a custom emoji must reference an encrypted CAS
-        // blob. `VALID_CID_64` (`00...`) decodes to a PUBLIC CID (encrypted flag
-        // clear); a valid image/size means it passes those checks and trips the
-        // encrypted gate specifically.
+    async fn set_message_reaction_accepts_public_custom_emoji_cid() {
+        // Public custom emoji (foundation): `VALID_CID_64` (`00...`) is a PUBLIC
+        // CID (encrypted flag clear). Custom emoji default to public, so the mint
+        // boundary must NOT reject it for being unencrypted. It now passes the
+        // descriptor checks and falls through to the registry lookup (absent on a
+        // bare NodeState), proving the encrypted gate is gone.
         let state = reaction_error_path_state();
         let err = set_message_reaction_impl(
             &state,
@@ -23378,8 +23367,15 @@ mod create_community_inner_tests {
             }),
         )
         .await
-        .expect_err("public custom emoji cid must be rejected");
-        assert!(err.contains("encrypted CAS blob"), "got: {err}");
+        .expect_err("bare NodeState has no channel_log_registry");
+        assert!(
+            err.contains("channel_log_registry missing"),
+            "public emoji must pass validation and reach the registry lookup, got: {err}"
+        );
+        assert!(
+            !err.contains("encrypted CAS blob"),
+            "no encrypted-gate rejection should fire, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -51402,6 +51398,47 @@ mod channel_message_ipc_tests {
         assert_eq!(snapshot.len(), 1, "small blob ingests as a single book");
         assert_eq!(snapshot[0].0, dto.cid);
 
+        drop(state);
+    }
+
+    /// Dedup proof: a PUBLIC ingest CIDs by hash(plaintext), so the same bytes
+    /// ingested in two DIFFERENT communities yield the IDENTICAL CID — the
+    /// network hosts one shared copy. (An encrypted ingest would differ per
+    /// epoch key; public does not. This is the content-addressing superpower the
+    /// public-emoji model unlocks.)
+    #[tokio::test]
+    async fn ingest_channel_artifact_bytes_public_is_deterministic_across_communities() {
+        let (tx, _log) = spawn_test_ingest_handler();
+        let state = StdMutex::new(NodeState {
+            ingest_tx: Some(tx),
+            ..NodeState::default()
+        });
+        let bytes: Vec<u8> = (0u8..200).collect();
+        let a = ingest_channel_artifact_bytes_impl(
+            &state,
+            "00".repeat(16),
+            bytes.clone(),
+            String::new(),
+            "image/png".into(),
+            false,
+        )
+        .await
+        .expect("public ingest a");
+        let b = ingest_channel_artifact_bytes_impl(
+            &state,
+            "11".repeat(16),
+            bytes.clone(),
+            String::new(),
+            "image/png".into(),
+            false,
+        )
+        .await
+        .expect("public ingest b");
+        assert_eq!(
+            a.cid, b.cid,
+            "same plaintext → same public CID (cross-community dedup)"
+        );
+        assert!(!a.encrypted && !b.encrypted, "both public");
         drop(state);
     }
 

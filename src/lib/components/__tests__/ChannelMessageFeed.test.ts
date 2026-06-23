@@ -1119,7 +1119,7 @@ describe('ChannelMessageFeed reactions — custom (CAS) emoji (ZEB-541)', () => 
       expect(normalizeEmojiMock).toHaveBeenCalledWith(file);
       expect(ctx.adapter.invoke).toHaveBeenCalledWith(
         'ingest_channel_artifact_bytes',
-        expect.objectContaining({ communityId: 'aa'.repeat(16), mime: 'image/png' }),
+        expect.objectContaining({ communityId: 'aa'.repeat(16), mime: 'image/png', encrypt: false }),
       );
       expect(ctx.adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
         communityId: 'aa'.repeat(16),
@@ -1129,6 +1129,56 @@ describe('ChannelMessageFeed reactions — custom (CAS) emoji (ZEB-541)', () => 
         add: true,
         customEmoji: { cid: 'newcid', mime: 'image/png', size: 321 },
       });
+    });
+  });
+
+  it('custom-emoji pick with "keep private" checked ingests encrypted', async () => {
+    const ctx = await setup();
+    (ctx.adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'ingest_channel_artifact_bytes') {
+        return Promise.resolve({ cid: 'newcid', mime: 'image/png', name: '', size: 321, encrypted: true });
+      }
+      return Promise.resolve(undefined);
+    });
+    const handler = ctx.adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'ee'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('hi')),
+        },
+      },
+    });
+    await waitFor(() => expect(ctx.container.querySelector('.channel-message')).toBeTruthy());
+
+    await fireEvent.click(ctx.container.querySelector('.picker-toggle') as HTMLButtonElement);
+    const priv = await waitFor(() => {
+      const el = ctx.container.querySelector(
+        '[aria-label="Keep custom emoji private to this community"]',
+      );
+      if (!el) throw new Error('private checkbox not rendered');
+      return el as HTMLInputElement;
+    });
+    await fireEvent.click(priv);
+    await fireEvent.click(ctx.container.querySelector('.picker-custom') as HTMLButtonElement);
+
+    const input = ctx.container.querySelector('.custom-emoji-input') as HTMLInputElement;
+    const file = new File([new Uint8Array([1, 2, 3])], 'pepe.png', { type: 'image/png' });
+    Object.defineProperty(input, 'files', { value: [file], configurable: true });
+    await fireEvent.change(input);
+
+    await waitFor(() => {
+      expect(ctx.adapter.invoke).toHaveBeenCalledWith(
+        'ingest_channel_artifact_bytes',
+        expect.objectContaining({ encrypt: true }),
+      );
     });
   });
 });

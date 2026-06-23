@@ -699,11 +699,26 @@ describe('ChannelMessageService reactions (ZEB-536 Spec 2)', () => {
       bytes: [0x89, 0x50, 0x4e, 0x47],
       name: '',
       mime: 'image/png',
-      encrypt: true,
+      encrypt: false,
     });
     // The bytes arg must be a plain Array (not a typed array) for IPC.
     const [, args] = (adapter.invoke as any).mock.calls[0];
     expect(Array.isArray(args.bytes)).toBe(true);
+  });
+
+  it('ingestEmojiBytes passes encrypt=true when caller opts into private', async () => {
+    await service.connectAdapter(adapter);
+    const bytes = new Uint8Array([1, 2, 3]);
+    const dto = { cid: 'cd'.repeat(32), mime: 'image/png', name: '', size: 256, encrypted: true };
+    (adapter.invoke as any).mockResolvedValue(dto);
+    await service.ingestEmojiBytes(CID, bytes, true);
+    expect(adapter.invoke).toHaveBeenCalledWith('ingest_channel_artifact_bytes', {
+      communityId: CID,
+      bytes: Array.from(bytes),
+      name: '',
+      mime: 'image/png',
+      encrypt: true,
+    });
   });
 
   it('ingestEmojiBytes normalizes a raw-string rejection into an Error', async () => {

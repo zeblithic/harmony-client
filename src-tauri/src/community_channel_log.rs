@@ -506,8 +506,6 @@ pub enum ChannelEventError {
     CustomEmojiNotImage { mime: String },
     #[error("custom emoji react must not also carry a unicode emoji")]
     CustomEmojiWithUnicode,
-    #[error("custom emoji cid must reference an encrypted CAS blob")]
-    CustomEmojiNotEncrypted,
     #[error("attachment name/mime too long (max {max} bytes)")]
     AttachmentFieldTooLong { max: usize },
     #[error("attachment too large: {size} bytes (max {max})")]
@@ -1220,16 +1218,6 @@ where
                 return Err(ChannelEventError::CustomEmojiNotImage {
                     mime: att.mime.clone(),
                 });
-            }
-            // A custom emoji is a channel-private (encrypted) CAS blob; the
-            // serve/preview gate keys off the CID's encrypted flag. Reject a
-            // public CID so an emoji image can't be made world-fetchable
-            // (parity with the mint-boundary check). CodeRabbit PR #320.
-            if !harmony_content::cid::ContentId::from_bytes(att.cid)
-                .flags()
-                .encrypted
-            {
-                return Err(ChannelEventError::CustomEmojiNotEncrypted);
             }
         }
     }
@@ -4498,8 +4486,9 @@ mod tests {
         let (signing_key, author, _pub64) = fixture_identity(0xa1);
         let community_id = fixture_community(0xc0);
         let channel_id = fixture_channel(0x01);
-        // `[0xB2; 32]` decodes to mode nibble 0xB (0b1011) → the encrypted flag
-        // bit is set, so this passes the encrypted-CID invariant below.
+        // `[0xB2; 32]` decodes to mode nibble 0xB (encrypted bit set) — an
+        // ENCRYPTED custom emoji. Both encrypted and public custom emoji verify;
+        // this case keeps the encrypted path covered.
         let att = ChannelAttachment {
             cid: [0xB2; 32],
             mime: "image/png".to_string(),
@@ -4543,12 +4532,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_react_rejects_unencrypted_custom_emoji_cid() {
-        // CodeRabbit PR #320: a custom emoji must reference an encrypted CAS
-        // blob. `[0x42; 32]` decodes to mode nibble 0x4 (0b0100) → encrypted bit
-        // CLEAR, so verify must reject it (a public CID would make the emoji
-        // image world-fetchable). It passes the field/size/image checks first so
-        // we exercise the encrypted gate specifically.
+    async fn verify_react_accepts_public_custom_emoji_cid() {
+        // Public custom emoji (foundation): `[0x42; 32]` decodes to mode nibble
+        // 0x4 (encrypted bit CLEAR) → a PUBLIC CID. Custom emoji default to
+        // public (deduplicated, freely served), so verify must ACCEPT it; the
+        // descriptor passes the field/size/image checks.
         let state = fixture_state_with_alice_joined();
         let (signing_key, author, _pub64) = fixture_identity(0xa1);
         let community_id = fixture_community(0xc0);
@@ -4562,13 +4550,9 @@ mod tests {
         let payload = custom_emoji_react_payload(community_id, channel_id, author, Some(att));
         let event = sign_channel_react(&payload, &signing_key).expect("sign react");
         let mut tracker = ChannelLogReplayTracker::new();
-        let err = verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+        verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
             .await
-            .expect_err("unencrypted custom emoji cid must fail verify");
-        assert!(
-            matches!(err, ChannelEventError::CustomEmojiNotEncrypted),
-            "expected CustomEmojiNotEncrypted, got {err:?}"
-        );
+            .expect("a public custom-emoji react must verify");
     }
 
     #[tokio::test]
