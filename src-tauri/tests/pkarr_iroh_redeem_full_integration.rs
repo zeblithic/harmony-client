@@ -1612,7 +1612,10 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// ZEB-427: durability fence on the iroh-handshake redemption path.
+// ZEB-427 / ZEB-509: durability fence on the iroh-handshake redemption path.
+// ZEB-427 proved the fence runs (the Space row reaches disk on commit); ZEB-509
+// strengthens it to prove the redeemer persists a *usable live epoch key*, not a
+// Space shell — guarding the `LiveEpochKeyMissing` symptom #307 fixed.
 //
 // This was the ONE join path missing ZEB-393 Bug A's durable-on-commit
 // fence: `create_community`, the legacy `redeem_invite`, and
@@ -1796,6 +1799,34 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
             "persisted owner-state must contain the joined community's Space row; \
              persisted space ids = {:?}",
             loaded.spaces.keys().collect::<Vec<_>>()
+        );
+
+        // ZEB-509 regression guard: a persisted Space ROW is necessary but not
+        // sufficient. The #307 deadlock surfaced as `LiveEpochKeyMissing` — the
+        // redeemer reloaded a Space whose epoch key was absent, so it looked joined
+        // yet could never serve or recover (the keystone behind the deposit→recover
+        // / 3-node / cross-WAN stalls). `contains_key` above would still pass if a
+        // future regression persisted a Space shell without its epoch. Assert the
+        // reloaded Space carries the *exact* live epoch key Alice sealed into the
+        // invite (epoch 0), proving the redeemer persisted a usable epoch — the
+        // precise thing `live_epoch_key` needs on the serve/recover path.
+        let reloaded_space = loaded
+            .spaces
+            .get(&s.community_id)
+            .expect("joined community Space row present (asserted above)");
+        assert_eq!(
+            reloaded_space
+                .current_epoch_key
+                .as_ref()
+                .map(|k| k.as_bytes()),
+            Some(s.alice_minted.membership_key.as_bytes()),
+            "reloaded redeemer Space must carry the sealed live epoch key \
+             (current_epoch_key) — LiveEpochKeyMissing was the #307 symptom"
+        );
+        assert_eq!(
+            reloaded_space.current_epoch,
+            Some(0),
+            "reloaded redeemer Space must carry the epoch counter (epoch 0 at join)"
         );
 
         // Graceful teardown (mirrors the option_a test) + engine shutdown.
