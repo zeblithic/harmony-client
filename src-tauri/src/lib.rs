@@ -20209,6 +20209,16 @@ pub(crate) struct ReactionEmojiInput {
     pub size: u64,
 }
 
+/// IPC projection of one named emoji for the picker. Serializes camelCase.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EmojiNameDto {
+    pub cid: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+}
+
 #[tauri::command]
 async fn set_message_reaction(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
@@ -21218,6 +21228,112 @@ pub(crate) async fn preview_reaction_emoji_impl(
     )
     .await?;
     decrypt_and_verify_artifact(bytes, encrypted, epoch_key_opt, expected_size)
+}
+
+/// Validate that `cid` is a well-formed 64-hex ContentId whose `encrypted` flag
+/// is UNSET. Naming is public-only: an encrypted emoji can't render outside its
+/// origin community, so it can't be a globally reusable named emoji.
+pub(crate) fn ensure_public_cid(cid: &str) -> Result<(), String> {
+    use harmony_content::cid::ContentId;
+    if cid.len() != 64 {
+        return Err("invalid cid hex".to_string());
+    }
+    let bytes: [u8; 32] = hex::decode(cid)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| "invalid cid hex".to_string())?;
+    if ContentId::from_bytes(bytes).flags().encrypted {
+        return Err("encrypted emoji can't be named — they can't be reused outside their community".to_string());
+    }
+    Ok(())
+}
+
+/// Resolve the `emoji_names.json` path from `NodeState.pkarr_settings_path`,
+/// mirroring how the nickname store co-locates beside `pkarr_settings.json`.
+fn emoji_names_path(state: &std::sync::Mutex<NodeState>) -> Result<std::path::PathBuf, String> {
+    let g = state.lock().map_err(|e| format!("NodeState poisoned: {e}"))?;
+    let p = g
+        .pkarr_settings_path
+        .clone()
+        .ok_or_else(|| OWNER_NOT_LOADED_MSG.to_string())?;
+    Ok(p.with_file_name("emoji_names.json"))
+}
+
+pub(crate) async fn set_emoji_name_impl(
+    state: &std::sync::Mutex<NodeState>,
+    cid: String,
+    name: Option<String>,
+    mime: String,
+    size: u64,
+    now_ms: u64,
+) -> Result<(), String> {
+    ensure_public_cid(&cid)?;
+    let trimmed = name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(n) = trimmed {
+        if !crate::emoji_names::valid_emoji_name(n) {
+            return Err(format!(
+                "invalid emoji name (use 1–{} of A–Z, a–z, 0–9, _ or -)",
+                crate::emoji_names::MAX_EMOJI_NAME_LEN
+            ));
+        }
+    }
+    let path = emoji_names_path(state)?;
+    {
+        let _guard = EMOJI_NAMES_WRITE_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let mut store = crate::emoji_names::EmojiNames::load_or_default(&path);
+        store.set(&cid, trimmed, &mime, size, now_ms);
+        store.save(&path)?;
+    }
+    // Task 4 wires the best-effort retain-on-name pin here (only when setting).
+    Ok(())
+}
+
+pub(crate) async fn list_emoji_names_impl(
+    state: &std::sync::Mutex<NodeState>,
+) -> Result<Vec<EmojiNameDto>, String> {
+    let path = emoji_names_path(state)?;
+    let store = crate::emoji_names::EmojiNames::load_or_default(&path);
+    Ok(store
+        .entries
+        .iter()
+        .map(|(cid, e)| EmojiNameDto {
+            cid: cid.clone(),
+            name: e.name.clone(),
+            mime: e.mime.clone(),
+            size: e.size,
+        })
+        .collect())
+}
+
+/// Set (or clear, with `name = null`) the LOCAL-ONLY personal name for a PUBLIC
+/// custom emoji. `mime`/`size` are the caller's known descriptor; ignored on
+/// clear. Emits `emoji-names-changed` so subscribed UIs re-fetch.
+#[tauri::command]
+async fn set_emoji_name(
+    app: tauri::AppHandle,
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    cid: String,
+    name: Option<String>,
+    mime: String,
+    size: u64,
+) -> Result<(), String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    set_emoji_name_impl(state_lock.inner(), cid, name, mime, size, now_ms).await?;
+    let _ = app.emit("emoji-names-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_emoji_names(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<Vec<EmojiNameDto>, String> {
+    list_emoji_names_impl(state_lock.inner()).await
 }
 
 /// Tauri IPC: list locally-known messages in a channel.
@@ -24061,6 +24177,86 @@ mod create_community_inner_tests {
         drop(node_state);
         ingest_drainer.abort();
         fetch_drainer.abort();
+    }
+
+    #[test]
+    fn ensure_public_cid_accepts_public_rejects_encrypted_and_malformed() {
+        let public_hex = hex::encode([0x42u8; 32]);
+        let encrypted_hex = hex::encode([0xB2u8; 32]);
+        assert!(ensure_public_cid(&public_hex).is_ok());
+        let err = ensure_public_cid(&encrypted_hex).unwrap_err();
+        assert!(err.contains("encrypted"), "got: {err}");
+        assert!(ensure_public_cid("zz").is_err()); // not 64 hex
+        assert!(ensure_public_cid(&"q".repeat(64)).is_err()); // non-hex
+    }
+
+    #[tokio::test]
+    async fn set_emoji_name_impl_writes_and_clears_public_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("pkarr_settings.json");
+        let state = std::sync::Mutex::new(NodeState {
+            pkarr_settings_path: Some(settings.clone()),
+            ..NodeState::default()
+        });
+        let public_hex = hex::encode([0x42u8; 32]);
+
+        set_emoji_name_impl(
+            &state,
+            public_hex.clone(),
+            Some("catjam".to_string()),
+            "image/png".to_string(),
+            200,
+            1_000,
+        )
+        .await
+        .expect("set must succeed for a public cid");
+
+        let listed = list_emoji_names_impl(&state).await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].cid, public_hex);
+        assert_eq!(listed[0].name, "catjam");
+        assert_eq!(listed[0].mime, "image/png");
+        assert_eq!(listed[0].size, 200);
+
+        set_emoji_name_impl(&state, public_hex.clone(), None, String::new(), 0, 2_000)
+            .await
+            .expect("clear must succeed");
+        assert!(list_emoji_names_impl(&state).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_emoji_name_impl_rejects_encrypted_and_bad_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = std::sync::Mutex::new(NodeState {
+            pkarr_settings_path: Some(dir.path().join("pkarr_settings.json")),
+            ..NodeState::default()
+        });
+        let encrypted_hex = hex::encode([0xB2u8; 32]);
+        let public_hex = hex::encode([0x42u8; 32]);
+
+        let err = set_emoji_name_impl(
+            &state,
+            encrypted_hex,
+            Some("nope".to_string()),
+            "image/png".to_string(),
+            1,
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("encrypted"), "got: {err}");
+
+        let err = set_emoji_name_impl(
+            &state,
+            public_hex,
+            Some("has space".to_string()),
+            "image/png".to_string(),
+            1,
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("name"), "got: {err}");
     }
 
     /// Failure path — fence abort after default-channel insert: the guard
@@ -45259,6 +45455,11 @@ async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Re
 /// `save_atomically` renames atomically, so a reader always sees a complete
 /// old-or-new file.
 static NICKNAME_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+/// Serializes the emoji-names file read-modify-write so two concurrent
+/// `set_emoji_name` calls can't lose an update (parity with `NICKNAME_WRITE_LOCK`).
+static EMOJI_NAMES_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
 /// Max nickname length, in chars. Generous for a personal label; bounds local
