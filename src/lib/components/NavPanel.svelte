@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { AppMode, NavNode, DisplayMode, SortOrder, ContentItem, ContentSection, StorageBuddy } from '../types';
   import { getChildNodes, findNode } from '../nav-utils';
-  import { isNavModeEnabled } from '../feature-flags';
+  import { resolveNavModeFlags } from '../feature-flags';
   import NavTree from './NavTree.svelte';
   import FolderTree from './FolderTree.svelte';
   import QuickFilters from './QuickFilters.svelte';
@@ -61,6 +61,10 @@
     /** ZEB-334: whether the self-notes space is the active view. */
     notesActive?: boolean;
   } = $props();
+
+  // ZEB-544: resolve the nav-rail gate map once per mount (a single localStorage
+  // read) rather than calling the per-mode check inline for each button.
+  const navFlags = resolveNavModeFlags();
 
   // ── ZEB-263 FAB + fan-out menu ──────────────────────────────────────
   // Click "+" → opens a 4-item popover (DM / Group DM / Community /
@@ -273,32 +277,32 @@
         <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'messages'}
           aria-label="Messages" aria-pressed={appMode === 'messages'}
           onclick={() => onModeChange?.('messages')}>Messages</button>
-        {#if isNavModeEnabled('vines')}
+        {#if navFlags.vines}
           <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'vines'}
             aria-label="Vines" aria-pressed={appMode === 'vines'}
             onclick={() => onModeChange?.('vines')}>Vines</button>
         {/if}
-        {#if isNavModeEnabled('files')}
+        {#if navFlags.files}
           <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'files'}
             aria-label="Files" aria-pressed={appMode === 'files'}
             onclick={() => onModeChange?.('files')}>Files</button>
         {/if}
-        {#if isNavModeEnabled('mail')}
+        {#if navFlags.mail}
           <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'mail'}
             aria-label="Mail" aria-pressed={appMode === 'mail'}
             onclick={() => onModeChange?.('mail')}>Mail</button>
         {/if}
-        {#if isNavModeEnabled('spellbook')}
+        {#if navFlags.spellbook}
           <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'spellbook'}
             aria-label="Spellbook" aria-pressed={appMode === 'spellbook'}
             onclick={() => onModeChange?.('spellbook')}>Spellbook</button>
         {/if}
-        {#if isNavModeEnabled('mint')}
+        {#if navFlags.mint}
           <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'mint'}
             aria-label="Mint" aria-pressed={appMode === 'mint'}
             onclick={() => onModeChange?.('mint')}>💰 Mint</button>
         {/if}
-        {#if isNavModeEnabled('network')}
+        {#if navFlags.network}
           <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'network'}
             aria-label="Network" aria-pressed={appMode === 'network'}
             onclick={() => onModeChange?.('network')}>Network</button>

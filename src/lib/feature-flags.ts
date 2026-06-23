@@ -54,7 +54,10 @@ function loadOverrides(): Partial<Record<AppMode, boolean>> {
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
     const out: Partial<Record<AppMode, boolean>> = {};
     for (const [mode, value] of Object.entries(parsed as Record<string, unknown>)) {
-      if (mode in NAV_MODE_DEFAULTS && typeof value === 'boolean') {
+      // `Object.hasOwn`, not `in`: `in` walks the prototype chain, so inherited
+      // names (`constructor`, `toString`, …) would pass the "known mode" filter
+      // and round-trip back into localStorage via setNavModeOverride.
+      if (Object.hasOwn(NAV_MODE_DEFAULTS, mode) && typeof value === 'boolean') {
         out[mode as AppMode] = value;
       }
     }
@@ -65,13 +68,28 @@ function loadOverrides(): Partial<Record<AppMode, boolean>> {
 }
 
 /**
+ * Resolve the full per-mode enablement map in a single localStorage read. Prefer
+ * this over calling `isNavModeEnabled` per-mode on a hot render path (the nav
+ * rail), where repeated reads/parses would otherwise multiply across buttons and
+ * re-renders.
+ */
+export function resolveNavModeFlags(): Record<AppMode, boolean> {
+  const overrides = loadOverrides();
+  const out = {} as Record<AppMode, boolean>;
+  for (const mode of Object.keys(NAV_MODE_DEFAULTS) as AppMode[]) {
+    out[mode] = ALWAYS_ENABLED.has(mode) ? true : (overrides[mode] ?? NAV_MODE_DEFAULTS[mode]);
+  }
+  return out;
+}
+
+/**
  * Whether a top-level mode should appear in the nav rail. `messages` is always
  * enabled; every other mode uses its code default unless a valid device-local
- * override flips it.
+ * override flips it. For multiple checks in one render, prefer
+ * `resolveNavModeFlags` (one read for all modes).
  */
 export function isNavModeEnabled(mode: AppMode): boolean {
-  if (ALWAYS_ENABLED.has(mode)) return true;
-  return loadOverrides()[mode] ?? NAV_MODE_DEFAULTS[mode];
+  return resolveNavModeFlags()[mode];
 }
 
 /**
