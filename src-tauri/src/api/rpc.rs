@@ -109,6 +109,26 @@ struct CommunityLimitArgs {
     limit: u32,
 }
 
+/// ZEB-527: `community_id` + `target_addr` + optional `reason` — shared by
+/// the two member-targeting moderation action verbs (`kick_from_community`,
+/// `unban_from_community`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModerationTargetArgs {
+    community_id: String,
+    target_addr: String,
+    reason: Option<String>,
+}
+
+/// ZEB-527: `community_id` + `proposal_event_id` for
+/// `countersign_admin_proposal`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CountersignArgs {
+    community_id: String,
+    proposal_event_id: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateCommunityArgs {
@@ -334,7 +354,7 @@ struct SetIdentityDiscoverableArgs {
 
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (61 commands). Every handler calls
+/// Build the curated v1 RPC surface (64 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
@@ -444,6 +464,39 @@ pub fn build_registry() -> RpcRegistry {
         CommunityLimitArgs,
         |state, _sink, a| async move {
             crate::list_recent_moderation_events_impl(state, a.community_id, a.limit).await
+        }
+    );
+    rpc!(
+        m,
+        "countersign_admin_proposal",
+        CountersignArgs,
+        |state, _sink, a| {
+            async move {
+                crate::countersign_admin_proposal_impl(state, a.community_id, a.proposal_event_id)
+                    .await
+            }
+        }
+    );
+    rpc!(
+        m,
+        "kick_from_community",
+        ModerationTargetArgs,
+        |state, _sink, a| {
+            async move {
+                crate::kick_from_community_impl(state, a.community_id, a.target_addr, a.reason)
+                    .await
+            }
+        }
+    );
+    rpc!(
+        m,
+        "unban_from_community",
+        ModerationTargetArgs,
+        |state, _sink, a| {
+            async move {
+                crate::unban_from_community_impl(state, a.community_id, a.target_addr, a.reason)
+                    .await
+            }
         }
     );
 
@@ -1164,6 +1217,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn countersign_admin_proposal_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "countersign_admin_proposal",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX, "proposalEventId": DUMMY_COMMUNITY_HEX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn kick_from_community_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "kick_from_community",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX, "targetAddr": DUMMY_COMMUNITY_HEX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn kick_from_community_rejects_missing_target() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "kick_from_community",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::BadArgs(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn unban_from_community_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "unban_from_community",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX, "targetAddr": DUMMY_COMMUNITY_HEX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
     async fn registry_has_exactly_the_curated_v1_surface() {
         let reg = build_registry();
         let mut names = reg.command_names();
@@ -1191,6 +1304,9 @@ mod tests {
             "list_pending_joins",
             "list_recent_counter_signs",
             "list_recent_moderation_events",
+            "countersign_admin_proposal",
+            "kick_from_community",
+            "unban_from_community",
             // channels
             "create_channel",
             "list_channels",

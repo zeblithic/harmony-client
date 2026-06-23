@@ -31717,9 +31717,8 @@ fn build_sealed_epoch_recipients(
 /// (power == 100), mints an AdminProposal instead of a direct Kick and
 /// returns `AdminActionResult::Pending`. Otherwise performs the direct
 /// Kick + EpochRotation and returns `AdminActionResult::Completed`.
-#[tauri::command]
-async fn kick_from_community(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn kick_from_community_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
     target_addr: String,
     reason: Option<String>,
@@ -31739,7 +31738,7 @@ async fn kick_from_community(
     let target = crate::owner_state_types::OwnerAddr(target_bytes);
 
     let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -31771,7 +31770,7 @@ async fn kick_from_community(
     // check we'd happily insert into a detached engine that's about to
     // be torn down.
     {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
@@ -31982,7 +31981,7 @@ async fn kick_from_community(
                 // against `prior_epoch` (the epoch at minting time) and only apply
                 // when the stored epoch is still behind the target.
                 if let Some(crdt_state) = {
-                    let g = state_lock
+                    let g = state
                         .lock()
                         .map_err(|e| format!("NodeState poisoned: {e}"))?;
                     g.crdt_state.clone()
@@ -32028,6 +32027,16 @@ async fn kick_from_community(
     }
 
     Ok(AdminActionResult::Completed)
+}
+
+#[tauri::command]
+async fn kick_from_community(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    target_addr: String,
+    reason: Option<String>,
+) -> Result<AdminActionResult, String> {
+    kick_from_community_impl(state_lock.inner(), community_id, target_addr, reason).await
 }
 
 // ── ZEB-262 Phase 4: set_power_level ─────────────────────────────────
@@ -32245,9 +32254,8 @@ async fn set_power_level(
 ///
 /// Does NOT trigger EpochRotation — Unban is additive. The subsequent
 /// Invite → Join flow handles its own epoch delivery.
-#[tauri::command]
-async fn unban_from_community(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn unban_from_community_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
     target_addr: String,
     reason: Option<String>,
@@ -32267,7 +32275,7 @@ async fn unban_from_community(
     let target = crate::owner_state_types::OwnerAddr(target_bytes);
 
     let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -32299,7 +32307,7 @@ async fn unban_from_community(
     // motivation; stop_node nullifies registry without bumping
     // generation).
     {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
@@ -32337,6 +32345,16 @@ async fn unban_from_community(
     }
 
     Ok(())
+}
+
+#[tauri::command]
+async fn unban_from_community(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    target_addr: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    unban_from_community_impl(state_lock.inner(), community_id, target_addr, reason).await
 }
 
 // ── ZEB-284 Task 2: list_recent_moderation_events ────────────────────
@@ -33240,9 +33258,8 @@ pub fn count_signers(
 /// expired (> 30 days) or non-existent proposals.
 ///
 /// Authorization: caller must be Joined and have power ≥ 100.
-#[tauri::command]
-async fn countersign_admin_proposal(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn countersign_admin_proposal_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
     proposal_event_id: String,
 ) -> Result<CountersignResult, String> {
@@ -33263,7 +33280,7 @@ async fn countersign_admin_proposal(
         })?;
 
     let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -33287,7 +33304,7 @@ async fn countersign_admin_proposal(
 
     // Generation + registry fence.
     {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
@@ -33443,6 +33460,15 @@ async fn countersign_admin_proposal(
         quorum_required,
         reached_quorum: signers_after >= quorum_required,
     })
+}
+
+#[tauri::command]
+async fn countersign_admin_proposal(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    proposal_event_id: String,
+) -> Result<CountersignResult, String> {
+    countersign_admin_proposal_impl(state_lock.inner(), community_id, proposal_event_id).await
 }
 
 // ── ZEB-250 Task 12: propose_change_quorum IPC ────────────────────────────
