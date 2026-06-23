@@ -42,6 +42,9 @@ export interface ChannelMessageDto {
     reactors: string[];
     emojiCid?: string;
     emojiSize?: number;
+    /** Present iff custom: whether the emoji CID is encrypted. The UI hides the
+     *  "name this emoji" affordance on encrypted chips. */
+    encrypted?: boolean;
   }[];
   /**
    * ZEB-534: owner-ids (hex) this message addresses, or absent if none.
@@ -59,6 +62,13 @@ export interface ChannelAttachmentDto {
   name: string;
   size: number;
   encrypted: boolean;
+}
+
+export interface EmojiNameDto {
+  cid: string;
+  name: string;
+  mime: string;
+  size: number;
 }
 
 interface ChannelMessageReceivedPayload {
@@ -95,6 +105,7 @@ interface ChannelReactionReceivedPayload {
    */
   emojiCid?: string;
   emojiSize?: number;
+  encrypted?: boolean;
 }
 
 function chKey(communityId: string, channelId: string): string {
@@ -150,6 +161,12 @@ export class ChannelMessageService {
     if (next) this.recomputeMineFlags(next);
   }
 
+  /** Listeners notified when the backend emits `emoji-names-changed` (the local
+   *  emoji-name map was set/cleared, possibly on another device). A registry
+   *  (not a single slot) so multiple UIs can each subscribe without stomping —
+   *  mirrors FriendService.friendsChangedListeners. */
+  private emojiNamesChangedListeners = new Set<() => void>();
+
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
   private byChannel = new Map<string, ChannelMessageDto[]>();
@@ -184,6 +201,13 @@ export class ChannelMessageService {
       this.applyReaction(p);
     });
     this.unlisteners.push(unlistenReaction);
+
+    const unlistenEmojiNames = await adapter.listen('emoji-names-changed', () => {
+      // Snapshot before iterating so a listener that unsubscribes itself
+      // during notification doesn't mutate the live set mid-loop.
+      for (const cb of [...this.emojiNamesChangedListeners]) cb();
+    });
+    this.unlisteners.push(unlistenEmojiNames);
   }
 
   /** Post a message. Returns the engine-minted messageId hex. */
@@ -397,6 +421,7 @@ export class ChannelMessageService {
     this.subscribers.clear();
     this.inFlightBackfill.clear();
     this.seenIds.clear();
+    this.emojiNamesChangedListeners.clear();
     this.selfOwnerId = null;
     this.adapter = null;
   }
@@ -615,6 +640,55 @@ export class ChannelMessageService {
       const msg = e instanceof Error ? e.message : String(e);
       throw new Error(msg);
     }
+  }
+
+  /**
+   * Set (or clear, with `null`) the LOCAL-ONLY personal name for a PUBLIC custom
+   * emoji. `mime`/`size` are the descriptor already known to the caller. The
+   * backend emits `emoji-names-changed`, so subscribed UIs re-fetch.
+   */
+  async setEmojiName(cid: string, name: string | null, mime: string, size: number): Promise<void> {
+    if (!this.adapter) throw new Error('ChannelMessageService.setEmojiName: adapter not connected');
+    try {
+      await this.adapter.invoke('set_emoji_name', { cid, name, mime, size });
+    } catch (e: unknown) {
+      throw new Error(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** List the user's named emoji for the picker. */
+  async listEmojiNames(): Promise<EmojiNameDto[]> {
+    if (!this.adapter) throw new Error('ChannelMessageService.listEmojiNames: adapter not connected');
+    try {
+      return (await this.adapter.invoke('list_emoji_names', {})) as EmojiNameDto[];
+    } catch (e: unknown) {
+      throw new Error(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** Fetch a NAMED (public) emoji's bytes by CID with no channel scope. */
+  async previewNamedEmoji(cid: string): Promise<Uint8Array> {
+    if (!this.adapter) throw new Error('ChannelMessageService.previewNamedEmoji: adapter not connected');
+    try {
+      const bytes = (await this.adapter.invoke('preview_named_emoji', { cid })) as number[];
+      return new Uint8Array(bytes);
+    } catch (e: unknown) {
+      throw new Error(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /**
+   * Register a callback fired when the backend emits `emoji-names-changed`
+   * (the local emoji-name map was set/cleared, possibly on another device).
+   * Receivers should re-fetch `listEmojiNames()`. Returns an unsubscribe
+   * function; call it (e.g. in a component's `onDestroy`) to remove ONLY this
+   * listener without disturbing others. Multiple subscribers are supported.
+   */
+  onEmojiNamesChanged(cb: () => void): () => void {
+    this.emojiNamesChangedListeners.add(cb);
+    return () => {
+      this.emojiNamesChangedListeners.delete(cb);
+    };
   }
 }
 
