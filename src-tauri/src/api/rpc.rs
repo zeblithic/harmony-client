@@ -197,6 +197,9 @@ struct SetMessageReactionArgs {
     message_id: String,
     emoji: String,
     add: bool,
+    /// ZEB-541: optional custom (CAS-backed) emoji descriptor.
+    #[serde(default)]
+    custom_emoji: Option<crate::ReactionEmojiInput>,
 }
 
 #[derive(serde::Deserialize)]
@@ -487,6 +490,7 @@ pub fn build_registry() -> RpcRegistry {
                 a.message_id,
                 a.emoji,
                 a.add,
+                a.custom_emoji,
             )
             .await
         }

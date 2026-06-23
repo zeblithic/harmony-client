@@ -30,8 +30,19 @@ export interface ChannelMessageDto {
   /**
    * ZEB-536 — per-emoji reaction summaries. Optional: populated by the
    * Rust IPC boundary; consumed by the reactions UI (Spec 2).
+   *
+   * ZEB-541 — a custom (CAS-backed image) reaction carries `emojiCid`
+   * (hex ContentId) + `emojiSize` (plaintext byte length, advisory) and an
+   * empty-string `emoji`. Both fields are absent for unicode reactions.
    */
-  reactions?: { emoji: string; count: number; mine: boolean; reactors: string[] }[];
+  reactions?: {
+    emoji: string;
+    count: number;
+    mine: boolean;
+    reactors: string[];
+    emojiCid?: string;
+    emojiSize?: number;
+  }[];
   /**
    * ZEB-534: owner-ids (hex) this message addresses, or absent if none.
    * Recipients derive "mentions me" as `selfOwnerHex` ∈ mentions. GUI
@@ -77,6 +88,13 @@ interface ChannelReactionReceivedPayload {
   emoji: string;
   add: boolean;
   at: HlcDto;
+  /**
+   * ZEB-541 — present iff this is a custom (CAS-backed image) reaction. The CID
+   * (hex ContentId) is materialized onto the chip entry so the feed can resolve
+   * + render the image; `emojiSize` is advisory (plaintext byte length).
+   */
+  emojiCid?: string;
+  emojiSize?: number;
 }
 
 function chKey(communityId: string, channelId: string): string {
@@ -444,12 +462,22 @@ export class ChannelMessageService {
     if (!msg) return;
 
     const reactions = msg.reactions ?? (msg.reactions = []);
-    const idx = reactions.findIndex((r) => r.emoji === p.emoji);
+    // A custom (image) reaction is keyed by its CID — its `emoji` is "" so it
+    // would otherwise collide with every other custom reaction. Unicode
+    // reactions key by the emoji string as before.
+    const idx = p.emojiCid
+      ? reactions.findIndex((r) => r.emojiCid === p.emojiCid)
+      : reactions.findIndex((r) => !r.emojiCid && r.emoji === p.emoji);
 
     if (p.add) {
       let entry = idx >= 0 ? reactions[idx] : undefined;
       if (!entry) {
         entry = { emoji: p.emoji, count: 0, mine: false, reactors: [] };
+        // Carry the custom-emoji descriptor so the feed can render the image.
+        if (p.emojiCid) {
+          entry.emojiCid = p.emojiCid;
+          entry.emojiSize = p.emojiSize;
+        }
         reactions.push(entry);
       }
       if (!entry.reactors.includes(p.reactor)) {
@@ -500,6 +528,13 @@ export class ChannelMessageService {
    * Set or clear the local member's reaction on a message. Fire-and-forget;
    * the result returns to the feed via the channel-reaction-received event
    * (the backend echoes local React events back through the same path).
+   *
+   * For a unicode reaction, pass the emoji string and omit `customEmoji` — the
+   * IPC payload is then byte-identical to the pre-custom-emoji behavior. For a
+   * custom (CAS-backed image) reaction (ZEB-541), pass `emoji: ''` and a
+   * `customEmoji` descriptor (the CID + advisory size of the already-ingested
+   * PNG); the key is forwarded as `customEmoji` so the backend authorizes +
+   * signs the CID.
    */
   async reactToMessage(
     communityId: string,
@@ -507,20 +542,72 @@ export class ChannelMessageService {
     messageId: string,
     emoji: string,
     add: boolean,
+    customEmoji?: { cid: string; mime: string; size: number },
   ): Promise<void> {
     if (!this.adapter) throw new Error('ChannelMessageService.reactToMessage: adapter not connected');
     try {
-      await this.adapter.invoke('set_message_reaction', {
-        communityId,
-        channelId,
-        messageId,
-        emoji,
-        add,
-      });
+      // Build the payload so `customEmoji` is ENTIRELY ABSENT for unicode
+      // reactions (spreading `undefined` would still serialize a key on some
+      // adapters; omitting it keeps the unicode path byte-identical).
+      const args: Record<string, unknown> = { communityId, channelId, messageId, emoji, add };
+      if (customEmoji) args.customEmoji = customEmoji;
+      await this.adapter.invoke('set_message_reaction', args);
     } catch (e: unknown) {
       // Tauri IPC rejections are raw strings in production (Error objects only
       // in tests). Normalize so callers reading `.message` keep the rejection
       // detail. Mirrors postMessage / MessageService.send.
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
+  }
+
+  /**
+   * Ingest already-normalized PNG bytes (from {@link normalizeEmoji}) into CAS
+   * as an encrypted channel artifact for use as a custom reaction emoji
+   * (ZEB-541). Returns the minted CID (hex) + plaintext size to pass to
+   * {@link reactToMessage} as the `customEmoji` descriptor. The backend enforces
+   * a 256 KiB cap; an over-cap input rejects.
+   */
+  async ingestEmojiBytes(
+    communityId: string,
+    bytes: Uint8Array,
+  ): Promise<{ cid: string; size: number }> {
+    if (!this.adapter) throw new Error('ChannelMessageService.ingestEmojiBytes: adapter not connected');
+    try {
+      const dto = await this.adapter.invoke('ingest_channel_artifact_bytes', {
+        communityId,
+        bytes: Array.from(bytes),
+        name: '',
+        mime: 'image/png',
+        encrypt: true,
+      }) as ChannelAttachmentDto;
+      return { cid: dto.cid, size: dto.size };
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
+  }
+
+  /**
+   * Fetch a custom reaction emoji's plaintext PNG bytes from CAS for inline
+   * render (ZEB-541). The backend authorizes the CID against the channel's
+   * signed React events and enforces a 256 KiB cap (no client-supplied max).
+   * Returns the decrypted bytes. Mirrors {@link previewArtifact}.
+   */
+  async previewReactionEmoji(
+    communityId: string,
+    channelId: string,
+    cid: string,
+  ): Promise<Uint8Array> {
+    if (!this.adapter) throw new Error('ChannelMessageService.previewReactionEmoji: adapter not connected');
+    try {
+      const bytes = await this.adapter.invoke('preview_reaction_emoji', {
+        communityId,
+        channelId,
+        cid,
+      }) as number[];
+      return new Uint8Array(bytes);
+    } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       throw new Error(msg);
     }

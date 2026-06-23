@@ -661,6 +661,107 @@ describe('ChannelMessageService reactions (ZEB-536 Spec 2)', () => {
     });
   });
 
+  it('reactToMessage omits customEmoji for a unicode reaction (byte-identical to before)', async () => {
+    // Regression guard: the unicode path must NOT carry a customEmoji key at all,
+    // so the backend's signed bytes are unchanged from pre-custom-emoji behavior.
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.reactToMessage(CID, CHID, 'm1', '👍', true);
+    const [, args] = (adapter.invoke as any).mock.calls[0];
+    expect(args).not.toHaveProperty('customEmoji');
+    expect(args.customEmoji).toBeUndefined();
+  });
+
+  it('reactToMessage forwards a customEmoji descriptor for a custom reaction', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    const custom = { cid: 'ab'.repeat(32), mime: 'image/png', size: 1234 };
+    await service.reactToMessage(CID, CHID, 'm1', '', true, custom);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+      communityId: CID,
+      channelId: CHID,
+      messageId: 'm1',
+      emoji: '',
+      add: true,
+      customEmoji: custom,
+    });
+  });
+
+  it('ingestEmojiBytes invokes ingest_channel_artifact_bytes with a number[] body + returns cid/size', async () => {
+    await service.connectAdapter(adapter);
+    const dto = { cid: 'cd'.repeat(32), mime: 'image/png', name: '', size: 256, encrypted: true };
+    (adapter.invoke as any).mockResolvedValue(dto);
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const out = await service.ingestEmojiBytes(CID, bytes);
+    expect(out).toEqual({ cid: dto.cid, size: dto.size });
+    expect(adapter.invoke).toHaveBeenCalledWith('ingest_channel_artifact_bytes', {
+      communityId: CID,
+      bytes: [0x89, 0x50, 0x4e, 0x47],
+      name: '',
+      mime: 'image/png',
+      encrypt: true,
+    });
+    // The bytes arg must be a plain Array (not a typed array) for IPC.
+    const [, args] = (adapter.invoke as any).mock.calls[0];
+    expect(Array.isArray(args.bytes)).toBe(true);
+  });
+
+  it('ingestEmojiBytes normalizes a raw-string rejection into an Error', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockRejectedValue('artifact too large: 300KiB (max 256KiB)');
+    await expect(
+      service.ingestEmojiBytes(CID, new Uint8Array([1, 2, 3])),
+    ).rejects.toThrow('artifact too large: 300KiB (max 256KiB)');
+  });
+
+  it('ingestEmojiBytes throws when the adapter is not connected', async () => {
+    await expect(
+      service.ingestEmojiBytes(CID, new Uint8Array([1])),
+    ).rejects.toThrow(/adapter not connected/);
+  });
+
+  it('previewReactionEmoji invokes preview_reaction_emoji and returns a Uint8Array', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue([1, 2, 3]);
+    const bytes = await service.previewReactionEmoji(CID, CHID, 'cc');
+    expect(adapter.invoke).toHaveBeenCalledWith('preview_reaction_emoji', {
+      communityId: CID,
+      channelId: CHID,
+      cid: 'cc',
+    });
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(Array.from(bytes)).toEqual([1, 2, 3]);
+  });
+
+  it('previewReactionEmoji normalizes a raw-string rejection into an Error', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockRejectedValue('reaction emoji not authorized for this channel');
+    await expect(
+      service.previewReactionEmoji(CID, CHID, 'cc'),
+    ).rejects.toThrow('reaction emoji not authorized for this channel');
+  });
+
+  it('previewReactionEmoji throws when the adapter is not connected', async () => {
+    await expect(
+      service.previewReactionEmoji(CID, CHID, 'cc'),
+    ).rejects.toThrow(/adapter not connected/);
+  });
+
+  it('a custom-emoji reaction-received event carries emojiCid/emojiSize into the chip entry', async () => {
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    const cid = 'ef'.repeat(32);
+    fireReaction({ reactor: OTHER, emoji: '', add: true, emojiCid: cid, emojiSize: 256 });
+    const msg = service.getMessages(CID, CHID)[0];
+    expect(msg.reactions?.[0]).toMatchObject({
+      emoji: '',
+      count: 1,
+      reactors: [OTHER],
+      emojiCid: cid,
+      emojiSize: 256,
+    });
+  });
+
   it('reactToMessage throws when the adapter is not connected', async () => {
     await expect(
       service.reactToMessage(CID, CHID, 'm1', '👍', true),

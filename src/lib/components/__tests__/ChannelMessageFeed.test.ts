@@ -14,6 +14,16 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
   save: saveMock,
 }));
 
+// ZEB-541: stub normalizeEmoji so the custom-emoji pick test doesn't need a real
+// canvas/decode — we only assert the normalize→ingest→react wiring.
+const { normalizeEmojiMock } = vi.hoisted(() => ({
+  normalizeEmojiMock: vi.fn().mockResolvedValue(new Uint8Array([0x89, 0x50, 0x4e, 0x47])),
+}));
+vi.mock('../../emoji-normalize', () => ({
+  EMOJI_EDGE: 128,
+  normalizeEmoji: normalizeEmojiMock,
+}));
+
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
   const listeners = new Map<string, Function>();
   return {
@@ -956,5 +966,169 @@ describe('ChannelMessageFeed reactions — toolbar + picker (ZEB-536)', () => {
     // Clicking a control in a different message's toolbar must close the picker.
     await fireEvent.click(otherToolbar.querySelector('.quick-react') as HTMLButtonElement);
     await waitFor(() => expect(ctx.container.querySelector('.reaction-picker')).toBeNull());
+  });
+});
+
+describe('ChannelMessageFeed reactions — custom (CAS) emoji (ZEB-541)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    normalizeEmojiMock.mockClear();
+    // ReactionEmojiImage decodes the previewed bytes — stub the browser APIs
+    // jsdom lacks so a custom chip can resolve its <img> blob URL.
+    vi.stubGlobal('createImageBitmap', vi.fn().mockResolvedValue({ width: 128, height: 128, close: vi.fn() }));
+    vi.stubGlobal('URL', {
+      ...URL,
+      createObjectURL: vi.fn(() => 'blob:emoji'),
+      revokeObjectURL: vi.fn(),
+    });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  // Seed a message carrying a CUSTOM reaction (emoji === '', emojiCid set).
+  async function seedCustomReaction(mine: boolean) {
+    const ctx = await setup();
+    (ctx.adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'preview_reaction_emoji')
+        // A full PNG header (signature + IHDR declaring 64x64). The render path
+        // now parses dims BEFORE decode and rejects unparseable headers, so an
+        // 8-byte signature alone is (correctly) refused — must carry the IHDR.
+        return Promise.resolve([
+          0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // signature
+          0x00, 0x00, 0x00, 0x0d, // IHDR length = 13
+          0x49, 0x48, 0x44, 0x52, // "IHDR"
+          0x00, 0x00, 0x00, 0x40, // width = 64
+          0x00, 0x00, 0x00, 0x40, // height = 64
+        ]);
+      if (cmd === 'set_message_reaction') return Promise.resolve(undefined);
+      if (cmd === 'ingest_channel_artifact_bytes') {
+        return Promise.resolve({ cid: 'newcid', mime: 'image/png', name: '', size: 321, encrypted: true });
+      }
+      return Promise.resolve(undefined);
+    });
+    const handler = ctx.adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'ee'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('hi')),
+          reactions: [
+            { emoji: '', count: 1, mine, reactors: ['ee'.repeat(20)], emojiCid: 'abc123', emojiSize: 321 },
+          ],
+        },
+      },
+    });
+    return ctx;
+  }
+
+  it('renders a ReactionEmojiImage <img> for a reaction with emojiCid', async () => {
+    const { container, adapter } = await seedCustomReaction(false);
+    await waitFor(() => {
+      const img = container.querySelector('.reaction-chip img.reaction-emoji-img');
+      expect(img).toBeTruthy();
+    });
+    expect(adapter.invoke).toHaveBeenCalledWith('preview_reaction_emoji', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      cid: 'abc123',
+    });
+  });
+
+  it('clicking a not-mine custom chip adds my reaction with the CID descriptor (add:true)', async () => {
+    const { container, adapter } = await seedCustomReaction(false);
+    let chip: Element | null = null;
+    await waitFor(() => {
+      chip = container.querySelector('.reaction-chip');
+      expect(chip).toBeTruthy();
+    });
+    await fireEvent.click(chip!);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+      communityId: 'aa'.repeat(16),
+      channelId: 'bb'.repeat(16),
+      messageId: 'm1',
+      emoji: '',
+      add: true,
+      customEmoji: { cid: 'abc123', mime: 'image/png', size: 321 },
+    });
+  });
+
+  it('clicking a mine custom chip toggles it off (add:false)', async () => {
+    const { container, adapter } = await seedCustomReaction(true);
+    let chip: Element | null = null;
+    await waitFor(() => {
+      chip = container.querySelector('.reaction-chip.mine');
+      expect(chip).toBeTruthy();
+    });
+    await fireEvent.click(chip!);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_message_reaction', expect.objectContaining({
+      messageId: 'm1',
+      emoji: '',
+      add: false,
+      customEmoji: { cid: 'abc123', mime: 'image/png', size: 321 },
+    }));
+  });
+
+  it('the picker custom button runs normalize → ingest → react', async () => {
+    const ctx = await setup();
+    (ctx.adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'ingest_channel_artifact_bytes') {
+        return Promise.resolve({ cid: 'newcid', mime: 'image/png', name: '', size: 321, encrypted: true });
+      }
+      return Promise.resolve(undefined);
+    });
+    const handler = ctx.adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'ee'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('hi')),
+        },
+      },
+    });
+    await waitFor(() => expect(ctx.container.querySelector('.channel-message')).toBeTruthy());
+
+    // Open the picker, click the custom (+) affordance — this sets the in-flight
+    // target and clicks the hidden file input.
+    await fireEvent.click(ctx.container.querySelector('.picker-toggle') as HTMLButtonElement);
+    await waitFor(() => expect(ctx.container.querySelector('.picker-custom')).toBeTruthy());
+    await fireEvent.click(ctx.container.querySelector('.picker-custom') as HTMLButtonElement);
+
+    // Simulate the user choosing a file: set files on the hidden input and fire change.
+    const input = ctx.container.querySelector('.custom-emoji-input') as HTMLInputElement;
+    const file = new File([new Uint8Array([1, 2, 3])], 'pepe.png', { type: 'image/png' });
+    Object.defineProperty(input, 'files', { value: [file], configurable: true });
+    await fireEvent.change(input);
+
+    await waitFor(() => {
+      expect(normalizeEmojiMock).toHaveBeenCalledWith(file);
+      expect(ctx.adapter.invoke).toHaveBeenCalledWith(
+        'ingest_channel_artifact_bytes',
+        expect.objectContaining({ communityId: 'aa'.repeat(16), mime: 'image/png' }),
+      );
+      expect(ctx.adapter.invoke).toHaveBeenCalledWith('set_message_reaction', {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        messageId: 'm1',
+        emoji: '',
+        add: true,
+        customEmoji: { cid: 'newcid', mime: 'image/png', size: 321 },
+      });
+    });
   });
 });

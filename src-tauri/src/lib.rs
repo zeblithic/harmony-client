@@ -20136,6 +20136,22 @@ async fn preview_channel_artifact(
         .await
 }
 
+/// ZEB-541 IPC seam for inline custom emoji rendering (no headless RPC verb).
+///
+/// Like [`preview_channel_artifact`] but the fetch cap is hard-coded
+/// server-side to [`MAX_CUSTOM_EMOJI_BYTES`] (256 KiB) — it deliberately takes
+/// no frontend `max_bytes`. Authorizes the emoji CID against the signed channel
+/// log (a `React` referencing it), then returns the decrypted plaintext bytes.
+#[tauri::command]
+async fn preview_reaction_emoji(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+    cid: String,
+) -> Result<Vec<u8>, String> {
+    preview_reaction_emoji_impl(state_lock.inner(), community_id, channel_id, cid).await
+}
+
 /// ZEB-539: Tauri IPC — ingest a local file as a channel artifact.
 /// Thin delegate to [`ingest_channel_artifact_impl`]; see that fn for the
 /// stat/cap, name/mime resolution, encrypt-in-memory, and serve-allowlist
@@ -20160,6 +20176,38 @@ async fn ingest_channel_artifact(
     .await
 }
 
+/// ZEB-541: Tauri IPC — ingest in-memory bytes as a channel artifact.
+///
+/// The bytes counterpart to [`ingest_channel_artifact`]; used by the
+/// custom-emoji upload path, which normalizes the picked image to a small PNG in
+/// the frontend and ships the bytes directly (no on-disk source). Thin delegate
+/// to [`ingest_channel_artifact_bytes_impl`]; see that fn for the
+/// `MAX_ARTIFACT_BYTES` cap and the encrypt/serve-allowlist contract.
+#[tauri::command]
+async fn ingest_channel_artifact_bytes(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    bytes: Vec<u8>,
+    name: String,
+    mime: String,
+    encrypt: bool,
+) -> Result<crate::community_channel_log_engine::ChannelAttachmentDto, String> {
+    ingest_channel_artifact_bytes_impl(state_lock.inner(), community_id, bytes, name, mime, encrypt)
+        .await
+}
+
+/// ZEB-541: optional custom-emoji descriptor a `set_message_reaction` caller
+/// supplies to bind a reaction to a CAS-backed image emoji. The `cid` is hex
+/// (32 bytes); `mime`/`size` mirror the verify-time caps. Serializes from JS
+/// as `{ cid, mime, size }` (camelCase fields are already lowercase here).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReactionEmojiInput {
+    pub cid: String,
+    pub mime: String,
+    pub size: u64,
+}
+
 #[tauri::command]
 async fn set_message_reaction(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
@@ -20168,6 +20216,7 @@ async fn set_message_reaction(
     message_id: String,
     emoji: String,
     add: bool,
+    custom_emoji: Option<ReactionEmojiInput>,
 ) -> Result<(), String> {
     set_message_reaction_impl(
         state_lock.inner(),
@@ -20176,6 +20225,7 @@ async fn set_message_reaction(
         message_id,
         emoji,
         add,
+        custom_emoji,
     )
     .await
 }
@@ -20337,6 +20387,7 @@ pub(crate) async fn set_message_reaction_impl(
     message_id: String,
     emoji: String,
     add: bool,
+    custom_emoji: Option<ReactionEmojiInput>,
 ) -> Result<(), String> {
     if community_id.len() != 32 {
         return Err("community_id must be 16 bytes (32 hex chars)".to_string());
@@ -20363,6 +20414,72 @@ pub(crate) async fn set_message_reaction_impl(
     let chid = crate::community_membership::ChannelId(chid_bytes);
     let target = crate::community_channel_log::MessageId(mid_bytes);
 
+    // ZEB-541 protocol invariant (CodeRabbit PR #320): a custom-emoji reaction
+    // is EITHER unicode OR a CAS descriptor, never both. Reject a custom react
+    // that also carries a unicode `emoji` at the mint boundary — `verify_channel_
+    // event` enforces the same on receipt (binds remote peers), but rejecting
+    // here gives a clear early error and keeps the local log clean.
+    if custom_emoji.is_some() && !emoji.is_empty() {
+        return Err("custom emoji reactions must not include a unicode emoji".to_string());
+    }
+
+    // ZEB-541: decode + validate the optional custom-emoji descriptor before
+    // signing. These caps mirror `verify_channel_event` (defense-in-depth — the
+    // descriptor is also re-verified on receipt, and the bytes are content-bound
+    // by the CID).
+    let emoji_attachment = match custom_emoji {
+        None => None,
+        Some(input) => {
+            // Bound the inputs BEFORE decoding/allocating (parity with
+            // `authorize_and_fetch_artifact`'s CID pre-check and the verify-time
+            // field-length cap): a 32-byte CID is exactly 64 hex chars, and the
+            // mime is bounded by MAX_ATTACHMENT_FIELD_BYTES, so an oversized IPC
+            // input can't trigger a large allocation or sign an over-long mime
+            // that peers would reject.
+            if input.cid.len() != 64 {
+                return Err("custom emoji cid must be 32 bytes (64 hex chars)".to_string());
+            }
+            if input.mime.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES {
+                return Err(format!(
+                    "custom emoji mime too long: {} > {}",
+                    input.mime.len(),
+                    crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+                ));
+            }
+            let emoji_cid: [u8; 32] = hex::decode(&input.cid)
+                .map_err(|e| format!("invalid custom emoji cid hex: {e}"))?
+                .try_into()
+                .map_err(|_| "custom emoji cid must be 32 bytes (64 hex chars)".to_string())?;
+            if !input.mime.starts_with("image/") {
+                return Err(format!("custom emoji must be an image, got {}", input.mime));
+            }
+            if input.size > MAX_CUSTOM_EMOJI_BYTES {
+                return Err(format!(
+                    "custom emoji exceeds cap: {} > {MAX_CUSTOM_EMOJI_BYTES}",
+                    input.size
+                ));
+            }
+            // A custom emoji is a channel-private (encrypted) CAS blob — the
+            // serve/preview gate keys off the CID's encrypted flag. Reject a
+            // public CID at the mint boundary so an emoji image can't be made
+            // world-fetchable (verify enforces the same on receipt). CodeRabbit
+            // PR #320. Checked last so a malformed mime/size surfaces its own
+            // (more specific) error first.
+            if !harmony_content::cid::ContentId::from_bytes(emoji_cid)
+                .flags()
+                .encrypted
+            {
+                return Err("custom emoji cid must reference an encrypted CAS blob".to_string());
+            }
+            Some(crate::community_channel_log::ChannelAttachment {
+                cid: emoji_cid,
+                mime: input.mime,
+                name: String::new(),
+                size: input.size,
+            })
+        }
+    };
+
     let registry = {
         let guard = state
             .lock()
@@ -20379,7 +20496,7 @@ pub(crate) async fn set_message_reaction_impl(
         .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
 
     engine
-        .react(target, emoji, add)
+        .react(target, emoji, add, emoji_attachment)
         .await
         .map_err(|e| e.to_string())
 }
@@ -20394,6 +20511,10 @@ pub(crate) const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 /// than this are download-only — the frontend hides the Preview affordance and
 /// this command also rejects defensively.
 pub(crate) const MAX_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Hard cap on a custom reaction emoji blob (plaintext). Tiny by design; a 128x128
+/// PNG is well under this. Enforced at verify (write) and at preview (serve).
+pub(crate) const MAX_CUSTOM_EMOJI_BYTES: u64 = 256 * 1024;
 
 /// ZEB-535: minimal extension -> MIME map for channel artifacts. Content
 /// sniffing is intentionally out of scope; an unknown extension falls back to
@@ -20510,8 +20631,7 @@ pub(crate) async fn ingest_channel_artifact_impl(
     mime: Option<String>,
     encrypt: bool,
 ) -> Result<crate::community_channel_log_engine::ChannelAttachmentDto, String> {
-    use harmony_content::chunker::ChunkerConfig;
-    use harmony_content::cid::{ContentFlags, ContentId};
+    use tokio::io::AsyncReadExt as _;
 
     if community_id.len() != 32 {
         return Err("community_id must be 16 bytes (32 hex chars)".to_string());
@@ -20532,14 +20652,112 @@ pub(crate) async fn ingest_channel_artifact_impl(
         .await
         .map_err(|e| format!("stat: {e}"))?;
     // Reject special files (FIFOs, /dev/zero, sockets, dirs). They report
-    // `len() == 0` and so sail past the stat cap, then the encrypted path's read
-    // would stream until OOM and the public path could ingest unbounded data
-    // before the post-stream cap check. Only a regular file has a trustworthy
-    // length and a bounded read.
+    // `len() == 0` and so sail past the stat cap, then the read would stream
+    // until OOM (the bounded read below catches that, but only a regular file
+    // has a trustworthy length and a bounded read).
     if !meta.is_file() {
         return Err("artifact source must be a regular file".to_string());
     }
-    let (name, mime) = prepare_artifact_meta(meta.len(), &source_path, name, mime)?;
+
+    let file = tokio::fs::File::open(&source_path)
+        .await
+        .map_err(|e| format!("open: {e}"))?;
+    // TOCTOU guard (CodeRabbit PR #320): the pre-open `is_file` check ran on the
+    // PATH; a swap to a FIFO/device/dir between that stat and `File::open` would
+    // make us read the wrong inode. Re-stat the OPENED handle and trust ITS type
+    // + length — the bounded `.take()` below already caps a growing file, but
+    // only a regular file has a trustworthy length to feed the cap check and
+    // size signing, so derive `prepare_artifact_meta`'s size from it.
+    let opened_meta = file
+        .metadata()
+        .await
+        .map_err(|e| format!("stat opened artifact: {e}"))?;
+    if !opened_meta.is_file() {
+        return Err("artifact source must be a regular file".to_string());
+    }
+    let (name, mime) = prepare_artifact_meta(opened_meta.len(), &source_path, name, mime)?;
+
+    // The DTO `size` is the actual ingested byte count (what the download side
+    // size-verifies against), NOT the pre-ingest stat — a file changing between
+    // the stat and the read/stream can't sign a mismatched `size`. The
+    // `.take(MAX_ARTIFACT_BYTES + 1)` + post-cap check bounds either path and
+    // closes the TOCTOU (a file growing after the stat can't exceed the cap).
+    if encrypt {
+        // Encryption needs the whole plaintext in memory anyway, so buffer
+        // (bounded) and delegate to the shared encrypt + chunk + serve core.
+        let mut limited =
+            tokio::io::BufReader::new(file).take(MAX_ARTIFACT_BYTES.saturating_add(1));
+        let mut plaintext = Vec::new();
+        limited
+            .read_to_end(&mut plaintext)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        if plaintext.len() as u64 > MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "artifact too large: {} > {MAX_ARTIFACT_BYTES}",
+                plaintext.len()
+            ));
+        }
+        ingest_channel_artifact_bytes_inner(state, space, plaintext, name, mime, true).await
+    } else {
+        // Public path: stream the file straight into the CAS chunk-by-chunk
+        // WITHOUT buffering the whole plaintext (restores the pre-refactor
+        // streaming behavior; a large public artifact must not allocate up to
+        // MAX_ARTIFACT_BYTES of RAM). `streaming_ingest_with_options` reports the
+        // streamed byte count, which becomes the authoritative `size` and is
+        // cap-checked post-stream.
+        use harmony_content::chunker::ChunkerConfig;
+        let ingest_tx = {
+            let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+            g.ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?
+        };
+        let reader = tokio::io::BufReader::new(file).take(MAX_ARTIFACT_BYTES.saturating_add(1));
+        let (root, n) = streaming_ingest_with_options(
+            reader,
+            &ingest_tx,
+            ChunkerConfig::DEFAULT,
+            None,
+            IngestOptions::default(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if n > MAX_ARTIFACT_BYTES {
+            return Err(format!("artifact too large: {n} > {MAX_ARTIFACT_BYTES}"));
+        }
+        Ok(crate::community_channel_log_engine::ChannelAttachmentDto {
+            cid: hex::encode(root.to_bytes()),
+            mime,
+            name,
+            size: n,
+            encrypted: root.flags().encrypted,
+        })
+    }
+}
+
+/// ZEB-541: shared encrypt-or-public ingest core, taking the artifact bytes
+/// already in memory. Factored out of [`ingest_channel_artifact_impl`] (which
+/// reads them from a file) so the bytes entry point
+/// [`ingest_channel_artifact_bytes_impl`] (used by the custom-emoji upload path)
+/// can reuse the exact same encrypt + chunk + serve-allowlist behavior without
+/// touching disk. Callers are responsible for the size cap on `plaintext`
+/// (file path: stat + bounded read; bytes path: `bytes.len()` check).
+///
+/// Encrypt path: encrypt `plaintext` with the community's live epoch key, ingest
+/// the ciphertext `serveable: true` with the `encrypted` flag. Public path:
+/// ingest `plaintext` directly with default flags. The DTO `size` is always the
+/// plaintext length (the value the download/preview side size-verifies against).
+async fn ingest_channel_artifact_bytes_inner(
+    state: &std::sync::Mutex<NodeState>,
+    space: crate::owner_state_types::SpaceId,
+    plaintext: Vec<u8>,
+    name: String,
+    mime: String,
+    encrypt: bool,
+) -> Result<crate::community_channel_log_engine::ChannelAttachmentDto, String> {
+    use harmony_content::chunker::ChunkerConfig;
+    use harmony_content::cid::{ContentFlags, ContentId};
 
     let ingest_tx = {
         let g = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -20548,35 +20766,10 @@ pub(crate) async fn ingest_channel_artifact_impl(
             .ok_or_else(|| "not connected".to_string())?
     };
 
-    // Authoritative artifact size = the bytes actually read + ingested (the
-    // plaintext length the download side size-verifies against), not the
-    // pre-ingest stat. Re-checked against the cap after the read.
-    let (root, size): (ContentId, u64) = if encrypt {
-        // Bounded read: cap the in-memory plaintext at MAX_ARTIFACT_BYTES + 1 so a
-        // file that grows after the stat (or a special file slipping past the
-        // is_file guard) can't read until OOM. The +1 sentinel makes the post-read
-        // cap check below catch the overflow case.
-        use tokio::io::AsyncReadExt as _;
-        let file = tokio::fs::File::open(&source_path)
-            .await
-            .map_err(|e| format!("open: {e}"))?;
-        let mut limited =
-            tokio::io::BufReader::new(file).take(MAX_ARTIFACT_BYTES.saturating_add(1));
-        let mut plaintext = Vec::new();
-        limited
-            .read_to_end(&mut plaintext)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
-        // Re-check the cap against the bytes we actually read (a file that grew
-        // after the stat could otherwise exceed it; the +1 sentinel above lands
-        // here too).
-        if plaintext.len() as u64 > MAX_ARTIFACT_BYTES {
-            return Err(format!(
-                "artifact too large: {} > {MAX_ARTIFACT_BYTES}",
-                plaintext.len()
-            ));
-        }
-        let size = plaintext.len() as u64;
+    // The DTO `size` is the plaintext length (what download/preview verify
+    // against), independent of whether we ingest ciphertext or plaintext.
+    let size = plaintext.len() as u64;
+    let root: ContentId = if encrypt {
         let epoch_key = current_epoch_key_for(state, &space).await?;
         let ciphertext = crate::community_state_sync::encrypt_blob(&epoch_key, &plaintext)
             .map_err(|e| format!("encrypt: {e:?}"))?;
@@ -20596,16 +20789,11 @@ pub(crate) async fn ingest_channel_artifact_impl(
         )
         .await
         .map_err(|e| e.to_string())?;
-        (root, size)
+        root
     } else {
-        // Public: stream plaintext from disk (no whole-file buffer), default flags.
-        // fast-follow: deterministic-CID reuse of an already-public copy is deferred;
-        // for v1 we re-ingest — dedup happens book-granular in CAS.
-        let file = tokio::fs::File::open(&source_path)
-            .await
-            .map_err(|e| format!("open: {e}"))?;
-        let (root, n) = streaming_ingest_with_options(
-            tokio::io::BufReader::new(file),
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(plaintext));
+        let (root, _n) = streaming_ingest_with_options(
+            reader,
             &ingest_tx,
             ChunkerConfig::DEFAULT,
             None,
@@ -20613,12 +20801,7 @@ pub(crate) async fn ingest_channel_artifact_impl(
         )
         .await
         .map_err(|e| e.to_string())?;
-        // `n` is the actually-streamed byte count. Re-check the cap against it
-        // (a file that grew after the stat could otherwise exceed it).
-        if n > MAX_ARTIFACT_BYTES {
-            return Err(format!("artifact too large: {n} > {MAX_ARTIFACT_BYTES}"));
-        }
-        (root, n)
+        root
     };
 
     Ok(crate::community_channel_log_engine::ChannelAttachmentDto {
@@ -20628,6 +20811,50 @@ pub(crate) async fn ingest_channel_artifact_impl(
         size,
         encrypted: root.flags().encrypted,
     })
+}
+
+/// ZEB-541: ingest in-memory bytes as an in-channel CAS artifact.
+///
+/// The bytes counterpart to [`ingest_channel_artifact_impl`] (which reads from a
+/// file path). Used by the custom-emoji upload path, which normalizes the picked
+/// image to a small PNG in the frontend and ships the bytes directly — there is
+/// no on-disk source file. Caps `bytes.len()` at [`MAX_ARTIFACT_BYTES`] (the
+/// generic 1 GiB artifact cap), then delegates to the shared
+/// [`ingest_channel_artifact_bytes_inner`]. The per-emoji 256 KiB cap
+/// ([`MAX_CUSTOM_EMOJI_BYTES`]) is enforced separately at react time and at
+/// serve time, NOT here — this entry point is a general bytes-ingest.
+pub(crate) async fn ingest_channel_artifact_bytes_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    bytes: Vec<u8>,
+    name: String,
+    mime: String,
+    encrypt: bool,
+) -> Result<crate::community_channel_log_engine::ChannelAttachmentDto, String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes16: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let space = crate::owner_state_types::SpaceId(cid_bytes16);
+
+    if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+        return Err(format!(
+            "artifact too large: {} > {MAX_ARTIFACT_BYTES}",
+            bytes.len()
+        ));
+    }
+    // Reject an over-long name/mime so the signed `attachments` field can never
+    // exceed the engine's bound (mirrors `prepare_artifact_meta`).
+    if name.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+        || mime.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+    {
+        return Err("attachment name/mime too long".to_string());
+    }
+
+    ingest_channel_artifact_bytes_inner(state, space, bytes, name, mime, encrypt).await
 }
 
 /// ZEB-535: monotonic counter making each artifact download's temp file name
@@ -20730,6 +20957,7 @@ pub(crate) async fn authorize_and_fetch_artifact(
     channel_id: &str,
     cid: &str,
     cap: u64,
+    scope: crate::community_channel_log_engine::AttachmentScope,
 ) -> Result<ArtifactFetch, String> {
     use harmony_content::cid::ContentId;
 
@@ -20778,7 +21006,7 @@ pub(crate) async fn authorize_and_fetch_artifact(
         .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
 
     let att = engine
-        .find_attachment(&cid_bytes)
+        .find_attachment(&cid_bytes, scope)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "unknown or unauthorized attachment".to_string())?;
@@ -20890,7 +21118,15 @@ pub(crate) async fn download_channel_artifact_impl(
         epoch_key_opt,
         expected_size,
         content_id,
-    } = authorize_and_fetch_artifact(state, &community_id, &channel_id, &cid, cap).await?;
+    } = authorize_and_fetch_artifact(
+        state,
+        &community_id,
+        &channel_id,
+        &cid,
+        cap,
+        crate::community_channel_log_engine::AttachmentScope::Any,
+    )
+    .await?;
 
     let written =
         finalize_artifact(bytes, encrypted, epoch_key_opt, expected_size, &dest_path).await?;
@@ -20945,7 +21181,53 @@ pub(crate) async fn preview_channel_artifact_impl(
         epoch_key_opt,
         expected_size,
         ..
-    } = authorize_and_fetch_artifact(state, &community_id, &channel_id, &cid, cap).await?;
+    } = authorize_and_fetch_artifact(
+        state,
+        &community_id,
+        &channel_id,
+        &cid,
+        cap,
+        crate::community_channel_log_engine::AttachmentScope::Any,
+    )
+    .await?;
+    decrypt_and_verify_artifact(bytes, encrypted, epoch_key_opt, expected_size)
+}
+
+/// ZEB-541 IPC seam for inline custom emoji rendering (no headless RPC verb).
+///
+/// Like [`preview_channel_artifact_impl`] but the fetch cap is hard-coded
+/// server-side to [`MAX_CUSTOM_EMOJI_BYTES`] (256 KiB) and NOT taken from a
+/// frontend-supplied bound — the tight, non-negotiable emoji cap is the point.
+/// Authorization is identical: [`authorize_and_fetch_artifact`] rejects a CID
+/// not referenced by any signed `React` (or `Post`) in the channel log before
+/// any byte is fetched, and yields the authoritative signed size. The signed
+/// size must be `<= MAX_CUSTOM_EMOJI_BYTES` (it always is for a valid custom
+/// emoji — verify enforces the same cap at write time), then the bytes are
+/// decrypted + length-verified and returned.
+pub(crate) async fn preview_reaction_emoji_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    channel_id: String,
+    cid: String,
+) -> Result<Vec<u8>, String> {
+    let ArtifactFetch {
+        bytes,
+        encrypted,
+        epoch_key_opt,
+        expected_size,
+        ..
+    } = authorize_and_fetch_artifact(
+        state,
+        &community_id,
+        &channel_id,
+        &cid,
+        MAX_CUSTOM_EMOJI_BYTES,
+        // Resolve the React emoji descriptor specifically — a Post attachment
+        // sharing this CID must not shadow the signed emoji's size (CodeRabbit
+        // PR #320).
+        crate::community_channel_log_engine::AttachmentScope::ReactionEmoji,
+    )
+    .await?;
     decrypt_and_verify_artifact(bytes, encrypted, epoch_key_opt, expected_size)
 }
 
@@ -22953,6 +23235,303 @@ mod create_community_inner_tests {
         );
     }
 
+    // ── ZEB-541: set_message_reaction_impl custom-emoji descriptor (Task 3) ──
+
+    /// The custom-emoji validation in `set_message_reaction_impl` runs before
+    /// the registry is read, so these error paths need no running node — a bare
+    /// `NodeState::default()` suffices. Valid 32-byte hex ids keep us past the
+    /// id-format gates so the custom-emoji checks are the ones that fire.
+    fn reaction_error_path_state() -> std::sync::Mutex<NodeState> {
+        std::sync::Mutex::new(NodeState::default())
+    }
+
+    const VALID_HEX_32: &str = "00112233445566778899aabbccddeeff";
+    const VALID_CID_64: &str = "0011223344556677001122334455667700112233445566770011223344556677";
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_invalid_custom_emoji_cid_hex() {
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: "z".repeat(64), // correct length (64 chars) but not valid hex
+                mime: "image/png".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("invalid cid hex must be rejected");
+        assert!(err.contains("invalid custom emoji cid hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_overlong_custom_emoji_cid() {
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: format!("{VALID_CID_64}00"), // valid hex but 33 bytes
+                mime: "image/png".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("overlong cid must be rejected");
+        assert!(err.contains("must be 32 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_overlong_custom_emoji_mime() {
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: VALID_CID_64.to_string(),
+                // starts with "image/" but exceeds MAX_ATTACHMENT_FIELD_BYTES
+                mime: format!(
+                    "image/{}",
+                    "x".repeat(crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES)
+                ),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("over-long mime must be rejected");
+        assert!(err.contains("mime too long"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_non_image_custom_emoji() {
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: VALID_CID_64.to_string(),
+                mime: "application/zip".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("non-image mime must be rejected");
+        assert!(err.contains("must be an image"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_oversize_custom_emoji() {
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: VALID_CID_64.to_string(),
+                mime: "image/png".to_string(),
+                size: MAX_CUSTOM_EMOJI_BYTES + 1,
+            }),
+        )
+        .await
+        .expect_err("oversize custom emoji must be rejected");
+        assert!(err.contains("exceeds cap"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_unencrypted_custom_emoji_cid() {
+        // CodeRabbit PR #320: a custom emoji must reference an encrypted CAS
+        // blob. `VALID_CID_64` (`00...`) decodes to a PUBLIC CID (encrypted flag
+        // clear); a valid image/size means it passes those checks and trips the
+        // encrypted gate specifically.
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: VALID_CID_64.to_string(),
+                mime: "image/png".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("public custom emoji cid must be rejected");
+        assert!(err.contains("encrypted CAS blob"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_custom_emoji_with_unicode() {
+        // CodeRabbit PR #320: a custom react must NOT also carry a unicode emoji
+        // (ambiguous reaction-index key). Rejected before any descriptor decode.
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            "\u{1F44D}".to_string(), // a unicode 👍 alongside a custom descriptor
+            true,
+            Some(ReactionEmojiInput {
+                cid: VALID_CID_64.to_string(),
+                mime: "image/png".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("custom emoji + unicode must be rejected");
+        assert!(
+            err.contains("must not include a unicode emoji"),
+            "got: {err}"
+        );
+    }
+
+    /// Happy path: a valid `customEmoji` appends a React carrying the emoji
+    /// attachment; the materialized DTO surfaces `emojiCid`. Stands up a real
+    /// community + channel-log engine (mirrors the artifact-authorize tests) so
+    /// the signed React flows through the engine and the reaction index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_message_reaction_happy_path_custom_emoji_surfaces_cid() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "emoji-react-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned"
+        );
+
+        let retic = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let device_hash = crate::owner_state_types::DeviceIdentityHash(retic.identity.address_hash);
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                fixture.device_id.clone(),
+                fixture.self_owner,
+                device_hash,
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x11; 32])),
+                std::sync::Arc::new(retic),
+                std::sync::Arc::clone(&fixture.signing_key),
+                fixture.enrollment_cert.clone(),
+            ),
+        ));
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(std::sync::Arc::clone(&dm_outbox)),
+            ..NodeState::default()
+        });
+
+        let channel_id_hex = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "logs".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("create_channel_impl must succeed");
+
+        let message_id_hex = post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            b"react to me".to_vec(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("post_channel_message_impl must succeed");
+
+        // React with a valid custom emoji descriptor.
+        let emoji_cid_hex = "b2".repeat(32);
+        set_message_reaction_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            message_id_hex.clone(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: emoji_cid_hex.clone(),
+                mime: "image/png".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect("custom-emoji react must succeed");
+
+        // Materialize: the message DTO's reactions must carry the custom emoji
+        // with emojiCid set and an empty unicode emoji string.
+        let dtos =
+            list_channel_messages_impl(&node_state, community_id_hex, channel_id_hex, None, 100)
+                .await
+                .expect("list_channel_messages_impl must succeed");
+        let msg = dtos
+            .iter()
+            .find(|d| d.message_id == message_id_hex)
+            .expect("the posted message must be present");
+        assert_eq!(msg.reactions.len(), 1, "exactly one reaction chip");
+        let r = &msg.reactions[0];
+        assert_eq!(r.count, 1);
+        assert!(r.mine, "the local owner reacted");
+        assert_eq!(r.emoji, "", "custom emoji uses an empty unicode field");
+        assert_eq!(
+            r.emoji_cid.as_deref(),
+            Some(emoji_cid_hex.as_str()),
+            "the materialized DTO must surface the custom emoji CID"
+        );
+        assert_eq!(r.emoji_size, Some(1024));
+    }
+
     /// ZEB-540: `preview_channel_artifact_impl` must REJECT an unauthorized CID
     /// exactly like the download path — the shared `authorize_and_fetch_artifact`
     /// gate (`find_attachment` returns `None`) fires before any fetch is issued.
@@ -23060,10 +23639,14 @@ mod create_community_inner_tests {
         )
         .await
         .expect_err("unauthorized cid must be rejected");
+        // The setup above (`create_channel_impl` + `post_channel_message_impl`
+        // both succeeded) proves the engine + registry exist, so the ONLY valid
+        // rejection here is the authorize-first miss. Accepting `no engine` /
+        // `channel_log_registry` would mask a regression where the preview path
+        // fails before ever reaching the attachment authorization (CodeRabbit PR
+        // #320).
         assert!(
-            err.contains("unknown or unauthorized attachment")
-                || err.contains("no engine")
-                || err.contains("channel_log_registry"),
+            err.contains("unknown or unauthorized attachment"),
             "got: {err}"
         );
     }
@@ -23178,6 +23761,309 @@ mod create_community_inner_tests {
         .await
         .expect_err("an attachment over the preview cap must be rejected before fetch");
         assert!(err.contains("exceeds cap"), "got: {err}");
+    }
+
+    // ── ZEB-541: preview_reaction_emoji_impl (Task 4) ───────────────────────
+
+    /// ZEB-541: a malformed (non-hex / wrong-length) CID is rejected at the
+    /// `authorize_and_fetch_artifact` boundary before any engine lookup, exactly
+    /// like the artifact-preview path. A bare `NodeState::default()` suffices
+    /// because the rejection precedes the registry access.
+    #[tokio::test]
+    async fn preview_reaction_emoji_rejects_invalid_cid_hex() {
+        let state = std::sync::Mutex::new(NodeState::default());
+        // Non-hex characters at the right length.
+        let err =
+            preview_reaction_emoji_impl(&state, "00".repeat(16), "00".repeat(16), "zz".repeat(32))
+                .await
+                .expect_err("non-hex cid must be rejected");
+        assert!(err.contains("invalid cid hex"), "got: {err}");
+    }
+
+    /// ZEB-541: an over-length CID hex string is rejected before any decode
+    /// allocation (IPC-boundary DoS guard shared with the artifact path).
+    #[tokio::test]
+    async fn preview_reaction_emoji_rejects_overlong_cid_hex() {
+        let state = std::sync::Mutex::new(NodeState::default());
+        let err = preview_reaction_emoji_impl(
+            &state,
+            "00".repeat(16),
+            "00".repeat(16),
+            "ab".repeat(4096),
+        )
+        .await
+        .expect_err("overlong cid must be rejected");
+        assert!(err.contains("invalid cid hex"), "got: {err}");
+    }
+
+    /// ZEB-541: a CID not referenced by ANY React (or Post) in the channel log
+    /// is rejected by the authorize-first gate (`find_attachment` returns
+    /// `None`) before any fetch. The channel has only a unicode React, whose
+    /// `emoji_attachment` is `None`, so the queried CID is unauthorized.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preview_reaction_emoji_rejects_unreferenced_cid() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "emoji-preview-auth-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned"
+        );
+
+        let retic = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let device_hash = crate::owner_state_types::DeviceIdentityHash(retic.identity.address_hash);
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                fixture.device_id.clone(),
+                fixture.self_owner,
+                device_hash,
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x11; 32])),
+                std::sync::Arc::new(retic),
+                std::sync::Arc::clone(&fixture.signing_key),
+                fixture.enrollment_cert.clone(),
+            ),
+        ));
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(std::sync::Arc::clone(&dm_outbox)),
+            ..NodeState::default()
+        });
+
+        let channel_id_hex = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "logs".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("create_channel_impl must succeed");
+
+        let message_id_hex = post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            b"react to me".to_vec(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("post_channel_message_impl must succeed");
+
+        // A unicode-only React — carries NO emoji_attachment, so no CID is
+        // authorized by it.
+        set_message_reaction_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            message_id_hex,
+            "👍".to_string(),
+            true,
+            None,
+        )
+        .await
+        .expect("unicode react must succeed");
+
+        // A public (unencrypted-flagged) CID that no event references.
+        let unattached_cid = format!("{}{}", "00".repeat(4), "ab".repeat(28));
+        assert_eq!(unattached_cid.len(), 64);
+        let err = preview_reaction_emoji_impl(
+            &node_state,
+            community_id_hex,
+            channel_id_hex,
+            unattached_cid,
+        )
+        .await
+        .expect_err("a cid no React references must be rejected");
+        assert!(
+            err.contains("unknown or unauthorized attachment"),
+            "got: {err}"
+        );
+    }
+
+    /// ZEB-541 happy path: ingest a small emoji blob (encrypted), react to a
+    /// message with the resulting `emoji_attachment`, then
+    /// `preview_reaction_emoji_impl` authorizes the emoji CID (via the React the
+    /// channel log holds) and returns the exact plaintext bytes. A small blob
+    /// (< the 256 KiB min chunk) ingests as a single book, so a fetch for the
+    /// root CID returns that book's bytes directly — no reassembly needed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preview_reaction_emoji_happy_path_returns_plaintext() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "emoji-preview-happy-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned"
+        );
+
+        // In-memory CAS: a single-book ingest stores (cid_hex -> ciphertext); the
+        // fetch handler returns the stored bytes for the requested root CID.
+        let cas: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (ingest_tx, mut ingest_rx) =
+            tokio::sync::mpsc::channel::<event_loop::IngestRequest>(16);
+        let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::channel::<event_loop::FetchRequest>(16);
+        let cas_i = std::sync::Arc::clone(&cas);
+        let ingest_drainer = tokio::spawn(async move {
+            while let Some(req) = ingest_rx.recv().await {
+                cas_i.lock().unwrap().insert(req.cid_hex, req.data);
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+        let cas_f = std::sync::Arc::clone(&cas);
+        let fetch_drainer = tokio::spawn(async move {
+            while let Some(req) = fetch_rx.recv().await {
+                let got = cas_f.lock().unwrap().get(&req.cid_hex).cloned();
+                let _ = req.reply.send(got.ok_or_else(|| "not found".to_string()));
+            }
+        });
+
+        let retic = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let device_hash = crate::owner_state_types::DeviceIdentityHash(retic.identity.address_hash);
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                fixture.device_id.clone(),
+                fixture.self_owner,
+                device_hash,
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x11; 32])),
+                std::sync::Arc::new(retic),
+                std::sync::Arc::clone(&fixture.signing_key),
+                fixture.enrollment_cert.clone(),
+            ),
+        ));
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(std::sync::Arc::clone(&dm_outbox)),
+            crdt_state: Some(std::sync::Arc::clone(&fixture.crdt_state)),
+            ingest_tx: Some(ingest_tx),
+            fetch_tx: Some(fetch_tx),
+            ..NodeState::default()
+        });
+
+        let channel_id_hex = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "logs".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("create_channel_impl must succeed");
+
+        let message_id_hex = post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            b"react to me".to_vec(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("post_channel_message_impl must succeed");
+
+        // Ingest a small emoji blob (encrypted) -> single book -> CAS map.
+        let emoji_plaintext: Vec<u8> = (0u8..200).collect();
+        let dto = ingest_channel_artifact_bytes_impl(
+            &node_state,
+            community_id_hex.clone(),
+            emoji_plaintext.clone(),
+            String::new(),
+            "image/png".to_string(),
+            true,
+        )
+        .await
+        .expect("emoji ingest must succeed");
+        assert!(dto.encrypted, "emoji blob is encrypted");
+        assert_eq!(dto.size, emoji_plaintext.len() as u64);
+
+        // React with the ingested emoji descriptor (binds the CID into a signed
+        // React in the channel log → serve-authorizable).
+        set_message_reaction_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            message_id_hex,
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: dto.cid.clone(),
+                mime: "image/png".to_string(),
+                size: dto.size,
+            }),
+        )
+        .await
+        .expect("custom-emoji react must succeed");
+
+        // Preview authorizes the emoji CID via the React and returns plaintext.
+        let bytes =
+            preview_reaction_emoji_impl(&node_state, community_id_hex, channel_id_hex, dto.cid)
+                .await
+                .expect("preview_reaction_emoji must return the emoji bytes");
+        assert_eq!(bytes, emoji_plaintext, "round-trip plaintext must match");
+
+        // Drop the senders so the drainers exit cleanly.
+        drop(node_state);
+        ingest_drainer.abort();
+        fetch_drainer.abort();
     }
 
     /// Failure path — fence abort after default-channel insert: the guard
@@ -47339,7 +48225,9 @@ pub fn run() {
             set_message_reaction,
             download_channel_artifact,
             preview_channel_artifact,
+            preview_reaction_emoji,
             ingest_channel_artifact,
+            ingest_channel_artifact_bytes,
             request_channel_backfill,
             list_libraries,
             list_discovered_libraries,
@@ -49792,6 +50680,28 @@ mod channel_message_ipc_tests {
         app
     }
 
+    /// ZEB-541: spawn an in-test ingest handler that records each `(cid_hex,
+    /// data)` pair and ACKs success, mirroring `path_ingest_tests`' recording
+    /// handler (which is private to that module). The returned log lets a
+    /// happy-path test assert which CIDs were ingested. The handler runs until
+    /// the returned sender is dropped.
+    #[allow(clippy::type_complexity)]
+    fn spawn_test_ingest_handler() -> (
+        tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+        std::sync::Arc<StdMutex<Vec<(String, Vec<u8>)>>>,
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<event_loop::IngestRequest>(16);
+        let log = std::sync::Arc::new(StdMutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let log_clone = std::sync::Arc::clone(&log);
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                log_clone.lock().unwrap().push((req.cid_hex, req.data));
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+        (tx, log)
+    }
+
     // ── ZEB-535: channel artifact ingest cap + meta resolution ──────────
     #[tokio::test]
     async fn ingest_channel_artifact_rejects_oversized() {
@@ -50396,6 +51306,103 @@ mod channel_message_ipc_tests {
         .await
         .expect_err("missing source file must error");
         assert!(err.contains("stat:"), "got: {err}");
+    }
+
+    // ── ZEB-541: ingest_channel_artifact_bytes (Task 5) ─────────────────────
+
+    /// ZEB-541: a short community_id is rejected at the first validation in the
+    /// bytes-ingest impl — before the cap check or any ingest dependency.
+    #[tokio::test]
+    async fn ingest_channel_artifact_bytes_rejects_short_community_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = ingest_channel_artifact_bytes(
+            state,
+            "deadbeef".into(),
+            vec![1, 2, 3],
+            String::new(),
+            "image/png".into(),
+            true,
+        )
+        .await
+        .expect_err("short community_id must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    /// ZEB-541: an over-long name is rejected at the field-length guard before
+    /// any ingest — proving the bytes path mirrors `prepare_artifact_meta`'s
+    /// field-length validation. The ingest handler is wired so a missing guard
+    /// would let the call succeed.
+    #[tokio::test]
+    async fn ingest_channel_artifact_bytes_rejects_overlong_name() {
+        let (tx, _rx) = spawn_test_ingest_handler();
+        let state = StdMutex::new(NodeState {
+            ingest_tx: Some(tx),
+            ..NodeState::default()
+        });
+        let overlong = "x".repeat(crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES + 1);
+        let err = ingest_channel_artifact_bytes_impl(
+            &state,
+            "00".repeat(16),
+            vec![1, 2, 3],
+            overlong,
+            "image/png".into(),
+            false,
+        )
+        .await
+        .expect_err("overlong name must error");
+        assert!(err.contains("name/mime too long"), "got: {err}");
+    }
+
+    /// ZEB-541: the bytes path caps at the generic 1 GiB artifact cap
+    /// (`MAX_ARTIFACT_BYTES`), NOT the 256 KiB emoji cap. The per-emoji cap is
+    /// enforced separately at react time and serve time. Allocating a real
+    /// 1 GiB-plus buffer is infeasible in a unit test, so this pins the const
+    /// that the bytes-ingest cap check compares the input length against.
+    #[test]
+    fn ingest_channel_artifact_bytes_cap_is_max_artifact_bytes() {
+        assert_eq!(MAX_ARTIFACT_BYTES, 1024 * 1024 * 1024);
+    }
+
+    /// ZEB-541 happy path: ingest small bytes (public, `encrypt=false`) returns
+    /// a DTO whose `size` is the plaintext length, `encrypted=false`, and `cid`
+    /// is a valid 64-char hex that hashes the ingested bytes (single book).
+    #[tokio::test]
+    async fn ingest_channel_artifact_bytes_public_returns_dto() {
+        use harmony_content::cid::ContentId;
+        let (tx, log) = spawn_test_ingest_handler();
+        let state = StdMutex::new(NodeState {
+            ingest_tx: Some(tx),
+            ..NodeState::default()
+        });
+        let bytes: Vec<u8> = (0u8..150).collect();
+        let dto = ingest_channel_artifact_bytes_impl(
+            &state,
+            "00".repeat(16),
+            bytes.clone(),
+            String::new(),
+            "image/png".into(),
+            false,
+        )
+        .await
+        .expect("public bytes ingest must succeed");
+
+        assert_eq!(dto.size, bytes.len() as u64, "size = plaintext length");
+        assert!(!dto.encrypted, "public ingest is not encrypted");
+        assert_eq!(dto.mime, "image/png");
+        assert_eq!(dto.name, "");
+        assert_eq!(dto.cid.len(), 64, "cid is 32-byte hex");
+        // The CID hashes the ingested (plaintext) bytes for the public path.
+        let raw = hex::decode(&dto.cid).expect("cid hex");
+        let cid = ContentId::from_bytes(<[u8; 32]>::try_from(raw).unwrap());
+        assert!(!cid.flags().encrypted, "public flag");
+        assert!(cid.verify_hash(&bytes), "cid must hash the public bytes");
+        // The recorded ingest book is the single root (small blob → one book).
+        let snapshot = log.lock().unwrap().clone();
+        assert_eq!(snapshot.len(), 1, "small blob ingests as a single book");
+        assert_eq!(snapshot[0].0, dto.cid);
+
+        drop(state);
     }
 
     #[tokio::test]

@@ -198,19 +198,59 @@ pub const POLL_BODY_MAGIC: u8 = 0x00;
 /// hex encoding of a 32-byte `PollId`). Total 65 bytes.
 pub const POLL_BODY_LEN: usize = 1 + 64;
 
-/// ZEB-539: if `event` is a `Post` carrying an attachment whose CID equals
-/// `cid`, return a clone of that `ChannelAttachment`. Used by
+/// Which signed-event kinds may supply the authorizing descriptor for a CID.
+///
+/// A CID binds the *bytes*, but a descriptor's `size`/`mime` are self-declared
+/// in the signed event (not derived from the bytes). When two events reference
+/// the same CID — e.g. an old `Post` attachment and a later `React`
+/// `emoji_attachment` — `find_attachment` returns the oldest match, so a `Post`
+/// can shadow a `React` emoji descriptor (and vice-versa). The emoji-preview
+/// path must therefore resolve the `React` descriptor *specifically*, so a
+/// `Post` with the same CID but a different/over-cap declared size can't cause a
+/// valid custom emoji to be mis-sized or rejected (CodeRabbit PR #320).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentScope {
+    /// Any attachment-bearing event authorizes (Post attachments + React emoji).
+    /// Used for generic artifact re-serve, where any signed reference suffices.
+    Any,
+    /// Only a `React`'s custom-emoji `emoji_attachment` authorizes. Used by the
+    /// emoji-preview path so a Post descriptor can't shadow the emoji's.
+    ReactionEmoji,
+}
+
+/// ZEB-539 / ZEB-541: if `event` references a `ChannelAttachment` whose CID
+/// equals `cid` (within `scope`), return a clone of that descriptor. Used by
 /// `find_attachment` to scan the log for a re-serve authorization record.
-fn attachment_with_cid(event: &SignedChannelEvent, cid: &[u8; 32]) -> Option<ChannelAttachment> {
-    // React events carry no attachments — only Post can authorize a re-serve.
-    let SignedChannelEvent::Post { attachments, .. } = event else {
-        return None;
-    };
-    attachments
-        .as_ref()?
-        .iter()
-        .find(|att| &att.cid == cid)
-        .cloned()
+///
+/// Two authorizing event shapes:
+/// - `Post` — any of its `attachments` (ZEB-539). Skipped under
+///   `AttachmentScope::ReactionEmoji`.
+/// - `React` — its optional custom-emoji `emoji_attachment` (ZEB-541). A signed
+///   React referencing an emoji CID makes that CID serve-authorizable to anyone
+///   who can read the channel, exactly like a Post attachment (same power gate).
+fn attachment_with_cid(
+    event: &SignedChannelEvent,
+    cid: &[u8; 32],
+    scope: AttachmentScope,
+) -> Option<ChannelAttachment> {
+    match event {
+        SignedChannelEvent::Post { attachments, .. } => {
+            if scope == AttachmentScope::ReactionEmoji {
+                return None;
+            }
+            attachments
+                .as_ref()?
+                .iter()
+                .find(|att| &att.cid == cid)
+                .cloned()
+        }
+        SignedChannelEvent::React {
+            emoji_attachment, ..
+        } => emoji_attachment
+            .as_ref()
+            .filter(|att| &att.cid == cid)
+            .cloned(),
+    }
 }
 
 /// Inspect a channel-message body for the ZEB-291 Phase 1.5 poll
@@ -270,6 +310,21 @@ pub struct ChannelReactionReceivedPayload {
     pub emoji: String,
     pub add: bool,
     pub at: HlcDto,
+    /// ZEB-541: hex CID of the custom emoji this React references, when the
+    /// reaction is a CAS-backed image emoji. `None` for unicode reactions.
+    /// Lets a peer render the custom chip immediately from the live event,
+    /// instead of staying blank until a `list_channel_messages`
+    /// re-materialization. Additive optional field — omitted on the wire for
+    /// unicode reactions, so it doesn't perturb the existing event shape.
+    /// (`default` is omitted: this payload is `Serialize`-only — it is only
+    /// emitted, never deserialized — so a deserialize default would be dead.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emoji_cid: Option<String>,
+    /// ZEB-541: advisory plaintext byte size of the custom emoji (from the
+    /// signed descriptor). `None` for unicode reactions. Pairs with
+    /// `emoji_cid`; the authoritative size is re-derived at serve time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emoji_size: Option<u64>,
 }
 
 // ── Config + params ─────────────────────────────────────────────────────────
@@ -708,6 +763,7 @@ impl ChannelLogEngine {
     pub async fn find_attachment(
         &self,
         cid: &[u8; 32],
+        scope: AttachmentScope,
     ) -> Result<Option<crate::community_channel_log::ChannelAttachment>, ChannelLogEngineError>
     {
         // Qodo (High): do NOT hold the async mutex across disk I/O, and do NOT
@@ -716,7 +772,7 @@ impl ChannelLogEngine {
         // lock, drop the lock, then read the segments off the executor via
         // `spawn_blocking`. Behavior is identical: scan persisted segments
         // (oldest first) then the tail, returning the first matching
-        // `ChannelAttachment`, else `None`.
+        // `ChannelAttachment` (within `scope`), else `None`.
         let (segments, tail, root): (Vec<SegmentDescriptor>, Vec<SignedChannelEvent>, _) = {
             let log = self.log.lock().await;
             (
@@ -733,7 +789,7 @@ impl ChannelLogEngine {
             for seg in &segments {
                 let events = read_segment_at(&root, seg)?;
                 for ev in &events {
-                    if let Some(att) = attachment_with_cid(ev, &cid) {
+                    if let Some(att) = attachment_with_cid(ev, &cid, scope) {
                         return Ok::<_, ChannelLogPersistError>(Some(att));
                     }
                 }
@@ -753,7 +809,7 @@ impl ChannelLogEngine {
 
         // Then the in-memory tail (already snapshotted; no I/O).
         for ev in &tail {
-            if let Some(att) = attachment_with_cid(ev, &cid) {
+            if let Some(att) = attachment_with_cid(ev, &cid, scope) {
                 return Ok(Some(att));
             }
         }
@@ -1021,6 +1077,7 @@ impl ChannelLogEngine {
         target: crate::community_channel_log::MessageId,
         emoji: String,
         add: bool,
+        emoji_attachment: Option<crate::community_channel_log::ChannelAttachment>,
     ) -> Result<(), ChannelLogEngineError> {
         if emoji.len() > crate::community_channel_log::MAX_REACTION_EMOJI_BYTES {
             return Err(ChannelLogEngineError::ReactionEmojiTooLarge {
@@ -1044,6 +1101,9 @@ impl ChannelLogEngine {
             channel_id: self.channel_id,
             author: self.self_owner,
             at: hlc,
+            // ZEB-541: custom-emoji CAS descriptor (None for unicode). Carried
+            // into the signed set so the reaction→emoji binding is tamper-proof.
+            emoji_attachment,
             emoji,
             add,
         };
@@ -1082,11 +1142,18 @@ impl ChannelLogEngine {
             author,
             at,
             emoji,
+            emoji_attachment,
             add,
             ..
         } = event
         else {
             return;
+        };
+        // ZEB-541: surface the custom-emoji CID/size on the live event so a peer
+        // can render the chip immediately. Both are `None` for unicode reactions.
+        let (emoji_cid, emoji_size) = match emoji_attachment {
+            Some(att) => (Some(hex::encode(att.cid)), Some(att.size)),
+            None => (None, None),
         };
         let payload = ChannelReactionReceivedPayload {
             community_id: hex::encode(self.community_id.0),
@@ -1100,6 +1167,8 @@ impl ChannelLogEngine {
                 logical: at.logical,
                 device_id: at.device_id.clone(),
             },
+            emoji_cid,
+            emoji_size,
         };
         crate::node_event_sink::emit_ser(&*self.sink, "channel-reaction-received", &payload);
     }
@@ -3227,7 +3296,7 @@ mod tests {
         // Present CID in the oldest persisted segment.
         let got = fix
             .engine
-            .find_attachment(&[0xb2; 32])
+            .find_attachment(&[0xb2; 32], AttachmentScope::Any)
             .await
             .expect("find ok")
             .expect("segment attachment present");
@@ -3236,7 +3305,7 @@ mod tests {
         // Present CID in the in-memory tail.
         let got = fix
             .engine
-            .find_attachment(&[0xc3; 32])
+            .find_attachment(&[0xc3; 32], AttachmentScope::Any)
             .await
             .expect("find ok")
             .expect("tail attachment present");
@@ -3245,10 +3314,117 @@ mod tests {
         // Absent CID → None.
         let none = fix
             .engine
-            .find_attachment(&[0xff; 32])
+            .find_attachment(&[0xff; 32], AttachmentScope::Any)
             .await
             .expect("find ok");
         assert!(none.is_none(), "absent cid must return None");
+    }
+
+    /// Build a signed React carrying a custom-emoji descriptor (fixture
+    /// identity, so the signature verifies). Mirrors `engine.react`'s payload.
+    fn make_signed_react_with_emoji(
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        author: OwnerAddr,
+        at: Hlc,
+        target: MessageId,
+        emoji_attachment: Option<ChannelAttachment>,
+        signing_key: &SigningKey,
+    ) -> SignedChannelEvent {
+        let payload = crate::community_channel_log::ChannelReactPayload {
+            target,
+            community_id,
+            channel_id,
+            author,
+            at,
+            emoji_attachment,
+            emoji: String::new(),
+            add: true,
+        };
+        crate::community_channel_log::sign_channel_react(&payload, signing_key).expect("sign react")
+    }
+
+    /// CodeRabbit PR #320: an OLDER `Post` attachment sharing the emoji CID must
+    /// NOT shadow the `React` emoji descriptor for the preview path. A CID binds
+    /// the bytes, but `size`/`mime` are self-declared per event — so the
+    /// emoji-preview path (`AttachmentScope::ReactionEmoji`) must resolve the
+    /// React descriptor specifically, while the generic scan
+    /// (`AttachmentScope::Any`) still returns the oldest match (the Post).
+    #[tokio::test]
+    async fn find_attachment_react_emoji_scope_skips_shadowing_post() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let shared_cid = [0x5a; 32];
+
+        // OLDER Post referencing the shared CID with a large, over-emoji-cap
+        // self-declared size and a non-image mime — the shadow that must lose.
+        let post_att = ChannelAttachment {
+            cid: shared_cid,
+            mime: "text/plain".to_string(),
+            name: "decoy.txt".to_string(),
+            size: crate::MAX_CUSTOM_EMOJI_BYTES + 50_000,
+        };
+        // NEWER React whose emoji_attachment references the SAME CID with the
+        // true (small, in-cap) descriptor.
+        let emoji_att = ChannelAttachment {
+            cid: shared_cid,
+            mime: "image/png".to_string(),
+            name: String::new(),
+            size: 1234,
+        };
+
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            let post = make_signed_event_with_attachments(
+                fix.community_id,
+                fix.channel_id,
+                fix.self_owner,
+                Hlc {
+                    wall_ms: 100,
+                    logical: 0,
+                    device_id: "test-device".to_string(),
+                },
+                "decoy post",
+                Some(vec![post_att.clone()]),
+                &fix.signing_key,
+            );
+            log.append(post).expect("append post");
+            let react = make_signed_react_with_emoji(
+                fix.community_id,
+                fix.channel_id,
+                fix.self_owner,
+                Hlc {
+                    wall_ms: 200,
+                    logical: 0,
+                    device_id: "test-device".to_string(),
+                },
+                MessageId([7u8; 16]),
+                Some(emoji_att.clone()),
+                &fix.signing_key,
+            );
+            log.append(react).expect("append react");
+        }
+
+        // Generic scan returns the oldest match — the Post (decoy).
+        let any = fix
+            .engine
+            .find_attachment(&shared_cid, AttachmentScope::Any)
+            .await
+            .expect("find ok")
+            .expect("some match under Any");
+        assert_eq!(any, post_att, "Any scope returns the oldest (Post) match");
+
+        // Emoji-preview scope skips the Post and resolves the React descriptor,
+        // so the valid emoji's true (in-cap) size is used — not the decoy's.
+        let emoji = fix
+            .engine
+            .find_attachment(&shared_cid, AttachmentScope::ReactionEmoji)
+            .await
+            .expect("find ok")
+            .expect("React emoji descriptor must be found, not shadowed by Post");
+        assert_eq!(
+            emoji, emoji_att,
+            "ReactionEmoji scope must return the React descriptor, not the Post"
+        );
     }
 
     // ── Sub-task 2B: publish ──────────────────────────────────────────
@@ -5402,7 +5578,7 @@ mod tests {
             .await
             .expect("post");
         Arc::clone(&fix.engine)
-            .react(msg_id, "👍".to_string(), true)
+            .react(msg_id, "👍".to_string(), true, None)
             .await
             .expect("react");
         let dtos = fix
@@ -5422,7 +5598,7 @@ mod tests {
 
         // un-react converges to empty
         Arc::clone(&fix.engine)
-            .react(msg_id, "👍".to_string(), false)
+            .react(msg_id, "👍".to_string(), false, None)
             .await
             .expect("unreact");
         let dtos2 = fix
@@ -5435,6 +5611,78 @@ mod tests {
             .find(|d| d.message_id == hex::encode(msg_id.0))
             .unwrap();
         assert!(m2.reactions.iter().all(|r| r.emoji != "👍"));
+    }
+
+    /// ZEB-541: the live `channel-reaction-received` event carries the custom
+    /// emoji CID + size so a peer can render the chip immediately (instead of
+    /// staying blank until a `list_channel_messages` re-materialization). A
+    /// custom-emoji React emits `emojiCid`/`emojiSize`; a unicode React emits
+    /// neither (the optional fields are skipped on serialize).
+    #[tokio::test]
+    async fn reaction_received_event_carries_custom_emoji_cid() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let msg_id = Arc::clone(&fix.engine)
+            .publish(b"hi".to_vec(), None, None, None)
+            .await
+            .expect("post");
+
+        // Custom-emoji React → the emitted event must surface emojiCid/emojiSize.
+        let emoji_cid = [0xB2u8; 32];
+        let att = crate::community_channel_log::ChannelAttachment {
+            cid: emoji_cid,
+            mime: "image/png".to_string(),
+            name: String::new(),
+            size: 1024,
+        };
+        Arc::clone(&fix.engine)
+            .react(msg_id, String::new(), true, Some(att))
+            .await
+            .expect("custom-emoji react");
+
+        let frames = fix.sink.frames();
+        let (_, custom) = frames
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "channel-reaction-received")
+            .expect("a channel-reaction-received frame must be emitted");
+        assert_eq!(
+            custom.get("emojiCid").and_then(|v| v.as_str()),
+            Some(hex::encode(emoji_cid).as_str()),
+            "custom React must carry the hex emoji CID"
+        );
+        assert_eq!(
+            custom.get("emojiSize").and_then(|v| v.as_u64()),
+            Some(1024),
+            "custom React must carry the emoji size"
+        );
+        assert_eq!(
+            custom.get("emoji").and_then(|v| v.as_str()),
+            Some(""),
+            "custom React uses an empty unicode emoji field"
+        );
+
+        // Unicode React → neither field is present (skip_serializing_if).
+        Arc::clone(&fix.engine)
+            .react(msg_id, "👍".to_string(), true, None)
+            .await
+            .expect("unicode react");
+        let frames = fix.sink.frames();
+        let (_, unicode) = frames
+            .iter()
+            .rev()
+            .find(|(name, v)| {
+                name == "channel-reaction-received"
+                    && v.get("emoji").and_then(|e| e.as_str()) == Some("👍")
+            })
+            .expect("the unicode reaction frame must be emitted");
+        assert!(
+            unicode.get("emojiCid").is_none(),
+            "unicode React must omit emojiCid"
+        );
+        assert!(
+            unicode.get("emojiSize").is_none(),
+            "unicode React must omit emojiSize"
+        );
     }
 
     /// ZEB-536 regression (Qodo/CodeAnt on PR #314): `list_message_dtos` must
@@ -5451,7 +5699,7 @@ mod tests {
         // More reactions than the page limit, all landing between P and Q.
         for i in 0..5u8 {
             Arc::clone(&fix.engine)
-                .react(p, format!("e{i}"), true)
+                .react(p, format!("e{i}"), true, None)
                 .await
                 .expect("react");
         }
@@ -5496,7 +5744,7 @@ mod tests {
             .expect("post P");
         for i in 0..5u8 {
             Arc::clone(&fix.engine)
-                .react(p, format!("e{i}"), true)
+                .react(p, format!("e{i}"), true, None)
                 .await
                 .expect("react");
         }
@@ -5612,7 +5860,7 @@ mod tests {
 
         // A: react to the message.
         Arc::clone(&fix_a.engine)
-            .react(msg_id, "👍".to_string(), true)
+            .react(msg_id, "👍".to_string(), true, None)
             .await
             .expect("A react");
 
@@ -5694,7 +5942,7 @@ mod tests {
 
         // Un-react: A sends add=false; both nodes converge to no 👍.
         Arc::clone(&fix_a.engine)
-            .react(msg_id, "👍".to_string(), false)
+            .react(msg_id, "👍".to_string(), false, None)
             .await
             .expect("A unreact");
         let unreact_packet = fix_a
@@ -5755,5 +6003,255 @@ mod tests {
             m_b2.reactions.iter().all(|r| r.emoji != "👍"),
             "B must see no 👍 after receiving unreact"
         );
+    }
+
+    /// ZEB-541 two-engine custom-emoji react: engine A ingests a small emoji
+    /// blob through the production CAS ingest pipeline (encrypted, serveable),
+    /// reacts to a message carrying that blob's `emoji_attachment`, and
+    /// broadcasts the React packet. Engine B (a second, independent engine on
+    /// the same community/channel/key/identity, separate dirs+sinks) receives
+    /// the React via `process_inbound_packet` and then proves the full
+    /// cross-engine custom-emoji path:
+    ///
+    /// 1. **Cross-engine authorize.** B's OWN signed channel log now holds A's
+    ///    React, so `B.find_attachment(emoji_cid)` returns A's signed
+    ///    `emoji_attachment` descriptor (the ZEB-541 React-scan extension —
+    ///    this is "B serving A's emoji CID": authorization is decided from the
+    ///    React B received, not from anything A told B out-of-band).
+    /// 2. **Cross-engine materialization.** B's `list_message_dtos` surfaces a
+    ///    `ReactionDto` with `emoji_cid = Some(hex)`, `emoji_size = Some`,
+    ///    `count == 1`, and an empty unicode `emoji` field.
+    /// 3. **Cross-engine fetch + decrypt.** Using the AUTHORITATIVE size from
+    ///    B's authorized descriptor, B fetches the ciphertext from the shared
+    ///    CAS by the authorized CID (the same `cid_hex` A ingested under), then
+    ///    decrypts with the shared community epoch key and size-verifies —
+    ///    mirroring the `authorize_and_fetch_artifact` → `decrypt_and_verify_artifact`
+    ///    contract `preview_reaction_emoji_impl` runs. The recovered plaintext
+    ///    must byte-equal what A ingested.
+    ///
+    /// Harness: mirrors `two_node_react_converges` (two independent engines,
+    /// packets forwarded A→B via `subscriber_tx`/`process_inbound_packet`)
+    /// extended with the `cas_serve_two_node_integration` ingest-drain shape
+    /// (a shared `cid_hex -> ciphertext` map fed by the production
+    /// `streaming_ingest_with_options` pipeline). Both engines derive the same
+    /// channel key from `build_engine_fixture`'s membership key
+    /// (`EpochKey::new([0x55; 32])`), modeling B holding the community epoch
+    /// key it would use to decrypt A's served emoji book.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_engine_custom_emoji_react_cross_engine_authorize_and_fetch() {
+        use crate::community_state_sync::decrypt_blob;
+
+        // The community epoch key both engines' channel keys are derived from
+        // (see `build_engine_fixture`). The emoji blob is encrypted under this
+        // same key, so B — which holds it — can decrypt A's served book.
+        let epoch_key = EpochKey::new([0x55; 32]);
+
+        // ── Engine A ──────────────────────────────────────────────────────
+        let mut fix_a = build_engine_fixture(8, 250, 1000).await;
+
+        // ── Engine B: same community/channel/key/identity, separate dirs ───
+        let tmp_b = tempfile::TempDir::new().expect("tempdir b");
+        let state_b = Arc::new(AlwaysJoinedState {
+            channel_id: fix_a.channel_id,
+            owner: fix_a.self_owner,
+            enrolled_key: fix_a.signing_key.verifying_key().to_bytes(),
+        });
+        let hlc_tracker_b: Arc<Mutex<BTreeMap<String, Hlc>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let (publisher_tx_b, _publisher_rx_b) = mpsc::channel(64);
+        let (subscriber_tx_b, subscriber_rx_b) = mpsc::channel(64);
+        let (query_tx_b, _query_rx_b) = mpsc::channel(8);
+        let (_rec_b, sink_b) = recording_sink_pair();
+        let params_b = ChannelLogEngineParams {
+            community_id: fix_a.community_id,
+            channel_id: fix_a.channel_id,
+            channel_key: Arc::clone(&fix_a.channel_key),
+            root_dir: tmp_b.path().to_path_buf(),
+            state_at_hlc: state_b,
+            self_owner: fix_a.self_owner,
+            self_device_id: "device-b".to_string(),
+            signing_key: Arc::clone(&fix_a.signing_key),
+            hlc_tracker: hlc_tracker_b,
+            sink: sink_b,
+            config: ChannelLogEngineConfig {
+                log_config: ChannelLogConfig {
+                    seal_threshold_events: 8,
+                },
+                flush_debounce_ms: 250,
+                max_dirty_ms: 1000,
+                ..Default::default()
+            },
+            publisher_tx: publisher_tx_b,
+            subscriber_rx: subscriber_rx_b,
+            query_request_tx: query_tx_b,
+        };
+        let engine_b = ChannelLogEngine::new(params_b).await.expect("engine b");
+
+        // ── Shared in-memory CAS: cid_hex -> stored bytes ─────────────────
+        // Mirrors `cas_serve_two_node_integration`'s ingest drain: the
+        // production `streaming_ingest_with_options` pipeline emits one
+        // `IngestRequest` per CID; the drain stores each under its cid_hex.
+        // The SAME map backs B's later fetch — the cross-engine CAS A serves.
+        let cas: Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (ingest_tx, mut ingest_rx) = mpsc::channel::<crate::event_loop::IngestRequest>(64);
+        let cas_i = Arc::clone(&cas);
+        let ingest_drainer = tokio::spawn(async move {
+            while let Some(req) = ingest_rx.recv().await {
+                cas_i.lock().unwrap().insert(req.cid_hex, req.data);
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+
+        // ── A: ingest a small emoji blob (encrypted, serveable) ───────────
+        // A tiny payload chunks to a single Book, so the root CID's bytes are
+        // the whole ciphertext (no reassembly needed for the fetch below).
+        let emoji_plaintext: Vec<u8> = (0u8..200).collect();
+        let ciphertext = crate::community_state_sync::encrypt_blob(&epoch_key, &emoji_plaintext)
+            .expect("encrypt emoji blob");
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(ciphertext.clone()));
+        let (root_cid, _n) = crate::streaming_ingest_with_options(
+            reader,
+            &ingest_tx,
+            harmony_content::chunker::ChunkerConfig::DEFAULT,
+            None,
+            crate::IngestOptions {
+                flags: harmony_content::cid::ContentFlags {
+                    encrypted: true,
+                    ..Default::default()
+                },
+                serveable: true,
+            },
+        )
+        .await
+        .expect("ingest emoji blob");
+        assert!(
+            root_cid.flags().encrypted,
+            "emoji root CID must carry the encrypted flag"
+        );
+        let emoji_cid_bytes: [u8; 32] = root_cid.to_bytes();
+        let emoji_cid_hex = hex::encode(emoji_cid_bytes);
+        let emoji_size = emoji_plaintext.len() as u64;
+
+        // ── A: post a message; forward the Post packet to B ───────────────
+        let msg_id = Arc::clone(&fix_a.engine)
+            .publish(b"react to me from A".to_vec(), None, None, None)
+            .await
+            .expect("A publish");
+        let post_packet = fix_a.publisher_rx.try_recv().expect("post packet from A");
+        subscriber_tx_b
+            .send(post_packet)
+            .await
+            .expect("feed Post to B");
+        wait_for(
+            || async {
+                let v = engine_b.list_messages(None, 100).await.unwrap();
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(())
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("B must see the Post");
+
+        // ── A: react with the ingested emoji descriptor (binds the CID into
+        //     a signed React → serve-authorizable). Forward the React to B ──
+        let emoji_att = ChannelAttachment {
+            cid: emoji_cid_bytes,
+            mime: "image/png".to_string(),
+            name: String::new(),
+            size: emoji_size,
+        };
+        Arc::clone(&fix_a.engine)
+            .react(msg_id, String::new(), true, Some(emoji_att.clone()))
+            .await
+            .expect("A custom-emoji react");
+        let react_packet = fix_a.publisher_rx.try_recv().expect("react packet from A");
+        subscriber_tx_b
+            .send(react_packet)
+            .await
+            .expect("feed React to B");
+
+        // ── Cross-engine authorize: B's find_attachment must yield A's
+        //     signed emoji descriptor (decided from the React B received) ──
+        let authorized = wait_for(
+            || async {
+                engine_b
+                    .find_attachment(&emoji_cid_bytes, AttachmentScope::ReactionEmoji)
+                    .await
+                    .ok()
+                    .flatten()
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("B must authorize A's emoji CID via the React it received");
+        assert_eq!(
+            authorized, emoji_att,
+            "B's authorized descriptor must match A's signed emoji_attachment"
+        );
+
+        // ── Cross-engine materialization: B's ReactionDto carries the CID ──
+        let dtos_b = engine_b
+            .list_message_dtos(None, 100)
+            .await
+            .expect("B list dtos");
+        let m_b = dtos_b
+            .iter()
+            .find(|d| d.message_id == hex::encode(msg_id.0))
+            .expect("B must hold the posted message");
+        assert_eq!(
+            m_b.reactions.len(),
+            1,
+            "exactly one custom-emoji reaction chip on B"
+        );
+        let r = &m_b.reactions[0];
+        assert_eq!(r.count, 1, "B must see count=1 for the custom emoji");
+        assert_eq!(
+            r.emoji, "",
+            "a custom emoji uses an empty unicode emoji field"
+        );
+        assert_eq!(
+            r.emoji_cid.as_deref(),
+            Some(emoji_cid_hex.as_str()),
+            "B's materialized DTO must surface A's custom emoji CID"
+        );
+        assert_eq!(
+            r.emoji_size,
+            Some(emoji_size),
+            "B's materialized DTO must surface the emoji size"
+        );
+
+        // ── Cross-engine fetch + decrypt (the serve path B would run) ─────
+        // Authoritative size comes from B's authorized descriptor, NOT a
+        // client value. B fetches the ciphertext from the shared CAS by the
+        // authorized CID, decrypts with the shared epoch key, and size-checks
+        // — exactly the decrypt_and_verify_artifact contract. The recovered
+        // plaintext must byte-equal what A ingested.
+        let authoritative_size = authorized.size;
+        let stored_ciphertext = cas
+            .lock()
+            .unwrap()
+            .get(&emoji_cid_hex)
+            .cloned()
+            .expect("the authorized emoji CID must be fetchable from A's CAS");
+        let recovered =
+            decrypt_blob(&epoch_key, &stored_ciphertext).expect("B decrypts emoji blob");
+        assert_eq!(
+            recovered.len() as u64,
+            authoritative_size,
+            "decrypted length must match the signed authoritative size"
+        );
+        assert_eq!(
+            recovered, emoji_plaintext,
+            "B must recover the exact emoji bytes A ingested (cross-engine round-trip)"
+        );
+
+        // Drop A's ingest sender so the drain task exits cleanly.
+        drop(ingest_tx);
+        ingest_drainer.abort();
     }
 }
