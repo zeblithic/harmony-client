@@ -4,6 +4,7 @@
   import { onMount } from 'svelte';
   import { OwnerService } from '../owner-service';
   import { MIN_RECOVERY_PASSPHRASE_LEN } from '../recovery-policy';
+  import { backupExportRequest } from '../backup-export-request.svelte';
 
   const svc = new OwnerService();
 
@@ -122,25 +123,25 @@
   // Transient UI state for pickType step (not yet committed to wizardState)
   let selectedBackupType = $state<'mnemonic' | 'file' | null>(null);
 
-  // ZEB-213: BackupStalenessWarning (mounted from App.svelte) dispatches
-  // 'harmony:backup-export-requested' on window when the user clicks the
-  // staleness banner's CTA. We jump straight into the backup wizard so the
-  // user doesn't have to scroll back to the identity panel to start.
-  // Only takes effect while the wizard is idle — interrupting a partial
-  // backup or restore mid-flow would be hostile UX.
-  function handleBackupExportRequested(): void {
+  // ZEB-213 / ZEB-545: BackupStalenessWarning (mounted at the App root) sets
+  // `backupExportRequest.pending` when the user clicks the staleness banner's
+  // CTA. We jump straight into the backup wizard so the user doesn't have to
+  // scroll back here to start. A reactive request (rather than a fire-and-forget
+  // window event) is robust to this panel being unmounted at request time —
+  // since ZEB-545 tab-gated Settings, IdentityPanel may mount only after the
+  // request (Account tab opened, or a collapsed window widened); the effect
+  // below picks up a pending request on mount as well as live. Consume (clear)
+  // it so it fires exactly once, and only while the wizard is idle —
+  // interrupting a partial backup or restore mid-flow would be hostile UX.
+  $effect(() => {
+    if (!backupExportRequest.pending) return;
+    backupExportRequest.pending = false;
     if (wizardState.kind === 'idle') {
       wizardState = { kind: 'backup', step: { phase: 'pickType' } };
     }
-  }
+  });
 
-  // ZEB-213 M2 (CodeAnt): Svelte's onMount with an async function returns
-  // a Promise — the runtime treats that as a no-op for teardown, so any
-  // `return () => {...}` cleanup inside an async onMount NEVER fires. The
-  // fix is to register the listener synchronously and run async work
-  // inside, returning a SYNCHRONOUS cleanup that Svelte will actually invoke.
   onMount(() => {
-    window.addEventListener('harmony:backup-export-requested', handleBackupExportRequested);
     // Fire-and-forget the async identity-hash fetch. The component lives
     // for the panel's lifetime, so a late-arriving response that finds
     // the component unmounted is harmless (we'd just write into a state
@@ -152,9 +153,6 @@
         loadError = `Could not read identity store: ${e}. The wizard cannot continue.`;
       }
     })();
-    return () => {
-      window.removeEventListener('harmony:backup-export-requested', handleBackupExportRequested);
-    };
   });
 
   async function copyText(s: string): Promise<void> {

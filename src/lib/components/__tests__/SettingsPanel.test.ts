@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/svelte';
+import { render, screen, fireEvent, within } from '@testing-library/svelte';
 
 // The container's only job is tab routing. Mock the six inner panels to a no-op
 // stub (they each fire Tauri IPC / construct services on mount) so this test
@@ -41,9 +41,24 @@ describe('SettingsPanel tab routing', () => {
     );
   });
 
-  it('shows only the Profile section content by default (single panel mounted)', () => {
+  it('shows only the Profile section in the visible panel by default', () => {
     render(SettingsPanel, { props: baseProps });
-    expect(screen.getAllByTestId('panel-stub')).toHaveLength(1);
+    // All sections stay mounted (inactive ones are `hidden`), so scope to the
+    // single visible tabpanel — getByRole excludes `hidden` elements.
+    expect(within(screen.getByRole('tabpanel')).getAllByTestId('panel-stub')).toHaveLength(1);
+  });
+
+  it('keeps inactive sections mounted across tab switches (no state-resetting unmount)', async () => {
+    const { container } = render(SettingsPanel, { props: baseProps });
+    await fireEvent.click(screen.getByRole('tab', { name: 'Notifications' }));
+    // The Profile section must remain in the DOM (just hidden), not be unmounted
+    // — unmounting would reset ProfileEditor drafts / wizard progress on return.
+    const profilePanel = container.querySelector('#settings-tabpanel-profile');
+    expect(profilePanel).not.toBeNull();
+    expect(profilePanel?.hasAttribute('hidden')).toBe(true);
+    // And the now-active panel is visible (not hidden).
+    const notifPanel = container.querySelector('#settings-tabpanel-notifications');
+    expect(notifPanel?.hasAttribute('hidden')).toBe(false);
   });
 
   for (const label of TAB_LABELS) {
@@ -63,10 +78,10 @@ describe('SettingsPanel tab routing', () => {
     });
   }
 
-  it('groups Identity + Devices under the Account tab (two panels mounted)', async () => {
+  it('groups Identity + Devices under the Account tab (two panels in the visible section)', async () => {
     render(SettingsPanel, { props: baseProps });
     await fireEvent.click(screen.getByRole('tab', { name: 'Account' }));
-    expect(screen.getAllByTestId('panel-stub')).toHaveLength(2);
+    expect(within(screen.getByRole('tabpanel')).getAllByTestId('panel-stub')).toHaveLength(2);
   });
 
   it('opens on a caller-supplied active tab (the backup-export → Account route)', () => {
@@ -79,6 +94,6 @@ describe('SettingsPanel tab routing', () => {
       'false',
     );
     expect(screen.getByRole('tabpanel').getAttribute('aria-labelledby')).toBe('settings-tab-account');
-    expect(screen.getAllByTestId('panel-stub')).toHaveLength(2);
+    expect(within(screen.getByRole('tabpanel')).getAllByTestId('panel-stub')).toHaveLength(2);
   });
 });

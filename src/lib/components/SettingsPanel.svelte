@@ -79,6 +79,7 @@
         role="tab"
         id="settings-tab-{tab.id}"
         aria-selected={activeTab === tab.id}
+        aria-controls="settings-tabpanel-{tab.id}"
         onclick={() => {
           activeTab = tab.id;
         }}
@@ -88,31 +89,66 @@
     {/each}
   </div>
 
+  <!--
+    Every section stays mounted; inactive panels are `hidden` rather than removed
+    (note: NOT an `{#if activeTab}` swap). Unmounting on tab switch would reset
+    each panel's component-local `$state` — wiping ProfileEditor drafts, the
+    IdentityPanel backup wizard mid-flow, or FriendsPanel add-friend/nickname
+    edits. This also restores the pre-tabs mount behavior (all sections mounted
+    while Settings is open) and keeps `aria-controls` targets present.
+  -->
   <div
     class="tab-content"
     role="tabpanel"
-    id="settings-tabpanel-{activeTab}"
-    aria-labelledby="settings-tab-{activeTab}"
+    id="settings-tabpanel-profile"
+    aria-labelledby="settings-tab-profile"
+    hidden={activeTab !== 'profile'}
   >
-    {#if activeTab === 'profile'}
-      <ProfileEditor {profile} onSave={onProfileSave} />
-    {:else if activeTab === 'account'}
-      <IdentityPanel />
-      <DevicesPanel />
-    {:else if activeTab === 'notifications'}
-      <NotificationSettingsPanel
-        service={notificationService}
-        {trustService}
-        {peers}
-        {communities}
-        {onClose}
-        {onTrustChange}
-      />
-    {:else if activeTab === 'network'}
-      <NetworkDiscoverabilitySettings />
-    {:else if activeTab === 'friends'}
-      <FriendsPanel service={friendService} cardService={friendCardService} {onOpenCard} />
-    {/if}
+    <ProfileEditor {profile} onSave={onProfileSave} />
+  </div>
+  <div
+    class="tab-content"
+    role="tabpanel"
+    id="settings-tabpanel-account"
+    aria-labelledby="settings-tab-account"
+    hidden={activeTab !== 'account'}
+  >
+    <IdentityPanel />
+    <DevicesPanel />
+  </div>
+  <div
+    class="tab-content"
+    role="tabpanel"
+    id="settings-tabpanel-notifications"
+    aria-labelledby="settings-tab-notifications"
+    hidden={activeTab !== 'notifications'}
+  >
+    <NotificationSettingsPanel
+      service={notificationService}
+      {trustService}
+      {peers}
+      {communities}
+      {onClose}
+      {onTrustChange}
+    />
+  </div>
+  <div
+    class="tab-content"
+    role="tabpanel"
+    id="settings-tabpanel-network"
+    aria-labelledby="settings-tab-network"
+    hidden={activeTab !== 'network'}
+  >
+    <NetworkDiscoverabilitySettings />
+  </div>
+  <div
+    class="tab-content"
+    role="tabpanel"
+    id="settings-tabpanel-friends"
+    aria-labelledby="settings-tab-friends"
+    hidden={activeTab !== 'friends'}
+  >
+    <FriendsPanel service={friendService} cardService={friendCardService} {onOpenCard} />
   </div>
 </div>
 

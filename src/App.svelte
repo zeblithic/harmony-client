@@ -11,6 +11,7 @@
   import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
   import SettingsPanel from './lib/components/SettingsPanel.svelte';
   import BackupStalenessWarning from './lib/components/BackupStalenessWarning.svelte';
+  import { backupExportRequest } from './lib/backup-export-request.svelte';
   import SpellbookMode from './lib/components/SpellbookMode.svelte';
   import FlashcardStats from './lib/components/FlashcardStats.svelte';
   import MailInbox from './lib/components/MailInbox.svelte';
@@ -61,7 +62,7 @@
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
-  import { onMount, tick } from 'svelte';
+  import { onMount } from 'svelte';
   import type { Update } from '@tauri-apps/plugin-updater';
   import { checkForUpdate } from './lib/updater-adapter';
   import {
@@ -2743,18 +2744,16 @@
     return [...peerMap.values()];
   });
 
-  async function handleExportRequested() {
-    // Surface the existing IdentityPanel backup flow via an event bus:
-    // IdentityPanel registers the listener in its onMount. Since ZEB-545 split
-    // Settings into tabs that lazily mount their panel, IdentityPanel only
-    // exists when Settings → Account is open — and Settings itself only renders
-    // in 'messages' mode. Route there and await the mount before dispatching, or
-    // the listener isn't registered yet and the request is silently dropped.
+  function handleExportRequested() {
+    // The backup wizard lives in IdentityPanel (Settings → Account). Mark the
+    // request reactively (not a fire-and-forget event) so it survives until that
+    // panel observes it — robust to the Account tab not being open, or to
+    // collapsed/mobile layout where Settings only renders once the window is
+    // widened — then route there so the wizard is visible when it opens.
+    backupExportRequest.pending = true;
     appMode = 'messages';
     showSettings = true;
     settingsTab = 'account';
-    await tick();
-    window.dispatchEvent(new CustomEvent('harmony:backup-export-requested'));
   }
 </script>
 
