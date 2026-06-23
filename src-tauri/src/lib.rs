@@ -20459,18 +20459,6 @@ pub(crate) async fn set_message_reaction_impl(
                     input.size
                 ));
             }
-            // A custom emoji is a channel-private (encrypted) CAS blob — the
-            // serve/preview gate keys off the CID's encrypted flag. Reject a
-            // public CID at the mint boundary so an emoji image can't be made
-            // world-fetchable (verify enforces the same on receipt). CodeRabbit
-            // PR #320. Checked last so a malformed mime/size surfaces its own
-            // (more specific) error first.
-            if !harmony_content::cid::ContentId::from_bytes(emoji_cid)
-                .flags()
-                .encrypted
-            {
-                return Err("custom emoji cid must reference an encrypted CAS blob".to_string());
-            }
             Some(crate::community_channel_log::ChannelAttachment {
                 cid: emoji_cid,
                 mime: input.mime,
@@ -23358,11 +23346,12 @@ mod create_community_inner_tests {
     }
 
     #[tokio::test]
-    async fn set_message_reaction_rejects_unencrypted_custom_emoji_cid() {
-        // CodeRabbit PR #320: a custom emoji must reference an encrypted CAS
-        // blob. `VALID_CID_64` (`00...`) decodes to a PUBLIC CID (encrypted flag
-        // clear); a valid image/size means it passes those checks and trips the
-        // encrypted gate specifically.
+    async fn set_message_reaction_accepts_public_custom_emoji_cid() {
+        // Public custom emoji (foundation): `VALID_CID_64` (`00...`) is a PUBLIC
+        // CID (encrypted flag clear). Custom emoji default to public, so the mint
+        // boundary must NOT reject it for being unencrypted. It now passes the
+        // descriptor checks and falls through to the registry lookup (absent on a
+        // bare NodeState), proving the encrypted gate is gone.
         let state = reaction_error_path_state();
         let err = set_message_reaction_impl(
             &state,
@@ -23378,8 +23367,15 @@ mod create_community_inner_tests {
             }),
         )
         .await
-        .expect_err("public custom emoji cid must be rejected");
-        assert!(err.contains("encrypted CAS blob"), "got: {err}");
+        .expect_err("bare NodeState has no channel_log_registry");
+        assert!(
+            err.contains("channel_log_registry missing"),
+            "public emoji must pass validation and reach the registry lookup, got: {err}"
+        );
+        assert!(
+            !err.contains("encrypted CAS blob"),
+            "no encrypted-gate rejection should fire, got: {err}"
+        );
     }
 
     #[tokio::test]
