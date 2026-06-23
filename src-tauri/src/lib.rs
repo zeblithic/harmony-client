@@ -21258,6 +21258,39 @@ pub(crate) async fn preview_named_emoji_impl(
         .map_err(|_| "event loop dropped fetch request".to_string())?
 }
 
+/// Best-effort: fetch a public emoji's bytes and re-ingest them serveable so the
+/// named emoji survives locally (picker render + re-serve). Idempotent (content-
+/// addressed). Any failure is logged, NOT propagated — naming must never block on
+/// a transient fetch hiccup.
+async fn pin_public_emoji_best_effort(state: &std::sync::Mutex<NodeState>, cid: &str) {
+    match preview_named_emoji_impl(state, cid.to_string()).await {
+        Ok(bytes) => {
+            match ingest_channel_artifact_bytes_inner(
+                state,
+                crate::owner_state_types::SpaceId([0u8; 16]),
+                bytes,
+                String::new(),
+                "image/png".to_string(),
+                false,
+            )
+            .await
+            {
+                Ok(dto) if dto.cid == cid => {}
+                Ok(dto) => tracing::warn!(
+                    requested = %cid, got = %dto.cid,
+                    "pin_public_emoji: re-ingest CID mismatch; name saved without local pin"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, cid = %cid, "pin_public_emoji: re-ingest failed")
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, cid = %cid, "pin_public_emoji: fetch failed; name saved without local pin")
+        }
+    }
+}
+
 /// Fetch a NAMED (public) custom emoji's plaintext bytes by CID with NO channel
 /// scope — for the picker, where the emoji may not appear in the current channel.
 /// Public-only + capped at `MAX_CUSTOM_EMOJI_BYTES`. Mirrors `fetch_avatar`.
@@ -21331,7 +21364,9 @@ pub(crate) async fn set_emoji_name_impl(
         store.set(&cid, trimmed, &mime, size, now_ms);
         store.save(&path)?;
     }
-    // Task 4 wires the best-effort retain-on-name pin here (only when setting).
+    if trimmed.is_some() {
+        pin_public_emoji_best_effort(state, &cid).await;
+    }
     Ok(())
 }
 
@@ -24273,6 +24308,57 @@ mod create_community_inner_tests {
             .await
             .unwrap_err();
         assert!(err.contains("encrypted"), "got: {err}");
+
+        drop(state);
+        ingest_drainer.abort();
+        fetch_drainer.abort();
+    }
+
+    #[tokio::test]
+    async fn pin_public_emoji_stores_bytes_locally() {
+        let cas: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (ingest_tx, mut ingest_rx) =
+            tokio::sync::mpsc::channel::<event_loop::IngestRequest>(16);
+        let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::channel::<event_loop::FetchRequest>(16);
+        let cas_i = std::sync::Arc::clone(&cas);
+        let ingest_drainer = tokio::spawn(async move {
+            while let Some(req) = ingest_rx.recv().await {
+                cas_i.lock().unwrap().insert(req.cid_hex, req.data);
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+        let cas_f = std::sync::Arc::clone(&cas);
+        let fetch_drainer = tokio::spawn(async move {
+            while let Some(req) = fetch_rx.recv().await {
+                let got = cas_f.lock().unwrap().get(&req.cid_hex).cloned();
+                let _ = req.reply.send(got.ok_or_else(|| "not found".to_string()));
+            }
+        });
+        let state = std::sync::Mutex::new(NodeState {
+            ingest_tx: Some(ingest_tx),
+            fetch_tx: Some(fetch_tx),
+            ..NodeState::default()
+        });
+
+        let plaintext: Vec<u8> = (0u8..200).collect();
+        let dto = ingest_channel_artifact_bytes_inner(
+            &state,
+            crate::owner_state_types::SpaceId([0u8; 16]),
+            plaintext.clone(),
+            String::new(),
+            "image/png".to_string(),
+            false,
+        )
+        .await
+        .expect("seed ingest");
+        cas.lock().unwrap().clear();
+        cas.lock()
+            .unwrap()
+            .insert(dto.cid.clone(), plaintext.clone());
+
+        pin_public_emoji_best_effort(&state, &dto.cid).await;
+        assert!(cas.lock().unwrap().contains_key(&dto.cid));
 
         drop(state);
         ingest_drainer.abort();
