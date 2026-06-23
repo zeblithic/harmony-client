@@ -32358,9 +32358,8 @@ async fn unban_from_community(
 /// EpochRotation, etc.) are filtered out.
 ///
 /// Errors: same hex/registry/Space-row error path as `list_community_members`.
-#[tauri::command]
-async fn list_recent_moderation_events(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn list_recent_moderation_events_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
     limit: u32,
 ) -> Result<Vec<ModerationEventDto>, String> {
@@ -32374,7 +32373,7 @@ async fn list_recent_moderation_events(
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (crdt_state, registry) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -32469,6 +32468,15 @@ async fn list_recent_moderation_events(
     Ok(dtos)
 }
 
+#[tauri::command]
+async fn list_recent_moderation_events(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    limit: u32,
+) -> Result<Vec<ModerationEventDto>, String> {
+    list_recent_moderation_events_impl(state_lock.inner(), community_id, limit).await
+}
+
 // ── ZEB-254 Task 12: list_pending_joins + list_recent_counter_signs ──────────
 //
 // Admin audit feed IPCs. Both read the raw signed event log from the
@@ -32496,9 +32504,8 @@ pub struct PendingJoinDto {
 /// within the 30-day expiry window. Sorted by pending_at_hlc ascending.
 ///
 /// Errors: same hex/registry/Space-row path as `list_community_members`.
-#[tauri::command]
-async fn list_pending_joins(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn list_pending_joins_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
 ) -> Result<Vec<PendingJoinDto>, String> {
     let id_bytes: [u8; 16] = hex::decode(&community_id)
@@ -32509,7 +32516,7 @@ async fn list_pending_joins(
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (registry, self_owner) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -32569,6 +32576,14 @@ async fn list_pending_joins(
         .unwrap_or_default()
         .as_millis() as u64;
     Ok(filter_pending_joins(&raw_events, now_ms))
+}
+
+#[tauri::command]
+async fn list_pending_joins(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<PendingJoinDto>, String> {
+    list_pending_joins_impl(state_lock.inner(), community_id).await
 }
 
 /// Pure filter: given the raw event log, return PendingJoin DTOs that
@@ -32653,9 +32668,8 @@ pub struct CounterSignDto {
 /// Sorted by countersigned_at_hlc descending. Pass limit=0 for default 20.
 ///
 /// Errors: same hex/registry path as `list_recent_moderation_events`.
-#[tauri::command]
-async fn list_recent_counter_signs(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn list_recent_counter_signs_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
     limit: u32,
 ) -> Result<Vec<CounterSignDto>, String> {
@@ -32668,7 +32682,7 @@ async fn list_recent_counter_signs(
     let cap = if limit == 0 { 20 } else { limit as usize };
 
     let (registry, self_owner) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -32723,6 +32737,15 @@ async fn list_recent_counter_signs(
     };
 
     Ok(filter_recent_counter_signs(&raw_events, self_owner, cap))
+}
+
+#[tauri::command]
+async fn list_recent_counter_signs(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    limit: u32,
+) -> Result<Vec<CounterSignDto>, String> {
+    list_recent_counter_signs_impl(state_lock.inner(), community_id, limit).await
 }
 
 /// Pure filter: given the raw event log and the local owner's address,

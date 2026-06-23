@@ -99,6 +99,16 @@ struct CommunityIdArgs {
     community_id: String,
 }
 
+/// ZEB-527: `community_id` + capped `limit` — shared by the two recent-feed
+/// moderation read verbs (`list_recent_counter_signs`,
+/// `list_recent_moderation_events`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommunityLimitArgs {
+    community_id: String,
+    limit: u32,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateCommunityArgs {
@@ -324,7 +334,7 @@ struct SetIdentityDiscoverableArgs {
 
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (49 commands). Every handler calls
+/// Build the curated v1 RPC surface (61 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
@@ -409,6 +419,32 @@ pub fn build_registry() -> RpcRegistry {
         "leave_community",
         CommunityIdArgs,
         |state, sink, a| async move { crate::leave_community_impl(state, sink, a.community_id).await }
+    );
+
+    // community moderation (ZEB-527)
+    rpc!(
+        m,
+        "list_pending_joins",
+        CommunityIdArgs,
+        |state, _sink, a| {
+            async move { crate::list_pending_joins_impl(state, a.community_id).await }
+        }
+    );
+    rpc!(
+        m,
+        "list_recent_counter_signs",
+        CommunityLimitArgs,
+        |state, _sink, a| async move {
+            crate::list_recent_counter_signs_impl(state, a.community_id, a.limit).await
+        }
+    );
+    rpc!(
+        m,
+        "list_recent_moderation_events",
+        CommunityLimitArgs,
+        |state, _sink, a| async move {
+            crate::list_recent_moderation_events_impl(state, a.community_id, a.limit).await
+        }
     );
 
     // Channels.
@@ -804,6 +840,8 @@ mod tests {
     use crate::NodeState;
     use std::sync::Mutex;
 
+    const DUMMY_COMMUNITY_HEX: &str = "00000000000000000000000000000000"; // 16 bytes
+
     fn test_sink() -> Arc<dyn NodeEventSink> {
         Arc::new(FanoutSink(vec![]))
     }
@@ -1066,6 +1104,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_pending_joins_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_pending_joins",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn list_pending_joins_rejects_missing_community_id() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_pending_joins",
+                test_state(),
+                test_sink(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::BadArgs(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn list_recent_counter_signs_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_recent_counter_signs",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX, "limit": 20 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn list_recent_moderation_events_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_recent_moderation_events",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX, "limit": 20 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
     async fn registry_has_exactly_the_curated_v1_surface() {
         let reg = build_registry();
         let mut names = reg.command_names();
@@ -1089,6 +1187,10 @@ mod tests {
             "redeem_invite",
             "join_open_community",
             "leave_community",
+            // community moderation (ZEB-527)
+            "list_pending_joins",
+            "list_recent_counter_signs",
+            "list_recent_moderation_events",
             // channels
             "create_channel",
             "list_channels",
