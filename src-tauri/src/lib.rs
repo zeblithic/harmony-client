@@ -20414,6 +20414,15 @@ pub(crate) async fn set_message_reaction_impl(
     let chid = crate::community_membership::ChannelId(chid_bytes);
     let target = crate::community_channel_log::MessageId(mid_bytes);
 
+    // ZEB-541 protocol invariant (CodeRabbit PR #320): a custom-emoji reaction
+    // is EITHER unicode OR a CAS descriptor, never both. Reject a custom react
+    // that also carries a unicode `emoji` at the mint boundary — `verify_channel_
+    // event` enforces the same on receipt (binds remote peers), but rejecting
+    // here gives a clear early error and keeps the local log clean.
+    if custom_emoji.is_some() && !emoji.is_empty() {
+        return Err("custom emoji reactions must not include a unicode emoji".to_string());
+    }
+
     // ZEB-541: decode + validate the optional custom-emoji descriptor before
     // signing. These caps mirror `verify_channel_event` (defense-in-depth — the
     // descriptor is also re-verified on receipt, and the bytes are content-bound
@@ -20449,6 +20458,18 @@ pub(crate) async fn set_message_reaction_impl(
                     "custom emoji exceeds cap: {} > {MAX_CUSTOM_EMOJI_BYTES}",
                     input.size
                 ));
+            }
+            // A custom emoji is a channel-private (encrypted) CAS blob — the
+            // serve/preview gate keys off the CID's encrypted flag. Reject a
+            // public CID at the mint boundary so an emoji image can't be made
+            // world-fetchable (verify enforces the same on receipt). CodeRabbit
+            // PR #320. Checked last so a malformed mime/size surfaces its own
+            // (more specific) error first.
+            if !harmony_content::cid::ContentId::from_bytes(emoji_cid)
+                .flags()
+                .encrypted
+            {
+                return Err("custom emoji cid must reference an encrypted CAS blob".to_string());
             }
             Some(crate::community_channel_log::ChannelAttachment {
                 cid: emoji_cid,
@@ -20637,11 +20658,24 @@ pub(crate) async fn ingest_channel_artifact_impl(
     if !meta.is_file() {
         return Err("artifact source must be a regular file".to_string());
     }
-    let (name, mime) = prepare_artifact_meta(meta.len(), &source_path, name, mime)?;
 
     let file = tokio::fs::File::open(&source_path)
         .await
         .map_err(|e| format!("open: {e}"))?;
+    // TOCTOU guard (CodeRabbit PR #320): the pre-open `is_file` check ran on the
+    // PATH; a swap to a FIFO/device/dir between that stat and `File::open` would
+    // make us read the wrong inode. Re-stat the OPENED handle and trust ITS type
+    // + length — the bounded `.take()` below already caps a growing file, but
+    // only a regular file has a trustworthy length to feed the cap check and
+    // size signing, so derive `prepare_artifact_meta`'s size from it.
+    let opened_meta = file
+        .metadata()
+        .await
+        .map_err(|e| format!("stat opened artifact: {e}"))?;
+    if !opened_meta.is_file() {
+        return Err("artifact source must be a regular file".to_string());
+    }
+    let (name, mime) = prepare_artifact_meta(opened_meta.len(), &source_path, name, mime)?;
 
     // The DTO `size` is the actual ingested byte count (what the download side
     // size-verifies against), NOT the pre-ingest stat — a file changing between
@@ -20923,6 +20957,7 @@ pub(crate) async fn authorize_and_fetch_artifact(
     channel_id: &str,
     cid: &str,
     cap: u64,
+    scope: crate::community_channel_log_engine::AttachmentScope,
 ) -> Result<ArtifactFetch, String> {
     use harmony_content::cid::ContentId;
 
@@ -20971,7 +21006,7 @@ pub(crate) async fn authorize_and_fetch_artifact(
         .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
 
     let att = engine
-        .find_attachment(&cid_bytes)
+        .find_attachment(&cid_bytes, scope)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "unknown or unauthorized attachment".to_string())?;
@@ -21083,7 +21118,15 @@ pub(crate) async fn download_channel_artifact_impl(
         epoch_key_opt,
         expected_size,
         content_id,
-    } = authorize_and_fetch_artifact(state, &community_id, &channel_id, &cid, cap).await?;
+    } = authorize_and_fetch_artifact(
+        state,
+        &community_id,
+        &channel_id,
+        &cid,
+        cap,
+        crate::community_channel_log_engine::AttachmentScope::Any,
+    )
+    .await?;
 
     let written =
         finalize_artifact(bytes, encrypted, epoch_key_opt, expected_size, &dest_path).await?;
@@ -21138,7 +21181,15 @@ pub(crate) async fn preview_channel_artifact_impl(
         epoch_key_opt,
         expected_size,
         ..
-    } = authorize_and_fetch_artifact(state, &community_id, &channel_id, &cid, cap).await?;
+    } = authorize_and_fetch_artifact(
+        state,
+        &community_id,
+        &channel_id,
+        &cid,
+        cap,
+        crate::community_channel_log_engine::AttachmentScope::Any,
+    )
+    .await?;
     decrypt_and_verify_artifact(bytes, encrypted, epoch_key_opt, expected_size)
 }
 
@@ -21171,6 +21222,10 @@ pub(crate) async fn preview_reaction_emoji_impl(
         &channel_id,
         &cid,
         MAX_CUSTOM_EMOJI_BYTES,
+        // Resolve the React emoji descriptor specifically — a Post attachment
+        // sharing this CID must not shadow the signed emoji's size (CodeRabbit
+        // PR #320).
+        crate::community_channel_log_engine::AttachmentScope::ReactionEmoji,
     )
     .await?;
     decrypt_and_verify_artifact(bytes, encrypted, epoch_key_opt, expected_size)
@@ -23302,6 +23357,57 @@ mod create_community_inner_tests {
         assert!(err.contains("exceeds cap"), "got: {err}");
     }
 
+    #[tokio::test]
+    async fn set_message_reaction_rejects_unencrypted_custom_emoji_cid() {
+        // CodeRabbit PR #320: a custom emoji must reference an encrypted CAS
+        // blob. `VALID_CID_64` (`00...`) decodes to a PUBLIC CID (encrypted flag
+        // clear); a valid image/size means it passes those checks and trips the
+        // encrypted gate specifically.
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: VALID_CID_64.to_string(),
+                mime: "image/png".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("public custom emoji cid must be rejected");
+        assert!(err.contains("encrypted CAS blob"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_custom_emoji_with_unicode() {
+        // CodeRabbit PR #320: a custom react must NOT also carry a unicode emoji
+        // (ambiguous reaction-index key). Rejected before any descriptor decode.
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            "\u{1F44D}".to_string(), // a unicode 👍 alongside a custom descriptor
+            true,
+            Some(ReactionEmojiInput {
+                cid: VALID_CID_64.to_string(),
+                mime: "image/png".to_string(),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("custom emoji + unicode must be rejected");
+        assert!(
+            err.contains("must not include a unicode emoji"),
+            "got: {err}"
+        );
+    }
+
     /// Happy path: a valid `customEmoji` appends a React carrying the emoji
     /// attachment; the materialized DTO surfaces `emojiCid`. Stands up a real
     /// community + channel-log engine (mirrors the artifact-authorize tests) so
@@ -23533,10 +23639,14 @@ mod create_community_inner_tests {
         )
         .await
         .expect_err("unauthorized cid must be rejected");
+        // The setup above (`create_channel_impl` + `post_channel_message_impl`
+        // both succeeded) proves the engine + registry exist, so the ONLY valid
+        // rejection here is the authorize-first miss. Accepting `no engine` /
+        // `channel_log_registry` would mask a regression where the preview path
+        // fails before ever reaching the attachment authorization (CodeRabbit PR
+        // #320).
         assert!(
-            err.contains("unknown or unauthorized attachment")
-                || err.contains("no engine")
-                || err.contains("channel_log_registry"),
+            err.contains("unknown or unauthorized attachment"),
             "got: {err}"
         );
     }

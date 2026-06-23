@@ -198,22 +198,52 @@ pub const POLL_BODY_MAGIC: u8 = 0x00;
 /// hex encoding of a 32-byte `PollId`). Total 65 bytes.
 pub const POLL_BODY_LEN: usize = 1 + 64;
 
+/// Which signed-event kinds may supply the authorizing descriptor for a CID.
+///
+/// A CID binds the *bytes*, but a descriptor's `size`/`mime` are self-declared
+/// in the signed event (not derived from the bytes). When two events reference
+/// the same CID — e.g. an old `Post` attachment and a later `React`
+/// `emoji_attachment` — `find_attachment` returns the oldest match, so a `Post`
+/// can shadow a `React` emoji descriptor (and vice-versa). The emoji-preview
+/// path must therefore resolve the `React` descriptor *specifically*, so a
+/// `Post` with the same CID but a different/over-cap declared size can't cause a
+/// valid custom emoji to be mis-sized or rejected (CodeRabbit PR #320).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentScope {
+    /// Any attachment-bearing event authorizes (Post attachments + React emoji).
+    /// Used for generic artifact re-serve, where any signed reference suffices.
+    Any,
+    /// Only a `React`'s custom-emoji `emoji_attachment` authorizes. Used by the
+    /// emoji-preview path so a Post descriptor can't shadow the emoji's.
+    ReactionEmoji,
+}
+
 /// ZEB-539 / ZEB-541: if `event` references a `ChannelAttachment` whose CID
-/// equals `cid`, return a clone of that descriptor. Used by `find_attachment`
-/// to scan the log for a re-serve authorization record.
+/// equals `cid` (within `scope`), return a clone of that descriptor. Used by
+/// `find_attachment` to scan the log for a re-serve authorization record.
 ///
 /// Two authorizing event shapes:
-/// - `Post` — any of its `attachments` (ZEB-539).
+/// - `Post` — any of its `attachments` (ZEB-539). Skipped under
+///   `AttachmentScope::ReactionEmoji`.
 /// - `React` — its optional custom-emoji `emoji_attachment` (ZEB-541). A signed
 ///   React referencing an emoji CID makes that CID serve-authorizable to anyone
 ///   who can read the channel, exactly like a Post attachment (same power gate).
-fn attachment_with_cid(event: &SignedChannelEvent, cid: &[u8; 32]) -> Option<ChannelAttachment> {
+fn attachment_with_cid(
+    event: &SignedChannelEvent,
+    cid: &[u8; 32],
+    scope: AttachmentScope,
+) -> Option<ChannelAttachment> {
     match event {
-        SignedChannelEvent::Post { attachments, .. } => attachments
-            .as_ref()?
-            .iter()
-            .find(|att| &att.cid == cid)
-            .cloned(),
+        SignedChannelEvent::Post { attachments, .. } => {
+            if scope == AttachmentScope::ReactionEmoji {
+                return None;
+            }
+            attachments
+                .as_ref()?
+                .iter()
+                .find(|att| &att.cid == cid)
+                .cloned()
+        }
         SignedChannelEvent::React {
             emoji_attachment, ..
         } => emoji_attachment
@@ -733,6 +763,7 @@ impl ChannelLogEngine {
     pub async fn find_attachment(
         &self,
         cid: &[u8; 32],
+        scope: AttachmentScope,
     ) -> Result<Option<crate::community_channel_log::ChannelAttachment>, ChannelLogEngineError>
     {
         // Qodo (High): do NOT hold the async mutex across disk I/O, and do NOT
@@ -741,7 +772,7 @@ impl ChannelLogEngine {
         // lock, drop the lock, then read the segments off the executor via
         // `spawn_blocking`. Behavior is identical: scan persisted segments
         // (oldest first) then the tail, returning the first matching
-        // `ChannelAttachment`, else `None`.
+        // `ChannelAttachment` (within `scope`), else `None`.
         let (segments, tail, root): (Vec<SegmentDescriptor>, Vec<SignedChannelEvent>, _) = {
             let log = self.log.lock().await;
             (
@@ -758,7 +789,7 @@ impl ChannelLogEngine {
             for seg in &segments {
                 let events = read_segment_at(&root, seg)?;
                 for ev in &events {
-                    if let Some(att) = attachment_with_cid(ev, &cid) {
+                    if let Some(att) = attachment_with_cid(ev, &cid, scope) {
                         return Ok::<_, ChannelLogPersistError>(Some(att));
                     }
                 }
@@ -778,7 +809,7 @@ impl ChannelLogEngine {
 
         // Then the in-memory tail (already snapshotted; no I/O).
         for ev in &tail {
-            if let Some(att) = attachment_with_cid(ev, &cid) {
+            if let Some(att) = attachment_with_cid(ev, &cid, scope) {
                 return Ok(Some(att));
             }
         }
@@ -3265,7 +3296,7 @@ mod tests {
         // Present CID in the oldest persisted segment.
         let got = fix
             .engine
-            .find_attachment(&[0xb2; 32])
+            .find_attachment(&[0xb2; 32], AttachmentScope::Any)
             .await
             .expect("find ok")
             .expect("segment attachment present");
@@ -3274,7 +3305,7 @@ mod tests {
         // Present CID in the in-memory tail.
         let got = fix
             .engine
-            .find_attachment(&[0xc3; 32])
+            .find_attachment(&[0xc3; 32], AttachmentScope::Any)
             .await
             .expect("find ok")
             .expect("tail attachment present");
@@ -3283,10 +3314,117 @@ mod tests {
         // Absent CID → None.
         let none = fix
             .engine
-            .find_attachment(&[0xff; 32])
+            .find_attachment(&[0xff; 32], AttachmentScope::Any)
             .await
             .expect("find ok");
         assert!(none.is_none(), "absent cid must return None");
+    }
+
+    /// Build a signed React carrying a custom-emoji descriptor (fixture
+    /// identity, so the signature verifies). Mirrors `engine.react`'s payload.
+    fn make_signed_react_with_emoji(
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        author: OwnerAddr,
+        at: Hlc,
+        target: MessageId,
+        emoji_attachment: Option<ChannelAttachment>,
+        signing_key: &SigningKey,
+    ) -> SignedChannelEvent {
+        let payload = crate::community_channel_log::ChannelReactPayload {
+            target,
+            community_id,
+            channel_id,
+            author,
+            at,
+            emoji_attachment,
+            emoji: String::new(),
+            add: true,
+        };
+        crate::community_channel_log::sign_channel_react(&payload, signing_key).expect("sign react")
+    }
+
+    /// CodeRabbit PR #320: an OLDER `Post` attachment sharing the emoji CID must
+    /// NOT shadow the `React` emoji descriptor for the preview path. A CID binds
+    /// the bytes, but `size`/`mime` are self-declared per event — so the
+    /// emoji-preview path (`AttachmentScope::ReactionEmoji`) must resolve the
+    /// React descriptor specifically, while the generic scan
+    /// (`AttachmentScope::Any`) still returns the oldest match (the Post).
+    #[tokio::test]
+    async fn find_attachment_react_emoji_scope_skips_shadowing_post() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let shared_cid = [0x5a; 32];
+
+        // OLDER Post referencing the shared CID with a large, over-emoji-cap
+        // self-declared size and a non-image mime — the shadow that must lose.
+        let post_att = ChannelAttachment {
+            cid: shared_cid,
+            mime: "text/plain".to_string(),
+            name: "decoy.txt".to_string(),
+            size: crate::MAX_CUSTOM_EMOJI_BYTES + 50_000,
+        };
+        // NEWER React whose emoji_attachment references the SAME CID with the
+        // true (small, in-cap) descriptor.
+        let emoji_att = ChannelAttachment {
+            cid: shared_cid,
+            mime: "image/png".to_string(),
+            name: String::new(),
+            size: 1234,
+        };
+
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            let post = make_signed_event_with_attachments(
+                fix.community_id,
+                fix.channel_id,
+                fix.self_owner,
+                Hlc {
+                    wall_ms: 100,
+                    logical: 0,
+                    device_id: "test-device".to_string(),
+                },
+                "decoy post",
+                Some(vec![post_att.clone()]),
+                &fix.signing_key,
+            );
+            log.append(post).expect("append post");
+            let react = make_signed_react_with_emoji(
+                fix.community_id,
+                fix.channel_id,
+                fix.self_owner,
+                Hlc {
+                    wall_ms: 200,
+                    logical: 0,
+                    device_id: "test-device".to_string(),
+                },
+                MessageId([7u8; 16]),
+                Some(emoji_att.clone()),
+                &fix.signing_key,
+            );
+            log.append(react).expect("append react");
+        }
+
+        // Generic scan returns the oldest match — the Post (decoy).
+        let any = fix
+            .engine
+            .find_attachment(&shared_cid, AttachmentScope::Any)
+            .await
+            .expect("find ok")
+            .expect("some match under Any");
+        assert_eq!(any, post_att, "Any scope returns the oldest (Post) match");
+
+        // Emoji-preview scope skips the Post and resolves the React descriptor,
+        // so the valid emoji's true (in-cap) size is used — not the decoy's.
+        let emoji = fix
+            .engine
+            .find_attachment(&shared_cid, AttachmentScope::ReactionEmoji)
+            .await
+            .expect("find ok")
+            .expect("React emoji descriptor must be found, not shadowed by Post");
+        assert_eq!(
+            emoji, emoji_att,
+            "ReactionEmoji scope must return the React descriptor, not the Post"
+        );
     }
 
     // ── Sub-task 2B: publish ──────────────────────────────────────────
@@ -6042,7 +6180,7 @@ mod tests {
         let authorized = wait_for(
             || async {
                 engine_b
-                    .find_attachment(&emoji_cid_bytes)
+                    .find_attachment(&emoji_cid_bytes, AttachmentScope::ReactionEmoji)
                     .await
                     .ok()
                     .flatten()

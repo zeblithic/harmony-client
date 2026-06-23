@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import type { ChannelMessageService } from '../channel-message-service';
-  import { assertHeaderDimsOk, assertDecodedDimsOk } from '../avatar-normalize';
+  import { parseImageHeaderDims, assertDecodedDimsOk } from '../avatar-normalize';
 
   // Custom (CAS-backed) reaction emoji image (ZEB-541). Resolves a reaction
   // emoji CID to a displayable blob URL via `previewReactionEmoji`, applying the
@@ -42,9 +42,16 @@
       const bytes = await channelMessageService.previewReactionEmoji(communityId, channelId, forCid);
       // Bail if torn down / cid swapped during the IPC — nothing created yet.
       if (!isLive(forCid)) return;
-      // Decode-bomb guards (ZEB-540 parity): header dims BEFORE decode, decoded
-      // dims AFTER (8192px). A throw lands in catch → neutral placeholder.
-      assertHeaderDimsOk(bytes);
+      // Decode-bomb guards (ZEB-540/541 parity): these bytes are UNTRUSTED —
+      // they come from a remote peer's signed React over the wire. Reject any
+      // format whose header we can't parse BEFORE createImageBitmap allocates
+      // the decoded bitmap. `assertHeaderDimsOk` silently passes unparseable
+      // formats, so a non-PNG/JPEG decompression bomb (a huge WebP/GIF) would
+      // otherwise reach decode before the post-decode guard. Emoji are minted as
+      // PNG, so a PNG/JPEG-only header parse is sufficient.
+      const header = parseImageHeaderDims(bytes);
+      if (!header) throw new Error('unsupported emoji image format; use PNG or JPEG');
+      assertDecodedDimsOk(header.width, header.height);
       const blob = new Blob([bytes], { type: 'image/png' });
       const bmp = await createImageBitmap(blob);
       try {

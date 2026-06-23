@@ -2,8 +2,23 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, waitFor } from '@testing-library/svelte';
 import ReactionEmojiImage from '../ReactionEmojiImage.svelte';
 
-// PNG magic bytes so the header-dim guard recognises the format.
-const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+/**
+ * A minimal PNG (signature + IHDR declaring `width`×`height`). The render path
+ * now parses the header for dims BEFORE decode, so the bytes must carry a real
+ * IHDR — an 8-byte signature alone is (correctly) rejected as unparseable.
+ */
+function pngWithDims(width: number, height: number): Uint8Array {
+  const b = new Uint8Array(24);
+  b.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0); // signature
+  b.set([0x00, 0x00, 0x00, 0x0d], 8); // IHDR length = 13
+  b.set([0x49, 0x48, 0x44, 0x52], 12); // "IHDR"
+  b.set([(width >>> 24) & 0xff, (width >>> 16) & 0xff, (width >>> 8) & 0xff, width & 0xff], 16);
+  b.set([(height >>> 24) & 0xff, (height >>> 16) & 0xff, (height >>> 8) & 0xff, height & 0xff], 20);
+  return b;
+}
+
+// A small, in-bounds PNG so the pre-decode header guard recognises the format.
+const PNG_BYTES = pngWithDims(64, 64);
 
 function makeService(previewReactionEmoji: any) {
   return { previewReactionEmoji } as any;
@@ -85,6 +100,21 @@ describe('ReactionEmojiImage (ZEB-541)', () => {
     });
     await waitFor(() => expect(container.querySelector('.reaction-emoji-fallback')).not.toBeNull());
     expect(container.querySelector('img.reaction-emoji-img')).toBeNull();
+    expect(createObjectURLMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unparseable (non-PNG/JPEG) format BEFORE decode (no <img>)', async () => {
+    // These bytes are UNTRUSTED (a remote peer's React). A format whose header
+    // we can't parse for dims must be rejected before createImageBitmap so a
+    // non-PNG/JPEG decompression bomb never reaches decode allocation.
+    const gif = new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]); // "GIF89a"
+    const previewReactionEmoji = vi.fn().mockResolvedValue(gif);
+    const { container } = render(ReactionEmojiImage, {
+      props: props({ channelMessageService: makeService(previewReactionEmoji) }),
+    });
+    await waitFor(() => expect(container.querySelector('.reaction-emoji-fallback')).not.toBeNull());
+    expect(container.querySelector('img.reaction-emoji-img')).toBeNull();
+    expect(createImageBitmapMock).not.toHaveBeenCalled();
     expect(createObjectURLMock).not.toHaveBeenCalled();
   });
 

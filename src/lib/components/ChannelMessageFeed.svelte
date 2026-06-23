@@ -672,7 +672,7 @@
             {/if}
             {#if !row.isPreFork && msg.reactions && msg.reactions.length > 0}
               <div class="reactions">
-                {#each msg.reactions as r (r.emojiCid ?? r.emoji)}
+                {#each msg.reactions as r (r.emojiCid ? `cid:${r.emojiCid}` : `emoji:${r.emoji}`)}
                   <button
                     type="button"
                     class="reaction-chip"
