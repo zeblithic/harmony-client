@@ -78,6 +78,29 @@ describe('SettingsPanel tab routing', () => {
     });
   }
 
+  it('navigates tabs with Arrow/Home/End keys and keeps a roving tabindex', async () => {
+    render(SettingsPanel, { props: baseProps });
+    const tab = (name: string) => screen.getByRole('tab', { name });
+    // Roving tabindex: only the active tab is in the tab order.
+    expect(tab('Profile').getAttribute('tabindex')).toBe('0');
+    expect(tab('Account').getAttribute('tabindex')).toBe('-1');
+
+    await fireEvent.keyDown(tab('Profile'), { key: 'ArrowRight' });
+    expect(tab('Account').getAttribute('aria-selected')).toBe('true');
+    expect(tab('Account').getAttribute('tabindex')).toBe('0');
+    expect(tab('Profile').getAttribute('tabindex')).toBe('-1');
+
+    await fireEvent.keyDown(tab('Account'), { key: 'End' });
+    expect(tab('Friends').getAttribute('aria-selected')).toBe('true');
+
+    await fireEvent.keyDown(tab('Friends'), { key: 'Home' });
+    expect(tab('Profile').getAttribute('aria-selected')).toBe('true');
+
+    // ArrowLeft from the first tab wraps to the last.
+    await fireEvent.keyDown(tab('Profile'), { key: 'ArrowLeft' });
+    expect(tab('Friends').getAttribute('aria-selected')).toBe('true');
+  });
+
   it('groups Identity + Devices under the Account tab (two panels in the visible section)', async () => {
     render(SettingsPanel, { props: baseProps });
     await fireEvent.click(screen.getByRole('tab', { name: 'Account' }));

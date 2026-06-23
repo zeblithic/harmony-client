@@ -68,11 +68,33 @@
     { id: 'network', label: 'Network' },
     { id: 'friends', label: 'Friends' },
   ];
+
+  function focusTab(id: SettingsTab): void {
+    // Every tab always renders, so the element exists; focus() works regardless
+    // of the roving tabindex value at this instant.
+    document.getElementById(`settings-tab-${id}`)?.focus();
+  }
+
+  // WAI-ARIA tablist keyboard interaction (horizontal, automatic activation):
+  // Left/Right move between tabs (wrapping), Home/End jump to the ends, and
+  // selection follows focus. Paired with a roving tabindex (only the active tab
+  // is in the tab order) so Tab enters the tablist once and arrows navigate it.
+  function handleTabKey(e: KeyboardEvent, index: number): void {
+    let target: number | null = null;
+    if (e.key === 'ArrowRight') target = (index + 1) % TABS.length;
+    else if (e.key === 'ArrowLeft') target = (index - 1 + TABS.length) % TABS.length;
+    else if (e.key === 'Home') target = 0;
+    else if (e.key === 'End') target = TABS.length - 1;
+    if (target === null) return;
+    e.preventDefault();
+    activeTab = TABS[target].id;
+    focusTab(activeTab);
+  }
 </script>
 
 <div class="settings-panel">
   <div class="tabs" role="tablist" aria-label="Settings sections">
-    {#each TABS as tab (tab.id)}
+    {#each TABS as tab, i (tab.id)}
       <button
         class="tab"
         class:active={activeTab === tab.id}
@@ -80,9 +102,11 @@
         id="settings-tab-{tab.id}"
         aria-selected={activeTab === tab.id}
         aria-controls="settings-tabpanel-{tab.id}"
+        tabindex={activeTab === tab.id ? 0 : -1}
         onclick={() => {
           activeTab = tab.id;
         }}
+        onkeydown={(e) => handleTabKey(e, i)}
       >
         {tab.label}
       </button>
