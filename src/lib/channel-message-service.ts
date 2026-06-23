@@ -499,9 +499,13 @@ export class ChannelMessageService {
       if (!entry) {
         entry = { emoji: p.emoji, count: 0, mine: false, reactors: [] };
         // Carry the custom-emoji descriptor so the feed can render the image.
+        // `encrypted` (ZEB-541) gates the live "name this emoji" affordance —
+        // naming is public-only, so an encrypted live chip must not offer it
+        // (previously it stayed `undefined` until a channel reseed).
         if (p.emojiCid) {
           entry.emojiCid = p.emojiCid;
           entry.emojiSize = p.emojiSize;
+          entry.encrypted = p.encrypted;
         }
         reactions.push(entry);
       }

@@ -922,6 +922,28 @@ describe('ChannelMessageFeed reactions — toolbar + picker (ZEB-536)', () => {
     await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeNull());
   });
 
+  it('closing the picker resets namedPickerFor so the named popover does not auto-reopen', async () => {
+    // CodeRabbit (ZEB-541): `namedPickerFor` could linger after the main picker
+    // closed, so reopening the picker on the same message auto-reopened the
+    // named popover. The $effect that aligns the two must drop it on close.
+    const { adapter, container } = await seedPlainMessage();
+    (adapter.invoke as any).mockImplementation((cmd: string) =>
+      cmd === 'list_emoji_names' ? Promise.resolve([]) : Promise.resolve(undefined),
+    );
+    // Open picker → open the named popover.
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeTruthy());
+    await fireEvent.click(container.querySelector('.picker-named') as HTMLButtonElement);
+    await waitFor(() => expect(container.querySelector('.named-popover')).toBeTruthy());
+    // Close the picker.
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeNull());
+    // Reopen the picker on the SAME message — the named popover must be gone.
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    await waitFor(() => expect(container.querySelector('.reaction-picker')).toBeTruthy());
+    expect(container.querySelector('.named-popover')).toBeNull();
+  });
+
   it('clicking outside closes the picker', async () => {
     const { container } = await seedPlainMessage();
     await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);

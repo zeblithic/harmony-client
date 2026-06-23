@@ -520,6 +520,17 @@
   let namingSize = 0;
   let uploadName = $state('');
 
+  // Keep the named-emoji popover aligned with the active reaction picker: if the
+  // main picker closed or moved to another message, drop the named popover.
+  // (Complements the channel-switch reset above, which only fires on a channel
+  // change — this also covers closing/reopening the picker on the SAME message,
+  // so the named popover doesn't auto-reopen.)
+  $effect(() => {
+    if (namedPickerFor !== null && namedPickerFor !== pickerOpenFor) {
+      namedPickerFor = null;
+    }
+  });
+
   // Open the OS file picker for a custom emoji on `msg`. Mirrors the avatar
   // File-acquisition flow (ProfileEditor): a native <input type="file"> whose
   // change handler reads `files[0]` — a real web `File`, which `normalizeEmoji`

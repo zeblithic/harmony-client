@@ -777,6 +777,22 @@ describe('ChannelMessageService reactions (ZEB-536 Spec 2)', () => {
     });
   });
 
+  it('a live custom-emoji reaction-received event carries encrypted into the chip entry', async () => {
+    // ZEB-541: the LIVE event must carry `encrypted` so the UI gates the
+    // "name this emoji" affordance correctly without waiting for a reseed.
+    await service.connectAdapter(adapter);
+    await seedMessage();
+    const encCid = 'aa'.repeat(32);
+    const pubCid = 'bb'.repeat(32);
+    fireReaction({ reactor: OTHER, emoji: '', add: true, emojiCid: encCid, emojiSize: 256, encrypted: true });
+    fireReaction({ reactor: OTHER, emoji: '', add: true, emojiCid: pubCid, emojiSize: 256, encrypted: false });
+    const msg = service.getMessages(CID, CHID)[0];
+    const enc = msg.reactions?.find((r) => r.emojiCid === encCid);
+    const pub = msg.reactions?.find((r) => r.emojiCid === pubCid);
+    expect(enc?.encrypted).toBe(true);
+    expect(pub?.encrypted).toBe(false);
+  });
+
   it('reactToMessage throws when the adapter is not connected', async () => {
     await expect(
       service.reactToMessage(CID, CHID, 'm1', '👍', true),

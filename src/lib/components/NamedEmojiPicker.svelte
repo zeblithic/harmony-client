@@ -22,6 +22,7 @@
   async function refresh() {
     try {
       all = await channelMessageService.listEmojiNames();
+      error = null;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }

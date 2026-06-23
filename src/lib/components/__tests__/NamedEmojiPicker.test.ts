@@ -45,4 +45,28 @@ describe('NamedEmojiPicker', () => {
     await fireEvent.click(getByLabelText('Remove name catjam'));
     expect(svc.setEmojiName).toHaveBeenCalledWith('aa', null, 'image/png', 7);
   });
+
+  it('clears a stale error when a later refresh succeeds (CodeRabbit ZEB-541)', async () => {
+    // First refresh rejects → an error alert shows. A subsequent refresh that
+    // resolves must clear the error so a transient failure doesn't stick.
+    let changeCb: () => void = () => {};
+    const svc = svcWith([]);
+    svc.listEmojiNames = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValue([]);
+    svc.onEmojiNamesChanged = vi.fn().mockImplementation((cb: () => void) => {
+      changeCb = cb;
+      return () => {};
+    });
+    const { queryByRole } = render(NamedEmojiPicker, {
+      props: { channelMessageService: svc, onpick: vi.fn() },
+    });
+    // The first (mount) refresh rejected → error alert present.
+    await waitFor(() => expect(queryByRole('alert')).toBeTruthy());
+    expect(queryByRole('alert')?.textContent).toContain('boom');
+    // Trigger a second refresh that resolves; the error must clear.
+    changeCb();
+    await waitFor(() => expect(queryByRole('alert')).toBeNull());
+  });
 });
