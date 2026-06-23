@@ -498,6 +498,8 @@ pub enum ChannelEventError {
     TooManyAttachments { count: usize, max: usize },
     #[error("reaction emoji too large: {len} bytes (max {max})")]
     EmojiTooLarge { len: usize, max: usize },
+    #[error("reaction emoji must not contain a NUL byte")]
+    EmojiContainsNul,
     #[error("custom emoji exceeds cap: {size} bytes (max {max})")]
     CustomEmojiTooLarge { size: u64, max: u64 },
     #[error("custom emoji must be an image (mime: {mime})")]
@@ -1167,6 +1169,15 @@ where
                 len: emoji.len(),
                 max: MAX_REACTION_EMOJI_BYTES,
             });
+        }
+        // The reaction index keys custom emoji under a NUL-prefixed sentinel
+        // (`\0cid:<hex>`) to keep them disjoint from unicode emoji strings. A
+        // 64-hex custom key can't fit under MAX_REACTION_EMOJI_BYTES today, so a
+        // unicode emoji can't collide — but reject any NUL in the unicode emoji
+        // to keep the two key-spaces provably disjoint by construction (and
+        // future-proof against a larger cap). No legitimate emoji contains NUL.
+        if emoji.as_bytes().contains(&0) {
+            return Err(ChannelEventError::EmojiContainsNul);
         }
         // ZEB-541: a React may carry at most ONE custom-emoji CAS descriptor
         // (structurally guaranteed by the `Option` type). When present, apply
@@ -4353,6 +4364,27 @@ mod tests {
             emoji: String::new(),
             add: true,
         }
+    }
+
+    #[tokio::test]
+    async fn verify_react_rejects_nul_in_unicode_emoji() {
+        let state = fixture_state_with_alice_joined();
+        let (signing_key, author, _pub64) = fixture_identity(0xa1);
+        let community_id = fixture_community(0xc0);
+        let channel_id = fixture_channel(0x01);
+        // A unicode react (no attachment) whose emoji embeds the NUL sentinel
+        // must be rejected so it can never land in the custom-emoji key-space.
+        let mut payload = custom_emoji_react_payload(community_id, channel_id, author, None);
+        payload.emoji = "\u{0}cid:deadbeef".to_string();
+        let event = sign_channel_react(&payload, &signing_key).expect("sign react");
+        let mut tracker = ChannelLogReplayTracker::new();
+        let err = verify_channel_event(&event, &community_id, &channel_id, &state, &mut tracker)
+            .await
+            .expect_err("NUL in emoji must fail verify");
+        assert!(
+            matches!(err, ChannelEventError::EmojiContainsNul),
+            "expected EmojiContainsNul, got {err:?}"
+        );
     }
 
     #[tokio::test]

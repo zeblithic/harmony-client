@@ -110,14 +110,25 @@ describe('emoji-normalize', () => {
     expect(cib).not.toHaveBeenCalled();
   });
 
-  it('rejects an over-limit DECODED bitmap (post-decode guard) for an unparseable header', async () => {
-    // GIF signature → header guard is a no-op; the decoded-dim guard must fire.
+  it('rejects an unparseable (non-PNG/JPEG) format BEFORE decode', async () => {
+    // GIF header can't be parsed for dims → we must reject before decoding so a
+    // non-PNG/JPEG decompression bomb never reaches createImageBitmap.
+    const cib = vi.fn();
+    vi.stubGlobal('createImageBitmap', cib);
+    const gif = new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]); // "GIF89a"
+    const f = new File([gif], 'x.gif', { type: 'image/gif' });
+    await expect(normalizeEmoji(f)).rejects.toThrow(/unsupported|format|png|jpeg/i);
+    expect(cib).not.toHaveBeenCalled();
+  });
+
+  it('rejects an over-limit DECODED bitmap via the post-decode guard (defense in depth)', async () => {
+    // A PNG whose header declares small dims but whose decoded bitmap is huge
+    // (header under-declares) must still be caught after createImageBitmap.
     installCanvasStubs({
       bitmapWidth: AVATAR_MAX_DECODED_DIM + 1,
       bitmapHeight: 64,
     });
-    const gif = new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]); // "GIF89a"
-    const f = new File([gif], 'x.gif', { type: 'image/gif' });
+    const f = new File([pngWithDims(64, 64)], 'sneaky.png', { type: 'image/png' });
     await expect(normalizeEmoji(f)).rejects.toThrow(/too large/i);
   });
 

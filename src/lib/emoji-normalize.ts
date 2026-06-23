@@ -1,6 +1,6 @@
 import {
   validateAvatarInput,
-  assertHeaderDimsOk,
+  parseImageHeaderDims,
   assertDecodedDimsOk,
 } from './avatar-normalize';
 
@@ -25,15 +25,23 @@ export const EMOJI_EDGE = 128;
  */
 export async function normalizeEmoji(file: File): Promise<Uint8Array> {
   validateAvatarInput(file);
-  // Reject a decode bomb by its declared header dimensions BEFORE
-  // createImageBitmap allocates the decoded bitmap. Bounded read — the file is
-  // already ≤ AVATAR_MAX_INPUT_BYTES (validateAvatarInput above). An unparseable
-  // header falls through to the post-decode assertDecodedDimsOk guard below.
-  assertHeaderDimsOk(new Uint8Array(await file.arrayBuffer()));
+  // Bound the decode BEFORE createImageBitmap allocates the decoded bitmap.
+  // `parseImageHeaderDims` reads only the PNG/JPEG header; for an untrusted emoji
+  // upload we REJECT any format whose header we can't parse rather than let it
+  // decode unbounded — `assertHeaderDimsOk` silently passes unparseable formats,
+  // so a non-PNG/JPEG decompression bomb (e.g. a huge WebP/GIF) would otherwise
+  // reach createImageBitmap before the post-decode guard. Custom emoji are
+  // re-encoded to PNG anyway, so a PNG/JPEG source is sufficient. (The file is
+  // already ≤ AVATAR_MAX_INPUT_BYTES via validateAvatarInput above.)
+  const headerDims = parseImageHeaderDims(new Uint8Array(await file.arrayBuffer()));
+  if (!headerDims) {
+    throw new Error('unsupported emoji image format; use PNG or JPEG');
+  }
+  assertDecodedDimsOk(headerDims.width, headerDims.height);
   const bitmap = await createImageBitmap(file);
   try {
-    // Decompression-bomb guard: reject an absurdly large decoded bitmap before
-    // allocating a canvas / drawing (the byte-size check only bounds the file).
+    // Defense in depth: the actual decoded bitmap must also be within bounds,
+    // in case a header under-declares its true decoded dimensions.
     assertDecodedDimsOk(bitmap.width, bitmap.height);
     const canvas = document.createElement('canvas');
     canvas.width = EMOJI_EDGE;
