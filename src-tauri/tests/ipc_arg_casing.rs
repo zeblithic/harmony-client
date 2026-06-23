@@ -101,3 +101,27 @@ fn set_friend_nickname_takes_camelcase_args_via_plain_command() {
          through Tauri (ZEB-414 / ZEB-419)",
     );
 }
+
+#[test]
+fn emoji_name_ipcs_use_plain_commands_with_camelcase_args() {
+    let src = std::fs::read_to_string("src/lib.rs").expect("read src/lib.rs");
+    assert!(
+        src.contains("async fn set_emoji_name("),
+        "set_emoji_name IPC not found in src/lib.rs",
+    );
+    assert!(
+        src.contains("cid: String,")
+            && src.contains("name: Option<String>,")
+            && src.contains("mime: String,")
+            && src.contains("size: u64,"),
+        "set_emoji_name must declare cid/name/mime/size params",
+    );
+    assert!(
+        src.contains("async fn list_emoji_names("),
+        "list_emoji_names IPC not found",
+    );
+    assert!(
+        src.contains("async fn preview_named_emoji("),
+        "preview_named_emoji IPC not found",
+    );
+}
