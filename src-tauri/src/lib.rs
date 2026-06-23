@@ -21243,7 +21243,10 @@ pub(crate) fn ensure_public_cid(cid: &str) -> Result<(), String> {
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
         .ok_or_else(|| "invalid cid hex".to_string())?;
     if ContentId::from_bytes(bytes).flags().encrypted {
-        return Err("encrypted emoji can't be named — they can't be reused outside their community".to_string());
+        return Err(
+            "encrypted emoji can't be named — they can't be reused outside their community"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -21251,7 +21254,9 @@ pub(crate) fn ensure_public_cid(cid: &str) -> Result<(), String> {
 /// Resolve the `emoji_names.json` path from `NodeState.pkarr_settings_path`,
 /// mirroring how the nickname store co-locates beside `pkarr_settings.json`.
 fn emoji_names_path(state: &std::sync::Mutex<NodeState>) -> Result<std::path::PathBuf, String> {
-    let g = state.lock().map_err(|e| format!("NodeState poisoned: {e}"))?;
+    let g = state
+        .lock()
+        .map_err(|e| format!("NodeState poisoned: {e}"))?;
     let p = g
         .pkarr_settings_path
         .clone()
