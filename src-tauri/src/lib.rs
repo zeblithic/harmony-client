@@ -20421,6 +20421,22 @@ pub(crate) async fn set_message_reaction_impl(
     let emoji_attachment = match custom_emoji {
         None => None,
         Some(input) => {
+            // Bound the inputs BEFORE decoding/allocating (parity with
+            // `authorize_and_fetch_artifact`'s CID pre-check and the verify-time
+            // field-length cap): a 32-byte CID is exactly 64 hex chars, and the
+            // mime is bounded by MAX_ATTACHMENT_FIELD_BYTES, so an oversized IPC
+            // input can't trigger a large allocation or sign an over-long mime
+            // that peers would reject.
+            if input.cid.len() != 64 {
+                return Err("custom emoji cid must be 32 bytes (64 hex chars)".to_string());
+            }
+            if input.mime.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES {
+                return Err(format!(
+                    "custom emoji mime too long: {} > {}",
+                    input.mime.len(),
+                    crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
+                ));
+            }
             let emoji_cid: [u8; 32] = hex::decode(&input.cid)
                 .map_err(|e| format!("invalid custom emoji cid hex: {e}"))?
                 .try_into()
@@ -20623,35 +20639,67 @@ pub(crate) async fn ingest_channel_artifact_impl(
     }
     let (name, mime) = prepare_artifact_meta(meta.len(), &source_path, name, mime)?;
 
-    // Bounded read: cap the in-memory plaintext at MAX_ARTIFACT_BYTES + 1 so a
-    // file that grows after the stat (or a special file slipping past the
-    // is_file guard) can't read until OOM. The +1 sentinel makes the post-read
-    // cap check below catch the overflow case. The DTO `size` is the actual
-    // ingested byte count (the plaintext length the download side size-verifies
-    // against), not the pre-ingest stat — so a file changing between the stat
-    // and the read can't sign a mismatched `size` or grow past the cap.
-    //
-    // Note: the file is fully buffered (not streamed) before the shared inner.
-    // The encrypted path must buffer to encrypt; the public path is unified onto
-    // the same buffered model so both share one ingest core. MAX_ARTIFACT_BYTES
-    // bounds the buffer either way.
     let file = tokio::fs::File::open(&source_path)
         .await
         .map_err(|e| format!("open: {e}"))?;
-    let mut limited = tokio::io::BufReader::new(file).take(MAX_ARTIFACT_BYTES.saturating_add(1));
-    let mut plaintext = Vec::new();
-    limited
-        .read_to_end(&mut plaintext)
-        .await
-        .map_err(|e| format!("read: {e}"))?;
-    if plaintext.len() as u64 > MAX_ARTIFACT_BYTES {
-        return Err(format!(
-            "artifact too large: {} > {MAX_ARTIFACT_BYTES}",
-            plaintext.len()
-        ));
-    }
 
-    ingest_channel_artifact_bytes_inner(state, space, plaintext, name, mime, encrypt).await
+    // The DTO `size` is the actual ingested byte count (what the download side
+    // size-verifies against), NOT the pre-ingest stat — a file changing between
+    // the stat and the read/stream can't sign a mismatched `size`. The
+    // `.take(MAX_ARTIFACT_BYTES + 1)` + post-cap check bounds either path and
+    // closes the TOCTOU (a file growing after the stat can't exceed the cap).
+    if encrypt {
+        // Encryption needs the whole plaintext in memory anyway, so buffer
+        // (bounded) and delegate to the shared encrypt + chunk + serve core.
+        let mut limited =
+            tokio::io::BufReader::new(file).take(MAX_ARTIFACT_BYTES.saturating_add(1));
+        let mut plaintext = Vec::new();
+        limited
+            .read_to_end(&mut plaintext)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        if plaintext.len() as u64 > MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "artifact too large: {} > {MAX_ARTIFACT_BYTES}",
+                plaintext.len()
+            ));
+        }
+        ingest_channel_artifact_bytes_inner(state, space, plaintext, name, mime, true).await
+    } else {
+        // Public path: stream the file straight into the CAS chunk-by-chunk
+        // WITHOUT buffering the whole plaintext (restores the pre-refactor
+        // streaming behavior; a large public artifact must not allocate up to
+        // MAX_ARTIFACT_BYTES of RAM). `streaming_ingest_with_options` reports the
+        // streamed byte count, which becomes the authoritative `size` and is
+        // cap-checked post-stream.
+        use harmony_content::chunker::ChunkerConfig;
+        let ingest_tx = {
+            let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+            g.ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?
+        };
+        let reader = tokio::io::BufReader::new(file).take(MAX_ARTIFACT_BYTES.saturating_add(1));
+        let (root, n) = streaming_ingest_with_options(
+            reader,
+            &ingest_tx,
+            ChunkerConfig::DEFAULT,
+            None,
+            IngestOptions::default(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if n > MAX_ARTIFACT_BYTES {
+            return Err(format!("artifact too large: {n} > {MAX_ARTIFACT_BYTES}"));
+        }
+        Ok(crate::community_channel_log_engine::ChannelAttachmentDto {
+            cid: hex::encode(root.to_bytes()),
+            mime,
+            name,
+            size: n,
+            encrypted: root.flags().encrypted,
+        })
+    }
 }
 
 /// ZEB-541: shared encrypt-or-public ingest core, taking the artifact bytes
@@ -23156,7 +23204,7 @@ mod create_community_inner_tests {
             String::new(),
             true,
             Some(ReactionEmojiInput {
-                cid: "zz".to_string(), // not valid hex
+                cid: "z".repeat(64), // correct length (64 chars) but not valid hex
                 mime: "image/png".to_string(),
                 size: 1024,
             }),
@@ -23185,6 +23233,31 @@ mod create_community_inner_tests {
         .await
         .expect_err("overlong cid must be rejected");
         assert!(err.contains("must be 32 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_rejects_overlong_custom_emoji_mime() {
+        let state = reaction_error_path_state();
+        let err = set_message_reaction_impl(
+            &state,
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            VALID_HEX_32.to_string(),
+            String::new(),
+            true,
+            Some(ReactionEmojiInput {
+                cid: VALID_CID_64.to_string(),
+                // starts with "image/" but exceeds MAX_ATTACHMENT_FIELD_BYTES
+                mime: format!(
+                    "image/{}",
+                    "x".repeat(crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES)
+                ),
+                size: 1024,
+            }),
+        )
+        .await
+        .expect_err("over-long mime must be rejected");
+        assert!(err.contains("mime too long"), "got: {err}");
     }
 
     #[tokio::test]
