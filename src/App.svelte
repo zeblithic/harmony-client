@@ -9,13 +9,8 @@
   import VineFeed from './lib/components/VineFeed.svelte';
   import FileBrowser from './lib/components/FileBrowser.svelte';
   import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
-  import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
-  import NetworkDiscoverabilitySettings from './lib/components/NetworkDiscoverabilitySettings.svelte';
-  import FriendsPanel from './lib/components/FriendsPanel.svelte';
-  import ProfileEditor from './lib/components/ProfileEditor.svelte';
-  import IdentityPanel from './lib/components/IdentityPanel.svelte';
+  import SettingsPanel from './lib/components/SettingsPanel.svelte';
   import BackupStalenessWarning from './lib/components/BackupStalenessWarning.svelte';
-  import DevicesPanel from './lib/components/DevicesPanel.svelte';
   import SpellbookMode from './lib/components/SpellbookMode.svelte';
   import FlashcardStats from './lib/components/FlashcardStats.svelte';
   import MailInbox from './lib/components/MailInbox.svelte';
@@ -66,7 +61,7 @@
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import type { Update } from '@tauri-apps/plugin-updater';
   import { checkForUpdate } from './lib/updater-adapter';
   import {
@@ -106,6 +101,12 @@
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
   let showSettings = $state(false);
+  // ZEB-545: which Settings tab is active. Held here (not just inside
+  // SettingsPanel) so the app can route to a specific section — see
+  // handleExportRequested, which opens Settings → Account for the backup wizard.
+  let settingsTab = $state<'profile' | 'account' | 'notifications' | 'network' | 'friends'>(
+    'profile',
+  );
   let appMode = $state<AppMode>('messages');
 
   // ZEB-405 (WS-C): user-controlled reveal + width of the messages-mode media
@@ -2742,9 +2743,17 @@
     return [...peerMap.values()];
   });
 
-  function handleExportRequested() {
-    // Surface the existing IdentityPanel backup flow via an event bus.
-    // IdentityPanel listens for this on window in its onMount.
+  async function handleExportRequested() {
+    // Surface the existing IdentityPanel backup flow via an event bus:
+    // IdentityPanel registers the listener in its onMount. Since ZEB-545 split
+    // Settings into tabs that lazily mount their panel, IdentityPanel only
+    // exists when Settings → Account is open — and Settings itself only renders
+    // in 'messages' mode. Route there and await the mount before dispatching, or
+    // the listener isn't registered yet and the request is silently dropped.
+    appMode = 'messages';
+    showSettings = true;
+    settingsTab = 'account';
+    await tick();
     window.dispatchEvent(new CustomEvent('harmony:backup-export-requested'));
   }
 </script>
@@ -3015,22 +3024,19 @@
     />
   {/snippet}
   {#snippet settingsPanel()}
-    <ProfileEditor profile={myProfile} onSave={handleProfileSave} />
-    <IdentityPanel />
-    <DevicesPanel />
-    <NotificationSettingsPanel
-      service={notificationService}
+    <SettingsPanel
+      profile={myProfile}
+      onProfileSave={handleProfileSave}
+      {notificationService}
       {trustService}
       peers={knownPeers}
       {communities}
       onClose={() => { showSettings = false; }}
       onTrustChange={handleTrustChange}
-    />
-    <NetworkDiscoverabilitySettings />
-    <FriendsPanel
-      service={friendService}
-      cardService={friendCardService}
+      {friendService}
+      {friendCardService}
       onOpenCard={openMemberCard}
+      bind:activeTab={settingsTab}
     />
   {/snippet}
   {#snippet vineFeed()}
