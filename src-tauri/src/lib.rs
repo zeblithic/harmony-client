@@ -51401,6 +51401,47 @@ mod channel_message_ipc_tests {
         drop(state);
     }
 
+    /// Dedup proof: a PUBLIC ingest CIDs by hash(plaintext), so the same bytes
+    /// ingested in two DIFFERENT communities yield the IDENTICAL CID — the
+    /// network hosts one shared copy. (An encrypted ingest would differ per
+    /// epoch key; public does not. This is the content-addressing superpower the
+    /// public-emoji model unlocks.)
+    #[tokio::test]
+    async fn ingest_channel_artifact_bytes_public_is_deterministic_across_communities() {
+        let (tx, _log) = spawn_test_ingest_handler();
+        let state = StdMutex::new(NodeState {
+            ingest_tx: Some(tx),
+            ..NodeState::default()
+        });
+        let bytes: Vec<u8> = (0u8..200).collect();
+        let a = ingest_channel_artifact_bytes_impl(
+            &state,
+            "00".repeat(16),
+            bytes.clone(),
+            String::new(),
+            "image/png".into(),
+            false,
+        )
+        .await
+        .expect("public ingest a");
+        let b = ingest_channel_artifact_bytes_impl(
+            &state,
+            "11".repeat(16),
+            bytes.clone(),
+            String::new(),
+            "image/png".into(),
+            false,
+        )
+        .await
+        .expect("public ingest b");
+        assert_eq!(
+            a.cid, b.cid,
+            "same plaintext → same public CID (cross-community dedup)"
+        );
+        assert!(!a.encrypted && !b.encrypted, "both public");
+        drop(state);
+    }
+
     #[tokio::test]
     async fn list_channel_messages_rejects_limit_over_cap() {
         let app = mock_app_with_default_node_state();
