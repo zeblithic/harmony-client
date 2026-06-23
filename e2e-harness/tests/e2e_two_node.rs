@@ -1453,8 +1453,13 @@ async fn s6_relay_deposit_recover() {
         // Recover half (RECV/CLEARED) characterized pending ZEB-509: co-located
         // community query-serve never converges (epoch incomplete) → offline
         // recipient can't re-sync community state to drive the relay/butler pull.
-        // Deposit half (REACHABILITY + HELD) is hard-asserted above; cross-WAN
-        // two-machine (ZEB-477) is the authoritative recover proof.
+        // The owner-state epoch DURABILITY race behind this is fixed (#307) and
+        // regression-guarded (the ZEB-509 epoch-key assertion in
+        // pkarr_iroh_redeem_full_integration::zeb427_iroh_redeem_fences_owner_state_space_to_disk);
+        // the residual is the co-located harness-topology gap (recover likely needs
+        // the cross-WAN pkarr/relay re-discovery layer this topology lacks). Deposit
+        // half (REACHABILITY + HELD) is hard-asserted above; cross-WAN two-machine
+        // (ZEB-477) is the authoritative recover proof.
         eprintln!(
             "S6 FINDING (ZEB-509): b did not recover the deposited DM within 90s \
              co-located. Deposit landed (HELD passed); the gap is the co-located \
@@ -1482,8 +1487,13 @@ async fn s6_relay_deposit_recover() {
         // Recover half (RECV/CLEARED) characterized pending ZEB-509: co-located
         // community query-serve never converges (epoch incomplete) → offline
         // recipient can't re-sync community state to drive the relay/butler pull.
-        // Deposit half (REACHABILITY + HELD) is hard-asserted above; cross-WAN
-        // two-machine (ZEB-477) is the authoritative recover proof.
+        // The owner-state epoch DURABILITY race behind this is fixed (#307) and
+        // regression-guarded (the ZEB-509 epoch-key assertion in
+        // pkarr_iroh_redeem_full_integration::zeb427_iroh_redeem_fences_owner_state_space_to_disk);
+        // the residual is the co-located harness-topology gap (recover likely needs
+        // the cross-WAN pkarr/relay re-discovery layer this topology lacks). Deposit
+        // half (REACHABILITY + HELD) is hard-asserted above; cross-WAN two-machine
+        // (ZEB-477) is the authoritative recover proof.
         eprintln!(
             "S6 FINDING (ZEB-509): r's held entry was not released within 60s after \
              b's recovery co-located. RECV passed but the clear/GC handshake did not \
@@ -1874,8 +1884,13 @@ async fn s7_butler_deposit_recover() {
         // Recover half (RECV/CLEARED) characterized pending ZEB-509: co-located
         // community query-serve never converges (epoch incomplete) → offline
         // recipient can't re-sync community state to drive the relay/butler pull.
-        // Deposit half (REACHABILITY + HELD) is hard-asserted above; cross-WAN
-        // two-machine (ZEB-477) is the authoritative recover proof.
+        // The owner-state epoch DURABILITY race behind this is fixed (#307) and
+        // regression-guarded (the ZEB-509 epoch-key assertion in
+        // pkarr_iroh_redeem_full_integration::zeb427_iroh_redeem_fences_owner_state_space_to_disk);
+        // the residual is the co-located harness-topology gap (recover likely needs
+        // the cross-WAN pkarr/relay re-discovery layer this topology lacks). Deposit
+        // half (REACHABILITY + HELD) is hard-asserted above; cross-WAN two-machine
+        // (ZEB-477) is the authoritative recover proof.
         eprintln!(
             "S7 FINDING (ZEB-509): P did not recover the butler-deposited DM within \
              120s co-located. Deposit landed (HELD passed); the gap is the co-located \
@@ -1913,8 +1928,13 @@ async fn s7_butler_deposit_recover() {
         // Recover half (RECV/CLEARED) characterized pending ZEB-509: co-located
         // community query-serve never converges (epoch incomplete) → offline
         // recipient can't re-sync community state to drive the relay/butler pull.
-        // Deposit half (REACHABILITY + HELD) is hard-asserted above; cross-WAN
-        // two-machine (ZEB-477) is the authoritative recover proof.
+        // The owner-state epoch DURABILITY race behind this is fixed (#307) and
+        // regression-guarded (the ZEB-509 epoch-key assertion in
+        // pkarr_iroh_redeem_full_integration::zeb427_iroh_redeem_fences_owner_state_space_to_disk);
+        // the residual is the co-located harness-topology gap (recover likely needs
+        // the cross-WAN pkarr/relay re-discovery layer this topology lacks). Deposit
+        // half (REACHABILITY + HELD) is hard-asserted above; cross-WAN two-machine
+        // (ZEB-477) is the authoritative recover proof.
         eprintln!(
             "S7 FINDING (ZEB-509): B2's held entry did not record P's recovery within \
              60s co-located. RECV passed but the ingest/GC handshake did not settle \
