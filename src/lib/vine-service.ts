@@ -57,7 +57,18 @@ export class VineService {
    *  window (ZEB-209 bot R1). */
   private mockSeededIds = new Set<string>();
 
-  constructor() {
+  /**
+   * @param opts.seedMockData Whether to seed the discover feed with mock vines
+   *   so the UI is never empty while iterating. Defaults to `import.meta.env.DEV`
+   *   — true in `vite dev` / browser dev and under vitest, **false in a
+   *   production `vite build`**. ZEB-546: Vines ship in the alpha surface, so a
+   *   shipped build must NOT seed fake vines — real testers would otherwise see
+   *   them before (or without ever reaching) a live connection. Tests pass an
+   *   explicit flag to exercise both modes deterministically.
+   */
+  constructor(opts?: { seedMockData?: boolean }) {
+    const seedMockData = opts?.seedMockData ?? import.meta.env.DEV;
+    if (!seedMockData) return;
     // Seed with mock data for browser/dev mode — `connectAdapter()` clears
     // these (selectively, preserving any locally-created entries from the
     // pre-connect window) before subscribing to real events (ZEB-209).

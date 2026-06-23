@@ -17,6 +17,22 @@ describe('VineService', () => {
     expect(svc.vines.length).toBe(mockVines.length);
   });
 
+  // ZEB-546: Vines ship in the alpha surface, so a production build must not
+  // seed fake vines. The constructor gates seeding on `import.meta.env.DEV`
+  // (true under vitest / dev, false in a `vite build`); these pin both modes.
+  it('does NOT seed mock vines when seedMockData is false (shipped build)', () => {
+    const prod = new VineService({ seedMockData: false });
+    expect(prod.vines.length).toBe(0);
+    expect(prod.discoverVines.length).toBe(0);
+    expect(prod.followedVines.length).toBe(0);
+    expect(prod.viewedIds.size).toBe(0);
+  });
+
+  it('seeds mock vines when seedMockData is true (dev/browser)', () => {
+    const dev = new VineService({ seedMockData: true });
+    expect(dev.vines.length).toBe(mockVines.length);
+  });
+
   it('populates viewedIds from mock data', () => {
     const expectedViewed = mockVines.filter(v => v.viewed).map(v => v.id);
     for (const id of expectedViewed) {
