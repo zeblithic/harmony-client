@@ -462,6 +462,11 @@
   let customEmojiFor: string | null = null;
   let reactionError = $state<string | null>(null);
 
+  // Foundation: custom emoji are PUBLIC by default (deduplicated, freely served).
+  // This per-upload toggle opts a single emoji into the encrypted/private path.
+  // Reset to public after each pick so the safe default never silently sticks.
+  let customEmojiPrivate = $state(false);
+
   // Open the OS file picker for a custom emoji on `msg`. Mirrors the avatar
   // File-acquisition flow (ProfileEditor): a native <input type="file"> whose
   // change handler reads `files[0]` — a real web `File`, which `normalizeEmoji`
@@ -483,6 +488,9 @@
     const input = e.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
     const messageId = customEmojiFor;
+    // Capture the per-upload privacy choice, then reset to the public default.
+    const makePrivate = customEmojiPrivate;
+    customEmojiPrivate = false;
     // Reset the input + the target so a repeated pick of the same file re-fires
     // change, and a stale target can't leak into a later pick.
     input.value = '';
@@ -497,7 +505,7 @@
     try {
       const bytes = await normalizeEmoji(file);
       if (epoch !== attachEpoch) return; // channel switched mid-normalize
-      const { cid: emojiCid, size } = await channelMessageService.ingestEmojiBytes(commId, bytes);
+      const { cid: emojiCid, size } = await channelMessageService.ingestEmojiBytes(commId, bytes, makePrivate);
       if (epoch !== attachEpoch) return; // channel switched mid-ingest
       await channelMessageService.reactToMessage(commId, chid, messageId, '', true, {
         cid: emojiCid,
@@ -737,6 +745,16 @@
                   aria-label="Custom emoji"
                   onclick={() => startCustomEmojiPick(msg)}
                 >&#x2795;</button>
+                <label class="picker-private" title="Public emoji can be cached and re-shared by anyone and can't be deleted later. Check this to keep this emoji private to the community.">
+                  <input
+                    type="checkbox"
+                    bind:checked={customEmojiPrivate}
+                    aria-label="Keep custom emoji private to this community"
+                    aria-describedby="picker-private-hint-{msg.messageId}"
+                  />
+                  <span>Keep private</span>
+                </label>
+                <span class="picker-private-hint" id="picker-private-hint-{msg.messageId}">Public emoji can't be deleted later.</span>
               </div>
             {/if}
           </div>
@@ -978,6 +996,20 @@
     border-radius: 6px;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
     z-index: 10;
+  }
+  /* The picker is a 5-col grid; `grid-column: 1 / -1` drops the checkbox + hint
+     onto their own full-width rows below the emoji palette. */
+  .picker-private {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    grid-column: 1 / -1;
+    font-size: 0.75rem;
+  }
+  .picker-private-hint {
+    grid-column: 1 / -1;
+    font-size: 0.7rem;
+    opacity: 0.6;
   }
   .compose {
     border-top: 1px solid var(--border);
