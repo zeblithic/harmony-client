@@ -357,9 +357,12 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
     )
     .await;
     let set_status = r.status();
-    assert_ne!(
-        set_status, 404,
-        "connectivity_set_identity_discoverable must be reachable (not 404)"
+    // Reaches the handler: 200 (set applied, publisher present) or 500 (publisher
+    // unavailable in this headless boot). Asserting the specific codes — not merely
+    // `!= 404` — catches 4xx regressions (auth/arg-shape) that would otherwise pass.
+    assert!(
+        matches!(set_status.as_u16(), 200 | 500),
+        "connectivity_set_identity_discoverable must be 200 or 500; got {set_status}"
     );
     if set_status == 200 {
         let r = rpc(
@@ -451,10 +454,10 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
         }),
     )
     .await;
-    assert_ne!(
+    assert_eq!(
         r.status(),
-        404,
-        "kick_from_community must be reachable (not 404)"
+        500,
+        "kick_from_community with a bogus-but-valid target must fail through the handler (500), not 404/4xx"
     );
     let r = rpc(
         &http,
@@ -467,10 +470,10 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
         }),
     )
     .await;
-    assert_ne!(
+    assert_eq!(
         r.status(),
-        404,
-        "unban_from_community must be reachable (not 404)"
+        500,
+        "unban_from_community with a bogus-but-valid target must fail through the handler (500), not 404/4xx"
     );
     let r = rpc(
         &http,
@@ -483,10 +486,10 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
         }),
     )
     .await;
-    assert_ne!(
+    assert_eq!(
         r.status(),
-        404,
-        "countersign_admin_proposal must be reachable (not 404)"
+        500,
+        "countersign_admin_proposal with a bogus-but-valid proposal id must fail through the handler (500), not 404/4xx"
     );
 
     // ── Phase 6g: create_channel → channel id ───────────────────────────
