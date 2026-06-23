@@ -99,6 +99,36 @@ struct CommunityIdArgs {
     community_id: String,
 }
 
+/// ZEB-527: `community_id` + capped `limit` — shared by the two recent-feed
+/// moderation read verbs (`list_recent_counter_signs`,
+/// `list_recent_moderation_events`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommunityLimitArgs {
+    community_id: String,
+    limit: u32,
+}
+
+/// ZEB-527: `community_id` + `target_addr` + optional `reason` — shared by
+/// the two member-targeting moderation action verbs (`kick_from_community`,
+/// `unban_from_community`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModerationTargetArgs {
+    community_id: String,
+    target_addr: String,
+    reason: Option<String>,
+}
+
+/// ZEB-527: `community_id` + `proposal_event_id` for
+/// `countersign_admin_proposal`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CountersignArgs {
+    community_id: String,
+    proposal_event_id: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateCommunityArgs {
@@ -316,9 +346,15 @@ struct RepublishOwnerCardArgs {
     profile_page_root: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetIdentityDiscoverableArgs {
+    enabled: bool,
+}
+
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (49 commands). Every handler calls
+/// Build the curated v1 RPC surface (64 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
@@ -403,6 +439,65 @@ pub fn build_registry() -> RpcRegistry {
         "leave_community",
         CommunityIdArgs,
         |state, sink, a| async move { crate::leave_community_impl(state, sink, a.community_id).await }
+    );
+
+    // community moderation (ZEB-527)
+    rpc!(
+        m,
+        "list_pending_joins",
+        CommunityIdArgs,
+        |state, _sink, a| {
+            async move { crate::list_pending_joins_impl(state, a.community_id).await }
+        }
+    );
+    rpc!(
+        m,
+        "list_recent_counter_signs",
+        CommunityLimitArgs,
+        |state, _sink, a| async move {
+            crate::list_recent_counter_signs_impl(state, a.community_id, a.limit).await
+        }
+    );
+    rpc!(
+        m,
+        "list_recent_moderation_events",
+        CommunityLimitArgs,
+        |state, _sink, a| async move {
+            crate::list_recent_moderation_events_impl(state, a.community_id, a.limit).await
+        }
+    );
+    rpc!(
+        m,
+        "countersign_admin_proposal",
+        CountersignArgs,
+        |state, _sink, a| {
+            async move {
+                crate::countersign_admin_proposal_impl(state, a.community_id, a.proposal_event_id)
+                    .await
+            }
+        }
+    );
+    rpc!(
+        m,
+        "kick_from_community",
+        ModerationTargetArgs,
+        |state, _sink, a| {
+            async move {
+                crate::kick_from_community_impl(state, a.community_id, a.target_addr, a.reason)
+                    .await
+            }
+        }
+    );
+    rpc!(
+        m,
+        "unban_from_community",
+        ModerationTargetArgs,
+        |state, _sink, a| {
+            async move {
+                crate::unban_from_community_impl(state, a.community_id, a.target_addr, a.reason)
+                    .await
+            }
+        }
     );
 
     // Channels.
@@ -635,9 +730,31 @@ pub fn build_registry() -> RpcRegistry {
     );
     rpc!(
         m,
+        "connectivity_get_my_identity_pub_hex",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::connectivity_get_my_identity_pub_hex_impl(state).await }
+    );
+    rpc!(
+        m,
         "connectivity_list_peer_reachability",
         EmptyArgs,
         |state, _sink, _a| async move { crate::connectivity_list_peer_reachability_impl(state).await }
+    );
+    rpc!(
+        m,
+        "connectivity_set_identity_discoverable",
+        SetIdentityDiscoverableArgs,
+        |state, _sink, a| {
+            async move { crate::connectivity_set_identity_discoverable_impl(state, a.enabled).await }
+        }
+    );
+    rpc!(
+        m,
+        "connectivity_get_identity_discoverable",
+        EmptyArgs,
+        |state, _sink, _a| {
+            async move { crate::connectivity_get_identity_discoverable_impl(state).await }
+        }
     );
 
     // Network health.
@@ -775,6 +892,8 @@ mod tests {
     use crate::node_event_sink::FanoutSink;
     use crate::NodeState;
     use std::sync::Mutex;
+
+    const DUMMY_COMMUNITY_HEX: &str = "00000000000000000000000000000000"; // 16 bytes
 
     fn test_sink() -> Arc<dyn NodeEventSink> {
         Arc::new(FanoutSink(vec![]))
@@ -972,6 +1091,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connectivity_get_my_identity_pub_hex_returns_null_pre_owner() {
+        let reg = build_registry();
+        let out = reg
+            .dispatch(
+                "connectivity_get_my_identity_pub_hex",
+                test_state(),
+                test_sink(),
+                serde_json::Value::Null,
+            )
+            .await
+            .expect("verb registered + dispatches");
+        assert_eq!(out, serde_json::Value::Null); // Option<String>::None → JSON null
+    }
+
+    #[tokio::test]
+    async fn connectivity_get_identity_discoverable_defaults_false() {
+        let reg = build_registry();
+        let out = reg
+            .dispatch(
+                "connectivity_get_identity_discoverable",
+                test_state(),
+                test_sink(),
+                serde_json::Value::Null,
+            )
+            .await
+            .expect("verb registered");
+        assert_eq!(out, serde_json::Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn connectivity_set_identity_discoverable_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "connectivity_set_identity_discoverable",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "enabled": true }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::Command(_)),
+            "expected Command, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connectivity_set_identity_discoverable_rejects_missing_enabled() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "connectivity_set_identity_discoverable",
+                test_state(),
+                test_sink(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::BadArgs(_)),
+            "expected BadArgs, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pending_joins_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_pending_joins",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn list_pending_joins_rejects_missing_community_id() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_pending_joins",
+                test_state(),
+                test_sink(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::BadArgs(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn list_recent_counter_signs_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_recent_counter_signs",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX, "limit": 20 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn list_recent_moderation_events_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_recent_moderation_events",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX, "limit": 20 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn countersign_admin_proposal_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "countersign_admin_proposal",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX, "proposalEventId": DUMMY_COMMUNITY_HEX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn kick_from_community_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "kick_from_community",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX, "targetAddr": DUMMY_COMMUNITY_HEX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn kick_from_community_rejects_missing_target() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "kick_from_community",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::BadArgs(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn unban_from_community_errs_pre_owner() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "unban_from_community",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": DUMMY_COMMUNITY_HEX, "targetAddr": DUMMY_COMMUNITY_HEX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
     async fn registry_has_exactly_the_curated_v1_surface() {
         let reg = build_registry();
         let mut names = reg.command_names();
@@ -995,6 +1300,13 @@ mod tests {
             "redeem_invite",
             "join_open_community",
             "leave_community",
+            // community moderation (ZEB-527)
+            "list_pending_joins",
+            "list_recent_counter_signs",
+            "list_recent_moderation_events",
+            "countersign_admin_proposal",
+            "kick_from_community",
+            "unban_from_community",
             // channels
             "create_channel",
             "list_channels",
@@ -1030,7 +1342,10 @@ mod tests {
             "get_butler_held",
             // connectivity
             "connectivity_get_my_reachability_record",
+            "connectivity_get_my_identity_pub_hex",
             "connectivity_list_peer_reachability",
+            "connectivity_set_identity_discoverable",
+            "connectivity_get_identity_discoverable",
             "connectivity_redeem_invite_iroh",
             // network health
             "network_health_snapshot",

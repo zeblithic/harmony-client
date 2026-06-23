@@ -31717,9 +31717,8 @@ fn build_sealed_epoch_recipients(
 /// (power == 100), mints an AdminProposal instead of a direct Kick and
 /// returns `AdminActionResult::Pending`. Otherwise performs the direct
 /// Kick + EpochRotation and returns `AdminActionResult::Completed`.
-#[tauri::command]
-async fn kick_from_community(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn kick_from_community_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
     target_addr: String,
     reason: Option<String>,
@@ -31739,7 +31738,7 @@ async fn kick_from_community(
     let target = crate::owner_state_types::OwnerAddr(target_bytes);
 
     let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -31771,7 +31770,7 @@ async fn kick_from_community(
     // check we'd happily insert into a detached engine that's about to
     // be torn down.
     {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
@@ -31982,7 +31981,7 @@ async fn kick_from_community(
                 // against `prior_epoch` (the epoch at minting time) and only apply
                 // when the stored epoch is still behind the target.
                 if let Some(crdt_state) = {
-                    let g = state_lock
+                    let g = state
                         .lock()
                         .map_err(|e| format!("NodeState poisoned: {e}"))?;
                     g.crdt_state.clone()
@@ -32028,6 +32027,16 @@ async fn kick_from_community(
     }
 
     Ok(AdminActionResult::Completed)
+}
+
+#[tauri::command]
+async fn kick_from_community(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    target_addr: String,
+    reason: Option<String>,
+) -> Result<AdminActionResult, String> {
+    kick_from_community_impl(state_lock.inner(), community_id, target_addr, reason).await
 }
 
 // ── ZEB-262 Phase 4: set_power_level ─────────────────────────────────
@@ -32245,9 +32254,8 @@ async fn set_power_level(
 ///
 /// Does NOT trigger EpochRotation — Unban is additive. The subsequent
 /// Invite → Join flow handles its own epoch delivery.
-#[tauri::command]
-async fn unban_from_community(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn unban_from_community_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
     target_addr: String,
     reason: Option<String>,
@@ -32267,7 +32275,7 @@ async fn unban_from_community(
     let target = crate::owner_state_types::OwnerAddr(target_bytes);
 
     let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -32299,7 +32307,7 @@ async fn unban_from_community(
     // motivation; stop_node nullifies registry without bumping
     // generation).
     {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
@@ -32339,6 +32347,16 @@ async fn unban_from_community(
     Ok(())
 }
 
+#[tauri::command]
+async fn unban_from_community(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    target_addr: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    unban_from_community_impl(state_lock.inner(), community_id, target_addr, reason).await
+}
+
 // ── ZEB-284 Task 2: list_recent_moderation_events ────────────────────
 //
 // Read-only IPC: fetches the raw signed-event log from the community
@@ -32358,9 +32376,8 @@ async fn unban_from_community(
 /// EpochRotation, etc.) are filtered out.
 ///
 /// Errors: same hex/registry/Space-row error path as `list_community_members`.
-#[tauri::command]
-async fn list_recent_moderation_events(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn list_recent_moderation_events_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
     limit: u32,
 ) -> Result<Vec<ModerationEventDto>, String> {
@@ -32374,7 +32391,7 @@ async fn list_recent_moderation_events(
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (crdt_state, registry) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -32469,6 +32486,15 @@ async fn list_recent_moderation_events(
     Ok(dtos)
 }
 
+#[tauri::command]
+async fn list_recent_moderation_events(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    limit: u32,
+) -> Result<Vec<ModerationEventDto>, String> {
+    list_recent_moderation_events_impl(state_lock.inner(), community_id, limit).await
+}
+
 // ── ZEB-254 Task 12: list_pending_joins + list_recent_counter_signs ──────────
 //
 // Admin audit feed IPCs. Both read the raw signed event log from the
@@ -32496,9 +32522,8 @@ pub struct PendingJoinDto {
 /// within the 30-day expiry window. Sorted by pending_at_hlc ascending.
 ///
 /// Errors: same hex/registry/Space-row path as `list_community_members`.
-#[tauri::command]
-async fn list_pending_joins(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn list_pending_joins_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
 ) -> Result<Vec<PendingJoinDto>, String> {
     let id_bytes: [u8; 16] = hex::decode(&community_id)
@@ -32509,7 +32534,7 @@ async fn list_pending_joins(
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (registry, self_owner) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -32569,6 +32594,14 @@ async fn list_pending_joins(
         .unwrap_or_default()
         .as_millis() as u64;
     Ok(filter_pending_joins(&raw_events, now_ms))
+}
+
+#[tauri::command]
+async fn list_pending_joins(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<PendingJoinDto>, String> {
+    list_pending_joins_impl(state_lock.inner(), community_id).await
 }
 
 /// Pure filter: given the raw event log, return PendingJoin DTOs that
@@ -32653,9 +32686,8 @@ pub struct CounterSignDto {
 /// Sorted by countersigned_at_hlc descending. Pass limit=0 for default 20.
 ///
 /// Errors: same hex/registry path as `list_recent_moderation_events`.
-#[tauri::command]
-async fn list_recent_counter_signs(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn list_recent_counter_signs_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
     limit: u32,
 ) -> Result<Vec<CounterSignDto>, String> {
@@ -32665,10 +32697,16 @@ async fn list_recent_counter_signs(
         .try_into()
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
-    let cap = if limit == 0 { 20 } else { limit as usize };
+    // Bound the caller-supplied limit (parity with list_recent_moderation_events;
+    // this verb is reachable over the headless API). 0 keeps the legacy default.
+    let cap = if limit == 0 {
+        20
+    } else {
+        limit.clamp(1, 100) as usize
+    };
 
     let (registry, self_owner) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -32723,6 +32761,15 @@ async fn list_recent_counter_signs(
     };
 
     Ok(filter_recent_counter_signs(&raw_events, self_owner, cap))
+}
+
+#[tauri::command]
+async fn list_recent_counter_signs(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    limit: u32,
+) -> Result<Vec<CounterSignDto>, String> {
+    list_recent_counter_signs_impl(state_lock.inner(), community_id, limit).await
 }
 
 /// Pure filter: given the raw event log and the local owner's address,
@@ -33217,9 +33264,8 @@ pub fn count_signers(
 /// expired (> 30 days) or non-existent proposals.
 ///
 /// Authorization: caller must be Joined and have power ≥ 100.
-#[tauri::command]
-async fn countersign_admin_proposal(
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+pub(crate) async fn countersign_admin_proposal_impl(
+    state: &std::sync::Mutex<NodeState>,
     community_id: String,
     proposal_event_id: String,
 ) -> Result<CountersignResult, String> {
@@ -33240,7 +33286,7 @@ async fn countersign_admin_proposal(
         })?;
 
     let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
@@ -33264,7 +33310,7 @@ async fn countersign_admin_proposal(
 
     // Generation + registry fence.
     {
-        let g = state_lock
+        let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
@@ -33420,6 +33466,15 @@ async fn countersign_admin_proposal(
         quorum_required,
         reached_quorum: signers_after >= quorum_required,
     })
+}
+
+#[tauri::command]
+async fn countersign_admin_proposal(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    proposal_event_id: String,
+) -> Result<CountersignResult, String> {
+    countersign_admin_proposal_impl(state_lock.inner(), community_id, proposal_event_id).await
 }
 
 // ── ZEB-250 Task 12: propose_change_quorum IPC ────────────────────────────
@@ -43958,10 +44013,8 @@ mod friend_redeem_expiry_tests {
 /// Toggle case-B "Make me discoverable" setting. Persists the toggle to
 /// `connectivity-settings.json` and registers / unregisters the pkarr
 /// identity publication accordingly.
-#[tauri::command]
-async fn connectivity_set_identity_discoverable(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Mutex<NodeState>>,
+pub(crate) async fn connectivity_set_identity_discoverable_impl(
+    state: &std::sync::Mutex<NodeState>,
     enabled: bool,
 ) -> Result<(), String> {
     let (id_pub, settings_path) = {
@@ -43984,12 +44037,17 @@ async fn connectivity_set_identity_discoverable(
         return Err("pkarr_settings_path missing".into());
     };
 
-    // Persist the preference.
-    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
-    settings.identity_discoverable = enabled;
-    settings
-        .save(&path)
-        .map_err(|e| format!("save connectivity-settings: {e}"))?;
+    // Persist the preference. Offload the sync std::fs load+save off the Tokio
+    // worker — this seam is reachable over the async headless API surface.
+    tokio::task::spawn_blocking(move || {
+        let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
+        settings.identity_discoverable = enabled;
+        settings
+            .save(&path)
+            .map_err(|e| format!("save connectivity-settings: {e}"))
+    })
+    .await
+    .map_err(|e| format!("save connectivity-settings task: {e}"))??;
 
     // Toggle the publication.
     if enabled {
@@ -43997,6 +44055,17 @@ async fn connectivity_set_identity_discoverable(
     } else {
         id_pub.disable().await;
     }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn connectivity_set_identity_discoverable(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    connectivity_set_identity_discoverable_impl(state.inner(), enabled).await?;
 
     // Emit change event to the frontend.
     if let Err(e) = app.emit(
@@ -44012,9 +44081,8 @@ async fn connectivity_set_identity_discoverable(
 /// Read the current case-B "Make me discoverable" toggle state from the
 /// persisted settings file. Returns `false` when the file is missing or
 /// the pkarr settings path is not initialized.
-#[tauri::command]
-async fn connectivity_get_identity_discoverable(
-    state: tauri::State<'_, Mutex<NodeState>>,
+pub(crate) async fn connectivity_get_identity_discoverable_impl(
+    state: &std::sync::Mutex<NodeState>,
 ) -> Result<bool, String> {
     let path = {
         state
@@ -44027,7 +44095,20 @@ async fn connectivity_get_identity_discoverable(
         // Node not running or pkarr not initialized — return the default (off).
         return Ok(false);
     };
-    Ok(pkarr_settings::PkarrSettings::load_or_default(&path).identity_discoverable)
+    // Offload the sync std::fs read off the Tokio worker — this seam is reachable
+    // over the async headless API surface.
+    tokio::task::spawn_blocking(move || {
+        pkarr_settings::PkarrSettings::load_or_default(&path).identity_discoverable
+    })
+    .await
+    .map_err(|e| format!("load connectivity-settings task: {e}"))
+}
+
+#[tauri::command]
+async fn connectivity_get_identity_discoverable(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    connectivity_get_identity_discoverable_impl(state.inner()).await
 }
 
 /// ZEB-380: resolve `connectivity-settings.json` even when the node is stopped.
@@ -47510,6 +47591,14 @@ pub(crate) async fn connectivity_get_my_reachability_record_impl(
 #[tauri::command]
 async fn connectivity_get_my_identity_pub_hex(
     state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Option<String>, String> {
+    connectivity_get_my_identity_pub_hex_impl(state.inner()).await
+}
+
+/// Seam for `connectivity_get_my_identity_pub_hex` — shared by the Tauri IPC
+/// and the headless `api` surface.
+pub(crate) async fn connectivity_get_my_identity_pub_hex_impl(
+    state: &std::sync::Mutex<NodeState>,
 ) -> Result<Option<String>, String> {
     let g = state
         .lock()
