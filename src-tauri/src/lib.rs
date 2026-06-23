@@ -11862,10 +11862,20 @@ pub(crate) async fn publish_vine_impl(
     }
 
     // Snapshot the channels we need under the std lock; drop before any await.
-    let (node_addr, ingest_tx) = {
+    // Capture publish availability up front so we don't ingest (mint a CID +
+    // write content) only to fail the publish afterward, leaving orphaned bytes
+    // that no published descriptor references. (Qodo)
+    let (node_addr, ingest_tx, has_publish_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        (guard.node_addr.clone(), guard.ingest_tx.clone())
+        (
+            guard.node_addr.clone(),
+            guard.ingest_tx.clone(),
+            guard.publish_tx.is_some(),
+        )
     };
+    if !has_publish_tx {
+        return Err("not connected".to_string());
+    }
 
     // Resolve the video CID: use the caller's if non-empty, else ingest a small
     // synthetic payload so the descriptor references real, fetchable content.

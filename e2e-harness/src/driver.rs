@@ -445,12 +445,15 @@ pub async fn list_vine_videos(node: &NodeHandle) -> anyhow::Result<Vec<Value>> {
 }
 
 /// Mark a vine viewed; `true` if newly marked, `false` if already viewed.
+/// Fails loud on an unexpected response shape rather than masking a contract
+/// regression as `false` (the ZEB-462 masking trap) — mirrors `list_vine_videos`.
 pub async fn mark_vine_viewed(node: &NodeHandle, vine_id: &str) -> anyhow::Result<bool> {
-    Ok(node
+    let v = node
         .rpc("mark_vine_viewed", json!({ "vineId": vine_id }))
-        .await?
-        .as_bool()
-        .unwrap_or(false))
+        .await?;
+    v.get("viewed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!("mark_vine_viewed expected {{ viewed: bool }}, got: {v}"))
 }
 
 /// Reshare a vine by id; returns the published reshare's `reshareOf`.

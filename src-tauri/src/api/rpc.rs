@@ -638,7 +638,12 @@ pub fn build_registry() -> RpcRegistry {
         m,
         "mark_vine_viewed",
         VineIdArgs,
-        |state, _sink, a| async move { crate::mark_vine_viewed_impl(state, a.vine_id) }
+        |state, _sink, a| async move {
+            // Return an object `{ viewed }` (not a bare bool) to match the
+            // documented contract and the publish/reshare object shapes. (Qodo)
+            crate::mark_vine_viewed_impl(state, a.vine_id)
+                .map(|viewed| serde_json::json!({ "viewed": viewed }))
+        }
     );
     rpc!(
         m,
