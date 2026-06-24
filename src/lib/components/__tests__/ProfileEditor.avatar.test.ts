@@ -85,6 +85,23 @@ describe('ProfileEditor avatar upload', () => {
     expect(saved.avatarUrl).toBe('blob:fake');
   });
 
+  it('shows an animated-format notice when the picked file is a GIF (finding 16)', async () => {
+    render(ProfileEditor, { props: { profile: testProfile, onSave: vi.fn() } });
+    const input = screen.getByLabelText('Avatar image') as HTMLInputElement;
+    const gif = new File([new Uint8Array([9, 9, 9])], 'anim.gif', { type: 'image/gif' });
+    await fireEvent.change(input, { target: { files: [gif] } });
+    await waitFor(() => expect(screen.getByText(/static frame/i)).toBeInTheDocument());
+  });
+
+  it('does NOT show the animated-format notice for a static PNG (finding 16)', async () => {
+    render(ProfileEditor, { props: { profile: testProfile, onSave: vi.fn() } });
+    await pickFile(); // PNG
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('ingest_avatar_bytes', { bytes: [1, 2, 3] }),
+    );
+    expect(screen.queryByText(/static frame/i)).toBeNull();
+  });
+
   it('does NOT drop an existing avatarCid when saving without picking a new file', async () => {
     const profileWithAvatar: Profile = {
       ...testProfile,
