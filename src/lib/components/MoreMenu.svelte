@@ -29,6 +29,8 @@
     onSubmitFeedback?: () => void;
     onShowAbout?: () => void;
     onOpenDocs?: () => void;
+    /** ZEB-555: compact icon trigger for the collapsed (narrow-screen) rail. */
+    compact?: boolean;
   }
 
   const {
@@ -39,6 +41,7 @@
     onSubmitFeedback,
     onShowAbout,
     onOpenDocs,
+    compact = false,
   }: Props = $props();
 
   let open = $state(false);
@@ -107,6 +110,10 @@
   $effect(() => {
     if (open && containerEl) {
       queueMicrotask(() => {
+        // The menu may have closed before this microtask runs (rapid
+        // open→close); re-check so we never steal focus back into a dismissed
+        // menu. (Qodo PR #334.)
+        if (!open) return;
         containerEl?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
       });
     }
@@ -116,7 +123,9 @@
 <div class="more-container" bind:this={containerEl}>
   <button
     type="button"
-    class="nav-action-btn more-button"
+    class:nav-action-btn={!compact}
+    class:more-button={!compact}
+    class:more-icon-button={compact}
     data-testid="more-menu-button"
     aria-label="More"
     aria-haspopup="menu"
@@ -125,8 +134,12 @@
     bind:this={buttonEl}
     onclick={toggle}
   >
-    <span>More</span>
-    <span class="more-caret" aria-hidden="true">▾</span>
+    {#if compact}
+      <span aria-hidden="true">⋯</span>
+    {:else}
+      <span>More</span>
+      <span class="more-caret" aria-hidden="true">▾</span>
+    {/if}
   </button>
   {#if open}
     <div id="more-menu-list" class="more-dropdown" data-testid="more-menu" role="menu">
@@ -170,6 +183,22 @@
     align-items: center;
     justify-content: space-between;
   }
+  .more-icon-button {
+    width: 40px;
+    height: 40px;
+    border: none;
+    border-radius: 8px;
+    background: var(--bg-tertiary, #1f1f1f);
+    color: var(--text-primary, #fff);
+    font-size: 16px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .more-icon-button:hover {
+    background: var(--accent, #5865f2);
+  }
   .more-caret {
     font-size: 0.7rem;
     margin-left: 4px;
@@ -178,7 +207,7 @@
     position: absolute;
     bottom: calc(100% + 4px);
     left: 0;
-    right: 0;
+    min-width: 180px;
     background: var(--bg-secondary, #2a2a2a);
     border: 1px solid var(--border, #444);
     border-radius: 4px;

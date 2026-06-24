@@ -260,6 +260,16 @@ describe('NavPanel', () => {
       await fireEvent.click(screen.getByTestId('more-feedback'));
       expect(onSubmitFeedback).toHaveBeenCalled();
     });
+
+    it('keeps Help reachable when the nav is collapsed (narrow screens)', async () => {
+      // Regression (Qodo PR #334): collapsed (innerWidth <= 768) renders only
+      // the icon rail. The old (?) overlay was always visible, so Help must stay
+      // reachable here via a compact More trigger.
+      render(NavPanel, { props: { nodes: testNodes, collapsed: true } });
+      await fireEvent.click(screen.getByTestId('more-menu-button'));
+      expect(screen.getByTestId('more-feedback')).toBeTruthy();
+      expect(screen.getByTestId('more-network-health')).toBeTruthy();
+    });
   });
 
   describe('FAB + fan-out menu (ZEB-263)', () => {

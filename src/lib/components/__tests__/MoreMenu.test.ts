@@ -32,6 +32,15 @@ describe('MoreMenu (ZEB-555)', () => {
     expect(screen.queryByTestId('more-menu')).toBeNull();
   });
 
+  it('renders a compact icon trigger (collapsed rail) and still opens the menu', async () => {
+    render(MoreMenu, props({ compact: true }));
+    const btn = screen.getByTestId('more-menu-button');
+    expect(btn.getAttribute('aria-label')).toBe('More');
+    expect(btn.className).toContain('more-icon-button');
+    await open();
+    expect(screen.getByTestId('more-feedback')).toBeTruthy();
+  });
+
   it('opens to a Help-only menu (4 items, no "Go to") when there are no secondary modes', async () => {
     render(MoreMenu, props());
     await open();

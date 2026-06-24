@@ -359,6 +359,20 @@
           {node.name.charAt(0).toUpperCase()}
         </button>
       {/each}
+      <!-- ZEB-555: keep Help + secondary modes reachable on narrow (collapsed)
+           screens. The old (?) overlay was always visible regardless of nav
+           collapse; without this the More menu would exist only in the expanded
+           footer, stranding collapsed-layout users. -->
+      <MoreMenu
+        compact
+        {secondaryModes}
+        activeMode={appMode}
+        onSelectMode={(m) => onModeChange?.(m)}
+        onOpenNetworkHealth={() => onModeChange?.('network')}
+        {onSubmitFeedback}
+        {onShowAbout}
+        {onOpenDocs}
+      />
     </nav>
   {/if}
 </div>
