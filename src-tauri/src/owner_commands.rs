@@ -498,6 +498,8 @@ pub async fn issue_owner_recovery_token(
 /// confirmation and compares it against the device's current owner-id (ZEB-454).
 #[tauri::command]
 pub async fn preview_owner_mnemonic_identity(words: Vec<String>) -> Result<String, String> {
+    // Wipe the renderer-supplied plaintext words on drop (Vec<String>: Zeroize).
+    let words = Zeroizing::new(words);
     run_blocking(move || crate::recovery_cli::preview_owner_mnemonic_owner_id(&words)).await
 }
 
@@ -512,6 +514,8 @@ pub async fn restore_owner_mnemonic_from_words(
     words: Vec<String>,
     force: bool,
 ) -> Result<String, String> {
+    // Wipe the renderer-supplied plaintext words on drop (Vec<String>: Zeroize).
+    let words = Zeroizing::new(words);
     let identity_dir = resolve_identity_dir()?;
     run_blocking(move || {
         crate::recovery_cli::restore_owner_mnemonic_from_words_with_keychain(

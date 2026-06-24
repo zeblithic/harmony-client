@@ -1050,12 +1050,15 @@ pub fn restore_owner_mnemonic_with_keychain(
     force: bool,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
-    // Read the mnemonic file, then delegate to the words-array variant. `raw`
-    // is the only heap copy of the secret file text; it is wiped on drop.
+    // Read the mnemonic file, then delegate to the words-array variant. Both
+    // the file text (`raw`) and the per-word `String` copies (`words`) are
+    // wrapped in `Zeroizing` so no plaintext mnemonic lingers on the heap after
+    // this returns (`Vec<String>: Zeroize` wipes each element on drop).
     let raw = std::fs::read_to_string(mnemonic_file)
         .map_err(|e| format!("failed to read {}: {e}", mnemonic_file.display()))?;
     let raw = Zeroizing::new(raw);
-    let words: Vec<String> = raw.split_whitespace().map(String::from).collect();
+    let words: Zeroizing<Vec<String>> =
+        Zeroizing::new(raw.split_whitespace().map(String::from).collect());
     let owner_id_hex =
         restore_owner_mnemonic_from_words_with_keychain(identity_dir, &words, force, keychain)?;
     eprintln!("restored owner-id: {owner_id_hex}");
