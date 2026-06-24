@@ -11,6 +11,7 @@
   import PairingInviter from './PairingInviter.svelte';
   import PairingJoiner from './PairingJoiner.svelte';
   import Modal from './Modal.svelte';
+  import OwnerRestoreWizard from './OwnerRestoreWizard.svelte';
 
   let svc = new OwnerService();
   let state = $state<OwnerStateView | null>(null);
@@ -79,6 +80,8 @@
   let joinerOpen = $state(false);
 
   let backupOpen = $state(false);
+  // ZEB-454: owner-mnemonic restore wizard open/closed.
+  let restoreOpen = $state(false);
   let backupPassphrase = $state('');
   let backupPassphraseConfirm = $state('');
   let backupComment = $state('');
@@ -370,7 +373,25 @@
             Back up owner identity →
           </button>
         </div>
+        <!-- ZEB-454: re-adopt this owner identity from its 24-word recovery
+             phrase (the GUI analog of `restore owner-mnemonic`). -->
+        <button
+          class="restore-link"
+          data-testid="devices-restore-mnemonic"
+          onclick={() => { restoreOpen = true; }}
+        >
+          Restore from recovery phrase…
+        </button>
       </div>
+      {#if restoreOpen}
+        <!-- On success, reload so a fresh start_node loads the re-minted
+             owner_state (mirrors the pairing-join completion path). -->
+        <OwnerRestoreWizard
+          currentOwnerId={state.ownerId}
+          onRestored={() => location.reload()}
+          onCancel={() => { restoreOpen = false; }}
+        />
+      {/if}
 
       <!-- ② Devices list -->
       <div class="devices-list">
@@ -634,6 +655,20 @@
     font-size: 12px;
     color: var(--text-muted);
     font-family: monospace;
+  }
+  .restore-link {
+    margin-top: 8px;
+    padding: 0;
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-size: 0.8rem;
+    cursor: pointer;
+    text-decoration: underline;
+    text-align: left;
+  }
+  .restore-link:hover {
+    opacity: 0.85;
   }
   .devices-list {
     padding-bottom: 14px;

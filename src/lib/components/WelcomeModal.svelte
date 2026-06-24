@@ -18,6 +18,7 @@
   } from '../recovery-policy';
   import { trapFocus } from '../focus-trap';
   import PairingJoiner from './PairingJoiner.svelte';
+  import OwnerRestoreWizard from './OwnerRestoreWizard.svelte';
 
   interface Props {
     open: boolean;
@@ -25,7 +26,7 @@
   }
   const { open, onMinted }: Props = $props();
 
-  type Stage = 'explain' | 'minting' | 'backup' | 'skip-confirm' | 'joining';
+  type Stage = 'explain' | 'minting' | 'backup' | 'skip-confirm' | 'joining' | 'restore';
   let stage = $state<Stage>('explain');
   let mintResult = $state<MintIpcResult | null>(null);
   let mintError = $state<string | null>(null);
@@ -149,7 +150,29 @@
   function handleJoinComplete() {
     location.reload();
   }
+
+  // ZEB-454: restore the owner identity from its 24-word recovery phrase on a
+  // fresh install (total-loss recovery on a new machine). Non-destructive —
+  // the gate only mounts when no owner exists on this device, so there is
+  // nothing to overwrite. On success, reload so start_node loads the restored
+  // owner_state (same exit as a completed pairing-join).
+  function handleRestoreExisting() {
+    mintError = null;
+    stage = 'restore';
+  }
 </script>
+
+{#if open && stage === 'restore'}
+  <!-- Rendered as the sole modal (gate backdrop suppressed below), mirroring
+       the 'joining' branch. Cancel returns to the explain pane; the hard gate
+       is not dismissed — only a successful restore (which reloads into the
+       restored identity) or a mint leaves the gate. -->
+  <OwnerRestoreWizard
+    currentOwnerId={null}
+    onRestored={() => location.reload()}
+    onCancel={() => { stage = 'explain'; }}
+  />
+{/if}
 
 {#if open && stage === 'joining'}
   <!-- ZEB-494: pair this device into an existing identity instead of minting.
@@ -163,7 +186,7 @@
   />
 {/if}
 
-{#if open && stage !== 'joining'}
+{#if open && stage !== 'joining' && stage !== 'restore'}
   <div class="modal-backdrop" data-testid="welcome-modal-backdrop" role="presentation">
     <div
       bind:this={modalEl}
@@ -234,6 +257,13 @@
               disabled={stage === 'minting'}
             >
               Join another of my devices
+            </button>
+            <button
+              data-testid="welcome-restore-mnemonic"
+              onclick={handleRestoreExisting}
+              disabled={stage === 'minting'}
+            >
+              Restore from recovery phrase
             </button>
           {/if}
         </div>
