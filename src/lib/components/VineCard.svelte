@@ -2,7 +2,7 @@
   import type { VineVideo } from '../types';
   import Avatar from './Avatar.svelte';
   import { relativeTime } from '../file-utils';
-  import { vineCreatorLabel } from '../vine-utils';
+  import { vineCreatorLabel, vineOriginalCreatorLabel } from '../vine-utils';
 
   let { vine, onPlay, isViewed, showFollowButton = false, isFollowed = false, onFollow, onUnfollow, reactionCount = 0, likedByMe = false, onToggleLike, reshareCount = 0, onViewOriginal }: {
     vine: VineVideo;
@@ -28,9 +28,10 @@
   // the headless RPC with `creatorName` omitted carries "", so fall back to a
   // truncated owner-hex.
   let creatorLabel = $derived(vineCreatorLabel(vine.creatorName, vine.creatorAddress));
-  let originalLabel = $derived(
-    vineCreatorLabel(vine.originalCreatorName, vine.originalCreatorAddress ?? vine.creatorAddress),
-  );
+  // Reuse the shared origin resolver (falls back to the source creator's
+  // name/address pair) before the blank-guard, so "originally by" never shows
+  // hex when a creator name is available (Qodo PR #337).
+  let originalLabel = $derived(vineOriginalCreatorLabel(vine));
 
   function handleClick() {
     onPlay(vine);

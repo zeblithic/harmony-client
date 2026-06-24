@@ -75,3 +75,19 @@ export function vineCreatorLabel(
   const trimmed = name?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : address.slice(0, 8);
 }
+
+/**
+ * Non-blank "originally by …" label for a reshare's true-origin creator.
+ *
+ * Composes the two existing rules so attribution stays consistent (Qodo PR
+ * #337): resolve the origin pair via {@link resolveOriginalCreator} FIRST — which
+ * already falls back to the source vine's `creatorName`/`creatorAddress` when a
+ * reshare's `originalCreator*` fields are absent or only partially set — THEN
+ * apply the {@link vineCreatorLabel} blank-guard to the resolved pair. The
+ * truncated-hex floor only appears when BOTH the resolved origin name and the
+ * source creator name are empty (never preferred over an available name).
+ */
+export function vineOriginalCreatorLabel(vine: VineVideo): string {
+  const { originalCreatorName, originalCreatorAddress } = resolveOriginalCreator(vine);
+  return vineCreatorLabel(originalCreatorName, originalCreatorAddress);
+}

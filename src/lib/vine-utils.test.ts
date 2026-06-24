@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveOriginalCreator, vineCreatorLabel } from './vine-utils';
+import { resolveOriginalCreator, vineCreatorLabel, vineOriginalCreatorLabel } from './vine-utils';
 import type { VineVideo } from './types';
 
 function vine(overrides: Partial<VineVideo> = {}): VineVideo {
@@ -114,5 +114,46 @@ describe('vineCreatorLabel', () => {
 
   it('trims surrounding whitespace from a real name', () => {
     expect(vineCreatorLabel('  Bob  ', 'addr')).toBe('Bob');
+  });
+});
+
+describe('vineOriginalCreatorLabel', () => {
+  it('uses the true-origin name when a reshare carries both originalCreator fields', () => {
+    const v = vine({
+      reshareOf: 'vine-orig',
+      creatorAddress: 'addr-resharer',
+      creatorName: 'Resharer',
+      originalCreatorAddress: 'addr-alice',
+      originalCreatorName: 'Alice',
+    });
+    expect(vineOriginalCreatorLabel(v)).toBe('Alice');
+  });
+
+  it('falls back to the source creator NAME (not hex) when originalCreatorName is missing (Qodo #337 regression)', () => {
+    // A legacy/partial reshare payload with only a creatorName: must show that
+    // name, NOT a truncated address — the regression Qodo flagged.
+    const v = vine({
+      reshareOf: 'vine-orig',
+      creatorAddress: '685e4ba7deadbeef',
+      creatorName: 'Carol',
+      originalCreatorAddress: 'addr-alice',
+      // originalCreatorName intentionally unset (partial payload)
+    });
+    expect(vineOriginalCreatorLabel(v)).toBe('Carol');
+  });
+
+  it('uses the creator name for a non-reshare vine', () => {
+    const v = vine({ creatorAddress: 'addr-dan', creatorName: 'Dan' });
+    expect(vineOriginalCreatorLabel(v)).toBe('Dan');
+  });
+
+  it('falls back to truncated hex only when both resolved name and creator name are blank', () => {
+    const v = vine({
+      reshareOf: 'vine-orig',
+      creatorAddress: '685e4ba7deadbeef',
+      creatorName: '',
+      // no originalCreator* → resolver returns the (blank) source creator pair
+    });
+    expect(vineOriginalCreatorLabel(v)).toBe('685e4ba7');
   });
 });
