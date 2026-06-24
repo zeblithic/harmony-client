@@ -12,6 +12,14 @@
     throw new Error(`unhandled wizard variant: ${JSON.stringify(x)}`);
   }
 
+  // Normalize a caught value to its message. Tauri IPC rejections are raw
+  // strings in production but `Error` objects in tests; interpolating the value
+  // directly (`${e}`) would surface a stringified "Error: <msg>" to the user.
+  // Mirrors the idiom used at the restore-decrypt catch below.
+  function errMsg(e: unknown): string {
+    return e instanceof Error ? e.message : String(e);
+  }
+
   // `fullHash` is `null` until `current_identity_hash` resolves on mount.
   // Anything that reads/decides on the current identity (the typed-prefix
   // confirm gate, the Backup/Restore buttons, copy-to-clipboard) must check
@@ -150,7 +158,7 @@
       try {
         fullHash = await invoke<string>('current_identity_hash');
       } catch (e) {
-        loadError = `Could not read identity store: ${e}. The wizard cannot continue.`;
+        loadError = `Could not read identity store: ${errMsg(e)}. The wizard cannot continue.`;
       }
     })();
   });
@@ -195,7 +203,7 @@
         if (wizardState !== epoch) return;
         wizardState = {
           kind: 'backup',
-          step: { phase: 'mnemonicReveal', words: [], revealed: false, storedSafely: false, loadError: `Could not load recovery phrase: ${e}` },
+          step: { phase: 'mnemonicReveal', words: [], revealed: false, storedSafely: false, loadError: `Could not load recovery phrase: ${errMsg(e)}` },
         };
         return;
       }
@@ -274,7 +282,7 @@
           kind: 'backup',
           step: {
             phase: 'fileSaveError',
-            error: `Could not open the save dialog: ${e}. Try again.`,
+            error: `Could not open the save dialog: ${errMsg(e)}. Try again.`,
             passphrase,
             passphraseConfirm,
             comment,
@@ -329,7 +337,7 @@
           kind: 'backup',
           step: {
             phase: 'fileSaveError',
-            error: `Could not save to the chosen location: ${e}. Try a different location.`,
+            error: `Could not save to the chosen location: ${errMsg(e)}. Try a different location.`,
             passphrase,
             passphraseConfirm,
             comment,
@@ -477,7 +485,7 @@
       // the spec's ambiguous text — we don't leak which input was wrong.
       // Tauri rejects with a string in production, but tests use Error;
       // unwrap to .message in both paths so the prefix-detection works.
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = errMsg(e);
       const isIoError =
         msg.startsWith('failed to read ') ||
         msg.includes(' is too large to be a recovery file');

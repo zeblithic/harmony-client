@@ -913,6 +913,12 @@
     {#if composeError}
       <div class="compose-error" role="alert">{composeError}</div>
     {/if}
+    {#if ingesting}
+      <!-- Surface the in-flight ingest so pressing Enter (which no-ops while
+           a file is still being read in) reads as "finishing upload", not a
+           dead key. `role="status"` announces it to assistive tech. -->
+      <div class="compose-hint" role="status" data-testid="compose-ingest-hint">Finishing upload…</div>
+    {/if}
     {#if pendingAttachments.length > 0}
       <div class="pending-attachments">
         {#each pendingAttachments as att (att.cid)}
@@ -944,7 +950,7 @@
         bind:value={composeText}
         onkeydown={handleCompose}
         class="compose-input"
-        placeholder={`Message #${channelName}`}
+        placeholder={ingesting ? 'Finishing upload…' : `Message #${channelName}`}
         rows="2"
         aria-label="Channel message"
         disabled={posting}
@@ -1178,6 +1184,11 @@
     color: #d83c3e;
     padding: 6px 8px;
     border-radius: 4px;
+    font-size: 0.75rem;
+    margin-bottom: 8px;
+  }
+  .compose-hint {
+    color: var(--text-secondary);
     font-size: 0.75rem;
     margin-bottom: 8px;
   }

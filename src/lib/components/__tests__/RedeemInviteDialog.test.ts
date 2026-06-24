@@ -184,6 +184,33 @@ describe('RedeemInviteDialog', () => {
     expect(onSubmit).toHaveBeenCalledWith('harmony://invite/v1?ci=x');
   });
 
+  it('clears the iroh error banner when handing off to the LAN fallback (no stacked banners)', async () => {
+    // finding 12: after iroh fails and the user clicks "Try via local network",
+    // the iroh banner must clear so a subsequent LAN failure (which the parent
+    // surfaces via the `error` prop → the mapped banner) doesn't stack a second
+    // error banner on top of the iroh one.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_redeem_invite_iroh') {
+        return Promise.resolve({ status: 'inviter_unreachable' });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { getByTestId, queryByTestId, getByPlaceholderText } = render(RedeemInviteDialog, {
+      props: { onSubmit: vi.fn(), onCancel: vi.fn() },
+    });
+
+    const input = getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: 'harmony://invite/v1?ci=x' } });
+    await fireEvent.click(getByTestId('iroh-redeem-btn'));
+
+    await waitFor(() => getByTestId('iroh-error-banner'));
+    await fireEvent.click(getByTestId('fallback-lan-btn'));
+
+    // The iroh banner is gone; the LAN path now owns error display.
+    expect(queryByTestId('iroh-error-banner')).toBeNull();
+  });
+
   it('shows reach-but-local-failure message and NO fallback button when join_failed', async () => {
     // ZEB-325 PR #159 R1: status='join_failed' means the inviter was reached
     // and a valid JoinCountersign was delivered, but the local insert/commit
