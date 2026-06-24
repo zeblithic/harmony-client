@@ -1440,25 +1440,25 @@ impl NotifyEmitter for ProdNotifyEmitter {
 
 /// Production `PkarrSnapshot` wrapping the shared `PkarrPublisher`.
 ///
-/// **Phase 1 stub:** the upstream `PkarrSnapshot` trait is synchronous
-/// (so it can fan through `NetworkHealthService::snapshot` without
-/// imposing an `async` recursion at every call site), but
-/// `PkarrPublisher::active_handles()` is `async` — it takes an
-/// internal `tokio::Mutex`. Per the plan's "If the type is awkward,
-/// ship a stub returning false/0/empty" allowance, this impl holds
-/// the publisher `Arc` (so the wiring is real / re-pluggable) and
-/// returns conservative defaults. A follow-up ticket either:
+/// The `PkarrSnapshot` trait is synchronous (so it can fan through
+/// `NetworkHealthService::snapshot` without imposing `async` recursion at
+/// every call site), so this impl reads publish state via the publisher's
+/// non-blocking [`try_active_handles`][harmony_pkarr::PkarrPublisher::try_active_handles]
+/// accessor (ZEB-511). The registered handle set is the single source of
+/// truth:
 ///
-///   * adds a synchronous `try_active_handles() -> Option<Vec<String>>`
-///     accessor to `PkarrPublisher` that returns `None` when the
-///     async mutex is contended, OR
-///   * lifts a periodically-refreshed `ArcSwap<Vec<String>>` snapshot
-///     onto the publisher's spawned loop.
+///   * `identity_published` — the fixed `"identity"` handle is registered
+///     (case B; see `pkarr_identity_publisher::HANDLE`).
+///   * `community_publish_count` — number of `"community:<hex>"` handles
+///     registered (case C; see `pkarr_community_publisher`).
 ///
-/// Either path lets this impl read synchronously without blocking the
-/// rate-limiter task or the IPC handler.
+/// `try_active_handles()` returns `None` only during the sub-millisecond
+/// window the background driver holds the state lock; that maps to the
+/// conservative default (the driver never holds the lock across a network
+/// PUT). `identity_last_publish_ms` is derived in the synthesis from the
+/// confirmed relay `last_success_ms` — the publisher records no
+/// last-publish wall-clock of its own.
 pub struct ProdPkarrSnapshot {
-    #[allow(dead_code)]
     publisher: std::sync::Arc<harmony_pkarr::PkarrPublisher>,
 }
 
@@ -1470,19 +1470,28 @@ impl ProdPkarrSnapshot {
 
 impl PkarrSnapshot for ProdPkarrSnapshot {
     fn identity_published(&self) -> bool {
-        // TODO(zeb-329-followup): surface real state once
-        // `PkarrPublisher` exposes a sync handle accessor (see struct
-        // doc). Defaulting to `false` keeps the UI honest — better to
-        // show "unknown publish state" than to falsely claim success.
-        false
+        // Real state via the non-blocking publisher accessor (ZEB-511). The
+        // case-B identity publication registers under the fixed "identity"
+        // handle (pkarr_identity_publisher::HANDLE). `None` only on the
+        // sub-ms driver lock window → treat as "not observed" (conservative).
+        self.publisher
+            .try_active_handles()
+            .map(|h| h.iter().any(|k| k == "identity"))
+            .unwrap_or(false)
     }
     fn identity_last_publish_ms(&self) -> Option<u64> {
-        // TODO(zeb-329-followup): see struct doc.
+        // The publisher records no last-publish wall-clock; this is derived in
+        // NetworkHealthService::snapshot from the confirmed relay
+        // last_success_ms (ZEB-511). `None` here is the not-publishing default.
         None
     }
     fn community_publish_count(&self) -> u32 {
-        // TODO(zeb-329-followup): see struct doc.
-        0
+        // Case-C community publications register under "community:<hex>"
+        // handles (pkarr_community_publisher). Count them (ZEB-511).
+        self.publisher
+            .try_active_handles()
+            .map(|h| h.iter().filter(|k| k.starts_with("community:")).count() as u32)
+            .unwrap_or(0)
     }
     fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
         // TODO(zeb-329-followup): wire a ring buffer of recent
@@ -2588,6 +2597,67 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(found, "published identity became resolvable -> Pass");
+    }
+
+    /// Build a `ProdPkarrSnapshot` whose publisher has the given handles
+    /// registered. No driver is spawned — `register` inserts into the state
+    /// map, which `try_active_handles` reads synchronously (ZEB-511).
+    async fn prod_pkarr_with_handles(handles: &[&str]) -> ProdPkarrSnapshot {
+        use harmony_pkarr::{
+            current_epoch_id, derive_ephemeral_key, testing::MockPkarrRelay, EphemeralKeyBuilder,
+            PkarrCase, PkarrPublisher, PkarrRoutingRecord, RecordBuilder, RelayClient, RelayPool,
+        };
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let publisher = std::sync::Arc::new(PkarrPublisher::new(client));
+        let id_sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&id_sk.verifying_key().to_bytes());
+        for h in handles {
+            let id_pub_k = id_pub;
+            let kb: EphemeralKeyBuilder = std::sync::Arc::new(move |at_ms| {
+                derive_ephemeral_key(
+                    PkarrCase::Identity,
+                    &id_pub_k,
+                    &current_epoch_id(at_ms).to_be_bytes(),
+                )
+            });
+            let sk = id_sk.clone();
+            let b: RecordBuilder = std::sync::Arc::new(move |at_ms| {
+                PkarrRoutingRecord::sign_new(
+                    b"x".to_vec(),
+                    id_pub,
+                    at_ms,
+                    at_ms + crate::reachability_record::REACHABILITY_RECORD_TTL_MS,
+                    &sk,
+                )
+                .expect("sign")
+            });
+            publisher.register((*h).to_string(), kb, b).await;
+        }
+        ProdPkarrSnapshot::new(publisher)
+    }
+
+    #[tokio::test]
+    async fn prod_pkarr_identity_published_reflects_registered_handle() {
+        let snap = prod_pkarr_with_handles(&["identity"]).await;
+        assert!(snap.identity_published());
+        assert_eq!(snap.community_publish_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn prod_pkarr_community_count_counts_community_handles() {
+        let snap = prod_pkarr_with_handles(&["identity", "community:aa", "community:bb"]).await;
+        assert!(snap.identity_published());
+        assert_eq!(snap.community_publish_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn prod_pkarr_identity_unpublished_when_no_identity_handle() {
+        let snap = prod_pkarr_with_handles(&["community:aa"]).await;
+        assert!(!snap.identity_published());
+        assert_eq!(snap.community_publish_count(), 1);
     }
 
     #[tokio::test]
