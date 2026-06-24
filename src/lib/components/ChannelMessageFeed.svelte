@@ -10,6 +10,7 @@
   import ReactionEmojiImage from './ReactionEmojiImage.svelte';
   import NamedEmojiPicker from './NamedEmojiPicker.svelte';
   import { normalizeEmoji } from '../emoji-normalize';
+  import { emojiNameError, MAX_EMOJI_NAME_LEN } from '../emoji-name-validation';
   import { open } from '@tauri-apps/plugin-dialog';
   import { formatBytes, mimeCategoryIcon } from '../file-utils';
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
@@ -496,17 +497,34 @@
     if (!r.emojiCid) return;
     namingCid = r.emojiCid;
     namingValue = '';
+    namingError = null;
     namingMime = 'image/png';
     namingSize = r.emojiSize ?? 0;
   }
 
+  function cancelNameThis(): void {
+    namingCid = null;
+    namingError = null;
+  }
+
   // Task 10 — commit the typed name to the local emoji-name map. Reuses the
-  // existing `reactionError` surfaced-error state on failure.
+  // existing `reactionError` surfaced-error state on backend failure.
   async function commitNameThis(): Promise<void> {
+    if (!namingCid) return;
     const cid = namingCid;
     const name = namingValue.trim();
-    namingCid = null;
-    if (!cid || !name) return;
+    if (!name) {
+      cancelNameThis();
+      return;
+    }
+    // Validate client-side: keep the inline input OPEN on a bad name so the
+    // user's typed text isn't lost to a raw backend bounce.
+    const validationErr = emojiNameError(name);
+    if (validationErr) {
+      namingError = validationErr;
+      return;
+    }
+    cancelNameThis();
     try {
       await channelMessageService.setEmojiName(cid, name, namingMime, namingSize);
     } catch (e) {
@@ -535,6 +553,7 @@
   let namedPickerFor = $state<string | null>(null);
   let namingCid = $state<string | null>(null);
   let namingValue = $state('');
+  let namingError = $state<string | null>(null);
   let namingMime = '';
   let namingSize = 0;
   let uploadName = $state('');
@@ -601,8 +620,16 @@
         size,
       });
       // Task 10 — if a name was typed at upload (PUBLIC emoji only), bind it now.
+      // Validate client-side first so an invalid name surfaces friendly copy
+      // instead of the backend's raw bounce; the emoji itself still uploaded
+      // and reacted, so we only report that the NAME didn't stick.
       if (nameAtUpload && !makePrivate) {
-        await channelMessageService.setEmojiName(emojiCid, nameAtUpload, 'image/png', size);
+        const nameErr = emojiNameError(nameAtUpload);
+        if (nameErr) {
+          reactionError = `Uploaded, but couldn't name it: ${nameErr}`;
+        } else {
+          await channelMessageService.setEmojiName(emojiCid, nameAtUpload, 'image/png', size);
+        }
       }
     } catch (err) {
       if (epoch !== attachEpoch) return; // don't surface on a stale channel
@@ -803,11 +830,18 @@
                       <input
                         class="name-this-input"
                         type="text"
+                        maxlength={MAX_EMOJI_NAME_LEN}
                         aria-label="Emoji name"
                         bind:value={namingValue}
-                        onkeydown={(ev) => ev.key === 'Enter' && commitNameThis()}
+                        onkeydown={(ev) => {
+                          if (ev.key === 'Enter') commitNameThis();
+                          else if (ev.key === 'Escape') cancelNameThis();
+                        }}
                       />
                       <button type="button" class="name-this-save" aria-label="Save emoji name" onclick={() => commitNameThis()}>✓</button>
+                      {#if namingError}
+                        <span class="name-this-error" role="alert">{namingError}</span>
+                      {/if}
                     {:else}
                       <button type="button" class="name-this" aria-label="Name this emoji" onclick={() => startNameThis(r)}>✎</button>
                     {/if}
@@ -877,7 +911,7 @@
                 >🔖</button>
                 <label class="picker-upload-name">
                   <span>Name (optional)</span>
-                  <input type="text" aria-label="Name new emoji" bind:value={uploadName} placeholder="catjam" />
+                  <input type="text" maxlength={MAX_EMOJI_NAME_LEN} aria-label="Name new emoji" bind:value={uploadName} placeholder="catjam" />
                 </label>
                 {#if namedPickerFor === msg.messageId}
                   <div class="named-popover">
@@ -1174,6 +1208,7 @@
   }
   .name-this:hover { opacity: 1; }
   .name-this-input { width: 7rem; }
+  .name-this-error { font-size: 0.7rem; color: #d83c3e; margin-left: 4px; }
   .compose {
     border-top: 1px solid var(--border);
     padding: 8px 16px 12px;
