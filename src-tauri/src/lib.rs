@@ -20743,9 +20743,15 @@ pub(crate) fn detect_mime(name: &str) -> String {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "txt" => "text/plain",
+        "txt" | "md" | "log" | "csv" => "text/plain",
         "json" => "application/json",
         "png" => "image/png",
+        // jpg/jpeg are dimension-guarded before decode (the frontend's
+        // `assertHeaderDimsOk` parses PNG + JPEG headers), so they're safe to
+        // inline-preview. gif/webp are deliberately NOT mapped to image/* here:
+        // they have no pre-decode header guard, so mapping them would open a
+        // decode-bomb surface on the preview path — they stay download-only.
+        "jpg" | "jpeg" => "image/jpeg",
         "diff" | "patch" => "text/x-diff",
         _ => "application/octet-stream",
     }
@@ -51506,8 +51512,18 @@ mod channel_message_ipc_tests {
     #[test]
     fn detect_mime_maps_known_extensions() {
         assert_eq!(detect_mime("a.txt"), "text/plain");
+        assert_eq!(detect_mime("a.md"), "text/plain");
+        assert_eq!(detect_mime("a.log"), "text/plain");
+        assert_eq!(detect_mime("a.csv"), "text/plain");
         assert_eq!(detect_mime("a.json"), "application/json");
         assert_eq!(detect_mime("a.png"), "image/png");
+        assert_eq!(detect_mime("photo.jpg"), "image/jpeg");
+        assert_eq!(detect_mime("photo.jpeg"), "image/jpeg");
+        // Extension match is case-insensitive.
+        assert_eq!(detect_mime("PHOTO.JPG"), "image/jpeg");
+        // gif/webp stay download-only (no pre-decode header guard).
+        assert_eq!(detect_mime("anim.gif"), "application/octet-stream");
+        assert_eq!(detect_mime("pic.webp"), "application/octet-stream");
         assert_eq!(detect_mime("a.diff"), "text/x-diff");
         assert_eq!(detect_mime("a.patch"), "text/x-diff");
         assert_eq!(detect_mime("a.unknownext"), "application/octet-stream");
