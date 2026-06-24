@@ -15,6 +15,33 @@
   type Tab = 'global' | 'communities' | 'peers';
   let activeTab = $state<Tab>('global');
 
+  const TABS: { id: Tab; label: string }[] = [
+    { id: 'global', label: 'Global' },
+    { id: 'communities', label: 'Communities' },
+    { id: 'peers', label: 'Peers' },
+  ];
+
+  function focusTab(id: Tab): void {
+    document.getElementById(`notif-tab-${id}`)?.focus();
+  }
+
+  // WAI-ARIA tablist keyboard interaction (horizontal, automatic activation),
+  // mirroring SettingsPanel: Left/Right move between tabs (wrapping), Home/End
+  // jump to the ends, and selection follows focus. Paired with a roving
+  // tabindex (only the active tab is in the tab order) so Tab enters the tablist
+  // once and arrows navigate within it.
+  function handleTabKey(e: KeyboardEvent, index: number): void {
+    let target: number | null = null;
+    if (e.key === 'ArrowRight') target = (index + 1) % TABS.length;
+    else if (e.key === 'ArrowLeft') target = (index - 1 + TABS.length) % TABS.length;
+    else if (e.key === 'Home') target = 0;
+    else if (e.key === 'End') target = TABS.length - 1;
+    if (target === null) return;
+    e.preventDefault();
+    activeTab = TABS[target].id;
+    focusTab(activeTab);
+  }
+
   const ACTION_LABELS: Record<NotificationAction, string> = {
     silent: 'Muted',
     dot_only: 'Dot only',
@@ -160,13 +187,29 @@
     <button class="close-btn" aria-label="Close settings" onclick={() => onClose?.()}>&#x2715;</button>
   </div>
 
-  <div class="tabs">
-    <button class="tab {activeTab === 'global' ? 'active' : ''}" onclick={() => { activeTab = 'global'; }}>Global</button>
-    <button class="tab {activeTab === 'communities' ? 'active' : ''}" onclick={() => { activeTab = 'communities'; }}>Communities</button>
-    <button class="tab {activeTab === 'peers' ? 'active' : ''}" onclick={() => { activeTab = 'peers'; }}>Peers</button>
+  <div class="tabs" role="tablist" aria-label="Notification scope">
+    {#each TABS as tab, i (tab.id)}
+      <button
+        class="tab"
+        class:active={activeTab === tab.id}
+        role="tab"
+        id="notif-tab-{tab.id}"
+        aria-selected={activeTab === tab.id}
+        aria-controls="notif-tabpanel"
+        tabindex={activeTab === tab.id ? 0 : -1}
+        onclick={() => { activeTab = tab.id; }}
+        onkeydown={(e) => handleTabKey(e, i)}
+      >{tab.label}</button>
+    {/each}
   </div>
 
-  <div class="tab-content">
+  <div
+    class="tab-content"
+    id="notif-tabpanel"
+    role="tabpanel"
+    aria-labelledby="notif-tab-{activeTab}"
+    tabindex="0"
+  >
     {#if activeTab === 'global'}
       <div class="policy-rows">
         {#each (['quiet', 'standard', 'loud'] as const) as level}

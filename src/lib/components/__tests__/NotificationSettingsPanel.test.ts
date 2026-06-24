@@ -63,6 +63,30 @@ describe('NotificationSettingsPanel', () => {
     expect(screen.getByText('Work')).toBeTruthy();
   });
 
+  it('exposes the sub-tabs as a WAI-ARIA tablist with roving tabindex + arrow-key nav (finding 15)', async () => {
+    const svc = new NotificationService();
+    render(NotificationSettingsPanel, {
+      props: { service: svc, peers: mockPeers, communities: mockCommunities },
+    });
+    expect(screen.getByRole('tablist')).toBeTruthy();
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs).toHaveLength(3);
+    // Roving tabindex: only the active (Global) tab is in the tab order.
+    expect(tabs[0].getAttribute('aria-selected')).toBe('true');
+    expect(tabs[0].getAttribute('tabindex')).toBe('0');
+    expect(tabs[1].getAttribute('tabindex')).toBe('-1');
+    // ArrowRight moves selection to Communities (selection follows focus).
+    await fireEvent.keyDown(tabs[0], { key: 'ArrowRight' });
+    expect(tabs[1].getAttribute('aria-selected')).toBe('true');
+    expect(tabs[1].getAttribute('tabindex')).toBe('0');
+    expect(screen.getByText('Work')).toBeTruthy(); // Communities panel content
+    // The content is a labelled tabpanel pointing at the active tab.
+    expect(screen.getByRole('tabpanel').getAttribute('aria-labelledby')).toBe('notif-tab-communities');
+    // Home jumps back to the first tab.
+    await fireEvent.keyDown(tabs[1], { key: 'Home' });
+    expect(tabs[0].getAttribute('aria-selected')).toBe('true');
+  });
+
   it('calls onClose when close button is clicked', async () => {
     const svc = new NotificationService();
     const onClose = vi.fn();
