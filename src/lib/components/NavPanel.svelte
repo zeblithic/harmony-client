@@ -31,6 +31,7 @@
     onNewCommunity,
     onRedeemInvite,
     onBrowseLibraries,
+    onPostVine,
     onSelectNotes,
     notesActive = false,
     onSubmitFeedback,
@@ -60,6 +61,8 @@
     onRedeemInvite?: () => void;
     /** ZEB-218 Sub-D Phase 1: opens the library directory browser. */
     onBrowseLibraries?: () => void;
+    /** ZEB-559: open the vine publish composer from the global create menu. */
+    onPostVine?: () => void;
     /** ZEB-334: select the private self-notes space. */
     onSelectNotes?: () => void;
     /** ZEB-334: whether the self-notes space is the active view. */
@@ -258,6 +261,10 @@
           <button type="button" role="menuitem" onclick={() => handleMenuItem(onNewCommunity)}>🏛️ New community</button>
           <button type="button" role="menuitem" onclick={() => handleMenuItem(onRedeemInvite)}>🔗 Redeem invite link</button>
           <button type="button" role="menuitem" onclick={() => handleMenuItem(onBrowseLibraries)}>📚 Browse libraries</button>
+          {#if onPostVine}
+            <hr />
+            <button type="button" role="menuitem" onclick={() => handleMenuItem(onPostVine)}>🎬 Post a vine</button>
+          {/if}
         </div>
       {/if}
       <button class="settings-btn" onclick={() => onSettingsClick?.()} aria-label="Notification settings">⚙</button>

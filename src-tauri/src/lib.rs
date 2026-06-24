@@ -13090,6 +13090,75 @@ async fn ingest_avatar_bytes(
     ingest_avatar_bytes_inner(&ingest_tx, bytes).await
 }
 
+/// ZEB-559: maximum vine video size accepted by the GUI uploader. Vines are
+/// short-form clips that get served peer-to-peer over iroh/CAS, so an unbounded
+/// upload would mean painfully slow fetches for every viewer. 100 MiB is
+/// generous for a 30–90s 1080p clip. The limit is enforced *before* streaming
+/// (a cheap metadata stat) so an oversized file fails fast with a clear error
+/// instead of chunking gigabytes first.
+pub(crate) const VINE_VIDEO_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+/// ZEB-559: ingest a local video file — selected via the frontend's native
+/// file picker and passed here as an absolute path — into CAS, returning the
+/// root CID hex. Mirrors the headless `publish_vine` auto-mint path so a GUI
+/// tester no longer needs a pre-known Video CID to post a vine.
+///
+/// Twin of [`ingest_avatar_bytes_inner`] (default `ContentFlags` →
+/// PublicDurable / unencrypted, so the CID is publicly servable to other
+/// members; skips the sidecar insert so videos never appear in the file
+/// listing) but reads from a path and streams off disk — memory stays bounded
+/// at ~1 MiB regardless of file size, the same `streaming_ingest` guarantee the
+/// file vault relies on (ZEB-161).
+pub(crate) async fn ingest_vine_video_inner(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    path: String,
+) -> Result<String, String> {
+    use harmony_content::chunker::ChunkerConfig;
+
+    // Fail fast on a missing / non-file / empty / oversized selection via a
+    // cheap stat, before streaming a single chunk. The read-only metadata check
+    // precedes the irreversible CAS write (metadata-before-write convention).
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("could not read video file: {e}"))?;
+    if !meta.is_file() {
+        return Err("the selected path is not a file".to_string());
+    }
+    let size = meta.len();
+    if size == 0 {
+        return Err("the selected video file is empty".to_string());
+    }
+    if size > VINE_VIDEO_MAX_BYTES {
+        return Err(format!(
+            "video too large: {size} bytes exceeds the 100 MB limit"
+        ));
+    }
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| format!("could not open video file: {e}"))?;
+    let reader = tokio::io::BufReader::new(file);
+    let (root, _size) = streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(hex::encode(root.to_bytes()))
+}
+
+#[tauri::command]
+async fn ingest_vine_video(
+    path: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    let ingest_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .ingest_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    ingest_vine_video_inner(&ingest_tx, path).await
+}
+
 /// ZEB-345: structured input for one profile-page link, deserialized from the
 /// frontend. Validated (cap + scheme) inside `encode_profile_doc`.
 #[derive(serde::Deserialize, Clone)]
@@ -13417,6 +13486,75 @@ mod path_ingest_tests {
         assert!(cid.verify_hash(&bytes), "cid must hash the ingested bytes");
         drop(ingest_tx);
         let _ = drainer.await;
+    }
+
+    /// ZEB-559: the vine-video path-based ingest produces a publicly-servable
+    /// (PublicDurable / unencrypted) CID that hashes the file's bytes — the
+    /// same invariant avatars rely on, so other members can fetch the video.
+    #[tokio::test]
+    async fn ingest_vine_video_yields_public_durable_cid() {
+        use harmony_content::cid::{ContentClass, ContentId};
+        let (ingest_tx, mut ingest_rx) =
+            tokio::sync::mpsc::channel::<event_loop::IngestRequest>(16);
+        let drainer = tokio::spawn(async move {
+            while let Some(req) = ingest_rx.recv().await {
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+
+        let bytes = b"fake-mp4-payload\x00\x01\x02\x03moov".to_vec();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        tokio::fs::write(&path, &bytes)
+            .await
+            .expect("write temp video");
+
+        let cid_hex = ingest_vine_video_inner(&ingest_tx, path.to_string_lossy().into_owned())
+            .await
+            .expect("ingest");
+        let raw = hex::decode(&cid_hex).unwrap();
+        let cid = ContentId::from_bytes(<[u8; 32]>::try_from(raw).unwrap());
+        assert_eq!(cid.content_class(), ContentClass::PublicDurable);
+        assert!(cid.verify_hash(&bytes), "cid must hash the ingested bytes");
+
+        drop(ingest_tx);
+        let _ = drainer.await;
+    }
+
+    /// ZEB-559: the size gate rejects an oversized file *before* streaming, so
+    /// no ingest request is ever sent for a too-large video.
+    #[tokio::test]
+    async fn ingest_vine_video_rejects_oversize_file() {
+        let (ingest_tx, mut ingest_rx) =
+            tokio::sync::mpsc::channel::<event_loop::IngestRequest>(16);
+        let saw_request = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_request_drainer = saw_request.clone();
+        let drainer = tokio::spawn(async move {
+            while let Some(req) = ingest_rx.recv().await {
+                saw_request_drainer.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("huge.mp4");
+        // A sparse file just past the cap: set_len reserves no real bytes but
+        // metadata().len() reports the full size, which is all the gate reads.
+        let f = std::fs::File::create(&path).expect("create");
+        f.set_len(VINE_VIDEO_MAX_BYTES + 1).expect("set_len");
+        drop(f);
+
+        let err = ingest_vine_video_inner(&ingest_tx, path.to_string_lossy().into_owned())
+            .await
+            .expect_err("oversize must error");
+        assert!(err.contains("too large"), "got: {err}");
+
+        drop(ingest_tx);
+        let _ = drainer.await;
+        assert!(
+            !saw_request.load(std::sync::atomic::Ordering::SeqCst),
+            "oversize file must be rejected before any ingest request",
+        );
     }
 
     #[tokio::test]
@@ -48844,6 +48982,7 @@ pub fn run() {
             export_content,
             ingest_content,
             ingest_avatar_bytes,
+            ingest_vine_video,
             ingest_profile_doc,
             create_folder,
             ingest_folder_tree,

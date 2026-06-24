@@ -758,6 +758,24 @@
     }
   }
 
+  /**
+   * ZEB-559: open the native file picker, ingest the chosen video into CAS via
+   * the backend, and return its minted Video CID + filename for the composer to
+   * display. Returns null if the user cancels the picker; throws on ingest
+   * failure so VinePublishDialog can surface the message.
+   */
+  async function handlePickVineVideo(): Promise<{ cid: string; fileName: string } | null> {
+    const { open } = await import('@tauri-apps/plugin-dialog');
+    const picked = await open({
+      multiple: false,
+      filters: [{ name: 'Video', extensions: ['mp4', 'mov', 'webm', 'mkv', 'm4v', 'avi'] }],
+    });
+    if (!picked || typeof picked !== 'string') return null; // cancelled
+    const fileName = picked.split(/[\\/]/).pop() || 'video';
+    const cid = await vineService.ingestVideo(picked);
+    return { cid, fileName };
+  }
+
   async function handleVineReshare(vine: import('./lib/types').VineVideo) {
     // Self-reshare prevention (spec §Edge Cases → Self-reshare prevention):
     // silently no-op when the SOURCE vine is our OWN ORIGINAL
@@ -2862,6 +2880,7 @@
         onNewCommunity={() => { showCreateCommunity = true; createError = null; }}
         onRedeemInvite={() => { showRedeemInvite = true; redeemError = null; redeemUrl = ''; }}
         onBrowseLibraries={() => { libraryDirectoryOpen = true; }}
+        onPostVine={() => { showVinePublish = true; }}
         onSelectNotes={selectNotes}
         notesActive={notesSelected && !selectedCommunityNode}
         onSubmitFeedback={() => (feedbackModalOpen = true)}
@@ -3093,7 +3112,7 @@
       ownAddress={myAddress || undefined}
     />
     {#if showVinePublish}
-      <VinePublishDialog onPublish={handleVinePublish} onClose={() => showVinePublish = false} />
+      <VinePublishDialog onPublish={handleVinePublish} onPickVideo={handlePickVineVideo} onClose={() => showVinePublish = false} />
     {/if}
   {/snippet}
   {#snippet fileBrowser()}

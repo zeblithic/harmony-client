@@ -262,6 +262,28 @@ describe('VineService', () => {
     expect(svc.onChange).toHaveBeenCalledOnce();
   });
 
+  // ── ingestVideo (ZEB-559) ──────────────────────────────────────────
+
+  it('ingestVideo invokes ingest_vine_video with the path and returns the CID', async () => {
+    const { adapter } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue('deadbeefcid');
+    await svc.connectAdapter(adapter);
+    const cid = await svc.ingestVideo('/home/u/clip.mp4');
+    expect(adapter.invoke).toHaveBeenCalledWith('ingest_vine_video', { path: '/home/u/clip.mp4' });
+    expect(cid).toBe('deadbeefcid');
+  });
+
+  it('ingestVideo throws when there is no adapter (disconnected)', async () => {
+    await expect(svc.ingestVideo('/home/u/clip.mp4')).rejects.toThrow('not connected');
+  });
+
+  it('ingestVideo propagates backend ingest errors', async () => {
+    const { adapter } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('video too large: 209715201 bytes exceeds the 100 MB limit'));
+    await svc.connectAdapter(adapter);
+    await expect(svc.ingestVideo('/home/u/huge.mp4')).rejects.toThrow('video too large');
+  });
+
   // ── markViewed ─────────────────────────────────────────────────────
 
   it('adds id to viewedIds', () => {
