@@ -4,6 +4,7 @@
   import { formatBytes, mimeCategoryIcon } from '../file-utils';
   import { isPreviewable, isImage, isText, decodeTextHead, type TextHead } from '../artifact-preview';
   import { assertHeaderDimsOk, assertDecodedDimsOk, parseImageHeaderDims } from '../avatar-normalize';
+  import { mapContentFetchError } from '../content-fetch-errors';
   import { untrack } from 'svelte';
 
   let { communityId, channelId, attachments, channelMessageService }: {
@@ -118,8 +119,12 @@
     } catch (e) {
       // Don't resurrect state on a torn-down / reused component.
       if (!isLive(att.cid)) return;
+      // Map raw transport strings (leaked zenoh key-exprs, "timed out after 30s")
+      // to friendly copy; keep the raw detail in the console for diagnostics.
+      const raw = e instanceof Error ? e.message : String(e);
+      console.warn(`preview '${att.name}' failed:`, raw);
       previewStates = { ...previewStates, [att.cid]: 'error' };
-      previewErrors = { ...previewErrors, [att.cid]: e instanceof Error ? e.message : String(e) };
+      previewErrors = { ...previewErrors, [att.cid]: mapContentFetchError(raw) };
     }
   }
 
@@ -184,9 +189,12 @@
       await channelMessageService.downloadArtifact(communityId, channelId, att, destPath);
       states = { ...states, [att.cid]: 'saved' };
     } catch (e) {
-      // Tauri IPC rejections are raw strings in prod, Error in tests.
+      // Tauri IPC rejections are raw strings in prod, Error in tests. Map the
+      // raw transport detail to friendly copy; keep the raw in the console.
+      const raw = e instanceof Error ? e.message : String(e);
+      console.warn(`download '${att.name}' failed:`, raw);
       states = { ...states, [att.cid]: 'error' };
-      errors = { ...errors, [att.cid]: e instanceof Error ? e.message : String(e) };
+      errors = { ...errors, [att.cid]: mapContentFetchError(raw) };
     }
   }
 </script>

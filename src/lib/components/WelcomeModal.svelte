@@ -191,8 +191,18 @@
           Already have Harmony on another device? You can add this one to your
           existing identity instead of starting fresh.
         </p>
-        {#if mintError}
-          <p class="error" data-testid="welcome-mint-error">{mintError}</p>
+        {#if mintError && !alreadyExists}
+          <!-- Map the raw backend mint failure to friendly copy; keep the raw
+               string available for bug reports inside a <details> disclosure.
+               The "already exists" case is handled below by its own hint +
+               Reload escape, so the raw line is suppressed there. -->
+          <div class="error mint-error" data-testid="welcome-mint-error" role="alert">
+            <p class="mint-error-summary">Couldn’t create your identity on this device. Please try again.</p>
+            <details>
+              <summary>Technical details</summary>
+              <pre class="raw-error">{mintError}</pre>
+            </details>
+          </div>
         {/if}
         {#if alreadyExists}
           <p class="muted" data-testid="welcome-already-exists-hint">
@@ -338,6 +348,18 @@
   .actions button.danger { background: var(--danger, #d9534f); border-color: var(--danger, #d9534f); }
   .actions button:disabled { opacity: 0.5; cursor: default; }
   .error { color: crimson; font-size: 0.85rem; margin: 0 0 0.5rem; }
+  .mint-error-summary { margin: 0 0 0.35rem; }
+  .mint-error details { color: var(--text-secondary, #aaa); }
+  .mint-error summary { cursor: pointer; }
+  .mint-error .raw-error {
+    margin: 0.35rem 0 0;
+    padding: 0.4rem 0.5rem;
+    background: var(--bg-tertiary, rgba(0, 0, 0, 0.2));
+    border-radius: 4px;
+    font-size: 0.78rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
   footer { margin-top: 1rem; font-size: 0.85rem; }
   .version { display: inline-block; margin-right: 1rem; color: var(--text-secondary, #aaa); opacity: 0.7; }
   footer a { color: var(--accent, #5865f2); text-decoration: none; }

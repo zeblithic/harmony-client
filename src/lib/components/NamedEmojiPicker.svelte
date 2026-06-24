@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ChannelMessageService, EmojiNameDto } from '../channel-message-service';
+  import { emojiNameError, MAX_EMOJI_NAME_LEN } from '../emoji-name-validation';
   import ReactionEmojiImage from './ReactionEmojiImage.svelte';
 
   let { channelMessageService, onpick }: {
@@ -12,6 +13,10 @@
   let error = $state<string | null>(null);
   let renaming = $state<string | null>(null);
   let renameValue = $state('');
+  let renameError = $state<string | null>(null);
+  // Non-reactive in-flight guard: true while a setEmojiName IPC is awaiting so a
+  // trailing blur / repeated Enter can't double-fire (we close on success only).
+  let renameCommitting = false;
 
   const filtered = $derived(
     query.trim()
@@ -40,16 +45,40 @@
   function startRename(e: EmojiNameDto): void {
     renaming = e.cid;
     renameValue = e.name;
+    renameError = null;
+  }
+
+  function cancelRename(): void {
+    renaming = null;
+    renameError = null;
   }
 
   async function commitRename(e: EmojiNameDto): Promise<void> {
+    // Guard against a trailing blur after Enter, and a repeated Enter while the
+    // IPC is in flight — without it both would fire setEmojiName.
+    if (renaming !== e.cid || renameCommitting) return;
     const name = renameValue.trim();
-    renaming = null;
-    if (!name || name === e.name) return;
+    if (!name || name === e.name) {
+      cancelRename();
+      return;
+    }
+    // Validate client-side: keep the editor OPEN on a bad name so the user's
+    // typed text isn't lost to a raw backend bounce.
+    const validationErr = emojiNameError(name);
+    if (validationErr) {
+      renameError = validationErr;
+      return;
+    }
+    // Close only AFTER the backend confirms, so a transient failure keeps the
+    // typed name on screen to retry (CodeRabbit, PR #330).
+    renameCommitting = true;
     try {
       await channelMessageService.setEmojiName(e.cid, name, e.mime, e.size);
+      cancelRename();
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
+    } finally {
+      renameCommitting = false;
     }
   }
 
@@ -77,14 +106,23 @@
     {#each filtered as e (e.cid)}
       <div class="named-tile">
         {#if renaming === e.cid}
-          <input
-            class="named-rename"
-            type="text"
-            aria-label={`Rename ${e.name}`}
-            bind:value={renameValue}
-            onkeydown={(ev) => ev.key === 'Enter' && commitRename(e)}
-            onblur={() => commitRename(e)}
-          />
+          <span class="named-rename-wrap">
+            <input
+              class="named-rename"
+              type="text"
+              maxlength={MAX_EMOJI_NAME_LEN}
+              aria-label={`Rename ${e.name}`}
+              bind:value={renameValue}
+              onkeydown={(ev) => {
+                if (ev.key === 'Enter') commitRename(e);
+                else if (ev.key === 'Escape') cancelRename();
+              }}
+              onblur={() => commitRename(e)}
+            />
+            {#if renameError}
+              <span class="named-rename-error" role="alert">{renameError}</span>
+            {/if}
+          </span>
         {:else}
           <button type="button" class="named-pick" role="menuitem" title={e.name} onclick={() => pick(e)}>
             <ReactionEmojiImage cid={e.cid} {channelMessageService} />
@@ -104,6 +142,8 @@
 <style>
   .named-emoji-picker { display: flex; flex-direction: column; gap: 0.4rem; padding: 0.5rem; min-width: 14rem; max-width: 18rem; }
   .named-search, .named-rename { width: 100%; box-sizing: border-box; padding: 0.25rem 0.4rem; }
+  .named-rename-wrap { display: inline-flex; flex-direction: column; gap: 0.1rem; }
+  .named-rename-error { font-size: 0.7em; color: #d83c3e; }
   .named-grid { display: flex; flex-wrap: wrap; gap: 0.35rem; }
   .named-tile { display: inline-flex; align-items: center; gap: 0.15rem; }
   .named-pick { display: inline-flex; align-items: center; gap: 0.25rem; cursor: pointer; }

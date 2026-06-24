@@ -10,6 +10,7 @@
   import ReactionEmojiImage from './ReactionEmojiImage.svelte';
   import NamedEmojiPicker from './NamedEmojiPicker.svelte';
   import { normalizeEmoji } from '../emoji-normalize';
+  import { emojiNameError, MAX_EMOJI_NAME_LEN } from '../emoji-name-validation';
   import { open } from '@tauri-apps/plugin-dialog';
   import { formatBytes, mimeCategoryIcon } from '../file-utils';
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
@@ -496,21 +497,45 @@
     if (!r.emojiCid) return;
     namingCid = r.emojiCid;
     namingValue = '';
+    namingError = null;
     namingMime = 'image/png';
     namingSize = r.emojiSize ?? 0;
   }
 
+  function cancelNameThis(): void {
+    namingCid = null;
+    namingError = null;
+  }
+
   // Task 10 — commit the typed name to the local emoji-name map. Reuses the
-  // existing `reactionError` surfaced-error state on failure.
+  // existing `reactionError` surfaced-error state on backend failure.
   async function commitNameThis(): Promise<void> {
+    if (!namingCid || namingCommitting) return;
     const cid = namingCid;
     const name = namingValue.trim();
-    namingCid = null;
-    if (!cid || !name) return;
+    if (!name) {
+      cancelNameThis();
+      return;
+    }
+    // Validate client-side: keep the inline input OPEN on a bad name so the
+    // user's typed text isn't lost to a raw backend bounce.
+    const validationErr = emojiNameError(name);
+    if (validationErr) {
+      namingError = validationErr;
+      return;
+    }
+    // Close only AFTER the backend confirms, so a transient backend failure
+    // keeps the typed name on screen to retry rather than dropping it.
+    // `namingCommitting` guards a second Enter/✓ while the IPC is in flight
+    // (CodeRabbit, PR #330).
+    namingCommitting = true;
     try {
       await channelMessageService.setEmojiName(cid, name, namingMime, namingSize);
+      cancelNameThis();
     } catch (e) {
       reactionError = e instanceof Error ? e.message : String(e);
+    } finally {
+      namingCommitting = false;
     }
   }
 
@@ -535,6 +560,10 @@
   let namedPickerFor = $state<string | null>(null);
   let namingCid = $state<string | null>(null);
   let namingValue = $state('');
+  let namingError = $state<string | null>(null);
+  // Non-reactive in-flight guard: true while a setEmojiName IPC is awaiting so a
+  // repeated commit can't double-fire (we now close the input only on success).
+  let namingCommitting = false;
   let namingMime = '';
   let namingSize = 0;
   let uploadName = $state('');
@@ -601,8 +630,16 @@
         size,
       });
       // Task 10 — if a name was typed at upload (PUBLIC emoji only), bind it now.
+      // Validate client-side first so an invalid name surfaces friendly copy
+      // instead of the backend's raw bounce; the emoji itself still uploaded
+      // and reacted, so we only report that the NAME didn't stick.
       if (nameAtUpload && !makePrivate) {
-        await channelMessageService.setEmojiName(emojiCid, nameAtUpload, 'image/png', size);
+        const nameErr = emojiNameError(nameAtUpload);
+        if (nameErr) {
+          reactionError = `Uploaded, but couldn't name it: ${nameErr}`;
+        } else {
+          await channelMessageService.setEmojiName(emojiCid, nameAtUpload, 'image/png', size);
+        }
       }
     } catch (err) {
       if (epoch !== attachEpoch) return; // don't surface on a stale channel
@@ -803,11 +840,18 @@
                       <input
                         class="name-this-input"
                         type="text"
+                        maxlength={MAX_EMOJI_NAME_LEN}
                         aria-label="Emoji name"
                         bind:value={namingValue}
-                        onkeydown={(ev) => ev.key === 'Enter' && commitNameThis()}
+                        onkeydown={(ev) => {
+                          if (ev.key === 'Enter') commitNameThis();
+                          else if (ev.key === 'Escape') cancelNameThis();
+                        }}
                       />
                       <button type="button" class="name-this-save" aria-label="Save emoji name" onclick={() => commitNameThis()}>✓</button>
+                      {#if namingError}
+                        <span class="name-this-error" role="alert">{namingError}</span>
+                      {/if}
                     {:else}
                       <button type="button" class="name-this" aria-label="Name this emoji" onclick={() => startNameThis(r)}>✎</button>
                     {/if}
@@ -877,7 +921,7 @@
                 >🔖</button>
                 <label class="picker-upload-name">
                   <span>Name (optional)</span>
-                  <input type="text" aria-label="Name new emoji" bind:value={uploadName} placeholder="catjam" />
+                  <input type="text" maxlength={MAX_EMOJI_NAME_LEN} aria-label="Name new emoji" bind:value={uploadName} placeholder="catjam" />
                 </label>
                 {#if namedPickerFor === msg.messageId}
                   <div class="named-popover">
@@ -913,6 +957,12 @@
     {#if composeError}
       <div class="compose-error" role="alert">{composeError}</div>
     {/if}
+    {#if ingesting}
+      <!-- Surface the in-flight ingest so pressing Enter (which no-ops while
+           a file is still being read in) reads as "finishing upload", not a
+           dead key. `role="status"` announces it to assistive tech. -->
+      <div class="compose-hint" role="status" data-testid="compose-ingest-hint">Finishing upload…</div>
+    {/if}
     {#if pendingAttachments.length > 0}
       <div class="pending-attachments">
         {#each pendingAttachments as att (att.cid)}
@@ -944,7 +994,7 @@
         bind:value={composeText}
         onkeydown={handleCompose}
         class="compose-input"
-        placeholder={`Message #${channelName}`}
+        placeholder={ingesting ? 'Finishing upload…' : `Message #${channelName}`}
         rows="2"
         aria-label="Channel message"
         disabled={posting}
@@ -1168,6 +1218,7 @@
   }
   .name-this:hover { opacity: 1; }
   .name-this-input { width: 7rem; }
+  .name-this-error { font-size: 0.7rem; color: #d83c3e; margin-left: 4px; }
   .compose {
     border-top: 1px solid var(--border);
     padding: 8px 16px 12px;
@@ -1178,6 +1229,11 @@
     color: #d83c3e;
     padding: 6px 8px;
     border-radius: 4px;
+    font-size: 0.75rem;
+    margin-bottom: 8px;
+  }
+  .compose-hint {
+    color: var(--text-secondary);
     font-size: 0.75rem;
     margin-bottom: 8px;
   }

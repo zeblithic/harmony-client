@@ -632,6 +632,40 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
     });
   });
 
+  it('shows a "finishing upload" hint while ingesting and Enter does not post (finding 9)', async () => {
+    // Pressing Enter while a file is still being ingested no-ops; surface the
+    // in-flight state as "Finishing upload…" rather than a dead key.
+    openMock.mockResolvedValue('/tmp/a.txt');
+    const { adapter, container } = await setup();
+    // Hold the ingest open so the component stays in the `ingesting` state.
+    let resolveIngest!: (v: unknown) => void;
+    const ingestGate = new Promise<unknown>((r) => {
+      resolveIngest = r;
+    });
+    (adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'request_channel_backfill') return Promise.resolve(undefined);
+      if (cmd === 'ingest_channel_artifact') return ingestGate;
+      if (cmd === 'post_channel_message') return Promise.resolve('mid' + 'a'.repeat(29));
+      return Promise.resolve(undefined);
+    });
+    await fireEvent.click(container.querySelector('.attach-btn')!);
+    // Hint is visible while ingesting.
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="compose-ingest-hint"]')).toBeTruthy();
+    });
+    // Enter during ingest must not post.
+    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: 'too soon' } });
+    await fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(adapter.invoke).not.toHaveBeenCalledWith('post_channel_message', expect.anything());
+    // Let the ingest finish; the hint clears.
+    resolveIngest({ cid: 'cid0', mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true });
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="compose-ingest-hint"]')).toBeNull();
+    });
+  });
+
   it('clears pending attachments when the channel changes', async () => {
     openMock.mockResolvedValue('/tmp/a.txt');
     const { adapter, container, props, rerender } = await setup();

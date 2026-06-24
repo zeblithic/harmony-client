@@ -96,6 +96,23 @@ describe('WelcomeModal hard gate + flow', () => {
     expect(getByTestId('welcome-create-identity')).toBeTruthy();
   });
 
+  it('maps a mint failure to friendly copy with the raw backend string tucked into <details>', async () => {
+    // The first-run hard gate must not headline a raw backend string. A
+    // non-"already exists" failure shows friendly copy, with the raw detail
+    // preserved for bug reports inside a disclosure.
+    mintMock.mockRejectedValue('keychain write failed: SecKeychainItemCreate -34018');
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    await Promise.resolve(); await Promise.resolve();
+    const box = getByTestId('welcome-mint-error');
+    // Friendly headline, not the raw backend string.
+    expect(box.querySelector('.mint-error-summary')?.textContent).toMatch(/couldn.t create your identity/i);
+    // Raw detail preserved, but inside the <details> disclosure.
+    const details = box.querySelector('details');
+    expect(details).toBeTruthy();
+    expect(details?.textContent).toContain('SecKeychainItemCreate -34018');
+  });
+
   it('save recovery file calls export with pathToken + passphrase', async () => {
     mintMock.mockResolvedValue({ state: {}, recoveryToken: 'tok' });
     requestExportSavePathMock.mockResolvedValue('path-token-uuid');

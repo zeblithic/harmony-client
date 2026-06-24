@@ -159,6 +159,11 @@
 
   function handleSubmit() {
     if (!canSubmit) return;
+    // Clear the iroh-path banner before handing off to the LAN fallback: a
+    // LAN-redeem failure is surfaced by the parent via the `error` prop (the
+    // `mapped` banner), which would otherwise stack on top of the still-visible
+    // iroh banner — two error banners for one redeem attempt (finding 12).
+    irohError = null;
     onSubmit(url.trim());
   }
 </script>

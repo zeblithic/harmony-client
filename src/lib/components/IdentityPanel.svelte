@@ -2,7 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { open } from '@tauri-apps/plugin-dialog';
   import { onMount } from 'svelte';
-  import { OwnerService } from '../owner-service';
+  import { OwnerService, extractError } from '../owner-service';
   import { MIN_RECOVERY_PASSPHRASE_LEN } from '../recovery-policy';
   import { backupExportRequest } from '../backup-export-request.svelte';
 
@@ -150,7 +150,7 @@
       try {
         fullHash = await invoke<string>('current_identity_hash');
       } catch (e) {
-        loadError = `Could not read identity store: ${e}. The wizard cannot continue.`;
+        loadError = `Could not read identity store: ${extractError(e)}. The wizard cannot continue.`;
       }
     })();
   });
@@ -195,7 +195,7 @@
         if (wizardState !== epoch) return;
         wizardState = {
           kind: 'backup',
-          step: { phase: 'mnemonicReveal', words: [], revealed: false, storedSafely: false, loadError: `Could not load recovery phrase: ${e}` },
+          step: { phase: 'mnemonicReveal', words: [], revealed: false, storedSafely: false, loadError: `Could not load recovery phrase: ${extractError(e)}` },
         };
         return;
       }
@@ -274,7 +274,7 @@
           kind: 'backup',
           step: {
             phase: 'fileSaveError',
-            error: `Could not open the save dialog: ${e}. Try again.`,
+            error: `Could not open the save dialog: ${extractError(e)}. Try again.`,
             passphrase,
             passphraseConfirm,
             comment,
@@ -329,7 +329,7 @@
           kind: 'backup',
           step: {
             phase: 'fileSaveError',
-            error: `Could not save to the chosen location: ${e}. Try a different location.`,
+            error: `Could not save to the chosen location: ${extractError(e)}. Try a different location.`,
             passphrase,
             passphraseConfirm,
             comment,
@@ -477,7 +477,7 @@
       // the spec's ambiguous text — we don't leak which input was wrong.
       // Tauri rejects with a string in production, but tests use Error;
       // unwrap to .message in both paths so the prefix-detection works.
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = extractError(e);
       const isIoError =
         msg.startsWith('failed to read ') ||
         msg.includes(' is too large to be a recovery file');

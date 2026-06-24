@@ -101,6 +101,24 @@ describe('MessageAttachments', () => {
     await fireEvent.click(container.querySelector('.att-download')!);
     await waitFor(() => expect(downloadArtifact).toHaveBeenCalledTimes(2));
   });
+
+  it('maps a raw content-fetch timeout to friendly copy, leaking no transport internals (finding 6)', async () => {
+    saveMock.mockResolvedValue('/tmp/out.txt');
+    const downloadArtifact = vi
+      .fn()
+      .mockRejectedValue(new Error(`fetch 'harmony/content/3/${'a'.repeat(64)}' timed out after 30s`));
+    const { container } = render(MessageAttachments, {
+      props: props({ channelMessageService: makeService(downloadArtifact) }),
+    });
+    await fireEvent.click(container.querySelector('.att-download')!);
+    await waitFor(() => {
+      const err = container.querySelector('.att-error')?.textContent ?? '';
+      expect(err.toLowerCase()).toContain('offline');
+      // The raw zenoh key-expr / "timed out" internals never reach the user.
+      expect(err).not.toContain('harmony/content');
+      expect(err).not.toContain('timed out');
+    });
+  });
 });
 
 describe('MessageAttachments — inline preview (ZEB-540)', () => {
