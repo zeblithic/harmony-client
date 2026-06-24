@@ -935,22 +935,104 @@ pub fn restore_owner_mnemonic_cli(
     )
 }
 
-/// Inner entry point — accepts an injected keychain so tests can stay
-/// hermetic. Production callers go through [`restore_owner_mnemonic_cli`].
-pub fn restore_owner_mnemonic_with_keychain(
+/// Derive the owner-id (hex32) a 24-word mnemonic would restore, WITHOUT
+/// writing anything to disk (ZEB-454). The GUI restore wizard calls this to
+/// show the owner-id for confirmation before the irreversible re-mint, and to
+/// compare against the device's current owner-id. Pure derivation: no keychain,
+/// no `owner_state.cbor` read.
+pub fn preview_owner_mnemonic_owner_id(words: &[String]) -> Result<String, String> {
+    if words.len() != 24 {
+        return Err(format!("expected 24 BIP39 words, got {}", words.len()));
+    }
+    let phrase = Zeroizing::new(words.join(" "));
+    let artifact = RecoveryArtifact::from_mnemonic(&phrase).map_err(|e| e.to_string())?;
+    Ok(hex::encode(artifact.master_pubkey_bundle().identity_hash()))
+}
+
+/// The owner-overwrite guard, shared between the read-only preflight and the
+/// authoritative under-the-lock restore. Reads the persisted `owner_id` from
+/// `owner_state.cbor` (no keychain) and decides whether `derived_owner_id` may
+/// be written: an empty install is fine; an existing owner requires `force`;
+/// a *different* owner-id is refused even with `force`; an unreadable marker
+/// blocks unless `force`. Never mutates anything.
+fn owner_mnemonic_overwrite_guard(
     identity_dir: &Path,
-    mnemonic_file: &Path,
+    derived_owner_id: &[u8; 16],
+    force: bool,
+) -> Result<(), String> {
+    match crate::owner_state::read_persisted_owner_id(identity_dir) {
+        Ok(None) => Ok(()),
+        Ok(Some(existing)) => {
+            if !force {
+                return Err(format!(
+                    "an owner identity ({}) already exists on this device; pass --force to overwrite it",
+                    hex::encode(existing)
+                ));
+            }
+            if existing != *derived_owner_id {
+                return Err(format!(
+                    "this mnemonic derives owner-id {} but this device already holds owner-id {} — \
+                     refusing to overwrite a different identity even with --force",
+                    hex::encode(derived_owner_id),
+                    hex::encode(existing),
+                ));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // `owner_state.cbor` exists but is unreadable/corrupt — can't compare
+            // owner-ids. Without --force, surface an actionable error rather than
+            // wedging recovery. With --force the operator has explicitly opted
+            // into a destructive overwrite, so proceed (the mismatch check is
+            // necessarily skipped). Mirrors the identity-seed restore.
+            if !force {
+                return Err(format!(
+                    "an owner_state.cbor marker exists on this device but could not be read \
+                     ({e}); pass --force to overwrite it with this mnemonic"
+                ));
+            }
+            tracing::warn!(
+                error = %e,
+                "restore owner-mnemonic --force: overwriting an unreadable owner_state.cbor \
+                 (owner-id mismatch check skipped)"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Read-only preflight for the GUI restore (ZEB-454): validate the 24 words and
+/// run the overwrite guard WITHOUT stopping the node or writing anything, so a
+/// doomed restore (bad words / refused identity) is rejected before the command
+/// stops the running node. The authoritative re-check happens under the write
+/// lock in [`restore_owner_mnemonic_from_words_with_keychain`] (TOCTOU-safe);
+/// this only avoids a needless node stop.
+pub fn preflight_owner_mnemonic_restore(
+    identity_dir: &Path,
+    words: &[String],
+    force: bool,
+) -> Result<(), String> {
+    if words.len() != 24 {
+        return Err(format!("expected 24 BIP39 words, got {}", words.len()));
+    }
+    let phrase = Zeroizing::new(words.join(" "));
+    let artifact = RecoveryArtifact::from_mnemonic(&phrase).map_err(|e| e.to_string())?;
+    let derived_owner_id = artifact.master_pubkey_bundle().identity_hash();
+    drop(artifact);
+    owner_mnemonic_overwrite_guard(identity_dir, &derived_owner_id, force)
+}
+
+/// Words-array variant of [`restore_owner_mnemonic_with_keychain`] — the GUI
+/// Tauri command restores from a pasted 24-word array without a temp file
+/// (ZEB-454). Holds the same guard/re-mint/persist core; returns the restored
+/// owner-id hex (the file path delegates here and `eprintln!`s it). `phrase`
+/// and `seed` are `Zeroizing`; the caller owns secret hygiene for `words`.
+pub fn restore_owner_mnemonic_from_words_with_keychain(
+    identity_dir: &Path,
+    words: &[String],
     force: bool,
     keychain: Option<KeychainStore>,
-) -> Result<(), String> {
-    // Read + decode the mnemonic. `raw` is the only heap copy of the secret
-    // words; `words` borrows slices of it (no per-word `String` allocations to
-    // leave un-wiped), and `phrase`/`seed` are `Zeroizing`. Everything is wiped
-    // on drop.
-    let raw = std::fs::read_to_string(mnemonic_file)
-        .map_err(|e| format!("failed to read {}: {e}", mnemonic_file.display()))?;
-    let raw = Zeroizing::new(raw);
-    let words: Vec<&str> = raw.split_whitespace().collect();
+) -> Result<String, String> {
     if words.len() != 24 {
         return Err(format!("expected 24 BIP39 words, got {}", words.len()));
     }
@@ -972,49 +1054,11 @@ pub fn restore_owner_mnemonic_with_keychain(
         .lock()
         .unwrap_or_else(|p| p.into_inner());
 
-    // Overwrite guard (under the lock, BEFORE any disk write). The `.cbor`
-    // owner_id is read without touching the keychain. Mirrors the export-side
-    // invariant and `pairing/cert.rs::sign_enrollment_for_joiner`: never let two
-    // backends disagree about which identity owns this device.
-    match crate::owner_state::read_persisted_owner_id(identity_dir) {
-        Ok(None) => { /* empty install — nothing to overwrite */ }
-        Ok(Some(existing)) => {
-            if !force {
-                return Err(format!(
-                    "an owner identity ({}) already exists on this device; pass --force to overwrite it",
-                    hex::encode(existing)
-                ));
-            }
-            if existing != derived_owner_id {
-                return Err(format!(
-                    "this mnemonic derives owner-id {} but this device already holds owner-id {} — \
-                     refusing to overwrite a different identity even with --force",
-                    hex::encode(derived_owner_id),
-                    hex::encode(existing),
-                ));
-            }
-        }
-        Err(e) => {
-            // `owner_state.cbor` exists but is unreadable/corrupt — we can't
-            // compare owner-ids. Without --force, surface an actionable error
-            // rather than wedging recovery. With --force the operator has
-            // explicitly opted into a destructive overwrite, so proceed (the
-            // mismatch check is necessarily skipped — there's nothing readable
-            // to compare against). Mirrors the identity-seed restore, which
-            // does not let an unprobeable existing state block a forced restore.
-            if !force {
-                return Err(format!(
-                    "an owner_state.cbor marker exists on this device but could not be read \
-                     ({e}); pass --force to overwrite it with this mnemonic"
-                ));
-            }
-            tracing::warn!(
-                error = %e,
-                "restore owner-mnemonic --force: overwriting an unreadable owner_state.cbor \
-                 (owner-id mismatch check skipped)"
-            );
-        }
-    }
+    // Overwrite guard (under the lock, BEFORE any disk write) — shared with the
+    // read-only `preflight_owner_mnemonic_restore` so the GUI command can reject
+    // a doomed restore before stopping the node, while this authoritative check
+    // re-runs under the lock (TOCTOU-safe).
+    owner_mnemonic_overwrite_guard(identity_dir, &derived_owner_id, force)?;
 
     // Re-mint from the recovered seed: same owner_id, fresh device key.
     let now = std::time::SystemTime::now()
@@ -1030,7 +1074,29 @@ pub fn restore_owner_mnemonic_with_keychain(
         keychain,
     )?;
 
-    eprintln!("restored owner-id: {}", hex::encode(state.owner_id));
+    Ok(hex::encode(state.owner_id))
+}
+
+/// Inner entry point — accepts an injected keychain so tests can stay
+/// hermetic. Production callers go through [`restore_owner_mnemonic_cli`].
+pub fn restore_owner_mnemonic_with_keychain(
+    identity_dir: &Path,
+    mnemonic_file: &Path,
+    force: bool,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
+    // Read the mnemonic file, then delegate to the words-array variant. Both
+    // the file text (`raw`) and the per-word `String` copies (`words`) are
+    // wrapped in `Zeroizing` so no plaintext mnemonic lingers on the heap after
+    // this returns (`Vec<String>: Zeroize` wipes each element on drop).
+    let raw = std::fs::read_to_string(mnemonic_file)
+        .map_err(|e| format!("failed to read {}: {e}", mnemonic_file.display()))?;
+    let raw = Zeroizing::new(raw);
+    let words: Zeroizing<Vec<String>> =
+        Zeroizing::new(raw.split_whitespace().map(String::from).collect());
+    let owner_id_hex =
+        restore_owner_mnemonic_from_words_with_keychain(identity_dir, &words, force, keychain)?;
+    eprintln!("restored owner-id: {owner_id_hex}");
     Ok(())
 }
 
@@ -1574,6 +1640,135 @@ mod tests {
         .unwrap();
         let (words, owner_id) = export_owner_mnemonic_words_with_keychain(dir, None).unwrap();
         (words.join(" "), owner_id)
+    }
+
+    // ── ZEB-454: words-array variant + owner-id preview (GUI restore path) ──
+
+    #[test]
+    #[serial]
+    fn preview_owner_mnemonic_owner_id_matches_exported_owner_id() {
+        std::env::set_var("HARMONY_PASSPHRASE", "owner-preview-match");
+        let dir = tempfile::tempdir().unwrap();
+        let (phrase, owner_id) = plant_owner_and_export_words(dir.path(), 1_700_000_100);
+        let words: Vec<String> = phrase.split_whitespace().map(String::from).collect();
+
+        let previewed = preview_owner_mnemonic_owner_id(&words)
+            .expect("preview must derive the owner-id without touching disk");
+        assert_eq!(
+            previewed,
+            hex::encode(owner_id),
+            "previewed owner-id must equal the identity's owner-id"
+        );
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    fn preview_owner_mnemonic_owner_id_rejects_wrong_word_count() {
+        let words: Vec<String> = (0..23).map(|_| "abandon".to_string()).collect();
+        let err = preview_owner_mnemonic_owner_id(&words)
+            .expect_err("23 words must be rejected before any derivation");
+        assert!(err.contains("24 BIP39 words"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_owner_mnemonic_from_words_roundtrips_and_returns_owner_id() {
+        std::env::set_var("HARMONY_PASSPHRASE", "owner-words-roundtrip");
+        // Source: mint + export.
+        let src = tempfile::tempdir().unwrap();
+        let (phrase, owner_id) = plant_owner_and_export_words(src.path(), 1_700_000_110);
+        let words: Vec<String> = phrase.split_whitespace().map(String::from).collect();
+
+        // Destination: empty install, restore from the words array (GUI path).
+        let dst = tempfile::tempdir().unwrap();
+        let returned = restore_owner_mnemonic_from_words_with_keychain(
+            dst.path(),
+            &words,
+            /*force=*/ false,
+            None,
+        )
+        .expect("words-array restore must succeed onto an empty install");
+        assert_eq!(
+            returned,
+            hex::encode(owner_id),
+            "restore must return the restored owner-id hex"
+        );
+        let restored = crate::owner_state::load_owner_state(dst.path(), None)
+            .unwrap()
+            .expect("owner present after restore");
+        assert_eq!(restored.state.owner_id, owner_id);
+        let (restored_words, _) =
+            export_owner_mnemonic_words_with_keychain(dst.path(), None).unwrap();
+        assert_eq!(
+            restored_words.join(" "),
+            phrase,
+            "round-trip yields same words"
+        );
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_owner_mnemonic_from_words_force_refuses_different_owner() {
+        std::env::set_var("HARMONY_PASSPHRASE", "owner-words-wrongowner");
+        let dir = tempfile::tempdir().unwrap();
+        let (_a_phrase, a_owner_id) = plant_owner_and_export_words(dir.path(), 1_700_000_120);
+        let other = tempfile::tempdir().unwrap();
+        let (b_phrase, b_owner_id) = plant_owner_and_export_words(other.path(), 1_700_000_121);
+        assert_ne!(a_owner_id, b_owner_id, "test setup: A and B must differ");
+        let b_words: Vec<String> = b_phrase.split_whitespace().map(String::from).collect();
+
+        let err = restore_owner_mnemonic_from_words_with_keychain(
+            dir.path(),
+            &b_words,
+            /*force=*/ true,
+            None,
+        )
+        .expect_err("words-array restore must refuse a DIFFERENT owner even with force");
+        assert!(err.contains("different identity"), "got: {err}");
+        let still = crate::owner_state::load_owner_state(dir.path(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            still.state.owner_id, a_owner_id,
+            "A untouched after refusal"
+        );
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn preflight_owner_mnemonic_restore_validates_without_writing() {
+        std::env::set_var("HARMONY_PASSPHRASE", "owner-preflight");
+        let src = tempfile::tempdir().unwrap();
+        let (phrase, _owner_id) = plant_owner_and_export_words(src.path(), 1_700_000_200);
+        let words: Vec<String> = phrase.split_whitespace().map(String::from).collect();
+
+        // Empty install + valid words → Ok, and NOTHING is written.
+        let fresh = tempfile::tempdir().unwrap();
+        preflight_owner_mnemonic_restore(fresh.path(), &words, false)
+            .expect("preflight passes on an empty install");
+        assert!(
+            !fresh.path().join("owner_state.cbor").exists(),
+            "preflight must not write owner_state.cbor"
+        );
+
+        // Existing DIFFERENT owner, even with force → refused (no write).
+        let dir = tempfile::tempdir().unwrap();
+        let (_a_phrase, a_owner_id) = plant_owner_and_export_words(dir.path(), 1_700_000_201);
+        let other = tempfile::tempdir().unwrap();
+        let (b_phrase, b_owner_id) = plant_owner_and_export_words(other.path(), 1_700_000_202);
+        assert_ne!(a_owner_id, b_owner_id, "test setup: A and B must differ");
+        let b_words: Vec<String> = b_phrase.split_whitespace().map(String::from).collect();
+        let err = preflight_owner_mnemonic_restore(dir.path(), &b_words, true)
+            .expect_err("preflight refuses a different owner");
+        assert!(err.contains("different identity"), "got: {err}");
+
+        // Wrong word count → Err before any derivation.
+        let short: Vec<String> = (0..23).map(|_| "abandon".to_string()).collect();
+        assert!(preflight_owner_mnemonic_restore(fresh.path(), &short, false).is_err());
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
     #[test]

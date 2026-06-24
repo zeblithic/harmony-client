@@ -493,6 +493,64 @@ pub async fn issue_owner_recovery_token(
     .await
 }
 
+/// Derive the owner-id (hex) that restoring the given 24-word mnemonic would
+/// re-adopt, WITHOUT writing anything. The GUI restore wizard shows this for
+/// confirmation and compares it against the device's current owner-id (ZEB-454).
+#[tauri::command]
+pub async fn preview_owner_mnemonic_identity(words: Vec<String>) -> Result<String, String> {
+    // Wipe the renderer-supplied plaintext words on drop (Vec<String>: Zeroize).
+    let words = Zeroizing::new(words);
+    run_blocking(move || crate::recovery_cli::preview_owner_mnemonic_owner_id(&words)).await
+}
+
+/// Re-adopt the owner identity from its 24-word master-seed mnemonic (the GUI
+/// analog of `harmony-app restore owner-mnemonic`). Same guards as the headless
+/// path: refuses to overwrite an existing owner unless `force`, and refuses even
+/// with `force` if the mnemonic derives a DIFFERENT owner-id. Returns the
+/// restored owner-id hex. The renderer reloads afterwards so a fresh `start_node`
+/// loads the re-minted owner_state (ZEB-454).
+#[tauri::command]
+pub async fn restore_owner_mnemonic_from_words(
+    words: Vec<String>,
+    force: bool,
+    state: tauri::State<'_, Mutex<crate::NodeState>>,
+) -> Result<String, String> {
+    // Wipe the renderer-supplied plaintext words on drop (Vec<String>: Zeroize).
+    let words = Zeroizing::new(words);
+    let identity_dir = resolve_identity_dir()?;
+
+    // Preflight FIRST (CodeRabbit #339): a read-only validate + overwrite-guard
+    // check, so a doomed restore (bad words / refused identity / corrupt marker)
+    // returns WITHOUT needlessly stopping the running node. The `pre_words` clone
+    // is also `Zeroizing` (wiped after the check).
+    let pre_dir = identity_dir.clone();
+    let pre_words = words.clone();
+    run_blocking(move || {
+        crate::recovery_cli::preflight_owner_mnemonic_restore(&pre_dir, &pre_words, force)
+    })
+    .await?;
+
+    // Preflight passed → committed to writing. Enforce node lifecycle before the
+    // irreversible rewrite (CodeAnt #339): stop the running node FIRST so the OLD
+    // identity's engines (notably the ZEB-342 liveness refresher) cannot write a
+    // competing owner_state into the gap and clobber the restore. Mirrors
+    // mint_owner_identity's Phase-1 stop-before-persist. `stop_inner` is
+    // async-context-safe (drives shutdown on an ephemeral runtime inside
+    // std::thread::scope), and `None` stops unconditionally. The renderer reloads
+    // on success, re-running `start_node` (which itself does stop ->
+    // reload-identity -> respawn) to come up on the restored identity.
+    crate::stop_inner(state.inner(), None);
+    run_blocking(move || {
+        crate::recovery_cli::restore_owner_mnemonic_from_words_with_keychain(
+            &identity_dir,
+            &words,
+            force,
+            KeychainStore::new().ok(),
+        )
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
