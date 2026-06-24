@@ -811,6 +811,30 @@ describe('ChannelMessageFeed reactions — chips (ZEB-536)', () => {
     await waitFor(() => expect(container.querySelector('.reaction-error')).toBeNull());
   });
 
+  it('reaction picker supports arrow-key roving focus across menuitems (finding 15)', async () => {
+    const { container } = await seedMessageWithReactions([]);
+    let toggle!: Element;
+    await waitFor(() => {
+      toggle = container.querySelector('.picker-toggle')!;
+      expect(toggle).toBeTruthy();
+    });
+    await fireEvent.click(toggle);
+    const menu = container.querySelector('.reaction-picker') as HTMLElement;
+    expect(menu).toBeTruthy();
+    expect(menu.getAttribute('role')).toBe('menu');
+    const items = menu.querySelectorAll<HTMLElement>('[role="menuitem"]');
+    expect(items.length).toBeGreaterThan(1);
+    // Opening the picker moves focus to the first reaction.
+    expect(document.activeElement).toBe(items[0]);
+    // ArrowRight advances; ArrowLeft returns (wrapping roving focus). Fire from
+    // the focused item so the event bubbles to the menu's handler as it would
+    // in the browser.
+    await fireEvent.keyDown(items[0], { key: 'ArrowRight' });
+    expect(document.activeElement).toBe(items[1]);
+    await fireEvent.keyDown(items[1], { key: 'ArrowLeft' });
+    expect(document.activeElement).toBe(items[0]);
+  });
+
   it('a live channel-reaction-received event updates the chip count', async () => {
     const { adapter, container } = await seedMessageWithReactions([
       { emoji: '👍', count: 1, mine: false, reactors: ['ee'.repeat(20)] },

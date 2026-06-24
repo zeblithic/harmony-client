@@ -469,6 +469,33 @@
     pickerOpenFor = pickerOpenFor === messageId ? null : messageId;
   }
 
+  // ZEB-553 a11y: roving arrow-key focus across the reaction picker's
+  // role="menuitem" buttons. Guarded so it never hijacks Left/Right while the
+  // user is typing in the name field or interacting with the private checkbox.
+  function handlePickerKey(e: KeyboardEvent): void {
+    const target = e.target as HTMLElement;
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+    if (!['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
+    const menu = e.currentTarget as HTMLElement;
+    const items = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+    if (items.length === 0) return;
+    const current = items.indexOf(target.closest('[role="menuitem"]') as HTMLElement);
+    let next: number;
+    if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = items.length - 1;
+    else if (e.key === 'ArrowRight' || e.key === 'ArrowDown')
+      next = current < 0 ? 0 : (current + 1) % items.length;
+    else next = current < 0 ? items.length - 1 : (current - 1 + items.length) % items.length;
+    e.preventDefault();
+    items[next]?.focus();
+  }
+
+  // Move focus into the picker (first reaction) when it opens so arrow-key nav
+  // works immediately for keyboard users (Svelte action: runs on mount).
+  function autofocusFirstMenuItem(node: HTMLElement) {
+    node.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+  }
+
   // ZEB-536 — picker selection is an explicit add (spec §Design), unlike the
   // toggle semantics of chips/quick-react. Closes the popover.
   function pickFromPicker(msg: ChannelMessageDto, emoji: string): void {
@@ -881,7 +908,13 @@
               onclick={() => togglePicker(msg.messageId)}
             >😊</button>
             {#if pickerOpenFor === msg.messageId}
-              <div class="reaction-picker" role="menu" aria-label="Pick a reaction">
+              <div
+                class="reaction-picker"
+                role="menu"
+                aria-label="Pick a reaction"
+                onkeydown={handlePickerKey}
+                use:autofocusFirstMenuItem
+              >
                 {#each PICKER_EMOJI as emoji}
                   <button
                     type="button"
