@@ -49121,6 +49121,8 @@ pub fn run() {
             owner_commands::mint_owner_identity,
             owner_commands::export_owner_recovery_file_to_path,
             owner_commands::issue_owner_recovery_token,
+            owner_commands::preview_owner_mnemonic_identity,
+            owner_commands::restore_owner_mnemonic_from_words,
             get_backup_staleness,
             save_dialog::request_export_save_path,
             pairing_commands::start_inviter_pairing,

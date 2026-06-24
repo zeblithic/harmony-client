@@ -493,6 +493,37 @@ pub async fn issue_owner_recovery_token(
     .await
 }
 
+/// Derive the owner-id (hex) that restoring the given 24-word mnemonic would
+/// re-adopt, WITHOUT writing anything. The GUI restore wizard shows this for
+/// confirmation and compares it against the device's current owner-id (ZEB-454).
+#[tauri::command]
+pub async fn preview_owner_mnemonic_identity(words: Vec<String>) -> Result<String, String> {
+    run_blocking(move || crate::recovery_cli::preview_owner_mnemonic_owner_id(&words)).await
+}
+
+/// Re-adopt the owner identity from its 24-word master-seed mnemonic (the GUI
+/// analog of `harmony-app restore owner-mnemonic`). Same guards as the headless
+/// path: refuses to overwrite an existing owner unless `force`, and refuses even
+/// with `force` if the mnemonic derives a DIFFERENT owner-id. Returns the
+/// restored owner-id hex. The renderer reloads afterwards so a fresh `start_node`
+/// loads the re-minted owner_state (ZEB-454).
+#[tauri::command]
+pub async fn restore_owner_mnemonic_from_words(
+    words: Vec<String>,
+    force: bool,
+) -> Result<String, String> {
+    let identity_dir = resolve_identity_dir()?;
+    run_blocking(move || {
+        crate::recovery_cli::restore_owner_mnemonic_from_words_with_keychain(
+            &identity_dir,
+            &words,
+            force,
+            KeychainStore::new().ok(),
+        )
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
