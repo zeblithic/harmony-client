@@ -3124,7 +3124,14 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // ZEB-339 Task 9: the membership gate materializes the publisher's
     // `MemberState` (incl. `enrolled_device_keys`); we retain it for the
     // sig-verify step below so we don't re-materialize.
-    let publisher_member_state: crate::community_membership::MemberState = {
+    // ZEB-558: the gate yields (publisher_member_state, deferred_open_bootstrap).
+    // For an OPEN community + entirely-unknown publisher we DEFER the reject:
+    // the publisher's self-Join lives only inside the (not-yet-fetched) blob,
+    // so we validate it post-decode via `bootstrap_admit_open_publisher`.
+    let (publisher_member_state, deferred_open_bootstrap): (
+        Option<crate::community_membership::MemberState>,
+        bool,
+    ) = {
         let state = ctx.state.lock().await;
         let events: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
         drop(state);
@@ -3132,30 +3139,32 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             crate::community_membership::prior_state_at_hlc(&events, &payload.at, ctx.admin_addr);
         let member_state = materialized.members.get(&payload.publisher_addr).cloned();
         let status_now = member_state.as_ref().map(|s| s.status);
-        let is_joined = matches!(status_now, Some(MemberStatus::Joined));
-        if !is_joined {
+        if matches!(status_now, Some(MemberStatus::Joined)) {
+            (member_state, false)
+        } else if !ctx.is_invite_only && member_state.is_none() {
+            // OPEN + entirely-unknown publisher → defer. We do NOT run the
+            // prior-state publisher-sig check below (no enrolled keys yet);
+            // `bootstrap_admit_open_publisher` (post-decode) supplies them.
+            (None, true)
+        } else {
+            // invite-only, OR known-but-Left/Banned → strict reject (unchanged).
+            // `None` from `members.get` (in the invite-only case) is the
+            // catch-all "not currently Joined per our prior-state-at-publish-
+            // HLC view": the publisher was never a member, has not yet had
+            // their Join propagate to us (cold cache / out-of-band-bootstrap
+            // path), or `publisher_addr` is fabricated. We collapse these
+            // onto `MemberStatus::Left` rather than introduce a fourth
+            // variant — the error is diagnostic-only and the security
+            // invariant ("not Joined → reject") is unchanged. Frontend code
+            // that branches on this field MUST treat `Left` + `left_at: None`
+            // as the "never joined / unknown" case (genuine Leaves always
+            // carry a `left_at`).
             return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
                 addr: payload.publisher_addr,
-                // `None` from `members.get` is the catch-all "not
-                // currently Joined per our prior-state-at-publish-HLC
-                // view": the publisher was never a member, has not
-                // yet had their Join propagate to us (cold cache /
-                // out-of-band-bootstrap path), or `publisher_addr`
-                // is fabricated. We collapse all three onto
-                // `MemberStatus::Left` rather than introduce a fourth
-                // variant — the error is diagnostic-only and the
-                // security invariant ("not Joined → reject") is
-                // unchanged. Frontend code that branches on this
-                // field MUST treat `Left` + `left_at: None` as the
-                // "never joined / unknown" case (genuine Leaves
-                // always carry a `left_at`).
                 status: status_now.unwrap_or(MemberStatus::Left),
                 left_at: member_state.and_then(|s| s.left_at),
             });
         }
-        // `is_joined` ⇒ `member_state` is `Some`. Yield it for the
-        // ZEB-339 publisher-sig check below.
-        member_state.expect("is_joined implies Some(member_state)")
     };
 
     // 3+4. ZEB-339 Task 9: verify `payload.publisher_sig` against the
@@ -3175,8 +3184,17 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    `OwnerDeviceCacheResolver` could not resolve (cache keyed by
     //    Reticulum device-hash, not owner_id) is now authenticated
     //    directly from trusted local membership state.
-    if let Err(e) = verify_publisher_sig(&payload, &publisher_member_state) {
-        return IncomingOutcome::ErrPreMutation(e);
+    // ZEB-558: for the deferred open-bootstrap case we have no enrolled keys
+    // yet — the publisher-sig check runs post-decode against keys derived from
+    // the in-blob self-Join. For all other (known-Joined) publishers, verify
+    // now against their materialized enrolled keys exactly as before.
+    if !deferred_open_bootstrap {
+        let pms = publisher_member_state
+            .as_ref()
+            .expect("non-deferred publisher ⇒ Some(member_state)");
+        if let Err(e) = verify_publisher_sig(&payload, pms) {
+            return IncomingOutcome::ErrPreMutation(e);
+        }
     }
 
     // 5. Replay-protect via per-(addr, device) RootHlcTracker.
@@ -3272,6 +3290,38 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             .cmp(&crate::community_membership::event_sort_key(b))
     });
 
+    // ZEB-558: deferred open-bootstrap admission. The publisher was unknown at
+    // the gate; validate the open self-Join (and any DeviceAnnounce/Leave) they
+    // carry in this blob, bounded to strictly-before the root HLC (`payload.at`)
+    // so admission uses the same pre-root membership window as the known-
+    // publisher path. This derives their enrolled keys and confirms they are
+    // Joined-at-root; we then verify the root publisher_sig against those keys.
+    // The authoritative merge below re-validates and inserts the events.
+    if deferred_open_bootstrap {
+        match crate::community_membership::bootstrap_admit_open_publisher(
+            &resolved,
+            payload.publisher_addr,
+            ctx.admin_addr,
+            ctx.community_id,
+            &payload.at,
+        ) {
+            Some(bootstrap_member_state) => {
+                if let Err(e) = verify_publisher_sig(&payload, &bootstrap_member_state) {
+                    return IncomingOutcome::ErrPreMutation(e);
+                }
+            }
+            None => {
+                // No signature-valid open self-Join for the publisher in this
+                // blob → the publish is unauthorized; reject as before.
+                return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
+                    addr: payload.publisher_addr,
+                    status: MemberStatus::Left,
+                    left_at: None,
+                });
+            }
+        }
+    }
+
     // Phase B: lock community state once, run insert_event for each
     // event, collect rejections for out-of-lock reporting.
     let mut inserted_any = false;
@@ -3305,6 +3355,15 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         //     step 2 was a pre-filter; THIS is the authoritative
         //     security check w.r.t. local state mutations.
         //     CodeRabbit PR #88 round 3 finding.
+        //     ZEB-558 (CodeRabbit #336): the deferred open-bootstrap case runs
+        //     this re-check too. The publisher is normally unknown here (prior
+        //     state None) and admitted by THIS merge, but a concurrent local
+        //     insert could have landed their Join AND a Leave/Kick between
+        //     step 2's snapshot and now — skipping the re-check would let a
+        //     now-Left/Banned publisher pass root authorization and advance the
+        //     replay tracker. So we keep the check and only widen the accepted
+        //     prior-state for the deferred path to include `None` (the expected
+        //     unknown-publisher case) alongside `Joined`.
         {
             let events_now: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
             let mat_now = crate::community_membership::prior_state_at_hlc(
@@ -3314,7 +3373,16 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             );
             let pub_state = mat_now.members.get(&payload.publisher_addr).cloned();
             let pub_status = pub_state.as_ref().map(|s| s.status);
-            if !matches!(pub_status, Some(MemberStatus::Joined)) {
+            // Known-publisher path: must be Joined. Deferred open-bootstrap path:
+            // `None` is the normal unknown-publisher case (their self-Join is in
+            // `resolved`, admitted by this merge), so accept None OR Joined — but
+            // still reject Left/Banned/etc. surfaced by a concurrent insert.
+            let authorized = if deferred_open_bootstrap {
+                matches!(pub_status, None | Some(MemberStatus::Joined))
+            } else {
+                matches!(pub_status, Some(MemberStatus::Joined))
+            };
+            if !authorized {
                 // Drop the lock before returning so error reporting
                 // and the caller's persist machinery aren't serialized
                 // behind an unrelated state lock release.
