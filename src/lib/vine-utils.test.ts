@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveOriginalCreator } from './vine-utils';
+import { resolveOriginalCreator, vineCreatorLabel, vineOriginalCreatorLabel } from './vine-utils';
 import type { VineVideo } from './types';
 
 function vine(overrides: Partial<VineVideo> = {}): VineVideo {
@@ -89,5 +89,85 @@ describe('resolveOriginalCreator', () => {
     const resolved = resolveOriginalCreator(v);
     expect(resolved.originalCreatorAddress).toBe(v.creatorAddress);
     expect(resolved.originalCreatorName).toBe(v.creatorName);
+  });
+});
+
+describe('vineCreatorLabel', () => {
+  it('returns the name verbatim when present', () => {
+    expect(vineCreatorLabel('Alice', '685e4ba7deadbeef')).toBe('Alice');
+  });
+
+  it('falls back to truncated owner-hex when the name is empty (ZEB-561)', () => {
+    // A reshare/publish via the headless RPC with creatorName omitted carries
+    // "" — the viewer must never render a blank resharer.
+    expect(vineCreatorLabel('', '685e4ba7deadbeef')).toBe('685e4ba7');
+  });
+
+  it('falls back when the name is whitespace-only', () => {
+    expect(vineCreatorLabel('   ', '685e4ba7deadbeef')).toBe('685e4ba7');
+  });
+
+  it('falls back when the name is null or undefined', () => {
+    expect(vineCreatorLabel(null, '685e4ba7deadbeef')).toBe('685e4ba7');
+    expect(vineCreatorLabel(undefined, '685e4ba7deadbeef')).toBe('685e4ba7');
+  });
+
+  it('trims surrounding whitespace from a real name', () => {
+    expect(vineCreatorLabel('  Bob  ', 'addr')).toBe('Bob');
+  });
+});
+
+describe('vineOriginalCreatorLabel', () => {
+  it('uses the true-origin name when a reshare carries both originalCreator fields', () => {
+    const v = vine({
+      reshareOf: 'vine-orig',
+      creatorAddress: 'addr-resharer',
+      creatorName: 'Resharer',
+      originalCreatorAddress: 'addr-alice',
+      originalCreatorName: 'Alice',
+    });
+    expect(vineOriginalCreatorLabel(v)).toBe('Alice');
+  });
+
+  it('shows originalCreatorName even when its paired address is absent (display, not propagation)', () => {
+    // A name-only attribution display has no address/name mixing risk, so a
+    // present originalCreatorName must be shown — NOT dropped to creatorName the
+    // way resolveOriginalCreator's both-or-neither propagation rule would.
+    const v = vine({
+      reshareOf: 'vine-orig',
+      creatorAddress: 'a1b2c3d4',
+      creatorName: 'Resharer',
+      originalCreatorName: 'Original Person',
+      // originalCreatorAddress intentionally absent
+    });
+    expect(vineOriginalCreatorLabel(v)).toBe('Original Person');
+  });
+
+  it('falls back to the source creator NAME (not hex) when originalCreatorName is missing (Qodo #337 regression)', () => {
+    // A legacy/partial reshare payload with only a creatorName: must show that
+    // name, NOT a truncated address — the regression Qodo flagged.
+    const v = vine({
+      reshareOf: 'vine-orig',
+      creatorAddress: '685e4ba7deadbeef',
+      creatorName: 'Carol',
+      originalCreatorAddress: 'addr-alice',
+      // originalCreatorName intentionally unset (partial payload)
+    });
+    expect(vineOriginalCreatorLabel(v)).toBe('Carol');
+  });
+
+  it('uses the creator name for a non-reshare vine', () => {
+    const v = vine({ creatorAddress: 'addr-dan', creatorName: 'Dan' });
+    expect(vineOriginalCreatorLabel(v)).toBe('Dan');
+  });
+
+  it('falls back to truncated hex only when both resolved name and creator name are blank', () => {
+    const v = vine({
+      reshareOf: 'vine-orig',
+      creatorAddress: '685e4ba7deadbeef',
+      creatorName: '',
+      // no originalCreator* → resolver returns the (blank) source creator pair
+    });
+    expect(vineOriginalCreatorLabel(v)).toBe('685e4ba7');
   });
 });

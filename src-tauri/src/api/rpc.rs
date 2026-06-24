@@ -105,6 +105,22 @@ struct VineIdArgs {
     vine_id: String,
 }
 
+/// ZEB-562: headless vine-follow verbs. `name` is the optional display label
+/// recorded alongside the followed address (mirrors the GUI command).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FollowVineCreatorArgs {
+    address: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnfollowVineCreatorArgs {
+    address: String,
+}
+
 /// ZEB-527: `community_id` + capped `limit` — shared by the two recent-feed
 /// moderation read verbs (`list_recent_counter_signs`,
 /// `list_recent_moderation_events`).
@@ -651,6 +667,32 @@ pub fn build_registry() -> RpcRegistry {
         crate::ReshareVineArgs,
         |state, _sink, a| async move { crate::reshare_vine_impl(state, a).await }
     );
+    // ZEB-562: vine-follow verbs for the agent-driven e2e harness — parity with
+    // the GUI follow surface, mirroring the ZEB-552 vine RPC pattern.
+    rpc!(
+        m,
+        "follow_vine_creator",
+        FollowVineCreatorArgs,
+        |state, _sink, a| async move {
+            crate::follow_vine_creator_impl(state, a.address, a.name)
+                .map(|followed| serde_json::json!({ "followed": followed }))
+        }
+    );
+    rpc!(
+        m,
+        "unfollow_vine_creator",
+        UnfollowVineCreatorArgs,
+        |state, _sink, a| async move {
+            crate::unfollow_vine_creator_impl(state, a.address)
+                .map(|unfollowed| serde_json::json!({ "unfollowed": unfollowed }))
+        }
+    );
+    rpc!(
+        m,
+        "list_followed",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::list_followed_impl(state) }
+    );
 
     // Friends.
     rpc!(m, "list_friends", EmptyArgs, |state, _sink, _a| {
@@ -997,6 +1039,37 @@ mod tests {
                 assert!(!msg.is_empty(), "IPC error string should be non-empty")
             }
             other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn vine_follow_rpcs_are_registered_and_wired() {
+        // ZEB-562: dispatching the three follow verbs with valid args on a
+        // default (not-connected) NodeState must reach the `_impl` seam and
+        // surface its `Command("not connected")` error — NOT `UnknownCommand`
+        // (would mean unregistered) and NOT `BadArgs` (would mean the arg
+        // struct rejected the shape). Proves registration + arg parse + wiring.
+        let reg = build_registry();
+        let cases = [
+            (
+                "follow_vine_creator",
+                serde_json::json!({ "address": "abcd1234", "name": "Alice" }),
+            ),
+            (
+                "unfollow_vine_creator",
+                serde_json::json!({ "address": "abcd1234" }),
+            ),
+            ("list_followed", serde_json::json!({})),
+        ];
+        for (method, args) in cases {
+            let err = reg
+                .dispatch(method, test_state(), test_sink(), args)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RpcError::Command(_)),
+                "{method}: expected Command (not connected), got {err:?}"
+            );
         }
     }
 
@@ -1362,6 +1435,10 @@ mod tests {
             "list_vine_videos",
             "mark_vine_viewed",
             "reshare_vine",
+            // vine follows (ZEB-562)
+            "follow_vine_creator",
+            "unfollow_vine_creator",
+            "list_followed",
             // friends
             "list_friends",
             "generate_friend_token",

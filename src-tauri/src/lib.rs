@@ -12101,6 +12101,17 @@ async fn follow_vine_creator(
     name: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
+    follow_vine_creator_impl(state.inner(), address, name)
+}
+
+/// Shared seam for `follow_vine_creator` (GUI command + headless RPC).
+/// Returns `Ok(true)` if newly followed, `Ok(false)` if already followed.
+/// `Err("not connected")` if the node is not running; `Err` on self-follow.
+pub(crate) fn follow_vine_creator_impl(
+    state: &Mutex<NodeState>,
+    address: String,
+    name: Option<String>,
+) -> Result<bool, String> {
     let mut guard = state.lock().map_err(|e| format!("lock: {e}"))?;
 
     if address == guard.node_addr {
@@ -12134,6 +12145,15 @@ async fn unfollow_vine_creator(
     address: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
+    unfollow_vine_creator_impl(state.inner(), address)
+}
+
+/// Shared seam for `unfollow_vine_creator` (GUI command + headless RPC).
+/// Returns `Ok(true)` if removed, `Ok(false)` if it was not followed.
+pub(crate) fn unfollow_vine_creator_impl(
+    state: &Mutex<NodeState>,
+    address: String,
+) -> Result<bool, String> {
     let mut guard = state.lock().map_err(|e| format!("lock: {e}"))?;
 
     let mgr = guard.follow_mgr.as_mut().ok_or("not connected")?;
@@ -12161,6 +12181,13 @@ async fn unfollow_vine_creator(
 #[tauri::command]
 fn list_followed(
     state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<FollowEntryResponse>, String> {
+    list_followed_impl(state.inner())
+}
+
+/// Shared seam for `list_followed` (GUI command + headless RPC).
+pub(crate) fn list_followed_impl(
+    state: &Mutex<NodeState>,
 ) -> Result<Vec<FollowEntryResponse>, String> {
     let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
     let mgr = guard.follow_mgr.as_ref().ok_or("not connected")?;
