@@ -3560,23 +3560,48 @@ pub fn bootstrap_admit_open_publisher(
         admin_addr,
         is_invite_only: false,
     };
-    // Empty prior: an unknown publisher has no local membership, so the
-    // banned-status guard in `verify_event` sees no prior entry (not banned),
-    // and an open Join needs no power/countersig. This validates signature +
-    // EnrollmentCert exactly as the merge path will.
-    let prior = MaterializedMembership::default();
-    let verified: Vec<SignedMembershipEvent> = incoming_events
+    // 1. The publisher's signature-valid open self-Join(s), validated against an
+    //    empty prior: an unknown publisher has no local membership, so the
+    //    banned-status guard in `verify_event` sees no prior entry (not banned),
+    //    and an open Join needs no power/countersig. This validates signature +
+    //    EnrollmentCert exactly as the merge path will.
+    let empty = MaterializedMembership::default();
+    let mut verified: Vec<SignedMembershipEvent> = incoming_events
         .iter()
         .filter(|e| e.actor == publisher_addr && matches!(e.kind, MembershipEventKind::Join))
-        .filter(|e| verify_event(e, &prior, &ctx).is_ok())
+        .filter(|e| verify_event(e, &empty, &ctx).is_ok())
         .cloned()
         .collect();
     if verified.is_empty() {
         return None;
     }
-    // Materialize the verified self-Join(s) to derive the canonical
-    // MemberState (status + enrolled_device_keys from the cert) the merge
-    // will produce. `None` now-floor: we only need the resulting status/keys.
+    verified.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
+
+    // 2. Fold in the publisher's DeviceAnnounce events so the seeded enrolled-key
+    //    set matches what the authoritative merge materializes. A root publish may
+    //    be signed by a SECOND device added via DeviceAnnounce (ZEB-339 / #284),
+    //    and `verify_publisher_sig` accepts ANY enrolled key — so without these the
+    //    deferred path would wrongly reject a valid device-#2-signed publish.
+    //    Verify each incrementally against the state including the Join + already-
+    //    accepted announces (the same per-event prior_state the merge uses; the
+    //    announcer must be Joined, which `verify_event` enforces).
+    let mut announces: Vec<&SignedMembershipEvent> = incoming_events
+        .iter()
+        .filter(|e| {
+            e.actor == publisher_addr && matches!(e.kind, MembershipEventKind::DeviceAnnounce)
+        })
+        .collect();
+    announces.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
+    for ann in announces {
+        let prior = materialize_with_now(&verified, admin_addr, None);
+        if verify_event(ann, &prior, &ctx).is_ok() {
+            verified.push(ann.clone());
+            verified.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
+        }
+    }
+
+    // 3. Materialize Join(s) + accepted DeviceAnnounce(s) → the canonical
+    //    MemberState (Joined + full enrolled-key set) the merge will produce.
     let mat = materialize_with_now(&verified, admin_addr, None);
     mat.members
         .get(&publisher_addr)
@@ -11580,6 +11605,55 @@ mod zeb_339_signer_verify_tests {
         };
         verify_event(&announce, &prior, &ctx_invite)
             .expect("DeviceAnnounce bypasses the invite-only countersign gate by construction");
+    }
+
+    /// ZEB-558 (Qodo #336): the deferred open-bootstrap helper must seed the
+    /// publisher's FULL enrolled-key set, including a second device added via
+    /// DeviceAnnounce — otherwise a root publish signed by device #2 would be
+    /// wrongly rejected as PublisherSigInvalid on the cold-bootstrap path.
+    #[test]
+    fn bootstrap_admit_open_publisher_includes_device_announce_keys() {
+        let admin = mint_test_owner(0x71);
+        let owner = mint_test_owner(0x72);
+        let community_id = SpaceId([0x77; 16]);
+
+        // device #1: the open self-Join.
+        let join_payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let join = sign_event(&join_payload, &owner.device_key).unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..join
+        };
+
+        // device #2: announced after the join.
+        let (device2_sk, cert2) = mint_second_device(0x72, 0x73);
+        let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 200);
+
+        let events = vec![join, announce];
+        let ms = bootstrap_admit_open_publisher(&events, owner.owner, admin.owner, community_id)
+            .expect("Join + DeviceAnnounce must admit");
+        assert!(matches!(ms.status, MemberStatus::Joined));
+        assert!(
+            ms.enrolled_device_keys
+                .contains(&owner.cert.device_pubkeys.classical.ed25519_verify),
+            "device #1 key (from Join) must be seeded"
+        );
+        assert!(
+            ms.enrolled_device_keys
+                .contains(&cert2.device_pubkeys.classical.ed25519_verify),
+            "device #2 key (from DeviceAnnounce) must be seeded"
+        );
+        assert_eq!(ms.enrolled_device_keys.len(), 2);
     }
 
     /// Unit 4: verify_event rejects a DeviceAnnounce whose actor is NOT an
