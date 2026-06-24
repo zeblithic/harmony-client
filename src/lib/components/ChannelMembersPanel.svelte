@@ -12,6 +12,7 @@
     ownAddress,
     trustService,
     collapsed,
+    loading = false,
     onAvatarClick,
     resolveCard,
     resolveNickname,
@@ -22,6 +23,11 @@
     ownAddress: string;
     trustService?: TrustService;
     collapsed: boolean;
+    /** ZEB-553 item 11: true while an initial roster load is in flight after a
+     *  community switch. Drives a "Loading members…" affordance instead of a
+     *  bare "0", which otherwise reads as "this community has no members" during
+     *  the fetch. Only meaningful when the roster is still empty. */
+    loading?: boolean;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
     /** ZEB-341: optional profile-card resolver for member display names. */
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
@@ -108,13 +114,21 @@
   <aside class="members-panel" aria-label="Community members">
     <header class="panel-header">
       <span class="title">Members</span>
-      <span class="count">{visible.length}</span>
+      <!-- During the initial post-switch fetch the true count is unknown, so
+           "0" would be a lie — show an ellipsis until the roster resolves. -->
+      <span class="count">{loading && visible.length === 0 ? '…' : visible.length}</span>
     </header>
-    <!-- Explicit list roles: `list-style: none` strips the implicit
-         list/listitem semantics in Safari + VoiceOver, so a screen reader
-         wouldn't announce this as a list of N members without them. -->
-    <ul class="member-list" role="list">
-      {#each ordered as m (m.address)}
+    {#if loading && visible.length === 0}
+      <!-- ZEB-553 item 11: kept a sibling of the <ul> (not an <li>) so the list
+           stays a pure list of listitems for screen readers, and the loading
+           message is a clean status live-region instead. -->
+      <p class="member-loading" role="status">Loading members…</p>
+    {:else}
+      <!-- Explicit list roles: `list-style: none` strips the implicit
+           list/listitem semantics in Safari + VoiceOver, so a screen reader
+           wouldn't announce this as a list of N members without them. -->
+      <ul class="member-list" role="list">
+        {#each ordered as m (m.address)}
         <li class="member-row" role="listitem">
           <span
             class="presence-dot"
@@ -150,7 +164,8 @@
           </div>
         </li>
       {/each}
-    </ul>
+      </ul>
+    {/if}
   </aside>
 {/if}
 
@@ -190,6 +205,14 @@
     padding: 6px 0;
     overflow-y: auto;
     flex: 1;
+  }
+  /* ZEB-553 item 11: post-switch loading affordance for the roster. */
+  .member-loading {
+    margin: 0;
+    padding: 10px 14px;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    font-style: italic;
   }
   .member-row {
     display: flex;

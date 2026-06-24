@@ -28,6 +28,7 @@
     myPower,
     ownAddress,
     members,
+    membersLoading = false,
     isDegraded,
     sharedInProfile,
     communityService,
@@ -57,6 +58,10 @@
     myPower: number;
     ownAddress: string;
     members: CommunityMember[];
+    /** ZEB-553 item 11: forwarded to ChannelMembersPanel so a community switch
+     *  shows a loading affordance instead of a bare "0 members" while the
+     *  roster is being fetched. */
+    membersLoading?: boolean;
     isDegraded: boolean;
     sharedInProfile: boolean;
     communityService: CommunityService;
@@ -482,6 +487,7 @@
     {/if}
     <ChannelMembersPanel
       {members}
+      loading={membersLoading}
       {ownAddress}
       {trustService}
       {resolveCard}

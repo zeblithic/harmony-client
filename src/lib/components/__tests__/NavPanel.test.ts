@@ -276,7 +276,10 @@ describe('NavPanel', () => {
       const onRedeemInvite = vi.fn();
       render(NavPanel, { props: { ...fabBaseProps, onRedeemInvite } });
       await fireEvent.click(screen.getByLabelText(/Create new/i));
-      await fireEvent.click(screen.getByText(/Redeem invite/i));
+      // Scope to the menu item: with no community joined, the ZEB-553 item-13
+      // empty-state CTA also carries "Redeem invite link" (a plain button, not a
+      // menuitem), so a bare getByText would now be ambiguous.
+      await fireEvent.click(screen.getByRole('menuitem', { name: /Redeem invite/i }));
       expect(onRedeemInvite).toHaveBeenCalled();
     });
 
@@ -323,6 +326,74 @@ describe('NavPanel', () => {
       render(NavPanel, { props: { nodes: communityNodes, collapsed: false, onNodeClick } });
       await fireEvent.click(screen.getByText('IPFS Crew'));
       expect(onNodeClick).toHaveBeenCalledWith('comm-1');
+    });
+  });
+
+  describe('Zero-community empty-state redeem CTA (ZEB-553 item 13)', () => {
+    // A fresh tester may have a DM but no community joined — the CTA targets the
+    // absence of a *community* specifically (DMs don't count), since its purpose
+    // is onboarding into a first community via an invite.
+    const dmOnlyNodes: NavNode[] = [
+      {
+        id: 'eve-dm',
+        parentId: null,
+        type: 'dm',
+        name: 'Eve',
+        expanded: false,
+        unreadCount: 0,
+        unreadLevel: 'none',
+        lastActivity: 300,
+      },
+    ];
+    const communityNodes: NavNode[] = [
+      {
+        id: 'comm-1',
+        parentId: null,
+        type: 'community',
+        name: 'IPFS Crew',
+        expanded: true,
+        unreadCount: 0,
+        unreadLevel: 'none',
+        lastActivity: 1000,
+      },
+    ];
+
+    it('shows the empty-state CTA when no community is joined', () => {
+      render(NavPanel, { props: { nodes: dmOnlyNodes, collapsed: false, onRedeemInvite: vi.fn() } });
+      expect(screen.getByText(/No communities yet/i)).toBeTruthy();
+      // Menu is closed, so the only "Redeem invite link" affordance is the CTA.
+      expect(screen.getByRole('button', { name: /Redeem invite link/i })).toBeTruthy();
+    });
+
+    it('clicking the CTA invokes onRedeemInvite (same flow as the FAB menu item)', async () => {
+      const onRedeemInvite = vi.fn();
+      render(NavPanel, { props: { nodes: dmOnlyNodes, collapsed: false, onRedeemInvite } });
+      await fireEvent.click(screen.getByRole('button', { name: /Redeem invite link/i }));
+      expect(onRedeemInvite).toHaveBeenCalled();
+    });
+
+    it('hides the CTA once at least one community is present', () => {
+      render(NavPanel, { props: { nodes: communityNodes, collapsed: false, onRedeemInvite: vi.fn() } });
+      expect(screen.queryByText(/No communities yet/i)).toBeNull();
+    });
+
+    it('hides the CTA while a search query is active (no-results state, not a zero-community home)', async () => {
+      render(NavPanel, { props: { nodes: dmOnlyNodes, collapsed: false, onRedeemInvite: vi.fn() } });
+      expect(screen.getByText(/No communities yet/i)).toBeTruthy();
+      await fireEvent.input(screen.getByPlaceholderText('Search'), { target: { value: 'zzz' } });
+      expect(screen.queryByText(/No communities yet/i)).toBeNull();
+    });
+
+    it('does not show the CTA outside messages mode', () => {
+      render(NavPanel, {
+        props: { nodes: dmOnlyNodes, collapsed: false, appMode: 'vines', onRedeemInvite: vi.fn() },
+      });
+      expect(screen.queryByText(/No communities yet/i)).toBeNull();
+    });
+
+    it('does not show the CTA when no onRedeemInvite handler is wired', () => {
+      render(NavPanel, { props: { nodes: dmOnlyNodes, collapsed: false } });
+      expect(screen.queryByText(/No communities yet/i)).toBeNull();
     });
   });
 });

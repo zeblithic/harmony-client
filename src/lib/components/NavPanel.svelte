@@ -196,6 +196,14 @@
   });
 
   let topLevelNodes = $derived(getChildNodes(navNodes, null));
+
+  // ZEB-553 item 13: a zero-community tester has nothing actionable in the nav,
+  // and the only way to join one — "Redeem invite link" — is buried in the "+"
+  // FAB menu. Surface an explicit empty-state CTA when no community is present.
+  // Gated on community nodes specifically: DMs don't count, since the point is
+  // onboarding into a first community. The CTA reuses the same onRedeemInvite
+  // callback the FAB does, so it opens the identical RedeemInviteDialog flow.
+  let hasCommunities = $derived(navNodes.some((n) => n.type === 'community'));
 </script>
 
 <svelte:window onkeydown={handleWindowKeyDown} onmousedown={handleWindowMouseDown} />
@@ -262,6 +270,18 @@
           onSortOrderChange={changeSortOrder}
           {profileLookup}
         />
+        <!-- ZEB-553 item 13: zero-community empty-state CTA. Suppressed while a
+             search is active (the empty nav is then a "no results" state, not a
+             true zero-community home). -->
+        {#if appMode === 'messages' && onRedeemInvite && !hasCommunities && !searchQuery.trim()}
+          <div class="nav-empty-state">
+            <p class="nav-empty-title">No communities yet</p>
+            <p class="nav-empty-hint">Have an invite link? Redeem it to join your first community.</p>
+            <button type="button" class="nav-empty-cta" onclick={() => onRedeemInvite?.()}>
+              🔗 Redeem invite link
+            </button>
+          </div>
+        {/if}
       {/if}
     </nav>
     {#if appMode === 'files'}
@@ -402,6 +422,42 @@
   .notes-nav-row:hover { background: var(--bg-tertiary); }
   .notes-nav-row.active { background: var(--accent); color: var(--text-primary); }
   .notes-nav-icon { font-size: 0.95rem; }
+
+  /* ZEB-553 item 13: zero-community empty-state redeem CTA. */
+  .nav-empty-state {
+    margin: 12px 8px 0;
+    padding: 14px 12px;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    text-align: center;
+  }
+  .nav-empty-title {
+    margin: 0 0 4px;
+    color: var(--text-primary);
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  .nav-empty-hint {
+    margin: 0 0 10px;
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    line-height: 1.35;
+  }
+  .nav-empty-cta {
+    width: 100%;
+    padding: 7px 10px;
+    border: none;
+    border-radius: 4px;
+    background: var(--accent);
+    color: var(--text-primary);
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .nav-empty-cta:hover { filter: brightness(1.1); }
+  .nav-empty-cta:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
 
   .collapsed-icons {
     display: flex;
