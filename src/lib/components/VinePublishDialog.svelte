@@ -37,7 +37,9 @@
       videoCid = result.cid;
       pickedFileName = result.fileName;
     } catch (err) {
-      error = err instanceof Error ? err.message : 'Could not process the video';
+      // Production Tauri rejections are strings (e.g. "video too large: …");
+      // preserve them rather than collapsing to a generic message.
+      error = err instanceof Error ? err.message : String(err);
     } finally {
       ingesting = false;
     }
@@ -59,7 +61,7 @@
       pickedFileName = '';
       onClose();
     } catch (err) {
-      error = err instanceof Error ? err.message : 'Publish failed';
+      error = err instanceof Error ? err.message : String(err);
     } finally {
       publishing = false;
     }
@@ -86,33 +88,46 @@
     <form class="dialog-body" onsubmit={(e) => { e.preventDefault(); handleSubmit(); }}>
       <div class="field">
         <span class="field-label">Video</span>
-        {#if pickedFileName}
-          <div class="picked-file" data-testid="picked-file">
-            <span class="picked-check" aria-hidden="true">✓</span>
-            <span class="picked-name" title={pickedFileName}>{pickedFileName}</span>
+        {#if onPickVideo}
+          {#if pickedFileName}
+            <div class="picked-file" data-testid="picked-file">
+              <span class="picked-check" aria-hidden="true">✓</span>
+              <span class="picked-name" title={pickedFileName}>{pickedFileName}</span>
+              <button
+                type="button"
+                class="link-btn"
+                onclick={handleChooseVideo}
+                disabled={ingesting || publishing}
+              >Change</button>
+            </div>
+          {:else}
             <button
               type="button"
-              class="link-btn"
+              class="choose-video-btn"
+              bind:this={chooseBtn}
               onclick={handleChooseVideo}
               disabled={ingesting || publishing}
-            >Change</button>
-          </div>
+              data-testid="choose-video"
+            >
+              {#if ingesting}
+                <span class="spinner" aria-hidden="true"></span>Processing video…
+              {:else}
+                <span aria-hidden="true">🎬</span> Choose video…
+              {/if}
+            </button>
+            <span class="field-hint">Pick a local video file (max 100&nbsp;MB).</span>
+          {/if}
         {:else}
-          <button
-            type="button"
-            class="choose-video-btn"
-            bind:this={chooseBtn}
-            onclick={handleChooseVideo}
-            disabled={ingesting || publishing}
-            data-testid="choose-video"
-          >
-            {#if ingesting}
-              <span class="spinner" aria-hidden="true"></span>Processing video…
-            {:else}
-              <span aria-hidden="true">🎬</span> Choose video…
-            {/if}
-          </button>
-          <span class="field-hint">Pick a local video file (max 100&nbsp;MB).</span>
+          <!-- No native picker (web/dev or pre-connect): manual CID is the
+               primary path, so there's no dead "Choose video…" control. -->
+          <input
+            type="text"
+            bind:value={videoCid}
+            placeholder="Hex-encoded content ID"
+            class="field-input"
+            aria-label="Video CID"
+          />
+          <span class="field-hint">Paste a Video CID (file picker unavailable here).</span>
         {/if}
         {#if error}
           <span class="error-text" role="alert">{error}</span>
@@ -131,18 +146,20 @@
         <span class="char-count">{title.length}/140</span>
       </label>
 
-      <details class="advanced" bind:open={showAdvanced}>
-        <summary class="advanced-summary">Advanced: paste a Video CID</summary>
-        <input
-          type="text"
-          bind:value={videoCid}
-          oninput={() => { pickedFileName = ''; }}
-          placeholder="Hex-encoded content ID"
-          class="field-input advanced-input"
-          aria-label="Video CID"
-        />
-        <span class="field-hint">For a content ID you already have (e.g. from the headless API).</span>
-      </details>
+      {#if onPickVideo}
+        <details class="advanced" bind:open={showAdvanced}>
+          <summary class="advanced-summary">Advanced: paste a Video CID</summary>
+          <input
+            type="text"
+            bind:value={videoCid}
+            oninput={() => { pickedFileName = ''; }}
+            placeholder="Hex-encoded content ID"
+            class="field-input advanced-input"
+            aria-label="Video CID"
+          />
+          <span class="field-hint">For a content ID you already have (e.g. from the headless API).</span>
+        </details>
+      {/if}
 
       <div class="dialog-actions">
         <button type="button" class="btn btn-secondary" onclick={onClose}>Cancel</button>

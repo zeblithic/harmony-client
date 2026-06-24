@@ -3104,7 +3104,7 @@
       ownAddress={myAddress || undefined}
     />
     {#if showVinePublish}
-      <VinePublishDialog onPublish={handleVinePublish} onPickVideo={handlePickVineVideo} onClose={() => showVinePublish = false} />
+      <VinePublishDialog onPublish={handleVinePublish} onPickVideo={isTauri() ? handlePickVineVideo : undefined} onClose={() => showVinePublish = false} />
     {/if}
   {/snippet}
   {#snippet fileBrowser()}

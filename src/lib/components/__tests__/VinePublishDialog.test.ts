@@ -77,6 +77,19 @@ describe('VinePublishDialog (ZEB-559)', () => {
     expect(screen.getByTestId('choose-video')).toBeTruthy();
   });
 
+  it('without a native picker (onPickVideo undefined) shows manual CID as the primary control, no dead CTA', async () => {
+    const onPublish = vi.fn().mockResolvedValue(undefined);
+    render(VinePublishDialog, props({ onPickVideo: undefined, onPublish }));
+    // No picker CTA in the fallback mode — it would be a no-op.
+    expect(screen.queryByTestId('choose-video')).toBeNull();
+    // Manual CID is the primary, usable control.
+    await fireEvent.input(screen.getByLabelText('Video CID'), { target: { value: 'fallbackcid' } });
+    const publish = screen.getByRole('button', { name: 'Publish' });
+    await waitFor(() => expect(publish).not.toBeDisabled());
+    await fireEvent.click(publish);
+    await waitFor(() => expect(onPublish).toHaveBeenCalledWith('fallbackcid', undefined));
+  });
+
   it('Advanced: pasting a raw CID also enables Publish (headless-parity path)', async () => {
     const onPublish = vi.fn().mockResolvedValue(undefined);
     render(VinePublishDialog, props({ onPublish }));

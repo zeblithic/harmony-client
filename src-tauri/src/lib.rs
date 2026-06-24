@@ -13117,12 +13117,12 @@ pub(crate) const VINE_VIDEO_MAX_BYTES: u64 = 100 * 1024 * 1024;
 /// cap.
 pub(crate) async fn ingest_vine_video_inner(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
-    path: String,
+    path: &std::path::Path,
 ) -> Result<String, String> {
     use harmony_content::chunker::ChunkerConfig;
     use tokio::io::AsyncReadExt;
 
-    let file = tokio::fs::File::open(&path)
+    let file = tokio::fs::File::open(path)
         .await
         .map_err(|e| format!("could not open video file: {e}"))?;
     // Re-stat the OPENED fd (same inode as the read below — no path
@@ -13204,7 +13204,6 @@ async fn ingest_vine_video(
         .and_then(|n| n.to_str())
         .unwrap_or("video")
         .to_string();
-    let path_str = path.to_string_lossy().into_owned();
 
     let ingest_tx = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -13213,7 +13212,7 @@ async fn ingest_vine_video(
             .clone()
             .ok_or_else(|| "not connected".to_string())?
     };
-    let video_cid = ingest_vine_video_inner(&ingest_tx, path_str).await?;
+    let video_cid = ingest_vine_video_inner(&ingest_tx, path).await?;
     Ok(Some(VineVideoIngest {
         video_cid,
         file_name,
@@ -13570,7 +13569,7 @@ mod path_ingest_tests {
             .await
             .expect("write temp video");
 
-        let cid_hex = ingest_vine_video_inner(&ingest_tx, path.to_string_lossy().into_owned())
+        let cid_hex = ingest_vine_video_inner(&ingest_tx, &path)
             .await
             .expect("ingest");
         let raw = hex::decode(&cid_hex).unwrap();
@@ -13605,7 +13604,7 @@ mod path_ingest_tests {
         f.set_len(VINE_VIDEO_MAX_BYTES + 1).expect("set_len");
         drop(f);
 
-        let err = ingest_vine_video_inner(&ingest_tx, path.to_string_lossy().into_owned())
+        let err = ingest_vine_video_inner(&ingest_tx, &path)
             .await
             .expect_err("oversize must error");
         assert!(err.contains("too large"), "got: {err}");
