@@ -117,10 +117,76 @@ describe('VineFeed', () => {
     expect(screen.getByText(/All caught up/)).toBeTruthy();
   });
 
-  it('renders create button when onPublish is provided', () => {
+  it('renders a labeled create button when onPublish is provided', () => {
     const onPublish = vi.fn();
     render(VineFeed, { props: { followedVines: vines, viewedIds: makeViewedIds(), activeTab: 'following', followedAddresses: new Set(), onPublish } });
-    expect(screen.getByLabelText('Create vine')).toBeTruthy();
+    // ZEB-554: the create affordance is now a labeled "New vine" pill, not a
+    // bare "+" — its accessible name matches the visible text.
+    expect(screen.getByRole('button', { name: 'New vine' })).toBeTruthy();
+  });
+
+  it('fires onPublish when the header create button is clicked', async () => {
+    const onPublish = vi.fn();
+    render(VineFeed, { props: { followedVines: vines, viewedIds: makeViewedIds(), activeTab: 'following', followedAddresses: new Set(), onPublish } });
+    await fireEvent.click(screen.getByRole('button', { name: 'New vine' }));
+    expect(onPublish).toHaveBeenCalled();
+  });
+
+  describe('ZEB-554 empty-state "Share a vine" CTA', () => {
+    it('shows the CTA in an empty Following feed and fires onPublish', async () => {
+      const onPublish = vi.fn();
+      render(VineFeed, { props: {
+        followedVines: [], discoverVines: [], viewedIds: new Set(),
+        activeTab: 'following', followedAddresses: new Set(), onPublish,
+      } });
+      const cta = screen.getByRole('button', { name: 'Share a vine' });
+      await fireEvent.click(cta);
+      expect(onPublish).toHaveBeenCalled();
+    });
+
+    it('shows the CTA in an empty Discover feed', () => {
+      const onPublish = vi.fn();
+      render(VineFeed, { props: {
+        followedVines: [], discoverVines: [], viewedIds: new Set(),
+        activeTab: 'discover', followedAddresses: new Set(), onPublish,
+      } });
+      expect(screen.getByRole('button', { name: 'Share a vine' })).toBeTruthy();
+    });
+
+    it('shows the CTA in an empty Following → Unviewed feed with no followed vines', async () => {
+      // Regression (CodeAnt, PR #333): suppression must be gated on actually
+      // HAVING vines, not just the filter state. A zero-vine user who flips to
+      // Unviewed is not "all caught up" — they still need the create path.
+      const onPublish = vi.fn();
+      render(VineFeed, { props: {
+        followedVines: [], discoverVines: [], viewedIds: new Set(),
+        activeTab: 'following', followedAddresses: new Set(), onPublish,
+      } });
+      await fireEvent.click(screen.getByText('Unviewed'));
+      expect(screen.getByRole('button', { name: 'Share a vine' })).toBeTruthy();
+    });
+
+    it('omits the CTA in the all-caught-up (Following → Unviewed) state', async () => {
+      // The user HAS vines here, just none unviewed — the action is "switch to
+      // All", not "post", so the post CTA would be noise.
+      const allViewed = vines.map(v => ({ ...v, viewed: true }));
+      const onPublish = vi.fn();
+      render(VineFeed, { props: {
+        followedVines: allViewed, viewedIds: makeViewedIds(allViewed),
+        activeTab: 'following', followedAddresses: new Set(), onPublish,
+      } });
+      await fireEvent.click(screen.getByText('Unviewed'));
+      expect(screen.getByText(/All caught up/)).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'Share a vine' })).toBeNull();
+    });
+
+    it('omits the CTA when onPublish is not provided', () => {
+      render(VineFeed, { props: {
+        followedVines: [], discoverVines: [], viewedIds: new Set(),
+        activeTab: 'discover', followedAddresses: new Set(),
+      } });
+      expect(screen.queryByRole('button', { name: 'Share a vine' })).toBeNull();
+    });
   });
 
   it('has accessible feed list', () => {

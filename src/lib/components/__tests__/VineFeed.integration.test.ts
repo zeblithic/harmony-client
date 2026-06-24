@@ -259,7 +259,7 @@ describe('VineFeed Integration', () => {
 
   it('shows create button and fires onPublish', async () => {
     const { callbacks } = renderFeed();
-    const createBtn = screen.getByLabelText('Create vine');
+    const createBtn = screen.getByRole('button', { name: 'New vine' });
     await fireEvent.click(createBtn);
 
     expect(callbacks.onPublish).toHaveBeenCalled();
@@ -267,7 +267,7 @@ describe('VineFeed Integration', () => {
 
   it('hides create button when onPublish is not provided', () => {
     renderFeed({ onPublish: undefined });
-    expect(screen.queryByLabelText('Create vine')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'New vine' })).toBeNull();
   });
 
   // ── 7. Accessibility ──────────────────────────────────────────────
