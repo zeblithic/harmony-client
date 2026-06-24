@@ -24,6 +24,10 @@
   let avatarUrl = $state<string | undefined>(untrack(() => profile.avatarUrl));
   let avatarBusy = $state(false);
   let avatarError = $state<string | null>(null);
+  // Shown after a successful pick when the source was an animated format
+  // (GIF/WebP): normalizeAvatar flattens to a single static PNG frame, so a
+  // silent loss of animation would surprise the user.
+  let avatarNotice = $state<string | null>(null);
   let saved = $state(false);
   let savedTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -154,6 +158,7 @@
     if (!file) return;
     avatarBusy = true;
     avatarError = null;
+    avatarNotice = null;
     try {
       const bytes = await normalizeAvatar(file);
       const { invoke } = await import('@tauri-apps/api/core');
@@ -168,6 +173,11 @@
       avatarUrl = URL.createObjectURL(
         new Blob([new Uint8Array(bytes)], { type: 'image/png' }),
       );
+      // normalizeAvatar renders only the first frame of an animated GIF/WebP to
+      // a static PNG — surface that so a lost animation isn't a silent surprise.
+      if (/^image\/(gif|webp)$/i.test(file.type)) {
+        avatarNotice = 'Animated images are saved as a single static frame.';
+      }
     } catch (err) {
       avatarError = err instanceof Error ? err.message : String(err);
     } finally {
@@ -310,6 +320,9 @@
     {/if}
     {#if avatarError}
       <span class="avatar-error" role="alert">{avatarError}</span>
+    {/if}
+    {#if avatarNotice}
+      <span class="avatar-notice" role="status">{avatarNotice}</span>
     {/if}
   </div>
 
@@ -563,6 +576,11 @@
   .avatar-error {
     font-size: 12px;
     color: var(--danger, #d9534f);
+  }
+
+  .avatar-notice {
+    font-size: 12px;
+    color: var(--text-muted);
   }
 
   .about-section {

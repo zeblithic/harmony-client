@@ -297,7 +297,7 @@
       </p>
     {/if}
     <RecentActionsBadge events={recentEvents} />
-    <ul class="member-list" aria-label="Active members">
+    <ul class="member-list" role="list" aria-label="Active members">
       {#each joined as member (member.address)}
         <MemberRow
           {member}
@@ -310,14 +310,14 @@
         />
       {/each}
       {#if joined.length === 0}
-        <li class="empty-row">No members match your filter.</li>
+        <li class="empty-row" role="listitem">No members match your filter.</li>
       {/if}
     </ul>
 
     {#if banned.length > 0}
       <details bind:open={bannedExpanded}>
         <summary class="banned-summary">Banned ({banned.length})</summary>
-        <ul class="member-list banned-list" aria-label="Banned members">
+        <ul class="member-list banned-list" role="list" aria-label="Banned members">
           {#each banned as member (member.address)}
             <MemberRow
               {member}

@@ -788,6 +788,53 @@ describe('ChannelMessageFeed reactions — chips (ZEB-536)', () => {
     });
   });
 
+  it('reaction-error banner can be dismissed (finding 14)', async () => {
+    const { adapter, container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 1, mine: false, reactors: ['ee'.repeat(20)] },
+    ]);
+    // Make the toggle fail so the error banner surfaces.
+    (adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'set_message_reaction') return Promise.reject(new Error('reaction rejected'));
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'request_channel_backfill') return Promise.resolve(undefined);
+      return Promise.resolve(undefined);
+    });
+    let chip!: Element;
+    await waitFor(() => {
+      chip = container.querySelector('.reaction-chip')!;
+      expect(chip).toBeTruthy();
+    });
+    await fireEvent.click(chip);
+    await waitFor(() => expect(container.querySelector('.reaction-error')).not.toBeNull());
+    // The dismiss button clears the banner without requiring a new action.
+    await fireEvent.click(container.querySelector('.reaction-error-dismiss')!);
+    await waitFor(() => expect(container.querySelector('.reaction-error')).toBeNull());
+  });
+
+  it('reaction picker supports arrow-key roving focus across menuitems (finding 15)', async () => {
+    const { container } = await seedMessageWithReactions([]);
+    let toggle!: Element;
+    await waitFor(() => {
+      toggle = container.querySelector('.picker-toggle')!;
+      expect(toggle).toBeTruthy();
+    });
+    await fireEvent.click(toggle);
+    const menu = container.querySelector('.reaction-picker') as HTMLElement;
+    expect(menu).toBeTruthy();
+    expect(menu.getAttribute('role')).toBe('menu');
+    const items = menu.querySelectorAll<HTMLElement>('[role="menuitem"]');
+    expect(items.length).toBeGreaterThan(1);
+    // Opening the picker moves focus to the first reaction.
+    expect(document.activeElement).toBe(items[0]);
+    // ArrowRight advances; ArrowLeft returns (wrapping roving focus). Fire from
+    // the focused item so the event bubbles to the menu's handler as it would
+    // in the browser.
+    await fireEvent.keyDown(items[0], { key: 'ArrowRight' });
+    expect(document.activeElement).toBe(items[1]);
+    await fireEvent.keyDown(items[1], { key: 'ArrowLeft' });
+    expect(document.activeElement).toBe(items[0]);
+  });
+
   it('a live channel-reaction-received event updates the chip count', async () => {
     const { adapter, container } = await seedMessageWithReactions([
       { emoji: '👍', count: 1, mine: false, reactors: ['ee'.repeat(20)] },
@@ -1291,6 +1338,35 @@ describe('ChannelMessageFeed reactions — custom (CAS) emoji (ZEB-541)', () => 
       true,
       { cid: 'aa', mime: 'image/png', size: 7 },
     );
+  });
+
+  it('reaction-picker roving focus excludes the nested named-emoji popover (Qodo #331)', async () => {
+    const ctx = await seedWithNamedEmoji();
+    const container = ctx.container;
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    await fireEvent.click(await ctx.findByLabelText('Named emoji'));
+    // The popover renders its own role="menuitem" tile (the seeded "catjam").
+    await waitFor(() =>
+      expect(container.querySelector('.named-popover [role="menuitem"]')).toBeTruthy(),
+    );
+    const menu = container.querySelector('.reaction-picker') as HTMLElement;
+    const outer = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]')).filter(
+      (el) => !el.closest('.named-popover'),
+    );
+    const popoverItem = menu.querySelector('.named-popover [role="menuitem"]') as HTMLElement;
+    expect(outer.length).toBeGreaterThan(1);
+    expect(popoverItem).toBeTruthy();
+    // Roving from the last OUTER menuitem wraps to the first OUTER one — never
+    // into the popover's tile.
+    const last = outer[outer.length - 1];
+    last.focus();
+    await fireEvent.keyDown(last, { key: 'ArrowRight' });
+    expect(document.activeElement).toBe(outer[0]);
+    expect(document.activeElement).not.toBe(popoverItem);
+    // From inside the popover, the outer grid does NOT hijack arrow keys.
+    popoverItem.focus();
+    await fireEvent.keyDown(popoverItem, { key: 'ArrowRight' });
+    expect(document.activeElement).toBe(popoverItem);
   });
 
   // Seed a message with a single PUBLIC custom reaction chip (encrypted unset).

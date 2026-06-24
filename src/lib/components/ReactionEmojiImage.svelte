@@ -104,8 +104,23 @@
 
 {#if url}
   <img class="reaction-emoji-img" src={url} alt="custom emoji" />
+{:else if failed}
+  <!-- Distinguish failed (muted red ⚠) from still-loading (muted grey 🖼) both
+       visually and to assistive tech — the bare glyph was aria-hidden and gave
+       no hint whether to retry or wait. -->
+  <span
+    class="reaction-emoji-fallback reaction-emoji-failed"
+    role="img"
+    aria-label="Emoji failed to load"
+    title="Emoji failed to load"
+  >{'\u{26A0}'}</span>
 {:else}
-  <span class="reaction-emoji-fallback" aria-hidden="true">{failed ? '\u{26A0}' : '\u{1F5BC}'}</span>
+  <span
+    class="reaction-emoji-fallback reaction-emoji-pending"
+    role="img"
+    aria-label="Emoji loading"
+    title="Emoji loading…"
+  >{'\u{1F5BC}'}</span>
 {/if}
 
 <style>
@@ -122,5 +137,13 @@
     line-height: 1.4em;
     vertical-align: middle;
     opacity: 0.6;
+  }
+  /* Pending reads as a neutral, dimmer placeholder; failed reads as an alert. */
+  .reaction-emoji-pending {
+    opacity: 0.45;
+  }
+  .reaction-emoji-failed {
+    color: #d83c3e;
+    opacity: 0.85;
   }
 </style>

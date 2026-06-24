@@ -469,6 +469,39 @@
     pickerOpenFor = pickerOpenFor === messageId ? null : messageId;
   }
 
+  // ZEB-553 a11y: roving arrow-key focus across the reaction picker's
+  // role="menuitem" buttons. Guarded so it never hijacks Left/Right while the
+  // user is typing in the name field or interacting with the private checkbox.
+  function handlePickerKey(e: KeyboardEvent): void {
+    const target = e.target as HTMLElement;
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+    // The nested named-emoji popover renders its OWN role="menuitem" buttons and
+    // manages its own focus. Never rove into it from the outer grid, and never
+    // hijack arrows while focus is already inside it (Qodo, PR #331).
+    if (target.closest('.named-popover')) return;
+    if (!['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
+    const menu = e.currentTarget as HTMLElement;
+    const items = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]')).filter(
+      (el) => !el.closest('.named-popover'),
+    );
+    if (items.length === 0) return;
+    const current = items.indexOf(target.closest('[role="menuitem"]') as HTMLElement);
+    let next: number;
+    if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = items.length - 1;
+    else if (e.key === 'ArrowRight' || e.key === 'ArrowDown')
+      next = current < 0 ? 0 : (current + 1) % items.length;
+    else next = current < 0 ? items.length - 1 : (current - 1 + items.length) % items.length;
+    e.preventDefault();
+    items[next]?.focus();
+  }
+
+  // Move focus into the picker (first reaction) when it opens so arrow-key nav
+  // works immediately for keyboard users (Svelte action: runs on mount).
+  function autofocusFirstMenuItem(node: HTMLElement) {
+    node.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+  }
+
   // ZEB-536 — picker selection is an explicit add (spec §Design), unlike the
   // toggle semantics of chips/quick-react. Closes the popover.
   function pickFromPicker(msg: ChannelMessageDto, emoji: string): void {
@@ -881,7 +914,13 @@
               onclick={() => togglePicker(msg.messageId)}
             >😊</button>
             {#if pickerOpenFor === msg.messageId}
-              <div class="reaction-picker" role="menu" aria-label="Pick a reaction">
+              <div
+                class="reaction-picker"
+                role="menu"
+                aria-label="Pick a reaction"
+                onkeydown={handlePickerKey}
+                use:autofocusFirstMenuItem
+              >
                 {#each PICKER_EMOJI as emoji}
                   <button
                     type="button"
@@ -950,7 +989,15 @@
     onchange={handleCustomEmojiPick}
   />
   {#if reactionError}
-    <div class="reaction-error" role="alert">{reactionError}</div>
+    <div class="reaction-error" role="alert">
+      <span class="reaction-error-text">{reactionError}</span>
+      <button
+        type="button"
+        class="reaction-error-dismiss"
+        aria-label="Dismiss error"
+        onclick={() => (reactionError = null)}
+      >&times;</button>
+    </div>
   {/if}
 
   <div class="compose">
@@ -1110,10 +1157,25 @@
     border: 0;
   }
   .reaction-error {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     color: #d83c3e;
     font-size: 0.75rem;
     padding: 4px 12px;
   }
+  .reaction-error-text { flex: 1 1 auto; min-width: 0; }
+  .reaction-error-dismiss {
+    flex: 0 0 auto;
+    background: transparent;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: 1rem;
+    line-height: 1;
+    padding: 0 2px;
+  }
+  .reaction-error-dismiss:hover { opacity: 0.7; }
   .reaction-toolbar {
     position: absolute;
     top: -10px;
