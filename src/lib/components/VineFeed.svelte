@@ -164,7 +164,10 @@
     {/if}
     <div class="header-spacer"></div>
     {#if onPublish}
-      <button type="button" class="create-btn" onclick={onPublish} aria-label="Create vine">+</button>
+      <button type="button" class="create-btn" onclick={onPublish}>
+        <span class="create-btn-icon" aria-hidden="true">+</span>
+        New vine
+      </button>
     {/if}
   </header>
 
@@ -183,17 +186,25 @@
   {/if}
 
   {#if filteredVines.length === 0}
-    <p class="empty-state">
-      {#if activeTab === 'following'}
-        {#if feedFilter === 'unviewed'}
-          All caught up — no unviewed vines.
+    <div class="empty-state">
+      <p class="empty-state-text">
+        {#if activeTab === 'following'}
+          {#if feedFilter === 'unviewed'}
+            All caught up — no unviewed vines.
+          {:else}
+            Follow creators to build your feed. Check out the Discover tab to find people to follow.
+          {/if}
         {:else}
-          Follow creators to build your feed. Check out the Discover tab to find people to follow.
+          No vines on the network yet.
         {/if}
-      {:else}
-        No vines on the network yet.
+      </p>
+      {#if onPublish && !(activeTab === 'following' && feedFilter === 'unviewed')}
+        <button type="button" class="empty-state-cta" onclick={onPublish}>
+          <span class="create-btn-icon" aria-hidden="true">+</span>
+          Share a vine
+        </button>
       {/if}
-    </p>
+    </div>
   {:else}
     <div class="feed-list" role="list" aria-label="Vine feed">
       {#each filteredVines as vine (vine.id)}
@@ -270,23 +281,27 @@
   }
 
   .create-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     background: var(--accent);
     color: white;
     border: none;
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    font-size: 1.1rem;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 0.8rem;
     font-weight: 600;
     cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
     transition: opacity 0.15s;
   }
 
   .create-btn:hover {
     opacity: 0.85;
+  }
+
+  .create-btn-icon {
+    font-size: 1rem;
+    line-height: 1;
   }
 
   .tab-bar {
@@ -347,11 +362,38 @@
   }
 
   .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: 32px 16px;
+  }
+
+  .empty-state-text {
     color: var(--text-muted);
     font-size: 0.85rem;
     text-align: center;
-    padding: 32px 16px;
     margin: 0;
+    max-width: 36ch;
+  }
+
+  .empty-state-cta {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+
+  .empty-state-cta:hover {
+    opacity: 0.85;
   }
 
   .feed-list {
