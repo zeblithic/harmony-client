@@ -281,4 +281,12 @@ describe('MemberRow presence dot (ZEB-553)', () => {
     expect(dot?.getAttribute('role')).toBe('img');
     expect(dot?.getAttribute('aria-label')).toMatch(/offline/i);
   });
+
+  it('renders the row as a listitem (finding 15)', () => {
+    const peer = makeMember(0, 'joined', PEER);
+    const { container } = render(MemberRow, {
+      props: { member: peer, viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false } },
+    });
+    expect(container.querySelector('.member-row')?.getAttribute('role')).toBe('listitem');
+  });
 });

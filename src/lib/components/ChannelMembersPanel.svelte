@@ -110,9 +110,12 @@
       <span class="title">Members</span>
       <span class="count">{visible.length}</span>
     </header>
-    <ul class="member-list">
+    <!-- Explicit list roles: `list-style: none` strips the implicit
+         list/listitem semantics in Safari + VoiceOver, so a screen reader
+         wouldn't announce this as a list of N members without them. -->
+    <ul class="member-list" role="list">
       {#each ordered as m (m.address)}
-        <li class="member-row">
+        <li class="member-row" role="listitem">
           <span
             class="presence-dot"
             class:online={presenceOnline(m)}

@@ -157,6 +157,16 @@ describe('ChannelMembersPanel — ZEB-553 presence dots on the default roster', 
       expect(dot.getAttribute('aria-label')).toMatch(/online|offline/i);
     }
   });
+
+  it('exposes the roster as a list with listitem rows (finding 15)', () => {
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({ members: [self, member({ address: PEER })] }),
+    });
+    expect(container.querySelector('.member-list')?.getAttribute('role')).toBe('list');
+    const rows = container.querySelectorAll('.member-row');
+    expect(rows.length).toBe(2);
+    for (const row of rows) expect(row.getAttribute('role')).toBe('listitem');
+  });
 });
 
 describe('ChannelMembersPanel — ZEB-553 owner-card open', () => {

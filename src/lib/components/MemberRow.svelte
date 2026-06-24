@@ -177,8 +177,12 @@
   }
 </script>
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<li class="member-row" onkeydown={handleKeydown}>
+<!-- The row carries an Escape-to-close handler for the kebab menu; it stays a
+     listitem (not a button), so suppress the interaction-on-noninteractive
+     warnings for the keydown. `list-style: none` on the parent strips implicit
+     list semantics in Safari + VoiceOver, so the role is explicit. -->
+<!-- svelte-ignore a11y_no_static_element_interactions a11y_no_noninteractive_element_interactions -->
+<li class="member-row" role="listitem" onkeydown={handleKeydown}>
   <span
     class="presence-dot"
     class:online
