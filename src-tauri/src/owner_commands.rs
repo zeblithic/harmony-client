@@ -513,10 +513,21 @@ pub async fn preview_owner_mnemonic_identity(words: Vec<String>) -> Result<Strin
 pub async fn restore_owner_mnemonic_from_words(
     words: Vec<String>,
     force: bool,
+    state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<String, String> {
     // Wipe the renderer-supplied plaintext words on drop (Vec<String>: Zeroize).
     let words = Zeroizing::new(words);
     let identity_dir = resolve_identity_dir()?;
+    // Enforce node lifecycle before the irreversible rewrite (CodeAnt #339): stop
+    // the running node FIRST so the OLD identity's engines (notably the ZEB-342
+    // liveness refresher) cannot write a competing owner_state into the gap and
+    // clobber the restore. Mirrors mint_owner_identity's Phase-1 stop-before-
+    // persist. `stop_inner` is async-context-safe (drives shutdown on an
+    // ephemeral runtime inside std::thread::scope), and `None` stops
+    // unconditionally. The renderer reloads on success, re-running `start_node`
+    // (which itself does stop -> reload-identity -> respawn) to come up on the
+    // restored identity.
+    crate::stop_inner(state.inner(), None);
     run_blocking(move || {
         crate::recovery_cli::restore_owner_mnemonic_from_words_with_keychain(
             &identity_dir,
