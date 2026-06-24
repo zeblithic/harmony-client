@@ -758,6 +758,16 @@
     }
   }
 
+  /**
+   * ZEB-559: ingest a vine video via the backend-owned native picker (the
+   * backend opens the dialog and returns the CID + filename, so the renderer
+   * never supplies a filesystem path). Returns null if the user cancels; throws
+   * on ingest failure so VinePublishDialog can surface the message.
+   */
+  function handlePickVineVideo(): Promise<{ cid: string; fileName: string } | null> {
+    return vineService.ingestVideo();
+  }
+
   async function handleVineReshare(vine: import('./lib/types').VineVideo) {
     // Self-reshare prevention (spec §Edge Cases → Self-reshare prevention):
     // silently no-op when the SOURCE vine is our OWN ORIGINAL
@@ -2862,6 +2872,7 @@
         onNewCommunity={() => { showCreateCommunity = true; createError = null; }}
         onRedeemInvite={() => { showRedeemInvite = true; redeemError = null; redeemUrl = ''; }}
         onBrowseLibraries={() => { libraryDirectoryOpen = true; }}
+        onPostVine={() => { switchMode('vines'); showVinePublish = true; }}
         onSelectNotes={selectNotes}
         notesActive={notesSelected && !selectedCommunityNode}
         onSubmitFeedback={() => (feedbackModalOpen = true)}
@@ -3093,7 +3104,7 @@
       ownAddress={myAddress || undefined}
     />
     {#if showVinePublish}
-      <VinePublishDialog onPublish={handleVinePublish} onClose={() => showVinePublish = false} />
+      <VinePublishDialog onPublish={handleVinePublish} onPickVideo={isTauri() ? handlePickVineVideo : undefined} onClose={() => showVinePublish = false} />
     {/if}
   {/snippet}
   {#snippet fileBrowser()}

@@ -257,6 +257,21 @@ export class VineService {
     this.onChange?.();
   }
 
+  /**
+   * ZEB-559: open the backend-owned native picker, ingest the chosen video into
+   * CAS, and return its hex Video CID + display filename (or `null` if the user
+   * cancels the picker). The backend owns the dialog so the renderer never
+   * supplies a filesystem path (no arbitrary-file ingest). Throws if
+   * disconnected or if ingest fails — the composer surfaces the message.
+   */
+  async ingestVideo(): Promise<{ cid: string; fileName: string } | null> {
+    if (!this.adapter) throw new Error('not connected');
+    const r = (await this.adapter.invoke('ingest_vine_video', {})) as
+      | { videoCid: string; fileName: string }
+      | null;
+    return r ? { cid: r.videoCid, fileName: r.fileName } : null;
+  }
+
   /** Mark a vine as viewed locally (and notify backend). */
   markViewed(id: string): void {
     if (this.viewedIds.has(id)) return;

@@ -328,6 +328,21 @@ describe('NavPanel', () => {
       expect(onRedeemInvite).toHaveBeenCalled();
     });
 
+    it('does not show "Post a vine" when onPostVine is not wired (ZEB-559)', async () => {
+      render(NavPanel, { props: fabBaseProps });
+      await fireEvent.click(screen.getByLabelText(/Create new/i));
+      expect(screen.queryByText(/Post a vine/i)).toBeNull();
+    });
+
+    it('shows + wires "Post a vine" when onPostVine is provided (ZEB-559)', async () => {
+      const onPostVine = vi.fn();
+      render(NavPanel, { props: { ...fabBaseProps, onPostVine } });
+      await fireEvent.click(screen.getByLabelText(/Create new/i));
+      await fireEvent.click(screen.getByRole('menuitem', { name: /Post a vine/i }));
+      expect(onPostVine).toHaveBeenCalled();
+      expect(screen.queryByText(/Post a vine/i)).toBeNull();
+    });
+
     it('Escape closes the popover', async () => {
       render(NavPanel, { props: fabBaseProps });
       await fireEvent.click(screen.getByLabelText(/Create new/i));
