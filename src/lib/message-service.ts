@@ -81,7 +81,18 @@ export class MessageService {
    *  the user didn't request (Cursor Bugbot finding on PR #81 round 2). */
   private loadedDmSpaces = new Set<string>();
 
-  constructor() {
+  /**
+   * @param opts.seedMockData Whether to seed the message list with mock
+   *   messages so panes are never empty while iterating. Defaults to
+   *   `import.meta.env.DEV` — true under vitest / `vite dev`, **false in a
+   *   production `vite build`** (ZEB-560, mirroring NavService/VineService: a
+   *   shipped/alpha build must not render fake data, and must not depend on the
+   *   race-prone end-of-boot `connectAdapter()` clear). Tests pass an explicit
+   *   flag to exercise both modes deterministically.
+   */
+  constructor(opts?: { seedMockData?: boolean }) {
+    const seedMockData = opts?.seedMockData ?? import.meta.env.DEV;
+    if (!seedMockData) return;
     // Seed with mock data for browser/dev mode — `connectAdapter()` clears
     // these (selectively, preserving any locally-created entries from the
     // pre-connect window) before subscribing to real events (ZEB-209).

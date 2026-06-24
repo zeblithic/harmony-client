@@ -58,7 +58,23 @@ export class NavService {
    *  profiles from the pre-connect window (ZEB-209 bot R1). */
   private mockProfileKeys = new Set<string>();
 
-  constructor() {
+  /**
+   * @param opts.seedMockData Whether to seed the nav tree + profile map with
+   *   mock data so the sidebar is never empty while iterating. Defaults to
+   *   `import.meta.env.DEV` — true in `vite dev` / browser dev and under
+   *   vitest, **false in a production `vite build`**. ZEB-560: the sidebar
+   *   ships in the alpha surface, so a shipped build must NOT seed fake
+   *   communities/friends — a real tester would otherwise see them. Gating at
+   *   construction (rather than relying solely on the `connectAdapter()` clear)
+   *   is the robust fix: that clear sits at the end of a long serial boot-time
+   *   connect chain and never runs if an earlier service connect stalls,
+   *   leaving the mock sidebar permanently visible on a real node. Mirrors
+   *   VineService's ZEB-546 fix. Tests pass an explicit flag to exercise both
+   *   modes deterministically.
+   */
+  constructor(opts?: { seedMockData?: boolean }) {
+    const seedMockData = opts?.seedMockData ?? import.meta.env.DEV;
+    if (!seedMockData) return;
     // Seed with mock data for browser/dev mode — `connectAdapter()` clears
     // these (selectively, preserving any locally-created entries from the
     // pre-connect window) before subscribing to real events (ZEB-209).

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NavService } from './nav-service';
+import { navNodes as mockNavNodes, profileStore as mockProfileStore } from './mock-data';
 import type { TauriAdapter } from './zenoh-service';
 
 function createMockAdapter() {
@@ -21,6 +22,40 @@ function createMockAdapter() {
   }
   return { adapter, emit, listeners };
 }
+
+// ZEB-560: the mock sidebar seed (mock community folders + friend DMs) must
+// NOT render in the shipped/alpha GUI. The constructor gates seeding on
+// `import.meta.env.DEV` (true under vitest / `vite dev`, false in a `vite
+// build`), mirroring VineService's ZEB-546 fix — so a production build seeds
+// nothing and there is no race-prone reliance on the end-of-boot clear-on-
+// connect (which leaks the mock sidebar permanently if an earlier service
+// connect in the boot chain stalls). These pin both modes deterministically.
+describe('NavService mock-seed gating (ZEB-560)', () => {
+  it('does NOT seed mock nav nodes/profiles when seedMockData is false (shipped/alpha build)', () => {
+    const prod = new NavService({ seedMockData: false });
+    expect(prod.nodes).toEqual([]);
+    expect(prod.profiles.size).toBe(0);
+  });
+
+  it('seeds mock nav nodes/profiles when seedMockData is true (dev/browser)', () => {
+    const dev = new NavService({ seedMockData: true });
+    expect(dev.nodes.length).toBe(mockNavNodes.length);
+    expect(dev.profiles.size).toBe(mockProfileStore.size);
+  });
+
+  it('a production-built service still ingests real nav-updated events after connect (no seed to clear)', async () => {
+    const prod = new NavService({ seedMockData: false });
+    const mock = createMockAdapter();
+    await prod.connectAdapter(mock.adapter);
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'real-community-1',
+      kind: 'community',
+      name: 'Real Community',
+    });
+    expect(prod.nodes.find((n) => n.id === 'real-community-1')?.name).toBe('Real Community');
+  });
+});
 
 describe('NavService DM handling', () => {
   let nav: NavService;

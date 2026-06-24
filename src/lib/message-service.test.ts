@@ -16,6 +16,19 @@ describe('MessageService', () => {
     expect(svc.messages.length).toBe(mockMessages.length);
   });
 
+  // ZEB-560: like NavService/VineService, a shipped/alpha build must not seed
+  // mock messages. The constructor gates seeding on `import.meta.env.DEV`
+  // (true under vitest, false in a `vite build`); these pin both modes.
+  it('does NOT seed mock messages when seedMockData is false (shipped/alpha build)', () => {
+    const prod = new MessageService({ seedMockData: false });
+    expect(prod.messages).toEqual([]);
+  });
+
+  it('seeds mock messages when seedMockData is true (dev/browser)', () => {
+    const dev = new MessageService({ seedMockData: true });
+    expect(dev.messages.length).toBe(mockMessages.length);
+  });
+
   it('populates seenIds from incoming events (dedup)', async () => {
     // ZEB-209: mock IDs are cleared on connectAdapter, so post-connect
     // dedup must be tested with a real (network-arrived) ID, not a mock one.
