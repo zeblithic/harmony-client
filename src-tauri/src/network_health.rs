@@ -619,17 +619,36 @@ impl NetworkHealthService {
             platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
             my_network,
             peers,
-            pkarr_status: PkarrHealthSummary {
-                identity_published: self.pkarr.identity_published(),
-                identity_last_publish_ms: self.pkarr.identity_last_publish_ms(),
-                community_publish_count: self.pkarr.community_publish_count(),
-                recent_fallback_events: self.pkarr.recent_fallback_events(),
-                relays: self
+            pkarr_status: {
+                let relays: Vec<RelayHealthWire> = self
                     .relay
                     .relay_health()
                     .into_iter()
                     .map(Into::into)
-                    .collect(),
+                    .collect();
+                let identity_published = self.pkarr.identity_published();
+                // ZEB-511: the publisher records no last-publish wall-clock, but
+                // relay health does (last_success_ms, a *confirmed* PUT success).
+                // Surface the most-recent confirmed success — but only while we
+                // are actually publishing identity, so a community/friend PUT's
+                // timestamp is never attributed to an identity that isn't being
+                // published. Falls back to the impl's own value otherwise.
+                let identity_last_publish_ms = if identity_published {
+                    relays
+                        .iter()
+                        .filter_map(|r| r.last_success_ms)
+                        .max()
+                        .or_else(|| self.pkarr.identity_last_publish_ms())
+                } else {
+                    self.pkarr.identity_last_publish_ms()
+                };
+                PkarrHealthSummary {
+                    identity_published,
+                    identity_last_publish_ms,
+                    community_publish_count: self.pkarr.community_publish_count(),
+                    recent_fallback_events: self.pkarr.recent_fallback_events(),
+                    relays,
+                }
             },
             // ZEB-373 Task 5: real dynamic-dial telemetry, read from the
             // shared DialTelemetry via the DialSnapshot source.
@@ -2789,6 +2808,79 @@ mod tests {
             snap.pkarr_status.relays[0].last_outcome,
             Some(RelayOutcomeWire::Http { status: 503 })
         );
+    }
+
+    // ── ZEB-511: identity_last_publish_ms derived from relay success ──
+
+    /// Pkarr source with configurable publish flags (the real impl records no
+    /// last-publish wall-clock, so it returns None; the synthesis derives it).
+    struct ConfigurablePkarr {
+        identity_published: bool,
+        last_publish_ms: Option<u64>,
+    }
+    impl PkarrSnapshot for ConfigurablePkarr {
+        fn identity_published(&self) -> bool {
+            self.identity_published
+        }
+        fn identity_last_publish_ms(&self) -> Option<u64> {
+            self.last_publish_ms
+        }
+        fn community_publish_count(&self) -> u32 {
+            0
+        }
+        fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
+            vec![]
+        }
+    }
+
+    fn relay_with_success(success_ms: Option<u64>) -> harmony_pkarr::RelayHealth {
+        harmony_pkarr::RelayHealth {
+            url: format!("https://r{}.example", success_ms.unwrap_or(0)),
+            state: harmony_pkarr::RelayState::CoolingDown { until_ms: 0 },
+            last_outcome: None,
+            last_success_ms: success_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_identity_last_publish_ms_from_relay_success_when_publishing() {
+        // Publishing identity + the impl itself has no timestamp → the
+        // synthesis surfaces the most-recent confirmed relay success.
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(ConfigurablePkarr {
+                identity_published: true,
+                last_publish_ms: None,
+            }),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(FakeRelaySnapshot(vec![
+                relay_with_success(Some(1000)),
+                relay_with_success(Some(3000)),
+                relay_with_success(None),
+            ])),
+        );
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.pkarr_status.identity_last_publish_ms, Some(3000));
+    }
+
+    #[tokio::test]
+    async fn snapshot_identity_last_publish_ms_null_when_not_publishing() {
+        // Not publishing identity → never attribute a relay success to it.
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(ConfigurablePkarr {
+                identity_published: false,
+                last_publish_ms: None,
+            }),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(FakeRelaySnapshot(vec![relay_with_success(Some(3000))])),
+        );
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.pkarr_status.identity_last_publish_ms, None);
     }
 
     #[test]
