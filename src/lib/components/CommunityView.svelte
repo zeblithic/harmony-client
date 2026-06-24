@@ -486,6 +486,8 @@
       {trustService}
       {resolveCard}
       {resolveNickname}
+      {isOnline}
+      {onOpenCard}
       collapsed={membersPanelCollapsed}
     />
   </div>

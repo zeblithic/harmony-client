@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { render } from '@testing-library/svelte';
+import { render, fireEvent } from '@testing-library/svelte';
 import ChannelMembersPanel from '../ChannelMembersPanel.svelte';
 import type { CommunityMember } from '../../types';
 import type { ResolvedCard } from '../../member-card-service';
@@ -107,5 +107,74 @@ describe('ChannelMembersPanel — ZEB-432 label ladder', () => {
     const names = renderedNames(container);
     expect(names).toContain('deadbeef'); // PEER hex prefix
     expect(names.every((n) => n.trim().length > 0)).toBe(true); // no blank labels
+  });
+});
+
+describe('ChannelMembersPanel — ZEB-553 presence dots on the default roster', () => {
+  it('renders a presence dot on every row, lit for online members', () => {
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({
+        members: [self, member({ address: PEER }), member({ address: PEER2 })],
+        isOnline: (id: string) => id === PEER,
+      }),
+    });
+    const rows = container.querySelectorAll('.member-row');
+    expect(rows.length).toBe(3);
+    // Every row has a dot (the headline presence affordance was previously absent).
+    expect(container.querySelectorAll('.presence-dot').length).toBe(3);
+    // Self (always online) + PEER are lit; PEER2 is not.
+    expect(container.querySelectorAll('.presence-dot.online').length).toBe(2);
+  });
+
+  it('always shows self online even when the resolver reports everyone offline', () => {
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({
+        members: [self, member({ address: PEER })],
+        isOnline: () => false, // zenoh never loops our own beacon back
+      }),
+    });
+    // Rows are ordered self-first; only the self dot is lit.
+    const firstRow = container.querySelector('.member-row');
+    expect(firstRow?.querySelector('.presence-dot.online')).not.toBeNull();
+    expect(container.querySelectorAll('.presence-dot.online').length).toBe(1);
+  });
+
+  it('treats everyone but self as offline when no isOnline resolver is provided', () => {
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({ members: [self, member({ address: PEER })] }),
+    });
+    expect(container.querySelectorAll('.presence-dot.online').length).toBe(1); // self only
+  });
+});
+
+describe('ChannelMembersPanel — ZEB-553 owner-card open', () => {
+  it('opens the owner card on click with the SIGNED card name (never the local nickname)', async () => {
+    const calls: Array<{ ownerIdHex: string; displayName: string }> = [];
+    const card: ResolvedCard = { displayName: 'ZEBbot', statusText: 'hi' };
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({
+        members: [self, member({ address: PEER })],
+        resolveCard: (id: string) => (id === PEER ? card : undefined),
+        resolveNickname: (id: string) => (id === PEER ? 'Bestie' : undefined),
+        onOpenCard: (payload: { ownerIdHex: string; displayName: string }) => calls.push(payload),
+      }),
+    });
+    // The row label shows the nickname-first ladder ("Bestie")…
+    const peerBtn = Array.from(container.querySelectorAll<HTMLButtonElement>('.name-btn')).find(
+      (b) => (b.textContent ?? '').trim() === 'Bestie',
+    );
+    expect(peerBtn).toBeTruthy();
+    await fireEvent.click(peerBtn!);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].ownerIdHex).toBe(PEER);
+    // …but the owner-card popover must carry the signed card name, not the nickname.
+    expect(calls[0].displayName).toBe('ZEBbot');
+  });
+
+  it('renders names as plain spans (no card button) when onOpenCard is absent', () => {
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({ members: [self, member({ address: PEER })] }),
+    });
+    expect(container.querySelectorAll('.name-btn').length).toBe(0);
   });
 });
