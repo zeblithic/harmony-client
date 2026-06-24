@@ -1496,7 +1496,16 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
 }
 
 #[tokio::test]
-async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
+async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation() {
+    // ZEB-558: this exercises the INVITE-ONLY cold-cache reject→propagate→
+    // succeed path, which the open-community gate relaxation deliberately
+    // leaves unchanged. (For OPEN communities a cold-cache publish carrying the
+    // publisher's self-Join now self-admits on first delivery — covered by
+    // `open_community_two_node_wire_convergence_no_preseed` + the
+    // `bootstrap_admit_open_publisher` unit tests. Keeping this test OPEN would
+    // make alice's in-blob self-Join self-admit and there would be no degraded
+    // report to assert on.)
+    //
     // The same envelope is delivered twice. First time alice is not yet
     // materialized as a member → PublisherNotJoined rejection. Then her
     // cert-bearing Join propagates into the receiver's CRDT and we
@@ -1593,7 +1602,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
             &harmony_app::community_membership::VerifyContext {
                 expected_community_id: community_id,
                 admin_addr: alice_addr,
-                is_invite_only: false,
+                is_invite_only: true,
             },
         );
         assert_eq!(
@@ -1652,7 +1661,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
         community_id,
         membership_key: mk,
         admin_addr: alice_addr,
-        is_invite_only: false,
+        is_invite_only: true,
         device_id: "b-dev".into(),
         self_owner: alice_addr,
         signing_key: Arc::new(alice.device_key.clone()),
@@ -1708,7 +1717,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
             &harmony_app::community_membership::VerifyContext {
                 expected_community_id: community_id,
                 admin_addr: alice_addr,
-                is_invite_only: false,
+                is_invite_only: true,
             },
         );
         assert_eq!(
