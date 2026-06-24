@@ -219,12 +219,47 @@ describe('NavPanel', () => {
     expect(screen.getByRole('button', { name: /^files$/i })).toBeTruthy();
   });
 
-  it('reveals a deferred mode button when an override re-enables it, and routes on click', async () => {
+  it('reveals a deferred mode inside the More menu when an override re-enables it, and routes on click', async () => {
     setNavModeOverride('spellbook', true);
     const onModeChange = vi.fn();
     render(NavPanel, { props: { nodes: testNodes, collapsed: false, onModeChange } });
-    await fireEvent.click(screen.getByRole('button', { name: /spellbook/i }));
+    // ZEB-555: deferred/secondary modes now live in the "More ▾" overflow menu,
+    // not the primary rail.
+    await fireEvent.click(screen.getByTestId('more-menu-button'));
+    await fireEvent.click(screen.getByRole('menuitem', { name: /spellbook/i }));
     expect(onModeChange).toHaveBeenCalledWith('spellbook');
+  });
+
+  describe('More menu (ZEB-555)', () => {
+    it('renders a More button in the footer by default', () => {
+      render(NavPanel, { props: { nodes: testNodes, collapsed: false } });
+      expect(screen.getByTestId('more-menu-button')).toBeTruthy();
+    });
+
+    it('exposes the rehomed Help items when opened', async () => {
+      render(NavPanel, { props: { nodes: testNodes, collapsed: false } });
+      await fireEvent.click(screen.getByTestId('more-menu-button'));
+      expect(screen.getByTestId('more-network-health')).toBeTruthy();
+      expect(screen.getByTestId('more-feedback')).toBeTruthy();
+      expect(screen.getByTestId('more-about')).toBeTruthy();
+      expect(screen.getByTestId('more-docs')).toBeTruthy();
+    });
+
+    it('routes Network Health to the network mode via onModeChange', async () => {
+      const onModeChange = vi.fn();
+      render(NavPanel, { props: { nodes: testNodes, collapsed: false, onModeChange } });
+      await fireEvent.click(screen.getByTestId('more-menu-button'));
+      await fireEvent.click(screen.getByTestId('more-network-health'));
+      expect(onModeChange).toHaveBeenCalledWith('network');
+    });
+
+    it('forwards the Submit Feedback callback', async () => {
+      const onSubmitFeedback = vi.fn();
+      render(NavPanel, { props: { nodes: testNodes, collapsed: false, onSubmitFeedback } });
+      await fireEvent.click(screen.getByTestId('more-menu-button'));
+      await fireEvent.click(screen.getByTestId('more-feedback'));
+      expect(onSubmitFeedback).toHaveBeenCalled();
+    });
   });
 
   describe('FAB + fan-out menu (ZEB-263)', () => {

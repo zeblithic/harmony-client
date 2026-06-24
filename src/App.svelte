@@ -90,7 +90,6 @@
   import { get } from 'svelte/store';
   import { classifyOwnerIdentity, type OwnerIdentityState } from './lib/owner-gate';
   import { trapFocus } from './lib/focus-trap';
-  import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
   import FeedbackModal from './lib/components/FeedbackModal.svelte';
   import AboutModal from './lib/components/AboutModal.svelte';
   import {
@@ -2865,6 +2864,17 @@
         onBrowseLibraries={() => { libraryDirectoryOpen = true; }}
         onSelectNotes={selectNotes}
         notesActive={notesSelected && !selectedCommunityNode}
+        onSubmitFeedback={() => (feedbackModalOpen = true)}
+        onShowAbout={() => (aboutModalOpen = true)}
+        onOpenDocs={async () => {
+          try {
+            const { open: shellOpen } = await import('@tauri-apps/plugin-shell');
+            await shellOpen('https://github.com/zeblithic/harmony-client/blob/main/README.md');
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.warn('[zeb-555] failed to open docs:', msg);
+          }
+        }}
       />
       {#if !collapsed && appMode === 'messages'}
         <button
@@ -3573,24 +3583,6 @@
 {/if}
 
 
-<!-- ZEB-331: fixed-position help button overlay. Position top-right. -->
-<div class="help-overlay">
-  <HelpMenuButton
-    onSubmitFeedback={() => (feedbackModalOpen = true)}
-    onShowAbout={() => (aboutModalOpen = true)}
-    onOpenNetworkHealth={() => switchMode('network')}
-    onOpenDocs={async () => {
-      try {
-        const { open: shellOpen } = await import('@tauri-apps/plugin-shell');
-        await shellOpen('https://github.com/zeblithic/harmony-client/blob/main/README.md');
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.warn('[zeb-331] failed to open docs:', msg);
-      }
-    }}
-  />
-</div>
-
 <FeedbackModal
   open={feedbackModalOpen}
   onDismiss={() => (feedbackModalOpen = false)}
@@ -3701,16 +3693,6 @@
     white-space: normal;
     overflow-wrap: anywhere;
     max-width: calc(100% - 40px);
-  }
-
-  /* ZEB-331: HelpMenuButton fixed-position overlay. Below modal z-index
-     (1000) so modals always layer above the (?) icon; above general
-     content so it's always reachable. */
-  .help-overlay {
-    position: fixed;
-    top: 12px;
-    right: 12px;
-    z-index: 50;
   }
 
   /* ZEB-338: backup-reminder banner overlay. Below modal (1000) + help
