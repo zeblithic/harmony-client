@@ -99,6 +99,12 @@ struct CommunityIdArgs {
     community_id: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VineIdArgs {
+    vine_id: String,
+}
+
 /// ZEB-527: `community_id` + capped `limit` — shared by the two recent-feed
 /// moderation read verbs (`list_recent_counter_signs`,
 /// `list_recent_moderation_events`).
@@ -354,7 +360,7 @@ struct SetIdentityDiscoverableArgs {
 
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (64 commands). Every handler calls
+/// Build the curated v1 RPC surface (68 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
@@ -613,6 +619,37 @@ pub fn build_registry() -> RpcRegistry {
         "get_community_presence",
         GetCommunityPresenceArgs,
         |state, _sink, a| async move { crate::get_community_presence_impl(state, a.community_id).await }
+    );
+
+    // Vines (publish → feed → view → reshare; drives the two-node e2e harness).
+    rpc!(
+        m,
+        "publish_vine",
+        crate::PublishVineArgs,
+        |state, _sink, a| async move { crate::publish_vine_impl(state, a).await }
+    );
+    rpc!(
+        m,
+        "list_vine_videos",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::list_vine_videos_impl(state) }
+    );
+    rpc!(
+        m,
+        "mark_vine_viewed",
+        VineIdArgs,
+        |state, _sink, a| async move {
+            // Return an object `{ viewed }` (not a bare bool) to match the
+            // documented contract and the publish/reshare object shapes. (Qodo)
+            crate::mark_vine_viewed_impl(state, a.vine_id)
+                .map(|viewed| serde_json::json!({ "viewed": viewed }))
+        }
+    );
+    rpc!(
+        m,
+        "reshare_vine",
+        crate::ReshareVineArgs,
+        |state, _sink, a| async move { crate::reshare_vine_impl(state, a).await }
     );
 
     // Friends.
@@ -1320,6 +1357,11 @@ mod tests {
             "subscribe_community_presence",
             "unsubscribe_community_presence",
             "get_community_presence",
+            // vines
+            "publish_vine",
+            "list_vine_videos",
+            "mark_vine_viewed",
+            "reshare_vine",
             // friends
             "list_friends",
             "generate_friend_token",

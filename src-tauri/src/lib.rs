@@ -11740,6 +11740,43 @@ pub struct PublishReactionPayload {
     pub reactor_name: String,
 }
 
+/// Build + publish a vine descriptor on `harmony/vines/{creator_address}`.
+///
+/// Shared core for the GUI `publish_vine` command and the headless
+/// `publish_vine` / `reshare_vine` RPC seams: serialize the descriptor and
+/// route it through the event loop's `publish_tx`. The descriptor's
+/// `creator_address` selects the topic, so callers must set it to this node's
+/// own address before calling.
+pub(crate) async fn publish_vine_descriptor(
+    state: &Mutex<NodeState>,
+    descriptor: VineDescriptorPayload,
+) -> Result<(), String> {
+    let publish_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .publish_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    let key_expr = format!("harmony/vines/{}", descriptor.creator_address);
+    let payload = serde_json::to_vec(&descriptor).map_err(|e| format!("serialize: {e}"))?;
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    publish_tx
+        .send(event_loop::PublishRequest {
+            key_expr,
+            payload,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped publish request".to_string())?
+}
+
 /// Publish a vine descriptor to the mesh network via Zenoh pub/sub.
 ///
 /// Publishes JSON to `harmony/vines/{creator_address}`.
@@ -11759,13 +11796,9 @@ async fn publish_vine(
         }
     }
 
-    let (publish_tx, node_addr) = {
+    let node_addr = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        let tx = guard
-            .publish_tx
-            .clone()
-            .ok_or_else(|| "not connected".to_string())?;
-        (tx, guard.node_addr.clone())
+        guard.node_addr.clone()
     };
 
     let now_secs = std::time::SystemTime::now()
@@ -11779,7 +11812,7 @@ async fn publish_vine(
             &node_addr[..8.min(node_addr.len())],
             rand::random::<u32>()
         ),
-        creator_address: node_addr.clone(),
+        creator_address: node_addr,
         creator_name: vine.creator_name,
         created_at: now_secs,
         video_cid: vine.video_cid,
@@ -11789,22 +11822,187 @@ async fn publish_vine(
         original_creator_name: vine.original_creator_name,
     };
 
-    let key_expr = format!("harmony/vines/{}", node_addr);
-    let payload = serde_json::to_vec(&wire).map_err(|e| format!("serialize: {e}"))?;
+    publish_vine_descriptor(state.inner(), wire).await
+}
 
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    publish_tx
-        .send(event_loop::PublishRequest {
-            key_expr,
-            payload,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
+/// Headless RPC args for `publish_vine`. Unlike the GUI `PublishVinePayload`,
+/// `videoCid` is optional — when absent the impl ingests a small synthetic
+/// payload to mint a real CID, so the e2e harness can publish without a real
+/// video file or a separate ingest RPC. Non-reshare only (use `reshare_vine`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishVineArgs {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub video_cid: Option<String>,
+    #[serde(default)]
+    pub creator_name: Option<String>,
+}
 
-    reply_rx
-        .await
-        .map_err(|_| "event loop dropped publish request".to_string())?
+/// Headless RPC result for `publish_vine` / the published descriptor's identity.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishVineResult {
+    pub vine_id: String,
+    pub video_cid: String,
+}
+
+/// Headless seam for `publish_vine`: mint a CID via synthetic ingest when none
+/// is supplied, build a non-reshare descriptor, and publish it. Returns the
+/// generated vine id + the resolved video CID so a harness can assert on them.
+pub(crate) async fn publish_vine_impl(
+    state: &Mutex<NodeState>,
+    args: PublishVineArgs,
+) -> Result<PublishVineResult, String> {
+    if let Some(ref title) = args.title {
+        if title.len() > 140 {
+            return Err("title exceeds 140 bytes".to_string());
+        }
+    }
+
+    // Snapshot the channels we need under the std lock; drop before any await.
+    // Capture publish availability up front so we don't ingest (mint a CID +
+    // write content) only to fail the publish afterward, leaving orphaned bytes
+    // that no published descriptor references. (Qodo)
+    let (node_addr, ingest_tx, has_publish_tx) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            guard.node_addr.clone(),
+            guard.ingest_tx.clone(),
+            guard.publish_tx.is_some(),
+        )
+    };
+    if !has_publish_tx {
+        return Err("not connected".to_string());
+    }
+
+    // Resolve the video CID: use the caller's if non-empty, else ingest a small
+    // synthetic payload so the descriptor references real, fetchable content.
+    let video_cid = match args.video_cid {
+        Some(cid) if !cid.trim().is_empty() => cid,
+        _ => {
+            let ingest_tx = ingest_tx.ok_or_else(|| "not connected".to_string())?;
+            let synthetic = format!(
+                "harmony-headless-vine::{node_addr}::{:08x}",
+                rand::random::<u32>()
+            )
+            .into_bytes();
+            let reader = tokio::io::BufReader::new(std::io::Cursor::new(synthetic));
+            let (root, _size) = streaming_ingest(
+                reader,
+                &ingest_tx,
+                harmony_content::chunker::ChunkerConfig::DEFAULT,
+                None,
+            )
+            .await
+            .map_err(|e| format!("synthetic ingest: {e}"))?;
+            hex::encode(root.to_bytes())
+        }
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let id = format!(
+        "vine-{}-{now_secs}-{:08x}",
+        &node_addr[..8.min(node_addr.len())],
+        rand::random::<u32>()
+    );
+
+    let descriptor = VineDescriptorPayload {
+        id: id.clone(),
+        creator_address: node_addr,
+        creator_name: args.creator_name.unwrap_or_default(),
+        created_at: now_secs,
+        video_cid: video_cid.clone(),
+        title: args.title,
+        reshare_of: None,
+        original_creator_address: None,
+        original_creator_name: None,
+    };
+
+    publish_vine_descriptor(state, descriptor).await?;
+    Ok(PublishVineResult {
+        vine_id: id,
+        video_cid,
+    })
+}
+
+/// Headless RPC args for `reshare_vine`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReshareVineArgs {
+    pub vine_id: String,
+    #[serde(default)]
+    pub creator_name: Option<String>,
+}
+
+/// Headless RPC result for `reshare_vine`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReshareVineResult {
+    pub vine_id: String,
+    pub reshare_of: String,
+}
+
+/// Headless seam for `reshare_vine`: resolve the original descriptor from the
+/// local feed, then publish a reshare carrying full origin attribution. Errors
+/// if the original is not present in the local feed.
+pub(crate) async fn reshare_vine_impl(
+    state: &Mutex<NodeState>,
+    args: ReshareVineArgs,
+) -> Result<ReshareVineResult, String> {
+    if args.vine_id.trim().is_empty() {
+        return Err("vine_id is required".to_string());
+    }
+    let original = list_vine_videos_impl(state)?
+        .into_iter()
+        .find(|d| d.id == args.vine_id)
+        .ok_or_else(|| "reshare_vine: unknown vine_id".to_string())?;
+
+    let node_addr = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.node_addr.clone()
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let id = format!(
+        "vine-{}-{now_secs}-{:08x}",
+        &node_addr[..8.min(node_addr.len())],
+        rand::random::<u32>()
+    );
+
+    // Trace attribution to the true origin: if the original was itself a
+    // reshare, preserve its origin fields; otherwise the original IS the origin.
+    let original_creator_address = original
+        .original_creator_address
+        .or(Some(original.creator_address));
+    let original_creator_name = original
+        .original_creator_name
+        .or(Some(original.creator_name));
+
+    let descriptor = VineDescriptorPayload {
+        id: id.clone(),
+        creator_address: node_addr,
+        creator_name: args.creator_name.unwrap_or_default(),
+        created_at: now_secs,
+        video_cid: original.video_cid,
+        title: original.title,
+        reshare_of: Some(args.vine_id.clone()),
+        original_creator_address,
+        original_creator_name,
+    };
+
+    publish_vine_descriptor(state, descriptor).await?;
+    Ok(ReshareVineResult {
+        vine_id: id,
+        reshare_of: args.vine_id,
+    })
 }
 
 /// Publish a vine reaction (like/unlike) to the mesh network via Zenoh pub/sub.
@@ -11865,16 +12063,11 @@ async fn publish_vine_reaction(
         .map_err(|_| "event loop dropped publish request".to_string())?
 }
 
-/// Return all vines currently in the local cache, sorted by
-/// `created_at` descending (newest first). `viewed` field reflects
-/// local-only `mark_vine_viewed` state.
+/// Shared seam for `list_vine_videos` (GUI command + headless RPC): return all
+/// vines in the local cache, newest-first, with local-only `viewed` state.
 ///
 /// Returns `Err("not connected")` if the node is not running.
-/// ZEB-147 will extend this with disk persistence.
-#[tauri::command]
-fn list_vine_videos(
-    state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<Vec<VineVideoDto>, String> {
+pub(crate) fn list_vine_videos_impl(state: &Mutex<NodeState>) -> Result<Vec<VineVideoDto>, String> {
     let cache = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard
@@ -11887,6 +12080,19 @@ fn list_vine_videos(
         .map_err(|e| format!("vine_feed_cache lock: {e}"))?
         .list_descriptors();
     Ok(result)
+}
+
+/// Return all vines currently in the local cache, sorted by
+/// `created_at` descending (newest first). `viewed` field reflects
+/// local-only `mark_vine_viewed` state.
+///
+/// Returns `Err("not connected")` if the node is not running.
+/// ZEB-147 will extend this with disk persistence.
+#[tauri::command]
+fn list_vine_videos(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<VineVideoDto>, String> {
+    list_vine_videos_impl(state.inner())
 }
 
 #[tauri::command]
@@ -11969,15 +12175,14 @@ fn list_followed(
         .collect())
 }
 
-/// Mark a vine viewed by the local peer. Returns `Ok(true)` if newly
-/// marked viewed, `Ok(false)` if already viewed.
+/// Shared seam for `mark_vine_viewed` (GUI command + headless RPC). Returns
+/// `Ok(true)` if newly marked viewed, `Ok(false)` if already viewed.
 ///
 /// Returns `Err("not connected")` if the node is not running.
-/// Local-only in this PR; cross-device sync deferred to ZEB-147.
-#[tauri::command]
-fn mark_vine_viewed(
+/// Local-only; cross-device sync deferred to ZEB-147.
+pub(crate) fn mark_vine_viewed_impl(
+    state: &Mutex<NodeState>,
     vine_id: String,
-    state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
     let cache = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -11991,6 +12196,19 @@ fn mark_vine_viewed(
         .map_err(|e| format!("vine_feed_cache lock: {e}"))?
         .mark_viewed(vine_id);
     Ok(result)
+}
+
+/// Mark a vine viewed by the local peer. Returns `Ok(true)` if newly
+/// marked viewed, `Ok(false)` if already viewed.
+///
+/// Returns `Err("not connected")` if the node is not running.
+/// Local-only in this PR; cross-device sync deferred to ZEB-147.
+#[tauri::command]
+fn mark_vine_viewed(
+    vine_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    mark_vine_viewed_impl(state.inner(), vine_id)
 }
 
 // ── Content announcement types and file manager stubs ───────────────────
