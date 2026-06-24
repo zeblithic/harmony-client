@@ -3,8 +3,8 @@
    * ZEB-331 — Simple About modal (spec §4.3 / Task 7).
    *
    * Shows the app version (read from Tauri's app.getVersion), license
-   * line, and a link to the GitHub repo. Reached via HelpMenuButton's
-   * "About" item.
+   * line, and a link to the GitHub repo. Reached via the nav "More"
+   * menu's "About" item (ZEB-555; formerly the (?) HelpMenuButton).
    */
   import { onMount } from 'svelte';
   import { getVersion } from '@tauri-apps/api/app';

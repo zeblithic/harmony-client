@@ -6,6 +6,7 @@
   import FolderTree from './FolderTree.svelte';
   import QuickFilters from './QuickFilters.svelte';
   import StorageBuddySummary from './StorageBuddySummary.svelte';
+  import MoreMenu from './MoreMenu.svelte';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 
   let {
@@ -32,6 +33,9 @@
     onBrowseLibraries,
     onSelectNotes,
     notesActive = false,
+    onSubmitFeedback,
+    onShowAbout,
+    onOpenDocs,
   }: {
     nodes: NavNode[];
     collapsed: boolean;
@@ -60,11 +64,30 @@
     onSelectNotes?: () => void;
     /** ZEB-334: whether the self-notes space is the active view. */
     notesActive?: boolean;
+    /** ZEB-555: "More" menu Help-section actions (rehomed from the (?) button). */
+    onSubmitFeedback?: () => void;
+    onShowAbout?: () => void;
+    onOpenDocs?: () => void;
   } = $props();
 
   // ZEB-544: resolve the nav-rail gate map once per mount (a single localStorage
   // read) rather than calling the per-mode check inline for each button.
   const navFlags = resolveNavModeFlags();
+
+  // ZEB-555: the primary rail keeps the Communities-first set (Messages / Vines /
+  // Files); the secondary/flag-gated modes live in the "More ▾" overflow menu
+  // instead of crowding the rail. Only enabled ones appear, so the default alpha
+  // (all secondary flags off) shows a "More" menu with just the Help section.
+  const secondaryModes: { mode: AppMode; label: string }[] = (
+    [
+      ['mail', 'Mail'],
+      ['spellbook', 'Spellbook'],
+      ['mint', '💰 Mint'],
+      ['network', 'Network'],
+    ] as [AppMode, string][]
+  )
+    .filter(([mode]) => navFlags[mode])
+    .map(([mode, label]) => ({ mode, label }));
 
   // ── ZEB-263 FAB + fan-out menu ──────────────────────────────────────
   // Click "+" → opens a 4-item popover (DM / Group DM / Community /
@@ -307,27 +330,16 @@
             aria-label="Files" aria-pressed={appMode === 'files'}
             onclick={() => onModeChange?.('files')}>Files</button>
         {/if}
-        {#if navFlags.mail}
-          <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'mail'}
-            aria-label="Mail" aria-pressed={appMode === 'mail'}
-            onclick={() => onModeChange?.('mail')}>Mail</button>
-        {/if}
-        {#if navFlags.spellbook}
-          <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'spellbook'}
-            aria-label="Spellbook" aria-pressed={appMode === 'spellbook'}
-            onclick={() => onModeChange?.('spellbook')}>Spellbook</button>
-        {/if}
-        {#if navFlags.mint}
-          <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'mint'}
-            aria-label="Mint" aria-pressed={appMode === 'mint'}
-            onclick={() => onModeChange?.('mint')}>💰 Mint</button>
-        {/if}
-        {#if navFlags.network}
-          <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'network'}
-            aria-label="Network" aria-pressed={appMode === 'network'}
-            onclick={() => onModeChange?.('network')}>Network</button>
-        {/if}
       </div>
+      <MoreMenu
+        {secondaryModes}
+        activeMode={appMode}
+        onSelectMode={(m) => onModeChange?.(m)}
+        onOpenNetworkHealth={() => onModeChange?.('network')}
+        {onSubmitFeedback}
+        {onShowAbout}
+        {onOpenDocs}
+      />
       <button
         type="button"
         class="nav-action-btn"
@@ -347,6 +359,20 @@
           {node.name.charAt(0).toUpperCase()}
         </button>
       {/each}
+      <!-- ZEB-555: keep Help + secondary modes reachable on narrow (collapsed)
+           screens. The old (?) overlay was always visible regardless of nav
+           collapse; without this the More menu would exist only in the expanded
+           footer, stranding collapsed-layout users. -->
+      <MoreMenu
+        compact
+        {secondaryModes}
+        activeMode={appMode}
+        onSelectMode={(m) => onModeChange?.(m)}
+        onOpenNetworkHealth={() => onModeChange?.('network')}
+        {onSubmitFeedback}
+        {onShowAbout}
+        {onOpenDocs}
+      />
     </nav>
   {/if}
 </div>
