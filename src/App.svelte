@@ -79,6 +79,7 @@
   import { MemberCardService } from './lib/member-card-service';
   import { PresenceService } from './lib/presence-service';
   import { selfCommunityPower } from './lib/community-self-power';
+  import { shouldClearMembersLoading } from './lib/members-loading';
   import { getVoiceSession, type VoiceSession } from './lib/voice-session';
   import { getCallSession, type CallSession } from './lib/call-session';
   import { getGroupCallSession, type GroupCallSession } from './lib/group-call-session';
@@ -1118,10 +1119,13 @@
       const msg = e instanceof Error ? e.message : String(e);
       console.warn('[harmony-client] listCommunityMembers failed:', msg);
     } finally {
-      // ZEB-553 item 11: only clear the flag if this refresh is still for the
-      // active community — a superseded refresh (user switched away mid-fetch)
-      // must not clear the loading state the newer switch's refresh just set.
-      if (selectedCommunityId === id) membersLoading = false;
+      // ZEB-553 item 11 (Qodo PR #332): clear the loading flag when this fetch
+      // is still relevant — same community, or none selected (user left to
+      // Notes/DMs mid-fetch). A fetch superseded by a switch to a *different*
+      // community must not clear it; that community's own refresh owns its
+      // loading state. Without the null case the flag could stick true after a
+      // mid-fetch leave until the next community open reset it.
+      if (shouldClearMembersLoading(selectedCommunityId, id)) membersLoading = false;
     }
   }
 
