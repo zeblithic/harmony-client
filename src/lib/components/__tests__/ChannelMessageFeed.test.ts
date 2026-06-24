@@ -1340,6 +1340,35 @@ describe('ChannelMessageFeed reactions — custom (CAS) emoji (ZEB-541)', () => 
     );
   });
 
+  it('reaction-picker roving focus excludes the nested named-emoji popover (Qodo #331)', async () => {
+    const ctx = await seedWithNamedEmoji();
+    const container = ctx.container;
+    await fireEvent.click(container.querySelector('.picker-toggle') as HTMLButtonElement);
+    await fireEvent.click(await ctx.findByLabelText('Named emoji'));
+    // The popover renders its own role="menuitem" tile (the seeded "catjam").
+    await waitFor(() =>
+      expect(container.querySelector('.named-popover [role="menuitem"]')).toBeTruthy(),
+    );
+    const menu = container.querySelector('.reaction-picker') as HTMLElement;
+    const outer = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]')).filter(
+      (el) => !el.closest('.named-popover'),
+    );
+    const popoverItem = menu.querySelector('.named-popover [role="menuitem"]') as HTMLElement;
+    expect(outer.length).toBeGreaterThan(1);
+    expect(popoverItem).toBeTruthy();
+    // Roving from the last OUTER menuitem wraps to the first OUTER one — never
+    // into the popover's tile.
+    const last = outer[outer.length - 1];
+    last.focus();
+    await fireEvent.keyDown(last, { key: 'ArrowRight' });
+    expect(document.activeElement).toBe(outer[0]);
+    expect(document.activeElement).not.toBe(popoverItem);
+    // From inside the popover, the outer grid does NOT hijack arrow keys.
+    popoverItem.focus();
+    await fireEvent.keyDown(popoverItem, { key: 'ArrowRight' });
+    expect(document.activeElement).toBe(popoverItem);
+  });
+
   // Seed a message with a single PUBLIC custom reaction chip (encrypted unset).
   async function seedPublicChip(encrypted = false) {
     const ctx = await setup();

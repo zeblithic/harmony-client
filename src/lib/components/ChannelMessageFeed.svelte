@@ -475,9 +475,15 @@
   function handlePickerKey(e: KeyboardEvent): void {
     const target = e.target as HTMLElement;
     if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+    // The nested named-emoji popover renders its OWN role="menuitem" buttons and
+    // manages its own focus. Never rove into it from the outer grid, and never
+    // hijack arrows while focus is already inside it (Qodo, PR #331).
+    if (target.closest('.named-popover')) return;
     if (!['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
     const menu = e.currentTarget as HTMLElement;
-    const items = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+    const items = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]')).filter(
+      (el) => !el.closest('.named-popover'),
+    );
     if (items.length === 0) return;
     const current = items.indexOf(target.closest('[role="menuitem"]') as HTMLElement);
     let next: number;
