@@ -436,16 +436,31 @@
 
   // ZEB-536 — toggle the local member's reaction (chips + quick-react share
   // this). Fire-and-forget: the only post-await write clears the non-reactive
-  // guard Set (safe after teardown); failures are logged, not surfaced (the
-  // chip self-heals from the authoritative event / next list).
+  // guard Set (safe after teardown).
+  //
+  // Surface a failed reaction in the existing `.reaction-error` banner instead
+  // of swallowing it in a console.warn the tester never sees. The optimistic
+  // chip update is event-driven, so on failure NOTHING renders — without this
+  // the most-clicked control in the alpha just looks dead. `epoch` guards
+  // against showing the error on a channel the user already switched away from
+  // (mirrors the custom-emoji upload path).
+  function surfaceReactionError(action: string, epoch: number, e: unknown): void {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn(`${action} failed`, msg);
+    if (epoch !== attachEpoch) return;
+    reactionError = `Couldn't ${action}: ${msg}`;
+  }
+
   function toggleReaction(msg: ChannelMessageDto, emoji: string): void {
     const key = `${msg.messageId}:${emoji}`;
     if (reactionPending.has(key)) return;
     const add = !reactionMine(msg, emoji);
     reactionPending.add(key);
+    reactionError = null;
+    const epoch = attachEpoch;
     void channelMessageService
       .reactToMessage(communityId, channelId, msg.messageId, emoji, add)
-      .catch((e) => console.warn('reaction toggle failed', e instanceof Error ? e.message : String(e)))
+      .catch((e) => surfaceReactionError(add ? 'add that reaction' : 'remove your reaction', epoch, e))
       .finally(() => reactionPending.delete(key));
   }
 
@@ -457,9 +472,11 @@
   // toggle semantics of chips/quick-react. Closes the popover.
   function pickFromPicker(msg: ChannelMessageDto, emoji: string): void {
     pickerOpenFor = null;
+    reactionError = null;
+    const epoch = attachEpoch;
     void channelMessageService
       .reactToMessage(communityId, channelId, msg.messageId, emoji, true)
-      .catch((e) => console.warn('reaction pick failed', e instanceof Error ? e.message : String(e)));
+      .catch((e) => surfaceReactionError('add that reaction', epoch, e));
   }
 
   // Task 10 — react with a stored named emoji's descriptor (CID + mime + size),
@@ -467,9 +484,11 @@
   function pickNamedEmoji(msg: ChannelMessageDto, d: { cid: string; mime: string; size: number }): void {
     namedPickerFor = null;
     pickerOpenFor = null;
+    reactionError = null;
+    const epoch = attachEpoch;
     void channelMessageService
       .reactToMessage(communityId, channelId, msg.messageId, '', true, d)
-      .catch((e) => console.warn('named-emoji pick failed', e instanceof Error ? e.message : String(e)));
+      .catch((e) => surfaceReactionError('add that emoji', epoch, e));
   }
 
   // Task 10 — open the tiny inline name input on a PUBLIC custom reaction chip.
@@ -600,13 +619,16 @@
     const key = `${msg.messageId}:${r.emojiCid}`;
     if (reactionPending.has(key)) return;
     reactionPending.add(key);
+    reactionError = null;
+    const add = !r.mine;
+    const epoch = attachEpoch;
     void channelMessageService
-      .reactToMessage(communityId, channelId, msg.messageId, '', !r.mine, {
+      .reactToMessage(communityId, channelId, msg.messageId, '', add, {
         cid: r.emojiCid,
         mime: 'image/png',
         size: r.emojiSize ?? 0,
       })
-      .catch((e) => console.warn('custom reaction toggle failed', e instanceof Error ? e.message : String(e)))
+      .catch((e) => surfaceReactionError(add ? 'add that reaction' : 'remove your reaction', epoch, e))
       .finally(() => reactionPending.delete(key));
   }
 

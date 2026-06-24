@@ -227,3 +227,44 @@ describe('MemberRow display-name resolution (ZEB-432)', () => {
     expect(onOpenCard.mock.calls[0][0].displayName).toBe('ZEBbot'); // popover = card name
   });
 });
+
+describe('MemberRow presence dot (ZEB-553)', () => {
+  const PEER = 'cc'.repeat(16);
+
+  it('shows self online even when the resolver reports offline (zenoh no self-loopback)', () => {
+    const selfMember = makeMember(0, 'joined', VIEWER_ADDR);
+    const { container } = render(MemberRow, {
+      props: {
+        member: selfMember,
+        viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
+        isOnline: () => false, // resolver never reports our own beacon
+      },
+    });
+    expect(container.querySelector('.presence-dot.online')).not.toBeNull();
+  });
+
+  it('shows a non-self member offline when the resolver reports offline', () => {
+    const peer = makeMember(0, 'joined', PEER);
+    const { container } = render(MemberRow, {
+      props: {
+        member: peer,
+        viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
+        isOnline: () => false,
+      },
+    });
+    expect(container.querySelector('.presence-dot')).not.toBeNull(); // dot still present
+    expect(container.querySelector('.presence-dot.online')).toBeNull(); // but not lit
+  });
+
+  it('reflects the resolver for a non-self online member', () => {
+    const peer = makeMember(0, 'joined', PEER);
+    const { container } = render(MemberRow, {
+      props: {
+        member: peer,
+        viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
+        isOnline: (id: string) => id === PEER,
+      },
+    });
+    expect(container.querySelector('.presence-dot.online')).not.toBeNull();
+  });
+});

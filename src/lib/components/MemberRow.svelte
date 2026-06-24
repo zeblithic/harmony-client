@@ -143,7 +143,11 @@
   // ZEB-537: online status. Read through the resolver inside $derived so a
   // presence-updated counter bump (in App.svelte) re-evaluates the dot live —
   // mirrors the displayName/label ladder. Undefined resolver → offline.
-  let online = $derived(isOnline ? isOnline(member.address) : false);
+  // Self is always shown online: zenoh does not loop our own presence beacon
+  // back within a session, so `isOnline(self)` reads false even though we're
+  // clearly online — showing yourself "offline" in a community you're using
+  // is confusing and undermines trust in the indicator.
+  let online = $derived(isSelf || (isOnline ? isOnline(member.address) : false));
 
   function handleMenuItemClick(action: KebabAction) {
     menuOpen = false;

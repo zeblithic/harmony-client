@@ -4,6 +4,7 @@
   import Avatar from './Avatar.svelte';
   import type { TrustService } from '../trust-service';
   import type { ResolvedCard } from '../member-card-service';
+  import type { OpenCardPayload } from './MemberRow.svelte';
   import { nonEmpty } from '../display-label';
 
   let {
@@ -14,6 +15,8 @@
     onAvatarClick,
     resolveCard,
     resolveNickname,
+    isOnline,
+    onOpenCard,
   }: {
     members: CommunityMember[];
     ownAddress: string;
@@ -26,6 +29,14 @@
      *  over the broadcast profile-card name — mirrors MemberRow / the message
      *  author label ladder. */
     resolveNickname?: (ownerIdHex: string) => string | undefined;
+    /** ZEB-537: optional online-presence resolver, mirroring MemberRow. The
+     *  green dot is the headline presence affordance — without this prop the
+     *  always-visible roster never showed it. Undefined → offline. */
+    isOnline?: (ownerIdHex: string) => boolean;
+    /** ZEB-341: open the owner_id card popover for a member. Mirrors the
+     *  Settings roster / message-author path so clicking a member in the
+     *  always-visible roster opens their card instead of a dead no-op. */
+    onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
 
   // ZEB-432 label ladder (mirrors MemberRow / ChannelMessageFeed): local friend
@@ -59,6 +70,38 @@
       return an.localeCompare(bn);
     });
   });
+
+  // Online status, mirroring MemberRow. Self is always shown online: zenoh does
+  // not loop our own presence beacon back within a session, so `isOnline(self)`
+  // would otherwise read false even though we're clearly online.
+  function presenceOnline(m: CommunityMember): boolean {
+    return m.address === ownAddress || (isOnline ? isOnline(m.address) : false);
+  }
+
+  // The owner-card popover is the identity drill-down, so it shows the SIGNED
+  // profile-card name — never the local nickname (mirrors MemberRow's
+  // cardDisplayName ladder). A private label must not masquerade as identity.
+  function cardDisplayName(m: CommunityMember): string {
+    return (
+      nonEmpty(resolveCard?.(m.address)?.displayName) ??
+      nonEmpty(m.displayName) ??
+      m.address.slice(0, 8)
+    );
+  }
+
+  function handleOpenCard(m: CommunityMember, ev: MouseEvent) {
+    onOpenCard?.(
+      {
+        ownerIdHex: m.address,
+        displayName: cardDisplayName(m),
+        statusText: resolveCard?.(m.address)?.statusText ?? '',
+        avatarUrl: resolveCard?.(m.address)?.avatarUrl,
+        power: m.power,
+        membershipStatus: m.status,
+      },
+      ev,
+    );
+  }
 </script>
 
 {#if !collapsed}
@@ -70,18 +113,35 @@
     <ul class="member-list">
       {#each ordered as m (m.address)}
         <li class="member-row">
+          <span
+            class="presence-dot"
+            class:online={presenceOnline(m)}
+            title={presenceOnline(m) ? 'Online' : 'Offline'}
+            aria-label={presenceOnline(m) ? 'Online' : 'Offline'}
+          ></span>
           <button
             class="avatar-trigger"
             type="button"
             aria-label="Open profile for {memberLabel(m)}"
-            onclick={(e) => onAvatarClick?.(m.address, e)}
+            onclick={(e) => (onOpenCard ? handleOpenCard(m, e) : onAvatarClick?.(m.address, e))}
           >
             <Avatar address={m.address} {trustService} size={24} />
           </button>
           <div class="info">
-            <span class="name" class:self={m.address === ownAddress}>
-              {memberLabel(m)}
-            </span>
+            {#if onOpenCard}
+              <button
+                type="button"
+                class="name name-btn"
+                class:self={m.address === ownAddress}
+                onclick={(e) => handleOpenCard(m, e)}
+              >
+                {memberLabel(m)}
+              </button>
+            {:else}
+              <span class="name" class:self={m.address === ownAddress}>
+                {memberLabel(m)}
+              </span>
+            {/if}
             <span class="role" data-role={powerToRole(m.power)}>{powerToRole(m.power)}</span>
           </div>
         </li>
@@ -136,6 +196,20 @@
     font-size: 0.875rem;
   }
   .member-row:hover { background: var(--bg-tertiary); }
+  /* ZEB-537: online-presence indicator, mirroring MemberRow. */
+  .presence-dot {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    box-sizing: border-box;
+  }
+  .presence-dot.online {
+    background: #3ba55d;
+    border-color: #3ba55d;
+  }
   .avatar-trigger {
     background: none;
     border: none;
@@ -150,6 +224,23 @@
     white-space: nowrap;
   }
   .name.self { color: var(--accent); }
+  /* Clickable member name → owner-card popover (ZEB-341), mirroring MemberRow. */
+  .name-btn {
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    color: var(--text-primary);
+  }
+  .name-btn:hover { text-decoration: underline; }
+  .name-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+    border-radius: 2px;
+  }
   .role {
     font-size: 0.65rem;
     text-transform: uppercase;

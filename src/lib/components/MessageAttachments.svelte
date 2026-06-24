@@ -3,7 +3,7 @@
   import type { ChannelAttachmentDto, ChannelMessageService } from '../channel-message-service';
   import { formatBytes, mimeCategoryIcon } from '../file-utils';
   import { isPreviewable, isImage, isText, decodeTextHead, type TextHead } from '../artifact-preview';
-  import { assertHeaderDimsOk, assertDecodedDimsOk } from '../avatar-normalize';
+  import { assertHeaderDimsOk, assertDecodedDimsOk, parseImageHeaderDims } from '../avatar-normalize';
   import { untrack } from 'svelte';
 
   let { communityId, channelId, attachments, channelMessageService }: {
@@ -88,6 +88,17 @@
       if (isImage(att)) {
         // Decode-bomb guards mirror avatar-resolver: header dims BEFORE decode,
         // decoded dims AFTER (8192px limit). A throw lands in catch → error.
+        //
+        // Content-validate FIRST: `createImageBitmap` decodes by the BYTES, not
+        // the mime label, and `assertHeaderDimsOk` is a no-op for formats it
+        // can't parse — so an extension-spoofed non-PNG/JPEG (e.g. a WebP/GIF
+        // decode bomb renamed `.jpg`/`.png`, which `detect_mime` would then
+        // classify image/*) would otherwise be decoded unguarded. Require a
+        // genuine PNG/JPEG header so only formats the pre-decode dimension guard
+        // actually bounds ever reach the decoder. (CodeAnt, PR #329.)
+        if (!parseImageHeaderDims(bytes)) {
+          throw new Error('Not a previewable image — download it to view.');
+        }
         assertHeaderDimsOk(bytes);
         const blob = new Blob([bytes], { type: att.mime });
         const bmp = await createImageBitmap(blob);
