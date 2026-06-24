@@ -153,6 +153,19 @@ describe('VineFeed', () => {
       expect(screen.getByRole('button', { name: 'Share a vine' })).toBeTruthy();
     });
 
+    it('shows the CTA in an empty Following → Unviewed feed with no followed vines', async () => {
+      // Regression (CodeAnt, PR #333): suppression must be gated on actually
+      // HAVING vines, not just the filter state. A zero-vine user who flips to
+      // Unviewed is not "all caught up" — they still need the create path.
+      const onPublish = vi.fn();
+      render(VineFeed, { props: {
+        followedVines: [], discoverVines: [], viewedIds: new Set(),
+        activeTab: 'following', followedAddresses: new Set(), onPublish,
+      } });
+      await fireEvent.click(screen.getByText('Unviewed'));
+      expect(screen.getByRole('button', { name: 'Share a vine' })).toBeTruthy();
+    });
+
     it('omits the CTA in the all-caught-up (Following → Unviewed) state', async () => {
       // The user HAS vines here, just none unviewed — the action is "switch to
       // All", not "post", so the post CTA would be noise.

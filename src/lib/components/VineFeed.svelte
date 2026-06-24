@@ -106,6 +106,14 @@
     followedVines.filter(v => !viewedIds.has(v.id)).length
   );
 
+  // True "all caught up": the user HAS followed vines but none are unviewed.
+  // This is the only empty state where the "Share a vine" CTA is noise (the
+  // right action is "switch to All"). A zero-vine feed on the Unviewed filter
+  // is NOT all-caught-up — it still needs the create path. (CodeAnt, PR #333.)
+  let allCaughtUp = $derived(
+    activeTab === 'following' && feedFilter === 'unviewed' && followedVines.length > 0
+  );
+
   // Single-pass reshare-count index over both feeds. Per-card lookup
   // (`reshareCountMap.get(vine.id) ?? 0`) is O(1), so the full feed
   // render is O(N) total instead of the O(N²) it would be if each
@@ -198,7 +206,7 @@
           No vines on the network yet.
         {/if}
       </p>
-      {#if onPublish && !(activeTab === 'following' && feedFilter === 'unviewed')}
+      {#if onPublish && !allCaughtUp}
         <button type="button" class="empty-state-cta" onclick={onPublish}>
           <span class="create-btn-icon" aria-hidden="true">+</span>
           Share a vine
