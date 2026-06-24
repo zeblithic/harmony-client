@@ -93,6 +93,14 @@ describe('ProfileEditor avatar upload', () => {
     await waitFor(() => expect(screen.getByText(/static frame/i)).toBeInTheDocument());
   });
 
+  it('shows an animated-format notice when the picked file is a WebP (finding 16)', async () => {
+    render(ProfileEditor, { props: { profile: testProfile, onSave: vi.fn() } });
+    const input = screen.getByLabelText('Avatar image') as HTMLInputElement;
+    const webp = new File([new Uint8Array([9, 9, 9])], 'anim.webp', { type: 'image/webp' });
+    await fireEvent.change(input, { target: { files: [webp] } });
+    await waitFor(() => expect(screen.getByText(/static frame/i)).toBeInTheDocument());
+  });
+
   it('does NOT show the animated-format notice for a static PNG (finding 16)', async () => {
     render(ProfileEditor, { props: { profile: testProfile, onSave: vi.fn() } });
     await pickFile(); // PNG
