@@ -106,7 +106,7 @@ harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "8b870
 # git history for the RelayPool/health + real-wire-format provenance).
 # test-fixtures feature is activated only for the dev-dependency below
 # so MockPkarrRelay is excluded from release binaries (round-1 review fix).
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "14918226b988034a656aaeffc4b56f36ca72fc9a" }
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "fe8ba21d4a5bea337dffc36b1636e155fbaec1cd" }
 # ZEB-473 (DM-over-iroh, Move 1a): harmony-tunnel is the PQ iroh tunnel crate
 # that Move 1 rewires the dormant DM unicast fan-out onto. Pinned to the same
 # workspace-wide rev as the crates above. Imported here in Task 1 so later
@@ -201,7 +201,7 @@ tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util", "io-util"] }
 # Activate test-fixtures feature for harmony-pkarr in dev/test builds only,
 # so MockPkarrRelay (an axum HTTP server) is excluded from release binaries.
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "14918226b988034a656aaeffc4b56f36ca72fc9a", features = ["test-fixtures"] }
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "fe8ba21d4a5bea337dffc36b1636e155fbaec1cd", features = ["test-fixtures"] }
 
 # ZEB-156: harmony-runtime (pinned 04449d60 above) provides the narrow
 # `NodeRuntime::remove_content` + `StorageTier::remove` delegates this
