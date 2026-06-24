@@ -57,3 +57,21 @@ export function resolveOriginalCreator(vine: VineVideo): {
     originalCreatorName: vine.creatorName,
   };
 }
+
+/**
+ * Non-blank display label for a vine's creator/resharer (ZEB-561).
+ *
+ * The wire descriptor's `creatorName` can be empty: a reshare or publish issued
+ * via the headless `reshare_vine` / `publish_vine` RPC with `creatorName`
+ * omitted carries `creatorName=""` (the backend has no persisted social display
+ * name to default from), so a viewer would otherwise render a blank resharer.
+ * Never show blank — fall back to a truncated owner-hex, the same final rung the
+ * member/message surfaces use (`name || address.slice(0, 8)`).
+ */
+export function vineCreatorLabel(
+  name: string | null | undefined,
+  address: string,
+): string {
+  const trimmed = name?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : address.slice(0, 8);
+}

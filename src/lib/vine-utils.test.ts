@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveOriginalCreator } from './vine-utils';
+import { resolveOriginalCreator, vineCreatorLabel } from './vine-utils';
 import type { VineVideo } from './types';
 
 function vine(overrides: Partial<VineVideo> = {}): VineVideo {
@@ -89,5 +89,30 @@ describe('resolveOriginalCreator', () => {
     const resolved = resolveOriginalCreator(v);
     expect(resolved.originalCreatorAddress).toBe(v.creatorAddress);
     expect(resolved.originalCreatorName).toBe(v.creatorName);
+  });
+});
+
+describe('vineCreatorLabel', () => {
+  it('returns the name verbatim when present', () => {
+    expect(vineCreatorLabel('Alice', '685e4ba7deadbeef')).toBe('Alice');
+  });
+
+  it('falls back to truncated owner-hex when the name is empty (ZEB-561)', () => {
+    // A reshare/publish via the headless RPC with creatorName omitted carries
+    // "" — the viewer must never render a blank resharer.
+    expect(vineCreatorLabel('', '685e4ba7deadbeef')).toBe('685e4ba7');
+  });
+
+  it('falls back when the name is whitespace-only', () => {
+    expect(vineCreatorLabel('   ', '685e4ba7deadbeef')).toBe('685e4ba7');
+  });
+
+  it('falls back when the name is null or undefined', () => {
+    expect(vineCreatorLabel(null, '685e4ba7deadbeef')).toBe('685e4ba7');
+    expect(vineCreatorLabel(undefined, '685e4ba7deadbeef')).toBe('685e4ba7');
+  });
+
+  it('trims surrounding whitespace from a real name', () => {
+    expect(vineCreatorLabel('  Bob  ', 'addr')).toBe('Bob');
   });
 });

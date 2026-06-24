@@ -2,6 +2,7 @@
   import type { VineVideo } from '../types';
   import Avatar from './Avatar.svelte';
   import { relativeTime } from '../file-utils';
+  import { vineCreatorLabel } from '../vine-utils';
 
   let { vine, onPlay, isViewed, showFollowButton = false, isFollowed = false, onFollow, onUnfollow, reactionCount = 0, likedByMe = false, onToggleLike, reshareCount = 0, onViewOriginal }: {
     vine: VineVideo;
@@ -23,6 +24,14 @@
 
   let timeStr = $derived(relativeTime(vine.createdAt * 1000));
 
+  // ZEB-561: never render a blank creator/resharer — a descriptor published via
+  // the headless RPC with `creatorName` omitted carries "", so fall back to a
+  // truncated owner-hex.
+  let creatorLabel = $derived(vineCreatorLabel(vine.creatorName, vine.creatorAddress));
+  let originalLabel = $derived(
+    vineCreatorLabel(vine.originalCreatorName, vine.originalCreatorAddress ?? vine.creatorAddress),
+  );
+
   function handleClick() {
     onPlay(vine);
   }
@@ -41,7 +50,7 @@
     if (isFollowed) {
       onUnfollow?.(vine.creatorAddress);
     } else {
-      onFollow?.(vine.creatorAddress, vine.creatorName);
+      onFollow?.(vine.creatorAddress, creatorLabel);
     }
   }
 
@@ -56,7 +65,7 @@
   class:viewed={viewed}
   role="button"
   tabindex="0"
-  aria-label="{vine.title ?? 'Untitled vine'} by {vine.creatorName}"
+  aria-label="{vine.title ?? 'Untitled vine'} by {creatorLabel}"
   onclick={handleClick}
   onkeydown={handleKeyDown}
 >
@@ -68,8 +77,8 @@
   </div>
   <div class="card-info">
     <div class="creator-row">
-      <Avatar address={vine.creatorAddress} size={18} displayName={vine.creatorName} />
-      <span class="creator-name">{vine.creatorName}</span>
+      <Avatar address={vine.creatorAddress} size={18} displayName={creatorLabel} />
+      <span class="creator-name">{creatorLabel}</span>
       <span class="timestamp">{timeStr}</span>
     </div>
     {#if vine.title}
@@ -81,13 +90,13 @@
           type="button"
           class="attribution-link"
           onclick={(e) => { e.stopPropagation(); onViewOriginal?.(vine.reshareOf!); }}
-          aria-label="originally by {vine.originalCreatorName ?? vine.creatorName}"
+          aria-label="originally by {originalLabel}"
         >
-          <span aria-hidden="true">↗</span> originally by {vine.originalCreatorName ?? vine.creatorName}
+          <span aria-hidden="true">↗</span> originally by {originalLabel}
         </button>
       {:else}
         <span class="attribution-row">
-          <span aria-hidden="true">↗</span> originally by {vine.originalCreatorName ?? vine.creatorName}
+          <span aria-hidden="true">↗</span> originally by {originalLabel}
         </span>
       {/if}
     {/if}
