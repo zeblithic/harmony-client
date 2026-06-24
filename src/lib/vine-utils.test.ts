@@ -129,6 +129,20 @@ describe('vineOriginalCreatorLabel', () => {
     expect(vineOriginalCreatorLabel(v)).toBe('Alice');
   });
 
+  it('shows originalCreatorName even when its paired address is absent (display, not propagation)', () => {
+    // A name-only attribution display has no address/name mixing risk, so a
+    // present originalCreatorName must be shown — NOT dropped to creatorName the
+    // way resolveOriginalCreator's both-or-neither propagation rule would.
+    const v = vine({
+      reshareOf: 'vine-orig',
+      creatorAddress: 'a1b2c3d4',
+      creatorName: 'Resharer',
+      originalCreatorName: 'Original Person',
+      // originalCreatorAddress intentionally absent
+    });
+    expect(vineOriginalCreatorLabel(v)).toBe('Original Person');
+  });
+
   it('falls back to the source creator NAME (not hex) when originalCreatorName is missing (Qodo #337 regression)', () => {
     // A legacy/partial reshare payload with only a creatorName: must show that
     // name, NOT a truncated address — the regression Qodo flagged.
