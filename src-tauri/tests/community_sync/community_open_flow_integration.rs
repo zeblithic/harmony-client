@@ -896,3 +896,241 @@ mod bootstrap_admit_open_publisher_tests {
         );
     }
 }
+
+/// ZEB-558: open-community join must converge over the WIRE with no manual
+/// cross-seeding. This is the faithful repro of the production deadlock that
+/// `open_community_create_redeem_leave_round_trip` masks with its explicit
+/// `insert_local_event` pre-seeds. Pre-fix this DEADLOCKS (each engine
+/// rejects the other's publish `publisher_not_joined`); post-fix the gate's
+/// deferred bootstrap-admission converges both.
+#[tokio::test]
+async fn open_community_two_node_wire_convergence_no_preseed() {
+    let owner_a_test = harmony_app::community_membership::mint_test_owner(0x5A);
+    let owner_b_test = harmony_app::community_membership::mint_test_owner(0x5B);
+    let owner_a = owner_a_test.owner;
+    let owner_b = owner_b_test.owner;
+    let signing_a = owner_a_test.device_key.clone();
+    let signing_b = owner_b_test.device_key.clone();
+
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
+        a: (owner_a, [0u8; 64]),
+        b: (owner_b, [0u8; 64]),
+    });
+
+    // Shared in-memory CAS (mirrors the round-trip test).
+    let cas: Arc<Mutex<HashMap<harmony_content::cid::ContentId, Vec<u8>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel(64);
+    let cas_for_servicer = Arc::clone(&cas);
+    tokio::spawn(async move {
+        while let Some(op) = cas_op_rx.recv().await {
+            match op {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
+                    cas_for_servicer.lock().await.insert(cid, blob);
+                    if let Some(r) = reply {
+                        let _ = r.send(Ok(()));
+                    }
+                }
+                CasOp::GetOrFetch {
+                    cid,
+                    timeout: _,
+                    reply,
+                } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(Ok(v));
+                }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
+                }
+            }
+        }
+    });
+
+    // Bidirectional wire forwarders.
+    let (a_out_tx, mut a_out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (a_in_tx, a_in_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_out_tx, mut b_out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_in_tx, b_in_rx) = mpsc::channel::<Vec<u8>>(64);
+    let a_in_for_fwd = a_in_tx.clone();
+    tokio::spawn(async move {
+        while let Some(bytes) = b_out_rx.recv().await {
+            let _ = a_in_for_fwd.send(bytes).await;
+        }
+    });
+    let b_in_for_fwd = b_in_tx.clone();
+    tokio::spawn(async move {
+        while let Some(bytes) = a_out_rx.recv().await {
+            let _ = b_in_for_fwd.send(bytes).await;
+        }
+    });
+
+    let minted_a = mint_community_creation(
+        "WireConvergence",
+        false,
+        owner_a,
+        &signing_a,
+        &owner_a_test.cert,
+        Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".to_string(),
+        },
+    )
+    .expect("mint create");
+    let community_id = minted_a.community_id;
+
+    let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx.clone(),
+        Duration::from_secs(2),
+    ));
+    let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx.clone(),
+        Duration::from_secs(2),
+    ));
+
+    let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
+    let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
+    let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let (delta_a_tx, mut _delta_a_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
+    let (delta_b_tx, mut _delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
+    let tmp_a = tempfile::tempdir().expect("tmp a");
+    let tmp_b = tempfile::tempdir().expect("tmp b");
+
+    let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: minted_a.membership_key.clone(),
+        admin_addr: owner_a,
+        is_invite_only: false,
+        device_id: "a-dev".into(),
+        self_owner: owner_a,
+        signing_key: Arc::new(signing_a.clone()),
+        state: Arc::clone(&state_a),
+        tracker: Arc::clone(&tracker_a),
+        content_store: cs_a,
+        publisher_tx: a_out_tx,
+        subscriber_rx: a_in_rx,
+        paths: PersistPaths {
+            crdt: tmp_a.path().join("crdt.cbor"),
+            replay: tmp_a.path().join("replay.cbor"),
+        },
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        identity_resolver: Some(Arc::clone(&resolver)),
+        error_tx: None,
+        delta_tx: Some(delta_a_tx),
+        pending_redemptions: None,
+        crdt_state: None,
+        admin_identity_pub: None,
+        nav_emitter: None,
+        root_serve_rx: None,
+    });
+    let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: minted_a.membership_key.clone(),
+        admin_addr: owner_a,
+        is_invite_only: false,
+        device_id: "b-dev".into(),
+        self_owner: owner_b,
+        signing_key: Arc::new(signing_b.clone()),
+        state: Arc::clone(&state_b),
+        tracker: Arc::clone(&tracker_b),
+        content_store: cs_b,
+        publisher_tx: b_out_tx,
+        subscriber_rx: b_in_rx,
+        paths: PersistPaths {
+            crdt: tmp_b.path().join("crdt.cbor"),
+            replay: tmp_b.path().join("replay.cbor"),
+        },
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        identity_resolver: Some(Arc::clone(&resolver)),
+        error_tx: None,
+        delta_tx: Some(delta_b_tx),
+        pending_redemptions: None,
+        crdt_state: None,
+        admin_identity_pub: None,
+        nav_emitter: None,
+        root_serve_rx: None,
+    });
+
+    // A inserts its bootstrap Join → publishes over the wire.
+    engine_a
+        .insert_local_event(minted_a.bootstrap_join.clone())
+        .await
+        .expect("A bootstrap insert");
+
+    // B redeems the open invite + inserts ONLY its own Join → publishes.
+    // NO manual cross-seed of A's Join into B, and NO seed of B's Join into A.
+    let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
+        community_id,
+        epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: minted_a.membership_key.as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
+            state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(),
+        },
+        admin_addr: owner_a,
+        community_name: "WireConvergence".into(),
+        is_invite_only: false,
+        expires_at: None,
+        invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
+        forked_from: None,
+        pre_fork_snapshot: None,
+        inviter_enrollment: None,
+        untargeted_decrypt_key: None,
+    };
+    let minted_b = mint_redemption(
+        &invite_payload,
+        owner_b,
+        &signing_b,
+        &owner_b_test.cert,
+        Hlc {
+            wall_ms: 200_000,
+            logical: 0,
+            device_id: "b-dev".to_string(),
+        },
+    )
+    .expect("mint redeem");
+    engine_b
+        .insert_local_event(minted_b.bootstrap_join.clone())
+        .await
+        .expect("B redemption insert");
+
+    // Convergence over the WIRE: each engine must learn the other's Join with
+    // no pre-seed. Pre-fix this times out (mutual publisher_not_joined reject).
+    let a_has_both = wait_until(
+        || async { state_a.lock().await.events.len() == 2 },
+        Duration::from_secs(10),
+    )
+    .await;
+    let b_has_both = wait_until(
+        || async { state_b.lock().await.events.len() == 2 },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        a_has_both,
+        "A must learn B's Join over the wire (no pre-seed)"
+    );
+    assert!(
+        b_has_both,
+        "B must learn A's Join over the wire (no pre-seed)"
+    );
+
+    // Both materialize the same 2-member roster.
+    let dto_a = member_info_for(&state_a.lock().await.materialize_now(owner_a));
+    let dto_b = member_info_for(&state_b.lock().await.materialize_now(owner_a));
+    assert_eq!(dto_a.len(), 2, "A roster = admin + joiner");
+    assert_eq!(dto_b.len(), 2, "B roster = admin + joiner");
+    assert_eq!(dto_a, dto_b, "rosters must agree");
+
+    engine_a.shutdown().await.expect("shutdown a");
+    engine_b.shutdown().await.expect("shutdown b");
+}
