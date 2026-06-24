@@ -13093,15 +13093,14 @@ async fn ingest_avatar_bytes(
 /// ZEB-559: maximum vine video size accepted by the GUI uploader. Vines are
 /// short-form clips that get served peer-to-peer over iroh/CAS, so an unbounded
 /// upload would mean painfully slow fetches for every viewer. 100 MiB is
-/// generous for a 30–90s 1080p clip. The limit is enforced *before* streaming
-/// (a cheap metadata stat) so an oversized file fails fast with a clear error
-/// instead of chunking gigabytes first.
+/// generous for a 30–90s 1080p clip. Enforced on the opened handle's size AND
+/// on the actual streamed byte count (see `ingest_vine_video_inner`).
 pub(crate) const VINE_VIDEO_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
-/// ZEB-559: ingest a local video file — selected via the frontend's native
-/// file picker and passed here as an absolute path — into CAS, returning the
-/// root CID hex. Mirrors the headless `publish_vine` auto-mint path so a GUI
-/// tester no longer needs a pre-known Video CID to post a vine.
+/// ZEB-559: ingest a local video file (path resolved by the backend-owned
+/// native picker — see [`ingest_vine_video`]) into CAS, returning the root CID
+/// hex. Mirrors the headless `publish_vine` auto-mint path so a GUI tester no
+/// longer needs a pre-known Video CID to post a vine.
 ///
 /// Twin of [`ingest_avatar_bytes_inner`] (default `ContentFlags` →
 /// PublicDurable / unencrypted, so the CID is publicly servable to other
@@ -13109,46 +13108,104 @@ pub(crate) const VINE_VIDEO_MAX_BYTES: u64 = 100 * 1024 * 1024;
 /// listing) but reads from a path and streams off disk — memory stays bounded
 /// at ~1 MiB regardless of file size, the same `streaming_ingest` guarantee the
 /// file vault relies on (ZEB-161).
+///
+/// TOCTOU guard mirrors the channel-artifact ingest (CodeRabbit PR #320,
+/// reapplied here per CodeAnt/Qodo on PR #335): the size cap is enforced on the
+/// OPENED handle's `fstat` (not a separate path stat a swap could invalidate)
+/// AND on the actual streamed byte count via `.take(MAX + 1)` + a post-stream
+/// check, so a file growing or swapped after the stat still cannot exceed the
+/// cap.
 pub(crate) async fn ingest_vine_video_inner(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     path: String,
 ) -> Result<String, String> {
     use harmony_content::chunker::ChunkerConfig;
+    use tokio::io::AsyncReadExt;
 
-    // Fail fast on a missing / non-file / empty / oversized selection via a
-    // cheap stat, before streaming a single chunk. The read-only metadata check
-    // precedes the irreversible CAS write (metadata-before-write convention).
-    let meta = tokio::fs::metadata(&path)
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| format!("could not open video file: {e}"))?;
+    // Re-stat the OPENED fd (same inode as the read below — no path
+    // re-resolution) and fail fast on a non-file / empty / already-oversized
+    // selection before streaming a single chunk.
+    let meta = file
+        .metadata()
         .await
         .map_err(|e| format!("could not read video file: {e}"))?;
     if !meta.is_file() {
         return Err("the selected path is not a file".to_string());
     }
-    let size = meta.len();
-    if size == 0 {
+    if meta.len() == 0 {
         return Err("the selected video file is empty".to_string());
     }
-    if size > VINE_VIDEO_MAX_BYTES {
+    if meta.len() > VINE_VIDEO_MAX_BYTES {
         return Err(format!(
-            "video too large: {size} bytes exceeds the 100 MB limit"
+            "video too large: {} bytes exceeds the 100 MB limit",
+            meta.len()
         ));
     }
 
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|e| format!("could not open video file: {e}"))?;
-    let reader = tokio::io::BufReader::new(file);
-    let (root, _size) = streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None)
+    // Bound the reader so a file that grows after the fstat still cannot exceed
+    // the cap, and treat the streamed byte count as authoritative.
+    let reader = tokio::io::BufReader::new(file).take(VINE_VIDEO_MAX_BYTES.saturating_add(1));
+    let (root, streamed) = streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None)
         .await
         .map_err(|e| e.to_string())?;
+    if streamed > VINE_VIDEO_MAX_BYTES {
+        return Err(format!(
+            "video too large: streamed {streamed} bytes exceeds the 100 MB limit"
+        ));
+    }
     Ok(hex::encode(root.to_bytes()))
 }
 
+/// ZEB-559: result of a successful vine-video ingest — the minted Video CID
+/// plus the picked file's display name (for the composer's "✓ filename" chip).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VineVideoIngest {
+    pub video_cid: String,
+    pub file_name: String,
+}
+
+/// ZEB-559: open a backend-owned native file picker, ingest the chosen video
+/// into CAS, and return its CID + filename. Returns `Ok(None)` when the user
+/// cancels the picker.
+///
+/// The picker is opened by the BACKEND (mirroring [`ingest_content`]) rather
+/// than taking a renderer-supplied path: a path-taking IPC would let a
+/// compromised webview ingest any readable file as PublicDurable (servable)
+/// content — a local-file exfiltration primitive (CodeAnt, PR #335). With the
+/// backend owning the dialog the renderer can only trigger the picker; the user
+/// physically selects the file.
 #[tauri::command]
 async fn ingest_vine_video(
-    path: String,
+    app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<String, String> {
+) -> Result<Option<VineVideoIngest>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (path_tx, path_rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("Video", &["mp4", "mov", "webm", "mkv", "m4v", "avi"])
+        .pick_file(move |path| {
+            let _ = path_tx.send(path);
+        });
+    let picked = path_rx.await.map_err(|_| "dialog error".to_string())?;
+    let Some(file_path) = picked else {
+        return Ok(None); // user cancelled the picker
+    };
+    let path = file_path
+        .as_path()
+        .ok_or_else(|| "unsupported file path".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("video")
+        .to_string();
+    let path_str = path.to_string_lossy().into_owned();
+
     let ingest_tx = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard
@@ -13156,7 +13213,11 @@ async fn ingest_vine_video(
             .clone()
             .ok_or_else(|| "not connected".to_string())?
     };
-    ingest_vine_video_inner(&ingest_tx, path).await
+    let video_cid = ingest_vine_video_inner(&ingest_tx, path_str).await?;
+    Ok(Some(VineVideoIngest {
+        video_cid,
+        file_name,
+    }))
 }
 
 /// ZEB-345: structured input for one profile-page link, deserialized from the

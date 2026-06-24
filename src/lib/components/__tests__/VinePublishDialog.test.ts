@@ -65,6 +65,18 @@ describe('VinePublishDialog (ZEB-559)', () => {
     expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
   });
 
+  it('manually editing the Advanced CID clears the picked filename (no desync)', async () => {
+    const onPickVideo = vi.fn().mockResolvedValue({ cid: 'pickedcid', fileName: 'clip.mp4' });
+    render(VinePublishDialog, props({ onPickVideo }));
+    await fireEvent.click(screen.getByTestId('choose-video'));
+    await waitFor(() => expect(screen.getByTestId('picked-file')).toBeTruthy());
+    // Override the CID via the Advanced field — the filename chip must clear so
+    // the UI can't display clip.mp4 while publishing a different CID.
+    await fireEvent.input(screen.getByLabelText('Video CID'), { target: { value: 'manualcid' } });
+    await waitFor(() => expect(screen.queryByTestId('picked-file')).toBeNull());
+    expect(screen.getByTestId('choose-video')).toBeTruthy();
+  });
+
   it('Advanced: pasting a raw CID also enables Publish (headless-parity path)', async () => {
     const onPublish = vi.fn().mockResolvedValue(undefined);
     render(VinePublishDialog, props({ onPublish }));

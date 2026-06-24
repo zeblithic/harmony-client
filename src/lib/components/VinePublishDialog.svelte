@@ -136,6 +136,7 @@
         <input
           type="text"
           bind:value={videoCid}
+          oninput={() => { pickedFileName = ''; }}
           placeholder="Hex-encoded content ID"
           class="field-input advanced-input"
           aria-label="Video CID"

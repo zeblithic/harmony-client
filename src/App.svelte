@@ -759,21 +759,13 @@
   }
 
   /**
-   * ZEB-559: open the native file picker, ingest the chosen video into CAS via
-   * the backend, and return its minted Video CID + filename for the composer to
-   * display. Returns null if the user cancels the picker; throws on ingest
-   * failure so VinePublishDialog can surface the message.
+   * ZEB-559: ingest a vine video via the backend-owned native picker (the
+   * backend opens the dialog and returns the CID + filename, so the renderer
+   * never supplies a filesystem path). Returns null if the user cancels; throws
+   * on ingest failure so VinePublishDialog can surface the message.
    */
-  async function handlePickVineVideo(): Promise<{ cid: string; fileName: string } | null> {
-    const { open } = await import('@tauri-apps/plugin-dialog');
-    const picked = await open({
-      multiple: false,
-      filters: [{ name: 'Video', extensions: ['mp4', 'mov', 'webm', 'mkv', 'm4v', 'avi'] }],
-    });
-    if (!picked || typeof picked !== 'string') return null; // cancelled
-    const fileName = picked.split(/[\\/]/).pop() || 'video';
-    const cid = await vineService.ingestVideo(picked);
-    return { cid, fileName };
+  function handlePickVineVideo(): Promise<{ cid: string; fileName: string } | null> {
+    return vineService.ingestVideo();
   }
 
   async function handleVineReshare(vine: import('./lib/types').VineVideo) {
@@ -2880,7 +2872,7 @@
         onNewCommunity={() => { showCreateCommunity = true; createError = null; }}
         onRedeemInvite={() => { showRedeemInvite = true; redeemError = null; redeemUrl = ''; }}
         onBrowseLibraries={() => { libraryDirectoryOpen = true; }}
-        onPostVine={() => { showVinePublish = true; }}
+        onPostVine={() => { switchMode('vines'); showVinePublish = true; }}
         onSelectNotes={selectNotes}
         notesActive={notesSelected && !selectedCommunityNode}
         onSubmitFeedback={() => (feedbackModalOpen = true)}

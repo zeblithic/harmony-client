@@ -264,24 +264,31 @@ describe('VineService', () => {
 
   // ── ingestVideo (ZEB-559) ──────────────────────────────────────────
 
-  it('ingestVideo invokes ingest_vine_video with the path and returns the CID', async () => {
+  it('ingestVideo invokes ingest_vine_video (backend-owned picker) and maps the result', async () => {
     const { adapter } = createMockAdapter();
-    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue('deadbeefcid');
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue({ videoCid: 'deadbeefcid', fileName: 'clip.mp4' });
     await svc.connectAdapter(adapter);
-    const cid = await svc.ingestVideo('/home/u/clip.mp4');
-    expect(adapter.invoke).toHaveBeenCalledWith('ingest_vine_video', { path: '/home/u/clip.mp4' });
-    expect(cid).toBe('deadbeefcid');
+    const r = await svc.ingestVideo();
+    expect(adapter.invoke).toHaveBeenCalledWith('ingest_vine_video', {});
+    expect(r).toEqual({ cid: 'deadbeefcid', fileName: 'clip.mp4' });
+  });
+
+  it('ingestVideo returns null when the user cancels the picker', async () => {
+    const { adapter } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+    await svc.connectAdapter(adapter);
+    expect(await svc.ingestVideo()).toBeNull();
   });
 
   it('ingestVideo throws when there is no adapter (disconnected)', async () => {
-    await expect(svc.ingestVideo('/home/u/clip.mp4')).rejects.toThrow('not connected');
+    await expect(svc.ingestVideo()).rejects.toThrow('not connected');
   });
 
   it('ingestVideo propagates backend ingest errors', async () => {
     const { adapter } = createMockAdapter();
     (adapter.invoke as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('video too large: 209715201 bytes exceeds the 100 MB limit'));
     await svc.connectAdapter(adapter);
-    await expect(svc.ingestVideo('/home/u/huge.mp4')).rejects.toThrow('video too large');
+    await expect(svc.ingestVideo()).rejects.toThrow('video too large');
   });
 
   // ── markViewed ─────────────────────────────────────────────────────
