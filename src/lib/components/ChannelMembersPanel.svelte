@@ -116,6 +116,7 @@
           <span
             class="presence-dot"
             class:online={presenceOnline(m)}
+            role="img"
             title={presenceOnline(m) ? 'Online' : 'Offline'}
             aria-label={presenceOnline(m) ? 'Online' : 'Offline'}
           ></span>

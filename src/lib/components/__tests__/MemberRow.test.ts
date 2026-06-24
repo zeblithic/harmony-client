@@ -267,4 +267,18 @@ describe('MemberRow presence dot (ZEB-553)', () => {
     });
     expect(container.querySelector('.presence-dot.online')).not.toBeNull();
   });
+
+  it('marks the presence dot with role="img" + an online/offline label (finding 15)', () => {
+    const peer = makeMember(0, 'joined', PEER);
+    const { container } = render(MemberRow, {
+      props: {
+        member: peer,
+        viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
+        isOnline: () => false,
+      },
+    });
+    const dot = container.querySelector('.presence-dot');
+    expect(dot?.getAttribute('role')).toBe('img');
+    expect(dot?.getAttribute('aria-label')).toMatch(/offline/i);
+  });
 });

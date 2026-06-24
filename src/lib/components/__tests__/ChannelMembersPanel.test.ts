@@ -145,6 +145,18 @@ describe('ChannelMembersPanel — ZEB-553 presence dots on the default roster', 
     });
     expect(container.querySelectorAll('.presence-dot.online').length).toBe(1); // self only
   });
+
+  it('marks each presence dot with role="img" + an online/offline label (finding 15)', () => {
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({ members: [self, member({ address: PEER })], isOnline: () => false }),
+    });
+    const dots = container.querySelectorAll('.presence-dot');
+    expect(dots.length).toBe(2);
+    for (const dot of dots) {
+      expect(dot.getAttribute('role')).toBe('img');
+      expect(dot.getAttribute('aria-label')).toMatch(/online|offline/i);
+    }
+  });
 });
 
 describe('ChannelMembersPanel — ZEB-553 owner-card open', () => {

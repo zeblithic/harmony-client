@@ -89,6 +89,36 @@ describe('ReactionEmojiImage (ZEB-541)', () => {
     await waitFor(() => expect(container.querySelector('img.reaction-emoji-img')).not.toBeNull());
   });
 
+  it('labels the pending placeholder distinctly from the failed one (finding 17)', async () => {
+    let resolveFetch!: (v: Uint8Array) => void;
+    const previewReactionEmoji = vi.fn(() => new Promise<Uint8Array>((r) => { resolveFetch = r; }));
+    const { container } = render(ReactionEmojiImage, {
+      props: props({ channelMessageService: makeService(previewReactionEmoji) }),
+    });
+    const pending = container.querySelector('.reaction-emoji-pending');
+    expect(pending).not.toBeNull();
+    expect(pending?.getAttribute('role')).toBe('img');
+    expect(pending?.getAttribute('aria-label')).toMatch(/loading/i);
+    // Not the failed variant while still in flight.
+    expect(container.querySelector('.reaction-emoji-failed')).toBeNull();
+    resolveFetch(PNG_BYTES);
+    await waitFor(() => expect(container.querySelector('img.reaction-emoji-img')).not.toBeNull());
+  });
+
+  it('labels the failed placeholder distinctly from pending (finding 17)', async () => {
+    const previewReactionEmoji = vi.fn().mockRejectedValue(new Error('unauthorized'));
+    const { container } = render(ReactionEmojiImage, {
+      props: props({ channelMessageService: makeService(previewReactionEmoji) }),
+    });
+    await waitFor(() => {
+      const failed = container.querySelector('.reaction-emoji-failed');
+      expect(failed).not.toBeNull();
+      expect(failed?.getAttribute('role')).toBe('img');
+      expect(failed?.getAttribute('aria-label')).toMatch(/failed/i);
+    });
+    expect(container.querySelector('.reaction-emoji-pending')).toBeNull();
+  });
+
   it('shows the error placeholder when the fetch fails (no <img>)', async () => {
     const previewReactionEmoji = vi.fn().mockRejectedValue(new Error('unauthorized'));
     const { container } = render(ReactionEmojiImage, {

@@ -950,7 +950,15 @@
     onchange={handleCustomEmojiPick}
   />
   {#if reactionError}
-    <div class="reaction-error" role="alert">{reactionError}</div>
+    <div class="reaction-error" role="alert">
+      <span class="reaction-error-text">{reactionError}</span>
+      <button
+        type="button"
+        class="reaction-error-dismiss"
+        aria-label="Dismiss error"
+        onclick={() => (reactionError = null)}
+      >&times;</button>
+    </div>
   {/if}
 
   <div class="compose">
@@ -1110,10 +1118,25 @@
     border: 0;
   }
   .reaction-error {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     color: #d83c3e;
     font-size: 0.75rem;
     padding: 4px 12px;
   }
+  .reaction-error-text { flex: 1 1 auto; min-width: 0; }
+  .reaction-error-dismiss {
+    flex: 0 0 auto;
+    background: transparent;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: 1rem;
+    line-height: 1;
+    padding: 0 2px;
+  }
+  .reaction-error-dismiss:hover { opacity: 0.7; }
   .reaction-toolbar {
     position: absolute;
     top: -10px;

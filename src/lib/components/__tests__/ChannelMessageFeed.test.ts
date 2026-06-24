@@ -788,6 +788,29 @@ describe('ChannelMessageFeed reactions — chips (ZEB-536)', () => {
     });
   });
 
+  it('reaction-error banner can be dismissed (finding 14)', async () => {
+    const { adapter, container } = await seedMessageWithReactions([
+      { emoji: '👍', count: 1, mine: false, reactors: ['ee'.repeat(20)] },
+    ]);
+    // Make the toggle fail so the error banner surfaces.
+    (adapter.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'set_message_reaction') return Promise.reject(new Error('reaction rejected'));
+      if (cmd === 'list_channel_messages') return Promise.resolve([]);
+      if (cmd === 'request_channel_backfill') return Promise.resolve(undefined);
+      return Promise.resolve(undefined);
+    });
+    let chip!: Element;
+    await waitFor(() => {
+      chip = container.querySelector('.reaction-chip')!;
+      expect(chip).toBeTruthy();
+    });
+    await fireEvent.click(chip);
+    await waitFor(() => expect(container.querySelector('.reaction-error')).not.toBeNull());
+    // The dismiss button clears the banner without requiring a new action.
+    await fireEvent.click(container.querySelector('.reaction-error-dismiss')!);
+    await waitFor(() => expect(container.querySelector('.reaction-error')).toBeNull());
+  });
+
   it('a live channel-reaction-received event updates the chip count', async () => {
     const { adapter, container } = await seedMessageWithReactions([
       { emoji: '👍', count: 1, mine: false, reactors: ['ee'.repeat(20)] },
