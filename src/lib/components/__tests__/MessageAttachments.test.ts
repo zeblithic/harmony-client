@@ -25,7 +25,17 @@ function props(over: Record<string, unknown> = {}) {
 }
 
 // PNG magic bytes so the header-dim guard recognises the format.
-const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// A real minimal PNG header (8-byte signature + a 16x16 IHDR) so the preview
+// path's content-validation (`parseImageHeaderDims`, which requires a genuine
+// PNG/JPEG header) accepts it. The decoder itself (`createImageBitmap`) is
+// mocked, so no actual pixel data is needed.
+const PNG_BYTES = new Uint8Array([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
+  0x00, 0x00, 0x00, 0x0d, // IHDR chunk length = 13
+  0x49, 0x48, 0x44, 0x52, // "IHDR"
+  0x00, 0x00, 0x00, 0x10, // width = 16
+  0x00, 0x00, 0x00, 0x10, // height = 16
+]);
 
 describe('MessageAttachments', () => {
   beforeEach(() => { saveMock.mockReset(); });
@@ -147,6 +157,27 @@ describe('MessageAttachments — inline preview (ZEB-540)', () => {
       expect(el!.getAttribute('src')).toBe('blob:mock');
       expect(el!.getAttribute('alt')).toBe('a.png');
     });
+  });
+
+  it('refuses to preview an extension-spoofed non-PNG/JPEG image (decode-bomb safety)', async () => {
+    // A WebP (RIFF) payload mislabeled image/jpeg: detect_mime classifies by the
+    // sender-controlled extension, but createImageBitmap decodes by CONTENT, so
+    // the preview path must content-validate. parseImageHeaderDims rejects a
+    // non-PNG/JPEG header → preview is refused and the malicious bytes never
+    // reach the decoder. (CodeAnt, PR #329.)
+    const webp = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]);
+    const previewArtifact = vi.fn().mockResolvedValue(webp);
+    const spoofed = att({ cid: 'sp', mime: 'image/jpeg', name: 'evil.jpg', size: webp.length });
+    const { container } = render(MessageAttachments, {
+      props: props({ attachments: [spoofed], channelMessageService: previewService(previewArtifact) }),
+    });
+    await fireEvent.click(container.querySelector('.att-preview-btn')!);
+    await waitFor(() =>
+      expect(container.querySelector('.att-error')?.textContent).toContain('Not a previewable image'),
+    );
+    // The unguarded decoder was never invoked on the spoofed bytes.
+    expect(createImageBitmapMock).not.toHaveBeenCalled();
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
   });
 
   it('previews text: click renders the decoded head in a <pre>', async () => {
