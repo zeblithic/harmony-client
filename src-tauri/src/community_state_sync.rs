@@ -3291,16 +3291,19 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     });
 
     // ZEB-558: deferred open-bootstrap admission. The publisher was unknown at
-    // the gate; validate the open self-Join they carry in this blob (cert +
-    // signer key + open-Join rule, via `bootstrap_admit_open_publisher`),
-    // derive their enrolled keys, and verify the root publisher_sig against
-    // them. The authoritative merge below re-validates and inserts the Join.
+    // the gate; validate the open self-Join (and any DeviceAnnounce/Leave) they
+    // carry in this blob, bounded to strictly-before the root HLC (`payload.at`)
+    // so admission uses the same pre-root membership window as the known-
+    // publisher path. This derives their enrolled keys and confirms they are
+    // Joined-at-root; we then verify the root publisher_sig against those keys.
+    // The authoritative merge below re-validates and inserts the events.
     if deferred_open_bootstrap {
         match crate::community_membership::bootstrap_admit_open_publisher(
             &resolved,
             payload.publisher_addr,
             ctx.admin_addr,
             ctx.community_id,
+            &payload.at,
         ) {
             Some(bootstrap_member_state) => {
                 if let Err(e) = verify_publisher_sig(&payload, &bootstrap_member_state) {
@@ -3352,12 +3355,16 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         //     step 2 was a pre-filter; THIS is the authoritative
         //     security check w.r.t. local state mutations.
         //     CodeRabbit PR #88 round 3 finding.
-        //     ZEB-558: skipped for the deferred open-bootstrap case — the
-        //     publisher is being admitted by THIS merge (their self-Join is
-        //     in `resolved`), and an entirely-unknown publisher cannot have a
-        //     concurrent local Leave/Kick, so there is no prior local
-        //     membership for a race to invalidate.
-        if !deferred_open_bootstrap {
+        //     ZEB-558 (CodeRabbit #336): the deferred open-bootstrap case runs
+        //     this re-check too. The publisher is normally unknown here (prior
+        //     state None) and admitted by THIS merge, but a concurrent local
+        //     insert could have landed their Join AND a Leave/Kick between
+        //     step 2's snapshot and now — skipping the re-check would let a
+        //     now-Left/Banned publisher pass root authorization and advance the
+        //     replay tracker. So we keep the check and only widen the accepted
+        //     prior-state for the deferred path to include `None` (the expected
+        //     unknown-publisher case) alongside `Joined`.
+        {
             let events_now: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
             let mat_now = crate::community_membership::prior_state_at_hlc(
                 &events_now,
@@ -3366,7 +3373,16 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             );
             let pub_state = mat_now.members.get(&payload.publisher_addr).cloned();
             let pub_status = pub_state.as_ref().map(|s| s.status);
-            if !matches!(pub_status, Some(MemberStatus::Joined)) {
+            // Known-publisher path: must be Joined. Deferred open-bootstrap path:
+            // `None` is the normal unknown-publisher case (their self-Join is in
+            // `resolved`, admitted by this merge), so accept None OR Joined — but
+            // still reject Left/Banned/etc. surfaced by a concurrent insert.
+            let authorized = if deferred_open_bootstrap {
+                matches!(pub_status, None | Some(MemberStatus::Joined))
+            } else {
+                matches!(pub_status, Some(MemberStatus::Joined))
+            };
+            if !authorized {
                 // Drop the lock before returning so error reporting
                 // and the caller's persist machinery aren't serialized
                 // behind an unrelated state lock release.

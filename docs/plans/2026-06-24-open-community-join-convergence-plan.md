@@ -171,7 +171,7 @@ mod bootstrap_admit_open_publisher_tests {
 
 ```bash
 cd src-tauri
-cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(bootstrap_admit_open_publisher_tests)' 2>&1 | tail -20
+cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(bootstrap_admit_open_publisher_tests)' 2>&1 | tail -20; echo "test=${pipestatus[1]}"
 ```
 
 Expected: **compile error** — `bootstrap_admit_open_publisher` not found in `harmony_app::community_membership`.
@@ -234,12 +234,26 @@ pub fn bootstrap_admit_open_publisher(
 
 If `materialize_with_now` is at a slightly different line than 2725, find it with `grep -n "pub fn materialize_with_now" src/community_membership.rs`; the signature is `materialize_with_now(events: &[SignedMembershipEvent], admin_addr: OwnerAddr, now_ms: Option<u64>) -> MaterializedMembership`.
 
+> **Implementation note (post-review hardening).** The sketch above shows the
+> Join-only core. The shipped helper was extended during review and is the
+> source of truth (`community_membership.rs::bootstrap_admit_open_publisher`):
+> it also takes the root HLC (`publisher_at: &Hlc`) and folds the publisher's
+> `DeviceAnnounce` **and** `Leave` events that fall strictly before that HLC, in
+> `event_sort_key` order, each verified against the membership accumulated so
+> far. This (a) seeds the full enrolled-key set so a root signed by a second
+> device added via `DeviceAnnounce` is accepted (`verify_publisher_sig` accepts
+> any enrolled key — Qodo #336), and (b) authorizes against the same pre-root
+> membership window as the known-publisher path so a publisher who left before
+> the root, or a device announced after it, is not admitted (CodeRabbit #336).
+> Step 1's tests cover the multi-device admit, the post-root-device exclusion,
+> and the left-before-root rejection.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
 cd src-tauri
 cargo fmt --all
-cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(bootstrap_admit_open_publisher_tests)' 2>&1 | tail -20
+cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(bootstrap_admit_open_publisher_tests)' 2>&1 | tail -20; echo "test=${pipestatus[1]}"
 ```
 
 Expected: 4 tests PASS.
@@ -485,7 +499,7 @@ async fn open_community_two_node_wire_convergence_no_preseed() {
 
 ```bash
 cd src-tauri
-cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(open_community_two_node_wire_convergence_no_preseed)' 2>&1 | tail -25
+cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(open_community_two_node_wire_convergence_no_preseed)' 2>&1 | tail -25; echo "test=${pipestatus[1]}"
 ```
 
 Expected: **FAIL** — `wait_until` times out, panic `A must learn B's Join over the wire (no pre-seed)` (and/or the B assertion). This confirms the deadlock is real and the test has teeth.
@@ -626,7 +640,7 @@ In the Phase B block, wrap the existing TOCTOU re-check (the inner `{ let events
 
 ```bash
 cd src-tauri
-cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(open_community_two_node_wire_convergence_no_preseed)' 2>&1 | tail -20
+cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(open_community_two_node_wire_convergence_no_preseed)' 2>&1 | tail -20; echo "test=${pipestatus[1]}"
 ```
 
 Expected: PASS.
@@ -636,7 +650,7 @@ Expected: PASS.
 ```bash
 cd src-tauri
 cargo nextest run --locked -p harmony-app --features test-fixtures \
-  -E 'test(open_community_create_redeem_leave_round_trip) + test(redeem_invite_twice_does_not_corrupt_state) + test(alice_redeems_invite_only_against_bob_admin)' 2>&1 | tail -20
+  -E 'test(open_community_create_redeem_leave_round_trip) + test(redeem_invite_twice_does_not_corrupt_state) + test(alice_redeems_invite_only_against_bob_admin)' 2>&1 | tail -20; echo "test=${pipestatus[1]}"
 ```
 
 Expected: all PASS (the pre-seeded open round-trip still works; invite-only is unchanged because `deferred_open_bootstrap` is only ever `true` for `!is_invite_only`).
@@ -693,8 +707,8 @@ Expected: `fmt=0`, `clippy=0`, `test=0`. This relinks the integration binaries (
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client
-npx tsc --noEmit 2>&1 | tail -5; echo "tsc=$?"
-npx vitest run 2>&1 | tail -8
+npx tsc --noEmit 2>&1 | tail -5; echo "tsc=${pipestatus[1]}"
+npx vitest run 2>&1 | tail -8; echo "vitest=${pipestatus[1]}"
 ```
 
 Expected: tsc clean; vitest all pass (unchanged — this fix is backend-only).

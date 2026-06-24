@@ -245,16 +245,17 @@ async fn open_community_create_redeem_leave_round_trip() {
     assert_eq!(change_a.r#type, MembershipChangeType::Joined);
     assert_eq!(change_a.target, hex::encode(owner_a.0));
 
-    // ZEB-256 Task 6: B inserts A's bootstrap Join locally so the
-    // receive-side membership-at-HLC gate admits A's first publish.
-    // Without this seed B would reject `publisher_not_joined`
-    // because B's empty-state pre-Join can't bootstrap a Joined
-    // publisher entry. Production handles this via the redemption
-    // flow — `mint_redemption` reconstructs admin's Join from the
-    // invite payload's cryptographic proof and inserts both events
-    // locally before B publishes. Going through `insert_local_event`
-    // (rather than direct CRDT mutation) preserves the delta-tx
-    // emission the test asserts on below.
+    // ZEB-256 Task 6: B inserts A's bootstrap Join locally before B publishes.
+    // ZEB-558 note: for OPEN communities this pre-seed is no longer required for
+    // correctness — the deferred open-bootstrap admission path now lets B admit
+    // A's first publish from the self-Join carried in the blob (proven by
+    // `open_community_two_node_wire_convergence_no_preseed`, which omits these
+    // seeds). It is retained HERE so the delta-tx emission this test asserts on
+    // below fires symmetrically (and the seed remains correctness-required for
+    // invite-only communities). Production reconstructs admin's Join via
+    // `mint_redemption` from the invite payload's cryptographic proof. Going
+    // through `insert_local_event` (rather than direct CRDT mutation) preserves
+    // the delta-tx emission.
     let _delta_b_a_join = engine_b
         .insert_local_event(minted_a.bootstrap_join.clone())
         .await
@@ -794,6 +795,17 @@ mod bootstrap_admit_open_publisher_tests {
         (t.owner, minted.community_id, minted.bootstrap_join)
     }
 
+    // A root publish HLC well after every Join minted above (admin@100_000,
+    // joiner@200_000) — so those Joins fall strictly before the root and the
+    // bootstrap window admits them.
+    fn root_hlc() -> Hlc {
+        Hlc {
+            wall_ms: 1_000_000,
+            logical: 0,
+            device_id: "root-publish".into(),
+        }
+    }
+
     #[test]
     fn admits_publisher_with_valid_open_self_join() {
         let (admin, community_id, admin_join) = mint_open_admin_join(0xC1);
@@ -804,6 +816,7 @@ mod bootstrap_admit_open_publisher_tests {
             admin,
             admin,
             community_id,
+            &root_hlc(),
         );
         let ms = got.expect("valid open self-Join must admit");
         assert!(matches!(ms.status, MemberStatus::Joined));
@@ -857,6 +870,7 @@ mod bootstrap_admit_open_publisher_tests {
             joiner.owner,
             admin,
             community_id,
+            &root_hlc(),
         );
         let ms = got.expect("joiner self-Join must admit");
         assert!(matches!(ms.status, MemberStatus::Joined));
@@ -874,6 +888,7 @@ mod bootstrap_admit_open_publisher_tests {
             stranger,
             admin,
             community_id,
+            &root_hlc(),
         );
         assert!(got.is_none(), "no self-Join for the publisher ⇒ reject");
     }
@@ -889,6 +904,7 @@ mod bootstrap_admit_open_publisher_tests {
             admin,
             admin,
             other_community,
+            &root_hlc(),
         );
         assert!(
             got.is_none(),
@@ -1105,13 +1121,17 @@ async fn open_community_two_node_wire_convergence_no_preseed() {
 
     // Convergence over the WIRE: each engine must learn the other's Join with
     // no pre-seed. Pre-fix this times out (mutual publisher_not_joined reject).
+    // `>= 2` (not `== 2`): a debounced re-publish could merge and push the count
+    // past 2 before both polls observe the transient `== 2`, permanently
+    // bypassing an exact-equality condition. The roster-equality assertion below
+    // does the real semantic check.
     let a_has_both = wait_until(
-        || async { state_a.lock().await.events.len() == 2 },
+        || async { state_a.lock().await.events.len() >= 2 },
         Duration::from_secs(10),
     )
     .await;
     let b_has_both = wait_until(
-        || async { state_b.lock().await.events.len() == 2 },
+        || async { state_b.lock().await.events.len() >= 2 },
         Duration::from_secs(10),
     )
     .await;

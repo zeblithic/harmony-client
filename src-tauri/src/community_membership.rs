@@ -3554,55 +3554,79 @@ pub fn bootstrap_admit_open_publisher(
     publisher_addr: OwnerAddr,
     admin_addr: OwnerAddr,
     expected_community_id: SpaceId,
+    publisher_at: &Hlc,
 ) -> Option<MemberState> {
     let ctx = VerifyContext {
         expected_community_id,
         admin_addr,
         is_invite_only: false,
     };
-    // 1. The publisher's signature-valid open self-Join(s), validated against an
-    //    empty prior: an unknown publisher has no local membership, so the
-    //    banned-status guard in `verify_event` sees no prior entry (not banned),
-    //    and an open Join needs no power/countersig. This validates signature +
-    //    EnrollmentCert exactly as the merge path will.
-    let empty = MaterializedMembership::default();
-    let mut verified: Vec<SignedMembershipEvent> = incoming_events
+    // Authorize the deferred open-bootstrap publisher against their OWN
+    // membership as of strictly-before the root HLC — the same window the
+    // known-publisher path uses via `prior_state_at_hlc(payload.at)`. We can't
+    // call that helper directly (the publisher is unknown, so their events live
+    // only in this blob, not in local `state.events`), so we reconstruct the
+    // equivalent prefix from the blob, then materialize it:
+    //
+    //   * Only the publisher's own membership-changing events
+    //     (Join / DeviceAnnounce / Leave) bear on whether they are a Joined
+    //     member authorized to sign this root.
+    //   * Bounded by `publisher_at`: a device announced AFTER the root HLC must
+    //     not seed an authorizing key, and a Join landing after the root must
+    //     not resurrect membership for this publish.
+    //   * `Leave` is folded too, so a Join→Leave-before-root publisher
+    //     materializes to `Left` and is correctly NOT admitted (closes the
+    //     "already-departed" / "rejoined-then-left" gaps).
+    //
+    // Each event is verified against the membership accumulated so far — the
+    // same per-event prior the authoritative merge applies — so signatures,
+    // certs (DeviceAnnounce / Join carry their own; Leave's signer resolves from
+    // prior enrolled keys), and the Banned guard are enforced exactly as on the
+    // merge path. The first valid Join verifies against an empty prior (open
+    // Join needs no power/countersig). `verify_publisher_sig` accepts ANY
+    // enrolled key, so seeding the full device set (incl. a second device added
+    // via DeviceAnnounce — ZEB-339 / #284) is load-bearing for device-#2-signed
+    // publishes.
+    let before_root = |e: &SignedMembershipEvent| {
+        (e.at.wall_ms, e.at.logical, &e.at.device_id)
+            < (
+                publisher_at.wall_ms,
+                publisher_at.logical,
+                &publisher_at.device_id,
+            )
+    };
+    let mut candidates: Vec<&SignedMembershipEvent> = incoming_events
         .iter()
-        .filter(|e| e.actor == publisher_addr && matches!(e.kind, MembershipEventKind::Join))
-        .filter(|e| verify_event(e, &empty, &ctx).is_ok())
-        .cloned()
+        .filter(|e| e.actor == publisher_addr && before_root(e))
+        .filter(|e| {
+            matches!(
+                e.kind,
+                MembershipEventKind::Join
+                    | MembershipEventKind::DeviceAnnounce
+                    | MembershipEventKind::Leave
+            )
+        })
         .collect();
+    // Pre-sort once; pushing accepted events in this order keeps `verified`
+    // sorted without re-sorting on each iteration.
+    candidates.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
+
+    let mut verified: Vec<SignedMembershipEvent> = Vec::new();
+    for event in candidates {
+        // Per-event prior, with the event's own wall_ms as the "now floor" —
+        // mirrors `prior_state_at_event`'s authorization-time semantics.
+        let prior = materialize_with_now(&verified, admin_addr, Some(event.at.wall_ms));
+        if verify_event(event, &prior, &ctx).is_ok() {
+            verified.push(event.clone());
+        }
+    }
     if verified.is_empty() {
         return None;
     }
-    verified.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
 
-    // 2. Fold in the publisher's DeviceAnnounce events so the seeded enrolled-key
-    //    set matches what the authoritative merge materializes. A root publish may
-    //    be signed by a SECOND device added via DeviceAnnounce (ZEB-339 / #284),
-    //    and `verify_publisher_sig` accepts ANY enrolled key — so without these the
-    //    deferred path would wrongly reject a valid device-#2-signed publish.
-    //    Verify each incrementally against the state including the Join + already-
-    //    accepted announces (the same per-event prior_state the merge uses; the
-    //    announcer must be Joined, which `verify_event` enforces).
-    let mut announces: Vec<&SignedMembershipEvent> = incoming_events
-        .iter()
-        .filter(|e| {
-            e.actor == publisher_addr && matches!(e.kind, MembershipEventKind::DeviceAnnounce)
-        })
-        .collect();
-    announces.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
-    for ann in announces {
-        let prior = materialize_with_now(&verified, admin_addr, None);
-        if verify_event(ann, &prior, &ctx).is_ok() {
-            verified.push(ann.clone());
-            verified.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
-        }
-    }
-
-    // 3. Materialize Join(s) + accepted DeviceAnnounce(s) → the canonical
-    //    MemberState (Joined + full enrolled-key set) the merge will produce.
-    let mat = materialize_with_now(&verified, admin_addr, None);
+    // Materialize the verified pre-root prefix → the canonical MemberState the
+    // merge will produce; admit only if the publisher is Joined at that point.
+    let mat = materialize_with_now(&verified, admin_addr, Some(publisher_at.wall_ms));
     mat.members
         .get(&publisher_addr)
         .filter(|s| matches!(s.status, MemberStatus::Joined))
@@ -11640,8 +11664,20 @@ mod zeb_339_signer_verify_tests {
         let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 200);
 
         let events = vec![join, announce];
-        let ms = bootstrap_admit_open_publisher(&events, owner.owner, admin.owner, community_id)
-            .expect("Join + DeviceAnnounce must admit");
+        // Root publish lands after both device events (Join@100, announce@200).
+        let root_at = Hlc {
+            wall_ms: 300,
+            logical: 0,
+            device_id: "root".into(),
+        };
+        let ms = bootstrap_admit_open_publisher(
+            &events,
+            owner.owner,
+            admin.owner,
+            community_id,
+            &root_at,
+        )
+        .expect("Join + DeviceAnnounce must admit");
         assert!(matches!(ms.status, MemberStatus::Joined));
         assert!(
             ms.enrolled_device_keys
@@ -11654,6 +11690,126 @@ mod zeb_339_signer_verify_tests {
             "device #2 key (from DeviceAnnounce) must be seeded"
         );
         assert_eq!(ms.enrolled_device_keys.len(), 2);
+    }
+
+    /// ZEB-558 (CodeRabbit #336): admission authorizes against pre-root
+    /// membership only, so a DeviceAnnounce whose HLC is AFTER the root publish
+    /// HLC must NOT seed an authorizing key. The publisher is still admitted on
+    /// the pre-root Join, but the post-root device's key is out of window.
+    #[test]
+    fn bootstrap_admit_open_publisher_excludes_post_root_device() {
+        let admin = mint_test_owner(0x81);
+        let owner = mint_test_owner(0x82);
+        let community_id = SpaceId([0x88; 16]);
+
+        let join_payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let join = sign_event(&join_payload, &owner.device_key).unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..join
+        };
+
+        // device #2 announced at wall 400 — AFTER the root publish at wall 300.
+        let (device2_sk, cert2) = mint_second_device(0x82, 0x83);
+        let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 400);
+
+        let events = vec![join, announce];
+        let root_at = Hlc {
+            wall_ms: 300,
+            logical: 0,
+            device_id: "root".into(),
+        };
+        let ms = bootstrap_admit_open_publisher(
+            &events,
+            owner.owner,
+            admin.owner,
+            community_id,
+            &root_at,
+        )
+        .expect("pre-root Join admits the publisher");
+        assert!(matches!(ms.status, MemberStatus::Joined));
+        assert!(
+            ms.enrolled_device_keys
+                .contains(&owner.cert.device_pubkeys.classical.ed25519_verify),
+            "device #1 key (pre-root Join) must be seeded"
+        );
+        assert!(
+            !ms.enrolled_device_keys
+                .contains(&cert2.device_pubkeys.classical.ed25519_verify),
+            "device #2 announced AFTER the root HLC must NOT be seeded"
+        );
+        assert_eq!(ms.enrolled_device_keys.len(), 1);
+    }
+
+    /// ZEB-558 (CodeRabbit #336): a publisher who joined then LEFT before the
+    /// root publish HLC must NOT be admitted — folding the self-Leave
+    /// materializes them to `Left`, so the helper returns None.
+    #[test]
+    fn bootstrap_admit_open_publisher_rejects_publisher_who_left_before_root() {
+        let admin = mint_test_owner(0x91);
+        let owner = mint_test_owner(0x92);
+        let community_id = SpaceId([0x99; 16]);
+
+        let join_payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let join = sign_event(&join_payload, &owner.device_key).unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..join
+        };
+
+        // Self-Leave at wall 150 (still before the root at wall 300). Leave's
+        // signer resolves from prior enrolled keys (the Join), so it carries no
+        // enrollment cert.
+        let leave_payload = EventPayload {
+            id: [2u8; 16],
+            community_id,
+            kind: MembershipEventKind::Leave,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let leave = sign_event(&leave_payload, &owner.device_key).unwrap();
+
+        let events = vec![join, leave];
+        let root_at = Hlc {
+            wall_ms: 300,
+            logical: 0,
+            device_id: "root".into(),
+        };
+        let got = bootstrap_admit_open_publisher(
+            &events,
+            owner.owner,
+            admin.owner,
+            community_id,
+            &root_at,
+        );
+        assert!(
+            got.is_none(),
+            "a publisher who left before the root HLC must not be admitted"
+        );
     }
 
     /// Unit 4: verify_event rejects a DeviceAnnounce whose actor is NOT an
