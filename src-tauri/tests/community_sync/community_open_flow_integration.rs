@@ -763,3 +763,136 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
     engine_a.shutdown().await.expect("shutdown a");
     engine_b.shutdown().await.expect("shutdown b");
 }
+
+mod bootstrap_admit_open_publisher_tests {
+    use super::*;
+    use harmony_app::community_membership::{bootstrap_admit_open_publisher, MemberStatus};
+
+    // A freshly-minted open community: returns (admin_owner, community_id,
+    // admin's signature-valid open bootstrap Join event).
+    fn mint_open_admin_join(
+        seed: u8,
+    ) -> (
+        OwnerAddr,
+        harmony_app::owner_state_types::SpaceId,
+        harmony_app::community_membership::SignedMembershipEvent,
+    ) {
+        let t = harmony_app::community_membership::mint_test_owner(seed);
+        let minted = mint_community_creation(
+            "BootstrapTest",
+            false, // open
+            t.owner,
+            &t.device_key,
+            &t.cert,
+            Hlc {
+                wall_ms: 100_000,
+                logical: 0,
+                device_id: format!("dev-{seed}"),
+            },
+        )
+        .expect("mint create");
+        (t.owner, minted.community_id, minted.bootstrap_join)
+    }
+
+    #[test]
+    fn admits_publisher_with_valid_open_self_join() {
+        let (admin, community_id, admin_join) = mint_open_admin_join(0xC1);
+        // Publisher == admin (the creator-publish direction): the admin's own
+        // self-Join is in the blob; admit with their enrolled key seeded.
+        let got = bootstrap_admit_open_publisher(
+            std::slice::from_ref(&admin_join),
+            admin,
+            admin,
+            community_id,
+        );
+        let ms = got.expect("valid open self-Join must admit");
+        assert!(matches!(ms.status, MemberStatus::Joined));
+        assert!(
+            !ms.enrolled_device_keys.is_empty(),
+            "enrolled keys must be seeded from the cert"
+        );
+    }
+
+    #[test]
+    fn admits_joiner_self_join_from_redemption() {
+        // The joiner direction: a redemption-minted self-Join for a DIFFERENT
+        // owner against the same open community must admit.
+        let (admin, community_id, _admin_join) = mint_open_admin_join(0xC2);
+        let joiner = harmony_app::community_membership::mint_test_owner(0xD3);
+        let invite = harmony_app::community_invite::CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: vec![0u8; 32],
+                sealed_epoch_keys: Vec::new(),
+                state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(
+                ),
+            },
+            admin_addr: admin,
+            community_name: "BootstrapTest".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: None,
+            untargeted_decrypt_key: None,
+        };
+        let minted = mint_redemption(
+            &invite,
+            joiner.owner,
+            &joiner.device_key,
+            &joiner.cert,
+            Hlc {
+                wall_ms: 200_000,
+                logical: 0,
+                device_id: "joiner-dev".into(),
+            },
+        )
+        .expect("mint redeem");
+        let got = bootstrap_admit_open_publisher(
+            std::slice::from_ref(&minted.bootstrap_join),
+            joiner.owner,
+            admin,
+            community_id,
+        );
+        let ms = got.expect("joiner self-Join must admit");
+        assert!(matches!(ms.status, MemberStatus::Joined));
+        assert!(!ms.enrolled_device_keys.is_empty());
+    }
+
+    #[test]
+    fn rejects_when_no_self_join_for_publisher() {
+        // Blob carries the admin's Join but the publisher is a stranger with
+        // no Join present → None.
+        let (admin, community_id, admin_join) = mint_open_admin_join(0xC4);
+        let stranger = harmony_app::community_membership::mint_test_owner(0xE5).owner;
+        let got = bootstrap_admit_open_publisher(
+            std::slice::from_ref(&admin_join),
+            stranger,
+            admin,
+            community_id,
+        );
+        assert!(got.is_none(), "no self-Join for the publisher ⇒ reject");
+    }
+
+    #[test]
+    fn rejects_self_join_for_wrong_community() {
+        // A valid Join, but for a different community_id than the gate expects
+        // ⇒ verify_event's WrongCommunity guard fires ⇒ None.
+        let (admin, _community_id, admin_join) = mint_open_admin_join(0xC6);
+        let other_community = harmony_app::owner_state_types::SpaceId([0x99; 16]);
+        let got = bootstrap_admit_open_publisher(
+            std::slice::from_ref(&admin_join),
+            admin,
+            admin,
+            other_community,
+        );
+        assert!(
+            got.is_none(),
+            "Join for a different community must not admit"
+        );
+    }
+}

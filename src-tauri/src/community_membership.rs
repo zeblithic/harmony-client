@@ -3536,6 +3536,54 @@ pub fn verify_event(
     Ok(())
 }
 
+/// ZEB-558 — bootstrap-admission for an OPEN-community publisher we don't yet
+/// know locally. Given the membership events carried in an incoming publish
+/// blob, return the publisher's `MemberState` (with enrolled device keys)
+/// IFF the blob carries a signature-valid OPEN self-`Join` for them — the
+/// exact authorization `verify_event` applies on the merge path (cert +
+/// signer key + open-Join rule). Returns `None` when no such valid self-Join
+/// is present, so the caller rejects.
+///
+/// OPEN communities only: the caller (`handle_incoming_publish`) gates this
+/// on `!is_invite_only` AND an entirely-unknown publisher. The returned
+/// `MemberState` is used solely to verify the root `publisher_sig`; the
+/// authoritative merge re-validates and inserts the Join via `insert_event`,
+/// so this helper never widens what actually lands in the CRDT.
+pub fn bootstrap_admit_open_publisher(
+    incoming_events: &[SignedMembershipEvent],
+    publisher_addr: OwnerAddr,
+    admin_addr: OwnerAddr,
+    expected_community_id: SpaceId,
+) -> Option<MemberState> {
+    let ctx = VerifyContext {
+        expected_community_id,
+        admin_addr,
+        is_invite_only: false,
+    };
+    // Empty prior: an unknown publisher has no local membership, so the
+    // banned-status guard in `verify_event` sees no prior entry (not banned),
+    // and an open Join needs no power/countersig. This validates signature +
+    // EnrollmentCert exactly as the merge path will.
+    let prior = MaterializedMembership::default();
+    let verified: Vec<SignedMembershipEvent> = incoming_events
+        .iter()
+        .filter(|e| e.actor == publisher_addr && matches!(e.kind, MembershipEventKind::Join))
+        .filter(|e| verify_event(e, &prior, &ctx).is_ok())
+        .cloned()
+        .collect();
+    if verified.is_empty() {
+        return None;
+    }
+    // Materialize the verified self-Join(s) to derive the canonical
+    // MemberState (status + enrolled_device_keys from the cert) the merge
+    // will produce. `None` now-floor: we only need the resulting status/keys.
+    let mat = materialize_with_now(&verified, admin_addr, None);
+    mat.members
+        .get(&publisher_addr)
+        .filter(|s| matches!(s.status, MemberStatus::Joined))
+        .cloned()
+}
+
 /// ZEB-285: verify a single signed event against a frozen pre-fork
 /// snapshot's `identity_pubs` map. Used by the fork's UI when loading
 /// pre-fork history for display — fork members are not necessarily
