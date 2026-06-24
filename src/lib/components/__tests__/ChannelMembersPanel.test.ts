@@ -200,3 +200,56 @@ describe('ChannelMembersPanel — ZEB-553 owner-card open', () => {
     expect(container.querySelectorAll('.name-btn').length).toBe(0);
   });
 });
+
+describe('ChannelMembersPanel — ZEB-553 item 11 roster loading state', () => {
+  it('shows a loading affordance instead of a bare "0" when loading with an empty roster', () => {
+    const { container, getByText } = render(ChannelMembersPanel, {
+      props: baseProps({ members: [], loading: true }),
+    });
+    getByText(/Loading members/i);
+    // The true count is unknown mid-fetch, so the badge shows an ellipsis — a
+    // "0" would read as "this community has no members".
+    expect(container.querySelector('.count')?.textContent).toBe('…');
+    // The list itself isn't rendered while the loading status stands in for it.
+    expect(container.querySelector('.member-list')).toBeNull();
+  });
+
+  it('renders the roster (not the loading row) once members are present even while loading stays true', () => {
+    // Background refresh case: the roster is already on screen, so a refresh
+    // must not flash a loading state over it.
+    const { container, queryByText } = render(ChannelMembersPanel, {
+      props: baseProps({ members: [self, member({ address: PEER })], loading: true }),
+    });
+    expect(queryByText(/Loading members/i)).toBeNull();
+    expect(container.querySelectorAll('.member-row').length).toBe(2);
+  });
+
+  it('shows the empty list (not the loading row) when not loading and the roster is genuinely empty', () => {
+    const { container, queryByText } = render(ChannelMembersPanel, {
+      props: baseProps({ members: [], loading: false }),
+    });
+    expect(queryByText(/Loading members/i)).toBeNull();
+    expect(container.querySelector('.member-list')).not.toBeNull();
+    expect(container.querySelectorAll('.member-row').length).toBe(0);
+    expect(container.querySelector('.count')?.textContent).toBe('0');
+  });
+
+  it('marks the loading affordance as a status live-region and keeps it out of the list (a11y)', () => {
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({ members: [], loading: true }),
+    });
+    const status = container.querySelector('.member-loading');
+    expect(status?.getAttribute('role')).toBe('status');
+    // It must be a sibling of the (absent) list, never an <li>, so the list
+    // stays a pure list of member listitems for screen readers.
+    expect(status?.tagName).toBe('P');
+  });
+
+  it('defaults to no loading affordance when the loading prop is omitted', () => {
+    const { container, queryByText } = render(ChannelMembersPanel, {
+      props: baseProps({ members: [self] }),
+    });
+    expect(queryByText(/Loading members/i)).toBeNull();
+    expect(container.querySelector('.member-list')).not.toBeNull();
+  });
+});

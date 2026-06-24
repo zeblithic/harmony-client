@@ -79,6 +79,7 @@
   import { MemberCardService } from './lib/member-card-service';
   import { PresenceService } from './lib/presence-service';
   import { selfCommunityPower } from './lib/community-self-power';
+  import { shouldClearMembersLoading } from './lib/members-loading';
   import { getVoiceSession, type VoiceSession } from './lib/voice-session';
   import { getCallSession, type CallSession } from './lib/call-session';
   import { getGroupCallSession, type GroupCallSession } from './lib/group-call-session';
@@ -1008,6 +1009,14 @@
   let sharedInProfileByCommunity = $state<Map<string, boolean>>(new Map());
   let selectedCommunityId = $state<string | null>(null);
   let communityMembers = $state<CommunityMember[]>([]);
+  // ZEB-553 item 11: true while an *initial* roster load is in flight after a
+  // community switch (i.e. the roster is still empty). Owned entirely by
+  // refreshCommunityMembers — set when it starts against an empty roster,
+  // cleared in its finally — so it can never get stuck true and background
+  // refreshes (message throttle, reconnect) never flash a loading state.
+  // Forwarded into ChannelMembersPanel via CommunityView so a switch shows
+  // "Loading members…" instead of a bare, misleading "0".
+  let membersLoading = $state(false);
   // ZEB-404: timestamp throttle for the message-triggered roster refetch (see
   // the channelMessageService.onMessage wiring). Time-based — a failed or
   // too-early refresh self-heals on the next message rather than permanently
@@ -1085,6 +1094,11 @@
   }
 
   async function refreshCommunityMembers(id: string) {
+    // ZEB-553 item 11: only an initial load (empty roster) drives the loading
+    // affordance — a background refresh keeps the existing roster on screen and
+    // must not flash "Loading members…". changeSelectedCommunity clears the
+    // roster synchronously on a real switch, so this reads empty there.
+    if (communityMembers.length === 0) membersLoading = true;
     try {
       // ZEB-404: force-bypass the per-community member cache — an explicit
       // refresh must return ground truth (the cache is invalidated only by the
@@ -1104,6 +1118,14 @@
       // on a transient failure — the throttle/reconnect paths will retry.
       const msg = e instanceof Error ? e.message : String(e);
       console.warn('[harmony-client] listCommunityMembers failed:', msg);
+    } finally {
+      // ZEB-553 item 11 (Qodo PR #332): clear the loading flag when this fetch
+      // is still relevant — same community, or none selected (user left to
+      // Notes/DMs mid-fetch). A fetch superseded by a switch to a *different*
+      // community must not clear it; that community's own refresh owns its
+      // loading state. Without the null case the flag could stick true after a
+      // mid-fetch leave until the next community open reset it.
+      if (shouldClearMembersLoading(selectedCommunityId, id)) membersLoading = false;
     }
   }
 
@@ -2863,6 +2885,7 @@
         communityName={selectedCommunityNode.name}
         communityKind={communityService.getKind(selectedCommunityNode.id)}
         members={communityMembers}
+        membersLoading={membersLoading}
         ownAddress={selfOwnerId ?? ''}
         myPower={myCommunityPower}
         isDegraded={isCurrentCommunityDegraded}
