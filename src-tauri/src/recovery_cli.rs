@@ -949,6 +949,79 @@ pub fn preview_owner_mnemonic_owner_id(words: &[String]) -> Result<String, Strin
     Ok(hex::encode(artifact.master_pubkey_bundle().identity_hash()))
 }
 
+/// The owner-overwrite guard, shared between the read-only preflight and the
+/// authoritative under-the-lock restore. Reads the persisted `owner_id` from
+/// `owner_state.cbor` (no keychain) and decides whether `derived_owner_id` may
+/// be written: an empty install is fine; an existing owner requires `force`;
+/// a *different* owner-id is refused even with `force`; an unreadable marker
+/// blocks unless `force`. Never mutates anything.
+fn owner_mnemonic_overwrite_guard(
+    identity_dir: &Path,
+    derived_owner_id: &[u8; 16],
+    force: bool,
+) -> Result<(), String> {
+    match crate::owner_state::read_persisted_owner_id(identity_dir) {
+        Ok(None) => Ok(()),
+        Ok(Some(existing)) => {
+            if !force {
+                return Err(format!(
+                    "an owner identity ({}) already exists on this device; pass --force to overwrite it",
+                    hex::encode(existing)
+                ));
+            }
+            if existing != *derived_owner_id {
+                return Err(format!(
+                    "this mnemonic derives owner-id {} but this device already holds owner-id {} — \
+                     refusing to overwrite a different identity even with --force",
+                    hex::encode(derived_owner_id),
+                    hex::encode(existing),
+                ));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // `owner_state.cbor` exists but is unreadable/corrupt — can't compare
+            // owner-ids. Without --force, surface an actionable error rather than
+            // wedging recovery. With --force the operator has explicitly opted
+            // into a destructive overwrite, so proceed (the mismatch check is
+            // necessarily skipped). Mirrors the identity-seed restore.
+            if !force {
+                return Err(format!(
+                    "an owner_state.cbor marker exists on this device but could not be read \
+                     ({e}); pass --force to overwrite it with this mnemonic"
+                ));
+            }
+            tracing::warn!(
+                error = %e,
+                "restore owner-mnemonic --force: overwriting an unreadable owner_state.cbor \
+                 (owner-id mismatch check skipped)"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Read-only preflight for the GUI restore (ZEB-454): validate the 24 words and
+/// run the overwrite guard WITHOUT stopping the node or writing anything, so a
+/// doomed restore (bad words / refused identity) is rejected before the command
+/// stops the running node. The authoritative re-check happens under the write
+/// lock in [`restore_owner_mnemonic_from_words_with_keychain`] (TOCTOU-safe);
+/// this only avoids a needless node stop.
+pub fn preflight_owner_mnemonic_restore(
+    identity_dir: &Path,
+    words: &[String],
+    force: bool,
+) -> Result<(), String> {
+    if words.len() != 24 {
+        return Err(format!("expected 24 BIP39 words, got {}", words.len()));
+    }
+    let phrase = Zeroizing::new(words.join(" "));
+    let artifact = RecoveryArtifact::from_mnemonic(&phrase).map_err(|e| e.to_string())?;
+    let derived_owner_id = artifact.master_pubkey_bundle().identity_hash();
+    drop(artifact);
+    owner_mnemonic_overwrite_guard(identity_dir, &derived_owner_id, force)
+}
+
 /// Words-array variant of [`restore_owner_mnemonic_with_keychain`] — the GUI
 /// Tauri command restores from a pasted 24-word array without a temp file
 /// (ZEB-454). Holds the same guard/re-mint/persist core; returns the restored
@@ -981,49 +1054,11 @@ pub fn restore_owner_mnemonic_from_words_with_keychain(
         .lock()
         .unwrap_or_else(|p| p.into_inner());
 
-    // Overwrite guard (under the lock, BEFORE any disk write). The `.cbor`
-    // owner_id is read without touching the keychain. Mirrors the export-side
-    // invariant and `pairing/cert.rs::sign_enrollment_for_joiner`: never let two
-    // backends disagree about which identity owns this device.
-    match crate::owner_state::read_persisted_owner_id(identity_dir) {
-        Ok(None) => { /* empty install — nothing to overwrite */ }
-        Ok(Some(existing)) => {
-            if !force {
-                return Err(format!(
-                    "an owner identity ({}) already exists on this device; pass --force to overwrite it",
-                    hex::encode(existing)
-                ));
-            }
-            if existing != derived_owner_id {
-                return Err(format!(
-                    "this mnemonic derives owner-id {} but this device already holds owner-id {} — \
-                     refusing to overwrite a different identity even with --force",
-                    hex::encode(derived_owner_id),
-                    hex::encode(existing),
-                ));
-            }
-        }
-        Err(e) => {
-            // `owner_state.cbor` exists but is unreadable/corrupt — we can't
-            // compare owner-ids. Without --force, surface an actionable error
-            // rather than wedging recovery. With --force the operator has
-            // explicitly opted into a destructive overwrite, so proceed (the
-            // mismatch check is necessarily skipped — there's nothing readable
-            // to compare against). Mirrors the identity-seed restore, which
-            // does not let an unprobeable existing state block a forced restore.
-            if !force {
-                return Err(format!(
-                    "an owner_state.cbor marker exists on this device but could not be read \
-                     ({e}); pass --force to overwrite it with this mnemonic"
-                ));
-            }
-            tracing::warn!(
-                error = %e,
-                "restore owner-mnemonic --force: overwriting an unreadable owner_state.cbor \
-                 (owner-id mismatch check skipped)"
-            );
-        }
-    }
+    // Overwrite guard (under the lock, BEFORE any disk write) — shared with the
+    // read-only `preflight_owner_mnemonic_restore` so the GUI command can reject
+    // a doomed restore before stopping the node, while this authoritative check
+    // re-runs under the lock (TOCTOU-safe).
+    owner_mnemonic_overwrite_guard(identity_dir, &derived_owner_id, force)?;
 
     // Re-mint from the recovered seed: same owner_id, fresh device key.
     let now = std::time::SystemTime::now()
@@ -1698,6 +1733,41 @@ mod tests {
             still.state.owner_id, a_owner_id,
             "A untouched after refusal"
         );
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn preflight_owner_mnemonic_restore_validates_without_writing() {
+        std::env::set_var("HARMONY_PASSPHRASE", "owner-preflight");
+        let src = tempfile::tempdir().unwrap();
+        let (phrase, _owner_id) = plant_owner_and_export_words(src.path(), 1_700_000_200);
+        let words: Vec<String> = phrase.split_whitespace().map(String::from).collect();
+
+        // Empty install + valid words → Ok, and NOTHING is written.
+        let fresh = tempfile::tempdir().unwrap();
+        preflight_owner_mnemonic_restore(fresh.path(), &words, false)
+            .expect("preflight passes on an empty install");
+        assert!(
+            !fresh.path().join("owner_state.cbor").exists(),
+            "preflight must not write owner_state.cbor"
+        );
+
+        // Existing DIFFERENT owner, even with force → refused (no write).
+        let dir = tempfile::tempdir().unwrap();
+        let (_a_phrase, a_owner_id) = plant_owner_and_export_words(dir.path(), 1_700_000_201);
+        let other = tempfile::tempdir().unwrap();
+        let (b_phrase, b_owner_id) = plant_owner_and_export_words(other.path(), 1_700_000_202);
+        assert_ne!(a_owner_id, b_owner_id, "test setup: A and B must differ");
+        let b_words: Vec<String> = b_phrase.split_whitespace().map(String::from).collect();
+        let err = preflight_owner_mnemonic_restore(dir.path(), &b_words, true)
+            .expect_err("preflight refuses a different owner");
+        assert!(err.contains("different identity"), "got: {err}");
+
+        // Wrong word count → Err before any derivation.
+        let short: Vec<String> = (0..23).map(|_| "abandon".to_string()).collect();
+        assert!(preflight_owner_mnemonic_restore(fresh.path(), &short, false).is_err());
+
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
 

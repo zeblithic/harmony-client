@@ -118,7 +118,9 @@
       Enter your 24-word recovery phrase to re-adopt your owner identity on this
       device. Your phrase is checked locally and never sent anywhere.
     </p>
+    <label class="field-label" for="owner-restore-words-input">Recovery phrase (24 words)</label>
     <textarea
+      id="owner-restore-words-input"
       class="words"
       data-testid="owner-restore-words"
       bind:value={input}
@@ -127,6 +129,7 @@
       autocomplete="off"
       autocapitalize="off"
       spellcheck="false"
+      aria-label="Recovery phrase (24 words)"
     ></textarea>
     <p class="count" class:ok={wordCount === 24}>{wordCount} / 24 words</p>
     {#if validationError}
@@ -217,6 +220,12 @@
     font-family: monospace;
     font-size: 0.875rem;
     resize: vertical;
+  }
+  .field-label {
+    display: block;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    margin: 0 0 4px;
   }
   .count {
     color: var(--text-muted);
