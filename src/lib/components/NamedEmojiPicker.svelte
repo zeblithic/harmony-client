@@ -14,6 +14,9 @@
   let renaming = $state<string | null>(null);
   let renameValue = $state('');
   let renameError = $state<string | null>(null);
+  // Non-reactive in-flight guard: true while a setEmojiName IPC is awaiting so a
+  // trailing blur / repeated Enter can't double-fire (we close on success only).
+  let renameCommitting = false;
 
   const filtered = $derived(
     query.trim()
@@ -51,9 +54,9 @@
   }
 
   async function commitRename(e: EmojiNameDto): Promise<void> {
-    // Guard against a trailing blur after Enter already closed the editor —
-    // without it, Enter + the resulting blur would both fire setEmojiName.
-    if (renaming !== e.cid) return;
+    // Guard against a trailing blur after Enter, and a repeated Enter while the
+    // IPC is in flight — without it both would fire setEmojiName.
+    if (renaming !== e.cid || renameCommitting) return;
     const name = renameValue.trim();
     if (!name || name === e.name) {
       cancelRename();
@@ -66,11 +69,16 @@
       renameError = validationErr;
       return;
     }
-    cancelRename();
+    // Close only AFTER the backend confirms, so a transient failure keeps the
+    // typed name on screen to retry (CodeRabbit, PR #330).
+    renameCommitting = true;
     try {
       await channelMessageService.setEmojiName(e.cid, name, e.mime, e.size);
+      cancelRename();
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
+    } finally {
+      renameCommitting = false;
     }
   }
 

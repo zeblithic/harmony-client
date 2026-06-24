@@ -510,7 +510,7 @@
   // Task 10 — commit the typed name to the local emoji-name map. Reuses the
   // existing `reactionError` surfaced-error state on backend failure.
   async function commitNameThis(): Promise<void> {
-    if (!namingCid) return;
+    if (!namingCid || namingCommitting) return;
     const cid = namingCid;
     const name = namingValue.trim();
     if (!name) {
@@ -524,11 +524,18 @@
       namingError = validationErr;
       return;
     }
-    cancelNameThis();
+    // Close only AFTER the backend confirms, so a transient backend failure
+    // keeps the typed name on screen to retry rather than dropping it.
+    // `namingCommitting` guards a second Enter/✓ while the IPC is in flight
+    // (CodeRabbit, PR #330).
+    namingCommitting = true;
     try {
       await channelMessageService.setEmojiName(cid, name, namingMime, namingSize);
+      cancelNameThis();
     } catch (e) {
       reactionError = e instanceof Error ? e.message : String(e);
+    } finally {
+      namingCommitting = false;
     }
   }
 
@@ -554,6 +561,9 @@
   let namingCid = $state<string | null>(null);
   let namingValue = $state('');
   let namingError = $state<string | null>(null);
+  // Non-reactive in-flight guard: true while a setEmojiName IPC is awaiting so a
+  // repeated commit can't double-fire (we now close the input only on success).
+  let namingCommitting = false;
   let namingMime = '';
   let namingSize = 0;
   let uploadName = $state('');

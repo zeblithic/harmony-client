@@ -14,12 +14,16 @@
 
 const TRANSPORT_PATTERNS: Array<{ match: RegExp; friendly: string }> = [
   {
-    match: /timed out|timeout/i,
+    // "unavailable" lives here (not in not-found) on purpose: transport-disabled
+    // wording like "transport unavailable" / "unavailable this session" means
+    // "can't reach it right now", NOT "the file is gone" — mapping it to the
+    // removed/never-uploaded copy would mislead. (Qodo, PR #330.)
+    match: /timed out|timeout|unavailable/i,
     friendly:
       'This file isn’t available right now — whoever shared it may be offline. Try again later.',
   },
   {
-    match: /not found|no such|unavailable|notfound/i,
+    match: /not found|no such|notfound/i,
     friendly:
       'This file couldn’t be found — it may have been removed or never finished uploading.',
   },

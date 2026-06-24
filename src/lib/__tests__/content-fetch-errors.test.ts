@@ -15,6 +15,14 @@ describe('mapContentFetchError', () => {
     expect(mapContentFetchError('content not found for cid abc')).toMatch(/couldn.t be found|removed/i);
   });
 
+  it('maps transport-disabled "unavailable" wording to the offline copy, not the not-found copy', () => {
+    // Regression for the Qodo mis-mapping: "unavailable this session" is a
+    // transport-disabled state, not a missing file.
+    const out = mapContentFetchError('content transport unavailable this session');
+    expect(out.toLowerCase()).toContain('offline');
+    expect(out).not.toMatch(/removed|never finished/i);
+  });
+
   it('maps a leaked key-expression with no specific shape to a generic friendly message', () => {
     const out = mapContentFetchError("fetch 'harmony/content/3/deadbeef' failed: link closed");
     expect(out).not.toContain('harmony/content');
