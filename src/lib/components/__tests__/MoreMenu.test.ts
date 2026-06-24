@@ -114,6 +114,7 @@ describe('MoreMenu (ZEB-555)', () => {
     await open();
     await fireEvent.click(screen.getByTestId('more-about'));
     expect(p.onShowAbout).toHaveBeenCalled();
+    expect(screen.queryByTestId('more-menu')).toBeNull();
   });
 
   it('Documentation item → onOpenDocs + close', async () => {
@@ -122,6 +123,7 @@ describe('MoreMenu (ZEB-555)', () => {
     await open();
     await fireEvent.click(screen.getByTestId('more-docs'));
     expect(p.onOpenDocs).toHaveBeenCalled();
+    expect(screen.queryByTestId('more-menu')).toBeNull();
   });
 
   it('click outside closes the menu', async () => {
