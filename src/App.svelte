@@ -2857,6 +2857,7 @@
         activeNodeId={navActiveNodeId}
         onNodeClick={handleNodeClick}
         onSettingsClick={() => { showSettings = !showSettings; }}
+        settingsActive={showSettings}
         profileLookup={(addr) => navService.profileLookup(addr)}
         onModeChange={switchMode}
         {appMode}
@@ -3070,6 +3071,7 @@
     <SettingsPanel
       profile={myProfile}
       onProfileSave={handleProfileSave}
+      ownerIdHex={selfOwnerId ?? undefined}
       {notificationService}
       {trustService}
       peers={knownPeers}
@@ -3271,6 +3273,9 @@
     y={popoverY}
     onClose={closePopover}
     ownAddress={myAddress}
+    ownerIdHex={popoverProfile?.address === myProfile.address
+      ? (selfOwnerId ?? undefined)
+      : undefined}
     profileBroadcastService={profileBroadcastService}
     resolveCommunityName={(communityIdHex) => {
       // Look up the viewer's own NavNodes (subset of OwnerState.spaces);

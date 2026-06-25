@@ -7,9 +7,15 @@
   let {
     profile,
     onSave,
+    ownerIdHex,
   }: {
     profile: Profile;
     onSave: (profile: Profile) => void;
+    // ZEB-567: canonical owner_id hex. Seeds the self-avatar identicon so it
+    // matches the members-list / chat surfaces (which key off owner_id), rather
+    // than the random `profile.address` placeholder. Optional + `||` fallback so
+    // callers that don't have it yet keep the legacy behavior.
+    ownerIdHex?: string;
   } = $props();
 
   // Local edit state — initialized from props once. Not re-synced on prop
@@ -297,7 +303,7 @@
 
   <div class="avatar-preview">
     <Avatar
-      address={profile.address}
+      address={ownerIdHex || profile.address}
       displayName={displayName || 'Anonymous'}
       {avatarUrl}
       size={80}

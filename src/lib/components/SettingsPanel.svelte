@@ -31,6 +31,7 @@
   let {
     profile,
     onProfileSave,
+    ownerIdHex,
     notificationService,
     trustService,
     peers,
@@ -44,6 +45,8 @@
   }: {
     profile: Profile;
     onProfileSave: (profile: Profile) => void;
+    /** ZEB-567: canonical owner_id hex, threaded to ProfileEditor's self-avatar. */
+    ownerIdHex?: string;
     notificationService: NotificationService;
     trustService?: TrustService;
     peers: Peer[];
@@ -93,6 +96,12 @@
 </script>
 
 <div class="settings-panel">
+  <!-- ZEB-569: explicit close control (matches NotificationSettingsPanel /
+       CommunitySettingsPanel) so Settings isn't dismiss-only via the nav gear. -->
+  <div class="settings-header">
+    <h3>Settings</h3>
+    <button class="close-btn" aria-label="Close settings" onclick={() => onClose?.()}>&#x2715;</button>
+  </div>
   <div class="tabs" role="tablist" aria-label="Settings sections">
     {#each TABS as tab, i (tab.id)}
       <button
@@ -128,7 +137,7 @@
     aria-labelledby="settings-tab-profile"
     hidden={activeTab !== 'profile'}
   >
-    <ProfileEditor {profile} onSave={onProfileSave} />
+    <ProfileEditor {profile} {ownerIdHex} onSave={onProfileSave} />
   </div>
   <div
     class="tab-content"
@@ -177,6 +186,36 @@
 </div>
 
 <style>
+  /* ZEB-569: header + close button mirror NotificationSettingsPanel so the two
+     right-panel surfaces dismiss the same way. */
+  .settings-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .settings-header h3 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .close-btn {
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    font-size: 16px;
+    cursor: pointer;
+    padding: 4px;
+  }
+
+  .close-btn:hover {
+    color: var(--text-primary);
+  }
+
   /* Mirrors NotificationSettingsPanel's internal tab styling so the outer
      settings tabs read as the same control. */
   .tabs {
