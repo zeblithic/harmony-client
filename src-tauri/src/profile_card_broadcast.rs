@@ -335,11 +335,11 @@ pub const PROFILE_CARD_REFRESH_INTERVAL: std::time::Duration = std::time::Durati
 /// ZEB-568: short initial-burst schedule. A peer who has JUST subscribed (e.g.
 /// a member who just joined) races the steady 600s refresh — without an early
 /// re-publish their roster shows "Name unavailable" until the next 600s tick.
-/// On spawn we re-emit the cached card at these offsets BEFORE entering the
-/// steady `interval(refresh)` loop, so a late subscriber converges in seconds
-/// rather than minutes. Re-publishing identical bytes is idempotent at peers
-/// (equal-HLC -> no-op via newer-wins). Test builds override these to keep the
-/// burst-cadence test fast (see `BOOT_BURST_OFFSETS`).
+/// On spawn we re-emit the cached card at these offsets (absolute, measured
+/// from spawn) BEFORE entering the steady `interval(refresh)` loop, so a late
+/// subscriber converges in seconds rather than minutes. Re-publishing identical
+/// bytes is idempotent at peers (equal-HLC -> no-op via newer-wins). Test builds
+/// override these to keep the burst-cadence test fast (see `BOOT_BURST_OFFSETS`).
 #[cfg(not(test))]
 const BOOT_BURST_OFFSETS: &[std::time::Duration] = &[
     std::time::Duration::from_secs(3),
@@ -370,6 +370,27 @@ impl ProfileCardPublisher {
         sink: std::sync::Arc<dyn crate::profile_broadcast::ProfileBroadcastPublishSink>,
         refresh: std::time::Duration,
     ) -> std::sync::Arc<Self> {
+        Self::spawn_inner(sink, refresh, true)
+    }
+
+    /// Test-only: spawn WITHOUT the initial boot burst. Lets a unit test that
+    /// asserts exact publish counts (`republish_cached_reemits_and_is_noop_when_empty`)
+    /// be deterministic — the burst runs at 10/20/30ms in test builds and would
+    /// otherwise add background re-publishes mid-assertion. The burst path itself
+    /// is covered by `card_publisher_initial_burst_republishes_quickly`.
+    #[cfg(test)]
+    fn spawn_no_burst(
+        sink: std::sync::Arc<dyn crate::profile_broadcast::ProfileBroadcastPublishSink>,
+        refresh: std::time::Duration,
+    ) -> std::sync::Arc<Self> {
+        Self::spawn_inner(sink, refresh, false)
+    }
+
+    fn spawn_inner(
+        sink: std::sync::Arc<dyn crate::profile_broadcast::ProfileBroadcastPublishSink>,
+        refresh: std::time::Duration,
+        run_boot_burst: bool,
+    ) -> std::sync::Arc<Self> {
         let latest: std::sync::Arc<Mutex<Option<CardWire>>> = std::sync::Arc::new(Mutex::new(None));
         let task = {
             let latest_for_task = std::sync::Arc::clone(&latest);
@@ -381,12 +402,22 @@ impl ProfileCardPublisher {
                 // instead of waiting up to a full `refresh` (600s). Replaces the
                 // old "consume the immediate first tick then wait a full refresh"
                 // behavior. No-op while nothing is cached yet.
-                for offset in BOOT_BURST_OFFSETS {
-                    tokio::time::sleep(*offset).await;
-                    republish_snapshot(&latest_for_task, sink_for_task.as_ref()).await;
+                //
+                // BOOT_BURST_OFFSETS are absolute offsets FROM SPAWN, so sleep
+                // only the delta to the next offset (a plain `sleep(*offset)`
+                // each iteration would make them cumulative: 3/13/43s, not the
+                // documented 3/10/30s — see ZEB-568 review).
+                if run_boot_burst {
+                    let mut prev = std::time::Duration::ZERO;
+                    for offset in BOOT_BURST_OFFSETS {
+                        tokio::time::sleep(offset.saturating_sub(prev)).await;
+                        prev = *offset;
+                        republish_snapshot(&latest_for_task, sink_for_task.as_ref()).await;
+                    }
                 }
                 // Steady-state: re-publish every `refresh` for any peer that
-                // missed all of the above. Cadence UNCHANGED (600s).
+                // missed all of the above. Cadence (period) UNCHANGED (600s); it
+                // simply starts after the short burst completes.
                 let mut iv = tokio::time::interval(refresh);
                 iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 iv.tick().await; // consume immediate first tick (burst covered boot)
@@ -576,9 +607,15 @@ mod tests {
         let owner = crate::community_membership::mint_test_owner(0x73);
         let out = std::sync::Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
         let sink = std::sync::Arc::new(CapturingSink { out: out.clone() });
-        // Long refresh so the background burst/steady loop can't add publishes
-        // inside this test's window — every captured publish is explicit.
-        let pubr = ProfileCardPublisher::spawn(sink.clone(), std::time::Duration::from_secs(3600));
+        // spawn_no_burst + long refresh so neither the boot burst nor the steady
+        // loop can add publishes inside this test's window — every captured
+        // publish here is explicit, making the exact-count assertions
+        // deterministic. (The burst path is covered by
+        // `card_publisher_initial_burst_republishes_quickly`.)
+        let pubr = ProfileCardPublisher::spawn_no_burst(
+            sink.clone(),
+            std::time::Duration::from_secs(3600),
+        );
 
         // Nothing cached yet -> no-op, Ok, zero publishes.
         pubr.republish_cached().await.expect("noop ok");
