@@ -488,7 +488,6 @@ pub trait PkarrSnapshot: Send + Sync {
     /// Identity + community publish state, read atomically (a single
     /// handle-set read) so one snapshot can't report contradictory fields.
     fn publish_state(&self) -> PkarrPublishState;
-    fn identity_last_publish_ms(&self) -> Option<u64>;
     fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit>;
 }
 
@@ -644,15 +643,12 @@ impl NetworkHealthService {
                 // Surface the most-recent confirmed success — but only while we
                 // are actually publishing identity, so a community/friend PUT's
                 // timestamp is never attributed to an identity that isn't being
-                // published. Falls back to the impl's own value otherwise.
+                // published. A not-publishing node reports None (no stale
+                // timestamp); the value is relay-derived only.
                 let identity_last_publish_ms = if publish.identity_published {
-                    relays
-                        .iter()
-                        .filter_map(|r| r.last_success_ms)
-                        .max()
-                        .or_else(|| self.pkarr.identity_last_publish_ms())
+                    relays.iter().filter_map(|r| r.last_success_ms).max()
                 } else {
-                    self.pkarr.identity_last_publish_ms()
+                    None
                 };
                 PkarrHealthSummary {
                     identity_published: publish.identity_published,
@@ -1522,12 +1518,6 @@ impl PkarrSnapshot for ProdPkarrSnapshot {
             },
         }
     }
-    fn identity_last_publish_ms(&self) -> Option<u64> {
-        // The publisher records no last-publish wall-clock; this is derived in
-        // NetworkHealthService::snapshot from the confirmed relay
-        // last_success_ms (ZEB-511). `None` here is the not-publishing default.
-        None
-    }
     fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
         // TODO(zeb-329-followup): wire a ring buffer of recent
         // `PkarrFallback` invocations (see `pkarr_resolver_adapter`).
@@ -2084,9 +2074,6 @@ mod tests {
                 identity_published: true,
                 community_publish_count: 1,
             }
-        }
-        fn identity_last_publish_ms(&self) -> Option<u64> {
-            Some(1_700_000_000_000)
         }
         fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
             vec![]
@@ -2831,11 +2818,11 @@ mod tests {
 
     // ── ZEB-511: identity_last_publish_ms derived from relay success ──
 
-    /// Pkarr source with configurable publish flags (the real impl records no
-    /// last-publish wall-clock, so it returns None; the synthesis derives it).
+    /// Pkarr source with a configurable publish flag — the production impl
+    /// derives `identity_last_publish_ms` from relay health, not the pkarr
+    /// source, so this fake only needs to control `identity_published`.
     struct ConfigurablePkarr {
         identity_published: bool,
-        last_publish_ms: Option<u64>,
     }
     impl PkarrSnapshot for ConfigurablePkarr {
         fn publish_state(&self) -> PkarrPublishState {
@@ -2843,9 +2830,6 @@ mod tests {
                 identity_published: self.identity_published,
                 community_publish_count: 0,
             }
-        }
-        fn identity_last_publish_ms(&self) -> Option<u64> {
-            self.last_publish_ms
         }
         fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
             vec![]
@@ -2869,7 +2853,6 @@ mod tests {
             std::sync::Arc::new(FakeIroh { ready: true }),
             std::sync::Arc::new(ConfigurablePkarr {
                 identity_published: true,
-                last_publish_ms: None,
             }),
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),
@@ -2891,7 +2874,6 @@ mod tests {
             std::sync::Arc::new(FakeIroh { ready: true }),
             std::sync::Arc::new(ConfigurablePkarr {
                 identity_published: false,
-                last_publish_ms: None,
             }),
             std::sync::Arc::new(FakeResolver { records: vec![] }),
             empty_membership(),

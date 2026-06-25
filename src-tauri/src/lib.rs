@@ -48202,9 +48202,6 @@ impl crate::network_health::PkarrSnapshot for StubEmptyPkarrSnapshot {
             community_publish_count: 0,
         }
     }
-    fn identity_last_publish_ms(&self) -> Option<u64> {
-        None
-    }
     fn recent_fallback_events(&self) -> Vec<crate::network_health::PkarrFallbackHit> {
         Vec::new()
     }

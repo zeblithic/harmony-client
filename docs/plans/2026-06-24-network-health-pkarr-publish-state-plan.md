@@ -10,6 +10,13 @@
 
 **Decision record (settled with Jake, 2026-06-24):** Mechanism **B — upstream authoritative accessor** (reads the publisher's real state map → drift-free), chosen over a client-side observer mirror. This is a *diagnostics-correctness* ticket, so the snapshot must read the single source of truth and cannot itself drift into lying. Cost accepted: a cross-repo `harmony` PR + a `rev` pin bump here.
 
+## Review refinements (applied during PR bot review — supersede the per-task snippets below)
+
+The Task 3/4 snippets below capture the *initial* approach. Two correctness refinements landed during review and are what actually shipped:
+
+1. **Single atomic read.** Rather than `ProdPkarrSnapshot` exposing separate `identity_published()` + `community_publish_count()` (two `try_active_handles()` calls that could observe different handle sets under contention), the trait exposes one `publish_state() -> PkarrPublishState { identity_published, community_publish_count }` derived from a *single* handle-set read. The synthesis calls it once.
+2. **Purely relay-derived timestamp.** `identity_last_publish_ms` is derived **only** from `max(relays[].last_success_ms)`, gated on `identity_published` (not-publishing → `None`). There is no fallback to a pkarr-source method; the vestigial `PkarrSnapshot::identity_last_publish_ms()` was removed entirely.
+
 ## Global Constraints
 
 - **Two repos.** `harmony` (upstream, crate `harmony-pkarr`) at `/Users/zeblith/work/zeblithic/harmony`; `harmony-client` (this repo) at `/Users/zeblith/work/zeblithic/harmony-client`. The harmony-client branch `network-health-pkarr-publish-state` already exists off main `b3497d4d`.
