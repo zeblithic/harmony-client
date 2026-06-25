@@ -350,7 +350,9 @@ export class CommunityService {
     return this.invoke<string>('generate_invite', {
       communityId,
       inviteeHint: null,
-      expiresAt: null,
+      // ZEB-564: TTL duration in ms (null → backend's 7-day default). The GUI
+      // doesn't expose an expiry yet; the backend derives `now + ttlMs`.
+      ttlMs: null,
     });
   }
 

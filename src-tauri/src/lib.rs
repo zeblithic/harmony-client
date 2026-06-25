@@ -22041,6 +22041,23 @@ pub fn build_open_invite_url(
         .map_err(|e| format!("encode invite URL: {e}"))
 }
 
+/// Default community-invite lifetime when the caller supplies no TTL: 7 days.
+/// Preserves the historical default that the prior
+/// `expires_at.or(Some(now + 7d))` applied.
+const INVITE_DEFAULT_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// ZEB-564 (mirrors ZEB-507's `friend_token::resolve_expiry_ms`): resolve a
+/// caller-supplied TTL *duration* in milliseconds into the absolute wall-clock-ms
+/// expiry the invite-token contract requires. `None` → `now_ms + 7d` (the
+/// historical default); `Some(ttl)` → `now_ms + ttl`. The argument is a duration,
+/// not an epoch, so a caller can't hand us a wrong-unit absolute value (the
+/// dead-on-arrival footgun). `saturating_add` keeps a pathological TTL from
+/// wrapping to an already-expired value. Returns a concrete `u64` because
+/// community invites always carry an expiry (unlike friend tokens).
+fn resolve_invite_expiry_ms(ttl_ms: Option<u64>, now_ms: u64) -> u64 {
+    now_ms.saturating_add(ttl_ms.unwrap_or(INVITE_DEFAULT_TTL_MS))
+}
+
 /// Generate a `harmony://invite/...` URL for an OPEN community. The
 /// returned URL carries the community id + symmetric `EpochKey` +
 /// admin addr + community name, so any holder can decrypt the
@@ -22065,17 +22082,22 @@ async fn generate_invite(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
     invitee_hint: Option<String>,
-    expires_at: Option<u64>,
+    ttl_ms: Option<u64>,
 ) -> Result<String, String> {
-    generate_invite_impl(state_lock.inner(), community_id, invitee_hint, expires_at).await
+    generate_invite_impl(state_lock.inner(), community_id, invitee_hint, ttl_ms).await
 }
 
 /// ZEB-445: shared IPC/RPC seam.
+///
+/// ZEB-564: `ttl_ms` is a TTL *duration* in milliseconds, not an absolute epoch.
+/// The expiry is derived server-side as `now_ms + ttl_ms` (see
+/// `resolve_invite_expiry_ms`), defaulting to a 7-day lifetime when `None`, so a
+/// caller can't hand us a wrong-unit epoch (the dead-on-arrival footgun).
 pub(crate) async fn generate_invite_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
     invitee_hint: Option<String>,
-    expires_at: Option<u64>,
+    ttl_ms: Option<u64>,
 ) -> Result<String, String> {
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
@@ -22318,14 +22340,15 @@ pub(crate) async fn generate_invite_impl(
             }
         };
 
-        // Mint + sign the InviteToken. Default 7-day expiry when the caller
-        // passes none; the expiry is bound into the token signature so the
-        // redeemer enforces it. `token_invitee_hint` is Some(invitee) for
-        // targeted invites, None for untargeted.
+        // Mint + sign the InviteToken. ZEB-564: the expiry is derived from the
+        // TTL duration (`now + ttl_ms`), defaulting to 7 days when the caller
+        // passes none; it is bound into the token signature so the redeemer
+        // enforces it. `token_invitee_hint` is Some(invitee) for targeted
+        // invites, None for untargeted.
         let minted_at =
             crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
                 .await;
-        let effective_expiry = expires_at.or(Some(wall_now_ms + 7 * 24 * 60 * 60 * 1000));
+        let effective_expiry = Some(resolve_invite_expiry_ms(ttl_ms, wall_now_ms));
         let token = crate::invite_mint::mint_invite_token(
             self_owner,
             token_invitee_hint,
@@ -50695,6 +50718,44 @@ mod generate_invite_helper_tests {
         // resolver finding the invitee's device keys.)
         let admin = OwnerAddr([0x11; 16]);
         invite_only_generation_guard(admin, admin).expect("admin must be allowed");
+    }
+
+    // ── ZEB-564: resolve_invite_expiry_ms — TTL duration → absolute wall-clock ms ──
+    // Mirrors the ZEB-507 friend-token fix, but invites keep a 7-day default
+    // (friend tokens default to no expiry).
+
+    #[test]
+    fn resolve_invite_expiry_ms_defaults_to_seven_days() {
+        // Omitted TTL → the historical 7-day default (preserved from the prior
+        // `expires_at.or(Some(now + 7d))`), so existing callers are unchanged.
+        let now = 1_700_000_000_000u64;
+        let seven_days = 7 * 24 * 60 * 60 * 1000u64;
+        assert_eq!(resolve_invite_expiry_ms(None, now), now + seven_days);
+    }
+
+    #[test]
+    fn resolve_invite_expiry_ms_adds_ttl_to_now() {
+        let now = 1_700_000_000_000u64;
+        let four_hours = 4 * 60 * 60 * 1000u64;
+        assert_eq!(
+            resolve_invite_expiry_ms(Some(four_hours), now),
+            now + four_hours
+        );
+    }
+
+    #[test]
+    fn resolve_invite_expiry_ms_saturates_on_overflow() {
+        // Overflow-safe: a pathological TTL clamps to u64::MAX rather than wrapping
+        // to a tiny already-expired value (which would reintroduce the footgun).
+        assert_eq!(resolve_invite_expiry_ms(Some(u64::MAX), 5), u64::MAX);
+    }
+
+    #[test]
+    fn resolve_invite_expiry_ms_zero_ttl_is_immediate() {
+        // A zero TTL yields expires_at == now → immediately expired. The caller's
+        // explicit choice, not the silent unit mistake ZEB-564/ZEB-507 fixed.
+        let now = 1_700_000_000_000u64;
+        assert_eq!(resolve_invite_expiry_ms(Some(0), now), now);
     }
 
     // ── ZEB-369: resolve_invitee_device_keys ─────────────────────────────
