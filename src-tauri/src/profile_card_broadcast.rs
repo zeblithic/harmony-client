@@ -332,6 +332,27 @@ pub async fn publish_card_once(
 /// same bytes is idempotent at peers (equal-HLC -> no-op via newer-wins).
 pub const PROFILE_CARD_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// ZEB-568: short initial-burst schedule. A peer who has JUST subscribed (e.g.
+/// a member who just joined) races the steady 600s refresh — without an early
+/// re-publish their roster shows "Name unavailable" until the next 600s tick.
+/// On spawn we re-emit the cached card at these offsets (absolute, measured
+/// from spawn) BEFORE entering the steady `interval(refresh)` loop, so a late
+/// subscriber converges in seconds rather than minutes. Re-publishing identical
+/// bytes is idempotent at peers (equal-HLC -> no-op via newer-wins). Test builds
+/// override these to keep the burst-cadence test fast (see `BOOT_BURST_OFFSETS`).
+#[cfg(not(test))]
+const BOOT_BURST_OFFSETS: &[std::time::Duration] = &[
+    std::time::Duration::from_secs(3),
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(30),
+];
+#[cfg(test)]
+const BOOT_BURST_OFFSETS: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(10),
+    std::time::Duration::from_millis(20),
+    std::time::Duration::from_millis(30),
+];
+
 /// A published card on the wire: its Zenoh topic and the signed canonical-CBOR
 /// bytes. Cached so the refresh task can re-emit the exact same payload.
 type CardWire = (String, Vec<u8>);
@@ -349,22 +370,60 @@ impl ProfileCardPublisher {
         sink: std::sync::Arc<dyn crate::profile_broadcast::ProfileBroadcastPublishSink>,
         refresh: std::time::Duration,
     ) -> std::sync::Arc<Self> {
+        Self::spawn_inner(sink, refresh, true)
+    }
+
+    /// Test-only: spawn WITHOUT the initial boot burst. Lets a unit test that
+    /// asserts exact publish counts (`republish_cached_reemits_and_is_noop_when_empty`)
+    /// be deterministic — the burst runs at 10/20/30ms in test builds and would
+    /// otherwise add background re-publishes mid-assertion. The burst path itself
+    /// is covered by `card_publisher_initial_burst_republishes_quickly`.
+    #[cfg(test)]
+    fn spawn_no_burst(
+        sink: std::sync::Arc<dyn crate::profile_broadcast::ProfileBroadcastPublishSink>,
+        refresh: std::time::Duration,
+    ) -> std::sync::Arc<Self> {
+        Self::spawn_inner(sink, refresh, false)
+    }
+
+    fn spawn_inner(
+        sink: std::sync::Arc<dyn crate::profile_broadcast::ProfileBroadcastPublishSink>,
+        refresh: std::time::Duration,
+        run_boot_burst: bool,
+    ) -> std::sync::Arc<Self> {
         let latest: std::sync::Arc<Mutex<Option<CardWire>>> = std::sync::Arc::new(Mutex::new(None));
         let task = {
             let latest_for_task = std::sync::Arc::clone(&latest);
             let sink_for_task = std::sync::Arc::clone(&sink);
             tokio::spawn(async move {
+                // ZEB-568: initial-burst schedule — re-publish the cached card a
+                // few times soon after spawn so a peer that subscribes right
+                // after we boot (or after a profile-save) converges in seconds
+                // instead of waiting up to a full `refresh` (600s). Replaces the
+                // old "consume the immediate first tick then wait a full refresh"
+                // behavior. No-op while nothing is cached yet.
+                //
+                // BOOT_BURST_OFFSETS are absolute offsets FROM SPAWN, so sleep
+                // only the delta to the next offset (a plain `sleep(*offset)`
+                // each iteration would make them cumulative: 3/13/43s, not the
+                // documented 3/10/30s — see ZEB-568 review).
+                if run_boot_burst {
+                    let mut prev = std::time::Duration::ZERO;
+                    for offset in BOOT_BURST_OFFSETS {
+                        tokio::time::sleep(offset.saturating_sub(prev)).await;
+                        prev = *offset;
+                        republish_snapshot(&latest_for_task, sink_for_task.as_ref()).await;
+                    }
+                }
+                // Steady-state: re-publish every `refresh` for any peer that
+                // missed all of the above. Cadence (period) UNCHANGED (600s); it
+                // simply starts after the short burst completes.
                 let mut iv = tokio::time::interval(refresh);
                 iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                iv.tick().await; // consume immediate first tick
+                iv.tick().await; // consume immediate first tick (burst covered boot)
                 loop {
                     iv.tick().await;
-                    let snapshot = latest_for_task.lock().await.clone();
-                    if let Some((topic, bytes)) = snapshot {
-                        if let Err(e) = sink_for_task.publish(topic, bytes).await {
-                            tracing::warn!(error = %e, "profile card refresh publish failed");
-                        }
-                    }
+                    republish_snapshot(&latest_for_task, sink_for_task.as_ref()).await;
                 }
             })
         };
@@ -381,10 +440,40 @@ impl ProfileCardPublisher {
         self.sink.publish(topic, bytes).await
     }
 
+    /// ZEB-568: re-emit the cached `(topic, bytes)` self-card without
+    /// re-signing. Used by the eager-republish receiver task when a new peer /
+    /// member is observed, so a freshly-subscribed member receives our card in
+    /// seconds rather than waiting up to a full 600s `refresh`. No-op (returns
+    /// `Ok(())`) when nothing is cached yet (no profile-save / boot publish has
+    /// happened). Re-publishing identical bytes is idempotent at peers
+    /// (equal-HLC -> no-op via newer-wins).
+    pub async fn republish_cached(&self) -> Result<(), String> {
+        let snapshot = self.latest.lock().await.clone();
+        match snapshot {
+            Some((topic, bytes)) => self.sink.publish(topic, bytes).await,
+            None => Ok(()),
+        }
+    }
+
     /// Abort the refresh task. Idempotent. (Mirrors ProfileBroadcastPublisher::shutdown.)
     pub async fn shutdown(&self) {
         if let Some(h) = self.task.lock().await.take() {
             h.abort();
+        }
+    }
+}
+
+/// Re-publish the currently-cached self-card via `sink`, logging (but not
+/// propagating) a publish failure. Shared by the background task's initial
+/// burst and steady-state refresh. No-op while nothing is cached yet.
+async fn republish_snapshot(
+    latest: &Mutex<Option<CardWire>>,
+    sink: &dyn crate::profile_broadcast::ProfileBroadcastPublishSink,
+) {
+    let snapshot = latest.lock().await.clone();
+    if let Some((topic, bytes)) = snapshot {
+        if let Err(e) = sink.publish(topic, bytes).await {
+            tracing::warn!(error = %e, "profile card refresh publish failed");
         }
     }
 }
@@ -464,6 +553,106 @@ mod tests {
         pubr.shutdown().await;
         let n = out.lock().await.len();
         assert!(n >= 2, "refresh re-published at least once (got {n})");
+    }
+
+    /// ZEB-568: the initial-burst schedule re-publishes the cached card several
+    /// times soon after spawn (BOOT_BURST_OFFSETS = 10/20/30ms in test builds),
+    /// so a late subscriber converges in well under a full `refresh`. With a
+    /// long refresh (1s) the steady loop can't fire inside the test window —
+    /// so the extra publishes MUST come from the burst.
+    #[tokio::test]
+    async fn card_publisher_initial_burst_republishes_quickly() {
+        let owner = crate::community_membership::mint_test_owner(0x72);
+        let out = std::sync::Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let sink = std::sync::Arc::new(CapturingSink { out: out.clone() });
+        // refresh is 1s: far longer than the whole burst (30ms) + our 80ms wait,
+        // so any count > 1 is attributable to the burst, not the steady loop.
+        let pubr = ProfileCardPublisher::spawn(sink.clone(), std::time::Duration::from_secs(1));
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Bz".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        let bytes = canonical_cbor_encode(&card).unwrap();
+        pubr.publish_now(card_topic_for(&owner.owner.0), bytes)
+            .await
+            .unwrap();
+        assert_eq!(out.lock().await.len(), 1, "publish_now emits immediately");
+        // Wait past all three burst offsets (10/20/30ms) with margin.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        pubr.shutdown().await;
+        let n = out.lock().await.len();
+        // 1 publish_now + 3 burst re-publishes; assert at least 3 total so the
+        // test is robust to scheduler jitter on the last offset.
+        assert!(
+            n >= 3,
+            "initial burst re-published the cached card multiple times soon after spawn (got {n})"
+        );
+    }
+
+    /// ZEB-568: republish_cached re-emits the last cached card after a
+    /// publish_now, and is a no-op (Ok, zero publishes) when nothing is cached.
+    #[tokio::test]
+    async fn republish_cached_reemits_and_is_noop_when_empty() {
+        let owner = crate::community_membership::mint_test_owner(0x73);
+        let out = std::sync::Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let sink = std::sync::Arc::new(CapturingSink { out: out.clone() });
+        // spawn_no_burst + long refresh so neither the boot burst nor the steady
+        // loop can add publishes inside this test's window — every captured
+        // publish here is explicit, making the exact-count assertions
+        // deterministic. (The burst path is covered by
+        // `card_publisher_initial_burst_republishes_quickly`.)
+        let pubr = ProfileCardPublisher::spawn_no_burst(
+            sink.clone(),
+            std::time::Duration::from_secs(3600),
+        );
+
+        // Nothing cached yet -> no-op, Ok, zero publishes.
+        pubr.republish_cached().await.expect("noop ok");
+        assert_eq!(
+            out.lock().await.len(),
+            0,
+            "republish_cached is a no-op before anything is cached"
+        );
+
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Re".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        let bytes = canonical_cbor_encode(&card).unwrap();
+        let topic = card_topic_for(&owner.owner.0);
+        pubr.publish_now(topic.clone(), bytes.clone())
+            .await
+            .unwrap();
+        assert_eq!(out.lock().await.len(), 1, "publish_now emits once");
+
+        // republish_cached re-emits the SAME (topic, bytes).
+        pubr.republish_cached().await.expect("republish ok");
+        let g = out.lock().await;
+        assert_eq!(g.len(), 2, "republish_cached re-emitted the cached card");
+        assert_eq!(g[1].0, topic, "re-emitted to the same topic");
+        assert_eq!(g[1].1, bytes, "re-emitted byte-identical card");
     }
 
     #[tokio::test]
