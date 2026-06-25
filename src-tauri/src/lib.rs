@@ -7501,22 +7501,26 @@ pub async fn start_node_inner(
                         let publisher_weak = std::sync::Arc::downgrade(publisher);
                         let mut republish_rx = profile_card_republish_rx;
                         tokio::spawn(async move {
-                            // Train offsets relative to the triggering signal.
-                            // Spaced to span the brief window during which a newly
-                            // joined peer finishes wiring its card subscriber.
+                            // Absolute offsets from the triggering signal (same
+                            // convention as BOOT_BURST_OFFSETS): publishes land at
+                            // 0 / 2 / 5s. Spaced to span the brief window during
+                            // which a newly joined peer finishes wiring its card
+                            // subscriber.
                             const TRAIN: &[std::time::Duration] = &[
                                 std::time::Duration::ZERO,
                                 std::time::Duration::from_secs(2),
-                                std::time::Duration::from_secs(3), // cumulative ~5s
+                                std::time::Duration::from_secs(5),
                             ];
                             while republish_rx.recv().await.is_some() {
                                 // Debounce: collapse any already-queued signals
                                 // into this single train before running it.
                                 while republish_rx.try_recv().is_ok() {}
-                                for (i, gap) in TRAIN.iter().enumerate() {
-                                    if i > 0 {
-                                        tokio::time::sleep(*gap).await;
-                                    }
+                                // Sleep only the delta to the next absolute offset
+                                // so the slice reads as wall-clock publish times.
+                                let mut prev = std::time::Duration::ZERO;
+                                for offset in TRAIN {
+                                    tokio::time::sleep(offset.saturating_sub(prev)).await;
+                                    prev = *offset;
                                     match publisher_weak.upgrade() {
                                         Some(p) => {
                                             if let Err(e) = p.republish_cached().await {
