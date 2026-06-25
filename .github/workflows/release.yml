@@ -112,10 +112,44 @@ jobs:
             exit 1
           fi
 
+      # The precheck's `cargo nextest --all-targets` links ~119 integration
+      # test binaries (~10-12 GB). The stock runner image leaves only ~20 GB
+      # free, so the link ran the disk to ENOSPC and `ld` died with SIGBUS
+      # (signal 7, Bus error) on the first 0.1.2 attempt. ci.yml's rust-test
+      # job — which builds the identical `--all-targets` set and passes on main
+      # — reclaims disk first (ZEB-440); the release gate must match it. Plain
+      # rm -rf (no third-party action) keeps the SHA-pin policy; rm on absent
+      # paths is a no-op so runner-image changes degrade gracefully.
+      - name: Reclaim runner disk (ZEB-440)
+        run: |
+          echo "=== disk before reclaim ==="
+          df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          echo "=== disk after reclaim ==="
+          df -h /
+
       - name: Install Rust toolchain (honors rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      # ZEB-498: mold is a drop-in ELF linker far lighter on memory/disk than
+      # the default bfd/gold when linking this workspace's ~119 integration
+      # test binaries. ci.yml's rust-test uses it; the release precheck runs the
+      # same `nextest --all-targets`, so it needs the same linker to survive.
+      # make-default:true symlinks /usr/bin/ld -> mold (no RUSTFLAGS needed),
+      # which keeps cargo's fingerprints intact.
+      - name: Install mold linker (ZEB-498)
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
+        with:
+          mold-version: '2.41.0'
+          make-default: true
 
       # Precheck runs on ubuntu-22.04, and `cargo clippy` / `cargo nextest`
       # both compile the full workspace — which transitively pulls
