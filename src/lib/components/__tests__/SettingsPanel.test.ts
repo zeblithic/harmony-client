@@ -107,6 +107,13 @@ describe('SettingsPanel tab routing', () => {
     expect(within(screen.getByRole('tabpanel')).getAllByTestId('panel-stub')).toHaveLength(2);
   });
 
+  it('renders a close control in the header that fires onClose (ZEB-569)', async () => {
+    const onClose = vi.fn();
+    render(SettingsPanel, { props: { ...baseProps, onClose } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Close settings' }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it('opens on a caller-supplied active tab (the backup-export → Account route)', () => {
     // The backup-staleness banner drives Settings to Account via this prop so
     // IdentityPanel mounts and catches the export event; opening there directly

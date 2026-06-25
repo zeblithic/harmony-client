@@ -36,6 +36,7 @@
     y,
     onClose,
     ownAddress,
+    ownerIdHex,
     profileBroadcastService,
     resolveCommunityName,
     onViewProfile,
@@ -45,6 +46,10 @@
     mode?: 'reticulum' | 'owner-card';
     /** Required in 'reticulum' mode. */
     profile?: Profile;
+    /** ZEB-567: reticulum mode only. Canonical owner_id hex for the SELF profile
+     *  — seeds the avatar identicon to match members/chat instead of the random
+     *  `profile.address`. Omitted (others) → falls back to `profile.address`. */
+    ownerIdHex?: string;
     /** Required in 'owner-card' mode. */
     card?: OwnerCard;
     x: number;
@@ -292,7 +297,7 @@
   {/if}
 {:else if profile}
   <div class="popover-header">
-    <Avatar address={profile.address} displayName={profile.displayName} avatarUrl={profile.avatarUrl} size={64} />
+    <Avatar address={ownerIdHex || profile.address} displayName={profile.displayName} avatarUrl={profile.avatarUrl} size={64} />
     <div class="popover-identity">
       <div class="popover-name">{profile.displayName}</div>
       {#if profile.statusText}

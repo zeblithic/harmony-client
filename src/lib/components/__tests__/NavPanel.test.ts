@@ -272,6 +272,29 @@ describe('NavPanel', () => {
     });
   });
 
+  describe('Settings gear active state (ZEB-569)', () => {
+    it('marks the gear active (aria-pressed + .active) when settingsActive is set', () => {
+      render(NavPanel, { props: { nodes: testNodes, collapsed: false, settingsActive: true } });
+      const gear = screen.getByRole('button', { name: 'Settings' });
+      expect(gear.getAttribute('aria-pressed')).toBe('true');
+      expect(gear.classList.contains('active')).toBe(true);
+    });
+
+    it('is inactive by default so click-again-to-close stays discoverable only while open', () => {
+      render(NavPanel, { props: { nodes: testNodes, collapsed: false } });
+      const gear = screen.getByRole('button', { name: 'Settings' });
+      expect(gear.getAttribute('aria-pressed')).toBe('false');
+      expect(gear.classList.contains('active')).toBe(false);
+    });
+
+    it('fires onSettingsClick when the gear is clicked', async () => {
+      const onSettingsClick = vi.fn();
+      render(NavPanel, { props: { nodes: testNodes, collapsed: false, onSettingsClick } });
+      await fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+      expect(onSettingsClick).toHaveBeenCalled();
+    });
+  });
+
   describe('FAB + fan-out menu (ZEB-263)', () => {
     const fabBaseProps = {
       nodes: testNodes,

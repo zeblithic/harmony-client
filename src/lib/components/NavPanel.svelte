@@ -34,6 +34,7 @@
     onPostVine,
     onSelectNotes,
     notesActive = false,
+    settingsActive = false,
     onSubmitFeedback,
     onShowAbout,
     onOpenDocs,
@@ -67,6 +68,9 @@
     onSelectNotes?: () => void;
     /** ZEB-334: whether the self-notes space is the active view. */
     notesActive?: boolean;
+    /** ZEB-569: whether the Settings panel is open — drives the gear's active
+     *  state so the click-again-to-close toggle is discoverable. */
+    settingsActive?: boolean;
     /** ZEB-555: "More" menu Help-section actions (rehomed from the (?) button). */
     onSubmitFeedback?: () => void;
     onShowAbout?: () => void;
@@ -267,7 +271,7 @@
           {/if}
         </div>
       {/if}
-      <button class="settings-btn" onclick={() => onSettingsClick?.()} aria-label="Notification settings">⚙</button>
+      <button class="settings-btn" class:active={settingsActive} aria-pressed={settingsActive} onclick={() => onSettingsClick?.()} aria-label="Settings">⚙</button>
     </div>
     <nav class="nav-tree-container">
       {#if appMode === 'files'}
@@ -411,6 +415,14 @@
 
   .settings-btn:hover {
     color: var(--text-primary);
+  }
+
+  /* ZEB-569: active (Settings open) — mirrors the .active convention used by
+     .notes-nav-row / .mode-toggle in this rail. */
+  .settings-btn.active {
+    background: var(--accent);
+    color: var(--text-primary);
+    border-radius: 4px;
   }
 
   .search-input {
