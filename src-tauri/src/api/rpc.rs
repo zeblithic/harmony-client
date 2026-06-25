@@ -257,7 +257,9 @@ struct SetMessageReactionArgs {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GenerateFriendTokenArgs {
-    expires_at: Option<u64>,
+    /// ZEB-507: TTL *duration* in milliseconds (not an absolute epoch). The
+    /// server computes `expiresAt = now_ms + ttlMs`. Omitted/`null` → no expiry.
+    ttl_ms: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -702,7 +704,7 @@ pub fn build_registry() -> RpcRegistry {
         m,
         "generate_friend_token",
         GenerateFriendTokenArgs,
-        |state, _sink, a| async move { crate::generate_friend_token_impl(state, a.expires_at).await }
+        |state, _sink, a| async move { crate::generate_friend_token_impl(state, a.ttl_ms).await }
     );
     rpc!(m, "redeem_friend_token", UrlArgs, |state, sink, a| {
         async move { crate::redeem_friend_token_impl(state, sink, a.url).await }

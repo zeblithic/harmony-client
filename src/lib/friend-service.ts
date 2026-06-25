@@ -197,13 +197,15 @@ export class FriendService {
   }
 
   /**
-   * Mint a `harmony://friend/...` URL to share. `expiresAt` is an optional
-   * absolute wall-clock ms deadline bound into the token signature; omitted →
-   * `null` (no app-level expiry beyond the backend default).
+   * Mint a `harmony://friend/...` URL to share. `ttlMs` is an optional TTL
+   * *duration* in milliseconds; the backend derives the absolute expiry as
+   * `now + ttlMs` and binds it into the token signature (ZEB-507 — callers no
+   * longer supply an absolute epoch, so a wrong-unit value can't mint a
+   * dead-on-arrival token). Omitted → `null` (no app-level expiry).
    */
-  async generateFriendToken(expiresAt?: number): Promise<string> {
+  async generateFriendToken(ttlMs?: number): Promise<string> {
     return this.invoke<string>('generate_friend_token', {
-      expiresAt: expiresAt ?? null,
+      ttlMs: ttlMs ?? null,
     });
   }
 
