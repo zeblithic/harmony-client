@@ -45181,15 +45181,20 @@ fn friend_token_publish_guard(
 #[tauri::command]
 async fn generate_friend_token(
     state: tauri::State<'_, Mutex<NodeState>>,
-    expires_at: Option<u64>,
+    ttl_ms: Option<u64>,
 ) -> Result<String, String> {
-    generate_friend_token_impl(state.inner(), expires_at).await
+    generate_friend_token_impl(state.inner(), ttl_ms).await
 }
 
 /// ZEB-445: shared IPC/RPC seam.
+///
+/// ZEB-507: `ttl_ms` is a TTL *duration* in milliseconds, not an absolute epoch.
+/// `expires_at` is derived server-side as `now_ms + ttl_ms` (see
+/// `friend_token::resolve_expiry_ms`) so a caller can't hand us a wrong-unit
+/// epoch. `None` → no app-level expiry.
 pub(crate) async fn generate_friend_token_impl(
     state: &std::sync::Mutex<NodeState>,
-    expires_at: Option<u64>,
+    ttl_ms: Option<u64>,
 ) -> Result<String, String> {
     // Snapshot handles under the std lock, then drop it before any `.await`.
     let (dm_outbox, hlc_tracker, pkarr_invite_publisher) = {
@@ -45229,6 +45234,11 @@ pub(crate) async fn generate_friend_token_impl(
         .as_millis() as u64;
     let minted_at =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    // ZEB-507: derive the absolute expiry from the TTL using the same `now`
+    // that stamps `minted_at`, so both timestamps are server-authoritative and
+    // the caller never supplies an epoch (eliminating the wrong-unit footgun).
+    let expires_at = crate::friend_token::resolve_expiry_ms(ttl_ms, wall_now_ms);
 
     let payload = crate::friend_token::mint_friend_token(
         self_owner,

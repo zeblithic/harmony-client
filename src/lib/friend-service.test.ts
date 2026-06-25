@@ -33,21 +33,33 @@ describe('FriendService', () => {
     expect(adapter.listeners.has('friend-list-changed')).toBe(true);
   });
 
-  it('generateFriendToken invokes generate_friend_token with expiresAt: null when omitted', async () => {
+  it('generateFriendToken invokes generate_friend_token with ttlMs: null when omitted', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue('harmony://friend/AAAA');
     const url = await service.generateFriendToken();
-    expect(adapter.invoke).toHaveBeenCalledWith('generate_friend_token', { expiresAt: null });
+    expect(adapter.invoke).toHaveBeenCalledWith('generate_friend_token', { ttlMs: null });
     expect(url).toBe('harmony://friend/AAAA');
   });
 
-  it('generateFriendToken forwards a provided expiresAt', async () => {
+  it('generateFriendToken forwards a provided ttlMs (a duration, not an epoch)', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue('harmony://friend/BBBB');
-    await service.generateFriendToken(1_700_000_000_000);
+    const fourHoursMs = 4 * 60 * 60 * 1000;
+    await service.generateFriendToken(fourHoursMs);
     expect(adapter.invoke).toHaveBeenCalledWith('generate_friend_token', {
-      expiresAt: 1_700_000_000_000,
+      ttlMs: fourHoursMs,
     });
+  });
+
+  it('generateFriendToken preserves a zero ttlMs (?? not ||)', async () => {
+    // 0 is a meaningful TTL: the backend resolves it to expires_at == now
+    // (immediate expiry). The service uses `ttlMs ?? null`, so 0 must forward as
+    // `ttlMs: 0`; switching to `|| null` would silently collapse it to "no
+    // expiry". Mirrors the Rust `resolve_expiry_ms_zero_ttl_is_immediate` guard.
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('harmony://friend/CCCC');
+    await service.generateFriendToken(0);
+    expect(adapter.invoke).toHaveBeenCalledWith('generate_friend_token', { ttlMs: 0 });
   });
 
   it('redeemFriendToken invokes redeem_friend_token with the url and returns the DTO', async () => {

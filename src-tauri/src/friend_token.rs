@@ -204,6 +204,25 @@ pub fn mint_friend_token(
     })
 }
 
+/// Resolve a caller-supplied **TTL duration in milliseconds** into the absolute
+/// wall-clock-ms `expires_at` the token contract requires (`InviteToken.expires_at`,
+/// serde `xa`: "wall-clock ms past which the receiver MUST reject this token").
+///
+/// ZEB-507: the API used to take `expires_at` as an *absolute epoch-ms* and stamp
+/// it verbatim, so a caller who passed a seconds value (~10 digits) minted a
+/// dead-on-arrival token — every verify site compares against now-in-ms (~13
+/// digits), making a seconds value ~1000× too small and thus always-expired. By
+/// deriving `expires_at = now_ms + ttl_ms` server-side (the same `now_ms` already
+/// used for `minted_at`), the caller never supplies an epoch, so the wrong-unit
+/// class is structurally impossible.
+///
+/// `None` → no app-level expiry (the `Some(_)` guard is skipped at both verify
+/// sites). `saturating_add` keeps a pathological TTL from wrapping to a tiny
+/// (already-expired) value, which would silently reintroduce the footgun.
+pub(crate) fn resolve_expiry_ms(ttl_ms: Option<u64>, now_ms: u64) -> Option<u64> {
+    ttl_ms.map(|ttl| now_ms.saturating_add(ttl))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +264,43 @@ mod tests {
     #[test]
     fn decode_rejects_wrong_prefix() {
         assert!(decode_friend_token_url("harmony://invite/AAAA").is_err());
+    }
+
+    // ── resolve_expiry_ms (ZEB-507): TTL-duration → absolute wall-clock ms ──────
+
+    #[test]
+    fn resolve_expiry_ms_none_is_no_expiry() {
+        // Omitted TTL → no app-level expiry (the `if let Some(_)` guard is skipped
+        // at both verify sites), exactly as the pre-ZEB-507 `expiresAt: null` path.
+        assert_eq!(resolve_expiry_ms(None, 1_700_000_000_000), None);
+    }
+
+    #[test]
+    fn resolve_expiry_ms_adds_ttl_to_now() {
+        // A 4-hour TTL resolves to now + 4h in ms — server-derived from the same
+        // `now` used for `minted_at`, so the caller never supplies an epoch.
+        let now = 1_700_000_000_000u64;
+        let four_hours = 4 * 60 * 60 * 1000u64;
+        assert_eq!(
+            resolve_expiry_ms(Some(four_hours), now),
+            Some(now + four_hours)
+        );
+    }
+
+    #[test]
+    fn resolve_expiry_ms_saturates_on_overflow() {
+        // Overflow-safe: a pathological TTL clamps to u64::MAX rather than wrapping
+        // to a tiny (already-expired) value — which would reintroduce the footgun.
+        assert_eq!(resolve_expiry_ms(Some(u64::MAX), 5), Some(u64::MAX));
+    }
+
+    #[test]
+    fn resolve_expiry_ms_zero_ttl_is_immediate() {
+        // A zero TTL yields expires_at == now → immediately expired at redeem.
+        // That is the caller's explicit (if odd) choice, NOT the silent unit
+        // mistake ZEB-507 fixed: you can no longer pass a seconds-valued *epoch*.
+        let now = 1_700_000_000_000u64;
+        assert_eq!(resolve_expiry_ms(Some(0), now), Some(now));
     }
 
     #[test]
