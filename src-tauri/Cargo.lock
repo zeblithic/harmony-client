@@ -3067,7 +3067,7 @@ dependencies = [
 [[package]]
 name = "harmony-pkarr"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=14918226b988034a656aaeffc4b56f36ca72fc9a#14918226b988034a656aaeffc4b56f36ca72fc9a"
+source = "git+https://github.com/zeblithic/harmony.git?rev=3ef558fe8e4e203b1646d987acfaca0d4be967c0#3ef558fe8e4e203b1646d987acfaca0d4be967c0"
 dependencies = [
  "axum",
  "base64 0.22.1",

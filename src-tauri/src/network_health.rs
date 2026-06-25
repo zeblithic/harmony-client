@@ -472,13 +472,22 @@ pub trait IrohSnapshot: Send + Sync {
     fn nat_classification(&self) -> NatClass;
 }
 
+/// Identity + community publish state, derived from a *single* read of the
+/// publisher's handle set so the two fields can never disagree within one
+/// snapshot due to lock-contention timing between separate reads (ZEB-511).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PkarrPublishState {
+    pub identity_published: bool,
+    pub community_publish_count: u32,
+}
+
 /// Pkarr-side data the snapshot needs. Trait-extracted for testability;
-/// production impl reads from `pkarr_publisher.active_handles()` + the
+/// production impl reads from `pkarr_publisher.try_active_handles()` + the
 /// fallback ring buffer.
 pub trait PkarrSnapshot: Send + Sync {
-    fn identity_published(&self) -> bool;
-    fn identity_last_publish_ms(&self) -> Option<u64>;
-    fn community_publish_count(&self) -> u32;
+    /// Identity + community publish state, read atomically (a single
+    /// handle-set read) so one snapshot can't report contradictory fields.
+    fn publish_state(&self) -> PkarrPublishState;
     fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit>;
 }
 
@@ -619,17 +628,35 @@ impl NetworkHealthService {
             platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
             my_network,
             peers,
-            pkarr_status: PkarrHealthSummary {
-                identity_published: self.pkarr.identity_published(),
-                identity_last_publish_ms: self.pkarr.identity_last_publish_ms(),
-                community_publish_count: self.pkarr.community_publish_count(),
-                recent_fallback_events: self.pkarr.recent_fallback_events(),
-                relays: self
+            pkarr_status: {
+                let relays: Vec<RelayHealthWire> = self
                     .relay
                     .relay_health()
                     .into_iter()
                     .map(Into::into)
-                    .collect(),
+                    .collect();
+                // Single atomic read so identity + community can't disagree
+                // within one snapshot (ZEB-511).
+                let publish = self.pkarr.publish_state();
+                // ZEB-511: the publisher records no last-publish wall-clock, but
+                // relay health does (last_success_ms, a *confirmed* PUT success).
+                // Surface the most-recent confirmed success — but only while we
+                // are actually publishing identity, so a community/friend PUT's
+                // timestamp is never attributed to an identity that isn't being
+                // published. A not-publishing node reports None (no stale
+                // timestamp); the value is relay-derived only.
+                let identity_last_publish_ms = if publish.identity_published {
+                    relays.iter().filter_map(|r| r.last_success_ms).max()
+                } else {
+                    None
+                };
+                PkarrHealthSummary {
+                    identity_published: publish.identity_published,
+                    identity_last_publish_ms,
+                    community_publish_count: publish.community_publish_count,
+                    recent_fallback_events: self.pkarr.recent_fallback_events(),
+                    relays,
+                }
             },
             // ZEB-373 Task 5: real dynamic-dial telemetry, read from the
             // shared DialTelemetry via the DialSnapshot source.
@@ -1440,25 +1467,25 @@ impl NotifyEmitter for ProdNotifyEmitter {
 
 /// Production `PkarrSnapshot` wrapping the shared `PkarrPublisher`.
 ///
-/// **Phase 1 stub:** the upstream `PkarrSnapshot` trait is synchronous
-/// (so it can fan through `NetworkHealthService::snapshot` without
-/// imposing an `async` recursion at every call site), but
-/// `PkarrPublisher::active_handles()` is `async` — it takes an
-/// internal `tokio::Mutex`. Per the plan's "If the type is awkward,
-/// ship a stub returning false/0/empty" allowance, this impl holds
-/// the publisher `Arc` (so the wiring is real / re-pluggable) and
-/// returns conservative defaults. A follow-up ticket either:
+/// The `PkarrSnapshot` trait is synchronous (so it can fan through
+/// `NetworkHealthService::snapshot` without imposing `async` recursion at
+/// every call site), so this impl reads publish state via the publisher's
+/// non-blocking [`try_active_handles`][harmony_pkarr::PkarrPublisher::try_active_handles]
+/// accessor (ZEB-511). The registered handle set is the single source of
+/// truth:
 ///
-///   * adds a synchronous `try_active_handles() -> Option<Vec<String>>`
-///     accessor to `PkarrPublisher` that returns `None` when the
-///     async mutex is contended, OR
-///   * lifts a periodically-refreshed `ArcSwap<Vec<String>>` snapshot
-///     onto the publisher's spawned loop.
+///   * `identity_published` — the fixed `"identity"` handle is registered
+///     (case B; see `pkarr_identity_publisher::HANDLE`).
+///   * `community_publish_count` — number of `"community:<hex>"` handles
+///     registered (case C; see `pkarr_community_publisher`).
 ///
-/// Either path lets this impl read synchronously without blocking the
-/// rate-limiter task or the IPC handler.
+/// `try_active_handles()` returns `None` only during the sub-millisecond
+/// window the background driver holds the state lock; that maps to the
+/// conservative default (the driver never holds the lock across a network
+/// PUT). `identity_last_publish_ms` is derived in the synthesis from the
+/// confirmed relay `last_success_ms` — the publisher records no
+/// last-publish wall-clock of its own.
 pub struct ProdPkarrSnapshot {
-    #[allow(dead_code)]
     publisher: std::sync::Arc<harmony_pkarr::PkarrPublisher>,
 }
 
@@ -1469,20 +1496,27 @@ impl ProdPkarrSnapshot {
 }
 
 impl PkarrSnapshot for ProdPkarrSnapshot {
-    fn identity_published(&self) -> bool {
-        // TODO(zeb-329-followup): surface real state once
-        // `PkarrPublisher` exposes a sync handle accessor (see struct
-        // doc). Defaulting to `false` keeps the UI honest — better to
-        // show "unknown publish state" than to falsely claim success.
-        false
-    }
-    fn identity_last_publish_ms(&self) -> Option<u64> {
-        // TODO(zeb-329-followup): see struct doc.
-        None
-    }
-    fn community_publish_count(&self) -> u32 {
-        // TODO(zeb-329-followup): see struct doc.
-        0
+    fn publish_state(&self) -> PkarrPublishState {
+        // Single non-blocking read of the publisher's registered handles
+        // (ZEB-511), so identity + community fields always reflect the same
+        // handle set. Case-B identity registers under the fixed "identity"
+        // handle (pkarr_identity_publisher::HANDLE); case-C communities under
+        // "community:<hex>" (pkarr_community_publisher). `None` (the sub-ms
+        // driver lock window) maps both fields to the conservative default
+        // together — never a contradictory pair.
+        match self.publisher.try_active_handles() {
+            Some(handles) => PkarrPublishState {
+                identity_published: handles.iter().any(|k| k == "identity"),
+                community_publish_count: handles
+                    .iter()
+                    .filter(|k| k.starts_with("community:"))
+                    .count() as u32,
+            },
+            None => PkarrPublishState {
+                identity_published: false,
+                community_publish_count: 0,
+            },
+        }
     }
     fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
         // TODO(zeb-329-followup): wire a ring buffer of recent
@@ -2035,14 +2069,11 @@ mod tests {
 
     struct FakePkarr;
     impl PkarrSnapshot for FakePkarr {
-        fn identity_published(&self) -> bool {
-            true
-        }
-        fn identity_last_publish_ms(&self) -> Option<u64> {
-            Some(1_700_000_000_000)
-        }
-        fn community_publish_count(&self) -> u32 {
-            1
+        fn publish_state(&self) -> PkarrPublishState {
+            PkarrPublishState {
+                identity_published: true,
+                community_publish_count: 1,
+            }
         }
         fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
             vec![]
@@ -2590,6 +2621,70 @@ mod tests {
         assert!(found, "published identity became resolvable -> Pass");
     }
 
+    /// Build a `ProdPkarrSnapshot` whose publisher has the given handles
+    /// registered. No driver is spawned — `register` inserts into the state
+    /// map, which `try_active_handles` reads synchronously (ZEB-511).
+    async fn prod_pkarr_with_handles(handles: &[&str]) -> ProdPkarrSnapshot {
+        use harmony_pkarr::{
+            current_epoch_id, derive_ephemeral_key, testing::MockPkarrRelay, EphemeralKeyBuilder,
+            PkarrCase, PkarrPublisher, PkarrRoutingRecord, RecordBuilder, RelayClient, RelayPool,
+        };
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let publisher = std::sync::Arc::new(PkarrPublisher::new(client));
+        let id_sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&id_sk.verifying_key().to_bytes());
+        for h in handles {
+            let id_pub_k = id_pub;
+            let kb: EphemeralKeyBuilder = std::sync::Arc::new(move |at_ms| {
+                derive_ephemeral_key(
+                    PkarrCase::Identity,
+                    &id_pub_k,
+                    &current_epoch_id(at_ms).to_be_bytes(),
+                )
+            });
+            let sk = id_sk.clone();
+            let b: RecordBuilder = std::sync::Arc::new(move |at_ms| {
+                PkarrRoutingRecord::sign_new(
+                    b"x".to_vec(),
+                    id_pub,
+                    at_ms,
+                    at_ms + crate::reachability_record::REACHABILITY_RECORD_TTL_MS,
+                    &sk,
+                )
+                .expect("sign")
+            });
+            publisher.register((*h).to_string(), kb, b).await;
+        }
+        ProdPkarrSnapshot::new(publisher)
+    }
+
+    #[tokio::test]
+    async fn prod_pkarr_identity_published_reflects_registered_handle() {
+        let snap = prod_pkarr_with_handles(&["identity"]).await;
+        let st = snap.publish_state();
+        assert!(st.identity_published);
+        assert_eq!(st.community_publish_count, 0);
+    }
+
+    #[tokio::test]
+    async fn prod_pkarr_community_count_counts_community_handles() {
+        let snap = prod_pkarr_with_handles(&["identity", "community:aa", "community:bb"]).await;
+        let st = snap.publish_state();
+        assert!(st.identity_published);
+        assert_eq!(st.community_publish_count, 2);
+    }
+
+    #[tokio::test]
+    async fn prod_pkarr_identity_unpublished_when_no_identity_handle() {
+        let snap = prod_pkarr_with_handles(&["community:aa"]).await;
+        let st = snap.publish_state();
+        assert!(!st.identity_published);
+        assert_eq!(st.community_publish_count, 1);
+    }
+
     #[tokio::test]
     async fn prod_endpoint_bound_false_when_no_endpoint() {
         let probes = ProdSelfTest {
@@ -2719,6 +2814,74 @@ mod tests {
             snap.pkarr_status.relays[0].last_outcome,
             Some(RelayOutcomeWire::Http { status: 503 })
         );
+    }
+
+    // ── ZEB-511: identity_last_publish_ms derived from relay success ──
+
+    /// Pkarr source with a configurable publish flag — the production impl
+    /// derives `identity_last_publish_ms` from relay health, not the pkarr
+    /// source, so this fake only needs to control `identity_published`.
+    struct ConfigurablePkarr {
+        identity_published: bool,
+    }
+    impl PkarrSnapshot for ConfigurablePkarr {
+        fn publish_state(&self) -> PkarrPublishState {
+            PkarrPublishState {
+                identity_published: self.identity_published,
+                community_publish_count: 0,
+            }
+        }
+        fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
+            vec![]
+        }
+    }
+
+    fn relay_with_success(success_ms: Option<u64>) -> harmony_pkarr::RelayHealth {
+        harmony_pkarr::RelayHealth {
+            url: format!("https://r{}.example", success_ms.unwrap_or(0)),
+            state: harmony_pkarr::RelayState::CoolingDown { until_ms: 0 },
+            last_outcome: None,
+            last_success_ms: success_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_identity_last_publish_ms_from_relay_success_when_publishing() {
+        // Publishing identity + the impl itself has no timestamp → the
+        // synthesis surfaces the most-recent confirmed relay success.
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(ConfigurablePkarr {
+                identity_published: true,
+            }),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(FakeRelaySnapshot(vec![
+                relay_with_success(Some(1000)),
+                relay_with_success(Some(3000)),
+                relay_with_success(None),
+            ])),
+        );
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.pkarr_status.identity_last_publish_ms, Some(3000));
+    }
+
+    #[tokio::test]
+    async fn snapshot_identity_last_publish_ms_null_when_not_publishing() {
+        // Not publishing identity → never attribute a relay success to it.
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(ConfigurablePkarr {
+                identity_published: false,
+            }),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(FakeRelaySnapshot(vec![relay_with_success(Some(3000))])),
+        );
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.pkarr_status.identity_last_publish_ms, None);
     }
 
     #[test]
