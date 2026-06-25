@@ -184,6 +184,11 @@
   }
   .name-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   .hint { color: var(--text-secondary); font-size: 0.75rem; margin: 4px 0 16px; }
+  /* Keep the HTML `hidden` attribute authoritative: a bare `display` rule
+     overrides the UA stylesheet's `[hidden] { display: none }`, so without
+     this the `hidden` row would still render. The attribute-selector
+     specificity (0,2,0) beats `.control-row` (0,1,0). v3 drops `hidden`. */
+  .control-row[hidden] { display: none; }
   .control-row { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
   .slider { flex: 1; }
   .number-input {

@@ -169,4 +169,23 @@ describe('CreateChannelDialog', () => {
       expect(props.onClose).toHaveBeenCalled();
     });
   });
+
+  it('keeps the v2 write-power control present but hidden (ZEB-517)', async () => {
+    const { getByLabelText } = await setupDialog();
+    // The slider + number-input pair must exist from day one (slider-pairing
+    // rule) so v3 can reveal it without re-adding markup...
+    const slider = getByLabelText('Write-power threshold slider');
+    const numberInput = getByLabelText('Write-power threshold');
+    expect(slider).toBeTruthy();
+    expect(numberInput).toBeTruthy();
+    // ...but in v2 the whole row stays hidden. ZEB-517: a bare
+    // `.control-row { display: flex }` rule defeats the UA `[hidden]`
+    // stylesheet, so `hidden` is made authoritative via
+    // `.control-row[hidden] { display: none }`. Guard that the row keeps the
+    // `hidden` attribute — removing it (the v3 trigger) would re-leak the
+    // control to v2 users.
+    const row = slider.closest('.control-row') as HTMLElement | null;
+    expect(row).not.toBeNull();
+    expect(row?.hasAttribute('hidden')).toBe(true);
+  });
 });
