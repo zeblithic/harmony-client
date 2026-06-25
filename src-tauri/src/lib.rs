@@ -5033,6 +5033,20 @@ pub async fn start_node_inner(
                     let (community_degraded_tx, community_degraded_rx) = tokio::sync::mpsc::channel::<
                         crate::community_state_sync::CommunityDegradedReport,
                     >(256);
+                    // ZEB-568: eager profile-card re-publish signal. The delta
+                    // consumer (below) fires a `()` on this channel whenever it
+                    // observes a remote community-state merge that ADDS a member
+                    // (a `Join`/`JoinCountersign` delta). A small receiver task
+                    // spawned alongside the ProfileCardPublisher (after its spawn
+                    // below) debounces these and drives a short train of
+                    // `republish_cached()` calls so the newly-joined peer gets
+                    // our card in seconds instead of waiting up to a full 600s
+                    // refresh. Bounded + `try_send`: a full channel is dropped
+                    // (the receiver debounces a burst into one train anyway), and
+                    // when the delta consumer's sender clone drops on teardown
+                    // the receiver's `recv()` returns `None` and the task exits.
+                    let (profile_card_republish_tx, profile_card_republish_rx) =
+                        tokio::sync::mpsc::channel::<()>(8);
 
                     let registry: std::sync::Arc<
                         crate::community_state_sync::CommunitySyncRegistry,
@@ -5522,6 +5536,19 @@ pub async fn start_node_inner(
                                 > = std::sync::Arc::new(std::sync::Mutex::new(
                                     std::collections::BTreeSet::new(),
                                 ));
+                                // ZEB-568: eager profile-card re-publish trigger.
+                                // This closure already fires on EVERY delta (see
+                                // doc above); piggyback the member-added detection
+                                // here — same pattern as the ZEB-321 / ZEB-458 /
+                                // ZEB-495 per-delta hooks — rather than growing
+                                // `run_community_delta_consumer`'s callback list.
+                                // We fire on a freshly-merged `Join` or
+                                // `JoinCountersign` (the two kinds that admit a new
+                                // member into the roster), nudging the receiver
+                                // task to re-announce OUR self-card so the new peer
+                                // resolves us in seconds instead of up to 600s.
+                                let profile_card_republish_tx_for_hook =
+                                    profile_card_republish_tx.clone();
                                 move |delta: crate::community_state_sync::CommunityMembershipDelta| {
                                     let registry = std::sync::Arc::clone(&community_registry_for_heal);
                                     let community_signing_key = std::sync::Arc::clone(&signing_key_for_heal);
@@ -5573,7 +5600,32 @@ pub async fn start_node_inner(
                                         std::sync::Arc::clone(&device_intro_registry);
                                     let device_intro_done =
                                         std::sync::Arc::clone(&device_intro_done);
+                                    // ZEB-568: per-invocation clone of the eager
+                                    // profile-card republish sender (async block
+                                    // moves it; mirrors the other per-invocation
+                                    // hook clones above).
+                                    let profile_card_republish_tx =
+                                        profile_card_republish_tx_for_hook.clone();
                                     async move {
+                                        // ZEB-568: a freshly-merged Join /
+                                        // JoinCountersign means a new member just
+                                        // appeared. Nudge the republish receiver
+                                        // task to re-announce our self-card so the
+                                        // newcomer resolves our name promptly. The
+                                        // delta consumer ONLY emits deltas for
+                                        // freshly-Inserted events, so this never
+                                        // fires on a duplicate/echoed merge.
+                                        // `try_send` is fire-and-forget: a full
+                                        // channel is harmless (the receiver
+                                        // debounces a burst into one train), and we
+                                        // never block the delta consumer on it.
+                                        if matches!(
+                                            event.kind,
+                                            crate::community_membership::MembershipEventKind::Join
+                                                | crate::community_membership::MembershipEventKind::JoinCountersign { .. }
+                                        ) {
+                                            let _ = profile_card_republish_tx.try_send(());
+                                        }
                                         // ZEB-321 Phase 1 Task 8: per spec §7.4,
                                         // freshly-inserted ReachabilityAnnounce
                                         // events feed the LWW resolver and emit
@@ -7421,6 +7473,67 @@ pub async fn start_node_inner(
                             }),
                             crate::profile_card_broadcast::PROFILE_CARD_REFRESH_INTERVAL,
                         ));
+
+                    // ── ZEB-568: eager profile-card re-publish receiver ──────
+                    //
+                    // The delta consumer fires `()` on `profile_card_republish_rx`
+                    // whenever it merges a Join / JoinCountersign (a new member
+                    // appeared). On each signal we run a SHORT TRAIN of
+                    // `republish_cached()` calls — immediate, +2s, +5s — to beat
+                    // the subscribe-vs-publish race: the newcomer's
+                    // `declare_subscriber` may not be wired the instant we observe
+                    // their Join, so a single immediate publish can be missed. A
+                    // few spaced re-emits make the window forgiving without a
+                    // faster blanket timer (PROFILE_CARD_REFRESH_INTERVAL stays
+                    // 600s). DEBOUNCE: any signals that arrive WHILE a train runs
+                    // are drained and collapsed into the next single train, so a
+                    // burst of member-adds from one big state sync can't cause a
+                    // publish storm.
+                    //
+                    // Shutdown: the task holds a `Weak` to the publisher, so once
+                    // the node tears the publisher down a train just no-ops
+                    // (upgrade fails). It also exits cleanly when the channel
+                    // closes — every `profile_card_republish_tx` clone lives in
+                    // the delta-consumer closure, which drops when the registry
+                    // shuts down and the consumer task ends, closing the channel
+                    // and ending this `recv()` loop.
+                    if let Some(ref publisher) = profile_card_publisher_arc {
+                        let publisher_weak = std::sync::Arc::downgrade(publisher);
+                        let mut republish_rx = profile_card_republish_rx;
+                        tokio::spawn(async move {
+                            // Train offsets relative to the triggering signal.
+                            // Spaced to span the brief window during which a newly
+                            // joined peer finishes wiring its card subscriber.
+                            const TRAIN: &[std::time::Duration] = &[
+                                std::time::Duration::ZERO,
+                                std::time::Duration::from_secs(2),
+                                std::time::Duration::from_secs(3), // cumulative ~5s
+                            ];
+                            while republish_rx.recv().await.is_some() {
+                                // Debounce: collapse any already-queued signals
+                                // into this single train before running it.
+                                while republish_rx.try_recv().is_ok() {}
+                                for (i, gap) in TRAIN.iter().enumerate() {
+                                    if i > 0 {
+                                        tokio::time::sleep(*gap).await;
+                                    }
+                                    match publisher_weak.upgrade() {
+                                        Some(p) => {
+                                            if let Err(e) = p.republish_cached().await {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "ZEB-568 eager profile-card republish failed"
+                                                );
+                                            }
+                                        }
+                                        // Publisher torn down (node stopping) →
+                                        // abandon the rest of the train.
+                                        None => return,
+                                    }
+                                }
+                            }
+                        });
+                    }
 
                     // ZEB-325 Phase 2c: install the iroh invite-handshake
                     // dispatcher onto the iroh link manager now that
