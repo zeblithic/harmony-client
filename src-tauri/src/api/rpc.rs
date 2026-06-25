@@ -163,7 +163,10 @@ struct CreateCommunityArgs {
 struct GenerateInviteArgs {
     community_id: String,
     invitee_hint: Option<String>,
-    expires_at: Option<u64>,
+    /// ZEB-564: TTL *duration* in milliseconds (not an absolute epoch). The
+    /// server computes `expiry = now_ms + ttlMs`, defaulting to 7 days when
+    /// omitted/`null`.
+    ttl_ms: Option<u64>,
 }
 
 /// Shared by `redeem_invite` and `redeem_friend_token` — both take one
@@ -432,7 +435,7 @@ pub fn build_registry() -> RpcRegistry {
         "generate_invite",
         GenerateInviteArgs,
         |state, _sink, a| async move {
-            crate::generate_invite_impl(state, a.community_id, a.invitee_hint, a.expires_at).await
+            crate::generate_invite_impl(state, a.community_id, a.invitee_hint, a.ttl_ms).await
         }
     );
     rpc!(m, "redeem_invite", UrlArgs, |state, sink, a| async move {
