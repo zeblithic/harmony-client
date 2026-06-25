@@ -51,6 +51,17 @@ describe('FriendService', () => {
     });
   });
 
+  it('generateFriendToken preserves a zero ttlMs (?? not ||)', async () => {
+    // 0 is a meaningful TTL: the backend resolves it to expires_at == now
+    // (immediate expiry). The service uses `ttlMs ?? null`, so 0 must forward as
+    // `ttlMs: 0`; switching to `|| null` would silently collapse it to "no
+    // expiry". Mirrors the Rust `resolve_expiry_ms_zero_ttl_is_immediate` guard.
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('harmony://friend/CCCC');
+    await service.generateFriendToken(0);
+    expect(adapter.invoke).toHaveBeenCalledWith('generate_friend_token', { ttlMs: 0 });
+  });
+
   it('redeemFriendToken invokes redeem_friend_token with the url and returns the DTO', async () => {
     await service.connectAdapter(adapter);
     const result = { ownerIdHex: 'aabbccdd00112233aabbccdd00112233', display: 'Alice' };
