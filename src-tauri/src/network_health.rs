@@ -472,13 +472,23 @@ pub trait IrohSnapshot: Send + Sync {
     fn nat_classification(&self) -> NatClass;
 }
 
+/// Identity + community publish state, derived from a *single* read of the
+/// publisher's handle set so the two fields can never disagree within one
+/// snapshot due to lock-contention timing between separate reads (ZEB-511).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PkarrPublishState {
+    pub identity_published: bool,
+    pub community_publish_count: u32,
+}
+
 /// Pkarr-side data the snapshot needs. Trait-extracted for testability;
-/// production impl reads from `pkarr_publisher.active_handles()` + the
+/// production impl reads from `pkarr_publisher.try_active_handles()` + the
 /// fallback ring buffer.
 pub trait PkarrSnapshot: Send + Sync {
-    fn identity_published(&self) -> bool;
+    /// Identity + community publish state, read atomically (a single
+    /// handle-set read) so one snapshot can't report contradictory fields.
+    fn publish_state(&self) -> PkarrPublishState;
     fn identity_last_publish_ms(&self) -> Option<u64>;
-    fn community_publish_count(&self) -> u32;
     fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit>;
 }
 
@@ -626,14 +636,16 @@ impl NetworkHealthService {
                     .into_iter()
                     .map(Into::into)
                     .collect();
-                let identity_published = self.pkarr.identity_published();
+                // Single atomic read so identity + community can't disagree
+                // within one snapshot (ZEB-511).
+                let publish = self.pkarr.publish_state();
                 // ZEB-511: the publisher records no last-publish wall-clock, but
                 // relay health does (last_success_ms, a *confirmed* PUT success).
                 // Surface the most-recent confirmed success — but only while we
                 // are actually publishing identity, so a community/friend PUT's
                 // timestamp is never attributed to an identity that isn't being
                 // published. Falls back to the impl's own value otherwise.
-                let identity_last_publish_ms = if identity_published {
+                let identity_last_publish_ms = if publish.identity_published {
                     relays
                         .iter()
                         .filter_map(|r| r.last_success_ms)
@@ -643,9 +655,9 @@ impl NetworkHealthService {
                     self.pkarr.identity_last_publish_ms()
                 };
                 PkarrHealthSummary {
-                    identity_published,
+                    identity_published: publish.identity_published,
                     identity_last_publish_ms,
-                    community_publish_count: self.pkarr.community_publish_count(),
+                    community_publish_count: publish.community_publish_count,
                     recent_fallback_events: self.pkarr.recent_fallback_events(),
                     relays,
                 }
@@ -1488,29 +1500,33 @@ impl ProdPkarrSnapshot {
 }
 
 impl PkarrSnapshot for ProdPkarrSnapshot {
-    fn identity_published(&self) -> bool {
-        // Real state via the non-blocking publisher accessor (ZEB-511). The
-        // case-B identity publication registers under the fixed "identity"
-        // handle (pkarr_identity_publisher::HANDLE). `None` only on the
-        // sub-ms driver lock window → treat as "not observed" (conservative).
-        self.publisher
-            .try_active_handles()
-            .map(|h| h.iter().any(|k| k == "identity"))
-            .unwrap_or(false)
+    fn publish_state(&self) -> PkarrPublishState {
+        // Single non-blocking read of the publisher's registered handles
+        // (ZEB-511), so identity + community fields always reflect the same
+        // handle set. Case-B identity registers under the fixed "identity"
+        // handle (pkarr_identity_publisher::HANDLE); case-C communities under
+        // "community:<hex>" (pkarr_community_publisher). `None` (the sub-ms
+        // driver lock window) maps both fields to the conservative default
+        // together — never a contradictory pair.
+        match self.publisher.try_active_handles() {
+            Some(handles) => PkarrPublishState {
+                identity_published: handles.iter().any(|k| k == "identity"),
+                community_publish_count: handles
+                    .iter()
+                    .filter(|k| k.starts_with("community:"))
+                    .count() as u32,
+            },
+            None => PkarrPublishState {
+                identity_published: false,
+                community_publish_count: 0,
+            },
+        }
     }
     fn identity_last_publish_ms(&self) -> Option<u64> {
         // The publisher records no last-publish wall-clock; this is derived in
         // NetworkHealthService::snapshot from the confirmed relay
         // last_success_ms (ZEB-511). `None` here is the not-publishing default.
         None
-    }
-    fn community_publish_count(&self) -> u32 {
-        // Case-C community publications register under "community:<hex>"
-        // handles (pkarr_community_publisher). Count them (ZEB-511).
-        self.publisher
-            .try_active_handles()
-            .map(|h| h.iter().filter(|k| k.starts_with("community:")).count() as u32)
-            .unwrap_or(0)
     }
     fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
         // TODO(zeb-329-followup): wire a ring buffer of recent
@@ -2063,14 +2079,14 @@ mod tests {
 
     struct FakePkarr;
     impl PkarrSnapshot for FakePkarr {
-        fn identity_published(&self) -> bool {
-            true
+        fn publish_state(&self) -> PkarrPublishState {
+            PkarrPublishState {
+                identity_published: true,
+                community_publish_count: 1,
+            }
         }
         fn identity_last_publish_ms(&self) -> Option<u64> {
             Some(1_700_000_000_000)
-        }
-        fn community_publish_count(&self) -> u32 {
-            1
         }
         fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
             vec![]
@@ -2661,22 +2677,25 @@ mod tests {
     #[tokio::test]
     async fn prod_pkarr_identity_published_reflects_registered_handle() {
         let snap = prod_pkarr_with_handles(&["identity"]).await;
-        assert!(snap.identity_published());
-        assert_eq!(snap.community_publish_count(), 0);
+        let st = snap.publish_state();
+        assert!(st.identity_published);
+        assert_eq!(st.community_publish_count, 0);
     }
 
     #[tokio::test]
     async fn prod_pkarr_community_count_counts_community_handles() {
         let snap = prod_pkarr_with_handles(&["identity", "community:aa", "community:bb"]).await;
-        assert!(snap.identity_published());
-        assert_eq!(snap.community_publish_count(), 2);
+        let st = snap.publish_state();
+        assert!(st.identity_published);
+        assert_eq!(st.community_publish_count, 2);
     }
 
     #[tokio::test]
     async fn prod_pkarr_identity_unpublished_when_no_identity_handle() {
         let snap = prod_pkarr_with_handles(&["community:aa"]).await;
-        assert!(!snap.identity_published());
-        assert_eq!(snap.community_publish_count(), 1);
+        let st = snap.publish_state();
+        assert!(!st.identity_published);
+        assert_eq!(st.community_publish_count, 1);
     }
 
     #[tokio::test]
@@ -2819,14 +2838,14 @@ mod tests {
         last_publish_ms: Option<u64>,
     }
     impl PkarrSnapshot for ConfigurablePkarr {
-        fn identity_published(&self) -> bool {
-            self.identity_published
+        fn publish_state(&self) -> PkarrPublishState {
+            PkarrPublishState {
+                identity_published: self.identity_published,
+                community_publish_count: 0,
+            }
         }
         fn identity_last_publish_ms(&self) -> Option<u64> {
             self.last_publish_ms
-        }
-        fn community_publish_count(&self) -> u32 {
-            0
         }
         fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
             vec![]

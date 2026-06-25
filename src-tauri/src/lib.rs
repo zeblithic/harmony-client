@@ -48162,8 +48162,9 @@ pub(crate) fn force_reachability_republish(state: &Mutex<NodeState>) {
 }
 
 /// ZEB-329 boot helper: stand-in `PkarrSnapshot` used when the pkarr
-/// publisher isn't wired (no owner identity loaded at start_node).
-/// Mirrors `ProdPkarrSnapshot`'s Phase-1 conservative defaults so the
+/// publisher isn't wired (no owner identity loaded at start_node). With no
+/// publisher there is nothing to publish, so it reports the not-publishing
+/// state (identity `false` / 0 communities / no last-publish) and the
 /// Network Health panel renders without an "unknown publisher" toast.
 struct StubEmptyPkarrSnapshot;
 
@@ -48195,14 +48196,14 @@ impl crate::network_health::RelaySnapshot for PersistedRelaySnapshot {
 }
 
 impl crate::network_health::PkarrSnapshot for StubEmptyPkarrSnapshot {
-    fn identity_published(&self) -> bool {
-        false
+    fn publish_state(&self) -> crate::network_health::PkarrPublishState {
+        crate::network_health::PkarrPublishState {
+            identity_published: false,
+            community_publish_count: 0,
+        }
     }
     fn identity_last_publish_ms(&self) -> Option<u64> {
         None
-    }
-    fn community_publish_count(&self) -> u32 {
-        0
     }
     fn recent_fallback_events(&self) -> Vec<crate::network_health::PkarrFallbackHit> {
         Vec::new()
