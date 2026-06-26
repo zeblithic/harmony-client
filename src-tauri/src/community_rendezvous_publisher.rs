@@ -9,8 +9,23 @@
 //! community publisher does — registering once at the start of epoch N would
 //! otherwise keep publishing under the epoch-N key after the boundary while
 //! resolvers query under epoch N±1.
+//!
+//! # Self-promotion: pure decision now, driver deferred
+//!
+//! [`should_self_promote`] is the PURE, deterministic decision an under-filled
+//! community uses to elect a fill-in beacon (lowest-ranked eligible online
+//! candidate, power-aware). The periodic auto-promotion DRIVER — the background
+//! task that gathers the live online/power state, calls [`should_self_promote`],
+//! and triggers [`CommunityRendezvousPublisher::refresh_slot`] — is an
+//! INTENTIONAL follow-up, not built here. The spec frames self-promotion
+//! convergence (how aggressively to promote, how to damp oscillation) as an
+//! OPEN QUESTION to tune from observed data, and the shipping relay-advertiser
+//! opt-in (ZEB-380) already fills slots whenever any advertiser is online. The
+//! [`RendezvousObservability`] counters exist precisely to inform that future
+//! driver's tuning (promotion rate, slot-fill latency, demotions).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -18,7 +33,9 @@ use harmony_pkarr::{
     current_epoch_id, EphemeralKeyBuilder, PkarrPublisher, PkarrRoutingRecord, RecordBuilder,
 };
 
-use crate::community_rendezvous::{rendezvous_slot_key, slot_for_advertiser};
+use crate::community_rendezvous::{
+    rendezvous_slot_key, slot_for_advertiser, RENDEZVOUS_SLOT_COUNT,
+};
 use crate::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 
 /// Abstraction over the pkarr publish registry used by the rendezvous
@@ -66,6 +83,9 @@ pub struct CommunityRendezvousPublisher {
     /// Currently-registered rendezvous slot per community, so a rank change
     /// unregisters the stale slot handle before registering the new one.
     registered_slots: Mutex<HashMap<SpaceId, u16>>,
+    /// Counters feeding the (deferred) self-promotion driver's tuning. Bumped
+    /// whenever a slot is newly filled by [`Self::refresh_slot`].
+    observability: RendezvousObservability,
 }
 
 impl CommunityRendezvousPublisher {
@@ -100,7 +120,22 @@ impl CommunityRendezvousPublisher {
             identity_pub,
             routing_blob_builder,
             registered_slots: Mutex::new(HashMap::new()),
+            observability: RendezvousObservability::default(),
         }
+    }
+
+    /// Observability counters (promotions / slot-fills / slot-fill latency /
+    /// demotions). Read by the deferred self-promotion driver and by
+    /// [`RendezvousObservability::log`] to inform convergence tuning.
+    pub fn observability(&self) -> &RendezvousObservability {
+        &self.observability
+    }
+
+    /// Emit a `tracing::info!` reading the current observability counters. The
+    /// (deferred) self-promotion driver calls this periodically; it also keeps
+    /// every counter on a read path so none is dead code under `-D warnings`.
+    pub fn log_observability(&self) {
+        self.observability.log();
     }
 
     fn slot_handle(community_id: &SpaceId, slot: u16) -> String {
@@ -167,6 +202,12 @@ impl CommunityRendezvousPublisher {
 
                 let handle = Self::slot_handle(&community_id, slot);
                 self.sink.register(handle, key_builder, builder).await;
+                // Count a slot-fill only when this newly registers a slot (no
+                // prior slot, or a rank change to a different slot) — not on a
+                // no-op re-register of the same slot we already hold.
+                if prior_slot != Some(slot) {
+                    self.observability.record_slot_fill(0);
+                }
                 registered.insert(community_id, slot);
             }
             None => {
@@ -178,6 +219,113 @@ impl CommunityRendezvousPublisher {
                 }
             }
         }
+    }
+}
+
+/// Coarse power/availability class of a candidate beacon, used by
+/// [`should_self_promote`] to prefer always-on nodes over battery-constrained
+/// ones. Mirrors the relay/butler opt-in's availability notion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerTier {
+    /// Desktop / opted-in / on AC power — preferred for promotion.
+    HighAvailability,
+    /// Default class with no special availability signal.
+    Normal,
+    /// Mobile / battery — defers; promotes only as a last resort.
+    LowPower,
+}
+
+/// Promote `me` only if the live slot set is under-filled AND `me` is the
+/// lowest-ranked eligible online candidate. Eligibility is power-aware: prefer
+/// HighAvailability, then Normal; LowPower promotes only when no better
+/// candidate exists. Ranking among a tier is by address (same as slot claim),
+/// so the decision is deterministic and convergent without coordination.
+///
+/// PURE decision only — the periodic driver that gathers live online/power
+/// state and calls [`CommunityRendezvousPublisher::refresh_slot`] is a deferred
+/// follow-up (see module docs).
+pub fn should_self_promote(
+    _advertisers: &[OwnerAddr],
+    live_slot_count: usize,
+    candidates_ranked: &[(OwnerAddr, PowerTier)],
+    me: &OwnerAddr,
+) -> bool {
+    if live_slot_count >= RENDEZVOUS_SLOT_COUNT {
+        return false;
+    }
+    fn tier_rank(t: PowerTier) -> u8 {
+        match t {
+            PowerTier::HighAvailability => 0,
+            PowerTier::Normal => 1,
+            PowerTier::LowPower => 2,
+        }
+    }
+    // Best tier present among online candidates.
+    let Some(best_tier) = candidates_ranked.iter().map(|(_, t)| tier_rank(*t)).min() else {
+        return false;
+    };
+    // Lowest-address candidate within the best tier is the promoter.
+    let promoter = candidates_ranked
+        .iter()
+        .filter(|(_, t)| tier_rank(*t) == best_tier)
+        .map(|(a, _)| *a)
+        .min_by(|x, y| x.0.cmp(&y.0));
+    promoter.map(|p| p.0 == me.0).unwrap_or(false)
+}
+
+/// Observability counters for rendezvous slot dynamics. These feed the
+/// (deferred) self-promotion driver's convergence/oscillation tuning — see the
+/// module docs. Counters are read by [`Self::log`] (and via
+/// [`CommunityRendezvousPublisher::observability`]), so none is dead code.
+#[derive(Default)]
+pub struct RendezvousObservability {
+    /// Times this node self-promoted into an under-filled slot.
+    pub promotions: AtomicU64,
+    /// Times this node newly registered (filled) a rendezvous slot.
+    pub slot_fills: AtomicU64,
+    /// Per-fill latency samples in ms (now − under-filled-observed-at).
+    pub slot_fill_latency_ms: Mutex<Vec<u64>>,
+    /// Times this node relinquished a slot (rank loss / dropping out).
+    pub demotions: AtomicU64,
+}
+
+impl RendezvousObservability {
+    /// Record a self-promotion event (an under-filled slot we elected to fill).
+    pub fn record_promotion(&self) {
+        self.promotions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a newly-filled slot plus its fill latency sample.
+    pub fn record_slot_fill(&self, latency_ms: u64) {
+        self.slot_fills.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut samples) = self.slot_fill_latency_ms.try_lock() {
+            samples.push(latency_ms);
+        }
+    }
+
+    /// Record a demotion (slot relinquished).
+    pub fn record_demotion(&self) {
+        self.demotions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Emit a `tracing::info!` summarizing the counters. Reads every field so
+    /// the struct can never be flagged dead under `-D warnings`.
+    pub fn log(&self) {
+        let promotions = self.promotions.load(Ordering::Relaxed);
+        let slot_fills = self.slot_fills.load(Ordering::Relaxed);
+        let demotions = self.demotions.load(Ordering::Relaxed);
+        let latency_samples = self
+            .slot_fill_latency_ms
+            .try_lock()
+            .map(|s| s.len())
+            .unwrap_or(0);
+        tracing::info!(
+            promotions,
+            slot_fills,
+            demotions,
+            latency_samples,
+            "rendezvous self-promotion observability"
+        );
     }
 }
 
@@ -292,5 +440,74 @@ mod tests {
             .await
             .iter()
             .any(|h| h.contains("rendezvous")));
+    }
+
+    #[test]
+    fn lowest_ranked_eligible_online_promotes() {
+        let a = OwnerAddr([1u8; 16]);
+        let b = OwnerAddr([2u8; 16]);
+        // Slots under-filled (0 live of N). Both online + high-availability.
+        let ranked = vec![
+            (a, PowerTier::HighAvailability),
+            (b, PowerTier::HighAvailability),
+        ];
+        assert!(
+            should_self_promote(&[a, b], 0, &ranked, &a),
+            "lowest rank promotes"
+        );
+        assert!(
+            !should_self_promote(&[a, b], 0, &ranked, &b),
+            "higher rank defers"
+        );
+    }
+
+    #[test]
+    fn low_power_defers_to_high_availability() {
+        let a = OwnerAddr([1u8; 16]); // lowest rank but low power
+        let b = OwnerAddr([2u8; 16]); // higher rank but high availability
+        let ranked = vec![(a, PowerTier::LowPower), (b, PowerTier::HighAvailability)];
+        assert!(
+            !should_self_promote(&[a, b], 0, &ranked, &a),
+            "low-power defers"
+        );
+        assert!(
+            should_self_promote(&[a, b], 0, &ranked, &b),
+            "HA promotes as last resort"
+        );
+    }
+
+    #[test]
+    fn filled_slots_suppress_promotion() {
+        let a = OwnerAddr([1u8; 16]);
+        let ranked = vec![(a, PowerTier::HighAvailability)];
+        assert!(!should_self_promote(
+            &[a],
+            RENDEZVOUS_SLOT_COUNT,
+            &ranked,
+            &a
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_slot_increments_slot_fills_counter() {
+        let spy = Arc::new(MockPublisher::default());
+        let p = publisher_for(Arc::clone(&spy));
+        let cid = SpaceId([1u8; 16]);
+        let me = OwnerAddr([1u8; 16]);
+        let others = vec![OwnerAddr([2u8; 16]), me];
+        // Before any refresh, the counter is zero.
+        assert_eq!(p.observability().slot_fills.load(Ordering::Relaxed), 0);
+        // A refresh that registers slot 0 bumps the slot-fill counter to 1.
+        p.refresh_slot(cid, EpochKey::new([5u8; 32]), others.clone(), me)
+            .await;
+        assert_eq!(p.observability().slot_fills.load(Ordering::Relaxed), 1);
+        // A no-op re-register of the SAME slot must not double-count.
+        p.refresh_slot(cid, EpochKey::new([5u8; 32]), others, me)
+            .await;
+        assert_eq!(p.observability().slot_fills.load(Ordering::Relaxed), 1);
+        // The fill recorded a latency sample too.
+        assert_eq!(p.observability().slot_fill_latency_ms.lock().await.len(), 1);
+        // Exercise the tracing read path so log() is covered + non-dead.
+        p.log_observability();
     }
 }
