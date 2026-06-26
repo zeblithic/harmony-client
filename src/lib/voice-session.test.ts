@@ -95,8 +95,12 @@ describe('VoiceSession lifecycle + gate', () => {
     const s = newSession();
     await s.join('comm', 'chan');
     await s.setMuted(false);
+    // The Rust command takes a single `payload: SetVoiceMutedPayload` struct, so
+    // Tauri v2 requires the args wrapped under `payload` (mirrors the DM-voice
+    // path in call-session.ts). Sending them flat rejects with "missing required
+    // key payload" — the ZEB-577 stuck-unmute bug.
     expect(d.invoke).toHaveBeenCalledWith('set_voice_muted',
-      { communityId: 'comm', channelId: 'chan', muted: false });
+      { payload: { communityId: 'comm', channelId: 'chan', muted: false } });
   });
 
   it('setMuted rolls back local state when the backend rejects', async () => {
@@ -488,8 +492,9 @@ describe('VoiceSession moderation (ZEB-358)', () => {
     const s = newSession();
     await s.join('comm', 'chan');
     await s.moderate('cc'.repeat(16), 'mute');
+    // `payload: ModerateVoicePayload` struct → Tauri requires the `payload` wrapper.
     expect(d.invoke).toHaveBeenCalledWith('moderate_voice',
-      { communityId: 'comm', channelId: 'chan', targetOwnerHex: 'cc'.repeat(16), action: 'mute' });
+      { payload: { communityId: 'comm', channelId: 'chan', targetOwnerHex: 'cc'.repeat(16), action: 'mute' } });
   });
 
   it('selfKicked is exposed and silences', async () => {

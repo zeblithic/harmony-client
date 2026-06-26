@@ -366,7 +366,7 @@ export class VoiceSession {
     if (this.community && this.channel) {
       try {
         await this.deps.invoke('set_voice_muted',
-          { communityId: this.community, channelId: this.channel, muted });
+          { payload: { communityId: this.community, channelId: this.channel, muted } });
       } catch (err) {
         // Backend rejected the toggle — roll the local gate + store back so the
         // UI never advertises a mute state the presence roster won't reflect
@@ -386,7 +386,7 @@ export class VoiceSession {
     this.patch({ muted: true });
     if (this.community && this.channel) {
       void this.deps
-        .invoke('set_voice_muted', { communityId: this.community, channelId: this.channel, muted: true })
+        .invoke('set_voice_muted', { payload: { communityId: this.community, channelId: this.channel, muted: true } })
         .catch(() => {});
     }
   }
@@ -398,7 +398,7 @@ export class VoiceSession {
   async moderate(targetOwnerHex: string, action: 'mute' | 'unmute' | 'kick' | 'unkick'): Promise<void> {
     if (!this.community || !this.channel) return;
     await this.deps.invoke('moderate_voice', {
-      communityId: this.community, channelId: this.channel, targetOwnerHex, action,
+      payload: { communityId: this.community, channelId: this.channel, targetOwnerHex, action },
     });
   }
 
