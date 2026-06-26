@@ -7656,7 +7656,27 @@ pub async fn start_node_inner(
                             .with_auto_accept_known(friend_auto_accept_known_for_state)
                             // ZEB-461 Task 6: advertise our device bundle +
                             // reachability + PQ keys in the accept we sign.
-                            .with_self_reachability(self_reachability_for_friend),
+                            .with_self_reachability(self_reachability_for_friend)
+                            // ZEB-521: wire a LIVE home-relay read so each accept
+                            // refreshes its `home_relay_url` from the (now-resolved)
+                            // endpoint instead of advertising the boot snapshot,
+                            // which is often `None` because `home_relay()` hadn't
+                            // resolved at `start_node` time. The request/redeem
+                            // paths already read this fresh per-dial
+                            // (`build_self_handshake_reachability`); only this
+                            // long-lived acceptor froze it.
+                            .with_self_home_relay_refresh(
+                                iroh_endpoint_arc.as_ref().map(|ep| {
+                                    let ep = std::sync::Arc::clone(ep);
+                                    let refresh: crate::iroh_friend_acceptor::HomeRelayRefresh =
+                                        std::sync::Arc::new(move || {
+                                            ep.home_relay()
+                                                .map(|r| r.to_string())
+                                                .filter(|s| !s.is_empty())
+                                        });
+                                    refresh
+                                }),
+                            ),
                         );
 
                         // ZEB-375 (Friends Phase 2a): build the friend-PEX

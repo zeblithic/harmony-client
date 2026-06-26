@@ -542,6 +542,36 @@ pub struct SelfHandshakeReachability {
     pub pq_kem_pubkey: Vec<u8>,
 }
 
+/// ZEB-521: a cheap, synchronous read of this node's CURRENT iroh home-relay URL
+/// (unresolved/empty → `None`). Wired from the iroh endpoint in production so the
+/// friend acceptor can refresh its boot-snapshotted [`SelfHandshakeReachability`]
+/// at accept-sign time; `None` in tests (the snapshot is advertised as-is).
+pub type HomeRelayRefresh = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// ZEB-521: refresh the boot-snapshotted `home_relay_url` of a self-reachability
+/// bundle with a freshly-read value.
+///
+/// iroh's `Endpoint::home_relay()` returns `None` until its relay round-trip
+/// resolves — which frequently happens *after* `start_node` captured the bundle
+/// (the `lib.rs` accept-path snapshot). Because the friend acceptor holds that
+/// snapshot for the whole process lifetime, a node could otherwise advertise
+/// `home_relay_url = None` to *every* friend forever, leaving each peer's
+/// `DeviceTunnelContact` relay-less and the DM tunnel dependent solely on n0
+/// discovery (the ZEB-504 capture). The pkarr/reachability publish paths already
+/// re-read `home_relay()` fresh on every tick; this brings the friend handshake
+/// to parity. Prefer the freshly-read value; fall back to the snapshot if the
+/// relay still hasn't resolved (never clobber a good snapshot with a transient
+/// `None`).
+fn refresh_self_home_relay(
+    base: Option<SelfHandshakeReachability>,
+    fresh_home_relay: Option<String>,
+) -> Option<SelfHandshakeReachability> {
+    base.map(|mut r| {
+        r.home_relay_url = fresh_home_relay.or(r.home_relay_url);
+        r
+    })
+}
+
 /// Canonical preimage bytes the requester's device-#2 key signs for a
 /// [`FriendLinkRequest`]. A small CBOR-encoded tuple `("hfr1", from_addr,
 /// token_sig, eph, devices_digest)` — the `"hfr1"` domain tag makes a
@@ -1205,6 +1235,12 @@ where
     /// advertise in the accept it signs. `None` (the default; tests) ships the
     /// empty bundle. Production wires the real values via `with_self_reachability`.
     self_reachability: Option<SelfHandshakeReachability>,
+    /// ZEB-521: optional live read of this node's CURRENT iroh home-relay URL,
+    /// used to refresh `self_reachability.home_relay_url` at accept-sign time so
+    /// the advertised relay isn't permanently `None` when iroh's relay round-trip
+    /// resolved after `start_node` snapshotted it. `None` in tests / when iroh
+    /// didn't bind — the snapshot is advertised as-is.
+    self_home_relay_refresh: Option<HomeRelayRefresh>,
     config: FriendAcceptorConfig,
 }
 
@@ -1272,6 +1308,9 @@ where
             auto_accept_known: true,
             // ZEB-461: default to the empty self bundle; production fills it.
             self_reachability: None,
+            // ZEB-521: default to no live refresh; production wires it from the
+            // iroh endpoint so the advertised home relay is read fresh per accept.
+            self_home_relay_refresh: None,
             config,
         }
     }
@@ -1327,6 +1366,24 @@ where
     pub fn with_self_reachability(mut self, r: Option<SelfHandshakeReachability>) -> Self {
         self.self_reachability = r;
         self
+    }
+
+    /// ZEB-521: wire a live read of this node's current iroh home-relay URL so the
+    /// accept-time reachability bundle refreshes its `home_relay_url` instead of
+    /// advertising the (possibly-`None`) boot snapshot. Fluent setter (default
+    /// `None`, used by tests) so existing call sites keep compiling.
+    pub fn with_self_home_relay_refresh(mut self, refresh: Option<HomeRelayRefresh>) -> Self {
+        self.self_home_relay_refresh = refresh;
+        self
+    }
+
+    /// ZEB-521: the self-reachability bundle to advertise in an accept, with its
+    /// `home_relay_url` refreshed from the live endpoint (see
+    /// [`refresh_self_home_relay`]). Falls back to the boot snapshot when no
+    /// refresh is wired (tests) or the relay still hasn't resolved.
+    fn current_self_reachability(&self) -> Option<SelfHandshakeReachability> {
+        let fresh = self.self_home_relay_refresh.as_ref().and_then(|f| f());
+        refresh_self_home_relay(self.self_reachability.clone(), fresh)
     }
 
     /// Reconcile the published Case-D friend slots with the current friend graph
@@ -1552,6 +1609,9 @@ where
                 })?;
                 self.token_gate_open(&token_sig).await?;
                 let learned_at = self.next_hlc().await;
+                // ZEB-521: refresh the advertised home relay from the live
+                // endpoint just before signing (the boot snapshot is often None).
+                let self_reach = self.current_self_reachability();
                 let accepted = {
                     let mut state = self.crdt_state.lock().await;
                     process_friend_request(
@@ -1564,7 +1624,7 @@ where
                         &self.device2_signing_key,
                         &self.keytree,
                         now_secs,
-                        self.self_reachability.as_ref(),
+                        self_reach.as_ref(),
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1582,6 +1642,9 @@ where
                 // `process_friend_request` resolves `established_via` to MutualKey
                 // because `req.token_sig` is None on this path.
                 let learned_at = self.next_hlc().await;
+                // ZEB-521: refresh the advertised home relay from the live
+                // endpoint just before signing (the boot snapshot is often None).
+                let self_reach = self.current_self_reachability();
                 let accepted = {
                     let mut state = self.crdt_state.lock().await;
                     process_friend_request(
@@ -1594,7 +1657,7 @@ where
                         &self.device2_signing_key,
                         &self.keytree,
                         now_secs,
-                        self.self_reachability.as_ref(),
+                        self_reach.as_ref(),
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -2717,6 +2780,97 @@ mod tests {
             None,
             publisher,
         )
+    }
+
+    // ── ZEB-521: accept-time home-relay refresh ──────────────────────────
+
+    fn sample_reach(home: Option<&str>) -> SelfHandshakeReachability {
+        SelfHandshakeReachability {
+            identity_pub_64: [0x21; 64],
+            iroh_node_id: [0x22; 32],
+            home_relay_url: home.map(|s| s.to_string()),
+            pq_dsa_pubkey: vec![0xaa; 4],
+            pq_kem_pubkey: vec![0xbb; 4],
+        }
+    }
+
+    /// ZEB-521: a `None` boot snapshot must be filled by the freshly-read relay,
+    /// with every other field preserved untouched.
+    #[test]
+    fn refresh_self_home_relay_fills_stale_none_from_fresh() {
+        let out = refresh_self_home_relay(
+            Some(sample_reach(None)),
+            Some("https://relay.fresh/".into()),
+        )
+        .expect("base is Some");
+        assert_eq!(out.home_relay_url.as_deref(), Some("https://relay.fresh/"));
+        assert_eq!(out.iroh_node_id, [0x22; 32], "non-relay fields preserved");
+        assert_eq!(
+            out.pq_dsa_pubkey,
+            vec![0xaa; 4],
+            "non-relay fields preserved"
+        );
+    }
+
+    /// ZEB-521: a freshly-resolved relay wins over a stale snapshot value.
+    #[test]
+    fn refresh_self_home_relay_fresh_wins_over_stale_some() {
+        let out = refresh_self_home_relay(
+            Some(sample_reach(Some("https://old/"))),
+            Some("https://new/".into()),
+        )
+        .expect("base is Some");
+        assert_eq!(out.home_relay_url.as_deref(), Some("https://new/"));
+    }
+
+    /// ZEB-521: a `None` fresh read (relay still unresolved) must NOT clobber a
+    /// good snapshot, and must not invent a relay when neither side has one.
+    #[test]
+    fn refresh_self_home_relay_keeps_snapshot_when_fresh_unresolved() {
+        let kept = refresh_self_home_relay(Some(sample_reach(Some("https://snap/"))), None)
+            .expect("base is Some");
+        assert_eq!(kept.home_relay_url.as_deref(), Some("https://snap/"));
+        let still_none =
+            refresh_self_home_relay(Some(sample_reach(None)), None).expect("base is Some");
+        assert!(still_none.home_relay_url.is_none());
+    }
+
+    /// ZEB-521: an empty (`None`) bundle stays empty — no bundle to advertise.
+    #[test]
+    fn refresh_self_home_relay_empty_base_stays_none() {
+        assert!(refresh_self_home_relay(None, Some("https://x/".into())).is_none());
+    }
+
+    /// ZEB-521 (the regression guard): an acceptor whose boot snapshot captured
+    /// `home_relay_url = None` (relay not yet resolved at `start_node`) must
+    /// advertise the relay the live refresh closure now resolves — NOT the frozen
+    /// `None`. This is the exact condition that left peers with relay-less
+    /// `DeviceTunnelContact`s in the ZEB-504 capture.
+    #[test]
+    fn acceptor_refreshes_home_relay_from_live_endpoint() {
+        let acc = acceptor_with_publisher(None)
+            .with_self_reachability(Some(sample_reach(None)))
+            .with_self_home_relay_refresh(Some(Arc::new(|| {
+                Some("https://relay.live/".to_string())
+            })));
+        let advertised = acc.current_self_reachability().expect("bundle present");
+        assert_eq!(
+            advertised.home_relay_url.as_deref(),
+            Some("https://relay.live/")
+        );
+    }
+
+    /// ZEB-521: with no refresh wired (the test/iroh-unbound default), the boot
+    /// snapshot is advertised verbatim — no behavior change for that path.
+    #[test]
+    fn acceptor_without_refresh_uses_snapshot() {
+        let acc = acceptor_with_publisher(None)
+            .with_self_reachability(Some(sample_reach(Some("https://relay.snap/"))));
+        let advertised = acc.current_self_reachability().expect("bundle present");
+        assert_eq!(
+            advertised.home_relay_url.as_deref(),
+            Some("https://relay.snap/")
+        );
     }
 
     /// A real `PkarrInvitePublisher` backed by a mock relay (no records actually
