@@ -7,6 +7,11 @@
 // AudioWorkletNode so that tests can inject mocks without touching jsdom's
 // (non-existent) Web Audio implementation.
 
+import { loadWorkletModule } from './load-worklet-module';
+// `?raw` inlines the plain-JS worklet source as a string; loadWorkletModule
+// loads it from a same-origin blob: URL (ZEB-575).
+import captureProcessorSource from './pcm-capture-processor.js?raw';
+
 export type FrameCallback = (pcm: Float32Array) => void;
 
 export class AudioCapture {
@@ -36,9 +41,7 @@ export class AudioCapture {
         : new AudioContext({ sampleRate });
 
       if (!createWorkletNode) {
-        await this.context.audioWorklet.addModule(
-          new URL('./pcm-capture-processor.ts', import.meta.url).href,
-        );
+        await loadWorkletModule(this.context, captureProcessorSource);
       }
 
       this.source = this.context.createMediaStreamSource(this.stream);
