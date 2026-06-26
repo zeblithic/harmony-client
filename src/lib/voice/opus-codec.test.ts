@@ -7,6 +7,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { OpusCodec } from './opus-codec';
+import OpusScript from 'opusscript';
 
 // ---------------------------------------------------------------------------
 // Mock opusscript
@@ -97,5 +98,14 @@ describe('OpusCodec', () => {
 
   it('exposes codecType as opus', () => {
     expect(codec.codecType).toBe('opus');
+  });
+
+  it('selects the asm.js build (wasm:false) so the synchronous wasm fetch never runs (ZEB-576)', async () => {
+    await codec.init(16000, 1);
+    const ctor = OpusScript as unknown as ReturnType<typeof vi.fn>;
+    expect(ctor).toHaveBeenCalledTimes(1);
+    // 4th constructor arg is the options object; { wasm: false } avoids the
+    // emscripten wasm build's main-thread-blocking synchronous fetch.
+    expect(ctor.mock.calls[0][3]).toEqual({ wasm: false });
   });
 });
