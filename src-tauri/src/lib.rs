@@ -202,6 +202,7 @@ pub mod node_event_sink;
 pub mod notes_commands;
 pub mod notes_crdt;
 pub mod notes_persist;
+pub mod open_join_auth;
 pub mod owner_commands;
 pub mod owner_loaded;
 pub mod owner_state;
