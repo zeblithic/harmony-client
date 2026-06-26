@@ -8,6 +8,11 @@
 // AudioWorkletNode so that tests can inject mocks without touching jsdom's
 // (non-existent) Web Audio implementation — mirroring audio-capture.ts.
 
+import { loadWorkletModule } from './load-worklet-module';
+// `?raw` inlines the plain-JS worklet source as a string; loadWorkletModule
+// loads it from a same-origin blob: URL (ZEB-575).
+import playbackProcessorSource from './pcm-playback-processor.js?raw';
+
 /** Below this magnitude the limiter is transparent (pure identity). */
 const SOFT_CLIP_KNEE = 0.8;
 
@@ -83,11 +88,9 @@ export class VoiceMixer {
       ? this.config.createContext()
       : new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
     this.ctx = ctx;
-    // Mirror audio-capture.ts's addModule(worklet URL) mechanism exactly.
+    // Mirror audio-capture.ts's same-origin worklet load mechanism exactly (ZEB-575).
     if (!this.config.createWorkletNode) {
-      await ctx.audioWorklet.addModule(
-        new URL('./pcm-playback-processor.ts', import.meta.url).href,
-      );
+      await loadWorkletModule(ctx, playbackProcessorSource);
     }
     const node = this.config.createWorkletNode
       ? this.config.createWorkletNode(ctx)

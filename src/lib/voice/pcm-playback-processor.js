@@ -1,26 +1,23 @@
-// src/lib/voice/pcm-playback-processor.ts
+// src/lib/voice/pcm-playback-processor.js
 //
 // Playback worklet: receives mixed Float32 frames (20ms) on its port and
 // plays them out via a ring buffer, decoupling the 20ms producer cadence
 // from the 128-sample render quantum. Underrun → silence (no glitches).
-
-/// <reference types="audioworklet" />
 //
-// This file runs exclusively in the audio worklet global scope. It cannot be
-// unit-tested with jsdom — coverage comes through voice-mixer.ts's injected
-// factory tests.
+// Plain JS (not TS): loaded as worklet SOURCE via a `?raw` import and run inside
+// AudioWorkletGlobalScope, which executes JavaScript, not TypeScript (ZEB-575).
+// It cannot be unit-tested with jsdom — coverage comes through voice-mixer.ts's
+// injected factory tests.
 
 class PcmPlaybackProcessor extends AudioWorkletProcessor {
-  private ring: Float32Array;
-  private writeIdx = 0;
-  private readIdx = 0;
-  private available = 0;
-
   constructor() {
     super();
     this.ring = new Float32Array(48000); // ~1s at 48k; sized generously
-    this.port.onmessage = (e: MessageEvent) => {
-      const frame = e.data as Float32Array;
+    this.writeIdx = 0;
+    this.readIdx = 0;
+    this.available = 0;
+    this.port.onmessage = (e) => {
+      const frame = e.data;
       for (let i = 0; i < frame.length; i++) {
         if (this.available >= this.ring.length) break; // drop on overflow
         this.ring[this.writeIdx] = frame[i];
@@ -30,7 +27,7 @@ class PcmPlaybackProcessor extends AudioWorkletProcessor {
     };
   }
 
-  process(_inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
+  process(_inputs, outputs) {
     const channels = outputs[0];
     const frameLen = channels[0].length;
     for (let i = 0; i < frameLen; i++) {

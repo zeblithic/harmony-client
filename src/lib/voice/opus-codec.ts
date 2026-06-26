@@ -68,7 +68,15 @@ export class OpusCodec implements VoiceCodec {
 
     const mod = (await import('opusscript')) as OpusScriptModule;
     const OpusScript = mod.default;
-    this._codec = new OpusScript(sampleRate, channels, OpusScript.Application.VOIP);
+    // ZEB-576: opusscript's default (wasm) build fetches its .wasm
+    // *synchronously*, which the browser main thread blocks in the Tauri
+    // webview — "Aborted(sync fetching of the wasm failed)". opusscript offers
+    // no hook to preload Module.wasmBinary (it calls the emscripten factory with
+    // no args), so select the asm.js build: pure JS, no fetch, and ample for
+    // 16 kHz mono 20 ms Opus frames.
+    this._codec = new OpusScript(sampleRate, channels, OpusScript.Application.VOIP, {
+      wasm: false,
+    });
   }
 
   /**
