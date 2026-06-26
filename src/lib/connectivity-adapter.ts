@@ -24,6 +24,7 @@ import type {
   ResolutionProgressEvent,
 } from './types/connectivity';
 import type { RelayHealth } from './types/network-health';
+import type { RedeemInviteResultDto } from './community-service';
 
 /**
  * Returns this device's reachability snapshot, or `null` when the iroh
@@ -120,6 +121,31 @@ export async function redeemInviteIroh(inviteUrl: string): Promise<RedemptionOut
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(`connectivity_redeem_invite_iroh: ${msg}`);
+  }
+}
+
+/**
+ * Join an OPEN community over the cross-WAN iroh first-contact path.
+ *
+ * Resolves with a `RedeemInviteResultDto` whose optional `status` field
+ * (camelCase wire key `status`, omitted when null) drives the UI:
+ *   - `"joined"`    → the join completed; render the normal joined success.
+ *   - `"searching"` → RETRYABLE cold-start: no beacon was reachable yet; the
+ *                     node keeps retrying on its transport-epoch re-arm. Show a
+ *                     non-blocking "still searching" state, NOT an error.
+ *   - `"rejected"`  → the beacon explicitly rejected the join (banned / bad
+ *                     capability). A distinct blocked state, NOT the spinner.
+ *   - (field absent) → legacy/local redeem; render exactly as the LAN path.
+ *
+ * Rejects (throws) only on hard IPC-layer failures; the soft cold-start and
+ * rejection outcomes are encoded in `status` rather than thrown.
+ */
+export async function openJoinIroh(inviteUrl: string): Promise<RedeemInviteResultDto> {
+  try {
+    return await invoke<RedeemInviteResultDto>('connectivity_open_join_iroh', { inviteUrl });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`connectivity_open_join_iroh: ${msg}`);
   }
 }
 

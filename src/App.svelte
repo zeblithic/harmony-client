@@ -36,6 +36,7 @@
   import { VotingAdapter } from './lib/voting-adapter';
   import { setupDelegateOnBehalfToast } from './lib/voting-toast-wiring';
   import { LibraryDirectoryService } from './lib/library-directory-service';
+  import { openJoinIroh } from './lib/connectivity-adapter';
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
@@ -3508,6 +3509,7 @@
       <LibraryDirectoryBrowser
         service={libraryDirectoryService}
         adapter={tauriAdapter}
+        onOpenJoinIroh={(inviteUrl) => openJoinIroh(inviteUrl)}
         onJoin={async (communityId) => {
           // ZEB-252 Sub-D Phase 6: typed direct-join. Backend re-resolves
           // the matching directory entry server-side and delegates to

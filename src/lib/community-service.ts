@@ -30,6 +30,20 @@ export interface RedeemInviteResultDto {
    * counter-sign came back within 5s.
    */
   pending: boolean;
+  /**
+   * Open-community cross-WAN first-contact status (camelCase wire key
+   * `status`, omitted by the backend when null — so this is `undefined`
+   * for the legacy/local redeem path). Only emitted by
+   * `connectivity_open_join_iroh`:
+   *   - `"joined"`    → the join completed.
+   *   - `"searching"` → RETRYABLE cold-start: no beacon was reachable yet;
+   *                     the node keeps retrying on its transport-epoch
+   *                     re-arm. A non-blocking "still searching" state.
+   *   - `"rejected"`  → the beacon explicitly rejected the join (banned /
+   *                     bad capability). A distinct blocked state.
+   * Field absent → legacy/local redeem; render exactly as today.
+   */
+  status?: string;
 }
 
 /**

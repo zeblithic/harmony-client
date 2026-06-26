@@ -21,11 +21,13 @@
     DiscoveredLibraryInfo,
   } from '../library-directory-service';
   import type { TauriAdapter } from '../zenoh-service';
+  import type { RedeemInviteResultDto } from '../community-service';
 
   let {
     service,
     adapter,
     onJoin,
+    onOpenJoinIroh,
     onClose,
   }: {
     service: LibraryDirectoryService;
@@ -34,6 +36,17 @@
      *  Receives the entry's `community_id` (32-hex-char SpaceId) so the backend
      *  can re-resolve the directory entry server-side at click time. */
     onJoin: (communityId: string) => Promise<void>;
+    /**
+     * Open-community cross-WAN first-contact join. When provided, Join routes
+     * through this (the entry's `invite_url`) instead of the LAN `onJoin`
+     * path, so the returned `RedeemInviteResultDto.status` can drive a
+     * cold-start "searching" / "rejected" banner. On `"joined"` (or a
+     * status-absent legacy result) the component still delegates the App-side
+     * effects to `onJoin(community_id)` and closes the modal. Wired to
+     * `connectivity_open_join_iroh(inviteUrl)`. Omit to keep the pure LAN
+     * `onJoin` behavior (existing callers / tests).
+     */
+    onOpenJoinIroh?: (inviteUrl: string) => Promise<RedeemInviteResultDto>;
     /** Closes the browser modal. */
     onClose: () => void;
   } = $props();
@@ -46,6 +59,14 @@
   let removeError: string | null = $state(null);
   let joinPending = $state<string | null>(null); // community_id mid-join
   let joinError: string | null = $state(null);
+  // Open-community cross-WAN cold-start state (ZEB first-contact). Keyed by
+  // community_id so the banner attaches to the row the user clicked.
+  //   'searching' → retryable: no beacon reachable yet, the node keeps
+  //                 retrying on its transport-epoch re-arm (non-blocking).
+  //   'rejected'  → the beacon explicitly declined the join (banned / bad
+  //                 capability) — a distinct blocked state, NOT the spinner.
+  let coldStartSearching = $state<string | null>(null);
+  let coldStartRejected = $state<string | null>(null);
 
   // ZEB-279 Sub-D Phase 2: discovered libraries (auto-announce ingest).
   // Filtered IPC excludes already-added libraries, so a row migrates
@@ -174,7 +195,31 @@
   async function handleJoin(entry: DirectoryEntry) {
     joinPending = entry.community_id;
     joinError = null;
+    // Clear any prior cold-start banner for this row before re-attempting.
+    coldStartSearching = null;
+    coldStartRejected = null;
     try {
+      // Open-community cross-WAN first-contact path: when wired, route the
+      // entry's invite URL through `connectivity_open_join_iroh` so its
+      // `status` can drive a cold-start banner. The directory only lists OPEN
+      // communities, so every entry is eligible for this path.
+      if (onOpenJoinIroh) {
+        const result = await onOpenJoinIroh(entry.invite_url);
+        if (result.status === 'searching') {
+          // RETRYABLE cold start — keep the modal open and show a
+          // non-blocking "still searching" banner. NOT an error/failure.
+          coldStartSearching = entry.community_id;
+          return;
+        }
+        if (result.status === 'rejected') {
+          // Distinct blocked state — the community declined the join.
+          coldStartRejected = entry.community_id;
+          return;
+        }
+        // status === 'joined' (or absent / legacy) → fall through to the
+        // normal joined success path so the App does its nav-update,
+        // community switch, and member-refresh side-effects, then close.
+      }
       await onJoin(entry.community_id);
       onClose();
     } catch (e) {
@@ -342,6 +387,25 @@
             >
               {joinPending === entry.community_id ? 'Joining…' : 'Join'}
             </button>
+            {#if coldStartSearching === entry.community_id}
+              <!-- Non-blocking, retryable cold-start: no beacon reachable yet.
+                   The node keeps retrying on its transport-epoch re-arm — this
+                   is NOT a failure, so style it as an in-progress notice (NOT
+                   the red error banner). -->
+              <div class="searching-banner" data-testid="cold-start-searching" role="status">
+                <div class="spinner" aria-hidden="true"></div>
+                <span>
+                  Searching for the community — no one's reachable yet, we'll keep trying.
+                </span>
+              </div>
+            {/if}
+            {#if coldStartRejected === entry.community_id}
+              <!-- Distinct blocked state: the community explicitly declined the
+                   join (banned / bad capability). NOT the searching spinner. -->
+              <div class="rejected-banner" data-testid="cold-start-rejected" role="alert">
+                This community declined the join request.
+              </div>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -397,6 +461,44 @@
   .join-btn { align-self: center; padding: 6px 12px; background: rgba(120,140,200,0.4); border: none; border-radius: 4px; cursor: pointer; }
   .join-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .join-error { color: #d83c3e; font-size: 0.85rem; margin-top: 8px; }
+  /* Cold-start "still searching" — non-blocking, in-progress (NOT an error).
+     Neutral/secondary styling with the same spinner the redeem flow uses. */
+  .searching-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+  }
+  .spinner {
+    width: 12px;
+    height: 12px;
+    flex: 0 0 auto;
+    border: 2px solid var(--accent);
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+  /* Cold-start "rejected" — distinct blocked state (red, like join-error). */
+  .rejected-banner {
+    width: 100%;
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid #d83c3e;
+    border-radius: 4px;
+    color: #d83c3e;
+    font-size: 0.8rem;
+  }
   .remove-error { color: #d83c3e; font-size: 0.8rem; margin: 0 0 8px; }
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
   .modal-content { background: var(--bg-secondary); border-radius: 6px; }
