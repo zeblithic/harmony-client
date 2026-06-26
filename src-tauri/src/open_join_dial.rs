@@ -204,6 +204,17 @@ pub async fn open_join_after_resolve(
     // 7. Build the capability-proven OpenJoinRequest. The `epoch_auth`
     // timestamp MUST be `created_at.wall_ms` — the beacon's verify recomputes
     // the MAC over exactly that field (Task 5/6).
+    //
+    // Re-sample the wall clock HERE (after the awaited rendezvous resolution +
+    // dial/open_bi) rather than reusing the `now_ms` captured before resolve:
+    // a slow resolve/dial would otherwise stamp a stale `created_at`, which the
+    // beacon's freshness window could reject as stale despite the join being
+    // valid. The cold-start branch above (beacon = None) returns before reaching
+    // this point and is unaffected.
+    let fresh_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(now_ms);
     let nonce: [u8; 16] = {
         use rand::RngCore;
         let mut n = [0u8; 16];
@@ -211,7 +222,7 @@ pub async fn open_join_after_resolve(
         n
     };
     let created_at = Hlc {
-        wall_ms: now_ms,
+        wall_ms: fresh_now_ms,
         logical: 0,
         device_id: ctx.bootstrap_join.at.device_id.clone(),
     };

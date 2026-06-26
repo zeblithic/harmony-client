@@ -28,25 +28,38 @@
     adapter,
     onJoin,
     onOpenJoinIroh,
+    onJoinedUi,
     onClose,
   }: {
     service: LibraryDirectoryService;
     adapter: TauriAdapter;
     /** Called when the user clicks Join on an entry. Wired to join_open_community.
      *  Receives the entry's `community_id` (32-hex-char SpaceId) so the backend
-     *  can re-resolve the directory entry server-side at click time. */
+     *  can re-resolve the directory entry server-side at click time. This
+     *  PERFORMS A BACKEND JOIN — used for the legacy/local LAN redeem path. */
     onJoin: (communityId: string) => Promise<void>;
     /**
      * Open-community cross-WAN first-contact join. When provided, Join routes
      * through this (the entry's `invite_url`) instead of the LAN `onJoin`
      * path, so the returned `RedeemInviteResultDto.status` can drive a
-     * cold-start "searching" / "rejected" banner. On `"joined"` (or a
-     * status-absent legacy result) the component still delegates the App-side
-     * effects to `onJoin(community_id)` and closes the modal. Wired to
-     * `connectivity_open_join_iroh(inviteUrl)`. Omit to keep the pure LAN
+     * cold-start "searching" / "rejected" banner. The open-join backend ALREADY
+     * commits membership, so on `"joined"` the component runs only the UI
+     * follow-up (`onJoinedUi`, if provided) and closes — it does NOT re-invoke
+     * `onJoin`, which would trigger a redundant SECOND (LAN) backend join. Wired
+     * to `connectivity_open_join_iroh(inviteUrl)`. Omit to keep the pure LAN
      * `onJoin` behavior (existing callers / tests).
      */
     onOpenJoinIroh?: (inviteUrl: string) => Promise<RedeemInviteResultDto>;
+    /**
+     * UI-only follow-up after a successful cross-WAN open-join (`"joined"`).
+     * Runs the App-side nav-update / community-switch / member-refresh WITHOUT
+     * performing a backend join (the open-join IPC already committed
+     * membership). Receives the open-join result DTO (carrying the committed
+     * `communityId` + `communityName`). Called only on the `onOpenJoinIroh`
+     * `"joined"` path; absent → the component just closes the modal. The
+     * status-absent legacy result still falls through to the backend `onJoin`.
+     */
+    onJoinedUi?: (result: RedeemInviteResultDto) => Promise<void> | void;
     /** Closes the browser modal. */
     onClose: () => void;
   } = $props();
@@ -212,13 +225,22 @@
           return;
         }
         if (result.status === 'rejected') {
-          // Distinct blocked state — the community declined the join.
+          // Distinct blocked state — the community declined the join (or an
+          // internal dial invariant failed). NOT a retryable spinner.
           coldStartRejected = entry.community_id;
           return;
         }
-        // status === 'joined' (or absent / legacy) → fall through to the
-        // normal joined success path so the App does its nav-update,
-        // community switch, and member-refresh side-effects, then close.
+        if (result.status === 'joined') {
+          // The open-join backend ALREADY committed membership. Run only the
+          // UI follow-up (nav-update / switch / member-refresh) and close — do
+          // NOT call the legacy `onJoin`, which would trigger a redundant
+          // SECOND backend (LAN) join.
+          await onJoinedUi?.(result);
+          onClose();
+          return;
+        }
+        // status absent (legacy/local result) → fall through to the normal
+        // backend joined success path below.
       }
       await onJoin(entry.community_id);
       onClose();

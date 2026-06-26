@@ -102,8 +102,11 @@ impl OpenJoinRateLimiter {
     }
 
     /// Returns true if `nonce` was already seen within the retention horizon.
-    /// Records first-seen nonces and evicts ones older than the horizon to bound
-    /// memory.
+    /// Evicts entries older than the horizon to bound memory. Does NOT record
+    /// the nonce — recording is split into [`Self::record_nonce`] so a request
+    /// that is shed by the rate limiter (which is checked AFTER replay) does not
+    /// leave its nonce persisted, which would wrongly reject a legitimate retry
+    /// as a replay.
     fn is_replay(&mut self, nonce: &[u8; 16], now_ms: u64) -> bool {
         let horizon = now_ms.saturating_sub(OPEN_JOIN_RATE_LIMIT_WINDOW_MS.saturating_mul(4));
         let seen = &mut self.seen_nonces;
@@ -114,12 +117,16 @@ impl OpenJoinRateLimiter {
             }
             keep
         });
-        if self.seen_nonces.contains(nonce) {
-            return true;
-        }
+        self.seen_nonces.contains(nonce)
+    }
+
+    /// Record `nonce` as seen at `now_ms`. Called only AFTER a request has
+    /// passed both the replay check and the rate-limit check, so a `RateLimited`
+    /// rejection never persists a nonce (a later legitimate retry must not be
+    /// rejected as a replay).
+    fn record_nonce(&mut self, nonce: &[u8; 16], now_ms: u64) {
         self.seen_nonces.insert(*nonce);
         self.nonce_seen_at.insert(*nonce, now_ms);
-        false
     }
 }
 
@@ -198,15 +205,19 @@ pub fn verify_and_admit_open_join(
             .map_err(|_| OpenJoinReject::BadJoinerSig)?;
     }
 
-    // 7. Rate-limit + replay (after cheap structural + crypto checks, before the
-    //    stateful materialization). Replay first so a replayed nonce is reported
-    //    as Replay rather than masked by a coincident rate-limit shed.
+    // 7. Replay + rate-limit (after cheap structural + crypto checks, before the
+    //    stateful materialization). Replay is CHECKED first (without recording)
+    //    so a replayed nonce is reported as Replay rather than masked by a
+    //    coincident rate-limit shed. The nonce is RECORDED only AFTER the rate
+    //    limit also passes — otherwise a `RateLimited` rejection would persist
+    //    the nonce and a legitimate retry would be wrongly rejected as a replay.
     if limiter.is_replay(&req.nonce, now_ms) {
         return Err(OpenJoinReject::Replay);
     }
     if !limiter.allow(now_ms) {
         return Err(OpenJoinReject::RateLimited);
     }
+    limiter.record_nonce(&req.nonce, now_ms);
 
     // 8. Ban-check against the materialized state strictly before the joiner's
     //    Join HLC. A Banned owner is rejected even if their fresh Join would
@@ -644,5 +655,67 @@ mod tests {
             .map(|_| ());
         }
         assert_eq!(last.unwrap_err(), OpenJoinReject::RateLimited);
+    }
+
+    /// A request shed by the rate limiter must NOT persist its nonce: once the
+    /// rate-limit window rolls over, the SAME nonce must be admissible (it was
+    /// never actually accepted, so retrying it is not a replay).
+    #[test]
+    fn rate_limited_request_nonce_is_retryable_after_window() {
+        let f = Fixture::new();
+        let mut lim = OpenJoinRateLimiter::default();
+        // Saturate the window with unique nonces so the next request is shed.
+        for _ in 0..OPEN_JOIN_RATE_LIMIT_PER_WINDOW {
+            let (req, sig, sb) = f.fresh_request();
+            verify_and_admit_open_join(
+                &req,
+                &sig,
+                &sb,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                &mut lim,
+            )
+            .expect("in-window requests admit");
+        }
+        // This one is rate-limited; its nonce must NOT be recorded.
+        let (shed_req, shed_sig, shed_sb) = f.valid_request();
+        assert_eq!(
+            verify_and_admit_open_join(
+                &shed_req,
+                &shed_sig,
+                &shed_sb,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                &mut lim,
+            )
+            .unwrap_err(),
+            OpenJoinReject::RateLimited
+        );
+        // After the rate-limit window rolls over, the SAME nonce is admissible
+        // (not a replay) because the shed request never persisted it.
+        let later = f.now_ms + OPEN_JOIN_RATE_LIMIT_WINDOW_MS + 1;
+        verify_and_admit_open_join(
+            &shed_req,
+            &shed_sig,
+            &shed_sb,
+            &f.epoch_key,
+            f.community_id,
+            f.admin_addr,
+            &f.current_events,
+            later,
+            // Widen freshness so the request's created_at is still in-window at
+            // the later wall clock (the rate-limit window > default freshness).
+            OPEN_JOIN_RATE_LIMIT_WINDOW_MS * 4,
+            &mut lim,
+        )
+        .expect("a previously rate-limited nonce is admissible after the window");
     }
 }

@@ -204,6 +204,10 @@ impl CommunityRendezvousPublisher {
 
         if let Some(handle) = opt_unregister_handle {
             self.sink.unregister(&handle).await;
+            // A relinquished slot (rank change to a different slot, or opt-out to
+            // None) is a demotion — record it so the (deferred) self-promotion
+            // driver's tuning counter isn't dead.
+            self.observability.record_demotion();
         }
 
         if let Some(slot) = opt_register_slot {
@@ -457,6 +461,8 @@ mod tests {
             .await
             .iter()
             .any(|h| h.contains("rendezvous")));
+        // Relinquishing the slot (opt-out to None) records a demotion.
+        assert_eq!(p.observability().demotions.load(Ordering::Relaxed), 1);
     }
 
     #[test]

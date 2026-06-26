@@ -3510,6 +3510,25 @@
         service={libraryDirectoryService}
         adapter={tauriAdapter}
         onOpenJoinIroh={(inviteUrl) => openJoinIroh(inviteUrl)}
+        onJoinedUi={async (dto) => {
+          // Open-community cross-WAN first-contact "joined" follow-up: the
+          // `connectivity_open_join_iroh` IPC already committed membership
+          // backend-side, so this runs ONLY the UI side-effects (nav-update,
+          // community switch, member refresh) — it must NOT re-invoke
+          // `join_open_community`, which would be a redundant second backend
+          // join. Mirrors the side-effects in `onJoin` below, minus the
+          // backend `joinOpenCommunity` call.
+          navService.addOrUpdateNavSpace({
+            action: 'added',
+            spaceId: dto.communityId,
+            kind: 'community',
+            name: dto.communityName,
+            members: [],
+            parentId: null,
+          });
+          changeSelectedCommunity(dto.communityId);
+          await refreshCommunityMembers(dto.communityId);
+        }}
         onJoin={async (communityId) => {
           // ZEB-252 Sub-D Phase 6: typed direct-join. Backend re-resolves
           // the matching directory entry server-side and delegates to

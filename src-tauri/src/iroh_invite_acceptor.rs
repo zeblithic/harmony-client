@@ -525,6 +525,23 @@ where
         let epoch_key = engine.membership_key();
         let admin_addr = engine.admin_addr();
 
+        // SECURITY: tokenless open-join is only valid for OPEN communities. An
+        // `epoch_key` holder targeting an INVITE-ONLY community must still pass
+        // the invite/countersign gate; admitting an open-join here would bypass
+        // that gate. Reject BEFORE any admission processing.
+        if engine.is_invite_only() {
+            tracing::warn!(
+                community_id = %hex::encode(community_id.0),
+                remote_id = ?conn.remote_id(),
+                "open-join rejected: community is invite-only (countersign-gated)"
+            );
+            let resp = OpenJoinResponse::Rejected {
+                reason: "community is invite-only".to_string(),
+            };
+            self.write_len_prefixed_cbor(&mut send, &resp).await?;
+            return Err(HandshakeAcceptError::OpenJoinNotPermitted);
+        }
+
         // Snapshot the event log under the inner-state lock, then DROP the
         // lock before the (synchronous) verify+admit and the engine apply.
         let current_events = {
@@ -582,10 +599,32 @@ where
         // reaches every member over Zenoh. Mirrors the open-redeem arm in
         // `redeem_invite_inner_with_overrides`.
         let join_event_id = req.join_event.id;
-        engine
-            .insert_local_event(req.join_event)
-            .await
-            .map_err(|e| HandshakeAcceptError::HandleUnicast(format!("{e:?}")))?;
+        // `insert_local_event` runs `verify_event` and returns
+        // `Ok(InsertOutcome::Rejected(v))` for a SEMANTIC rejection (only `Err`
+        // is a transport failure). A Rejected insert means the Join did not land
+        // in the engine, so we must NOT report `Admitted` (which would tell the
+        // joiner it's a member while the beacon never published its Join). Match
+        // the outcome and surface a typed rejection on Rejected.
+        match engine.insert_local_event(req.join_event).await {
+            Ok(crate::community_state_crdt::InsertOutcome::Inserted)
+            | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {}
+            Ok(crate::community_state_crdt::InsertOutcome::Rejected(v)) => {
+                tracing::warn!(
+                    ?v,
+                    community_id = %hex::encode(community_id.0),
+                    remote_id = ?conn.remote_id(),
+                    "open-join: admitted Join rejected by engine verify_event; not reporting Admitted"
+                );
+                let resp = OpenJoinResponse::Rejected {
+                    reason: format!("join rejected on apply: {v:?}"),
+                };
+                self.write_len_prefixed_cbor(&mut send, &resp).await?;
+                return Err(HandshakeAcceptError::OpenJoinRejected);
+            }
+            Err(e) => {
+                return Err(HandshakeAcceptError::HandleUnicast(format!("{e:?}")));
+            }
+        }
 
         // Respond with the membership snapshot so the joiner converges fast.
         // For a large-membership community the snapshot can exceed the 256KiB
@@ -693,6 +732,13 @@ pub enum HandshakeAcceptError {
     /// variant just records the failure for the trait dispatch's warn log.
     #[error("open-join rejected")]
     OpenJoinRejected,
+    /// A tokenless open-join (`0x11`) request targeted an INVITE-ONLY community.
+    /// Open-join is only valid for open communities; an `epoch_key` holder must
+    /// still pass the invite/countersign gate, so this is rejected before any
+    /// admission processing. The typed `OpenJoinResponse::Rejected` was already
+    /// written to the dialer.
+    #[error("open-join not permitted for an invite-only community")]
+    OpenJoinNotPermitted,
     #[error(
         "JoinCountersign for target_event_id={target_event_id:?} did not land within {deadline_ms}ms"
     )]

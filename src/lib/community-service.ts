@@ -14,6 +14,19 @@ interface MembersChangedPayload { communityId: string; }
 interface DegradedPayload { communityId: string; degraded: boolean; }
 
 /**
+ * Open-community cross-WAN first-contact status (camelCase wire key `status`).
+ * The backend (`connectivity_open_join_iroh`) emits exactly one of these, or
+ * omits the field entirely on the legacy/local redeem path:
+ *   - `"joined"`    → the join completed.
+ *   - `"searching"` → RETRYABLE cold start: no beacon reachable yet; the node
+ *                     keeps retrying on its transport-epoch re-arm.
+ *   - `"rejected"`  → the beacon explicitly rejected the join (banned / bad
+ *                     capability), or an internal dial invariant failed — a
+ *                     distinct, NON-retryable blocked state.
+ */
+export type OpenJoinStatus = 'joined' | 'searching' | 'rejected';
+
+/**
  * Mirrors `RedeemInviteResultDto` in src-tauri/src/lib.rs (ZEB-265).
  * Returned from `redeem_invite` so the caller can render a real
  * community name + record the kind without re-decoding the invite URL.
@@ -34,16 +47,10 @@ export interface RedeemInviteResultDto {
    * Open-community cross-WAN first-contact status (camelCase wire key
    * `status`, omitted by the backend when null — so this is `undefined`
    * for the legacy/local redeem path). Only emitted by
-   * `connectivity_open_join_iroh`:
-   *   - `"joined"`    → the join completed.
-   *   - `"searching"` → RETRYABLE cold-start: no beacon was reachable yet;
-   *                     the node keeps retrying on its transport-epoch
-   *                     re-arm. A non-blocking "still searching" state.
-   *   - `"rejected"`  → the beacon explicitly rejected the join (banned /
-   *                     bad capability). A distinct blocked state.
-   * Field absent → legacy/local redeem; render exactly as today.
+   * `connectivity_open_join_iroh`. Field absent → legacy/local redeem;
+   * render exactly as today. See {@link OpenJoinStatus}.
    */
-  status?: string;
+  status?: OpenJoinStatus;
 }
 
 /**

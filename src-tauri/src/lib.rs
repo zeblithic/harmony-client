@@ -26284,18 +26284,29 @@ where
                 }
                 Err(e) => {
                     // An internal build/encode invariant violation (NOT a
-                    // transport failure — those are retryable Ok outcomes).
-                    // The local self-Join is already durable; surface the error
-                    // so the caller can distinguish a genuine bug from a cold
-                    // start, but do NOT roll back the join.
-                    tracing::warn!(
+                    // transport failure — those are retryable `Ok` cold-start
+                    // outcomes). Masking this as `no_beacon_reachable` would hide
+                    // a genuine bug behind a perpetual "searching" spinner that
+                    // never resolves. Log LOUDLY (error-level) and surface a
+                    // DISTINCT, NON-retryable outcome instead. The local self-Join
+                    // committed above stays durable (this branch does NOT early-
+                    // return, so the `community_sync_guard.commit()` below still
+                    // runs); only the first-contact dial result is downgraded to
+                    // a blocked (not retryable) state.
+                    tracing::error!(
                         community_id = %hex::encode(minted.community_id.0),
                         error = %e,
-                        "open-join: first-contact dial errored (local self-Join \
-                         already committed; treating as retryable cold start)"
+                        "open-join: first-contact dial failed on an INTERNAL invariant \
+                         (build/encode) — NOT a transport cold start; surfacing a \
+                         non-retryable blocked outcome (local self-Join stays committed)"
                     );
                     open_join_outcome = Some(crate::open_join_dial::OpenJoinOutcome {
-                        status: "no_beacon_reachable".to_string(),
+                        // Maps via `redeem_dto_from_open_join_outcome` to
+                        // `pending = false`, `status = Some("rejected")` — a
+                        // distinct blocked state, NOT the retryable searching
+                        // spinner. (Genuine transport-unreachable stays the
+                        // retryable `no_beacon_reachable` Ok-outcome.)
+                        status: "beacon_rejected".to_string(),
                         community_id: Some(hex::encode(minted.community_id.0)),
                     });
                 }
@@ -43180,8 +43191,12 @@ pub(crate) async fn connectivity_open_join_iroh_impl(
     };
 
     // Every NodeState handle below is required to mint + spawn + commit the
-    // open join. A missing one means the node isn't fully booted; surface a
-    // retryable searching status rather than panic-unwrapping.
+    // open join. A missing one means the node isn't fully booted — this is an
+    // INIT FAILURE, not a transient "no beacon yet". Surfacing it as the
+    // retryable "searching" status would mask a real boot problem behind a
+    // spinner that never resolves. Return a hard `Err` so the UI shows a
+    // distinct error (the `openJoinIroh` adapter wraps a rejection into
+    // `joinError`) rather than a perpetual cold-start.
     let (
         Some(pkarr_resolver),
         Some(crdt_state),
@@ -43204,13 +43219,11 @@ pub(crate) async fn connectivity_open_join_iroh_impl(
         dm_outbox,
     )
     else {
-        return Ok(RedeemInviteResultDto {
-            community_id: String::new(),
-            community_name: String::new(),
-            is_invite_only: false,
-            pending: true,
-            status: Some("searching".to_string()),
-        });
+        return Err(
+            "connectivity_open_join_iroh: node not fully booted (a required handle is \
+             missing) — cannot open-join; this is an init failure, not a retryable cold start"
+                .to_string(),
+        );
     };
 
     // ZEB-339: the self-Join minted on this open path signs with the enrolled

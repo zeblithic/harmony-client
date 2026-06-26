@@ -8,7 +8,7 @@ import type {
   DiscoveredLibraryInfo,
 } from '../../library-directory-service';
 import type { TauriAdapter } from '../../zenoh-service';
-import type { RedeemInviteResultDto } from '../../community-service';
+import type { OpenJoinStatus, RedeemInviteResultDto } from '../../community-service';
 
 /**
  * Open-community cross-WAN first-contact: the `connectivity_open_join_iroh`
@@ -16,7 +16,9 @@ import type { RedeemInviteResultDto } from '../../community-service';
  * drives the join UI. This suite asserts the status → UI mapping in
  * `LibraryDirectoryBrowser` (the open-community join flow):
  *   - "searching" → non-blocking retry banner (NOT an error; spinner shown).
- *   - "joined"    → normal joined success (delegates to onJoin + closes modal).
+ *   - "joined"    → UI-only follow-up (onJoinedUi) + close. Does NOT re-invoke
+ *                   the backend `onJoin` (the open-join IPC already committed
+ *                   membership — a second `onJoin` would be a redundant join).
  *   - "rejected"  → distinct blocked banner (NOT the searching spinner).
  *
  * `onOpenJoinIroh` (wired to the adapter's `openJoinIroh`) is mocked to return
@@ -59,7 +61,7 @@ const fixtureEntry: DirectoryEntry = {
   listed_at: { w: 0, l: 0, d: 'd' },
 };
 
-function dto(status: string | undefined): RedeemInviteResultDto {
+function dto(status: OpenJoinStatus | undefined): RedeemInviteResultDto {
   return {
     communityId: COMMUNITY_ID,
     communityName: 'Open Community',
@@ -73,15 +75,16 @@ function renderBrowser(
   onOpenJoinIroh: (inviteUrl: string) => Promise<RedeemInviteResultDto>,
   onJoin = vi.fn().mockResolvedValue(undefined),
   onClose = vi.fn(),
+  onJoinedUi = vi.fn().mockResolvedValue(undefined),
 ) {
   const svc = mockService(
     [{ address: 'aabbccddeeff00112233445566778899', added_at: { w: 0, l: 0, d: 'd' }, entry_count: 1 }],
     [fixtureEntry],
   );
   const utils = render(LibraryDirectoryBrowser, {
-    props: { service: svc, adapter: mockAdapter(), onJoin, onOpenJoinIroh, onClose },
+    props: { service: svc, adapter: mockAdapter(), onJoin, onOpenJoinIroh, onJoinedUi, onClose },
   });
-  return { ...utils, onJoin, onClose, svc };
+  return { ...utils, onJoin, onClose, onJoinedUi, svc };
 }
 
 describe('open-community cold-start join (connectivity_open_join_iroh status mapping)', () => {
@@ -91,7 +94,7 @@ describe('open-community cold-start join (connectivity_open_join_iroh status map
 
   it('"searching" renders the non-blocking retry banner — NOT an error, modal stays open', async () => {
     const onOpenJoinIroh = vi.fn().mockResolvedValue(dto('searching'));
-    const { findByText, getByTestId, queryByTestId, onJoin, onClose } =
+    const { findByText, getByTestId, queryByTestId, onJoin, onClose, onJoinedUi } =
       renderBrowser(onOpenJoinIroh);
 
     await fireEvent.click(await findByText('Join'));
@@ -111,22 +114,30 @@ describe('open-community cold-start join (connectivity_open_join_iroh status map
     // It is NOT the rejected/blocked banner.
     expect(queryByTestId('cold-start-rejected')).toBeNull();
 
-    // Non-blocking: the LAN onJoin side-effects did NOT fire and the modal
-    // did NOT close (the user keeps waiting in place).
+    // Non-blocking: neither the LAN onJoin nor the joined UI follow-up fired,
+    // and the modal did NOT close (the user keeps waiting in place).
     expect(onJoin).not.toHaveBeenCalled();
+    expect(onJoinedUi).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  it('"joined" takes the normal joined success path (onJoin + close), no cold-start banner', async () => {
-    const onOpenJoinIroh = vi.fn().mockResolvedValue(dto('joined'));
-    const { findByText, onJoin, onClose, queryByTestId } = renderBrowser(onOpenJoinIroh);
+  it('"joined" runs the UI-only follow-up (onJoinedUi + close) and does NOT re-invoke the backend onJoin', async () => {
+    const joinedDto = dto('joined');
+    const onOpenJoinIroh = vi.fn().mockResolvedValue(joinedDto);
+    const { findByText, onJoin, onClose, onJoinedUi, queryByTestId } =
+      renderBrowser(onOpenJoinIroh);
 
     await fireEvent.click(await findByText('Join'));
 
     await waitFor(() => {
-      expect(onJoin).toHaveBeenCalledWith(COMMUNITY_ID);
+      // UI follow-up receives the open-join result DTO; modal closes.
+      expect(onJoinedUi).toHaveBeenCalledWith(joinedDto);
       expect(onClose).toHaveBeenCalled();
     });
+
+    // The backend (LAN) join is NOT re-invoked — the open-join IPC already
+    // committed membership, so a second `onJoin` would be a redundant join.
+    expect(onJoin).not.toHaveBeenCalled();
 
     // Neither cold-start banner is shown on the joined path.
     expect(queryByTestId('cold-start-searching')).toBeNull();
@@ -135,7 +146,7 @@ describe('open-community cold-start join (connectivity_open_join_iroh status map
 
   it('"rejected" renders the distinct blocked banner — NOT the searching spinner', async () => {
     const onOpenJoinIroh = vi.fn().mockResolvedValue(dto('rejected'));
-    const { findByText, getByTestId, queryByTestId, onJoin, onClose } =
+    const { findByText, getByTestId, queryByTestId, onJoin, onClose, onJoinedUi } =
       renderBrowser(onOpenJoinIroh);
 
     await fireEvent.click(await findByText('Join'));
@@ -148,8 +159,9 @@ describe('open-community cold-start join (connectivity_open_join_iroh status map
     // It is NOT the searching spinner.
     expect(queryByTestId('cold-start-searching')).toBeNull();
 
-    // Blocked: did not join, did not close.
+    // Blocked: did not join (neither LAN nor UI follow-up), did not close.
     expect(onJoin).not.toHaveBeenCalled();
+    expect(onJoinedUi).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
   });
 

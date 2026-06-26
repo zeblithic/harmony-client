@@ -93,10 +93,13 @@ impl RendezvousResolveConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
         if let Ok(curve) = std::env::var("HARMONY_OPEN_JOIN_RESOLVE_CURVE") {
+            // CLAMP each parsed width to 1..=RENDEZVOUS_SLOT_COUNT rather than
+            // dropping out-of-range entries: a user passing `8` with N=4 wants a
+            // full-width batch, not a silently-dropped curve step.
             let parsed: Vec<usize> = curve
                 .split(',')
-                .filter_map(|s| s.trim().parse().ok())
-                .filter(|w| *w >= 1 && *w <= RENDEZVOUS_SLOT_COUNT)
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .map(|w| w.clamp(1, RENDEZVOUS_SLOT_COUNT))
                 .collect();
             if !parsed.is_empty() {
                 cfg.batch_curve = parsed;
