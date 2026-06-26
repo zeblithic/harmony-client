@@ -326,7 +326,14 @@ where
         // handle_unicast below.
         let packet = community_invite::decode_packet(&packet_bytes)
             .map_err(|e| HandshakeAcceptError::Decode(e.to_string()))?;
-        let community_invite::CommunityInvitePacket::Invite { signed, .. } = packet;
+        let community_invite::CommunityInvitePacket::Invite { signed, .. } = packet else {
+            // Open-join packets (0x11) are handled by the open-join admit
+            // dispatcher, not this invite acceptor. Reject here so the
+            // peek stays invite-only until that path is wired in.
+            return Err(HandshakeAcceptError::Decode(
+                "expected an invite packet on the invite-acceptor path".to_string(),
+            ));
+        };
         let bootstrap_join_id = signed.join_event.id;
         let community_id = signed.community_id;
 

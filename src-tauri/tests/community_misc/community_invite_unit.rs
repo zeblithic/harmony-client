@@ -492,6 +492,7 @@ fn community_invite_packet_roundtrip() {
             assert_eq!(s1, s2);
             assert_eq!(sig1, sig2);
         }
+        other => panic!("expected a pair of Invite packets, got {other:?}"),
     }
 }
 
