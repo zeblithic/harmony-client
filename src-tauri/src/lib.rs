@@ -134,6 +134,7 @@ pub mod community_relay_publisher;
 pub mod community_relay_pull;
 pub mod community_relay_pull_driver;
 pub mod community_relay_resolver;
+pub mod community_rendezvous;
 // ZEB-487: read-only DTO + mapper for the headless `get_relay_held` RPC.
 pub mod community_state_crdt;
 pub mod relay_held_dto;
