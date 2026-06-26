@@ -450,34 +450,48 @@ impl SnapshotEventApplier for CommunitySyncEngine {
 /// permanently — the joiner would converge into membership but never receive the
 /// channels.
 ///
-/// Retry-until-stable: re-apply the rejected remainder each round. Every round
-/// that materializes a new enrollment unblocks its dependents, so the snapshot
-/// converges in O(dependency-depth) rounds. A round with zero progress means the
-/// remainder is genuinely unverifiable (not an ordering miss); those are logged
-/// and dropped, matching the prior best-effort behavior. A duplicate (e.g. the
-/// joiner's own Join, already inserted by the open-redeem local arm) is an
-/// idempotent `AlreadyKnown`. Returns the number of events that landed.
+/// Two-tier ordering. First sort by [`event_sort_key`] — the canonical replay
+/// comparator the inbound merge path (`community_state_sync`) sorts by to apply
+/// a partially-ordered DAG-sync blob without order-caused verify rejections — so
+/// the common case (an actor's Join carries an earlier HLC than its dependent
+/// events) converges in a single pass with no re-verification. Then
+/// retry-until-stable as a fallback for any residual dependency the sort key
+/// doesn't capture: re-apply the rejected remainder each round; every round that
+/// materializes a new enrollment unblocks its dependents, bounded by
+/// `member_events.len()` rounds. A round with zero progress means the remainder
+/// is genuinely unverifiable — logged per-event with its `VerifyError` (matching
+/// the merge path's diagnostics) and dropped. A duplicate (e.g. the joiner's own
+/// Join, already inserted by the open-redeem local arm) is an idempotent
+/// `AlreadyKnown`. Returns the number of events that landed.
 async fn apply_admitted_snapshot<A: SnapshotEventApplier>(
     applier: &A,
     member_events: Vec<crate::community_membership::SignedMembershipEvent>,
 ) -> usize {
+    use crate::community_membership::event_sort_key;
     use crate::community_state_crdt::InsertOutcome;
+    // Canonical replay order first (mirrors the inbound merge path); the retry
+    // loop below is the fallback for anything the sort key can't capture.
     let mut pending = member_events;
+    pending.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
     let mut applied = 0usize;
-    // Each round either lands at least one new event or we stop, so this runs at
-    // most `member_events.len()` rounds — bounded, no risk of spinning.
     loop {
         if pending.is_empty() {
             break;
         }
         let applied_before = applied;
-        let mut deferred = Vec::new();
+        // Carry the `VerifyError` with each deferred event so the no-progress
+        // path can report which events failed and why (Qodo: parity with the
+        // merge path's per-event verify diagnostics).
+        let mut deferred: Vec<(
+            crate::community_membership::SignedMembershipEvent,
+            crate::community_membership::VerifyError,
+        )> = Vec::new();
         for ev in std::mem::take(&mut pending) {
             match applier.apply_one(ev.clone()).await {
                 Ok(InsertOutcome::Inserted) | Ok(InsertOutcome::AlreadyKnown) => applied += 1,
                 // A semantic rejection may just be an ordering miss (a dependency
-                // not yet materialized) — defer it to a later round.
-                Ok(InsertOutcome::Rejected(_)) => deferred.push(ev),
+                // not yet materialized) — keep the reason and defer to a later round.
+                Ok(InsertOutcome::Rejected(v)) => deferred.push((ev, v)),
                 // A non-ordering failure (transport / wrong-community) can't be
                 // resolved by re-application; log and drop.
                 Err(e) => tracing::warn!(
@@ -486,18 +500,21 @@ async fn apply_admitted_snapshot<A: SnapshotEventApplier>(
                 ),
             }
         }
-        pending = deferred;
         if applied == applied_before {
             // No event landed this round — the remainder can't be unblocked by
-            // re-application.
+            // re-application. Log each with its rejection reason, then stop.
+            for (ev, reason) in &deferred {
+                tracing::warn!(
+                    community_id = %hex::encode(ev.community_id.0),
+                    event_id = %hex::encode(ev.id),
+                    kind = ?ev.kind,
+                    ?reason,
+                    "open-join: admitted snapshot event never verified (dropping)"
+                );
+            }
             break;
         }
-    }
-    if !pending.is_empty() {
-        tracing::warn!(
-            unresolved = pending.len(),
-            "open-join: admitted snapshot retained unverifiable events after retry-until-stable"
-        );
+        pending = deferred.into_iter().map(|(ev, _)| ev).collect();
     }
     applied
 }
@@ -589,11 +606,14 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_snapshot_applies_enrollment_dependent_events_out_of_order() {
-        // ZEB-573 regression: the beacon ships its event log in hash order, so an
-        // admin-signed ChannelCreate can arrive BEFORE the admin's enrollment
-        // Join. A naive single pass drops it (SignerNotEnrolledForActor) and the
-        // joiner never receives the channel. The dependency-ordered apply must
-        // land both, Join first.
+        // ZEB-573 regression. `apply_admitted_snapshot` first sorts by
+        // `event_sort_key` (which fixes the common hash-order case in one pass),
+        // then retries-until-stable as a fallback. To exercise that FALLBACK,
+        // this fixture inverts the HLCs so the sort still orders the admin
+        // ChannelCreate (wall_ms 10) BEFORE the admin Join (wall_ms 20) — an
+        // enrollment dependency the sort key can't capture. A naive single pass
+        // drops the ChannelCreate (SignerNotEnrolledForActor); the apply must
+        // still land both, with the Join materialized first.
         let admin = OwnerAddr([0x21; 16]);
         let community = SpaceId([0x42; 16]);
         let admin_join = SignedMembershipEvent {
@@ -602,7 +622,7 @@ mod tests {
             kind: MembershipEventKind::Join,
             actor: admin,
             at: Hlc {
-                wall_ms: 10,
+                wall_ms: 20,
                 logical: 0,
                 device_id: "admin".into(),
             },
@@ -621,7 +641,7 @@ mod tests {
             },
             actor: admin,
             at: Hlc {
-                wall_ms: 20,
+                wall_ms: 10,
                 logical: 0,
                 device_id: "admin".into(),
             },
@@ -629,7 +649,8 @@ mod tests {
             countersig: None,
             enrollment: None,
         };
-        // Worst-case order: channel-create BEFORE the admin's Join.
+        // Input order is irrelevant (the apply sorts first); the HLC inversion
+        // above is what forces the channel-create ahead of the Join post-sort.
         let events = vec![channel_create.clone(), admin_join.clone()];
 
         let mock = OrderingMockApplier {
