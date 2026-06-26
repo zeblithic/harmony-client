@@ -9,7 +9,12 @@
 use crate::community_relay_announce::COMMUNITY_RELAY_ADVERTISERS_MAX;
 use crate::owner_state_types::EpochKey;
 use crate::owner_state_types::OwnerAddr;
+use crate::reachability_record::ReachabilityAnnouncePayload;
 use harmony_pkarr::derive::{derive_ephemeral_key, PkarrCase};
+use harmony_pkarr::epoch::epoch_tolerance_window;
+use harmony_pkarr::PkarrResolver;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Number of enumerated rendezvous slots == the relay-advertiser cap.
 pub const RENDEZVOUS_SLOT_COUNT: usize = COMMUNITY_RELAY_ADVERTISERS_MAX;
@@ -58,6 +63,177 @@ pub fn slot_for_advertiser(advertisers: &[OwnerAddr], me: &OwnerAddr) -> Option<
         return None;
     }
     Some(rank as u16)
+}
+
+/// Tunable widening schedule + per-batch deadline for the joiner's escalating
+/// rendezvous resolve.
+pub struct RendezvousResolveConfig {
+    /// Widening curve of batch widths, e.g. `[1, 2, N]`: probe slot 0, then
+    /// 0..1, then all. Tunable so the success-rate/latency trade can be set
+    /// from data (the spec's open question).
+    pub batch_curve: Vec<usize>,
+    /// Per-batch resolve deadline. Reserved for the production resolver's
+    /// network timeout; the pure driver records timing but never sleeps.
+    pub per_batch_deadline: Duration,
+}
+
+impl Default for RendezvousResolveConfig {
+    fn default() -> Self {
+        Self {
+            batch_curve: vec![1, 2, RENDEZVOUS_SLOT_COUNT],
+            per_batch_deadline: Duration::from_millis(2_500),
+        }
+    }
+}
+
+impl RendezvousResolveConfig {
+    /// Override from `HARMONY_OPEN_JOIN_RESOLVE_CURVE` (comma-separated batch
+    /// widths, each clamped to `1..=RENDEZVOUS_SLOT_COUNT`) and
+    /// `HARMONY_OPEN_JOIN_RESOLVE_DEADLINE_MS` (clamped `>= 1`).
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(curve) = std::env::var("HARMONY_OPEN_JOIN_RESOLVE_CURVE") {
+            let parsed: Vec<usize> = curve
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .filter(|w| *w >= 1 && *w <= RENDEZVOUS_SLOT_COUNT)
+                .collect();
+            if !parsed.is_empty() {
+                cfg.batch_curve = parsed;
+            }
+        }
+        if let Ok(ms) = std::env::var("HARMONY_OPEN_JOIN_RESOLVE_DEADLINE_MS") {
+            if let Ok(ms) = ms.parse::<u64>() {
+                cfg.per_batch_deadline = Duration::from_millis(ms.max(1));
+            }
+        }
+        cfg
+    }
+}
+
+/// Result of a joiner's escalating-batch resolve, carrying the instrumentation
+/// the spec's tuning open-question needs: which slot answered, how long it took,
+/// and how many widening batches were probed.
+#[derive(Debug, Default)]
+pub struct RendezvousResolveOutcome {
+    pub payload: Option<ReachabilityAnnouncePayload>,
+    pub winning_slot: Option<u16>,
+    pub elapsed_ms: u64,
+    pub batches_tried: usize,
+}
+
+/// Abstraction over "probe one rendezvous slot at one epoch". The production
+/// impl ([`PkarrSlotResolver`]) derives the slot verifying-key and queries
+/// pkarr; tests inject a deterministic stub. Returns `Some` only for a live,
+/// freshness-valid record.
+#[async_trait::async_trait]
+pub trait SlotResolver {
+    async fn resolve_slot(
+        &self,
+        slot_index: u16,
+        epoch_id: u64,
+    ) -> Option<ReachabilityAnnouncePayload>;
+}
+
+/// Escalating-batch rendezvous resolve over any [`SlotResolver`] (pure: no I/O,
+/// no clock — `now_ms` is supplied). For each width `w` in `cfg.batch_curve`,
+/// probe slots `0..w` across the epoch-tolerance window CONCURRENTLY, take the
+/// first live record, and return early recording `winning_slot` +
+/// `batches_tried` + `elapsed_ms`. Returns an empty outcome (cold start) if no
+/// slot answers across all batches.
+pub async fn resolve_rendezvous_with<R: SlotResolver + Sync>(
+    resolver: &R,
+    now_ms: u64,
+    cfg: &RendezvousResolveConfig,
+) -> RendezvousResolveOutcome {
+    let started = std::time::Instant::now();
+    let epoch_window = epoch_tolerance_window(now_ms);
+    let mut outcome = RendezvousResolveOutcome::default();
+
+    for &width in &cfg.batch_curve {
+        outcome.batches_tried += 1;
+        let capped = width.min(RENDEZVOUS_SLOT_COUNT);
+        // Probe every (slot, epoch) pair in this batch concurrently.
+        let mut probes = Vec::with_capacity(capped * epoch_window.len());
+        for slot in 0..capped as u16 {
+            for &epoch_id in &epoch_window {
+                probes.push(async move {
+                    resolver
+                        .resolve_slot(slot, epoch_id)
+                        .await
+                        .map(|payload| (slot, payload))
+                });
+            }
+        }
+        let results = futures::future::join_all(probes).await;
+        // First live record in slot-ascending order wins (probes were pushed
+        // slot-major, so the first `Some` is the lowest-numbered live slot).
+        if let Some((slot, payload)) = results.into_iter().flatten().next() {
+            outcome.winning_slot = Some(slot);
+            outcome.payload = Some(payload);
+            outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+            tracing::info!(
+                winning_slot = slot,
+                elapsed_ms = outcome.elapsed_ms,
+                batches_tried = outcome.batches_tried,
+                "open-join rendezvous resolved (tuning metric)"
+            );
+            return outcome;
+        }
+    }
+
+    outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+    tracing::info!(
+        winning_slot = tracing::field::Empty,
+        elapsed_ms = outcome.elapsed_ms,
+        batches_tried = outcome.batches_tried,
+        "open-join rendezvous resolve found no live beacon (cold start)"
+    );
+    outcome
+}
+
+/// Production [`SlotResolver`]: derives the slot verifying-key from `epoch_key`,
+/// queries pkarr, checks freshness, and decodes the routing blob into a
+/// [`ReachabilityAnnouncePayload`]. The BEP44 envelope already proves the writer
+/// held `epoch_key`, so the inner identity signature is intentionally NOT
+/// verified here — the joiner does not know the beacon's identity; trust is
+/// established at the handshake/admission layer.
+pub struct PkarrSlotResolver {
+    pub pkarr: Arc<PkarrResolver>,
+    pub epoch_key: EpochKey,
+    /// Wall-clock ms threaded in for the freshness check (kept off the trait so
+    /// the driver stays pure).
+    pub now_ms: u64,
+}
+
+#[async_trait::async_trait]
+impl SlotResolver for PkarrSlotResolver {
+    async fn resolve_slot(
+        &self,
+        slot_index: u16,
+        epoch_id: u64,
+    ) -> Option<ReachabilityAnnouncePayload> {
+        let vk = rendezvous_slot_verifying_key(&self.epoch_key, slot_index, epoch_id);
+        let rec = self.pkarr.resolve(&vk).await.ok()??;
+        rec.verify_freshness(self.now_ms).ok()?;
+        ciborium::from_reader::<ReachabilityAnnouncePayload, _>(rec.routing_blob.as_slice()).ok()
+    }
+}
+
+/// Production entry point: build a [`PkarrSlotResolver`] over a live pkarr
+/// resolver + the community `epoch_key`, then run the escalating-batch resolve.
+pub async fn resolve_rendezvous(
+    pkarr: &Arc<PkarrResolver>,
+    epoch_key: &EpochKey,
+    now_ms: u64,
+    cfg: &RendezvousResolveConfig,
+) -> RendezvousResolveOutcome {
+    let resolver = PkarrSlotResolver {
+        pkarr: Arc::clone(pkarr),
+        epoch_key: epoch_key.clone(),
+        now_ms,
+    };
+    resolve_rendezvous_with(&resolver, now_ms, cfg).await
 }
 
 #[cfg(test)]
@@ -158,5 +334,82 @@ mod tests {
         assert_eq!(slot_for_advertiser(&set, &addr(1)), Some(0));
         assert_eq!(slot_for_advertiser(&set, &addr(2)), Some(1));
         assert_eq!(slot_for_advertiser(&set, &addr(3)), Some(2));
+    }
+
+    /// Deterministic `SlotResolver`: answers only for a single configured live
+    /// slot (or never). Ignores `epoch_id` (the escalating-batch logic is what's
+    /// under test, not epoch derivation).
+    struct StubResolver {
+        live_slot: Option<u16>,
+    }
+
+    impl StubResolver {
+        fn with_live_slot(slot: u16) -> Self {
+            Self {
+                live_slot: Some(slot),
+            }
+        }
+        fn all_dead() -> Self {
+            Self { live_slot: None }
+        }
+    }
+
+    fn dummy_payload() -> ReachabilityAnnouncePayload {
+        ReachabilityAnnouncePayload {
+            iroh_node_id: [1u8; 32],
+            home_relay_url: "https://relay.example/".into(),
+            direct_addresses: Vec::new(),
+            announced_at_ms: 1_000_000,
+            identity_signature: [0u8; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SlotResolver for StubResolver {
+        async fn resolve_slot(
+            &self,
+            slot_index: u16,
+            _epoch_id: u64,
+        ) -> Option<ReachabilityAnnouncePayload> {
+            if Some(slot_index) == self.live_slot {
+                Some(dummy_payload())
+            } else {
+                None
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_slot0_without_widening_when_slot0_is_live() {
+        let stub = StubResolver::with_live_slot(0);
+        let cfg = RendezvousResolveConfig::default();
+        let out = resolve_rendezvous_with(&stub, 1_000_000, &cfg).await;
+        assert_eq!(out.winning_slot, Some(0));
+        assert_eq!(
+            out.batches_tried, 1,
+            "should not widen past the first batch"
+        );
+        assert!(out.payload.is_some());
+    }
+
+    #[tokio::test]
+    async fn widens_to_find_a_live_slot_when_slot0_is_dead() {
+        let stub = StubResolver::with_live_slot(2); // only slot 2 answers
+        let cfg = RendezvousResolveConfig::default(); // curve [1, 2, N]
+        let out = resolve_rendezvous_with(&stub, 1_000_000, &cfg).await;
+        assert_eq!(out.winning_slot, Some(2));
+        assert!(out.batches_tried >= 3, "had to widen to the full set");
+        assert!(out.payload.is_some());
+    }
+
+    #[tokio::test]
+    async fn cold_start_returns_none() {
+        let stub = StubResolver::all_dead();
+        let cfg = RendezvousResolveConfig::default();
+        let out = resolve_rendezvous_with(&stub, 1_000_000, &cfg).await;
+        assert_eq!(out.payload, None);
+        assert_eq!(out.winning_slot, None);
     }
 }
