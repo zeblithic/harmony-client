@@ -49,12 +49,14 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use iroh::endpoint::Connection;
+use serde::Serialize;
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::community_invite::{self, AppHandleEmit};
+use crate::community_invite::{self, AppHandleEmit, OpenJoinResponse};
 use crate::community_membership::{EventId, MembershipEventKind, SignedMembershipEvent};
 use crate::community_state_sync::CommunitySyncRegistry;
 use crate::dm_outbox::DmOutbox;
+use crate::open_join_admit::{OpenJoinRateLimiter, OPEN_JOIN_FRESHNESS_WINDOW_MS};
 use crate::owner_state_crdt::OwnerState;
 
 /// Default per-await IO deadline for the inbound handshake. Each
@@ -207,6 +209,14 @@ where
     /// short. `Default::default()` uses the `DEFAULT_ACCEPTOR_*`
     /// constants.
     config: HandshakeAcceptorConfig,
+    /// Per-acceptor rate limiter + nonce-replay cache shared across all
+    /// inbound open-join requests this node serves. Guarded by a
+    /// `TokioMutex` because [`OpenJoinRateLimiter::allow`]/`is_replay`
+    /// mutate it and the dispatcher may handle concurrent connections;
+    /// the lock is held only across the synchronous
+    /// `verify_and_admit_open_join` call, never across the engine apply
+    /// or the response write.
+    open_join_limiter: TokioMutex<OpenJoinRateLimiter>,
 }
 
 impl<H> IrohInviteHandshakeAcceptor<H>
@@ -251,6 +261,7 @@ where
             app,
             pkarr_invite_publisher,
             config,
+            open_join_limiter: TokioMutex::new(OpenJoinRateLimiter::default()),
         }
     }
 
@@ -326,13 +337,21 @@ where
         // handle_unicast below.
         let packet = community_invite::decode_packet(&packet_bytes)
             .map_err(|e| HandshakeAcceptError::Decode(e.to_string()))?;
-        let community_invite::CommunityInvitePacket::Invite { signed, .. } = packet else {
-            // Open-join packets (0x11) are handled by the open-join admit
-            // dispatcher, not this invite acceptor. Reject here so the
-            // peek stays invite-only until that path is wired in.
-            return Err(HandshakeAcceptError::Decode(
-                "expected an invite packet on the invite-acceptor path".to_string(),
-            ));
+        let signed = match packet {
+            community_invite::CommunityInvitePacket::Invite { signed, .. } => signed,
+            // Open-join packets (0x11) take a separate verify+admit path
+            // (no invite token; capability is the `epoch_auth` MAC). It
+            // owns the rest of the bi-stream — it writes the typed
+            // `OpenJoinResponse` and returns directly.
+            community_invite::CommunityInvitePacket::OpenJoin {
+                req,
+                signature,
+                signed_bytes,
+            } => {
+                return self
+                    .handle_open_join_inbound(conn, send, req, signature, signed_bytes)
+                    .await;
+            }
         };
         let bootstrap_join_id = signed.join_event.id;
         let community_id = signed.community_id;
@@ -398,14 +417,30 @@ where
             tokio::time::sleep(self.config.poll_interval).await;
         };
 
-        // Encode the response: canonical CBOR of the SignedMembershipEvent.
-        // We use ciborium directly rather than canonical_cbor_encode
-        // because SignedMembershipEvent already has a stable canonical
-        // form (it's signed; the wire bytes must be reproducible across
-        // peers — Bob's engine will receive these bytes and call
+        // Write [u32 LE length-prefix][canonical CBOR of the
+        // SignedMembershipEvent] then finish(). We use the shared
+        // CBOR-writer helper: SignedMembershipEvent already has a stable
+        // canonical form (it's signed; the wire bytes must be reproducible
+        // across peers — Bob's engine receives these bytes and calls
         // insert_local_event_with_pubs against them).
+        self.write_len_prefixed_cbor(&mut send, &countersign)
+            .await?;
+
+        Ok(bootstrap_join_id)
+    }
+
+    /// Encode `value` as CBOR and write `[u32 LE length-prefix][cbor bytes]`
+    /// to `send`, then `finish()`. Shared by the invite countersign response
+    /// and the open-join `OpenJoinResponse` write. Each await is bounded by
+    /// `config.io_deadline`; oversized responses surface as
+    /// `ResponseTooLarge` rather than being written.
+    async fn write_len_prefixed_cbor<T: Serialize>(
+        &self,
+        send: &mut iroh::endpoint::SendStream,
+        value: &T,
+    ) -> Result<(), HandshakeAcceptError> {
         let mut response_bytes = Vec::new();
-        ciborium::into_writer(&countersign, &mut response_bytes)
+        ciborium::into_writer(value, &mut response_bytes)
             .map_err(|e| HandshakeAcceptError::EncodeResponse(e.to_string()))?;
         if response_bytes.len() > HANDSHAKE_MAX_PACKET_LEN {
             return Err(HandshakeAcceptError::ResponseTooLarge {
@@ -415,7 +450,6 @@ where
         }
         let response_len = response_bytes.len() as u32;
 
-        // Write [u32 LE length-prefix][cbor bytes] then finish().
         tokio::time::timeout(
             self.config.io_deadline,
             send.write_all(&response_len.to_le_bytes()),
@@ -436,8 +470,118 @@ where
         // `send.finish()` is sync — no timeout needed.
         send.finish()
             .map_err(|e| HandshakeAcceptError::Finish(e.to_string()))?;
+        Ok(())
+    }
 
-        Ok(bootstrap_join_id)
+    /// Inbound handler for a tokenless open-join request (`0x11` packet).
+    ///
+    /// Snapshots the beacon engine's verification inputs (`epoch_key`,
+    /// `admin_addr`, the signed-membership log) under the state lock, then
+    /// drops the lock and runs the pure
+    /// [`crate::open_join_admit::verify_and_admit_open_join`] gate
+    /// (capability, identity, freshness, replay, rate-limit, ban-check, then
+    /// open-admission) while holding only the per-acceptor limiter lock. On
+    /// admission it applies the joiner's self-signed Join to the engine via
+    /// `insert_local_event` — which runs `verify_event` (the open Join is
+    /// self-authorizing via its carried EnrollmentCert) and fires the publish
+    /// loop so the Join propagates to every member over Zenoh — then writes an
+    /// `OpenJoinResponse::Admitted { member_events }` snapshot so the joiner
+    /// converges immediately. On rejection it writes a typed
+    /// `OpenJoinResponse::Rejected { reason }` and returns the
+    /// `OpenJoinRejected` error.
+    ///
+    /// Returns the admitted Join's `EventId` (mirroring the invite path's
+    /// `bootstrap_join_id`) so the trait dispatch can log it.
+    async fn handle_open_join_inbound(
+        &self,
+        conn: &Connection,
+        mut send: iroh::endpoint::SendStream,
+        req: community_invite::OpenJoinRequest,
+        signature: [u8; 64],
+        signed_bytes: Vec<u8>,
+    ) -> Result<EventId, HandshakeAcceptError> {
+        let community_id = req.community_id;
+        // The engine owns `membership_key()`/`admin_addr()` and the
+        // `insert_local_event` apply; its inner `CommunityState` (reached via
+        // `engine.state()`) owns the signed-membership `events` log. Fetch the
+        // engine once and reuse it for both the snapshot and the apply.
+        let engine = self
+            .community_registry
+            .engine_arc(&community_id)
+            .await
+            .ok_or(HandshakeAcceptError::CommunityNotFound { community_id })?;
+        let epoch_key = engine.membership_key();
+        let admin_addr = engine.admin_addr();
+
+        // Snapshot the event log under the inner-state lock, then DROP the
+        // lock before the (synchronous) verify+admit and the engine apply.
+        let current_events = {
+            let g = engine.state();
+            let g = g.lock().await;
+            g.events.values().cloned().collect::<Vec<_>>()
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before UNIX_EPOCH")
+            .as_millis() as u64;
+
+        // Hold the per-acceptor limiter only across the synchronous gate (it
+        // mutates the rate-limit counter + nonce-replay cache). Drop it before
+        // the engine apply / response write so a slow peer can't pin it.
+        let admit = {
+            let mut limiter = self.open_join_limiter.lock().await;
+            crate::open_join_admit::verify_and_admit_open_join(
+                &req,
+                &signature,
+                &signed_bytes,
+                &epoch_key,
+                community_id,
+                admin_addr,
+                &current_events,
+                now_ms,
+                OPEN_JOIN_FRESHNESS_WINDOW_MS,
+                &mut limiter,
+            )
+        };
+
+        let admit = match admit {
+            Ok(ok) => ok,
+            Err(reject) => {
+                tracing::warn!(
+                    ?reject,
+                    community_id = %hex::encode(community_id.0),
+                    remote_id = ?conn.remote_id(),
+                    "open-join rejected"
+                );
+                // Surface a typed rejection so the joiner can show a reason.
+                let resp = OpenJoinResponse::Rejected {
+                    reason: format!("{reject:?}"),
+                };
+                self.write_len_prefixed_cbor(&mut send, &resp).await?;
+                return Err(HandshakeAcceptError::OpenJoinRejected);
+            }
+        };
+
+        // Apply the admitted Join to the engine. `insert_local_event` runs
+        // `verify_event` (the open Join is self-authorizing via its carried
+        // EnrollmentCert — actor may be a remote owner, which verify_event
+        // resolves from the cert) and notifies the publish loop, so the Join
+        // reaches every member over Zenoh. Mirrors the open-redeem arm in
+        // `redeem_invite_inner_with_overrides`.
+        let join_event_id = req.join_event.id;
+        engine
+            .insert_local_event(req.join_event)
+            .await
+            .map_err(|e| HandshakeAcceptError::HandleUnicast(format!("{e:?}")))?;
+
+        // Respond with the membership snapshot so the joiner converges fast.
+        let resp = OpenJoinResponse::Admitted {
+            member_events: admit.member_events_snapshot,
+        };
+        self.write_len_prefixed_cbor(&mut send, &resp).await?;
+
+        Ok(join_event_id)
     }
 }
 
@@ -505,6 +649,12 @@ pub enum HandshakeAcceptError {
     CommunityNotFound {
         community_id: crate::owner_state_types::SpaceId,
     },
+    /// An inbound open-join (`0x11`) request failed
+    /// [`crate::open_join_admit::verify_and_admit_open_join`]. The typed
+    /// `OpenJoinResponse::Rejected` was already written to the dialer; this
+    /// variant just records the failure for the trait dispatch's warn log.
+    #[error("open-join rejected")]
+    OpenJoinRejected,
     #[error(
         "JoinCountersign for target_event_id={target_event_id:?} did not land within {deadline_ms}ms"
     )]
@@ -531,4 +681,112 @@ pub enum HandshakeAcceptError {
         step: &'static str,
         deadline_ms: u64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::community_invite::{
+        build_signed_invite_packet, build_signed_open_join_packet, decode_packet,
+        device_hash_from_identity_pub, encode_packet, CommunityInvitePacket, CommunityInviteSigned,
+        InviteToken, OpenJoinRequest,
+    };
+    use crate::community_membership::{
+        mint_test_owner, MembershipEventKind, SignedMembershipEvent,
+    };
+    use crate::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr, SpaceId};
+
+    fn sample_join_event() -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            id: [0u8; 16],
+            community_id: SpaceId([1u8; 16]),
+            kind: MembershipEventKind::Join,
+            actor: OwnerAddr([0u8; 16]),
+            at: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "j".to_string(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: Some(mint_test_owner(0x4A).cert),
+        }
+    }
+
+    /// `decode_packet` must route a `0x11` wire to the `OpenJoin` variant and a
+    /// `0x10` wire to the `Invite` variant. This guards the match arm the
+    /// inbound dispatcher branches on (`handle_invite_handshake_inbound`); the
+    /// full admit round-trip is proven by the Task 12 integration test.
+    #[test]
+    fn dispatch_routes_open_join_discriminant() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        // The 0x10 invite decode enforces signing_device_hash ==
+        // SHA256(joiner_identity_pub)[..16], so derive the hash honestly for
+        // both packets rather than using a placeholder.
+        let identity_pub = [4u8; 64];
+        let device_hash = DeviceIdentityHash(device_hash_from_identity_pub(&identity_pub));
+
+        // 0x11 open-join wire (Task 4 builder).
+        let open_req = OpenJoinRequest {
+            community_id: SpaceId([1u8; 16]),
+            join_event: sample_join_event(),
+            joiner_identity_pub: identity_pub,
+            signing_device_hash: device_hash,
+            epoch_auth: [9u8; 32],
+            nonce: [2u8; 16],
+            created_at: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "j".to_string(),
+            },
+        };
+        let open_wire =
+            encode_packet(&build_signed_open_join_packet(open_req, &sk).expect("build open-join"))
+                .expect("encode open-join");
+
+        // 0x10 invite wire (existing builder). decode_packet is signature-
+        // agnostic (verify happens later in handle_unicast), so dummy token /
+        // sig bytes still decode structurally to the Invite variant.
+        let invite_signed = CommunityInviteSigned {
+            community_id: SpaceId([1u8; 16]),
+            join_event: sample_join_event(),
+            invite_token: InviteToken {
+                inviter: OwnerAddr([5u8; 16]),
+                invitee_hint: None,
+                minted_at: Hlc {
+                    wall_ms: 900,
+                    logical: 0,
+                    device_id: "i".to_string(),
+                },
+                expires_at: None,
+                sig: [0u8; 64],
+            },
+            joiner_identity_pub: identity_pub,
+            signing_device_hash: device_hash,
+            created_at: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "j".to_string(),
+            },
+        };
+        let invite_wire =
+            encode_packet(&build_signed_invite_packet(invite_signed, &sk).expect("build invite"))
+                .expect("encode invite");
+
+        assert_eq!(open_wire[0], 0x11, "open-join discriminant byte");
+        assert_eq!(invite_wire[0], 0x10, "invite discriminant byte");
+        assert!(
+            matches!(
+                decode_packet(&open_wire).expect("decode open-join"),
+                CommunityInvitePacket::OpenJoin { .. }
+            ),
+            "0x11 wire must decode to the OpenJoin variant"
+        );
+        assert!(
+            matches!(
+                decode_packet(&invite_wire).expect("decode invite"),
+                CommunityInvitePacket::Invite { .. }
+            ),
+            "0x10 wire must decode to the Invite variant"
+        );
+    }
 }

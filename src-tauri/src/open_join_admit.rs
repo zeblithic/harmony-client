@@ -32,6 +32,14 @@ pub const OPEN_JOIN_RATE_LIMIT_PER_WINDOW: usize = 20;
 /// Rolling rate-limit window, in milliseconds.
 pub const OPEN_JOIN_RATE_LIMIT_WINDOW_MS: u64 = 60_000;
 
+/// How old an [`OpenJoinRequest`]'s `created_at` may be (relative to the
+/// beacon's wall clock) before it is rejected as `Stale`. Distinct from the
+/// rate-limit window: the freshness window bounds the joiner's signed
+/// capability/timestamp validity, while the rate-limit window paces admissions.
+/// 2 minutes accommodates cross-WAN dial/resolve latency and modest clock skew
+/// while keeping the replayable/forge-resistant window short.
+pub const OPEN_JOIN_FRESHNESS_WINDOW_MS: u64 = 120_000;
+
 /// Rejection reasons for [`verify_and_admit_open_join`]. Distinct variants so a
 /// caller can pick a wire status / log line per failure class without parsing
 /// strings.
