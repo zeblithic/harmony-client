@@ -162,61 +162,78 @@ impl CommunityRendezvousPublisher {
         advertisers: Vec<OwnerAddr>,
         me: OwnerAddr,
     ) {
-        let mut registered = self.registered_slots.lock().await;
-        let prior_slot = registered.get(&community_id).copied();
-
-        match slot_for_advertiser(&advertisers, &me) {
-            Some(slot) => {
-                // A rank change must drop the stale slot handle before the new
-                // one is registered (each rendezvous slot has a single writer).
-                if let Some(old) = prior_slot {
-                    if old != slot {
-                        self.sink
-                            .unregister(&Self::slot_handle(&community_id, old))
-                            .await;
+        // Decision + map mutation happen UNDER the lock (fast, no await);
+        // the awaited register/unregister run OUTSIDE it so a slow pkarr op on
+        // one community can't head-of-line-block refreshes for every other
+        // community. The lock guards only the `registered_slots` map.
+        let mut opt_unregister_handle: Option<String> = None;
+        let mut opt_register_slot: Option<u16> = None;
+        let mut did_fill = false;
+        {
+            let mut registered = self.registered_slots.lock().await;
+            let prior_slot = registered.get(&community_id).copied();
+            match slot_for_advertiser(&advertisers, &me) {
+                Some(slot) => {
+                    // A rank change must drop the stale slot handle before the
+                    // new one is registered (each slot has a single writer).
+                    if let Some(old) = prior_slot {
+                        if old != slot {
+                            opt_unregister_handle = Some(Self::slot_handle(&community_id, old));
+                        }
+                    }
+                    // Always (re-)register the current slot — this is the
+                    // periodic-refresh mechanism, so we re-register even when
+                    // the slot is unchanged.
+                    opt_register_slot = Some(slot);
+                    // Count a slot-fill only when this newly registers a slot
+                    // (no prior slot, or a rank change) — not on a no-op
+                    // re-register of the same slot we already hold.
+                    if prior_slot != Some(slot) {
+                        did_fill = true;
+                    }
+                    registered.insert(community_id, slot);
+                }
+                None => {
+                    if let Some(old) = prior_slot {
+                        opt_unregister_handle = Some(Self::slot_handle(&community_id, old));
+                        registered.remove(&community_id);
                     }
                 }
-
-                // Clone the epoch-key bytes into the closure so the slot key is
-                // re-derived against the live epoch on every publish.
-                let epoch_key_bytes = *epoch_key.as_bytes();
-                let key_builder: EphemeralKeyBuilder = Arc::new(move |at_ms| {
-                    let epoch_id = current_epoch_id(at_ms);
-                    let ek = EpochKey::new(epoch_key_bytes);
-                    rendezvous_slot_key(&ek, slot, epoch_id)
-                });
-
-                let id_sk = self.identity_signing_key.clone();
-                let id_pub = self.identity_pub;
-                let blob_builder = Arc::clone(&self.routing_blob_builder);
-                let builder: RecordBuilder = Arc::new(move |at_ms| {
-                    PkarrRoutingRecord::sign_new(
-                        blob_builder(),
-                        id_pub,
-                        at_ms,
-                        at_ms + crate::reachability_record::REACHABILITY_RECORD_TTL_MS,
-                        &id_sk,
-                    )
-                    .expect("sign — fixed-size buffers should not fail")
-                });
-
-                let handle = Self::slot_handle(&community_id, slot);
-                self.sink.register(handle, key_builder, builder).await;
-                // Count a slot-fill only when this newly registers a slot (no
-                // prior slot, or a rank change to a different slot) — not on a
-                // no-op re-register of the same slot we already hold.
-                if prior_slot != Some(slot) {
-                    self.observability.record_slot_fill(0);
-                }
-                registered.insert(community_id, slot);
             }
-            None => {
-                if let Some(old) = prior_slot {
-                    self.sink
-                        .unregister(&Self::slot_handle(&community_id, old))
-                        .await;
-                    registered.remove(&community_id);
-                }
+        } // drop the guard before any await
+
+        if let Some(handle) = opt_unregister_handle {
+            self.sink.unregister(&handle).await;
+        }
+
+        if let Some(slot) = opt_register_slot {
+            // Clone the epoch-key bytes into the closure so the slot key is
+            // re-derived against the live epoch on every publish.
+            let epoch_key_bytes = *epoch_key.as_bytes();
+            let key_builder: EphemeralKeyBuilder = Arc::new(move |at_ms| {
+                let epoch_id = current_epoch_id(at_ms);
+                let ek = EpochKey::new(epoch_key_bytes);
+                rendezvous_slot_key(&ek, slot, epoch_id)
+            });
+
+            let id_sk = self.identity_signing_key.clone();
+            let id_pub = self.identity_pub;
+            let blob_builder = Arc::clone(&self.routing_blob_builder);
+            let builder: RecordBuilder = Arc::new(move |at_ms| {
+                PkarrRoutingRecord::sign_new(
+                    blob_builder(),
+                    id_pub,
+                    at_ms,
+                    at_ms + crate::reachability_record::REACHABILITY_RECORD_TTL_MS,
+                    &id_sk,
+                )
+                .expect("sign — fixed-size buffers should not fail")
+            });
+
+            let handle = Self::slot_handle(&community_id, slot);
+            self.sink.register(handle, key_builder, builder).await;
+            if did_fill {
+                self.observability.record_slot_fill(0);
             }
         }
     }

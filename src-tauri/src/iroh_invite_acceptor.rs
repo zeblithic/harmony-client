@@ -181,6 +181,18 @@ pub trait IrohHandshakeDispatcher: Send + Sync + 'static {
 /// stay safe on memory-pressured devices.
 pub const HANDSHAKE_MAX_PACKET_LEN: usize = 256 * 1024;
 
+/// CBOR-encode `value` (via the same `ciborium` encoder
+/// `write_len_prefixed_cbor` uses) purely to MEASURE its serialized length —
+/// used to decide whether a response fits the handshake cap before committing
+/// to a write.
+fn cbor_encoded_len<T: Serialize>(
+    value: &T,
+) -> Result<usize, ciborium::ser::Error<std::io::Error>> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(value, &mut buf)?;
+    Ok(buf.len())
+}
+
 /// Production dispatcher: wires `handle_connection` into the existing
 /// `community_invite::handle_unicast` path against NodeState handles.
 ///
@@ -576,8 +588,34 @@ where
             .map_err(|e| HandshakeAcceptError::HandleUnicast(format!("{e:?}")))?;
 
         // Respond with the membership snapshot so the joiner converges fast.
+        // For a large-membership community the snapshot can exceed the 256KiB
+        // handshake cap, which would make `write_len_prefixed_cbor` fail with
+        // `ResponseTooLarge` AFTER admission already succeeded — breaking
+        // open-join for big communities. Guard it: if the encoded `Admitted`
+        // response would exceed the cap, fall back to an EMPTY snapshot. The
+        // joiner already locally inserted its own Join in the open-redeem arm
+        // and converges the rest over Zenoh, so an empty snapshot is a valid
+        // degraded path (its Task-10 apply loop treats an empty list as a
+        // no-op and still returns "joined").
         let resp = OpenJoinResponse::Admitted {
             member_events: admit.member_events_snapshot,
+        };
+        let resp = match cbor_encoded_len(&resp) {
+            Ok(len) if len > HANDSHAKE_MAX_PACKET_LEN => {
+                tracing::warn!(
+                    encoded_len = len,
+                    max = HANDSHAKE_MAX_PACKET_LEN,
+                    community_id = %hex::encode(community_id.0),
+                    "open-join admitted snapshot exceeds handshake cap; sending empty snapshot \
+                     (joiner converges via Zenoh)"
+                );
+                OpenJoinResponse::Admitted {
+                    member_events: Vec::new(),
+                }
+            }
+            // Encode error here is non-fatal for the size check; let the actual
+            // write surface it as `EncodeResponse`.
+            _ => resp,
         };
         self.write_len_prefixed_cbor(&mut send, &resp).await?;
 

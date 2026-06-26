@@ -135,10 +135,14 @@ pub trait SlotResolver {
     ) -> Option<ReachabilityAnnouncePayload>;
 }
 
-/// Escalating-batch rendezvous resolve over any [`SlotResolver`] (pure: no I/O,
-/// no clock — `now_ms` is supplied). For each width `w` in `cfg.batch_curve`,
-/// probe slots `0..w` across the epoch-tolerance window CONCURRENTLY, take the
-/// first live record, and return early recording `winning_slot` +
+/// Escalating-batch rendezvous resolve over any [`SlotResolver`] (`now_ms` is
+/// supplied so the driver itself stays clock-free; the only I/O is the per-batch
+/// deadline). For each width `w` in `cfg.batch_curve`, probe slots `0..w` across
+/// the epoch-tolerance window CONCURRENTLY and return on the FIRST live record —
+/// the first beacon to respond wins (not strictly the lowest slot), so one
+/// hung/slow probe can never stall discovery. Each batch is bounded by
+/// `cfg.per_batch_deadline`: on the deadline elapsing OR all probes returning
+/// `None`, widen to the next batch width. Records `winning_slot` +
 /// `batches_tried` + `elapsed_ms`. Returns an empty outcome (cold start) if no
 /// slot answers across all batches.
 pub async fn resolve_rendezvous_with<R: SlotResolver + Sync>(
@@ -146,6 +150,8 @@ pub async fn resolve_rendezvous_with<R: SlotResolver + Sync>(
     now_ms: u64,
     cfg: &RendezvousResolveConfig,
 ) -> RendezvousResolveOutcome {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
     let started = std::time::Instant::now();
     let epoch_window = epoch_tolerance_window(now_ms);
     let mut outcome = RendezvousResolveOutcome::default();
@@ -153,22 +159,34 @@ pub async fn resolve_rendezvous_with<R: SlotResolver + Sync>(
     for &width in &cfg.batch_curve {
         outcome.batches_tried += 1;
         let capped = width.min(RENDEZVOUS_SLOT_COUNT);
-        // Probe every (slot, epoch) pair in this batch concurrently.
-        let mut probes = Vec::with_capacity(capped * epoch_window.len());
-        for slot in 0..capped as u16 {
-            for &epoch_id in &epoch_window {
-                probes.push(async move {
+        // Probe every (slot, epoch) pair in this batch concurrently, draining
+        // them as they complete so the FIRST live beacon wins without waiting
+        // on slower/hung probes. Bounded by the per-batch deadline.
+        let mut probes: FuturesUnordered<_> = (0..capped as u16)
+            .flat_map(|slot| {
+                epoch_window.iter().map(move |&epoch_id| async move {
                     resolver
                         .resolve_slot(slot, epoch_id)
                         .await
                         .map(|payload| (slot, payload))
-                });
+                })
+            })
+            .collect();
+
+        let winner = tokio::time::timeout(cfg.per_batch_deadline, async {
+            while let Some(result) = probes.next().await {
+                if let Some((slot, payload)) = result {
+                    return Some((slot, payload));
+                }
             }
-        }
-        let results = futures::future::join_all(probes).await;
-        // First live record in slot-ascending order wins (probes were pushed
-        // slot-major, so the first `Some` is the lowest-numbered live slot).
-        if let Some((slot, payload)) = results.into_iter().flatten().next() {
+            None
+        })
+        .await
+        // On the batch deadline elapsing (Err), treat the batch as exhausted
+        // and widen to the next width rather than hanging.
+        .unwrap_or(None);
+
+        if let Some((slot, payload)) = winner {
             outcome.winning_slot = Some(slot);
             outcome.payload = Some(payload);
             outcome.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -201,9 +219,6 @@ pub async fn resolve_rendezvous_with<R: SlotResolver + Sync>(
 pub struct PkarrSlotResolver {
     pub pkarr: Arc<PkarrResolver>,
     pub epoch_key: EpochKey,
-    /// Wall-clock ms threaded in for the freshness check (kept off the trait so
-    /// the driver stays pure).
-    pub now_ms: u64,
 }
 
 #[async_trait::async_trait]
@@ -215,7 +230,14 @@ impl SlotResolver for PkarrSlotResolver {
     ) -> Option<ReachabilityAnnouncePayload> {
         let vk = rendezvous_slot_verifying_key(&self.epoch_key, slot_index, epoch_id);
         let rec = self.pkarr.resolve(&vk).await.ok()??;
-        rec.verify_freshness(self.now_ms).ok()?;
+        // Re-sample the wall clock AFTER the awaited resolve so freshness is
+        // checked against "now", not a timestamp captured before a possibly
+        // long network round-trip (the stale-clock bug fixed in PR#306).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        rec.verify_freshness(now_ms).ok()?;
         ciborium::from_reader::<ReachabilityAnnouncePayload, _>(rec.routing_blob.as_slice()).ok()
     }
 }
@@ -231,7 +253,6 @@ pub async fn resolve_rendezvous(
     let resolver = PkarrSlotResolver {
         pkarr: Arc::clone(pkarr),
         epoch_key: epoch_key.clone(),
-        now_ms,
     };
     resolve_rendezvous_with(&resolver, now_ms, cfg).await
 }
@@ -411,5 +432,46 @@ mod tests {
         let out = resolve_rendezvous_with(&stub, 1_000_000, &cfg).await;
         assert_eq!(out.payload, None);
         assert_eq!(out.winning_slot, None);
+    }
+
+    /// `SlotResolver` whose slot 0 NEVER completes (hangs) but whose slot 1
+    /// answers live. Proves the resolve returns the live higher slot via the
+    /// first-responding-beacon path and never blocks on the hung probe.
+    struct HungSlot0Resolver;
+
+    #[async_trait::async_trait]
+    impl SlotResolver for HungSlot0Resolver {
+        async fn resolve_slot(
+            &self,
+            slot_index: u16,
+            _epoch_id: u64,
+        ) -> Option<ReachabilityAnnouncePayload> {
+            if slot_index == 0 {
+                // Never completes — models a hung/dropped DHT probe.
+                std::future::pending::<()>().await;
+                unreachable!("pending() never resolves");
+            }
+            if slot_index == 1 {
+                Some(dummy_payload())
+            } else {
+                None
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hung_probe_does_not_block_a_live_higher_slot() {
+        let resolver = HungSlot0Resolver;
+        let cfg = RendezvousResolveConfig::default(); // curve [1, 2, N], 2500ms
+                                                      // Wrap in a generous outer timeout: if the resolve hung on slot 0 this
+                                                      // would elapse; instead the live slot-1 beacon answers in batch 2.
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            resolve_rendezvous_with(&resolver, 1_000_000, &cfg),
+        )
+        .await
+        .expect("resolve must not hang on a stuck slot-0 probe");
+        assert_eq!(out.winning_slot, Some(1));
+        assert!(out.payload.is_some());
     }
 }

@@ -358,10 +358,19 @@ pub async fn open_join_after_resolve(
             // event is self-authorizing via its carried cert / materialized
             // membership); a duplicate (e.g. our own Join, if already inserted
             // by the open-redeem local arm) is an idempotent no-op.
+            use crate::community_state_crdt::InsertOutcome;
             let mut applied = 0usize;
             for ev in member_events {
                 match engine.insert_local_event(ev).await {
-                    Ok(_) => applied += 1,
+                    // Only a genuinely-inserted or already-known event counts as
+                    // applied. `insert_local_event` returns `Ok(Rejected(..))`
+                    // for verification failures — those must NOT be counted.
+                    Ok(InsertOutcome::Inserted) | Ok(InsertOutcome::AlreadyKnown) => {
+                        applied += 1;
+                    }
+                    Ok(InsertOutcome::Rejected(v)) => {
+                        tracing::warn!(?v, "open-join: admitted snapshot event rejected");
+                    }
                     Err(e) => {
                         // Non-fatal: a single bad/duplicate event must not abort
                         // the bootstrap. Log and continue; the engine converges
