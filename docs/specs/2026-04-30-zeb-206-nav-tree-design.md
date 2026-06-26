@@ -74,6 +74,8 @@ The brainstorming progression considered and rejected these alternatives:
 2. **Matrix-style per-space membership CRDT for *every* space.** Over-engineers public broadcast (forces a CRDT write to subscribe). Rejected for fighting Zenoh's natural pub/sub topology.
 3. **Gift-wrapped Zenoh DMs (Nostr NIP-17 style).** Single transport, but subscription pattern itself is a fingerprint. Rejected; Reticulum's unlinkability is harmony's distinguishing privacy story.
 4. **No global directory at all.** Strongest privacy, but cold-start UX is rough. Rejected in favor of opt-in library-federated directories (each library is a small federated index, not a singleton).
+
+   > **⚠️ Update 2026-06-26 (ZEB-556 scope-2 decision).** The public-community directory — including the library-federated model below (built in ZEB-218 / ZEB-252) — is **not surfaced in alpha and is not on the roadmap as a global/top-level index**. A global registry becomes overwhelmingly large + noisy to sift through; alpha discovery is **word-of-mouth** (a community shares its Harmony link via its website / Discord / socials / member profiles). The future *exploratory* direction (not committed) is **community-owned micro-directories**: a directed graph / "webring" of per-community registries (partner links, "if you like X you might like Y"), where crawl-the-graph friction is a feature — it distributes/parallelizes load, and you only crawl/serve communities you're a part of. See **ZEB-574**. The `library_directory.rs` / `LibraryDirectoryBrowser.svelte` code remains built but intentionally unsurfaced.
 5. **Local-only nav state per device.** Simplest implementation, but joining a community on phone wouldn't show on desktop. Major UX regression. Rejected.
 
 ## Data model
@@ -326,6 +328,8 @@ The per-DM-Space content key is established at Space creation, distributed to in
 **The specific encryption scheme** (key-derivation, AEAD primitive, nonce policy, group-DM key rotation under membership growth) is the subject of a dedicated companion spec — parallel to ZEB-211 for owner-state. Sub-B (ZEB-216) is blocked on that spec landing; this section is the design contract.
 
 ### Flow D — Library-federated discovery
+
+> **⚠️ Not surfaced in alpha (ZEB-556, 2026-06-26).** Built (ZEB-218 / ZEB-252) but intentionally not exposed; alpha discovery is word-of-mouth. Future exploratory direction: community-owned micro-directory "webring" (ZEB-574), not a global or library-curated index.
 
 1. User opens "Browse Communities"
 2. harmony-client has list of trusted libraries (user-configured + auto-discovered via `harmony/discovery/library/announce`)
