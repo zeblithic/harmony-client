@@ -205,6 +205,7 @@ pub mod notes_crdt;
 pub mod notes_persist;
 pub mod open_join_admit;
 pub mod open_join_auth;
+pub mod open_join_dial;
 pub mod owner_commands;
 pub mod owner_loaded;
 pub mod owner_state;
@@ -43070,7 +43071,7 @@ async fn invite_targets_orphaned_community_dir(
 /// Synthesize an iroh `EndpointAddr` from a verified reachability routing
 /// record: iroh node id (required) + home relay url (skipped if malformed) +
 /// direct addresses. Shared by the redeem and add-friend dial paths.
-fn endpoint_addr_from_routing(
+pub(crate) fn endpoint_addr_from_routing(
     routing: &crate::reachability_record::ReachabilityAnnouncePayload,
 ) -> Result<iroh::EndpointAddr, String> {
     let id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
