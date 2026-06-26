@@ -364,39 +364,21 @@ pub async fn open_join_after_resolve(
                     "open-join: admitted but no engine handle to apply the snapshot".to_string(),
                 );
             };
-            // Apply each event to the joiner's engine so it materializes the
-            // live membership. `insert_local_event` runs `verify_event` (each
-            // event is self-authorizing via its carried cert / materialized
-            // membership); a duplicate (e.g. our own Join, if already inserted
-            // by the open-redeem local arm) is an idempotent no-op.
-            use crate::community_state_crdt::InsertOutcome;
-            let mut applied = 0usize;
-            for ev in member_events {
-                match engine.insert_local_event(ev).await {
-                    // Only a genuinely-inserted or already-known event counts as
-                    // applied. `insert_local_event` returns `Ok(Rejected(..))`
-                    // for verification failures — those must NOT be counted.
-                    Ok(InsertOutcome::Inserted) | Ok(InsertOutcome::AlreadyKnown) => {
-                        applied += 1;
-                    }
-                    Ok(InsertOutcome::Rejected(v)) => {
-                        tracing::warn!(?v, "open-join: admitted snapshot event rejected");
-                    }
-                    Err(e) => {
-                        // Non-fatal: a single bad/duplicate event must not abort
-                        // the bootstrap. Log and continue; the engine converges
-                        // the rest over Zenoh.
-                        tracing::warn!(
-                            error = %e,
-                            "open-join: applying an admitted member event failed (continuing)"
-                        );
-                    }
-                }
-            }
+            // Apply the admitted snapshot in dependency order. The beacon
+            // harvests its event log in `HashMap` (hash) order, so an
+            // admin-signed steady-state event (e.g. ChannelCreate) can precede
+            // the admin's enrollment-introducing Join; applied naively in one
+            // pass it would fail `verify_event` with `SignerNotEnrolledForActor`
+            // and be dropped, leaving the joiner channel-less (ZEB-573).
+            // `apply_admitted_snapshot` retries the rejected remainder until it
+            // stabilizes, so enrollment-dependent events land once their
+            // dependency is materialized. A duplicate (e.g. our own Join already
+            // inserted by the open-redeem local arm) is an idempotent no-op.
+            let applied = apply_admitted_snapshot(engine.as_ref(), member_events).await;
             tracing::info!(
                 community_id = %hex::encode(ctx.community_id.0),
                 applied,
-                "open-join: admitted — applied membership snapshot"
+                "open-join: admitted — applied membership snapshot (dependency-ordered)"
             );
             Ok(OpenJoinOutcome {
                 status: "joined".to_string(),
@@ -430,6 +412,94 @@ fn joiner_identity_pub_from_signing_key(sk: &ed25519_dalek::SigningKey) -> [u8; 
     joiner_pub[..32].copy_from_slice(x25519_pub.as_bytes());
     joiner_pub[32..].copy_from_slice(&ed25519_pub);
     joiner_pub
+}
+
+/// Applies one admitted membership event to the joiner's local state.
+/// Implemented by [`CommunitySyncEngine`] in production; a unit-test double
+/// models the enrollment-ordering dependency. The `String` error is the
+/// non-ordering failure class (transport / wrong-community) — distinct from a
+/// semantic `InsertOutcome::Rejected`, which `apply_admitted_snapshot` may
+/// resolve on a later round.
+#[async_trait::async_trait]
+trait SnapshotEventApplier {
+    async fn apply_one(
+        &self,
+        ev: crate::community_membership::SignedMembershipEvent,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, String>;
+}
+
+#[async_trait::async_trait]
+impl SnapshotEventApplier for CommunitySyncEngine {
+    async fn apply_one(
+        &self,
+        ev: crate::community_membership::SignedMembershipEvent,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, String> {
+        self.insert_local_event(ev)
+            .await
+            .map_err(|e| format!("{e:?}"))
+    }
+}
+
+/// Apply an admitted open-join membership snapshot in dependency order.
+///
+/// ZEB-573: the beacon harvests its community event log in `HashMap` (hash)
+/// order, so an admin-signed steady-state event (channel-create, config) can
+/// land *before* the admin's enrollment-introducing Join. `verify_event` then
+/// rejects it with `SignerNotEnrolledForActor` (the actor's enrolled device key
+/// isn't materialized yet). A single naive pass would drop such events
+/// permanently — the joiner would converge into membership but never receive the
+/// channels.
+///
+/// Retry-until-stable: re-apply the rejected remainder each round. Every round
+/// that materializes a new enrollment unblocks its dependents, so the snapshot
+/// converges in O(dependency-depth) rounds. A round with zero progress means the
+/// remainder is genuinely unverifiable (not an ordering miss); those are logged
+/// and dropped, matching the prior best-effort behavior. A duplicate (e.g. the
+/// joiner's own Join, already inserted by the open-redeem local arm) is an
+/// idempotent `AlreadyKnown`. Returns the number of events that landed.
+async fn apply_admitted_snapshot<A: SnapshotEventApplier>(
+    applier: &A,
+    member_events: Vec<crate::community_membership::SignedMembershipEvent>,
+) -> usize {
+    use crate::community_state_crdt::InsertOutcome;
+    let mut pending = member_events;
+    let mut applied = 0usize;
+    // Each round either lands at least one new event or we stop, so this runs at
+    // most `member_events.len()` rounds — bounded, no risk of spinning.
+    loop {
+        if pending.is_empty() {
+            break;
+        }
+        let applied_before = applied;
+        let mut deferred = Vec::new();
+        for ev in std::mem::take(&mut pending) {
+            match applier.apply_one(ev.clone()).await {
+                Ok(InsertOutcome::Inserted) | Ok(InsertOutcome::AlreadyKnown) => applied += 1,
+                // A semantic rejection may just be an ordering miss (a dependency
+                // not yet materialized) — defer it to a later round.
+                Ok(InsertOutcome::Rejected(_)) => deferred.push(ev),
+                // A non-ordering failure (transport / wrong-community) can't be
+                // resolved by re-application; log and drop.
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "open-join: applying an admitted member event failed (continuing)"
+                ),
+            }
+        }
+        pending = deferred;
+        if applied == applied_before {
+            // No event landed this round — the remainder can't be unblocked by
+            // re-application.
+            break;
+        }
+    }
+    if !pending.is_empty() {
+        tracing::warn!(
+            unresolved = pending.len(),
+            "open-join: admitted snapshot retained unverifiable events after retry-until-stable"
+        );
+    }
+    applied
 }
 
 #[cfg(test)]
@@ -478,5 +548,105 @@ mod tests {
         let outcome = outcome.unwrap();
         assert_eq!(outcome.status, "no_beacon_reachable");
         assert_eq!(outcome.community_id, Some(hex::encode([2u8; 16])));
+    }
+
+    /// Test double modeling `verify_event`'s enrollment dependency: a Join is
+    /// self-authorizing (always lands, materializing the actor's enrollment); a
+    /// steady-state event (e.g. ChannelCreate) is Rejected with
+    /// `SignerNotEnrolledForActor` until its actor's Join has been applied.
+    struct OrderingMockApplier {
+        enrolled: tokio::sync::Mutex<std::collections::HashSet<OwnerAddr>>,
+        apply_order: tokio::sync::Mutex<Vec<[u8; 16]>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SnapshotEventApplier for OrderingMockApplier {
+        async fn apply_one(
+            &self,
+            ev: SignedMembershipEvent,
+        ) -> Result<crate::community_state_crdt::InsertOutcome, String> {
+            use crate::community_membership::VerifyError;
+            use crate::community_state_crdt::InsertOutcome;
+            match &ev.kind {
+                MembershipEventKind::Join => {
+                    self.enrolled.lock().await.insert(ev.actor);
+                    self.apply_order.lock().await.push(ev.id);
+                    Ok(InsertOutcome::Inserted)
+                }
+                _ => {
+                    if self.enrolled.lock().await.contains(&ev.actor) {
+                        self.apply_order.lock().await.push(ev.id);
+                        Ok(InsertOutcome::Inserted)
+                    } else {
+                        Ok(InsertOutcome::Rejected(
+                            VerifyError::SignerNotEnrolledForActor,
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_snapshot_applies_enrollment_dependent_events_out_of_order() {
+        // ZEB-573 regression: the beacon ships its event log in hash order, so an
+        // admin-signed ChannelCreate can arrive BEFORE the admin's enrollment
+        // Join. A naive single pass drops it (SignerNotEnrolledForActor) and the
+        // joiner never receives the channel. The dependency-ordered apply must
+        // land both, Join first.
+        let admin = OwnerAddr([0x21; 16]);
+        let community = SpaceId([0x42; 16]);
+        let admin_join = SignedMembershipEvent {
+            id: [0xA0; 16],
+            community_id: community,
+            kind: MembershipEventKind::Join,
+            actor: admin,
+            at: Hlc {
+                wall_ms: 10,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+        };
+        let channel_create = SignedMembershipEvent {
+            id: [0xC0; 16],
+            community_id: community,
+            kind: MembershipEventKind::ChannelCreate {
+                channel_id: crate::community_membership::ChannelId([0x01; 16]),
+                name: "general".into(),
+                write_power: 0,
+                kind: crate::community_membership::ChannelKind::Text,
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 20,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+        };
+        // Worst-case order: channel-create BEFORE the admin's Join.
+        let events = vec![channel_create.clone(), admin_join.clone()];
+
+        let mock = OrderingMockApplier {
+            enrolled: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            apply_order: tokio::sync::Mutex::new(Vec::new()),
+        };
+        let applied = apply_admitted_snapshot(&mock, events).await;
+
+        assert_eq!(
+            applied, 2,
+            "both events must land once the snapshot is applied in dependency order"
+        );
+        let order = mock.apply_order.lock().await.clone();
+        assert_eq!(
+            order,
+            vec![admin_join.id, channel_create.id],
+            "the admin Join must materialize before the channel-create lands"
+        );
     }
 }
