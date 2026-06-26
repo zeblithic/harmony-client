@@ -45,7 +45,7 @@ The **only** missing bridge is: turn "I hold the link (`epoch_key`)" into "I can
 
 A DHT/pkarr record is one signed value per key, and a link-holder does not know any beacon's `identity_pub`. To let a holder resolve a *set* of beacons from `epoch_key` alone, use **enumerated rendezvous slots**:
 
-- `N` = `COMMUNITY_RELAY_ADVERTISERS_MAX` (~8).
+- `N` = `COMMUNITY_RELAY_ADVERTISERS_MAX` (currently 4; `community_relay_announce.rs`).
 - Slot key: `rendezvous_key(i) = derive_ephemeral_key(PkarrCase::Rendezvous, epoch_key, i ‖ epoch_id)` for `i ∈ 0..N`, reusing the existing epoch-tolerance scheme (`epoch_id` + adjacent windows). A new `PkarrCase::Rendezvous` (or equivalent domain-separation tag, e.g. info-string `"rendezvous"`) keeps these keys disjoint from the existing member-keyed records.
 - Payload: the same `ReachabilityAnnouncePayload` (iroh endpoint id + relay URLs) the member publisher already emits.
 - **Publisher per slot:** each beacon claims exactly one slot by its deterministic rank in the CRDT-known advertiser ordering (sort advertisers by `identity_pub`; rank = slot index). Because the advertiser set is CRDT-replicated, every member computes the same ordering → each slot has exactly one writer → no DHT write races.
