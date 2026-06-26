@@ -51,7 +51,8 @@ use harmony_app::community_channel_log_engine::{
     ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
 };
 use harmony_app::community_membership::{
-    materialize, sign_event, EventPayload, MemberStatus, MembershipEventKind, SignedMembershipEvent,
+    materialize, sign_event, ChannelId, ChannelKind, EventPayload, MemberStatus,
+    MembershipEventKind, SignedMembershipEvent,
 };
 use harmony_app::community_rendezvous::{rendezvous_slot_verifying_key, RENDEZVOUS_SLOT_COUNT};
 use harmony_app::community_rendezvous_publisher::CommunityRendezvousPublisher;
@@ -192,6 +193,9 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
 struct OpenJoinSetup {
     // ── Identities / community ──────────────────────────────────────────
     bob_comm_sk: Arc<SigningKey>,
+    /// Alice's enrolled community device key — admin signer for ChannelCreate
+    /// in the channel-materialization test (`insert_alice_channel`).
+    alice_comm_sk: Arc<SigningKey>,
     alice_addr: OwnerAddr,
     bob_addr: OwnerAddr,
     epoch_key: EpochKey,
@@ -204,6 +208,9 @@ struct OpenJoinSetup {
 
     // ── Registries / engines ────────────────────────────────────────────
     registry_alice: Arc<CommunitySyncRegistry>,
+    /// Bob's registry — needed to read Bob's materialized state (channels) in
+    /// the channel-materialization assertion. Existing tests only query Alice.
+    registry_bob: Arc<CommunitySyncRegistry>,
     bob_engine: Arc<harmony_app::community_state_sync::CommunitySyncEngine>,
 
     // ── pkarr ───────────────────────────────────────────────────────────
@@ -253,6 +260,67 @@ impl OpenJoinSetup {
             .await;
         await_rendezvous_slot_visible(&self.fresh_resolver(), &self.epoch_key, slot).await;
         slot
+    }
+
+    /// Sign an admin (`alice_comm_sk`) `ChannelCreate` at a wall-clock AFTER
+    /// Alice's bootstrap Join and insert it into Alice's engine, so her harvested
+    /// admit-snapshot carries an admin-signed channel event whose `verify_event`
+    /// depends on Alice's own enrollment Join being materialized first. On the
+    /// pre-fix single-pass apply this dropped with `SignerNotEnrolledForActor`
+    /// whenever the HashMap harvest ordered the ChannelCreate ahead of the Join
+    /// (ZEB-573). Asserts Alice materializes it herself (snapshot precondition).
+    async fn insert_alice_channel(&self, channel_id: ChannelId, name: &str) {
+        let payload = EventPayload {
+            id: {
+                let mut id = [0u8; 16];
+                id[0] = 0xCC;
+                id[1..3].copy_from_slice(&channel_id.0[0..2]);
+                id
+            },
+            community_id: self.community_id,
+            kind: MembershipEventKind::ChannelCreate {
+                channel_id,
+                name: name.to_string(),
+                write_power: 0,
+                kind: ChannelKind::Text,
+            },
+            actor: self.alice_addr,
+            at: Hlc {
+                wall_ms: 100_500,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let ev =
+            sign_event(&payload, self.alice_comm_sk.as_ref()).expect("sign alice ChannelCreate");
+        let alice_engine = self
+            .registry_alice
+            .engine_arc(&self.community_id)
+            .await
+            .expect("alice engine arc");
+        alice_engine
+            .insert_local_event(ev)
+            .await
+            .expect("alice ChannelCreate insert must Ok");
+
+        // Precondition: Alice's own engine materializes the channel, so the
+        // beacon's harvested snapshot will actually carry it for Bob.
+        let alice_state = self
+            .registry_alice
+            .state_for(&self.community_id)
+            .await
+            .expect("alice state");
+        let events: Vec<_> = {
+            let g = alice_state.lock().await;
+            g.events.values().cloned().collect()
+        };
+        assert!(
+            materialize(&events, self.alice_addr)
+                .channels
+                .contains_key(&channel_id),
+            "Alice's own engine must materialize the channel she just created (she is \
+             enrolled via her bootstrap Join), else the admit-snapshot can't carry it"
+        );
     }
 }
 
@@ -542,10 +610,9 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
             engine_config: ChannelLogEngineConfig::default(),
             transport_epoch_rx: None,
         });
-    let _ = alice_comm_sk; // admin signer; only needed during setup above.
-
     OpenJoinSetup {
         bob_comm_sk,
+        alice_comm_sk,
         alice_addr,
         bob_addr,
         epoch_key,
@@ -554,6 +621,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         alice_ep,
         bob_ep,
         registry_alice,
+        registry_bob,
         bob_engine,
         pkarr_resolver,
         relay_client: client,
@@ -653,6 +721,47 @@ async fn assert_alice_materializes_bob_joined(setup: &OpenJoinSetup) {
          about Bob cross-WAN.)",
         mat.members.get(&setup.bob_addr).map(|m| m.status),
         events.len(),
+    );
+}
+
+/// Poll Bob's engine until it materializes the admin's channel `channel_id` from
+/// the admitted snapshot. This is the ZEB-573 load-bearing assertion: the
+/// admin-signed `ChannelCreate` (verify depends on Alice's enrollment Join) must
+/// survive Bob's dependency-ordered apply rather than being dropped with
+/// `SignerNotEnrolledForActor`. On the pre-fix single-pass apply this could time
+/// out whenever the harvest ordered the ChannelCreate ahead of Alice's Join.
+async fn assert_bob_materializes_channel(setup: &OpenJoinSetup, channel_id: ChannelId) {
+    let bob_state = setup
+        .registry_bob
+        .state_for(&setup.community_id)
+        .await
+        .expect("bob state must exist");
+    for _ in 0..50 {
+        let events: Vec<_> = {
+            let g = bob_state.lock().await;
+            g.events.values().cloned().collect()
+        };
+        if materialize(&events, setup.alice_addr)
+            .channels
+            .contains_key(&channel_id)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let events: Vec<_> = {
+        let g = bob_state.lock().await;
+        g.events.values().cloned().collect()
+    };
+    let mat = materialize(&events, setup.alice_addr);
+    panic!(
+        "Bob never materialized Alice's channel {channel_id:?} from the admitted snapshot — \
+         the admin-signed ChannelCreate was dropped instead of dependency-ordered-applied \
+         (ZEB-573 symptom: SignerNotEnrolledForActor on out-of-order apply). Bob has {} \
+         events and {} channels: {:?}",
+        events.len(),
+        mat.channels.len(),
+        mat.channels.keys().collect::<Vec<_>>(),
     );
 }
 
@@ -869,6 +978,82 @@ async fn open_join_cold_start_is_retryable_then_succeeds() {
     })
     .await
     .expect("open_join_cold_start_is_retryable_then_succeeds timed out at 60s");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 4: the joiner materializes the admin's channel from the admitted
+// snapshot (ZEB-573 regression guard). The existing tests only assert the
+// membership direction (Alice learns Bob joined); this asserts the OTHER
+// direction — Bob applies Alice's admin-signed ChannelCreate, whose verify
+// depends on Alice's enrollment Join being applied first. The pre-fix
+// single-pass apply dropped it with SignerNotEnrolledForActor whenever the
+// HashMap harvest ordered ChannelCreate ahead of the Join; the merged fix
+// (dependency-ordered apply: pre-sort by event_sort_key + retry-until-stable)
+// lands it. Closes the "channels parity-only (not asserted)" gap that let
+// ZEB-573 through.
+//
+// SCOPE — end-to-end guard, NOT a deterministic ordering guard: the harness
+// can't force the beacon's `g.events.values()` HashMap harvest order, so on a
+// REVERT of the apply-order fix this catches the regression only
+// probabilistically (when the harvest happens to put ChannelCreate ahead of
+// Alice's Join). The DETERMINISTIC worst-case ordering is pinned separately by
+// the unit test `admitted_snapshot_applies_enrollment_dependent_events_out_of_order`
+// (open_join_dial.rs), which constructs HLC-inverted events directly. The two
+// are complementary: that unit test proves the apply logic deterministically;
+// this proves the full open-join cold path delivers channels end-to-end. On
+// shipped (sorted-apply) code this test is non-flaky — the pre-sort makes the
+// apply order deterministic regardless of harvest order.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bob_materializes_alice_channel_via_open_join() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let s = setup_two_party_open_join().await;
+
+        // Alice (admin) creates #general BEFORE Bob dials, so her harvested
+        // admit-snapshot carries an admin-signed ChannelCreate.
+        let channel_id = ChannelId([0xC1; 16]);
+        s.insert_alice_channel(channel_id, "general").await;
+
+        // Alice is sole advertiser → slot 0.
+        let slot = s.publish_rendezvous_slot(vec![s.alice_addr]).await;
+        assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
+
+        let now_ms = wall_ms();
+        let outcome = connectivity_open_join_iroh_inner(
+            Arc::clone(&s.pkarr_resolver),
+            bob_dial_ctx(&s),
+            now_ms,
+        )
+        .await
+        .expect("open join inner must Ok");
+        assert_eq!(
+            outcome.status, "joined",
+            "open-join happy path must join. Got status={:?}",
+            outcome.status
+        );
+
+        // Membership converges (existing guarantee) AND Bob materializes Alice's
+        // channel from the admitted snapshot (the ZEB-573 fix).
+        assert_alice_materializes_bob_joined(&s).await;
+        assert_bob_materializes_channel(&s, channel_id).await;
+
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("bob_materializes_alice_channel_via_open_join timed out at 60s");
 }
 
 // The escalating-batch failover test (Test 2) needs ≥2 slots to widen past a
