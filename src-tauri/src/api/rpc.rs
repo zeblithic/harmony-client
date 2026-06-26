@@ -453,6 +453,16 @@ pub fn build_registry() -> RpcRegistry {
             crate::connectivity_redeem_invite_iroh_impl(state, sink, a.url).await
         }
     );
+    // open-community-cross-wan: open/tokenless first-contact join verb. The
+    // Task 12 two-agent E2E harness drives this for never-met open communities.
+    rpc!(
+        m,
+        "connectivity_open_join_iroh",
+        UrlArgs,
+        |state, sink, a| async move {
+            crate::connectivity_open_join_iroh_impl(state, sink, a.url).await
+        }
+    );
     rpc!(
         m,
         "join_open_community",
@@ -1471,6 +1481,7 @@ mod tests {
             "connectivity_set_identity_discoverable",
             "connectivity_get_identity_discoverable",
             "connectivity_redeem_invite_iroh",
+            "connectivity_open_join_iroh",
             // network health
             "network_health_snapshot",
             "network_health_run_self_test",

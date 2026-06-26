@@ -134,6 +134,8 @@ pub mod community_relay_publisher;
 pub mod community_relay_pull;
 pub mod community_relay_pull_driver;
 pub mod community_relay_resolver;
+pub mod community_rendezvous;
+pub mod community_rendezvous_publisher;
 // ZEB-487: read-only DTO + mapper for the headless `get_relay_held` RPC.
 pub mod community_state_crdt;
 pub mod relay_held_dto;
@@ -201,6 +203,9 @@ pub mod node_event_sink;
 pub mod notes_commands;
 pub mod notes_crdt;
 pub mod notes_persist;
+pub mod open_join_admit;
+pub mod open_join_auth;
+pub mod open_join_dial;
 pub mod owner_commands;
 pub mod owner_loaded;
 pub mod owner_state;
@@ -7073,6 +7078,24 @@ pub async fn start_node_inner(
                         ),
                     );
 
+                    // Beacon-side rendezvous slot publisher (open-community
+                    // cross-WAN first contact). Built from the SAME four inputs
+                    // as the member-keyed community publisher above, so both
+                    // publish the identical routing blob via the identical
+                    // `sign_new` seam. The relay-advertise loop drives its
+                    // `refresh_slot` (a member who is a relay advertiser at rank
+                    // i < N publishes its reachability under the rendezvous slot
+                    // key), so it re-publishes on the same relay-ad refresh +
+                    // membership-change triggers.
+                    let community_rendezvous_pub = std::sync::Arc::new(
+                        community_rendezvous_publisher::CommunityRendezvousPublisher::new(
+                            std::sync::Arc::clone(&pkarr_publisher_arc),
+                            (*signing_key_arc).clone(),
+                            identity_pub_64,
+                            std::sync::Arc::clone(&blob_builder),
+                        ),
+                    );
+
                     // ZEB-371: Case-D friend publisher. Reuses the SAME shared
                     // pkarr publisher and reachability `blob_builder` as the
                     // other case managers, so a re-register refreshes the
@@ -8163,6 +8186,16 @@ pub async fn start_node_inner(
                                         let device_id = device_id.clone();
                                         let optin = std::sync::Arc::clone(&relay_optin_doc);
                                         let membership = std::sync::Arc::clone(&relay_membership);
+                                        // Beacon-side rendezvous slot publisher + the
+                                        // resolver it ranks into slots. Driven on the
+                                        // SAME relay-ad refresh / membership-change
+                                        // triggers as the relay ad itself, so the
+                                        // node re-publishes its rendezvous slot
+                                        // whenever it re-publishes its relay ad.
+                                        let rendezvous_publisher =
+                                            std::sync::Arc::clone(&community_rendezvous_pub);
+                                        let rendezvous_resolver =
+                                            std::sync::Arc::clone(&community_relay_resolver);
                                         // THIS node's relay coordinates (stable for
                                         // the endpoint's lifetime; home_relay is
                                         // snapshotted at publish time below).
@@ -8180,6 +8213,10 @@ pub async fn start_node_inner(
                                             let optin = std::sync::Arc::clone(&optin);
                                             let membership = std::sync::Arc::clone(&membership);
                                             let ep = std::sync::Arc::clone(&ep_for_relay);
+                                            let rendezvous_publisher =
+                                                std::sync::Arc::clone(&rendezvous_publisher);
+                                            let rendezvous_resolver =
+                                                std::sync::Arc::clone(&rendezvous_resolver);
                                             Box::pin(async move {
                                                 let now_ms = std::time::SystemTime::now()
                                                     .duration_since(std::time::UNIX_EPOCH)
@@ -8283,6 +8320,30 @@ pub async fn start_node_inner(
                                                              insert_local_event failed; continuing"
                                                         );
                                                     }
+
+                                                    // Beacon-side: (re)publish this
+                                                    // node's rendezvous slot for `c`.
+                                                    // Ranks into a slot by its position
+                                                    // in the FRESH advertiser set; if
+                                                    // this node is at rank i < N it
+                                                    // publishes its reachability under
+                                                    // the slot key, else it unregisters
+                                                    // any stale slot. Re-published on
+                                                    // the same triggers as the relay ad
+                                                    // (refresh cadence + membership-
+                                                    // change force-wake).
+                                                    let advertisers = rendezvous_resolver
+                                                        .advertiser_addrs_for_community(
+                                                            &c, now_ms,
+                                                        );
+                                                    rendezvous_publisher
+                                                        .refresh_slot(
+                                                            c,
+                                                            engine.membership_key(),
+                                                            advertisers,
+                                                            actor,
+                                                        )
+                                                        .await;
                                                 }
                                             })
                                                 as futures::future::BoxFuture<'static, ()>
@@ -25357,6 +25418,22 @@ pub struct RedeemInviteResultDto {
     /// the timeout, so `pending` was effectively always false even with an
     /// offline admin; the oneshot now fires only on a real JoinCountersign.
     pub pending: bool,
+    /// Open-community cross-WAN first-contact status, set ONLY by the
+    /// `connectivity_open_join_iroh` path (the open/tokenless counterpart of
+    /// `connectivity_redeem_invite_iroh`). `None` for every other redeem
+    /// caller (legacy `redeem_invite`, invite-only iroh redeem). Values:
+    /// * `Some("joined")` — a beacon admitted us and applied its membership
+    ///   snapshot; the local self-Join is already committed.
+    /// * `Some("searching")` — cold start: no live beacon was resolved (or the
+    ///   dial failed before a response). RETRYABLE — `pending` is also `true`
+    ///   so the community appears greyed; the open-redeem flow re-attempts
+    ///   first contact on the next transport-epoch re-arm. NOT an error.
+    /// * `Some("rejected")` — a beacon was reached but explicitly rejected the
+    ///   request (capability/freshness/ban/rate-limit). NOT retryable as a
+    ///   cold-start; the frontend should surface a distinct error/blocked
+    ///   state rather than the "searching" spinner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// Wire shape of the `nav-updated` IPC event. Mirrors the frontend
@@ -25618,6 +25695,71 @@ pub struct RedeemInviteOverrides {
     /// a short wait WITHOUT mutating the process-global env var — the
     /// cross-test env race removed in ZEB-500. `None` in production.
     pub redeem_timeout: Option<std::time::Duration>,
+
+    /// Open cross-WAN first-contact dial deps. When `Some` AND the payload is
+    /// open (`!is_invite_only`), the open branch — after the local self-Join
+    /// insert succeeds — drives `open_join_dial::connectivity_open_join_iroh_inner`
+    /// to resolve a live beacon from the DHT rendezvous slots and apply the
+    /// admitted membership snapshot. The dial's `OpenJoinOutcome` is folded into
+    /// the returned DTO's `status` (and `pending`) via
+    /// `redeem_dto_from_open_join_outcome`. `None` (the default) → the legacy
+    /// behavior: insert the self-Join locally and rely on Zenoh CRDT sync to
+    /// converge (no first-contact dial). The `connectivity_open_join_iroh_impl`
+    /// IPC supplies this; every other caller leaves it `None`.
+    pub open_join_iroh: Option<OpenJoinIrohDeps>,
+}
+
+/// Dependencies for the open cross-WAN first-contact dial, injected into the
+/// open branch of `redeem_invite_inner_with_overrides` via
+/// [`RedeemInviteOverrides::open_join_iroh`].
+///
+/// The community `epoch_key` and the bootstrap-Join signing key are NOT carried
+/// here — the open branch already has them in scope (`minted.membership_key`
+/// and the `signing_key` argument `mint_redemption` signed `bootstrap_join`
+/// with), so threading them again would risk divergence from the values the
+/// engine + the minted Join were built against.
+pub struct OpenJoinIrohDeps {
+    /// The joiner's pkarr resolver (resolves the DHT rendezvous slots).
+    pub pkarr_resolver: std::sync::Arc<harmony_pkarr::PkarrResolver>,
+    /// The joiner's iroh endpoint used to dial the resolved beacon. `None`
+    /// (node not fully booted) → treated as unreachable → retryable cold start.
+    pub iroh_endpoint: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>,
+    /// Per-await dial timeouts (production: `HandshakeDialConfig::from_env`).
+    pub dial_config: crate::HandshakeDialConfig,
+}
+
+/// Pure mapping from an open-join [`crate::open_join_dial::OpenJoinOutcome`]
+/// onto the redeem DTO. Factored out so the cold-start (retryable) vs admitted
+/// (joined) vs rejected (error-ish) status mapping is unit-testable without an
+/// engine, an iroh endpoint, or a pkarr resolver.
+///
+/// `base` is the DTO the open redeem would otherwise return (the locally
+/// committed self-Join — `is_invite_only = false`, `pending = false`,
+/// `status = None`). The outcome only adjusts `pending` + `status`:
+/// * `"joined"`            → `pending = false`, `status = Some("joined")`.
+/// * `"no_beacon_reachable"` → `pending = true`, `status = Some("searching")`
+///   (RETRYABLE cold start — the community appears greyed and re-attempts on
+///   the next transport-epoch re-arm; NOT an error).
+/// * `"beacon_rejected"`   → `pending = false`, `status = Some("rejected")`
+///   (an explicit rejection is NOT a retryable cold-start; the frontend shows a
+///   distinct blocked state rather than the searching spinner).
+/// * any other (forward-compat) status → mirrored verbatim into `status` with
+///   `pending = false`.
+fn redeem_dto_from_open_join_outcome(
+    base: RedeemInviteResultDto,
+    outcome: &crate::open_join_dial::OpenJoinOutcome,
+) -> RedeemInviteResultDto {
+    let (pending, status) = match outcome.status.as_str() {
+        "joined" => (false, "joined"),
+        "no_beacon_reachable" => (true, "searching"),
+        "beacon_rejected" => (false, "rejected"),
+        other => (false, other),
+    };
+    RedeemInviteResultDto {
+        pending,
+        status: Some(status.to_string()),
+        ..base
+    }
 }
 
 /// ZEB-262 Phase 4: invite-only `redeem_invite` inner helper. Encodes
@@ -26063,6 +26205,10 @@ where
     // without a counter-sign landing. Always false for open communities.
     // Set inside the invite-only branch by the timeout match arm.
     let mut pending_redemption_timed_out: bool = false;
+    // Open cross-WAN first-contact dial outcome. `Some` only when the open
+    // branch ran the iroh first-contact dial (`overrides.open_join_iroh` set).
+    // Folded into the returned DTO's `status` + `pending` at step 10.
+    let mut open_join_outcome: Option<crate::open_join_dial::OpenJoinOutcome> = None;
     if adopt_orphaned_membership {
         // ZEB-436: repair path — no membership event to mint, no
         // countersign to await. Loud info (not debug): adoption should be
@@ -26094,6 +26240,77 @@ where
         ) {
             // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
             return Err(format!("self Join not inserted (got {outcome:?})"));
+        }
+
+        // Open cross-WAN first-contact dial (open-community-cross-wan): the
+        // local self-Join is committed above, but on a never-met-peer cold join
+        // there is no live Zenoh peer yet to converge against. When the caller
+        // supplied `open_join_iroh` deps, resolve a live beacon from the DHT
+        // rendezvous slots and dial it on the handshake ALPN to fetch + apply
+        // the admitted membership snapshot NOW. The dial primitive returns a
+        // RETRYABLE non-error on cold start (no beacon) or any transport failure
+        // — it never rolls back the durable local self-Join.
+        //
+        // The dial's `signing_key` MUST be the SAME key `mint_redemption` signed
+        // `bootstrap_join` with (the `signing_key` arg here) so the joiner
+        // identity it derives hashes to `bootstrap_join.actor` and the beacon's
+        // device-hash binding (Task 5) passes. The `epoch_key` is
+        // `minted.membership_key`, the link capability the engine spawned with.
+        if let Some(deps) = overrides.open_join_iroh.as_ref() {
+            let ctx = crate::open_join_dial::OpenJoinDialCtx {
+                community_id: minted.community_id,
+                epoch_key: minted.membership_key.clone(),
+                bootstrap_join: minted.bootstrap_join.clone(),
+                signing_key: std::sync::Arc::clone(&signing_key),
+                iroh_endpoint: deps.iroh_endpoint.clone(),
+                engine: Some(engine_arc.clone()),
+                // `HandshakeDialConfig` is `Copy` — copy it out of the borrowed deps.
+                dial_config: deps.dial_config,
+            };
+            match crate::open_join_dial::connectivity_open_join_iroh_inner(
+                deps.pkarr_resolver.clone(),
+                ctx,
+                wall_now_ms,
+            )
+            .await
+            {
+                Ok(o) => {
+                    tracing::info!(
+                        community_id = %hex::encode(minted.community_id.0),
+                        status = %o.status,
+                        "open-join: first-contact dial completed"
+                    );
+                    open_join_outcome = Some(o);
+                }
+                Err(e) => {
+                    // An internal build/encode invariant violation (NOT a
+                    // transport failure — those are retryable `Ok` cold-start
+                    // outcomes). Masking this as `no_beacon_reachable` would hide
+                    // a genuine bug behind a perpetual "searching" spinner that
+                    // never resolves. Log LOUDLY (error-level) and surface a
+                    // DISTINCT, NON-retryable outcome instead. The local self-Join
+                    // committed above stays durable (this branch does NOT early-
+                    // return, so the `community_sync_guard.commit()` below still
+                    // runs); only the first-contact dial result is downgraded to
+                    // a blocked (not retryable) state.
+                    tracing::error!(
+                        community_id = %hex::encode(minted.community_id.0),
+                        error = %e,
+                        "open-join: first-contact dial failed on an INTERNAL invariant \
+                         (build/encode) — NOT a transport cold start; surfacing a \
+                         non-retryable blocked outcome (local self-Join stays committed)"
+                    );
+                    open_join_outcome = Some(crate::open_join_dial::OpenJoinOutcome {
+                        // Maps via `redeem_dto_from_open_join_outcome` to
+                        // `pending = false`, `status = Some("rejected")` — a
+                        // distinct blocked state, NOT the retryable searching
+                        // spinner. (Genuine transport-unreachable stays the
+                        // retryable `no_beacon_reachable` Ok-outcome.)
+                        status: "beacon_rejected".to_string(),
+                        community_id: Some(hex::encode(minted.community_id.0)),
+                    });
+                }
+            }
         }
     } else {
         // INVITE-ONLY: 7a-d.
@@ -26706,11 +26923,21 @@ where
     // 10. Return DTO with the invite's name + kind so the caller can
     // render the new community without re-decoding the URL or
     // round-tripping. ZEB-265.
-    Ok(RedeemInviteResultDto {
+    let base_dto = RedeemInviteResultDto {
         community_id: hex::encode(minted.community_id.0),
         community_name: payload.community_name.clone(),
         is_invite_only: payload.is_invite_only,
         pending: pending_redemption_timed_out,
+        // Set only by the open cross-WAN first-contact dial below (when
+        // `overrides.open_join_iroh` is `Some`). For every other caller the
+        // open-join status is not applicable.
+        status: None,
+    };
+    // Fold the open first-contact dial outcome (if any) into the DTO's
+    // `status` + `pending` via the pure, unit-tested mapping helper.
+    Ok(match open_join_outcome {
+        Some(outcome) => redeem_dto_from_open_join_outcome(base_dto, &outcome),
+        None => base_dto,
     })
 }
 
@@ -27210,6 +27437,72 @@ mod redeem_invite_inner_tests {
     use harmony_identity::PrivateIdentity;
     use std::collections::BTreeMap;
     use tokio::sync::mpsc;
+
+    // ── Open-join DTO mapping (open-community-cross-wan) ───────────────────────
+
+    fn open_join_base_dto() -> RedeemInviteResultDto {
+        RedeemInviteResultDto {
+            community_id: "aa".to_string(),
+            community_name: "Open Town".to_string(),
+            is_invite_only: false,
+            pending: false,
+            status: None,
+        }
+    }
+
+    /// A cold-start open-join outcome (`no_beacon_reachable`) maps to a
+    /// RETRYABLE DTO — `status == "searching"`, `pending == true` — NOT an
+    /// error. The community appears greyed and re-attempts first contact on the
+    /// next transport-epoch re-arm.
+    #[test]
+    fn open_join_cold_start_maps_to_retryable_dto() {
+        let outcome = crate::open_join_dial::OpenJoinOutcome {
+            status: "no_beacon_reachable".to_string(),
+            community_id: Some("aa".to_string()),
+        };
+        let dto = redeem_dto_from_open_join_outcome(open_join_base_dto(), &outcome);
+        assert_eq!(
+            dto.status.as_deref(),
+            Some("searching"),
+            "cold start must map to a retryable searching status, not an error"
+        );
+        assert!(
+            dto.pending,
+            "cold start must be pending=true (greyed, retryable)"
+        );
+        // The base community identity/name/kind are preserved.
+        assert_eq!(dto.community_id, "aa");
+        assert!(!dto.is_invite_only);
+    }
+
+    /// An admitted open-join outcome (`joined`) maps to a joined DTO:
+    /// `status == "joined"`, `pending == false`.
+    #[test]
+    fn open_join_joined_maps_to_joined_dto() {
+        let outcome = crate::open_join_dial::OpenJoinOutcome {
+            status: "joined".to_string(),
+            community_id: Some("aa".to_string()),
+        };
+        let dto = redeem_dto_from_open_join_outcome(open_join_base_dto(), &outcome);
+        assert_eq!(dto.status.as_deref(), Some("joined"));
+        assert!(!dto.pending, "a joined open-join must not be pending");
+    }
+
+    /// An explicit beacon rejection (`beacon_rejected`) maps to a distinct,
+    /// non-retryable `rejected` status — NOT the retryable `searching` spinner.
+    #[test]
+    fn open_join_rejected_maps_to_rejected_dto() {
+        let outcome = crate::open_join_dial::OpenJoinOutcome {
+            status: "beacon_rejected".to_string(),
+            community_id: Some("aa".to_string()),
+        };
+        let dto = redeem_dto_from_open_join_outcome(open_join_base_dto(), &outcome);
+        assert_eq!(dto.status.as_deref(), Some("rejected"));
+        assert!(
+            !dto.pending,
+            "an explicit rejection is not a retryable cold start"
+        );
+    }
 
     // ── Fixture helper ────────────────────────────────────────────────────────
 
@@ -42811,6 +43104,216 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
     Ok(outcome)
 }
 
+/// Tauri IPC: redeem an OPEN community URL via cross-WAN first contact.
+///
+/// The open/tokenless counterpart of [`connectivity_redeem_invite_iroh`]. An
+/// open URL carries the raw epoch key (the link capability); there is no
+/// admin counter-sign dance. This drives the normal open-redeem flow
+/// (`redeem_invite_inner_with_overrides`) — URL-parse, mint a self-Join, spawn
+/// the engine, insert the self-Join locally — and then, on a never-met-peer
+/// cold join where no live Zenoh peer exists yet, dials a live beacon resolved
+/// from the DHT rendezvous slots to fetch + apply the admitted membership
+/// snapshot NOW (`open_join_dial::connectivity_open_join_iroh_inner`).
+///
+/// Returns a [`RedeemInviteResultDto`] whose `status` carries the open-join
+/// outcome: `Some("joined")` on admission, `Some("searching")` on a retryable
+/// cold start (no live beacon — the community appears greyed and re-attempts on
+/// the next transport-epoch re-arm), or `Some("rejected")` when a beacon
+/// explicitly refused the request.
+// ZEB-365: bare `#[tauri::command]` => camelCase args (CLAUDE.md "Tauri IPC
+// parameter naming"). `connectivity-adapter.ts` invokes this with `{ inviteUrl }`.
+// Do NOT add `rename_all = "snake_case"`.
+#[tauri::command]
+async fn connectivity_open_join_iroh(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    invite_url: String,
+) -> Result<RedeemInviteResultDto, String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    connectivity_open_join_iroh_impl(state.inner(), sink, invite_url).await
+}
+
+/// Shared IPC/RPC seam for the open cross-WAN first-contact community-join verb.
+/// Takes a [`crate::node_event_sink::NodeEventSink`] instead of a
+/// `tauri::AppHandle` so the headless `serve` RPC surface can drive cross-WAN
+/// open-join (the REAL first-contact path for never-met nodes).
+///
+/// Snapshots the same `NodeState` handles `connectivity_redeem_invite_iroh_impl`
+/// does (under a single std-lock scope, dropped before any `.await`), reads the
+/// `community_signing_key` + `enrollment_cert` from the dm_outbox, builds the
+/// generation fence, then delegates to `redeem_invite_inner_with_overrides` with
+/// `open_join_iroh` populated so its open branch runs the first-contact dial.
+pub(crate) async fn connectivity_open_join_iroh_impl(
+    state: &Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    invite_url: String,
+) -> Result<RedeemInviteResultDto, String> {
+    let _ = &sink; // ZEB: nav-updated emit is a frontend follow-up (banner task).
+                   // Snapshot NodeState handles in a single guard scope, then drop the std
+                   // lock BEFORE any `.await`. Mirrors `connectivity_redeem_invite_iroh_impl`.
+    let (
+        pkarr_resolver,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        community_adapter_tx,
+        transport_epoch_rx,
+        channel_log_registry,
+        dm_outbox,
+        iroh_endpoint,
+        sync_engine,
+        snapshot_generation,
+    ) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pkarr_resolver.clone(),
+            g.crdt_state.clone(),
+            g.hlc_tracker.clone(),
+            g.dm_device_id.clone(),
+            g.dm_self_owner,
+            g.community_registry.clone(),
+            g.community_adapter_request_tx.clone(),
+            // ZEB-434 D6: pass-through Option (a missing receiver degrades to a
+            // non-re-arming fetch driver, not a hard failure).
+            g.transport_epoch_rx.clone(),
+            g.channel_log_registry.clone(),
+            g.dm_outbox.clone(),
+            g.iroh_endpoint.clone(),
+            // ZEB-427: durable-on-commit fence handle. Deliberately NOT part of
+            // the Some(...) gate below — the fence handles None itself.
+            g.sync_engine.clone(),
+            g.generation,
+        )
+    };
+
+    // Every NodeState handle below is required to mint + spawn + commit the
+    // open join. A missing one means the node isn't fully booted — this is an
+    // INIT FAILURE, not a transient "no beacon yet". Surfacing it as the
+    // retryable "searching" status would mask a real boot problem behind a
+    // spinner that never resolves. Return a hard `Err` so the UI shows a
+    // distinct error (the `openJoinIroh` adapter wraps a rejection into
+    // `joinError`) rather than a perpetual cold-start.
+    let (
+        Some(pkarr_resolver),
+        Some(crdt_state),
+        Some(hlc_tracker),
+        Some(device_id),
+        Some(self_owner),
+        Some(community_registry),
+        Some(community_adapter_tx),
+        Some(channel_log_registry),
+        Some(dm_outbox),
+    ) = (
+        pkarr_resolver,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        community_adapter_tx,
+        channel_log_registry,
+        dm_outbox,
+    )
+    else {
+        return Err(
+            "connectivity_open_join_iroh: node not fully booted (a required handle is \
+             missing) — cannot open-join; this is an init failure, not a retryable cold start"
+                .to_string(),
+        );
+    };
+
+    // ZEB-339: the self-Join minted on this open path signs with the enrolled
+    // device key (#2) and carries this device's own EnrollmentCert. The SAME
+    // `community_signing_key` is threaded into the open-join dial so the joiner
+    // identity it derives hashes to `bootstrap_join.actor` (the beacon's Task-5
+    // device-hash binding requires this).
+    let (community_signing_key, enrollment_cert) = {
+        let outbox_g = dm_outbox.lock().await;
+        (
+            std::sync::Arc::clone(&outbox_g.community_signing_key),
+            outbox_g.enrollment_cert.clone(),
+        )
+    };
+
+    // Generation fence (mirrors `redeem_invite` / the iroh invite redeem): the
+    // commit is suppressed if the node was stopped (or stop+restart raced) mid
+    // first-contact.
+    let fence_check = move || -> Result<(), String> {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during connectivity_open_join_iroh \
+                 (was {}, now {}); join minted on a detached crdt_state and won't \
+                 be persisted — engine spawn suppressed",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry was torn down during connectivity_open_join_iroh \
+                 — engine spawn suppressed"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    };
+
+    let dto = redeem_invite_inner_with_overrides(
+        invite_url,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_signing_key,
+        enrollment_cert,
+        community_registry,
+        community_adapter_tx,
+        transport_epoch_rx,
+        dm_outbox,
+        channel_log_registry,
+        fence_check,
+        crate::owner_commands::resolve_identity_dir().ok(),
+        RedeemInviteOverrides {
+            open_join_iroh: Some(OpenJoinIrohDeps {
+                pkarr_resolver,
+                iroh_endpoint,
+                dial_config: HandshakeDialConfig::from_env(),
+            }),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    // ZEB-393 Bug A: durable-on-commit fence (mirrors `redeem_invite`). Persist
+    // the joined community's owner-state Space to disk before returning so a
+    // non-graceful exit can't lose this membership. Non-fatal; `None` only
+    // pre-start_node.
+    if let Some(engine) = sync_engine.as_ref() {
+        fence_owner_state_flush(
+            engine,
+            OWNER_STATE_FENCE_TIMEOUT,
+            "connectivity_open_join_iroh",
+            &dto.community_id,
+        )
+        .await;
+    }
+
+    // durable-seal-targets: on a successful open first-contact JOIN, wake the
+    // reachability publisher so this freshly-joined member emits its per-community
+    // `ReachabilityAnnounce` now (mirrors the iroh invite redeem).
+    if dto.status.as_deref() == Some("joined") {
+        force_reachability_republish(state);
+    }
+
+    Ok(dto)
+}
+
 /// Upper bound on a durable-on-commit fence's `flush_now().await`.
 /// Qodo (PR #226 R1): `flush_now` waits on a oneshot reply from the
 /// engine's internal task; a stalled task (or backpressure in its
@@ -43066,7 +43569,7 @@ async fn invite_targets_orphaned_community_dir(
 /// Synthesize an iroh `EndpointAddr` from a verified reachability routing
 /// record: iroh node id (required) + home relay url (skipped if malformed) +
 /// direct addresses. Shared by the redeem and add-friend dial paths.
-fn endpoint_addr_from_routing(
+pub(crate) fn endpoint_addr_from_routing(
     routing: &crate::reachability_record::ReachabilityAnnouncePayload,
 ) -> Result<iroh::EndpointAddr, String> {
     let id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
@@ -43896,6 +44399,8 @@ where
         // ZEB-501: production uses the env-or-5s default (the pre-delivered
         // countersign resolves the oneshot well within it).
         redeem_timeout: None,
+        // Invite-only path — no open first-contact dial.
+        open_join_iroh: None,
     };
     let result = redeem_invite_inner_with_overrides(
         invite_url,
@@ -49394,6 +49899,8 @@ pub fn run() {
             connectivity_force_republish,
             // ZEB-323 Phase 2b: pkarr policy IPCs.
             connectivity_redeem_invite_iroh,
+            // open-community-cross-wan: open/tokenless first-contact join.
+            connectivity_open_join_iroh,
             connectivity_set_identity_discoverable,
             connectivity_get_identity_discoverable,
             connectivity_discover_identity,

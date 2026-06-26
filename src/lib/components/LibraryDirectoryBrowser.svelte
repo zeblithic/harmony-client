@@ -21,19 +21,45 @@
     DiscoveredLibraryInfo,
   } from '../library-directory-service';
   import type { TauriAdapter } from '../zenoh-service';
+  import type { RedeemInviteResultDto } from '../community-service';
 
   let {
     service,
     adapter,
     onJoin,
+    onOpenJoinIroh,
+    onJoinedUi,
     onClose,
   }: {
     service: LibraryDirectoryService;
     adapter: TauriAdapter;
     /** Called when the user clicks Join on an entry. Wired to join_open_community.
      *  Receives the entry's `community_id` (32-hex-char SpaceId) so the backend
-     *  can re-resolve the directory entry server-side at click time. */
+     *  can re-resolve the directory entry server-side at click time. This
+     *  PERFORMS A BACKEND JOIN — used for the legacy/local LAN redeem path. */
     onJoin: (communityId: string) => Promise<void>;
+    /**
+     * Open-community cross-WAN first-contact join. When provided, Join routes
+     * through this (the entry's `invite_url`) instead of the LAN `onJoin`
+     * path, so the returned `RedeemInviteResultDto.status` can drive a
+     * cold-start "searching" / "rejected" banner. The open-join backend ALREADY
+     * commits membership, so on `"joined"` the component runs only the UI
+     * follow-up (`onJoinedUi`, if provided) and closes — it does NOT re-invoke
+     * `onJoin`, which would trigger a redundant SECOND (LAN) backend join. Wired
+     * to `connectivity_open_join_iroh(inviteUrl)`. Omit to keep the pure LAN
+     * `onJoin` behavior (existing callers / tests).
+     */
+    onOpenJoinIroh?: (inviteUrl: string) => Promise<RedeemInviteResultDto>;
+    /**
+     * UI-only follow-up after a successful cross-WAN open-join (`"joined"`).
+     * Runs the App-side nav-update / community-switch / member-refresh WITHOUT
+     * performing a backend join (the open-join IPC already committed
+     * membership). Receives the open-join result DTO (carrying the committed
+     * `communityId` + `communityName`). Called only on the `onOpenJoinIroh`
+     * `"joined"` path; absent → the component just closes the modal. The
+     * status-absent legacy result still falls through to the backend `onJoin`.
+     */
+    onJoinedUi?: (result: RedeemInviteResultDto) => Promise<void> | void;
     /** Closes the browser modal. */
     onClose: () => void;
   } = $props();
@@ -46,6 +72,14 @@
   let removeError: string | null = $state(null);
   let joinPending = $state<string | null>(null); // community_id mid-join
   let joinError: string | null = $state(null);
+  // Open-community cross-WAN cold-start state (ZEB first-contact). Keyed by
+  // community_id so the banner attaches to the row the user clicked.
+  //   'searching' → retryable: no beacon reachable yet, the node keeps
+  //                 retrying on its transport-epoch re-arm (non-blocking).
+  //   'rejected'  → the beacon explicitly declined the join (banned / bad
+  //                 capability) — a distinct blocked state, NOT the spinner.
+  let coldStartSearching = $state<string | null>(null);
+  let coldStartRejected = $state<string | null>(null);
 
   // ZEB-279 Sub-D Phase 2: discovered libraries (auto-announce ingest).
   // Filtered IPC excludes already-added libraries, so a row migrates
@@ -174,7 +208,40 @@
   async function handleJoin(entry: DirectoryEntry) {
     joinPending = entry.community_id;
     joinError = null;
+    // Clear any prior cold-start banner for this row before re-attempting.
+    coldStartSearching = null;
+    coldStartRejected = null;
     try {
+      // Open-community cross-WAN first-contact path: when wired, route the
+      // entry's invite URL through `connectivity_open_join_iroh` so its
+      // `status` can drive a cold-start banner. The directory only lists OPEN
+      // communities, so every entry is eligible for this path.
+      if (onOpenJoinIroh) {
+        const result = await onOpenJoinIroh(entry.invite_url);
+        if (result.status === 'searching') {
+          // RETRYABLE cold start — keep the modal open and show a
+          // non-blocking "still searching" banner. NOT an error/failure.
+          coldStartSearching = entry.community_id;
+          return;
+        }
+        if (result.status === 'rejected') {
+          // Distinct blocked state — the community declined the join (or an
+          // internal dial invariant failed). NOT a retryable spinner.
+          coldStartRejected = entry.community_id;
+          return;
+        }
+        if (result.status === 'joined') {
+          // The open-join backend ALREADY committed membership. Run only the
+          // UI follow-up (nav-update / switch / member-refresh) and close — do
+          // NOT call the legacy `onJoin`, which would trigger a redundant
+          // SECOND backend (LAN) join.
+          await onJoinedUi?.(result);
+          onClose();
+          return;
+        }
+        // status absent (legacy/local result) → fall through to the normal
+        // backend joined success path below.
+      }
       await onJoin(entry.community_id);
       onClose();
     } catch (e) {
@@ -342,6 +409,25 @@
             >
               {joinPending === entry.community_id ? 'Joining…' : 'Join'}
             </button>
+            {#if coldStartSearching === entry.community_id}
+              <!-- Non-blocking, retryable cold-start: no beacon reachable yet.
+                   The node keeps retrying on its transport-epoch re-arm — this
+                   is NOT a failure, so style it as an in-progress notice (NOT
+                   the red error banner). -->
+              <div class="searching-banner" data-testid="cold-start-searching" role="status">
+                <div class="spinner" aria-hidden="true"></div>
+                <span>
+                  Searching for the community — no one's reachable yet, we'll keep trying.
+                </span>
+              </div>
+            {/if}
+            {#if coldStartRejected === entry.community_id}
+              <!-- Distinct blocked state: the community explicitly declined the
+                   join (banned / bad capability). NOT the searching spinner. -->
+              <div class="rejected-banner" data-testid="cold-start-rejected" role="alert">
+                This community declined the join request.
+              </div>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -397,6 +483,44 @@
   .join-btn { align-self: center; padding: 6px 12px; background: rgba(120,140,200,0.4); border: none; border-radius: 4px; cursor: pointer; }
   .join-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .join-error { color: #d83c3e; font-size: 0.85rem; margin-top: 8px; }
+  /* Cold-start "still searching" — non-blocking, in-progress (NOT an error).
+     Neutral/secondary styling with the same spinner the redeem flow uses. */
+  .searching-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+  }
+  .spinner {
+    width: 12px;
+    height: 12px;
+    flex: 0 0 auto;
+    border: 2px solid var(--accent);
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+  /* Cold-start "rejected" — distinct blocked state (red, like join-error). */
+  .rejected-banner {
+    width: 100%;
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid #d83c3e;
+    border-radius: 4px;
+    color: #d83c3e;
+    font-size: 0.8rem;
+  }
   .remove-error { color: #d83c3e; font-size: 0.8rem; margin: 0 0 8px; }
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
   .modal-content { background: var(--bg-secondary); border-radius: 6px; }

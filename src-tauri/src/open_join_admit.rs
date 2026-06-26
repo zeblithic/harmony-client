@@ -1,0 +1,721 @@
+//! Beacon-side verification + admission for tokenless open-community join.
+//!
+//! `verify_and_admit_open_join` is the security core of the open-join handshake:
+//! a beacon (which holds the community `epoch_key`) calls it to decide whether
+//! to admit a tokenless [`OpenJoinRequest`]. It is **pure/synchronous** — no
+//! I/O, no engine lock — so it is fully unit-testable. The caller (the iroh
+//! accept dispatcher) supplies `current_events` (the beacon engine's signed
+//! membership log) and, on success, applies the admitted Join to its engine.
+//!
+//! Check order (cheap structural → capability → identity → stateful):
+//!   1. Community scope (`req.community_id == community_id`).
+//!   2. Freshness window (bounded skew on `created_at.wall_ms`).
+//!   3. Capability proof (`epoch_auth` recomputed under `epoch_key`).
+//!   4. Device-hash binding (`signing_device_hash == H(joiner_identity_pub)`).
+//!   5. Joiner identity control (enrollment cert → enrolled device key).
+//!   6. Packet-envelope signature (`verify_strict` over the exact signed bytes).
+//!   7. Nonce-replay + per-window rate limit.
+//!   8. Ban-check (materialized state strictly before the Join HLC).
+//!   9. Admit via the shipping `bootstrap_admit_open_publisher` gate.
+
+use crate::community_invite::{device_hash_from_identity_pub, OpenJoinRequest};
+use crate::community_membership::{
+    bootstrap_admit_open_publisher, enrolled_key_from_cert, prior_state_at_hlc, MemberStatus,
+    SignedMembershipEvent,
+};
+use crate::open_join_auth::verify_epoch_auth;
+use crate::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
+use std::collections::{HashMap, HashSet};
+
+/// Max admissions accepted per rolling window before excess is shed.
+pub const OPEN_JOIN_RATE_LIMIT_PER_WINDOW: usize = 20;
+/// Rolling rate-limit window, in milliseconds.
+pub const OPEN_JOIN_RATE_LIMIT_WINDOW_MS: u64 = 60_000;
+
+/// How old an [`OpenJoinRequest`]'s `created_at` may be (relative to the
+/// beacon's wall clock) before it is rejected as `Stale`. Distinct from the
+/// rate-limit window: the freshness window bounds the joiner's signed
+/// capability/timestamp validity, while the rate-limit window paces admissions.
+/// 2 minutes accommodates cross-WAN dial/resolve latency and modest clock skew
+/// while keeping the replayable/forge-resistant window short.
+pub const OPEN_JOIN_FRESHNESS_WINDOW_MS: u64 = 120_000;
+
+/// Rejection reasons for [`verify_and_admit_open_join`]. Distinct variants so a
+/// caller can pick a wire status / log line per failure class without parsing
+/// strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenJoinReject {
+    /// `epoch_auth` did not recompute under `epoch_key` (no/forged capability).
+    BadCapability,
+    /// `signing_device_hash` ≠ `H(joiner_identity_pub)` (request self-contradicts).
+    DeviceHashMismatch,
+    /// The packet envelope signature failed `verify_strict` against the joiner's
+    /// enrolled device key.
+    BadJoinerSig,
+    /// The Join's enrollment cert is missing/invalid (no proof of identity control).
+    BadEnrollment,
+    /// `created_at` is outside the bounded freshness window (too old or too far future).
+    Stale,
+    /// The request nonce was already seen within the replay-cache horizon.
+    Replay,
+    /// The joiner owner is `Banned` at the Join HLC.
+    Banned,
+    /// Per-window admission cap exceeded.
+    RateLimited,
+    /// Wrong community, or `bootstrap_admit_open_publisher` declined (not Joined).
+    NotAdmittable,
+}
+
+/// Successful admission: the joiner's owner address plus the event snapshot
+/// (the beacon's current log with the joiner's Join appended) the caller serves
+/// back and applies to its engine.
+#[derive(Debug)]
+pub struct OpenJoinAdmitOk {
+    pub joiner_addr: OwnerAddr,
+    pub member_events_snapshot: Vec<SignedMembershipEvent>,
+}
+
+/// Per-window admission limiter + nonce-replay cache. The window is coarse
+/// (a count per rolling window); the nonce cache rejects exact-replay within
+/// the retention horizon and is bounded by eviction.
+#[derive(Default)]
+pub struct OpenJoinRateLimiter {
+    window_start_ms: u64,
+    count_in_window: usize,
+    seen_nonces: HashSet<[u8; 16]>,
+    nonce_seen_at: HashMap<[u8; 16], u64>,
+}
+
+impl OpenJoinRateLimiter {
+    /// Returns true if a request is allowed; rolls the window over when it has
+    /// elapsed. Mutates the in-window counter only when allowing.
+    fn allow(&mut self, now_ms: u64) -> bool {
+        if now_ms.saturating_sub(self.window_start_ms) >= OPEN_JOIN_RATE_LIMIT_WINDOW_MS {
+            self.window_start_ms = now_ms;
+            self.count_in_window = 0;
+        }
+        if self.count_in_window >= OPEN_JOIN_RATE_LIMIT_PER_WINDOW {
+            return false;
+        }
+        self.count_in_window += 1;
+        true
+    }
+
+    /// Returns true if `nonce` was already seen within the retention horizon.
+    /// Evicts entries older than the horizon to bound memory. Does NOT record
+    /// the nonce — recording is split into [`Self::record_nonce`] so a request
+    /// that is shed by the rate limiter (which is checked AFTER replay) does not
+    /// leave its nonce persisted, which would wrongly reject a legitimate retry
+    /// as a replay.
+    fn is_replay(&mut self, nonce: &[u8; 16], now_ms: u64) -> bool {
+        let horizon = now_ms.saturating_sub(OPEN_JOIN_RATE_LIMIT_WINDOW_MS.saturating_mul(4));
+        let seen = &mut self.seen_nonces;
+        self.nonce_seen_at.retain(|n, t| {
+            let keep = *t >= horizon;
+            if !keep {
+                seen.remove(n);
+            }
+            keep
+        });
+        self.seen_nonces.contains(nonce)
+    }
+
+    /// Record `nonce` as seen at `now_ms`. Called only AFTER a request has
+    /// passed both the replay check and the rate-limit check, so a `RateLimited`
+    /// rejection never persists a nonce (a later legitimate retry must not be
+    /// rejected as a replay).
+    fn record_nonce(&mut self, nonce: &[u8; 16], now_ms: u64) {
+        self.seen_nonces.insert(*nonce);
+        self.nonce_seen_at.insert(*nonce, now_ms);
+    }
+}
+
+/// Verify a tokenless open-join request and, if valid, admit the joiner.
+///
+/// `signed_bytes` MUST be the exact bytes the joiner signed (= the
+/// `signed_bytes` captured by `decode_packet` for the `OpenJoin` variant, which
+/// is `canonical_cbor_encode(&req)`); we verify `packet_sig` against THESE bytes
+/// rather than re-encoding `req` here, so encoder drift can never desync the
+/// verify preimage from the mint preimage.
+///
+/// `now_ms` is the beacon's wall clock; `freshness_window_ms` bounds how old
+/// `created_at` may be. `current_events` is the beacon engine's signed
+/// membership log (assumed already verified — `prior_state_at_hlc`/`materialize`
+/// do not re-verify signatures).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_and_admit_open_join(
+    req: &OpenJoinRequest,
+    packet_sig: &[u8; 64],
+    signed_bytes: &[u8],
+    epoch_key: &EpochKey,
+    community_id: SpaceId,
+    admin_addr: OwnerAddr,
+    current_events: &[SignedMembershipEvent],
+    now_ms: u64,
+    freshness_window_ms: u64,
+    limiter: &mut OpenJoinRateLimiter,
+) -> Result<OpenJoinAdmitOk, OpenJoinReject> {
+    // 1. Community scope.
+    if req.community_id != community_id {
+        return Err(OpenJoinReject::NotAdmittable);
+    }
+
+    // 2. Freshness (bounded window; reject future-dated beyond a small skew).
+    let created = req.created_at.wall_ms;
+    if now_ms.saturating_sub(created) > freshness_window_ms
+        || created > now_ms.saturating_add(60_000)
+    {
+        return Err(OpenJoinReject::Stale);
+    }
+
+    // 3. Capability proof. `timestamp_ms` is `created_at.wall_ms` — the joiner
+    //    mints `epoch_auth` over the same value (Task 10 must match this).
+    if !verify_epoch_auth(
+        epoch_key,
+        &community_id,
+        &req.joiner_identity_pub,
+        &req.nonce,
+        created,
+        &req.epoch_auth,
+    ) {
+        return Err(OpenJoinReject::BadCapability);
+    }
+
+    // 4. Device-hash binding. `decode_packet` does NOT enforce this for 0x11, so
+    //    reject a request whose advertised device hash doesn't derive from its
+    //    own identity pub.
+    if req.signing_device_hash.0 != device_hash_from_identity_pub(&req.joiner_identity_pub) {
+        return Err(OpenJoinReject::DeviceHashMismatch);
+    }
+
+    // 5. Joiner identity control: the enrollment cert binds the join_event's
+    //    device key to the joiner owner, verified the same way the merge path
+    //    does (cert.verify + Master issuer + owner == actor).
+    let enrolled =
+        enrolled_key_from_cert(&req.join_event).map_err(|_| OpenJoinReject::BadEnrollment)?;
+
+    // 6. Packet envelope signature: signed by the joiner's enrolled device key
+    //    over the EXACT `signed_bytes` (mirrors verify_publisher_sig's
+    //    verify_strict posture). We do NOT re-encode `req` here.
+    {
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&enrolled.device_ed25519)
+            .map_err(|_| OpenJoinReject::BadJoinerSig)?;
+        let sig = ed25519_dalek::Signature::from_bytes(packet_sig);
+        vk.verify_strict(signed_bytes, &sig)
+            .map_err(|_| OpenJoinReject::BadJoinerSig)?;
+    }
+
+    // 7. Replay + rate-limit (after cheap structural + crypto checks, before the
+    //    stateful materialization). Replay is CHECKED first (without recording)
+    //    so a replayed nonce is reported as Replay rather than masked by a
+    //    coincident rate-limit shed. The nonce is RECORDED only AFTER the rate
+    //    limit also passes — otherwise a `RateLimited` rejection would persist
+    //    the nonce and a legitimate retry would be wrongly rejected as a replay.
+    if limiter.is_replay(&req.nonce, now_ms) {
+        return Err(OpenJoinReject::Replay);
+    }
+    if !limiter.allow(now_ms) {
+        return Err(OpenJoinReject::RateLimited);
+    }
+    limiter.record_nonce(&req.nonce, now_ms);
+
+    // 8. Ban-check against the materialized state strictly before the joiner's
+    //    Join HLC. A Banned owner is rejected even if their fresh Join would
+    //    otherwise admit.
+    let mat = prior_state_at_hlc(current_events, &req.join_event.at, admin_addr);
+    if let Some(ms) = mat.members.get(&enrolled.owner) {
+        if ms.status == MemberStatus::Banned {
+            return Err(OpenJoinReject::Banned);
+        }
+    }
+
+    // 9. Admit via the shipping open-admission gate: feed the request's own Join
+    //    alongside the current log; bootstrap_admit_open_publisher materializes
+    //    the publisher's prefix STRICTLY BEFORE the root HLC and confirms they
+    //    are Joined. The production sync path's root HLC (`payload.at`) is always
+    //    strictly after the publisher's self-Join; here the Join *is* the only
+    //    publisher event, so we derive a root HLC one logical tick past it so the
+    //    Join falls inside the pre-root window. (The ban-check above deliberately
+    //    uses `req.join_event.at` itself, not this bumped root.)
+    let admission_root = crate::owner_state_types::Hlc {
+        wall_ms: req.join_event.at.wall_ms,
+        logical: req.join_event.at.logical.saturating_add(1),
+        device_id: req.join_event.at.device_id.clone(),
+    };
+    let mut events_with_join = current_events.to_vec();
+    events_with_join.push(req.join_event.clone());
+    bootstrap_admit_open_publisher(
+        &events_with_join,
+        enrolled.owner,
+        admin_addr,
+        community_id,
+        &admission_root,
+    )
+    .ok_or(OpenJoinReject::NotAdmittable)?;
+
+    Ok(OpenJoinAdmitOk {
+        joiner_addr: enrolled.owner,
+        member_events_snapshot: events_with_join,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::community_invite::OpenJoinRequest;
+    use crate::community_membership::{
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        TestOwner,
+    };
+    use crate::open_join_auth::mint_epoch_auth;
+    use crate::owner_state_types::{DeviceIdentityHash, Hlc};
+
+    const COMMUNITY: SpaceId = SpaceId([0x42; 16]);
+    const FRESHNESS: u64 = 60_000;
+
+    /// A self-contained, real-mint open-join fixture: a community admin, a
+    /// joiner with a valid Master EnrollmentCert and a self-signed open Join,
+    /// and a faithfully built `OpenJoinRequest` (real `epoch_auth`, real packet
+    /// signature) the beacon would receive.
+    struct Fixture {
+        epoch_key: EpochKey,
+        community_id: SpaceId,
+        admin_addr: OwnerAddr,
+        joiner: TestOwner,
+        joiner_identity_pub: [u8; 64],
+        joiner_addr: OwnerAddr,
+        current_events: Vec<SignedMembershipEvent>,
+        now_ms: u64,
+        /// Monotonic nonce source so `fresh_request` yields unique nonces.
+        next_nonce: std::cell::Cell<u8>,
+    }
+
+    impl Fixture {
+        fn build(banned: bool) -> Self {
+            let epoch_key = EpochKey::new([0x5e; 32]);
+            let admin = mint_test_owner(0x21);
+            let joiner = mint_test_owner(0x22);
+
+            // 64-byte identity pub for the joiner (any value the request is
+            // internally consistent about; epoch_auth + device-hash both bind to
+            // exactly these bytes). Derive deterministically from the seed.
+            let mut joiner_identity_pub = [0u8; 64];
+            joiner_identity_pub[..32]
+                .copy_from_slice(&joiner.device_key.verifying_key().to_bytes());
+            joiner_identity_pub[32..].copy_from_slice(&[0x22u8; 32]);
+
+            // Admin self-Join (gives the admin a real Joined member entry; the
+            // bootstrap rule also grants admin_addr power 100). Carries the
+            // admin's EnrollmentCert so its signer resolves.
+            let admin_join = {
+                let p = EventPayload {
+                    id: [0x01; 16],
+                    community_id: COMMUNITY,
+                    kind: MembershipEventKind::Join,
+                    actor: admin.owner,
+                    at: Hlc {
+                        wall_ms: 10,
+                        logical: 0,
+                        device_id: "admin".into(),
+                    },
+                };
+                let e = sign_event(&p, &admin.device_key).unwrap();
+                SignedMembershipEvent {
+                    enrollment: Some(admin.cert.clone()),
+                    ..e
+                }
+            };
+
+            let mut current_events = vec![admin_join];
+
+            if banned {
+                // The joiner first Joins early, then the admin Kicks them
+                // (→ Banned), both strictly before the fresh re-Join HLC the
+                // request carries. materialize() only bans an existing member,
+                // so the prior Join is required.
+                let prior_join = {
+                    let p = EventPayload {
+                        id: [0x02; 16],
+                        community_id: COMMUNITY,
+                        kind: MembershipEventKind::Join,
+                        actor: joiner.owner,
+                        at: Hlc {
+                            wall_ms: 20,
+                            logical: 0,
+                            device_id: "joiner".into(),
+                        },
+                    };
+                    let e = sign_event(&p, &joiner.device_key).unwrap();
+                    SignedMembershipEvent {
+                        enrollment: Some(joiner.cert.clone()),
+                        ..e
+                    }
+                };
+                let kick = {
+                    let p = EventPayload {
+                        id: [0x03; 16],
+                        community_id: COMMUNITY,
+                        kind: MembershipEventKind::Kick {
+                            target: joiner.owner,
+                            reason: None,
+                        },
+                        actor: admin.owner,
+                        at: Hlc {
+                            wall_ms: 30,
+                            logical: 0,
+                            device_id: "admin".into(),
+                        },
+                    };
+                    sign_event(&p, &admin.device_key).unwrap()
+                };
+                current_events.push(prior_join);
+                current_events.push(kick);
+            }
+
+            Fixture {
+                epoch_key,
+                community_id: COMMUNITY,
+                admin_addr: admin.owner,
+                joiner_addr: joiner.owner,
+                joiner_identity_pub,
+                joiner,
+                current_events,
+                // Far enough past the request's created_at (1000) to be in-window.
+                now_ms: 5_000,
+                next_nonce: std::cell::Cell::new(0),
+            }
+        }
+
+        fn new() -> Self {
+            Self::build(false)
+        }
+
+        fn with_banned_joiner() -> Self {
+            Self::build(true)
+        }
+
+        /// The joiner's self-signed open Join the request carries, at a fresh
+        /// HLC after any prior ban events.
+        fn join_event(&self) -> SignedMembershipEvent {
+            let p = EventPayload {
+                id: [0x10; 16],
+                community_id: self.community_id,
+                kind: MembershipEventKind::Join,
+                actor: self.joiner.owner,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "joiner".into(),
+                },
+            };
+            let e = sign_event(&p, &self.joiner.device_key).unwrap();
+            SignedMembershipEvent {
+                enrollment: Some(self.joiner.cert.clone()),
+                ..e
+            }
+        }
+
+        /// Build a fully-signed request with the given nonce: real `epoch_auth`
+        /// over (community, identity_pub, nonce, created_at.wall_ms) and a real
+        /// packet signature over canonical CBOR of the request.
+        fn request_with_nonce(&self, nonce: [u8; 16]) -> (OpenJoinRequest, [u8; 64], Vec<u8>) {
+            let created_at = Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "joiner".into(),
+            };
+            let epoch_auth = mint_epoch_auth(
+                &self.epoch_key,
+                &self.community_id,
+                &self.joiner_identity_pub,
+                &nonce,
+                created_at.wall_ms,
+            );
+            let req = OpenJoinRequest {
+                community_id: self.community_id,
+                join_event: self.join_event(),
+                joiner_identity_pub: self.joiner_identity_pub,
+                signing_device_hash: DeviceIdentityHash(device_hash_from_identity_pub(
+                    &self.joiner_identity_pub,
+                )),
+                epoch_auth,
+                nonce,
+                created_at,
+            };
+            // Sign with the joiner's ENROLLED DEVICE key — the same key
+            // enrolled_key_from_cert resolves — so verify_strict passes.
+            let packet = crate::community_invite::build_signed_open_join_packet(
+                req.clone(),
+                &self.joiner.device_key,
+            )
+            .expect("build packet");
+            match packet {
+                crate::community_invite::CommunityInvitePacket::OpenJoin {
+                    signature,
+                    signed_bytes,
+                    ..
+                } => (req, signature, signed_bytes),
+                other => panic!("expected OpenJoin, got {other:?}"),
+            }
+        }
+
+        fn valid_request(&self) -> (OpenJoinRequest, [u8; 64], Vec<u8>) {
+            self.request_with_nonce([0x07; 16])
+        }
+
+        /// A request with a unique nonce each call (for rate-limit testing).
+        fn fresh_request(&self) -> (OpenJoinRequest, [u8; 64], Vec<u8>) {
+            let n = self.next_nonce.get();
+            self.next_nonce.set(n.wrapping_add(1));
+            let mut nonce = [0u8; 16];
+            nonce[0] = n;
+            nonce[1] = 0xAA; // disjoint from valid_request's [0x07;16]
+            self.request_with_nonce(nonce)
+        }
+    }
+
+    #[test]
+    fn admits_a_valid_open_join() {
+        let f = Fixture::new();
+        let (req, sig, signed_bytes) = f.valid_request();
+        let mut lim = OpenJoinRateLimiter::default();
+        let ok = verify_and_admit_open_join(
+            &req,
+            &sig,
+            &signed_bytes,
+            &f.epoch_key,
+            f.community_id,
+            f.admin_addr,
+            &f.current_events,
+            f.now_ms,
+            FRESHNESS,
+            &mut lim,
+        )
+        .expect("valid open join should be admitted");
+        assert_eq!(ok.joiner_addr, f.joiner_addr);
+        assert!(
+            ok.member_events_snapshot.len() == f.current_events.len() + 1,
+            "snapshot must include the joiner's Join"
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_capability() {
+        let f = Fixture::new();
+        let (mut req, sig, signed_bytes) = f.valid_request();
+        req.epoch_auth = [0u8; 32]; // not a valid MAC
+        let mut lim = OpenJoinRateLimiter::default();
+        assert_eq!(
+            verify_and_admit_open_join(
+                &req,
+                &sig,
+                &signed_bytes,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                &mut lim,
+            )
+            .unwrap_err(),
+            OpenJoinReject::BadCapability
+        );
+    }
+
+    #[test]
+    fn rejects_device_hash_mismatch() {
+        let f = Fixture::new();
+        let (mut req, sig, signed_bytes) = f.valid_request();
+        // Corrupt the advertised device hash so it no longer derives from the
+        // identity pub. epoch_auth still validates (it doesn't cover the hash),
+        // so this exercises the dedicated DeviceHashMismatch reject.
+        req.signing_device_hash = DeviceIdentityHash([0xFF; 16]);
+        let mut lim = OpenJoinRateLimiter::default();
+        assert_eq!(
+            verify_and_admit_open_join(
+                &req,
+                &sig,
+                &signed_bytes,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                &mut lim,
+            )
+            .unwrap_err(),
+            OpenJoinReject::DeviceHashMismatch
+        );
+    }
+
+    #[test]
+    fn rejects_banned_identity() {
+        let f = Fixture::with_banned_joiner();
+        let (req, sig, signed_bytes) = f.valid_request();
+        let mut lim = OpenJoinRateLimiter::default();
+        assert_eq!(
+            verify_and_admit_open_join(
+                &req,
+                &sig,
+                &signed_bytes,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                &mut lim,
+            )
+            .unwrap_err(),
+            OpenJoinReject::Banned
+        );
+    }
+
+    #[test]
+    fn rejects_stale_timestamp() {
+        let f = Fixture::new();
+        let (req, sig, signed_bytes) = f.valid_request();
+        let mut lim = OpenJoinRateLimiter::default();
+        // now far beyond created_at + window.
+        assert_eq!(
+            verify_and_admit_open_join(
+                &req,
+                &sig,
+                &signed_bytes,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms + 10_000_000,
+                FRESHNESS,
+                &mut lim,
+            )
+            .unwrap_err(),
+            OpenJoinReject::Stale
+        );
+    }
+
+    #[test]
+    fn rejects_replayed_nonce() {
+        let f = Fixture::new();
+        let (req, sig, signed_bytes) = f.valid_request();
+        let mut lim = OpenJoinRateLimiter::default();
+        verify_and_admit_open_join(
+            &req,
+            &sig,
+            &signed_bytes,
+            &f.epoch_key,
+            f.community_id,
+            f.admin_addr,
+            &f.current_events,
+            f.now_ms,
+            FRESHNESS,
+            &mut lim,
+        )
+        .expect("first ok");
+        assert_eq!(
+            verify_and_admit_open_join(
+                &req,
+                &sig,
+                &signed_bytes,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                &mut lim,
+            )
+            .unwrap_err(),
+            OpenJoinReject::Replay
+        );
+    }
+
+    #[test]
+    fn rate_limit_sheds_excess() {
+        let f = Fixture::new();
+        let mut lim = OpenJoinRateLimiter::default();
+        let mut last: Result<(), OpenJoinReject> = Ok(());
+        for _ in 0..(OPEN_JOIN_RATE_LIMIT_PER_WINDOW + 1) {
+            let (req, sig, signed_bytes) = f.fresh_request(); // unique nonce each time
+            last = verify_and_admit_open_join(
+                &req,
+                &sig,
+                &signed_bytes,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                &mut lim,
+            )
+            .map(|_| ());
+        }
+        assert_eq!(last.unwrap_err(), OpenJoinReject::RateLimited);
+    }
+
+    /// A request shed by the rate limiter must NOT persist its nonce: once the
+    /// rate-limit window rolls over, the SAME nonce must be admissible (it was
+    /// never actually accepted, so retrying it is not a replay).
+    #[test]
+    fn rate_limited_request_nonce_is_retryable_after_window() {
+        let f = Fixture::new();
+        let mut lim = OpenJoinRateLimiter::default();
+        // Saturate the window with unique nonces so the next request is shed.
+        for _ in 0..OPEN_JOIN_RATE_LIMIT_PER_WINDOW {
+            let (req, sig, sb) = f.fresh_request();
+            verify_and_admit_open_join(
+                &req,
+                &sig,
+                &sb,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                &mut lim,
+            )
+            .expect("in-window requests admit");
+        }
+        // This one is rate-limited; its nonce must NOT be recorded.
+        let (shed_req, shed_sig, shed_sb) = f.valid_request();
+        assert_eq!(
+            verify_and_admit_open_join(
+                &shed_req,
+                &shed_sig,
+                &shed_sb,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                &mut lim,
+            )
+            .unwrap_err(),
+            OpenJoinReject::RateLimited
+        );
+        // After the rate-limit window rolls over, the SAME nonce is admissible
+        // (not a replay) because the shed request never persisted it.
+        let later = f.now_ms + OPEN_JOIN_RATE_LIMIT_WINDOW_MS + 1;
+        verify_and_admit_open_join(
+            &shed_req,
+            &shed_sig,
+            &shed_sb,
+            &f.epoch_key,
+            f.community_id,
+            f.admin_addr,
+            &f.current_events,
+            later,
+            // Widen freshness so the request's created_at is still in-window at
+            // the later wall clock (the rate-limit window > default freshness).
+            OPEN_JOIN_RATE_LIMIT_WINDOW_MS * 4,
+            &mut lim,
+        )
+        .expect("a previously rate-limited nonce is admissible after the window");
+    }
+}

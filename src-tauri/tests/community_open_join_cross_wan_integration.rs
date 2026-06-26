@@ -1,0 +1,876 @@
+//! Two-node, no-LAN, cross-WAN OPEN-community first-contact round-trip.
+//!
+//! The OPEN analogue of `pkarr_iroh_redeem_full_integration.rs`'s invite-only
+//! `bob_joins_alice_via_iroh_handshake_option_a`. Where that test redeems a
+//! *targeted invite token*, here Bob holds ONLY the open community link's
+//! `community_id` + `epoch_key` (no invite, no token, no LAN), resolves Alice's
+//! enumerated DHT *rendezvous slot* through a mock pkarr relay, dials her on the
+//! `HARMONY_HANDSHAKE_V1` ALPN, sends a capability-proven `OpenJoinRequest`, and
+//! is admitted by Alice's `IrohInviteHandshakeAcceptor` (which dispatches the
+//! `0x11` open-join packet → `verify_and_admit_open_join` → `insert_local_event`).
+//!
+//! ## Why this proves the feature (fails on `main`)
+//!
+//! On `main` the open-redeem path has NO cross-WAN dial: a remote joiner inserts
+//! only their *local* self-Join and waits for same-LAN Zenoh. Alice — on the far
+//! side of a WAN with no shared multicast — never learns about Bob. The
+//! load-bearing assertion in `bob_open_joins_alice_cross_wan_via_rendezvous`
+//! (Alice's engine materializes Bob as `MemberStatus::Joined`) can ONLY pass
+//! once the rendezvous-resolve → dial → beacon-admit path exists. The harness is
+//! loopback-iroh-only with relays disabled (the existing invite-only harness's
+//! config), so there is no LAN/Zenoh shortcut that could make Alice learn about
+//! Bob other than the open-join dial under test.
+//!
+//! ## How Alice's rendezvous slot is seeded into the mock pkarr (the crux)
+//!
+//! Alice is a relay advertiser. We drive the real
+//! `CommunityRendezvousPublisher::refresh_slot` (built over the SAME live
+//! `PkarrPublisher` the harness spawns) which registers a pkarr publish handle
+//! keyed by `rendezvous_slot_key(epoch_key, slot, current_epoch_id(now))` with
+//! Alice's `ReachabilityAnnouncePayload` as the routing blob. The spawned
+//! publisher task then PUTs that record into the mock relay (immediate, since
+//! `register` schedules `next_publish_at = now`). We poll
+//! `pkarr.resolve(rendezvous_slot_verifying_key(epoch_key, slot, epoch))` until
+//! the record is visible before driving Bob's dial — identical in spirit to the
+//! invite-only test's `await_pkarr_record_visible`, but keyed on the rendezvous
+//! slot vk instead of the invite-token-derived ephemeral key.
+//!
+//! Slot selection is by advertiser rank (`slot_for_advertiser`: sort the
+//! advertiser set ascending by 16-byte address, position == slot). To force a
+//! given slot we choose the advertiser set accordingly: `[alice]` → Alice ranks
+//! 0 → slot 0; `[lower_dummy, alice]` (Alice the higher address) → Alice ranks 1
+//! → slot 1 while slot 0 stays empty (the dummy never publishes).
+
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ed25519_dalek::SigningKey;
+use harmony_app::community_channel_log_engine::{
+    ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
+};
+use harmony_app::community_membership::{
+    materialize, sign_event, EventPayload, MemberStatus, MembershipEventKind, SignedMembershipEvent,
+};
+use harmony_app::community_rendezvous::{rendezvous_slot_verifying_key, RENDEZVOUS_SLOT_COUNT};
+use harmony_app::community_rendezvous_publisher::CommunityRendezvousPublisher;
+use harmony_app::community_state_sync::{
+    CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
+};
+use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
+use harmony_app::dm_outbox::DmOutbox;
+use harmony_app::event_loop::CommunityAdapterRequest;
+use harmony_app::iroh_endpoint::{alpn, IrohEndpoint};
+use harmony_app::iroh_invite_acceptor::IrohInviteHandshakeAcceptor;
+use harmony_app::open_join_dial::{connectivity_open_join_iroh_inner, OpenJoinDialCtx};
+use harmony_app::owner_state_crdt::OwnerState;
+use harmony_app::owner_state_types::{DeviceIdentityHash, EpochKey, Hlc, OwnerAddr, SpaceId};
+use harmony_app::reachability_record::ReachabilityAnnouncePayload;
+use harmony_app::reachability_resolver::ReachabilityResolver;
+use harmony_app::zenoh_iroh_transport::IrohZenohLinkManager;
+use harmony_identity::PrivateIdentity;
+use iroh::endpoint::{presets, Endpoint, RelayMode};
+use iroh::SecretKey;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
+use zenoh_link::LinkUnicast;
+
+// ────────────────────────────────────────────────────────────────────────────
+// Identity resolver (mirrors the invite-only harness).
+// ────────────────────────────────────────────────────────────────────────────
+
+struct TwoIdentityResolver {
+    alice: (OwnerAddr, [u8; 64]),
+    bob: (OwnerAddr, [u8; 64]),
+}
+
+#[async_trait::async_trait]
+impl IdentityResolver for TwoIdentityResolver {
+    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+        if *addr == self.alice.0 {
+            Some(self.alice.1)
+        } else if *addr == self.bob.0 {
+            Some(self.bob.1)
+        } else {
+            None
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helpers (mirrored from pkarr_iroh_redeem_full_integration.rs).
+// ────────────────────────────────────────────────────────────────────────────
+
+fn signing_key_from(identity: &PrivateIdentity) -> SigningKey {
+    let priv_bytes = identity.to_private_bytes();
+    let mut secret = [0u8; 32];
+    secret.copy_from_slice(&priv_bytes[32..64]);
+    SigningKey::from_bytes(&secret)
+}
+
+fn dup_identity(src: &PrivateIdentity) -> PrivateIdentity {
+    PrivateIdentity::from_private_bytes(&src.to_private_bytes())
+        .expect("PrivateIdentity round-trip via to/from_private_bytes")
+}
+
+/// `(OwnerAddr, 64-byte composite identity_pub)` from an Ed25519 signing key,
+/// via the same X25519-from-Ed25519 derivation the open-join dialer uses.
+fn derive_composite_owner(sk: &SigningKey) -> (OwnerAddr, [u8; 64]) {
+    let x25519_priv = harmony_app::dm_signing::ed25519_priv_to_x25519(sk);
+    let x25519_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
+    let ed25519_pub = sk.verifying_key().to_bytes();
+    let mut combined = [0u8; 64];
+    combined[..32].copy_from_slice(x25519_pub.as_bytes());
+    combined[32..].copy_from_slice(&ed25519_pub);
+    let id = harmony_identity::Identity::from_public_bytes(&combined)
+        .expect("composite identity_pub must round-trip via Identity::from_public_bytes");
+    (OwnerAddr(id.address_hash), combined)
+}
+
+async fn build_hermetic_endpoint() -> Arc<IrohEndpoint> {
+    let secret = SecretKey::generate();
+    let inner = Endpoint::builder(presets::Minimal)
+        .secret_key(secret)
+        .alpns(vec![
+            alpn::HARMONY_ZENOH_V1.to_vec(),
+            alpn::HARMONY_HANDSHAKE_V1.to_vec(),
+        ])
+        .relay_mode(RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind_addr loopback")
+        .bind()
+        .await
+        .expect("bind iroh endpoint");
+    Arc::new(IrohEndpoint::from_endpoint_for_integration_test(inner))
+}
+
+fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
+    let cas: Arc<TokioMutex<HashMap<harmony_content::cid::ContentId, Vec<u8>>>> =
+        Arc::new(TokioMutex::new(HashMap::new()));
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(64);
+    let cas_for_servicer = Arc::clone(&cas);
+    tokio::spawn(async move {
+        while let Some(op) = cas_op_rx.recv().await {
+            match op {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
+                    cas_for_servicer.lock().await.insert(cid, blob);
+                    if let Some(r) = reply {
+                        let _ = r.send(Ok(()));
+                    }
+                }
+                CasOp::GetOrFetch {
+                    cid,
+                    timeout: _,
+                    reply,
+                } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(Ok(v));
+                }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
+                }
+            }
+        }
+    });
+    cas_op_tx
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Two-party OPEN harness.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Everything the open-join roundtrip tests need after the shared setup.
+/// Fields prefixed `_` are keep-alive handles (spawned tasks, accept loops,
+/// tempdirs, the mock relay) that must outlive the dial call.
+struct OpenJoinSetup {
+    // ── Identities / community ──────────────────────────────────────────
+    bob_comm_sk: Arc<SigningKey>,
+    alice_addr: OwnerAddr,
+    bob_addr: OwnerAddr,
+    epoch_key: EpochKey,
+    community_id: SpaceId,
+    bob_bootstrap_join: SignedMembershipEvent,
+
+    // ── Endpoints (for teardown) ────────────────────────────────────────
+    alice_ep: Arc<IrohEndpoint>,
+    bob_ep: Arc<IrohEndpoint>,
+
+    // ── Registries / engines ────────────────────────────────────────────
+    registry_alice: Arc<CommunitySyncRegistry>,
+    bob_engine: Arc<harmony_app::community_state_sync::CommunitySyncEngine>,
+
+    // ── pkarr ───────────────────────────────────────────────────────────
+    pkarr_resolver: Arc<harmony_pkarr::PkarrResolver>,
+    /// The relay client behind `pkarr_resolver`. Used to mint FRESH resolvers
+    /// (independent caches over the same relay store) — the resolver carries a
+    /// 60s negative cache, so a key that resolved absent during cold-start
+    /// stays cached-absent for 60s even after a beacon publishes. The retry in
+    /// the cold-start test resolves through a fresh resolver, modelling the
+    /// production retry that fires minutes later (past the negative TTL).
+    relay_client: Arc<harmony_pkarr::RelayClient>,
+    alice_rendezvous_publisher: CommunityRendezvousPublisher,
+
+    // ── keep-alive ──────────────────────────────────────────────────────
+    _alice_accept: tokio::task::JoinHandle<()>,
+    _bob_accept: tokio::task::JoinHandle<()>,
+    _relay: harmony_pkarr::testing::MockPkarrRelay,
+    publisher_handle: tokio::task::JoinHandle<()>,
+    _dir_alice: tempfile::TempDir,
+    _dir_bob: tempfile::TempDir,
+}
+
+impl OpenJoinSetup {
+    /// A fresh `PkarrResolver` over the same relay store — an independent cache,
+    /// so it never reads a stale negative-cache entry left by a prior resolve.
+    fn fresh_resolver(&self) -> Arc<harmony_pkarr::PkarrResolver> {
+        Arc::new(harmony_pkarr::PkarrResolver::new(Arc::clone(
+            &self.relay_client,
+        )))
+    }
+
+    /// Drive Alice's rendezvous publisher for the given advertiser set
+    /// (`me = alice_addr`), then poll the mock relay (through a FRESH resolver,
+    /// immune to any prior negative-cache entry) until the resulting slot record
+    /// is visible. Returns the slot index Alice claimed.
+    async fn publish_rendezvous_slot(&self, advertisers: Vec<OwnerAddr>) -> u16 {
+        let slot =
+            harmony_app::community_rendezvous::slot_for_advertiser(&advertisers, &self.alice_addr)
+                .expect("alice must claim a slot for the chosen advertiser set");
+        self.alice_rendezvous_publisher
+            .refresh_slot(
+                self.community_id,
+                self.epoch_key.clone(),
+                advertisers,
+                self.alice_addr,
+            )
+            .await;
+        await_rendezvous_slot_visible(&self.fresh_resolver(), &self.epoch_key, slot).await;
+        slot
+    }
+}
+
+/// Stand up the full two-party OPEN harness. Mirrors
+/// `setup_two_party_iroh_handshake`, but Alice's community is OPEN
+/// (`is_invite_only = false`), Bob holds a spawned engine for it (so the
+/// admitted snapshot can be applied), and Alice owns a
+/// `CommunityRendezvousPublisher` over the live `PkarrPublisher`.
+async fn setup_two_party_open_join() -> OpenJoinSetup {
+    // ── 1. Identities (dual-identity model, mirrors the invite-only harness). ─
+    let alice_identity = PrivateIdentity::from_seed(&[0xa1; 32]);
+    let bob_identity = PrivateIdentity::from_seed(&[0xb2; 32]);
+    let alice_sk = Arc::new(signing_key_from(&alice_identity));
+    let bob_sk = Arc::new(signing_key_from(&bob_identity));
+    let (alice_transport_addr, alice_pub) = derive_composite_owner(&alice_sk);
+    let (bob_transport_addr, _bob_pub) = derive_composite_owner(&bob_sk);
+
+    let alice_comm = harmony_app::community_membership::mint_test_owner(0xA1);
+    let bob_comm = harmony_app::community_membership::mint_test_owner(0xB2);
+    let alice_comm_sk = Arc::new(SigningKey::from_bytes(&alice_comm.device_key.to_bytes()));
+    let bob_comm_sk = Arc::new(SigningKey::from_bytes(&bob_comm.device_key.to_bytes()));
+    let alice_addr = alice_comm.owner;
+    let bob_addr = bob_comm.owner;
+
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
+        alice: (alice_addr, [0u8; 64]),
+        bob: (bob_addr, [0u8; 64]),
+    });
+    let _ = (alice_transport_addr, bob_transport_addr);
+
+    // ── 2. Iroh endpoints + link managers. ──────────────────────────────
+    let alice_ep = build_hermetic_endpoint().await;
+    let bob_ep = build_hermetic_endpoint().await;
+    let alice_bound = alice_ep.bound_sockets();
+    assert!(
+        !alice_bound.is_empty(),
+        "alice's hermetic endpoint must expose bound_sockets() so bob's dialer has a loopback target"
+    );
+
+    let alice_reachability = ReachabilityResolver::new();
+    let bob_reachability = ReachabilityResolver::new();
+
+    let (alice_link_tx, _alice_link_rx) = flume::unbounded::<LinkUnicast>();
+    let alice_link_mgr = Arc::new(IrohZenohLinkManager::new(
+        Arc::clone(&alice_ep),
+        alice_reachability.clone(),
+        alice_link_tx,
+    ));
+    let (bob_link_tx, _bob_link_rx) = flume::unbounded::<LinkUnicast>();
+    let bob_link_mgr = Arc::new(IrohZenohLinkManager::new(
+        Arc::clone(&bob_ep),
+        bob_reachability.clone(),
+        bob_link_tx,
+    ));
+    let alice_accept = alice_link_mgr.spawn_accept_loop();
+    let bob_accept = bob_link_mgr.spawn_accept_loop();
+
+    // ── 3. Alice's OPEN community + engine. ──────────────────────────────
+    let alice_minted = harmony_app::mint_community_creation(
+        "OpenJoinCommunity",
+        false, // OPEN community — the whole point of this test.
+        alice_addr,
+        alice_comm_sk.as_ref(),
+        &alice_comm.cert,
+        Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".to_string(),
+        },
+    )
+    .expect("alice mint OPEN community");
+    let community_id = alice_minted.community_id;
+    let epoch_key = alice_minted.membership_key.clone();
+
+    let cas_op_tx = spawn_shared_cas();
+    let cs_alice: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx.clone(),
+        Duration::from_secs(2),
+    ));
+    let cs_bob: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx.clone(),
+        Duration::from_secs(2),
+    ));
+
+    let dir_alice = tempfile::tempdir().expect("alice tempdir");
+    let dir_bob = tempfile::tempdir().expect("bob tempdir");
+
+    let registry_alice = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "alice-dev".into(),
+        content_store: Arc::clone(&cs_alice),
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir_alice.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: alice_addr,
+        signing_key: Arc::clone(&alice_comm_sk),
+        crdt_state: None,
+        nav_emitter: None,
+    }));
+    let registry_bob = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "bob-dev".into(),
+        content_store: Arc::clone(&cs_bob),
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir_bob.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: bob_addr,
+        signing_key: Arc::clone(&bob_comm_sk),
+        crdt_state: None,
+        nav_emitter: None,
+    }));
+
+    // Spawn Alice's engine + insert her bootstrap Join.
+    let (alice_pub_tx, _alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (_alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    registry_alice
+        .spawn_engine_inner_now(
+            community_id,
+            epoch_key.clone(),
+            alice_addr,
+            false, // OPEN
+            alice_pub_tx,
+            alice_sub_rx,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("spawn alice engine");
+    let alice_engine = registry_alice
+        .engine_arc(&community_id)
+        .await
+        .expect("alice engine arc");
+    alice_engine
+        .insert_local_event(alice_minted.bootstrap_join.clone())
+        .await
+        .expect("alice bootstrap insert");
+
+    // Spawn Bob's engine for Alice's OPEN community so the admitted snapshot has
+    // somewhere to land. Bob starts with an empty event log; the dial applies
+    // Alice's bootstrap + Bob's Join from the Admitted response.
+    let (bob_pub_tx, _bob_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (_bob_sub_tx, bob_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    registry_bob
+        .spawn_engine_inner_now(
+            community_id,
+            epoch_key.clone(),
+            alice_addr,
+            false, // OPEN
+            bob_pub_tx,
+            bob_sub_rx,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("spawn bob engine");
+    let bob_engine = registry_bob
+        .engine_arc(&community_id)
+        .await
+        .expect("bob engine arc");
+
+    // ── 4. Alice's dm_outbox + crdt_state (acceptor dependencies). ──────
+    let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+        "alice-dev".into(),
+        alice_addr,
+        DeviceIdentityHash(alice_identity.identity.address_hash),
+        Arc::clone(&alice_sk),
+        Arc::new(dup_identity(&alice_identity)),
+        Arc::clone(&alice_comm_sk),
+        alice_comm.cert.clone(),
+    )));
+    let alice_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+
+    // ── 5. Mock pkarr relay + publisher. ────────────────────────────────
+    let relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
+    let pool = harmony_pkarr::RelayPool::new(vec![relay.base_url.clone()]);
+    let client = Arc::new(harmony_pkarr::RelayClient::new(pool));
+    let pkarr_publisher = Arc::new(harmony_pkarr::PkarrPublisher::new(Arc::clone(&client)));
+    let publisher_handle = Arc::clone(&pkarr_publisher).spawn();
+    let pkarr_resolver = Arc::new(harmony_pkarr::PkarrResolver::new(Arc::clone(&client)));
+
+    // Alice's reachability routing record — the slot record's routing blob.
+    let alice_routing = ReachabilityAnnouncePayload {
+        iroh_node_id: *alice_ep.node_id().as_bytes(),
+        home_relay_url: alice_ep
+            .home_relay()
+            .map(|r| r.to_string())
+            .unwrap_or_default(),
+        direct_addresses: alice_bound.clone(),
+        announced_at_ms: 1_700_000_000_000,
+        identity_signature: [0xCDu8; 64],
+        butler_set: Vec::new(),
+        bs_at: 0,
+    };
+    let alice_routing_blob = {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&alice_routing, &mut buf).expect("encode alice routing_blob");
+        buf
+    };
+    // The rendezvous publisher reuses the SAME (publisher, identity_signing_key,
+    // identity_pub, routing_blob_builder) inputs the member-keyed community
+    // publisher takes at boot — the slot record's OUTER envelope is signed by an
+    // ephemeral key derived from `epoch_key` (so any holder of the link can
+    // resolve it), while `id_sk`/`id_pub` bind the inner identity.
+    let alice_rendezvous_publisher = CommunityRendezvousPublisher::new(
+        Arc::clone(&pkarr_publisher),
+        (*alice_sk).clone(),
+        alice_pub,
+        Arc::new(move || alice_routing_blob.clone()),
+    );
+
+    // ── 6. Alice's handshake acceptor (handles BOTH 0x10 invite and 0x11
+    //       open-join via its inbound dispatcher). ────────────────────────
+    let alice_acceptor: Arc<IrohInviteHandshakeAcceptor<()>> =
+        Arc::new(IrohInviteHandshakeAcceptor::<()>::with_config(
+            Arc::clone(&registry_alice),
+            Arc::clone(&alice_dm_outbox),
+            Arc::clone(&alice_crdt_state),
+            None,
+            None,
+            harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
+                io_deadline: Duration::from_millis(10_000),
+                poll_deadline: Duration::from_millis(10_000),
+                poll_interval: Duration::from_millis(20),
+            },
+        ));
+    if alice_link_mgr
+        .install_handshake_dispatcher(alice_acceptor)
+        .await
+        .is_err()
+    {
+        panic!("first install must succeed (OnceCell empty)");
+    }
+
+    // Drain Bob's adapter dispatch (engine spawn produces one request).
+    let (_bob_adapter_tx, mut bob_adapter_rx) = mpsc::channel::<CommunityAdapterRequest>(8);
+    tokio::spawn(async move {
+        while let Some(req) = bob_adapter_rx.recv().await {
+            drop(req.publisher_rx);
+            drop(req.subscriber_tx);
+        }
+    });
+
+    // ── 7. Bob's self-signed OPEN bootstrap Join. ───────────────────────
+    // OPEN community → no invite token, no countersign. The Join is signed by
+    // Bob's enrolled community device key (`bob_comm_sk`) and carries Bob's
+    // EnrollmentCert so the beacon's `enrolled_key_from_cert` resolves the
+    // signer. CRITICAL: the `signing_key` threaded into the dial ctx is the
+    // SAME `bob_comm_sk`, so the open-join packet envelope signature verifies
+    // against the cert's enrolled device key (Task 5 device-hash/identity gate).
+    let bob_bootstrap_join = {
+        let payload = EventPayload {
+            id: {
+                let mut id = [0u8; 16];
+                id[0] = 0xB0;
+                id
+            },
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: bob_addr,
+            at: Hlc {
+                wall_ms: 100_200,
+                logical: 0,
+                device_id: "bob-dev".into(),
+            },
+        };
+        let mut ev = sign_event(&payload, bob_comm_sk.as_ref()).expect("sign bob open join");
+        ev.enrollment = Some(bob_comm.cert.clone());
+        ev
+    };
+
+    // Keep the channel-log registry construction parity-only (not asserted);
+    // built so the harness matches the invite-only wiring shape.
+    let (bob_channel_log_adapter_tx, _bob_channel_log_adapter_rx) =
+        mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
+    let _bob_channel_log_registry: Arc<ChannelLogRegistry> =
+        ChannelLogRegistry::new(ChannelLogRegistryConfig {
+            adapter_request_tx: bob_channel_log_adapter_tx,
+            sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
+            identity_dir: dir_bob.path().to_path_buf(),
+            self_owner: bob_addr,
+            self_device_id: "bob-dev".into(),
+            signing_key: Arc::clone(&bob_comm_sk),
+            engine_config: ChannelLogEngineConfig::default(),
+            transport_epoch_rx: None,
+        });
+    let _ = alice_comm_sk; // admin signer; only needed during setup above.
+
+    OpenJoinSetup {
+        bob_comm_sk,
+        alice_addr,
+        bob_addr,
+        epoch_key,
+        community_id,
+        bob_bootstrap_join,
+        alice_ep,
+        bob_ep,
+        registry_alice,
+        bob_engine,
+        pkarr_resolver,
+        relay_client: client,
+        alice_rendezvous_publisher,
+        _alice_accept: alice_accept,
+        _bob_accept: bob_accept,
+        _relay: relay,
+        publisher_handle,
+        _dir_alice: dir_alice,
+        _dir_bob: dir_bob,
+    }
+}
+
+/// Poll (≤5s) until Alice's rendezvous slot record for `slot` is visible in the
+/// mock relay under `rendezvous_slot_verifying_key(epoch_key, slot, epoch)` for
+/// the joiner's current wall-clock epoch. Mirrors `await_pkarr_record_visible`
+/// in the invite-only test but keyed on the rendezvous slot vk.
+async fn await_rendezvous_slot_visible(
+    pkarr_resolver: &harmony_pkarr::PkarrResolver,
+    epoch_key: &EpochKey,
+    slot: u16,
+) {
+    let now_ms = wall_ms();
+    let epoch_id = harmony_pkarr::current_epoch_id(now_ms);
+    let vk = rendezvous_slot_verifying_key(epoch_key, slot, epoch_id);
+    let mut visible = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(Some(_)) = pkarr_resolver.resolve(&vk).await {
+            visible = true;
+            break;
+        }
+    }
+    assert!(
+        visible,
+        "alice's rendezvous slot-{slot} record must appear in the mock relay within 5s \
+         before driving Bob's open-join dial"
+    );
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as u64
+}
+
+/// Build Bob's open-join dial context for `setup`. `signing_key` is
+/// `bob_comm_sk` — the SAME key that signed `bob_bootstrap_join` — so the
+/// beacon's enrolled-device-key envelope-signature check passes.
+fn bob_dial_ctx(setup: &OpenJoinSetup) -> OpenJoinDialCtx {
+    OpenJoinDialCtx {
+        community_id: setup.community_id,
+        epoch_key: setup.epoch_key.clone(),
+        bootstrap_join: setup.bob_bootstrap_join.clone(),
+        signing_key: Arc::clone(&setup.bob_comm_sk),
+        iroh_endpoint: Some(Arc::clone(&setup.bob_ep)),
+        engine: Some(Arc::clone(&setup.bob_engine)),
+        dial_config: harmony_app::HandshakeDialConfig {
+            connect_timeout: Duration::from_millis(5_000),
+            open_bi_timeout: Duration::from_millis(5_000),
+            response_read_timeout: Duration::from_millis(5_000),
+            write_timeout: Duration::from_millis(5_000),
+        },
+    }
+}
+
+/// Poll Alice's engine until it materializes Bob as `MemberStatus::Joined`.
+/// This is the load-bearing cross-WAN assertion: on `main` the open path never
+/// dials Alice, so she never learns about Bob and this can only time out.
+async fn assert_alice_materializes_bob_joined(setup: &OpenJoinSetup) {
+    let alice_state = setup
+        .registry_alice
+        .state_for(&setup.community_id)
+        .await
+        .expect("alice state must exist");
+    for _ in 0..50 {
+        let events: Vec<_> = {
+            let g = alice_state.lock().await;
+            g.events.values().cloned().collect()
+        };
+        let mat = materialize(&events, setup.alice_addr);
+        if mat.members.get(&setup.bob_addr).map(|m| m.status) == Some(MemberStatus::Joined) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let events: Vec<_> = {
+        let g = alice_state.lock().await;
+        g.events.values().cloned().collect()
+    };
+    let mat = materialize(&events, setup.alice_addr);
+    panic!(
+        "Alice's engine never materialized Bob as Joined cross-WAN — the open dial→admit \
+         path did not deliver Bob's Join to Alice. Bob status = {:?}; alice has {} events. \
+         (On main this is expected to FAIL: no open dial path exists, so Alice never learns \
+         about Bob cross-WAN.)",
+        mat.members.get(&setup.bob_addr).map(|m| m.status),
+        events.len(),
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 1: the must-fail-on-main proof.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bob_open_joins_alice_cross_wan_via_rendezvous() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // Pre-pay iroh's ~30s first-bind global init OUTSIDE the budget (ZEB-347).
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let s = setup_two_party_open_join().await;
+
+        // Alice is the sole advertiser → ranks 0 → publishes rendezvous slot 0.
+        let slot = s.publish_rendezvous_slot(vec![s.alice_addr]).await;
+        assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
+
+        // Bob holds ONLY community_id + epoch_key (via the ctx). `now_ms` is the
+        // joiner's real wall clock so `epoch_auth`'s timestamp is fresh against
+        // Alice's freshness window and the resolve epoch matches the publish.
+        let now_ms = wall_ms();
+        let outcome = connectivity_open_join_iroh_inner(
+            Arc::clone(&s.pkarr_resolver),
+            bob_dial_ctx(&s),
+            now_ms,
+        )
+        .await
+        .expect("open join inner must Ok (transport failures map to outcome.status)");
+
+        assert_eq!(
+            outcome.status, "joined",
+            "open-join happy path must return 'joined' (resolved slot 0 → dialed Alice on \
+             HARMONY_HANDSHAKE_V1 → admitted via 0x11 open-join). Got status={:?} community_id={:?}",
+            outcome.status, outcome.community_id
+        );
+        assert_eq!(
+            outcome.community_id.as_deref(),
+            Some(hex::encode(s.community_id.0).as_str()),
+            "community_id must echo Alice's open community"
+        );
+
+        // ── THE load-bearing cross-WAN assertion (fails on main). ───────────
+        // On main, the open-redeem path inserts only Bob's LOCAL self-Join and
+        // waits for same-LAN Zenoh; there is no cross-WAN dial, so Alice never
+        // learns about Bob. This passes ONLY because the new dial→admit path
+        // delivered Bob's Join to Alice's engine over the loopback iroh stream.
+        assert_alice_materializes_bob_joined(&s).await;
+
+        // Teardown: abort the publisher first so it stops using the endpoints.
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("bob_open_joins_alice_cross_wan_via_rendezvous timed out at 60s");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 2: slot-1 failover when slot-0 beacon is offline.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_join_fails_over_to_slot1_when_slot0_beacon_offline() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let s = setup_two_party_open_join().await;
+
+        // Force Alice onto slot 1 by giving slot 0 to a lower-address dummy
+        // advertiser that never publishes. `slot_for_advertiser` sorts ascending
+        // by address: the all-zero dummy ranks 0 (and stays silent), Alice ranks
+        // 1. So slot 0 is DEAD and only slot 1 is live — the escalating-batch
+        // resolve must widen past the dead slot 0 to find Alice.
+        let dummy_lower = OwnerAddr([0u8; 16]);
+        assert!(
+            dummy_lower.0 < s.alice_addr.0,
+            "dummy advertiser must sort below alice so alice claims slot 1"
+        );
+        let slot = s
+            .publish_rendezvous_slot(vec![dummy_lower, s.alice_addr])
+            .await;
+        assert_eq!(slot, 1, "alice (higher address) ranks 1 → slot 1");
+
+        // Confirm slot 0 really is empty in the relay (sanity: the failover is
+        // genuinely exercised, not masked by an accidental slot-0 publish).
+        let epoch_id = harmony_pkarr::current_epoch_id(wall_ms());
+        let slot0_vk = rendezvous_slot_verifying_key(&s.epoch_key, 0, epoch_id);
+        assert!(
+            matches!(s.pkarr_resolver.resolve(&slot0_vk).await, Ok(None)),
+            "slot 0 must be empty so the resolve genuinely widens to slot 1"
+        );
+
+        let now_ms = wall_ms();
+        let outcome = connectivity_open_join_iroh_inner(
+            Arc::clone(&s.pkarr_resolver),
+            bob_dial_ctx(&s),
+            now_ms,
+        )
+        .await
+        .expect("open join inner must Ok");
+
+        assert_eq!(
+            outcome.status, "joined",
+            "Bob must still join via slot-1 failover (escalating resolve widens past the \
+             dead slot 0). Got status={:?}",
+            outcome.status
+        );
+        assert_alice_materializes_bob_joined(&s).await;
+
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("open_join_fails_over_to_slot1_when_slot0_beacon_offline timed out at 60s");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 3: cold-start is retryable (non-error), then succeeds once a beacon
+// publishes.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_join_cold_start_is_retryable_then_succeeds() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let s = setup_two_party_open_join().await;
+
+        // ── Cold start: NO slot published → no beacon resolves. ─────────────
+        // This must be a RETRYABLE non-error outcome, not an Err and not a join.
+        let now_ms = wall_ms();
+        let cold = connectivity_open_join_iroh_inner(
+            Arc::clone(&s.pkarr_resolver),
+            bob_dial_ctx(&s),
+            now_ms,
+        )
+        .await
+        .expect("cold-start open join must Ok (no_beacon_reachable is a non-error)");
+        assert_eq!(
+            cold.status, "no_beacon_reachable",
+            "with no beacon published, the open join must return the retryable \
+             'no_beacon_reachable' status (NOT an Err, NOT 'joined'). Got {:?}",
+            cold.status
+        );
+
+        // Alice must NOT know about Bob yet (nothing was dialed).
+        {
+            let alice_state = s
+                .registry_alice
+                .state_for(&s.community_id)
+                .await
+                .expect("alice state");
+            let events: Vec<_> = {
+                let g = alice_state.lock().await;
+                g.events.values().cloned().collect()
+            };
+            let mat = materialize(&events, s.alice_addr);
+            assert!(
+                !mat.members.contains_key(&s.bob_addr),
+                "Alice must not know Bob during cold start (no dial happened)"
+            );
+        }
+
+        // ── Now Alice publishes slot 0 and Bob re-dials → joins. ────────────
+        let slot = s.publish_rendezvous_slot(vec![s.alice_addr]).await;
+        assert_eq!(slot, 0);
+
+        // The retry resolves through a FRESH resolver. Bob's cold-start dial
+        // above negatively cached the (then-absent) slot-0 key for 60s; in
+        // production the retry fires minutes later (transport-epoch re-arm),
+        // well past that TTL, so a fresh-cache resolver faithfully models the
+        // expired-negative-cache state rather than wedging the test on the TTL.
+        let now_ms = wall_ms();
+        let warm = connectivity_open_join_iroh_inner(s.fresh_resolver(), bob_dial_ctx(&s), now_ms)
+            .await
+            .expect("retry open join must Ok");
+        assert_eq!(
+            warm.status, "joined",
+            "after a beacon publishes, the retried open join must succeed. Got {:?}",
+            warm.status
+        );
+        assert_alice_materializes_bob_joined(&s).await;
+
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("open_join_cold_start_is_retryable_then_succeeds timed out at 60s");
+}
+
+// The escalating-batch failover test (Test 2) needs ≥2 slots to widen past a
+// dead slot 0; reference the const so an accidental N drift surfaces here.
+const _: () = assert!(RENDEZVOUS_SLOT_COUNT >= 2, "failover test needs >= 2 slots");

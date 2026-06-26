@@ -315,6 +315,88 @@ pub struct CommunityInviteSigned {
 impl CanonicalPayloadSealed for CommunityInviteSigned {}
 impl CanonicalPayload for CommunityInviteSigned {}
 
+/// Tokenless open-community join request — a sibling of
+/// [`CommunityInviteSigned`] on the same `HARMONY_HANDSHAKE_V1` ALPN.
+/// Carries the joiner's self-signed Join (with its enrollment cert inside
+/// `join_event.enrollment`) plus the link-capability proof
+/// (`epoch_auth` + `nonce`) in place of an invite token.
+///
+/// Wire format: 7-key map. Field codes are 2 chars to satisfy the
+/// same-length-keys CBOR invariant at this nesting level, exactly like
+/// [`CommunityInviteSigned`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenJoinRequest {
+    /// The community being joined.
+    #[serde(rename = "ci")]
+    pub community_id: SpaceId,
+
+    /// The joiner's signed Join event WITHOUT countersig. Open-community
+    /// joins are admitted via `bootstrap_admit_open_publisher` (no
+    /// counter-sig); the embedded `join_event.enrollment` carries the
+    /// joiner's master-signed EnrollmentCert.
+    #[serde(rename = "je")]
+    pub join_event: SignedMembershipEvent,
+
+    /// Joiner's full 64-byte identity public bytes
+    /// (`X25519_pub(32) || Ed25519_pub(32)`). Bootstrap-only — the beacon
+    /// doesn't yet have an OwnerDeviceCache entry for the joiner. Wire
+    /// form: CBOR bstr(64).
+    #[serde(
+        rename = "ip",
+        serialize_with = "serialize_identity_pub_as_bstr",
+        deserialize_with = "deserialize_identity_pub_from_bstr"
+    )]
+    pub joiner_identity_pub: [u8; 64],
+
+    /// Joiner's DeviceIdentityHash.
+    #[serde(rename = "dh")]
+    pub signing_device_hash: DeviceIdentityHash,
+
+    /// Link-capability MAC proving the joiner holds the community
+    /// `epoch_key` (minted via `open_join_auth::mint_epoch_auth`). The
+    /// beacon recomputes and rejects on mismatch. Wire form: CBOR
+    /// bstr(32).
+    #[serde(
+        rename = "ea",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub epoch_auth: [u8; 32],
+
+    /// Per-request nonce bound into `epoch_auth`; the beacon's replay
+    /// cache rejects repeats. Wire form: CBOR bstr(16).
+    #[serde(
+        rename = "no",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub nonce: [u8; 16],
+
+    /// Wall-clock at request creation. Bound into `epoch_auth` and used
+    /// by the beacon for freshness/clock-skew rejection.
+    #[serde(rename = "ca")]
+    pub created_at: Hlc,
+}
+
+impl CanonicalPayloadSealed for OpenJoinRequest {}
+impl CanonicalPayload for OpenJoinRequest {}
+
+/// Beacon → joiner response to an [`OpenJoinRequest`]. Either admits the
+/// joiner and ships the current membership snapshot, or rejects with a
+/// human-readable reason. Shared by the beacon-side admit path (Task 6)
+/// and the joiner-side dial path (Task 10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenJoinResponse {
+    /// Admitted: the membership snapshot the joiner should apply to
+    /// bootstrap-sync the community.
+    Admitted {
+        member_events: Vec<SignedMembershipEvent>,
+    },
+    /// Rejected with a reason tag (mirrors the beacon-side
+    /// `OpenJoinReject` discriminant name).
+    Rejected { reason: String },
+}
+
 // =====================================================================
 // ZEB-285 Phase 1 — PreForkSnapshot + BoundedChannelLogSnapshot
 //
@@ -600,6 +682,15 @@ pub enum CommunityInvitePacket {
         /// encoder drift. On send, encode_packet re-encodes from
         /// `signed`, asserts byte-equality with `signed_bytes`, and
         /// emits `signed_bytes` verbatim.
+        signed_bytes: Vec<u8>,
+    },
+    /// Tokenless open-community join (discriminant 0x11). Sibling of
+    /// `Invite` on the same ALPN; `signature` is the joiner's Ed25519 sig
+    /// over canonical CBOR of `req`, captured as `signed_bytes` for
+    /// bit-exact re-verify.
+    OpenJoin {
+        req: OpenJoinRequest,
+        signature: [u8; 64],
         signed_bytes: Vec<u8>,
     },
 }
@@ -1467,6 +1558,26 @@ pub fn encode_packet(
             out.extend_from_slice(signature);
             Ok(out)
         }
+        CommunityInvitePacket::OpenJoin {
+            req,
+            signature,
+            signed_bytes,
+        } => {
+            let re_encoded = canonical_cbor_encode(req)
+                .map_err(|e| CommunityInviteEncodeError::ReSerialize(format!("re-encode: {e}")))?;
+            if re_encoded != *signed_bytes {
+                return Err(CommunityInviteEncodeError::SignedMutated(
+                    "CommunityInvitePacket::OpenJoin: req mutated post-build (re-encode \
+                     mismatches cached signed_bytes; signature would not cover wire body)"
+                        .into(),
+                ));
+            }
+            let mut out = Vec::with_capacity(1 + signed_bytes.len() + 64);
+            out.push(0x11);
+            out.extend_from_slice(signed_bytes);
+            out.extend_from_slice(signature);
+            Ok(out)
+        }
     }
 }
 
@@ -1533,6 +1644,35 @@ pub fn decode_packet(bytes: &[u8]) -> Result<CommunityInvitePacket, CommunityInv
                 signed_bytes,
             })
         }
+        0x11 => {
+            let mut cursor = std::io::Cursor::new(body_bytes);
+            let req: OpenJoinRequest = ciborium::from_reader(&mut cursor)
+                .map_err(|e| CommunityInviteDecodeError::Cbor(e.to_string()))?;
+            let consumed = cursor.position();
+            if consumed as usize != body_bytes.len() {
+                return Err(CommunityInviteDecodeError::TrailingBytes {
+                    consumed,
+                    total: body_bytes.len() as u64,
+                });
+            }
+            // Canonical-encoding round-trip check: reject reordered map
+            // keys / indefinite-length / oversized-prefix encodings, same
+            // as the 0x10 arm. The joiner identity ↔ signing_device_hash
+            // binding + capability/freshness checks are beacon-side
+            // (open_join_admit), not part of pure framing.
+            let canonical = canonical_cbor_encode(&req)
+                .map_err(|e| CommunityInviteDecodeError::Cbor(e.to_string()))?;
+            if canonical != body_bytes {
+                return Err(CommunityInviteDecodeError::Invalid(
+                    "CommunityInvitePacket body must use canonical CBOR",
+                ));
+            }
+            Ok(CommunityInvitePacket::OpenJoin {
+                req,
+                signature,
+                signed_bytes,
+            })
+        }
         other => Err(CommunityInviteDecodeError::UnknownDiscriminant(*other)),
     }
 }
@@ -1562,6 +1702,26 @@ pub fn build_signed_invite_packet(
     let signature = signing_key.sign(&signed_bytes).to_bytes();
     Ok(CommunityInvitePacket::Invite {
         signed,
+        signature,
+        signed_bytes,
+    })
+}
+
+/// Build a complete open-join [`CommunityInvitePacket`] ready for
+/// [`encode_packet`]. Encodes `req` to canonical CBOR, signs the resulting
+/// bytes via `signing_key`, bundles into the `OpenJoin` variant. Mirrors
+/// [`build_signed_invite_packet`], swapping the invite token for the
+/// `epoch_auth`/`nonce` capability already inside `req`.
+pub fn build_signed_open_join_packet(
+    req: OpenJoinRequest,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<CommunityInvitePacket, CommunityInviteEncodeError> {
+    use ed25519_dalek::Signer;
+    let signed_bytes =
+        canonical_cbor_encode(&req).map_err(|e| CommunityInviteEncodeError::Cbor(e.to_string()))?;
+    let signature = signing_key.sign(&signed_bytes).to_bytes();
+    Ok(CommunityInvitePacket::OpenJoin {
+        req,
         signature,
         signed_bytes,
     })
@@ -1914,7 +2074,13 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         signed,
         signature,
         signed_bytes,
-    } = packet;
+    } = packet
+    else {
+        // Open-join packets (0x11) are dispatched by the open-join admit
+        // path, not this invite-redeem helper; reject as not-an-invite.
+        tracing::warn!("community_invite handle_unicast received a non-invite packet; dropping");
+        return Err(CommunityInviteVerifyError::EnvelopeSigInvalid);
+    };
 
     // 2. Snapshot self_owner + private_identity + community_signing_key (#2)
     //    from dm_outbox under its lock; drop the guard before any further
@@ -3001,5 +3167,81 @@ mod tests {
             !new_bytes.windows(2).any(|w| w == b"se"),
             "empty sealed_epoch_keys must omit the `se` key"
         );
+    }
+}
+
+#[cfg(test)]
+mod open_join_packet_tests {
+    use super::*;
+    use crate::community_membership::{MembershipEventKind, SignedMembershipEvent};
+
+    fn joiner_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[11u8; 32])
+    }
+
+    /// Minimal self-signed Join for the joiner. Mirrors the inline
+    /// `SignedMembershipEvent` literal used by the invite-only payload
+    /// helpers above (no dedicated `sample_join_event` helper exists in
+    /// this file); the enrollment cert comes from `mint_test_owner`.
+    fn sample_join_event() -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            id: [0u8; 16],
+            community_id: SpaceId([1u8; 16]),
+            kind: MembershipEventKind::Join,
+            actor: OwnerAddr([0u8; 16]),
+            at: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "j".to_string(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: Some(crate::community_membership::mint_test_owner(0x4A).cert),
+        }
+    }
+
+    fn sample_request() -> OpenJoinRequest {
+        OpenJoinRequest {
+            community_id: SpaceId([1u8; 16]),
+            join_event: sample_join_event(),
+            joiner_identity_pub: [4u8; 64],
+            signing_device_hash: DeviceIdentityHash([7u8; 16]),
+            epoch_auth: [9u8; 32],
+            nonce: [2u8; 16],
+            created_at: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "j".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn open_join_packet_round_trips_and_verifies() {
+        let sk = joiner_signing_key();
+        let req = sample_request();
+        let packet = build_signed_open_join_packet(req.clone(), &sk).expect("build");
+        let wire = encode_packet(&packet).expect("encode");
+        // First byte is the open-join discriminant.
+        assert_eq!(wire[0], 0x11, "open-join discriminant");
+        let decoded = decode_packet(&wire).expect("decode");
+        match decoded {
+            CommunityInvitePacket::OpenJoin { req: got, .. } => {
+                assert_eq!(got.community_id, req.community_id);
+                assert_eq!(got.joiner_identity_pub, req.joiner_identity_pub);
+                assert_eq!(got.epoch_auth, req.epoch_auth);
+                assert_eq!(got.nonce, req.nonce);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invite_and_open_join_discriminants_are_distinct() {
+        let sk = joiner_signing_key();
+        let wire =
+            encode_packet(&build_signed_open_join_packet(sample_request(), &sk).unwrap()).unwrap();
+        assert_eq!(wire[0], 0x11);
+        assert_ne!(wire[0], 0x10);
     }
 }

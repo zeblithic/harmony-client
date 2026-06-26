@@ -1128,6 +1128,17 @@ impl CommunitySyncEngine {
         self.admin_addr
     }
 
+    /// Returns whether this community is invite-only (countersign-gated) vs
+    /// open (tokenless `epoch_key`-capability join). The open-join acceptor
+    /// (`iroh_invite_acceptor::handle_open_join_inbound`) reads this to REJECT a
+    /// tokenless `OpenJoinRequest` against an invite-only community — an
+    /// `epoch_key` holder must still go through the invite/countersign gate, so
+    /// admitting an open-join here would bypass that gate. Mirrors
+    /// [`Self::admin_addr`] (cheap field copy retained on the engine).
+    pub fn is_invite_only(&self) -> bool {
+        self.is_invite_only
+    }
+
     /// ZEB-254 Task 10: when a `PendingJoin` event is freshly inserted,
     /// check self-eligibility and — if eligible — spawn a task that
     /// signs + inserts a `JoinCountersign` event.
