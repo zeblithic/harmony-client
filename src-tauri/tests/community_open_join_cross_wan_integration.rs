@@ -991,6 +991,18 @@ async fn open_join_cold_start_is_retryable_then_succeeds() {
 // (dependency-ordered apply: pre-sort by event_sort_key + retry-until-stable)
 // lands it. Closes the "channels parity-only (not asserted)" gap that let
 // ZEB-573 through.
+//
+// SCOPE — end-to-end guard, NOT a deterministic ordering guard: the harness
+// can't force the beacon's `g.events.values()` HashMap harvest order, so on a
+// REVERT of the apply-order fix this catches the regression only
+// probabilistically (when the harvest happens to put ChannelCreate ahead of
+// Alice's Join). The DETERMINISTIC worst-case ordering is pinned separately by
+// the unit test `admitted_snapshot_applies_enrollment_dependent_events_out_of_order`
+// (open_join_dial.rs), which constructs HLC-inverted events directly. The two
+// are complementary: that unit test proves the apply logic deterministically;
+// this proves the full open-join cold path delivers channels end-to-end. On
+// shipped (sorted-apply) code this test is non-flaky — the pre-sort makes the
+// apply order deterministic regardless of harvest order.
 // ────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
