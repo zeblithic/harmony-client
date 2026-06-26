@@ -7078,6 +7078,24 @@ pub async fn start_node_inner(
                         ),
                     );
 
+                    // Beacon-side rendezvous slot publisher (open-community
+                    // cross-WAN first contact). Built from the SAME four inputs
+                    // as the member-keyed community publisher above, so both
+                    // publish the identical routing blob via the identical
+                    // `sign_new` seam. The relay-advertise loop drives its
+                    // `refresh_slot` (a member who is a relay advertiser at rank
+                    // i < N publishes its reachability under the rendezvous slot
+                    // key), so it re-publishes on the same relay-ad refresh +
+                    // membership-change triggers.
+                    let community_rendezvous_pub = std::sync::Arc::new(
+                        community_rendezvous_publisher::CommunityRendezvousPublisher::new(
+                            std::sync::Arc::clone(&pkarr_publisher_arc),
+                            (*signing_key_arc).clone(),
+                            identity_pub_64,
+                            std::sync::Arc::clone(&blob_builder),
+                        ),
+                    );
+
                     // ZEB-371: Case-D friend publisher. Reuses the SAME shared
                     // pkarr publisher and reachability `blob_builder` as the
                     // other case managers, so a re-register refreshes the
@@ -8168,6 +8186,16 @@ pub async fn start_node_inner(
                                         let device_id = device_id.clone();
                                         let optin = std::sync::Arc::clone(&relay_optin_doc);
                                         let membership = std::sync::Arc::clone(&relay_membership);
+                                        // Beacon-side rendezvous slot publisher + the
+                                        // resolver it ranks into slots. Driven on the
+                                        // SAME relay-ad refresh / membership-change
+                                        // triggers as the relay ad itself, so the
+                                        // node re-publishes its rendezvous slot
+                                        // whenever it re-publishes its relay ad.
+                                        let rendezvous_publisher =
+                                            std::sync::Arc::clone(&community_rendezvous_pub);
+                                        let rendezvous_resolver =
+                                            std::sync::Arc::clone(&community_relay_resolver);
                                         // THIS node's relay coordinates (stable for
                                         // the endpoint's lifetime; home_relay is
                                         // snapshotted at publish time below).
@@ -8185,6 +8213,10 @@ pub async fn start_node_inner(
                                             let optin = std::sync::Arc::clone(&optin);
                                             let membership = std::sync::Arc::clone(&membership);
                                             let ep = std::sync::Arc::clone(&ep_for_relay);
+                                            let rendezvous_publisher =
+                                                std::sync::Arc::clone(&rendezvous_publisher);
+                                            let rendezvous_resolver =
+                                                std::sync::Arc::clone(&rendezvous_resolver);
                                             Box::pin(async move {
                                                 let now_ms = std::time::SystemTime::now()
                                                     .duration_since(std::time::UNIX_EPOCH)
@@ -8288,6 +8320,30 @@ pub async fn start_node_inner(
                                                              insert_local_event failed; continuing"
                                                         );
                                                     }
+
+                                                    // Beacon-side: (re)publish this
+                                                    // node's rendezvous slot for `c`.
+                                                    // Ranks into a slot by its position
+                                                    // in the FRESH advertiser set; if
+                                                    // this node is at rank i < N it
+                                                    // publishes its reachability under
+                                                    // the slot key, else it unregisters
+                                                    // any stale slot. Re-published on
+                                                    // the same triggers as the relay ad
+                                                    // (refresh cadence + membership-
+                                                    // change force-wake).
+                                                    let advertisers = rendezvous_resolver
+                                                        .advertiser_addrs_for_community(
+                                                            &c, now_ms,
+                                                        );
+                                                    rendezvous_publisher
+                                                        .refresh_slot(
+                                                            c,
+                                                            engine.membership_key(),
+                                                            advertisers,
+                                                            actor,
+                                                        )
+                                                        .await;
                                                 }
                                             })
                                                 as futures::future::BoxFuture<'static, ()>
