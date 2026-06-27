@@ -41,7 +41,7 @@
 //! 0 → slot 0; `[lower_dummy, alice]` (Alice the higher address) → Alice ranks 1
 //! → slot 1 while slot 0 stays empty (the dummy never publishes).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -212,6 +212,17 @@ struct OpenJoinSetup {
     /// the channel-materialization assertion. Existing tests only query Alice.
     registry_bob: Arc<CommunitySyncRegistry>,
     bob_engine: Arc<harmony_app::community_state_sync::CommunitySyncEngine>,
+    /// ZEB-573: Bob's REAL per-channel log registry (the adapter receiver is
+    /// kept alive via `_bob_channel_log_adapter_drain` below, not dropped). The
+    /// channel-LOG layer is the unexercised half — `list_channel_messages` looks
+    /// the engine up here, and on the open-join admit path it is never spawned
+    /// in-session (config materializes, log engine does not). Used by
+    /// `bob_open_join_admit_leaves_channel_log_engine_unspawned`.
+    bob_channel_log_registry: Arc<ChannelLogRegistry>,
+    /// Per-device HLC tracker for Bob — the same lane the production redeem /
+    /// boot reconcile threads into `register_channel_log_engine` /
+    /// `reconcile_from_state`.
+    bob_hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>>,
 
     // ── pkarr ───────────────────────────────────────────────────────────
     pkarr_resolver: Arc<harmony_pkarr::PkarrResolver>,
@@ -229,6 +240,11 @@ struct OpenJoinSetup {
     _bob_accept: tokio::task::JoinHandle<()>,
     _relay: harmony_pkarr::testing::MockPkarrRelay,
     publisher_handle: tokio::task::JoinHandle<()>,
+    /// ZEB-573: drains Bob's channel-log adapter requests so the registry's
+    /// `spawn` (via reconcile) does not block on a full/closed bridge — the
+    /// production analogue is `event_loop::run` owning the adapter side. Kept
+    /// alive so its receiver stays open for the registry's lifetime.
+    _bob_channel_log_adapter_drain: tokio::task::JoinHandle<()>,
     _dir_alice: tempfile::TempDir,
     _dir_bob: tempfile::TempDir,
 }
@@ -595,11 +611,23 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         ev
     };
 
-    // Keep the channel-log registry construction parity-only (not asserted);
-    // built so the harness matches the invite-only wiring shape.
-    let (bob_channel_log_adapter_tx, _bob_channel_log_adapter_rx) =
+    // ZEB-573: build Bob's REAL channel-log registry and KEEP its adapter
+    // receiver alive (production's `event_loop::run` owns the adapter side).
+    // Earlier this harness dropped the receiver (`_bob_channel_log_adapter_rx`)
+    // and never asserted on the registry, so the channel-LOG layer — the half
+    // `list_channel_messages` reads — was completely unexercised, which is how
+    // ZEB-573 (config materializes, log engine never spawns in-session) slipped
+    // through. We drain requests in a spawned task so the registry's `spawn`
+    // never blocks on the bridge.
+    let (bob_channel_log_adapter_tx, mut bob_channel_log_adapter_rx) =
         mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
-    let _bob_channel_log_registry: Arc<ChannelLogRegistry> =
+    let bob_channel_log_adapter_drain = tokio::spawn(async move {
+        while bob_channel_log_adapter_rx.recv().await.is_some() {
+            // Drop each request (we never assert on the per-channel adapter
+            // wiring here — only that the registry holds a spawned engine).
+        }
+    });
+    let bob_channel_log_registry: Arc<ChannelLogRegistry> =
         ChannelLogRegistry::new(ChannelLogRegistryConfig {
             adapter_request_tx: bob_channel_log_adapter_tx,
             sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
@@ -610,6 +638,8 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
             engine_config: ChannelLogEngineConfig::default(),
             transport_epoch_rx: None,
         });
+    let bob_hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
+        Arc::new(TokioMutex::new(BTreeMap::new()));
     OpenJoinSetup {
         bob_comm_sk,
         alice_comm_sk,
@@ -623,6 +653,8 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         registry_alice,
         registry_bob,
         bob_engine,
+        bob_channel_log_registry,
+        bob_hlc_tracker,
         pkarr_resolver,
         relay_client: client,
         alice_rendezvous_publisher,
@@ -630,6 +662,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         _bob_accept: bob_accept,
         _relay: relay,
         publisher_handle,
+        _bob_channel_log_adapter_drain: bob_channel_log_adapter_drain,
         _dir_alice: dir_alice,
         _dir_bob: dir_bob,
     }
@@ -1054,6 +1087,200 @@ async fn bob_materializes_alice_channel_via_open_join() {
     })
     .await
     .expect("bob_materializes_alice_channel_via_open_join timed out at 60s");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// ZEB-573: the channel-LOG layer (the half `list_channel_messages` reads).
+//
+// The test above (`bob_materializes_alice_channel_via_open_join`) asserts only
+// the CONFIG layer: `materialize(events).channels.contains_key(channel_id)`.
+// #347 fixed that (dependency-ordered apply). But a URL-only OPEN joiner ALSO
+// needs the per-channel LOG engine spawned in-session — without it
+// `list_channel_messages` returns "no engine for <community>/<channel>" until
+// the next app restart's boot reconcile.
+//
+// This test drives the FULL production open-join redeem
+// (`redeem_invite_inner_with_overrides` with `open_join_iroh` set) — the exact
+// path the IPC `connectivity_open_join_iroh` uses — against Bob's REAL
+// channel-log registry, and asserts the admitted channel's LOG engine is present
+// when redeem returns. On a branch WITHOUT the in-session reconcile, the
+// admitted `ChannelCreate` materializes config but the log engine is only
+// spawned via the racy delta-consumer path (not synchronized with
+// `channel_log_tx.commit()`), so it is RELIABLY absent in-session → this fails.
+// The fix (an in-session `reconcile_from_state` after the Space + channel-log
+// commits) spawns it deterministically → this passes.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Build a token-less OPEN invite URL for Alice's community carrying her current
+/// materialized state (members + channels). Mirrors `generate_invite_impl`'s
+/// open arm: `sealed_epoch_key` is the raw 32-byte `EpochKey`, `is_invite_only`
+/// is false, and `state_snapshot` is frozen from Alice's engine.
+async fn build_open_invite_url_for_alice(s: &OpenJoinSetup) -> String {
+    use harmony_app::community_invite::{
+        CommunityInvitePayload, InviteEpochSnapshot, MaterializedCommunityState,
+    };
+
+    let alice_state = s
+        .registry_alice
+        .state_for(&s.community_id)
+        .await
+        .expect("alice state");
+    let events: Vec<_> = {
+        let g = alice_state.lock().await;
+        g.events.values().cloned().collect()
+    };
+    let mat = materialize(&events, s.alice_addr);
+
+    let payload = CommunityInvitePayload {
+        community_id: s.community_id,
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            // OPEN: raw 32-byte epoch key (the link capability).
+            sealed_epoch_key: s.epoch_key.as_bytes().to_vec(),
+            sealed_epoch_keys: Vec::new(),
+            state_snapshot: MaterializedCommunityState {
+                members: mat.members.clone(),
+                channels: mat.channels.clone(),
+                power_levels: mat.power_levels.clone(),
+            },
+        },
+        admin_addr: s.alice_addr,
+        community_name: "OpenJoinCommunity".to_string(),
+        is_invite_only: false,
+        expires_at: None,
+        invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
+        forked_from: None,
+        pre_fork_snapshot: None,
+        inviter_enrollment: None,
+        untargeted_decrypt_key: None,
+    };
+    harmony_app::build_open_invite_url(&payload).expect("encode open invite url")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bob_open_join_redeem_spawns_channel_log_engine_in_session() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let s = setup_two_party_open_join().await;
+
+        // Alice (admin) creates #general BEFORE Bob joins, so her harvested
+        // admit-snapshot AND her invite-URL state_snapshot both carry the
+        // admin-signed ChannelCreate.
+        let channel_id = ChannelId([0xC1; 16]);
+        s.insert_alice_channel(channel_id, "general").await;
+
+        // Alice is sole advertiser → slot 0 (Bob's open-join dial resolves it).
+        let slot = s.publish_rendezvous_slot(vec![s.alice_addr]).await;
+        assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
+
+        // Bob's redeem-side handles. The redeem path spawns its OWN community
+        // engine via `spawn_engine_with_guard` into `registry_bob` (idempotent
+        // with the harness pre-spawn), inserts Bob's self-Join, dials Alice's
+        // beacon, applies the admitted snapshot, commits the Space + channel-log
+        // transaction, and (with the fix) reconciles the channel-log engines.
+        let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+        let (bob_adapter_tx, mut bob_adapter_rx) = mpsc::channel::<CommunityAdapterRequest>(8);
+        let _bob_adapter_drain = tokio::spawn(async move {
+            while let Some(req) = bob_adapter_rx.recv().await {
+                drop(req.publisher_rx);
+                drop(req.subscriber_tx);
+            }
+        });
+        // dm_outbox: redeem reads `signing_key` for joiner-identity derivation and
+        // resolves destinations from the owner cache (empty here → open path needs
+        // no Reticulum fan-out). Bob's community signer = `bob_comm_sk`.
+        let bob_identity = PrivateIdentity::from_seed(&[0xb2; 32]);
+        let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+            "bob-dev".into(),
+            s.bob_addr,
+            DeviceIdentityHash(bob_identity.identity.address_hash),
+            Arc::clone(&s.bob_comm_sk),
+            Arc::new(dup_identity(&bob_identity)),
+            Arc::clone(&s.bob_comm_sk),
+            harmony_app::community_membership::mint_test_owner(0xB2).cert,
+        )));
+
+        let invite_url = build_open_invite_url_for_alice(&s).await;
+
+        let dto = harmony_app::redeem_invite_inner_with_overrides(
+            invite_url,
+            Arc::clone(&bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            harmony_app::community_membership::mint_test_owner(0xB2).cert,
+            Arc::clone(&s.registry_bob),
+            bob_adapter_tx,
+            None, // no transport-epoch watch
+            Arc::clone(&bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            || Ok(()), // no generation fence in this harness
+            None,      // identity_dir: no pre_fork_snapshot write
+            harmony_app::RedeemInviteOverrides {
+                open_join_iroh: Some(harmony_app::OpenJoinIrohDeps {
+                    pkarr_resolver: Arc::clone(&s.pkarr_resolver),
+                    iroh_endpoint: Some(Arc::clone(&s.bob_ep)),
+                    dial_config: harmony_app::HandshakeDialConfig {
+                        connect_timeout: Duration::from_millis(10_000),
+                        open_bi_timeout: Duration::from_millis(10_000),
+                        response_read_timeout: Duration::from_millis(10_000),
+                        write_timeout: Duration::from_millis(10_000),
+                    },
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("open-join redeem must Ok");
+
+        assert_eq!(
+            dto.status.as_deref(),
+            Some("joined"),
+            "open-join redeem must report 'joined' (beacon admitted Bob). Got {:?}",
+            dto.status
+        );
+
+        // CONFIG layer (the #347 guarantee) — Bob materialized Alice's channel.
+        assert_bob_materializes_channel(&s, channel_id).await;
+
+        // LOG layer (the ZEB-573 fix) — the per-channel log engine the admitted
+        // ChannelCreate implies must be spawned IN-SESSION. Pre-fix this is None
+        // (the admit materialized config but never spawned the log engine; that
+        // only happens at the next boot reconcile). `list_channel_messages` looks
+        // the engine up here, so a None means "no engine for <community>/<channel>".
+        let log_engine = s
+            .bob_channel_log_registry
+            .engine(&s.community_id, &channel_id)
+            .await;
+        assert!(
+            log_engine.is_some(),
+            "ZEB-573: Bob's open-join redeem materialized the channel CONFIG but did NOT \
+             spawn the per-channel LOG engine in-session — list_channel_messages would \
+             return 'no engine for {}/{}'. The admitted ChannelCreate must trigger an \
+             in-session reconcile (mirroring start_node) so the log engine spawns before \
+             redeem returns, not only at the next app restart.",
+            hex::encode(s.community_id.0),
+            hex::encode(channel_id.0),
+        );
+
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("bob_open_join_redeem_spawns_channel_log_engine_in_session timed out at 60s");
 }
 
 // The escalating-batch failover test (Test 2) needs ≥2 slots to widen past a
