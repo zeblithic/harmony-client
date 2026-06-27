@@ -3729,6 +3729,50 @@ pub fn bootstrap_admit_invite_only_publisher(
         .cloned()
 }
 
+/// Select the catchup-trigger event id for `target`: the most recent (by HLC)
+/// membership event authored by `target` that is a `Join` OR a **countersigned**
+/// `PendingJoin`. Returns `None` when no such event exists.
+///
+/// ZEB-578: this MUST stay consistent with the EpochCatchup **apply-side**
+/// trigger acceptance in `apply_event` (search "ZEB-254 R5-1"), which clears
+/// `pending_catchup_for` for a recipient only when the catchup's `triggered_by`
+/// points at a `Join` or a *countersigned* `PendingJoin`. The self-heal
+/// synthesizer (`self_heal_community_observer`) uses this to choose the
+/// `triggered_by` when it MINTS a catchup. If synthesizer and apply disagree, an
+/// invite-only joiner — whose originating membership event is a countersigned
+/// `PendingJoin`, never a `Join` — is either never sent a catchup (synthesizer
+/// too strict, the bug this fixes) or sent one the apply side ignores.
+///
+/// Un-countersigned `PendingJoin` is intentionally excluded: a still-pending
+/// joiner is not yet a member (§10.6 backward-secrecy), and `pending_catchup_for`
+/// only ever holds members enqueued at status `Joined` (the `Join` arm and the
+/// *countersigned*-`PendingJoin` arm of `apply_event`). The explicit
+/// countersigned check keeps the two paths provably aligned regardless.
+pub fn select_catchup_trigger_event(
+    events: &[SignedMembershipEvent],
+    target: OwnerAddr,
+) -> Option<EventId> {
+    let countersigned: std::collections::HashSet<EventId> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            MembershipEventKind::JoinCountersign { target_event_id } => Some(*target_event_id),
+            _ => None,
+        })
+        .collect();
+    events
+        .iter()
+        .filter(|e| {
+            e.actor == target
+                && match &e.kind {
+                    MembershipEventKind::Join => true,
+                    MembershipEventKind::PendingJoin { .. } => countersigned.contains(&e.id),
+                    _ => false,
+                }
+        })
+        .max_by_key(|e| (e.at.wall_ms, e.at.logical))
+        .map(|e| e.id)
+}
+
 /// ZEB-285: verify a single signed event against a frozen pre-fork
 /// snapshot's `identity_pubs` map. Used by the fork's UI when loading
 /// pre-fork history for display — fork members are not necessarily
@@ -7396,6 +7440,119 @@ mod zeb_254_pending_join_verify_tests {
         assert!(
             got.is_none(),
             "a bare Joined publisher (admin founder Join) must not self-admit invite-only"
+        );
+    }
+
+    // ── ZEB-578: select_catchup_trigger_event ────────────────────────────────
+    // The synthesizer's catchup-trigger selection must mirror the apply-side
+    // acceptance: a `Join` OR a countersigned `PendingJoin` is a valid trigger;
+    // an un-countersigned `PendingJoin` is not. (An invite-only joiner only ever
+    // authors a PendingJoin, so without accepting it they never get a catchup.)
+
+    /// Build a minimal event of `kind` authored by `actor` at `wall_ms`. Only
+    /// the fields `select_catchup_trigger_event` reads (actor/kind/id/at) need to
+    /// be meaningful; the sig is a dummy (the selector does not verify).
+    fn catchup_ev(
+        id_byte: u8,
+        actor: OwnerAddr,
+        kind: MembershipEventKind,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let mut id = [0u8; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            id,
+            community_id: SpaceId([0xcc; 16]),
+            kind,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "catchup-test".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    #[test]
+    fn select_catchup_trigger_event_accepts_join() {
+        let dave = mint_test_owner(0xD1);
+        let join = catchup_ev(0x01, dave.owner, MembershipEventKind::Join, 100);
+        let got = select_catchup_trigger_event(std::slice::from_ref(&join), dave.owner);
+        assert_eq!(
+            got,
+            Some(join.id),
+            "a Join authored by the target is a valid catchup trigger"
+        );
+    }
+
+    #[test]
+    fn select_catchup_trigger_event_accepts_countersigned_pending_join() {
+        let admin = mint_test_owner(0xA1);
+        let dave = mint_test_owner(0xD1);
+        let cid = SpaceId([0xcc; 16]);
+        let token = make_invite_token(&admin, admin.owner, None, None);
+        // make_pending_join_event mints the PendingJoin with id [9u8; 16].
+        let pending = make_pending_join_event(&dave, dave.owner, cid, token);
+        let countersign = catchup_ev(
+            0x58,
+            admin.owner,
+            MembershipEventKind::JoinCountersign {
+                target_event_id: pending.id,
+            },
+            1_700_000_002_000,
+        );
+        let events = vec![pending.clone(), countersign];
+        let got = select_catchup_trigger_event(&events, dave.owner);
+        assert_eq!(
+            got,
+            Some(pending.id),
+            "an invite-only joiner's COUNTERSIGNED PendingJoin is a valid catchup trigger"
+        );
+    }
+
+    #[test]
+    fn select_catchup_trigger_event_rejects_uncountersigned_pending_join() {
+        let admin = mint_test_owner(0xA1);
+        let dave = mint_test_owner(0xD1);
+        let cid = SpaceId([0xcc; 16]);
+        let token = make_invite_token(&admin, admin.owner, None, None);
+        // No JoinCountersign for `pending` → a still-pending joiner, not a member.
+        let pending = make_pending_join_event(&dave, dave.owner, cid, token);
+        let got = select_catchup_trigger_event(std::slice::from_ref(&pending), dave.owner);
+        assert_eq!(
+            got, None,
+            "an un-countersigned PendingJoin must NOT trigger a catchup (§10.6 backward-secrecy)"
+        );
+    }
+
+    #[test]
+    fn select_catchup_trigger_event_prefers_most_recent_on_rejoin() {
+        let admin = mint_test_owner(0xA1);
+        let dave = mint_test_owner(0xD1);
+        let cid = SpaceId([0xcc; 16]);
+        // An old Join (dave joined, later left), then a newer countersigned
+        // PendingJoin (re-join into a rotated epoch). The most-recent qualifying
+        // event must win so the dedupe key tracks the live join.
+        let early_join = catchup_ev(0x01, dave.owner, MembershipEventKind::Join, 100);
+        let token = make_invite_token(&admin, admin.owner, None, None);
+        let pending = make_pending_join_event(&dave, dave.owner, cid, token); // wall 1_700_000_001_000
+        let countersign = catchup_ev(
+            0x58,
+            admin.owner,
+            MembershipEventKind::JoinCountersign {
+                target_event_id: pending.id,
+            },
+            1_700_000_002_000,
+        );
+        let events = vec![early_join, pending.clone(), countersign];
+        let got = select_catchup_trigger_event(&events, dave.owner);
+        assert_eq!(
+            got,
+            Some(pending.id),
+            "the most-recent qualifying event (the re-join PendingJoin) wins over the older Join"
         );
     }
 }
