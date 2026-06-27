@@ -21,7 +21,7 @@ use crate::community_invite::{
     build_signed_open_join_packet, device_hash_from_identity_pub, encode_packet, OpenJoinRequest,
     OpenJoinResponse,
 };
-use crate::community_rendezvous::{resolve_rendezvous, RendezvousResolveConfig};
+use crate::community_rendezvous::{rendezvous_config_from_env, resolve_rendezvous};
 use crate::community_state_sync::CommunitySyncEngine;
 use crate::iroh_endpoint::IrohEndpoint;
 use crate::open_join_auth::mint_epoch_auth;
@@ -103,9 +103,18 @@ pub async fn connectivity_open_join_iroh_inner(
         &pkarr,
         &ctx.epoch_key,
         now_ms,
-        &RendezvousResolveConfig::from_env(),
+        &rendezvous_config_from_env(),
     )
     .await;
+    // Surface the resolve instrumentation at `info` so the success-rate/latency
+    // tuning data (the spec's open question) is visible without `RUST_LOG=debug`.
+    tracing::info!(
+        winning_slot = ?resolve.winning_slot,
+        elapsed_ms = resolve.elapsed_ms,
+        batches_tried = resolve.batches_tried,
+        found_beacon = resolve.payload.is_some(),
+        "open-join: rendezvous resolve complete"
+    );
     open_join_after_resolve(resolve.payload, ctx, now_ms).await
 }
 
