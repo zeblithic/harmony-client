@@ -3433,14 +3433,20 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             // Known-publisher path: must be Joined. Deferred bootstrap paths:
             // `None` is the normal unknown-publisher case (their self-authorizing
             // Join/PendingJoin is in `resolved`, admitted by this merge), so
-            // accept None OR Joined. The invite-only deferred path additionally
-            // accepts PendingJoin (the publisher's admitted-but-uncountersigned
-            // state). Still reject Left/Banned surfaced by a concurrent insert.
-            let authorized = if deferred_open_bootstrap || deferred_invite_bootstrap {
+            // accept None OR Joined. ONLY the invite-only deferred path
+            // additionally accepts PendingJoin — that is the invite publisher's
+            // admitted-but-uncountersigned state, which has no analogue in an
+            // open community (open joins mint an immediate Join). Keeping the
+            // PendingJoin allowance out of the open arm avoids widening the open
+            // path's authorization surface. Still reject Left/Banned surfaced by
+            // a concurrent insert.
+            let authorized = if deferred_invite_bootstrap {
                 matches!(
                     pub_status,
                     None | Some(MemberStatus::Joined) | Some(MemberStatus::PendingJoin)
                 )
+            } else if deferred_open_bootstrap {
+                matches!(pub_status, None | Some(MemberStatus::Joined))
             } else {
                 matches!(pub_status, Some(MemberStatus::Joined))
             };

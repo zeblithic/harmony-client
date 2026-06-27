@@ -3711,12 +3711,21 @@ pub fn bootstrap_admit_invite_only_publisher(
         return None;
     }
 
-    // Admit a publisher who materializes to Joined OR PendingJoin (the expected
-    // invite-only pre-counter-sign state). Left/Banned → not admitted.
+    // Admit ONLY a publisher who materializes to PendingJoin — the invite-only
+    // pre-counter-sign state, which is exactly ZEB-526's case: a joiner whose
+    // self-authorizing PendingJoin (admin-signed InviteToken) the admin has not
+    // yet seen. We deliberately do NOT admit a `Joined` publisher here: an
+    // unknown publisher self-presenting as Joined (e.g. the admin's own bootstrap
+    // Join, or a countersigned member's republished root) is not part of the
+    // joiner-admission flow and must reach the receiver through normal
+    // propagation, preserving the invite-only cold-cache reject→propagate→admit
+    // contract. Widening to `Joined` would let any self-authorizing root
+    // self-admit on first contact, enlarging the invite-only trust surface for no
+    // ZEB-526 benefit. Left/Banned → not admitted.
     let mat = materialize_with_now(&verified, admin_addr, Some(publisher_at.wall_ms));
     mat.members
         .get(&publisher_addr)
-        .filter(|s| matches!(s.status, MemberStatus::Joined | MemberStatus::PendingJoin))
+        .filter(|s| matches!(s.status, MemberStatus::PendingJoin))
         .cloned()
 }
 
@@ -7353,6 +7362,40 @@ mod zeb_254_pending_join_verify_tests {
         assert!(
             got.is_none(),
             "a forged (non-admin-signed) InviteToken must not admit the joiner"
+        );
+    }
+
+    /// A publisher whose only self-evidence is a bare `Join` (materializes to
+    /// `Joined`) — e.g. the admin's own founder bootstrap Join — must NOT
+    /// self-admit on first contact. Only an uncountersigned `PendingJoin`
+    /// (ZEB-526's joiner case) bootstraps onto the gate; a `Joined` root reaches
+    /// the receiver through normal propagation. This preserves the invite-only
+    /// cold-cache reject→propagate→admit contract that the open-community
+    /// relaxation (ZEB-558) deliberately left unchanged for invite-only.
+    #[test]
+    fn bootstrap_admit_invite_only_publisher_rejects_bare_join_publisher() {
+        let admin = mint_test_owner(0xc8);
+        let community_id = SpaceId([0xcf; 16]);
+
+        // The publisher IS the admin; the blob carries only the admin's founder
+        // Join (a valid, self-authorizing root-of-trust Join → materializes to
+        // Joined). Even so, the invite-only bootstrap must not admit it.
+        let events = vec![admin_bootstrap_join(&admin, community_id)];
+        let root_at = Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "root".into(),
+        };
+        let got = bootstrap_admit_invite_only_publisher(
+            &events,
+            admin.owner,
+            admin.owner,
+            community_id,
+            &root_at,
+        );
+        assert!(
+            got.is_none(),
+            "a bare Joined publisher (admin founder Join) must not self-admit invite-only"
         );
     }
 }
