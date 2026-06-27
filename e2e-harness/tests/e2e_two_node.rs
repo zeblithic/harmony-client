@@ -2299,8 +2299,16 @@ async fn s10_plain_redeem_third_member_probe() {
     let redeem = redeem_invite(&c, &invite).await;
     eprintln!("S10 plain redeem_invite result: {redeem:?}");
 
-    // Poll both directions for convergence within a generous window.
-    let converged = poll_until(Duration::from_secs(120), || async {
+    // Bounded characterization window (NOT a generous assert window): co-located,
+    // the plain-redeem path CANNOT peer (see header), so non-convergence is the
+    // structural outcome and `poll_until` here always runs to the deadline —
+    // every second is paid on every run. 30s comfortably exceeds the peered
+    // convergence latency the asserting scenarios observe (s1/s9 converge in
+    // seconds), so it still reports a genuine convergence if behavior ever
+    // changes, without burning 2 minutes characterizing a known gap. Do not
+    // re-expand this to match the asserting scenarios' 120s — that ceiling is
+    // free for them (they return early on success) and pure waste here.
+    let converged = poll_until(Duration::from_secs(30), || async {
         let a_sees_c = roster_has_joined(&a, &community, &c_owner).await?;
         let c_sees_a = roster_has_joined(&c, &community, &a_owner).await?;
         Ok((a_sees_c && c_sees_a).then_some(()))
@@ -2311,7 +2319,7 @@ async fn s10_plain_redeem_third_member_probe() {
         eprintln!("S10: plain-redeem 3rd member converged bidirectionally (a sees c, c sees a).");
     } else {
         eprintln!(
-            "S10 FINDING: plain-redeem 3rd member did not converge co-located within 120s. \
+            "S10 FINDING: plain-redeem 3rd member did not converge co-located within 30s. \
              Expected: this path is not peered co-located — the plain `redeem_invite` verb skips \
              the iroh first-contact handshake that establishes the a<->c zenoh link, so c's \
              state-root publish never reaches the founder. The convergence fixes (founder-side \
