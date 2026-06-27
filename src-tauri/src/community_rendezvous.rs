@@ -65,8 +65,11 @@ pub fn rendezvous_slot_verifying_key(
 /// beyond the slot cap. Because the advertiser set is CRDT-replicated, every
 /// member computes the same ordering, so each slot has exactly one writer.
 pub fn slot_for_advertiser(advertisers: &[OwnerAddr], me: &OwnerAddr) -> Option<u16> {
-    let addrs: Vec<[u8; 16]> = advertisers.iter().map(|a| a.0).collect();
-    core_slot_for_advertiser(&addrs, &me.0, RENDEZVOUS_SLOT_COUNT)
+    // `OwnerAddr` is `Ord` over its 16-byte inner address, so it satisfies the
+    // core helper's `A: Ord` bound directly — no need to strip to `[u8; 16]`.
+    // The derived ordering sorts/dedups by the inner bytes, matching the prior
+    // `a.0.cmp(&b.0)` exactly.
+    core_slot_for_advertiser(advertisers, me, RENDEZVOUS_SLOT_COUNT)
 }
 
 /// Build the core rendezvous resolve config from the open-join env knobs.

@@ -106,6 +106,15 @@ pub async fn connectivity_open_join_iroh_inner(
         &rendezvous_config_from_env(),
     )
     .await;
+    // Surface the resolve instrumentation at `info` so the success-rate/latency
+    // tuning data (the spec's open question) is visible without `RUST_LOG=debug`.
+    tracing::info!(
+        winning_slot = ?resolve.winning_slot,
+        elapsed_ms = resolve.elapsed_ms,
+        batches_tried = resolve.batches_tried,
+        found_beacon = resolve.payload.is_some(),
+        "open-join: rendezvous resolve complete"
+    );
     open_join_after_resolve(resolve.payload, ctx, now_ms).await
 }
 
