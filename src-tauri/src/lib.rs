@@ -19930,6 +19930,96 @@ pub(crate) async fn register_channel_log_engine(
         .await
 }
 
+/// ZEB-573: in-session walk of a community's materialized channels, spawning a
+/// per-channel log engine for each live (non-tombstoned) entry — the in-session
+/// analogue of the `start_node` boot-time reconcile (lib.rs `start_node`'s
+/// per-community sweep that calls `ChannelLogRegistry::reconcile_from_state`).
+///
+/// Why this exists: a URL-only OPEN-community joiner converges into membership
+/// and (post-#347) materializes channel **config** via the admin's
+/// `ChannelCreate` events applied by `open_join_dial::apply_admitted_snapshot`.
+/// But those events land via the dial's direct `insert_local_event` calls, NOT
+/// through the in-session spawn path the creator's #general uses. The creator's
+/// channel-log engine spawns because the local `insert_local_event(ChannelCreate)`
+/// fires a `CommunityMembershipDelta` that the long-lived
+/// `run_community_delta_consumer` projects into a `register_channel_log_engine`
+/// call. On the open-join admit path that delta-consumer spawn is RACY against
+/// the redeem's `channel_log_tx.commit()` (the admit runs INSIDE the open
+/// transaction, the consumer task runs on a separate tokio task, and the commit
+/// can drain the deferred-spawn queue before — or independently of — the
+/// consumer enqueuing it), so the admitted channels' log engines reliably appear
+/// only at the NEXT `start_node` boot reconcile. The symptom: `list_channels`
+/// shows the channel but `list_channel_messages` returns "no engine for
+/// <community>/<channel>" until restart (ZEB-573).
+///
+/// The redeem open-join arm calls this AFTER the owner-state Space +
+/// `channel_log_tx` commits to deterministically spawn the admitted channels'
+/// log engines in-session, mirroring `start_node`. Idempotent: each `spawn`
+/// returns the existing Arc, so a channel already spawned by the racy consumer
+/// path is a no-op. Runs OUTSIDE any open transaction (the caller commits the
+/// redeem's `channel_log_tx` first), so `reconcile_from_state` never observes a
+/// `DeferredForCommit`. Errors are logged and swallowed — a missing channel-log
+/// engine self-heals at the next boot reconcile, exactly as the boot caller does.
+pub(crate) async fn reconcile_community_channel_logs(
+    channel_log_registry: &std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
+    community_engine: &std::sync::Arc<crate::community_state_sync::CommunitySyncEngine>,
+    community_id: crate::owner_state_types::SpaceId,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+) {
+    // Materialise the channels map under the engine's CRDT lock (cheap —
+    // briefly held, recomputes only if stale, returns a clone). Same shape
+    // as the start_node per-community sweep.
+    let materialized = {
+        let state_g = community_engine.state();
+        let g = state_g.lock().await;
+        g.materialized(community_engine.admin_addr())
+    };
+    let membership_key = community_engine.membership_key();
+    let state_at_hlc = community_engine.state_at_hlc_resolver();
+    if let Err(e) = std::sync::Arc::clone(channel_log_registry)
+        .reconcile_from_state(
+            community_id,
+            &materialized,
+            &membership_key,
+            state_at_hlc,
+            hlc_tracker,
+        )
+        .await
+    {
+        tracing::warn!(
+            community_id = %hex::encode(community_id.0),
+            error = ?e,
+            "ZEB-573: in-session channel-log reconcile failed; admitted channels' \
+             log engines will be re-attempted at next start_node boot reconcile"
+        );
+    }
+}
+
+/// ZEB-573 test seam: lets the open-join cross-WAN integration harness drive the
+/// exact in-session reconcile the redeem open-join arm runs, so the test can
+/// prove the admit alone leaves the channel-log engine absent and this call
+/// closes the gap. Mirrors the `*_impl` test-fixtures wrappers elsewhere in this
+/// module.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub async fn reconcile_community_channel_logs_for_test(
+    channel_log_registry: &std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
+    community_engine: &std::sync::Arc<crate::community_state_sync::CommunitySyncEngine>,
+    community_id: crate::owner_state_types::SpaceId,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+) {
+    reconcile_community_channel_logs(
+        channel_log_registry,
+        community_engine,
+        community_id,
+        hlc_tracker,
+    )
+    .await
+}
+
 /// ZEB-445: shared IPC/RPC seam.
 pub(crate) async fn create_channel_impl(
     state: &std::sync::Mutex<NodeState>,
@@ -26957,6 +27047,31 @@ where
     // `notify_dirty` re-fires the debounce; the retry now reads the committed
     // `current_epoch`/`current_epoch_key` and succeeds.
     engine_arc.notify_dirty();
+
+    // ZEB-573: spawn the admitted channels' per-channel LOG engines IN-SESSION.
+    // Scoped to the OPEN-join first-contact dial path (`open_join_iroh` set):
+    // its `apply_admitted_snapshot` lands the admin's `ChannelCreate` events via
+    // direct `insert_local_event` calls, so the channels' CONFIG materializes
+    // (and #347 fixed its dependency-order apply) — but the per-channel log
+    // engine spawns only via the racy delta-consumer→`register_channel_log_engine`
+    // path, which is NOT synchronized with the `channel_log_tx.commit()` above.
+    // The result is `list_channels` showing the channel while
+    // `list_channel_messages` returns "no engine" until the next boot reconcile.
+    // Mirror what `start_node` does at boot: walk this community's materialized
+    // channels and spawn a log engine for each, AFTER the owner-state Space +
+    // `channel_log_tx` commits (so `reconcile_from_state` runs outside any open
+    // transaction). Idempotent — a channel already spawned by the consumer path
+    // is a no-op. Invite-only is intentionally untouched: it never sets
+    // `open_join_iroh` and converges its channels through the live delta path.
+    if overrides.open_join_iroh.is_some() {
+        reconcile_community_channel_logs(
+            &channel_log_registry,
+            &engine_arc,
+            minted.community_id,
+            std::sync::Arc::clone(&hlc_tracker),
+        )
+        .await;
+    }
 
     // 10. Return DTO with the invite's name + kind so the caller can
     // render the new community without re-decoding the URL or
