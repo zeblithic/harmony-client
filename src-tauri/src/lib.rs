@@ -23576,6 +23576,28 @@ pub(crate) async fn create_community_impl(
         }
     }
 
+    // ZEB-582: invite-only communities auto-enable this owner's relay opt-in at
+    // creation. An invite-redeem delivers membership over the iroh relay, but
+    // the follow-on channel-bearing state-root/epoch sync depends on a post-join
+    // zenoh dial to the admin — which dies cross-WAN behind a hard NAT/CGNAT, so
+    // a remote joiner converges membership yet silently never receives channels.
+    // Opting the founder's fleet in to relay gives remote joiners a relay-backed
+    // pull path for the (ciphertext, epoch-sealed) state-root, closing that
+    // footgun by default. Open communities land channel config inline in the
+    // admitted snapshot, so they don't need this. Best-effort: the community
+    // already committed durably above, so a relay-optin failure (e.g. the
+    // relay-optin engine isn't installed in this boot) must NOT fail the create
+    // — it is logged, and the admin can still toggle relay in community settings.
+    if is_invite_only {
+        if let Err(e) = set_community_relay_opt_in_impl(state, community_id.clone(), true).await {
+            tracing::warn!(
+                error = %e,
+                community_id = %community_id,
+                "create_community: auto relay opt-in for invite-only community failed (non-fatal)"
+            );
+        }
+    }
+
     // durable-seal-targets: wake the reachability publisher so this device
     // emits a per-community `ReachabilityAnnounce` (carrying its durable
     // butler-set) for the just-created community NOW, rather than after the

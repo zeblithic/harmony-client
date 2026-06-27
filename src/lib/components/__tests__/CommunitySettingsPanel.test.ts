@@ -408,4 +408,47 @@ describe('CommunitySettingsPanel', () => {
     // The resolved name must reach the DOM (end-to-end through the props chain).
     expect(getByText(/Resolved Descendant Name/)).toBeTruthy();
   });
+
+  // ── ZEB-582: per-community relay opt-in toggle ────────────────────────────
+
+  it('relay_toggle_reflects_get_community_relay_status', async () => {
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'get_community_relay_status') return Promise.resolve(true);
+      return Promise.resolve([]);
+    });
+    const { getByLabelText } = render(CommunitySettingsPanel, { props: baseProps });
+    // The async status read flips the checkbox checked once it resolves.
+    await waitFor(() => {
+      const cb = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(cb.checked).toBe(true);
+    });
+  });
+
+  it('relay_toggle_invokes_set_community_relay_opt_in_with_camelCase_args', async () => {
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    const calls: Array<[string, unknown]> = [];
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string, args?: unknown) => {
+      calls.push([cmd, args]);
+      // Start opted-out so a click sets it ON.
+      if (cmd === 'get_community_relay_status') return Promise.resolve(false);
+      return Promise.resolve([]);
+    });
+    const { getByLabelText } = render(CommunitySettingsPanel, { props: baseProps });
+    // Wait for the initial status read to settle (toggle enabled, unchecked).
+    const cb = await waitFor(() => {
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(el.disabled).toBe(false);
+      expect(el.checked).toBe(false);
+      return el;
+    });
+    await fireEvent.click(cb);
+    // The setter must be called with the backend's snake_case→camelCase arg
+    // names (communityIdHex / optedIn) — a wrong key silently arrives undefined.
+    await waitFor(() => {
+      const setCall = calls.find(([c]) => c === 'set_community_relay_opt_in');
+      expect(setCall).toBeTruthy();
+      expect(setCall![1]).toEqual({ communityIdHex: baseProps.communityId, optedIn: true });
+    });
+  });
 });

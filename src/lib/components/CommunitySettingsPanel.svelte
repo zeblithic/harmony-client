@@ -178,6 +178,69 @@
       });
   });
 
+  // ZEB-582: per-community relay opt-in. Semantically first-person — "my fleet
+  // volunteers to store & forward this community's (ciphertext) messages for
+  // members who are offline or behind strict networks." Invite-only communities
+  // auto-enable this at creation (backend), so remote/CGNAT joiners get a
+  // relay-backed state-root pull path instead of silently never receiving
+  // channels; this toggle surfaces that state and lets the owner opt out (or any
+  // member opt in). Reads/writes the existing get_community_relay_status /
+  // set_community_relay_opt_in IPCs (note: both key on `communityIdHex`).
+  let relayOptedIn = $state(false);
+  let relayLoading = $state(true);
+  let relayPending = $state(false);
+  let relayError = $state<string | null>(null);
+  // Monotonic guard: a communityId change must drop a stale in-flight status
+  // read so it can't overwrite a newer community's value (mirrors the
+  // latestProposalsCallId pattern above).
+  let relayStatusSeq = 0;
+
+  $effect(() => {
+    void communityId;
+    const mySeq = ++relayStatusSeq;
+    relayLoading = true;
+    invoke<boolean>('get_community_relay_status', { communityIdHex: communityId })
+      .then((v) => {
+        if (mySeq !== relayStatusSeq) return; // superseded
+        relayOptedIn = v === true;
+        relayError = null;
+      })
+      .catch((e) => {
+        if (mySeq !== relayStatusSeq) return;
+        relayError = e instanceof Error ? e.message : String(e);
+      })
+      .finally(() => {
+        if (mySeq !== relayStatusSeq) return;
+        relayLoading = false;
+      });
+  });
+
+  async function handleRelayToggle(e: Event) {
+    if (relayPending) return;
+    // Capture the checkbox BEFORE awaiting — `e.currentTarget` is nulled once
+    // the synchronous event dispatch completes, so re-reading it in the catch
+    // would throw and strand the optimistic state (same hazard as the
+    // shared-in-profile toggle below).
+    const target = e.currentTarget as HTMLInputElement;
+    const next = target.checked;
+    relayOptedIn = next; // optimistic
+    relayPending = true;
+    try {
+      await invoke('set_community_relay_opt_in', {
+        communityIdHex: communityId,
+        optedIn: next,
+      });
+      relayError = null;
+    } catch (err) {
+      // Roll back both the model and the DOM checkbox on failure.
+      relayOptedIn = !next;
+      target.checked = !next;
+      relayError = err instanceof Error ? err.message : String(err);
+    } finally {
+      relayPending = false;
+    }
+  }
+
   let search = $state('');
   let filteredMembers = $derived(
     search.trim() === ''
@@ -324,6 +387,33 @@
         When enabled, peers viewing your profile will see that you've
         joined <strong>{communityName}</strong>. Off by default.
       </p>
+    </div>
+
+    <!-- ZEB-582: per-community relay opt-in. Invite-only communities default
+         this on at creation so remote members actually receive channels. -->
+    <div class="section">
+      <div class="section-label">Message relay</div>
+      <label class="toggle-row">
+        <input
+          type="checkbox"
+          checked={relayOptedIn}
+          disabled={relayLoading || relayPending}
+          onchange={handleRelayToggle}
+        />
+        <span class="toggle-label">
+          Relay this community for offline members
+        </span>
+      </label>
+      <p class="toggle-help">
+        When on, your devices help store &amp; forward this community's messages
+        so members who are offline or behind strict networks still receive them.
+        The relay only ever sees encrypted data.{#if communityKind === 'invite-only'}
+          Especially important if you invite members from other networks —
+          without a relay, they may join but never receive channels.{/if}
+      </p>
+      {#if relayError}
+        <p class="fork-error">{relayError}</p>
+      {/if}
     </div>
 
     <div class="section">

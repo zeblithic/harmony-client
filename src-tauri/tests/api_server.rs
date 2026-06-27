@@ -296,6 +296,70 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
         "community id is 16 bytes as 32 hex chars; got: {community_id}"
     );
 
+    // ── Phase 6f-relay (ZEB-582): invite-only auto-enables relay opt-in ──
+    // The mint restart above re-ran the owner-loaded boot block, which installs
+    // the relay-optin fleet-sync engine — so `get_community_relay_status` is a
+    // real bool here (not a 500 "not running"). The OPEN community just created
+    // must NOT auto-enable relay opt-in (open-join delivers channel config
+    // inline; no relay dependency).
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "get_community_relay_status",
+        serde_json::json!({ "communityIdHex": community_id }),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        200,
+        "get_community_relay_status must be 200 for an existing community"
+    );
+    assert!(
+        !r.json::<bool>().await.expect("relay status body is JSON"),
+        "ZEB-582: an OPEN community must NOT auto-enable relay opt-in"
+    );
+
+    // A freshly-created INVITE-ONLY community MUST auto-enable relay opt-in at
+    // creation, so a remote/CGNAT joiner gets a relay-backed state-root pull
+    // path instead of silently never receiving channels. The set is applied
+    // synchronously inside create_community before it returns, so the status
+    // read needs no poll.
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "create_community",
+        serde_json::json!({ "name": "api-e2e-invite", "isInviteOnly": true }),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        200,
+        "create_community (invite-only) must succeed"
+    );
+    let invite_community_id: String = r
+        .json()
+        .await
+        .expect("create_community (invite-only) returns a JSON string");
+    let r = rpc(
+        &http,
+        &base,
+        &bearer,
+        "get_community_relay_status",
+        serde_json::json!({ "communityIdHex": invite_community_id }),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        200,
+        "get_community_relay_status must be 200 after an invite-only create"
+    );
+    assert!(
+        r.json::<bool>().await.expect("relay status body is JSON"),
+        "ZEB-582: an invite-only community must auto-enable relay opt-in at creation"
+    );
+
     // ── Phase 6f-mod: the nine ZEB-512/520/527 verbs are REACHABLE ──────
     // Tasks 1–4 exposed these on the headless RPC surface; each previously
     // returned 404 `unknown command`. The non-negotiable proof for all nine
