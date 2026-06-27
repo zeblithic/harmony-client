@@ -542,6 +542,34 @@ pub struct SelfHandshakeReachability {
     pub pq_kem_pubkey: Vec<u8>,
 }
 
+/// ZEB-521: a cheap, synchronous read of this node's CURRENT iroh home-relay URL
+/// (unresolved/empty → `None`). Wired from the iroh endpoint in production so the
+/// friend acceptor can refresh its boot-snapshotted [`SelfHandshakeReachability`]
+/// at accept-sign time; `None` in tests (the snapshot is advertised as-is).
+pub type HomeRelayRefresh = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// ZEB-521: the `home_relay_url` to advertise in a signed accept — prefer the
+/// freshly-read endpoint relay, fall back to the boot snapshot.
+///
+/// iroh's `Endpoint::home_relay()` returns `None` until its relay round-trip
+/// resolves — which frequently happens *after* `start_node` captured the
+/// snapshot (the `lib.rs` accept-path `SelfHandshakeReachability`). Because the
+/// friend acceptor holds that snapshot for the whole process lifetime, a node
+/// could otherwise advertise `home_relay_url = None` to *every* friend forever,
+/// leaving each peer's `DeviceTunnelContact` relay-less and the DM tunnel
+/// dependent solely on n0 discovery (the ZEB-504 capture). The pkarr/reachability
+/// publish paths already re-read `home_relay()` fresh on every tick; this brings
+/// the friend handshake to parity. Prefer the freshly-read value; fall back to
+/// the snapshot if the relay still hasn't resolved (never clobber a good snapshot
+/// with a transient `None`, never invent one when neither side has it).
+///
+/// Operates on the relay value directly (not the whole bundle) so the accept
+/// path never deep-clones the ~KB-scale `SelfHandshakeReachability` PQ keys just
+/// to override one `Option<String>`.
+fn effective_home_relay(fresh: Option<String>, snapshot: Option<&str>) -> Option<String> {
+    fresh.or_else(|| snapshot.map(str::to_owned))
+}
+
 /// Canonical preimage bytes the requester's device-#2 key signs for a
 /// [`FriendLinkRequest`]. A small CBOR-encoded tuple `("hfr1", from_addr,
 /// token_sig, eph, devices_digest)` — the `"hfr1"` domain tag makes a
@@ -977,6 +1005,11 @@ pub fn process_friend_request(
     keytree: &crate::owner_state_crypto::KeyTree,
     now_secs: u64,
     self_reachability: Option<&SelfHandshakeReachability>,
+    // ZEB-521: the live endpoint's CURRENT home relay (cheap `Option<String>`),
+    // which overrides `self_reachability`'s boot-snapshotted `home_relay_url` when
+    // resolved. Threaded in (rather than refreshing a cloned bundle at the call
+    // site) so the accept path borrows the snapshot and never deep-clones it.
+    fresh_home_relay: Option<String>,
 ) -> Result<FriendLinkAccepted, FriendHandshakeError> {
     // 1. Authenticate the requester's cert → enrolled device-#2 key.
     let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)?;
@@ -1116,7 +1149,9 @@ pub fn process_friend_request(
     let (iroh_node_id, home_relay_url, pq_dsa_pubkey, pq_kem_pubkey) = match self_reachability {
         Some(r) => (
             r.iroh_node_id,
-            r.home_relay_url.clone(),
+            // ZEB-521: live relay wins over the boot snapshot (see
+            // `effective_home_relay`). No bundle → no relay regardless of `fresh`.
+            effective_home_relay(fresh_home_relay, r.home_relay_url.as_deref()),
             r.pq_dsa_pubkey.clone(),
             r.pq_kem_pubkey.clone(),
         ),
@@ -1205,6 +1240,12 @@ where
     /// advertise in the accept it signs. `None` (the default; tests) ships the
     /// empty bundle. Production wires the real values via `with_self_reachability`.
     self_reachability: Option<SelfHandshakeReachability>,
+    /// ZEB-521: optional live read of this node's CURRENT iroh home-relay URL,
+    /// used to refresh `self_reachability.home_relay_url` at accept-sign time so
+    /// the advertised relay isn't permanently `None` when iroh's relay round-trip
+    /// resolved after `start_node` snapshotted it. `None` in tests / when iroh
+    /// didn't bind — the snapshot is advertised as-is.
+    self_home_relay_refresh: Option<HomeRelayRefresh>,
     config: FriendAcceptorConfig,
 }
 
@@ -1272,6 +1313,9 @@ where
             auto_accept_known: true,
             // ZEB-461: default to the empty self bundle; production fills it.
             self_reachability: None,
+            // ZEB-521: default to no live refresh; production wires it from the
+            // iroh endpoint so the advertised home relay is read fresh per accept.
+            self_home_relay_refresh: None,
             config,
         }
     }
@@ -1327,6 +1371,24 @@ where
     pub fn with_self_reachability(mut self, r: Option<SelfHandshakeReachability>) -> Self {
         self.self_reachability = r;
         self
+    }
+
+    /// ZEB-521: wire a live read of this node's current iroh home-relay URL so the
+    /// accept-time reachability bundle refreshes its `home_relay_url` instead of
+    /// advertising the (possibly-`None`) boot snapshot. Fluent setter (default
+    /// `None`, used by tests) so existing call sites keep compiling.
+    pub fn with_self_home_relay_refresh(mut self, refresh: Option<HomeRelayRefresh>) -> Self {
+        self.self_home_relay_refresh = refresh;
+        self
+    }
+
+    /// ZEB-521: the live endpoint's CURRENT home relay (or `None` when no refresh
+    /// closure is wired — tests/iroh-unbound — or the relay still hasn't resolved).
+    /// Passed alongside the boot snapshot into [`process_friend_request`], which
+    /// applies the [`effective_home_relay`] precedence at accept-sign time. Cheap:
+    /// a single closure call returning an `Option<String>`, no bundle clone.
+    fn current_fresh_home_relay(&self) -> Option<String> {
+        self.self_home_relay_refresh.as_ref().and_then(|f| f())
     }
 
     /// Reconcile the published Case-D friend slots with the current friend graph
@@ -1552,6 +1614,10 @@ where
                 })?;
                 self.token_gate_open(&token_sig).await?;
                 let learned_at = self.next_hlc().await;
+                // ZEB-521: pass the live endpoint's current home relay (overriding
+                // the boot snapshot) so the signed accept advertises a resolvable
+                // relay — the snapshot is often None just after start_node.
+                let fresh_home_relay = self.current_fresh_home_relay();
                 let accepted = {
                     let mut state = self.crdt_state.lock().await;
                     process_friend_request(
@@ -1565,6 +1631,7 @@ where
                         &self.keytree,
                         now_secs,
                         self.self_reachability.as_ref(),
+                        fresh_home_relay,
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1582,6 +1649,10 @@ where
                 // `process_friend_request` resolves `established_via` to MutualKey
                 // because `req.token_sig` is None on this path.
                 let learned_at = self.next_hlc().await;
+                // ZEB-521: pass the live endpoint's current home relay (overriding
+                // the boot snapshot) so the signed accept advertises a resolvable
+                // relay — the snapshot is often None just after start_node.
+                let fresh_home_relay = self.current_fresh_home_relay();
                 let accepted = {
                     let mut state = self.crdt_state.lock().await;
                     process_friend_request(
@@ -1595,6 +1666,7 @@ where
                         &self.keytree,
                         now_secs,
                         self.self_reachability.as_ref(),
+                        fresh_home_relay,
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -2411,6 +2483,7 @@ mod tests {
             &kt,
             0,
             Some(&reach),
+            None,
         )
         .expect("processed");
         // The accept must actually carry the signed reachability (not empty).
@@ -2492,6 +2565,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
             None,
         )
         .expect("valid request processed");
@@ -2584,6 +2658,7 @@ mod tests {
             &kt,
             0,
             None,
+            None,
         )
         .expect("processed");
 
@@ -2624,6 +2699,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
             None,
         )
         .expect_err("bad sig rejected");
@@ -2681,6 +2757,7 @@ mod tests {
             &kt,
             0,
             None,
+            None,
         )
         .expect_err("owner-mismatched cert rejected");
         assert!(matches!(err, FriendHandshakeError::EnrollmentOwnerMismatch));
@@ -2717,6 +2794,120 @@ mod tests {
             None,
             publisher,
         )
+    }
+
+    // ── ZEB-521: accept-time home-relay refresh ──────────────────────────
+
+    fn sample_reach(home: Option<&str>) -> SelfHandshakeReachability {
+        SelfHandshakeReachability {
+            identity_pub_64: [0x21; 64],
+            iroh_node_id: [0x22; 32],
+            home_relay_url: home.map(|s| s.to_string()),
+            pq_dsa_pubkey: vec![0xaa; 4],
+            pq_kem_pubkey: vec![0xbb; 4],
+        }
+    }
+
+    /// ZEB-521: a freshly-resolved relay wins — it fills a stale `None` snapshot
+    /// and overrides a stale `Some`.
+    #[test]
+    fn effective_home_relay_prefers_fresh_over_snapshot() {
+        assert_eq!(
+            effective_home_relay(Some("https://relay.fresh/".into()), None).as_deref(),
+            Some("https://relay.fresh/"),
+        );
+        assert_eq!(
+            effective_home_relay(Some("https://new/".into()), Some("https://old/")).as_deref(),
+            Some("https://new/"),
+        );
+    }
+
+    /// ZEB-521: a `None` fresh read (relay still unresolved) must NOT clobber a
+    /// good snapshot, and must not invent a relay when neither side has one.
+    #[test]
+    fn effective_home_relay_falls_back_to_snapshot_when_fresh_unresolved() {
+        assert_eq!(
+            effective_home_relay(None, Some("https://snap/")).as_deref(),
+            Some("https://snap/"),
+        );
+        assert!(effective_home_relay(None, None).is_none());
+    }
+
+    /// ZEB-521: the acceptor's fresh-relay seam reads the live closure (or `None`
+    /// when no closure is wired — the test/iroh-unbound default). This cheap
+    /// `Option<String>` is what gets threaded into `process_friend_request`.
+    #[test]
+    fn acceptor_current_fresh_home_relay_reads_live_closure() {
+        let wired =
+            acceptor_with_publisher(None).with_self_home_relay_refresh(Some(Arc::new(|| {
+                Some("https://relay.live/".to_string())
+            })));
+        assert_eq!(
+            wired.current_fresh_home_relay().as_deref(),
+            Some("https://relay.live/"),
+        );
+        let bare = acceptor_with_publisher(None);
+        assert!(bare.current_fresh_home_relay().is_none());
+    }
+
+    /// ZEB-521 (the regression guard): a boot snapshot that captured
+    /// `home_relay_url = None` (relay not yet resolved at `start_node`) must yield
+    /// a signed accept advertising the relay the live endpoint now resolves — NOT
+    /// the frozen `None`. This is the exact condition that left peers with
+    /// relay-less `DeviceTunnelContact`s in the ZEB-504 capture.
+    #[test]
+    fn process_friend_request_advertises_fresh_relay_over_stale_snapshot() {
+        let me = mint_test_owner(0x78);
+        let req = signed_request_no_token(0x79);
+        let kt = crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        let accepted = process_friend_request(
+            &mut state,
+            test_hlc(1),
+            &req,
+            me.owner,
+            None,
+            &me.cert,
+            &me.device_key,
+            &kt,
+            0,
+            Some(&sample_reach(None)),
+            Some("https://relay.live/".to_string()),
+        )
+        .expect("processed");
+        assert_eq!(
+            accepted.home_relay_url.as_deref(),
+            Some("https://relay.live/"),
+            "the signed accept must carry the live relay, not the frozen None",
+        );
+    }
+
+    /// ZEB-521: with no fresh relay (the test/iroh-unbound default), the signed
+    /// accept advertises the boot snapshot verbatim — no behavior change.
+    #[test]
+    fn process_friend_request_falls_back_to_snapshot_relay_without_fresh() {
+        let me = mint_test_owner(0x7a);
+        let req = signed_request_no_token(0x7b);
+        let kt = crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        let accepted = process_friend_request(
+            &mut state,
+            test_hlc(1),
+            &req,
+            me.owner,
+            None,
+            &me.cert,
+            &me.device_key,
+            &kt,
+            0,
+            Some(&sample_reach(Some("https://relay.snap/"))),
+            None,
+        )
+        .expect("processed");
+        assert_eq!(
+            accepted.home_relay_url.as_deref(),
+            Some("https://relay.snap/"),
+        );
     }
 
     /// A real `PkarrInvitePublisher` backed by a mock relay (no records actually
@@ -3085,6 +3276,7 @@ mod tests {
             &kt,
             0,
             None,
+            None,
         )
         .expect("processed");
         let entry = state
@@ -3120,6 +3312,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
             None,
         )
         .expect("processed");
@@ -3167,6 +3360,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
             None,
         )
         .expect("no-token request processed");
