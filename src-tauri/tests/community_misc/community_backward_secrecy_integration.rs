@@ -1454,26 +1454,61 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
     )
     .await;
 
-    // The observer must have synthesized an EpochCatchup naming Dave. Pre-fix it
-    // skipped him because his only membership event is a PendingJoin, not a Join.
-    let events: Vec<_> = {
+    // The observer must synthesize an EpochCatchup for Dave AND it must seal the
+    // correct post-rotation key K(1) — not merely name him. A wrong trigger /
+    // epoch could name Dave while sealing the wrong key; applying the catchup to
+    // Dave's space guards trigger-selection correctness, mirroring the Join-path
+    // sibling test. Pre-fix the synthesizer skipped Dave entirely (his only
+    // membership event is a PendingJoin, not a Join).
+    let catchup_event = {
         let state = engine.state();
         let g = state.lock().await;
-        g.events.values().cloned().collect()
-    };
-    let has_dave_catchup = events.iter().any(|e| {
-        matches!(
-            &e.kind,
-            MembershipEventKind::EpochCatchup {
-                recipient_ciphertexts,
-                ..
-            } if recipient_ciphertexts.iter().any(|rc| rc.recipient == dave_addr)
-        )
-    });
-    assert!(
-        has_dave_catchup,
-        "observer must synthesize an EpochCatchup for the invite-only (countersigned PendingJoin) joiner"
+        g.events
+            .values()
+            .find(|e| {
+                matches!(
+                    &e.kind,
+                    MembershipEventKind::EpochCatchup { recipient_ciphertexts, .. }
+                        if recipient_ciphertexts.iter().any(|rc| rc.recipient == dave_addr)
+                )
+            })
+            .cloned()
+    }
+    .expect(
+        "observer must synthesize an EpochCatchup for the invite-only (countersigned PendingJoin) joiner",
     );
+
+    let mut dave_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    assert!(
+        apply_catchup_to_space(
+            &mut dave_space,
+            &catchup_event,
+            dave_addr,
+            &dave_signing_key
+        ),
+        "Dave must be able to apply the observer's catchup"
+    );
+    assert_eq!(
+        dave_space.current_epoch,
+        Some(1),
+        "catchup must advance Dave to epoch 1"
+    );
+    assert!(
+        dave_space
+            .current_epoch_key
+            .as_ref()
+            .map(|k| k.as_bytes() == k1.as_bytes())
+            .unwrap_or(false),
+        "catchup must seal the post-rotation key K(1) to Dave (correct trigger + epoch)"
+    );
+    {
+        let set = synth_catchups.lock().unwrap();
+        assert!(
+            set.iter()
+                .any(|(sid, addr, _, _)| *sid == community_id && *addr == dave_addr),
+            "synth_catchups must record the synthesized catchup for Dave"
+        );
+    }
 
     registry.shutdown_all().await.expect("shutdown");
 }

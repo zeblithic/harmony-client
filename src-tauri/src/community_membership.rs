@@ -3769,7 +3769,12 @@ pub fn select_catchup_trigger_event(
                     _ => false,
                 }
         })
-        .max_by_key(|e| (e.at.wall_ms, e.at.logical))
+        // "Most recent" by the repo's canonical TOTAL order (`event_sort_key`:
+        // HLC + device_id + id + sig), not a partial `(wall_ms, logical)` key —
+        // an HLC tie (same owner across two devices) must resolve deterministically
+        // so every replica's synthesizer picks the same `triggered_by` and derives
+        // the same catchup dedupe key. Matches the apply-side candidate sort.
+        .max_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)))
         .map(|e| e.id)
 }
 
