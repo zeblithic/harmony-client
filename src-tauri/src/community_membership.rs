@@ -3633,6 +3633,102 @@ pub fn bootstrap_admit_open_publisher(
         .cloned()
 }
 
+/// ZEB-526: invite-only sibling of [`bootstrap_admit_open_publisher`]. Authorizes
+/// a deferred INVITE-ONLY publisher whose membership is unknown locally, so the
+/// receiver can derive the publisher's enrolled keys (for the root publisher_sig
+/// check) and let the authoritative merge insert the publisher's self-authorizing
+/// PendingJoin — firing the admin's auto-counter-sign so the join converges over
+/// the zenoh-publish fallback when the iroh first-contact dial didn't deliver.
+///
+/// Two differences from the open helper:
+///   * **Admits a `PendingJoin` publisher, not just `Joined`.** An invite-only
+///     redemption mints a `PendingJoin` (admin counter-sign pending); the
+///     publisher is legitimately not-yet-`Joined` when it first publishes. The
+///     merge admits ONLY the PendingJoin (their non-membership events fail the
+///     per-event `verify_event`); their root stays gated until counter-signed.
+///   * **Includes the admin's own bootstrap events in the authorization window.**
+///     The publisher's PendingJoin carries an admin-signed `InviteToken`;
+///     `verify_event` must resolve the ADMIN's enrolled key, which materializes
+///     from the admin's own bootstrap `Join`. That admin `Join` rides in the
+///     joiner's published blob (the joiner inserts it at redeem time), so we seed
+///     candidates with both `admin_addr`- and `publisher_addr`-authored events.
+///
+/// Bounded strictly-before `publisher_at` (same pre-root window as the known-
+/// publisher path) and each event verified against the membership accumulated so
+/// far — so the admin `Join` (creator = root of trust) verifies first and seeds
+/// the admin key, then the publisher's PendingJoin verifies its `InviteToken`
+/// against it. The authoritative merge re-validates and inserts everything; this
+/// is the cheap pre-flight that supplies keys + confirms a real self-authorizing
+/// join exists (anti-spam for an epoch-key holder who carries no valid join).
+pub fn bootstrap_admit_invite_only_publisher(
+    incoming_events: &[SignedMembershipEvent],
+    publisher_addr: OwnerAddr,
+    admin_addr: OwnerAddr,
+    expected_community_id: SpaceId,
+    publisher_at: &Hlc,
+) -> Option<MemberState> {
+    let ctx = VerifyContext {
+        expected_community_id,
+        admin_addr,
+        is_invite_only: true,
+    };
+    let before_root = |e: &SignedMembershipEvent| {
+        (e.at.wall_ms, e.at.logical, &e.at.device_id)
+            < (
+                publisher_at.wall_ms,
+                publisher_at.logical,
+                &publisher_at.device_id,
+            )
+    };
+    // Seed with BOTH the admin's and the publisher's own membership-bearing
+    // events (the admin's so the InviteToken signer key resolves). The merge's
+    // per-event `verify_event` is the authoritative gate; this only needs to
+    // reconstruct enough prior to verify + materialize the publisher's join.
+    let mut candidates: Vec<&SignedMembershipEvent> = incoming_events
+        .iter()
+        .filter(|e| (e.actor == admin_addr || e.actor == publisher_addr) && before_root(e))
+        .filter(|e| {
+            matches!(
+                e.kind,
+                MembershipEventKind::Join
+                    | MembershipEventKind::PendingJoin { .. }
+                    | MembershipEventKind::JoinCountersign { .. }
+                    | MembershipEventKind::DeviceAnnounce
+                    | MembershipEventKind::Leave
+            )
+        })
+        .collect();
+    candidates.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
+
+    let mut verified: Vec<SignedMembershipEvent> = Vec::new();
+    for event in candidates {
+        let prior = materialize_with_now(&verified, admin_addr, Some(event.at.wall_ms));
+        if verify_event(event, &prior, &ctx).is_ok() {
+            verified.push(event.clone());
+        }
+    }
+    if verified.is_empty() {
+        return None;
+    }
+
+    // Admit ONLY a publisher who materializes to PendingJoin — the invite-only
+    // pre-counter-sign state, which is exactly ZEB-526's case: a joiner whose
+    // self-authorizing PendingJoin (admin-signed InviteToken) the admin has not
+    // yet seen. We deliberately do NOT admit a `Joined` publisher here: an
+    // unknown publisher self-presenting as Joined (e.g. the admin's own bootstrap
+    // Join, or a countersigned member's republished root) is not part of the
+    // joiner-admission flow and must reach the receiver through normal
+    // propagation, preserving the invite-only cold-cache reject→propagate→admit
+    // contract. Widening to `Joined` would let any self-authorizing root
+    // self-admit on first contact, enlarging the invite-only trust surface for no
+    // ZEB-526 benefit. Left/Banned → not admitted.
+    let mat = materialize_with_now(&verified, admin_addr, Some(publisher_at.wall_ms));
+    mat.members
+        .get(&publisher_addr)
+        .filter(|s| matches!(s.status, MemberStatus::PendingJoin))
+        .cloned()
+}
+
 /// ZEB-285: verify a single signed event against a frozen pre-fork
 /// snapshot's `identity_pubs` map. Used by the fork's UI when loading
 /// pre-fork history for display — fork members are not necessarily
@@ -7142,6 +7238,164 @@ mod zeb_254_pending_join_verify_tests {
             matches!(result, Err(VerifyError::EnrollmentOwnerMismatch)),
             "cert minted for a different owner must yield EnrollmentOwnerMismatch; got {:?}",
             result
+        );
+    }
+
+    // ── ZEB-526: bootstrap_admit_invite_only_publisher ───────────────────────
+
+    /// Helper: the admin's community-creation bootstrap Join (root of trust),
+    /// at an early HLC, carrying the admin's enrollment cert.
+    fn admin_bootstrap_join(admin: &TestOwner, community_id: SpaceId) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin.owner,
+            at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        let ev = sign_event(&payload, &admin.device_key).expect("sign admin bootstrap join");
+        SignedMembershipEvent {
+            enrollment: Some(admin.cert.clone()),
+            ..ev
+        }
+    }
+
+    /// A valid self-authorizing PendingJoin (admin-signed InviteToken + joiner
+    /// cert), with the admin's own bootstrap Join present in the blob to seed the
+    /// InviteToken-signer key, admits the joiner as PendingJoin with their
+    /// enrolled device key (needed for the deferred root publisher_sig check).
+    #[test]
+    fn bootstrap_admit_invite_only_publisher_admits_pending_join_with_admin_bootstrap() {
+        let admin = mint_test_owner(0xc1);
+        let joiner = mint_test_owner(0xc2);
+        let community_id = SpaceId([0xcc; 16]);
+
+        let admin_join = admin_bootstrap_join(&admin, community_id);
+        let token = make_invite_token(&admin, admin.owner, None, None);
+        let pending = make_pending_join_event(&joiner, joiner.owner, community_id, token);
+
+        // Root publish strictly after the PendingJoin (wall 1_700_000_001_000).
+        let root_at = Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "root".into(),
+        };
+        let events = vec![admin_join, pending];
+        let ms = bootstrap_admit_invite_only_publisher(
+            &events,
+            joiner.owner,
+            admin.owner,
+            community_id,
+            &root_at,
+        )
+        .expect("a valid admin-signed PendingJoin must admit the joiner as PendingJoin");
+        assert!(
+            matches!(ms.status, MemberStatus::PendingJoin),
+            "invite-only joiner is admitted as PendingJoin (pre-counter-sign)"
+        );
+        assert!(
+            ms.enrolled_device_keys
+                .contains(&joiner.cert.device_pubkeys.classical.ed25519_verify),
+            "joiner's device key (from the PendingJoin cert) must be seeded for publisher_sig"
+        );
+    }
+
+    /// No self-authorizing PendingJoin for the publisher in the blob → None
+    /// (the publish is unauthorized; there is nothing to salvage).
+    #[test]
+    fn bootstrap_admit_invite_only_publisher_rejects_without_pending_join() {
+        let admin = mint_test_owner(0xc3);
+        let joiner = mint_test_owner(0xc4);
+        let community_id = SpaceId([0xcd; 16]);
+
+        // Blob carries only the admin bootstrap — no PendingJoin for the joiner.
+        let events = vec![admin_bootstrap_join(&admin, community_id)];
+        let root_at = Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "root".into(),
+        };
+        let got = bootstrap_admit_invite_only_publisher(
+            &events,
+            joiner.owner,
+            admin.owner,
+            community_id,
+            &root_at,
+        );
+        assert!(
+            got.is_none(),
+            "no PendingJoin for the publisher → not admitted"
+        );
+    }
+
+    /// A PendingJoin whose InviteToken is signed by a NON-admin (forged) must
+    /// fail verify_event → None. Guards the security boundary: only an
+    /// admin-authorized invite can bootstrap a publisher onto the gate.
+    #[test]
+    fn bootstrap_admit_invite_only_publisher_rejects_forged_invite_token() {
+        let admin = mint_test_owner(0xc5);
+        let attacker = mint_test_owner(0xc6); // NOT the admin
+        let joiner = mint_test_owner(0xc7);
+        let community_id = SpaceId([0xce; 16]);
+
+        // Token claims `inviter = admin` but is SIGNED by the attacker's key.
+        let forged = make_invite_token(&attacker, admin.owner, None, None);
+        let pending = make_pending_join_event(&joiner, joiner.owner, community_id, forged);
+
+        let events = vec![admin_bootstrap_join(&admin, community_id), pending];
+        let root_at = Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "root".into(),
+        };
+        let got = bootstrap_admit_invite_only_publisher(
+            &events,
+            joiner.owner,
+            admin.owner,
+            community_id,
+            &root_at,
+        );
+        assert!(
+            got.is_none(),
+            "a forged (non-admin-signed) InviteToken must not admit the joiner"
+        );
+    }
+
+    /// A publisher whose only self-evidence is a bare `Join` (materializes to
+    /// `Joined`) — e.g. the admin's own founder bootstrap Join — must NOT
+    /// self-admit on first contact. Only an uncountersigned `PendingJoin`
+    /// (ZEB-526's joiner case) bootstraps onto the gate; a `Joined` root reaches
+    /// the receiver through normal propagation. This preserves the invite-only
+    /// cold-cache reject→propagate→admit contract that the open-community
+    /// relaxation (ZEB-558) deliberately left unchanged for invite-only.
+    #[test]
+    fn bootstrap_admit_invite_only_publisher_rejects_bare_join_publisher() {
+        let admin = mint_test_owner(0xc8);
+        let community_id = SpaceId([0xcf; 16]);
+
+        // The publisher IS the admin; the blob carries only the admin's founder
+        // Join (a valid, self-authorizing root-of-trust Join → materializes to
+        // Joined). Even so, the invite-only bootstrap must not admit it.
+        let events = vec![admin_bootstrap_join(&admin, community_id)];
+        let root_at = Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "root".into(),
+        };
+        let got = bootstrap_admit_invite_only_publisher(
+            &events,
+            admin.owner,
+            admin.owner,
+            community_id,
+            &root_at,
+        );
+        assert!(
+            got.is_none(),
+            "a bare Joined publisher (admin founder Join) must not self-admit invite-only"
         );
     }
 }

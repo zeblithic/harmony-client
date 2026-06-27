@@ -2255,6 +2255,82 @@ async fn s9_three_member_channel_convergence() {
     drop((a, b, c, ah, bh, ch));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// S10 (PROBE, characterize — ZEB-526): plain `redeem_invite` 3rd-member join.
+//
+// CO-LOCATED LIMITATION (do not promote to a hard assert): the plain
+// `redeem_invite` verb skips the iroh first-contact handshake that establishes
+// the a<->c zenoh peering (s1/s6/s9 use `connectivity_redeem_invite_iroh`, which
+// peers the nodes). Without that handshake the two nodes' zenoh sessions never
+// connect co-located, so c's state-root publish never reaches the founder — the
+// join cannot converge here regardless of the server-side fixes. This is a
+// transport/peering property of the plain path, not a defect in the convergence
+// fixes.
+//
+// The ZEB-526 fixes ARE validated elsewhere:
+//   * Founder-side invite-only self-Join admission — `bootstrap_admit_invite_only_publisher`
+//     unit tests + the `invite_only_self_join_admission` integration test that drives
+//     `handle_incoming_publish` with a joiner's published blob (peering-free).
+//   * Joiner-side redeem publish re-arm — the redeem-path `notify_dirty` after the
+//     epoch-Space commit (verified: c re-publishes a complete root post-commit).
+// The end-to-end fallback convergence (zenoh publish path when the iroh dial does
+// not deliver) is a CROSS-WAN proof (AVALON), as ZEB-526's original repro was.
+//
+// Characterizes: prints `S10:` on convergence or `S10 FINDING:` otherwise, then
+// mark_success — the co-located run reports without failing on the peering gap.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s10_plain_redeem_third_member_probe() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let (mut run, ah, ch, a, c) = two_minted_nodes("s10").await;
+    let a_owner = owner_id(&a).await;
+    let c_owner = owner_id(&c).await;
+
+    let community = create_community(&a, "s10-community", true)
+        .await
+        .expect("create invite-only community");
+    let invite = generate_invite(&a, &community)
+        .await
+        .expect("generate invite");
+
+    // THE PROBE: plain redeem (zenoh-publish path only, no iroh handshake).
+    let redeem = redeem_invite(&c, &invite).await;
+    eprintln!("S10 plain redeem_invite result: {redeem:?}");
+
+    // Bounded characterization window (NOT a generous assert window): co-located,
+    // the plain-redeem path CANNOT peer (see header), so non-convergence is the
+    // structural outcome and `poll_until` here always runs to the deadline —
+    // every second is paid on every run. 30s comfortably exceeds the peered
+    // convergence latency the asserting scenarios observe (s1/s9 converge in
+    // seconds), so it still reports a genuine convergence if behavior ever
+    // changes, without burning 2 minutes characterizing a known gap. Do not
+    // re-expand this to match the asserting scenarios' 120s — that ceiling is
+    // free for them (they return early on success) and pure waste here.
+    let converged = poll_until(Duration::from_secs(30), || async {
+        let a_sees_c = roster_has_joined(&a, &community, &c_owner).await?;
+        let c_sees_a = roster_has_joined(&c, &community, &a_owner).await?;
+        Ok((a_sees_c && c_sees_a).then_some(()))
+    })
+    .await;
+
+    if converged.is_ok() {
+        eprintln!("S10: plain-redeem 3rd member converged bidirectionally (a sees c, c sees a).");
+    } else {
+        eprintln!(
+            "S10 FINDING: plain-redeem 3rd member did not converge co-located within 30s. \
+             Expected: this path is not peered co-located — the plain `redeem_invite` verb skips \
+             the iroh first-contact handshake that establishes the a<->c zenoh link, so c's \
+             state-root publish never reaches the founder. The convergence fixes (founder-side \
+             invite-only self-Join admission + joiner-side redeem publish re-arm) are validated \
+             by unit + integration tests; the end-to-end fallback is a cross-WAN (AVALON) proof."
+        );
+    }
+    run.mark_success();
+    drop((a, c, ah, ch));
+}
+
 /// Headless two-node Vines round-trip over REAL transport: A publishes → it
 /// lands in B's feed → B marks it viewed (idempotent) → B reshares → the
 /// reshare, carrying origin attribution, lands back in A's feed. Both nodes are
