@@ -35331,24 +35331,20 @@ pub async fn self_heal_community_observer(
             let state_g = state_g.lock().await;
             state_g.events.values().cloned().collect()
         };
-        // Most recent Join by this actor (in case of rejoin).
-        let triggered_by_id = events
-            .iter()
-            .filter(|e| {
-                e.actor == target
-                    && matches!(
-                        e.kind,
-                        crate::community_membership::MembershipEventKind::Join
-                    )
-            })
-            .max_by_key(|e| (e.at.wall_ms, e.at.logical))
-            .map(|e| e.id);
+        // ZEB-578: accept a `Join` OR a countersigned `PendingJoin` as the
+        // catchup trigger (most recent wins, for rejoin). An invite-only joiner
+        // only ever authors a `PendingJoin` — never a `Join` — so without this an
+        // invite-only member admitted into a rotated epoch is enqueued in
+        // `pending_catchup_for` but never sent a catchup. Selection is shared
+        // with the EpochCatchup apply side via `select_catchup_trigger_event`.
+        let triggered_by_id =
+            crate::community_membership::select_catchup_trigger_event(&events, target);
 
         let Some(triggered_by) = triggered_by_id else {
             tracing::warn!(
                 ?community_id,
                 ?target,
-                "self_heal: pending_catchup_for but no Join event found — skipping"
+                "self_heal: pending_catchup_for but no Join/countersigned-PendingJoin event found — skipping"
             );
             continue;
         };

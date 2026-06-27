@@ -1117,6 +1117,402 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
     registry.shutdown_all().await.expect("shutdown");
 }
 
+/// ZEB-578: an INVITE-ONLY member admitted into a community whose epoch has
+/// already rotated joins via a *countersigned* `PendingJoin` — never a `Join`.
+/// The self-heal observer must still synthesize an `EpochCatchup` for them, or
+/// they stay in `pending_catchup_for` forever and never receive the live key.
+///
+/// Drives the ACTUAL `self_heal_community_observer` against an invite-only engine
+/// where Dave's membership is a `PendingJoin` + admin `JoinCountersign`. Pre-fix
+/// the synthesizer matched only `Join` and skipped Dave ("no Join event found");
+/// post-fix it accepts the countersigned PendingJoin as the catchup trigger.
+#[tokio::test]
+async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
+    use ed25519_dalek::Signer;
+    use harmony_app::community_invite::{canonical_invite_token_bytes, InviteToken};
+    use harmony_app::community_state_sync::{
+        CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
+    };
+    use harmony_app::content_store::{ContentStore, RuntimeContentStore};
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_app::self_heal_community_observer;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    let community_id = SpaceId([0x57; 16]);
+
+    let pub64_for = |sk: &ed25519_dalek::SigningKey| -> [u8; 64] {
+        let ed = sk.verifying_key().to_bytes();
+        let x = harmony_app::dm_signing::ed25519_pub_to_x25519(&ed).expect("ed→x25519");
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&x);
+        out[32..].copy_from_slice(&ed);
+        out
+    };
+
+    let admin = harmony_app::community_membership::mint_test_owner(0xAA);
+    let admin_addr = admin.owner;
+    let admin_signing_key = Arc::new(admin.device_key.clone());
+    let admin_pub64 = pub64_for(&admin_signing_key);
+
+    let bob = harmony_app::community_membership::mint_test_owner(0xBB);
+    let bob_addr = bob.owner;
+    let bob_signing_key = bob.device_key.clone();
+    let bob_pub64 = pub64_for(&bob_signing_key);
+
+    let dave = harmony_app::community_membership::mint_test_owner(0xDD);
+    let dave_addr = dave.owner;
+    let dave_signing_key = dave.device_key.clone();
+    let dave_pub64 = pub64_for(&dave_signing_key);
+
+    // k0: engine spawn-time key. k1: post-rotation key the catchup must seal.
+    let k0 = EpochKey::new([0x10u8; 32]);
+    let k1 = EpochKey::new([0x20u8; 32]);
+
+    struct StaticResolver(std::collections::HashMap<OwnerAddr, [u8; 64]>);
+    #[async_trait::async_trait]
+    impl IdentityResolver for StaticResolver {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+            self.0.get(addr).copied()
+        }
+    }
+    let mut pub_map = std::collections::HashMap::new();
+    pub_map.insert(admin_addr, admin_pub64);
+    pub_map.insert(bob_addr, bob_pub64);
+    pub_map.insert(dave_addr, dave_pub64);
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver(pub_map));
+
+    // CAS servicer so publish_root_now (notify_dirty after each insert) doesn't
+    // deadlock waiting on a reply.
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<harmony_app::content_store::CasOp>(64);
+    tokio::spawn(async move {
+        use harmony_app::content_store::CasOp;
+        let mut store: std::collections::HashMap<harmony_content::cid::ContentId, Vec<u8>> =
+            std::collections::HashMap::new();
+        while let Some(op) = cas_op_rx.recv().await {
+            match op {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
+                    store.insert(cid, blob);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+                CasOp::GetOrFetch { cid, reply, .. } => {
+                    let _ = reply.send(Ok(store.get(&cid).cloned()));
+                }
+                CasOp::GetLocal { cid, reply } => {
+                    let _ = reply.send(store.get(&cid).cloned());
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
+                }
+            }
+        }
+    });
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "admin-dev".into(),
+        content_store: cs,
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: admin_addr,
+        signing_key: Arc::clone(&admin_signing_key),
+        crdt_state: None,
+        nav_emitter: None,
+    }));
+
+    let (pub_tx, _pub_rx) = mpsc::channel(8);
+    let (_sub_tx, sub_rx) = mpsc::channel(8);
+    registry
+        .spawn_engine_inner_now(
+            community_id,
+            k0.clone(),
+            admin_addr,
+            true, // INVITE-ONLY — the scenario under test
+            pub_tx,
+            sub_rx,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("engine spawn");
+    let engine = registry
+        .engine_arc(&community_id)
+        .await
+        .expect("engine arc");
+
+    // admin Join (root of trust; its cert seeds the enrolled key the InviteToken
+    // sig is verified against).
+    let join_admin = SignedMembershipEvent {
+        enrollment: Some(admin.cert.clone()),
+        ..make_signed_event(
+            0x01,
+            community_id,
+            admin_addr,
+            MembershipEventKind::Join,
+            100,
+            &admin_signing_key,
+        )
+    };
+    engine
+        .insert_local_event_with_pubs(join_admin, admin_pub64, None)
+        .await
+        .expect("insert admin join");
+
+    // An admin-signed InviteToken (invite-only joins carry one). Reused for both
+    // bob and Dave — only the inviter sig matters to verify, not the hint.
+    let mint_admin_token = || {
+        let mut tok = InviteToken {
+            inviter: admin_addr,
+            invitee_hint: None,
+            minted_at: Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "admin-dev".into(),
+            },
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let bytes = canonical_invite_token_bytes(&tok).expect("encode token");
+        tok.sig = admin_signing_key.sign(&bytes).to_bytes();
+        tok
+    };
+
+    // bob joins INVITE-ONLY at epoch 0 (PendingJoin + admin countersign) so the
+    // later kick is a real membership transition that triggers a rotation. A bare
+    // `Join` from a non-admin is rejected in an invite-only community.
+    let pending_bob = SignedMembershipEvent {
+        enrollment: Some(bob.cert.clone()),
+        ..make_signed_event(
+            0x02,
+            community_id,
+            bob_addr,
+            MembershipEventKind::PendingJoin {
+                invite_token: mint_admin_token(),
+            },
+            200,
+            &bob_signing_key,
+        )
+    };
+    engine
+        .insert_local_event_with_pubs(pending_bob.clone(), bob_pub64, None)
+        .await
+        .expect("insert bob pending join");
+    let countersign_bob = make_signed_event(
+        0x03,
+        community_id,
+        admin_addr,
+        MembershipEventKind::JoinCountersign {
+            target_event_id: pending_bob.id,
+        },
+        201,
+        &admin_signing_key,
+    );
+    engine
+        .insert_local_event_with_pubs(countersign_bob, admin_pub64, None)
+        .await
+        .expect("insert bob countersign");
+
+    // admin kicks bob → rotation advances the community to epoch 1.
+    let kick_bob = make_signed_event(
+        0x10,
+        community_id,
+        admin_addr,
+        MembershipEventKind::Kick {
+            target: bob_addr,
+            reason: None,
+        },
+        1000,
+        &admin_signing_key,
+    );
+    engine
+        .insert_local_event_with_pubs(kick_bob.clone(), admin_pub64, None)
+        .await
+        .expect("insert kick");
+
+    let rotation_rcs: Vec<RecipientCiphertext> =
+        seal_epoch_to_members(&k1, &[(&admin_addr, &admin_signing_key)])
+            .into_iter()
+            .map(|(addr, sealed)| RecipientCiphertext {
+                recipient: addr,
+                sealed,
+            })
+            .collect();
+    let rotation_event = make_signed_event(
+        0x11,
+        community_id,
+        admin_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 0,
+            triggered_by: kick_bob.id,
+            recipient_ciphertexts: rotation_rcs,
+        },
+        1001,
+        &admin_signing_key,
+    );
+    engine
+        .insert_local_event_with_pubs(rotation_event, admin_pub64, None)
+        .await
+        .expect("insert rotation");
+
+    // Dave joins INVITE-ONLY *after* the rotation: a PendingJoin carrying an
+    // admin-signed InviteToken, then the admin's JoinCountersign. He materializes
+    // to Joined and (epoch already 1) is enqueued into pending_catchup_for.
+    let pending_dave = SignedMembershipEvent {
+        enrollment: Some(dave.cert.clone()),
+        ..make_signed_event(
+            0x04,
+            community_id,
+            dave_addr,
+            MembershipEventKind::PendingJoin {
+                invite_token: mint_admin_token(),
+            },
+            2000,
+            &dave_signing_key,
+        )
+    };
+    engine
+        .insert_local_event_with_pubs(pending_dave.clone(), dave_pub64, None)
+        .await
+        .expect("insert dave pending join");
+
+    let countersign_dave = make_signed_event(
+        0x05,
+        community_id,
+        admin_addr,
+        MembershipEventKind::JoinCountersign {
+            target_event_id: pending_dave.id,
+        },
+        2001,
+        &admin_signing_key,
+    );
+    engine
+        .insert_local_event_with_pubs(countersign_dave, admin_pub64, None)
+        .await
+        .expect("insert dave countersign");
+
+    // Sanity: Dave is Joined via PendingJoin+countersign AND flagged for catchup
+    // (he joined after the epoch rotated). This is the precondition the
+    // synthesizer must act on.
+    {
+        let state = engine.state();
+        let g = state.lock().await;
+        let mat = g.materialize_now(admin_addr);
+        assert!(
+            matches!(
+                mat.members.get(&dave_addr).map(|s| s.status),
+                Some(harmony_app::community_membership::MemberStatus::Joined)
+            ),
+            "Dave must materialize to Joined via PendingJoin + countersign"
+        );
+        assert!(
+            mat.pending_catchup_for.contains(&dave_addr),
+            "Dave must be enqueued for catchup (joined after the epoch rotation)"
+        );
+    }
+
+    // crdt_state carries K(1) — the key the observer must seal to Dave.
+    let admin_space_k1 = make_space_with_epoch(community_id, admin_addr, 1, k1.clone());
+    let mut owner_state = OwnerState::default();
+    owner_state.apply_space_with_canonicalization(admin_space_k1);
+    let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+    let hlc_tracker: Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>> =
+        Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+    let synth_rotations: Arc<
+        Mutex<
+            BTreeSet<(
+                SpaceId,
+                OwnerAddr,
+                harmony_app::community_membership::EventId,
+            )>,
+        >,
+    > = Arc::new(Mutex::new(BTreeSet::new()));
+    let synth_catchups: SynthCatchupsSet = Arc::new(Mutex::new(BTreeSet::new()));
+
+    self_heal_community_observer(
+        community_id,
+        Arc::clone(&registry),
+        Arc::clone(&admin_signing_key),
+        Arc::clone(&hlc_tracker),
+        "admin-dev".into(),
+        admin_addr,
+        Arc::clone(&crdt_state),
+        Arc::clone(&synth_rotations),
+        Arc::clone(&synth_catchups),
+    )
+    .await;
+
+    // The observer must synthesize an EpochCatchup for Dave AND it must seal the
+    // correct post-rotation key K(1) — not merely name him. A wrong trigger /
+    // epoch could name Dave while sealing the wrong key; applying the catchup to
+    // Dave's space guards trigger-selection correctness, mirroring the Join-path
+    // sibling test. Pre-fix the synthesizer skipped Dave entirely (his only
+    // membership event is a PendingJoin, not a Join).
+    let catchup_event = {
+        let state = engine.state();
+        let g = state.lock().await;
+        g.events
+            .values()
+            .find(|e| {
+                matches!(
+                    &e.kind,
+                    MembershipEventKind::EpochCatchup { recipient_ciphertexts, .. }
+                        if recipient_ciphertexts.iter().any(|rc| rc.recipient == dave_addr)
+                )
+            })
+            .cloned()
+    }
+    .expect(
+        "observer must synthesize an EpochCatchup for the invite-only (countersigned PendingJoin) joiner",
+    );
+
+    let mut dave_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    assert!(
+        apply_catchup_to_space(
+            &mut dave_space,
+            &catchup_event,
+            dave_addr,
+            &dave_signing_key
+        ),
+        "Dave must be able to apply the observer's catchup"
+    );
+    assert_eq!(
+        dave_space.current_epoch,
+        Some(1),
+        "catchup must advance Dave to epoch 1"
+    );
+    assert!(
+        dave_space
+            .current_epoch_key
+            .as_ref()
+            .map(|k| k.as_bytes() == k1.as_bytes())
+            .unwrap_or(false),
+        "catchup must seal the post-rotation key K(1) to Dave (correct trigger + epoch)"
+    );
+    {
+        let set = synth_catchups.lock().unwrap();
+        assert!(
+            set.iter()
+                .any(|(sid, addr, _, _)| *sid == community_id && *addr == dave_addr),
+            "synth_catchups must record the synthesized catchup for Dave"
+        );
+    }
+
+    registry.shutdown_all().await.expect("shutdown");
+}
+
 /// ZEB-249 §4.3: Two admins A1 and A2 simultaneously kick X and Y. After
 /// both rotations, the materialized pending_rotation_for is empty (self-heal
 /// converged). Members who received the correct rotation can decrypt.
