@@ -3139,8 +3139,9 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // For an OPEN community + entirely-unknown publisher we DEFER the reject:
     // the publisher's self-Join lives only inside the (not-yet-fetched) blob,
     // so we validate it post-decode via `bootstrap_admit_open_publisher`.
-    let (publisher_member_state, deferred_open_bootstrap): (
+    let (publisher_member_state, deferred_open_bootstrap, deferred_invite_bootstrap): (
         Option<crate::community_membership::MemberState>,
+        bool,
         bool,
     ) = {
         let state = ctx.state.lock().await;
@@ -3151,25 +3152,36 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         let member_state = materialized.members.get(&payload.publisher_addr).cloned();
         let status_now = member_state.as_ref().map(|s| s.status);
         if matches!(status_now, Some(MemberStatus::Joined)) {
-            (member_state, false)
+            (member_state, false, false)
         } else if !ctx.is_invite_only && member_state.is_none() {
             // OPEN + entirely-unknown publisher → defer. We do NOT run the
             // prior-state publisher-sig check below (no enrolled keys yet);
             // `bootstrap_admit_open_publisher` (post-decode) supplies them.
-            (None, true)
+            (None, true, false)
+        } else if ctx.is_invite_only && member_state.is_none() {
+            // ZEB-526: INVITE-ONLY + entirely-unknown publisher → defer (do NOT
+            // reject pre-decode). The publisher's self-authorizing PendingJoin
+            // (admin-signed InviteToken + EnrollmentCert) lives only inside the
+            // not-yet-fetched blob; `bootstrap_admit_invite_only_publisher`
+            // (post-decode) validates it and supplies the publisher's enrolled
+            // keys for the root publisher-sig check. The authoritative merge then
+            // inserts that PendingJoin (firing the admin's auto-counter-sign),
+            // giving the invite-only join the zenoh-publish convergence FALLBACK
+            // it lacked when the single iroh first-contact dial doesn't land
+            // (offline party, cross-WAN flake, or the plain `redeem_invite` path).
+            // The publisher is admitted ONLY as PendingJoin — their non-membership
+            // events fail the per-event `verify_event` in the merge, and their
+            // own root stays gated until the counter-sign makes them Joined.
+            (None, false, true)
         } else {
-            // invite-only, OR known-but-Left/Banned → strict reject (unchanged).
-            // `None` from `members.get` (in the invite-only case) is the
-            // catch-all "not currently Joined per our prior-state-at-publish-
-            // HLC view": the publisher was never a member, has not yet had
-            // their Join propagate to us (cold cache / out-of-band-bootstrap
-            // path), or `publisher_addr` is fabricated. We collapse these
-            // onto `MemberStatus::Left` rather than introduce a fourth
-            // variant — the error is diagnostic-only and the security
-            // invariant ("not Joined → reject") is unchanged. Frontend code
-            // that branches on this field MUST treat `Left` + `left_at: None`
-            // as the "never joined / unknown" case (genuine Leaves always
-            // carry a `left_at`).
+            // known-but-Left/Banned, or a known-PendingJoin re-publishing
+            // (we already hold their PendingJoin — no salvage needed; their
+            // root is unauthorized until counter-signed) → strict reject
+            // (unchanged). `member_state` is `Some` here (every `None` case is
+            // handled by the two defer arms above). We collapse the status onto
+            // `MemberStatus::Left` only via the `unwrap_or` below, which is now
+            // unreachable but kept for type-safety; the security invariant
+            // ("not Joined → reject") is unchanged.
             return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
                 addr: payload.publisher_addr,
                 status: status_now.unwrap_or(MemberStatus::Left),
@@ -3199,7 +3211,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // yet — the publisher-sig check runs post-decode against keys derived from
     // the in-blob self-Join. For all other (known-Joined) publishers, verify
     // now against their materialized enrolled keys exactly as before.
-    if !deferred_open_bootstrap {
+    if !deferred_open_bootstrap && !deferred_invite_bootstrap {
         let pms = publisher_member_state
             .as_ref()
             .expect("non-deferred publisher ⇒ Some(member_state)");
@@ -3333,6 +3345,40 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         }
     }
 
+    // ZEB-526: deferred INVITE-ONLY-bootstrap admission. The publisher was
+    // unknown at the gate; validate the self-authorizing PendingJoin (admin-
+    // signed InviteToken + EnrollmentCert) they carry in this blob, bounded to
+    // strictly-before the root HLC. Unlike the open sibling this admits a
+    // PendingJoin (not Joined) publisher and includes the admin's own bootstrap
+    // events in the authorization window so the InviteToken's admin-signer key
+    // resolves. It derives the publisher's enrolled keys, against which we verify
+    // the root publisher_sig; the authoritative merge below then inserts the
+    // PendingJoin, firing the admin's auto-counter-sign so the join converges.
+    if deferred_invite_bootstrap {
+        match crate::community_membership::bootstrap_admit_invite_only_publisher(
+            &resolved,
+            payload.publisher_addr,
+            ctx.admin_addr,
+            ctx.community_id,
+            &payload.at,
+        ) {
+            Some(bootstrap_member_state) => {
+                if let Err(e) = verify_publisher_sig(&payload, &bootstrap_member_state) {
+                    return IncomingOutcome::ErrPreMutation(e);
+                }
+            }
+            None => {
+                // No signature-valid self-authorizing PendingJoin for the
+                // publisher in this blob → the publish is unauthorized; reject.
+                return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
+                    addr: payload.publisher_addr,
+                    status: MemberStatus::Left,
+                    left_at: None,
+                });
+            }
+        }
+    }
+
     // Phase B: lock community state once, run insert_event for each
     // event, collect rejections for out-of-lock reporting.
     let mut inserted_any = false;
@@ -3384,12 +3430,17 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             );
             let pub_state = mat_now.members.get(&payload.publisher_addr).cloned();
             let pub_status = pub_state.as_ref().map(|s| s.status);
-            // Known-publisher path: must be Joined. Deferred open-bootstrap path:
-            // `None` is the normal unknown-publisher case (their self-Join is in
-            // `resolved`, admitted by this merge), so accept None OR Joined — but
-            // still reject Left/Banned/etc. surfaced by a concurrent insert.
-            let authorized = if deferred_open_bootstrap {
-                matches!(pub_status, None | Some(MemberStatus::Joined))
+            // Known-publisher path: must be Joined. Deferred bootstrap paths:
+            // `None` is the normal unknown-publisher case (their self-authorizing
+            // Join/PendingJoin is in `resolved`, admitted by this merge), so
+            // accept None OR Joined. The invite-only deferred path additionally
+            // accepts PendingJoin (the publisher's admitted-but-uncountersigned
+            // state). Still reject Left/Banned surfaced by a concurrent insert.
+            let authorized = if deferred_open_bootstrap || deferred_invite_bootstrap {
+                matches!(
+                    pub_status,
+                    None | Some(MemberStatus::Joined) | Some(MemberStatus::PendingJoin)
+                )
             } else {
                 matches!(pub_status, Some(MemberStatus::Joined))
             };

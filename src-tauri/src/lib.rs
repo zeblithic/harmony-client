@@ -26940,6 +26940,20 @@ where
     )
     .await;
 
+    // ZEB-526: re-arm the community engine's publish debounce now that the
+    // owner-state epoch Space is durably committed (above). The engine's
+    // spawn-time publish — armed by the PendingJoin `insert_local_event` earlier
+    // — races AHEAD of this commit: it fires ~250ms after boot while the
+    // owner-state Space row is still absent, so `live_epoch_key` returns
+    // `LiveEpochKeyMissing` and `publish_root_now` aborts. A failed publish does
+    // NOT re-arm its own debounce timer, and the persist-only fence above
+    // re-arms only on *failure*. Without an explicit re-arm here, a plain-redeem
+    // joiner never publishes a complete state-root, so the founder never receives
+    // its self-authorizing PendingJoin to counter-sign — the invite-only
+    // convergence deadlock. `notify_dirty` re-fires the debounce; the retry now
+    // reads the committed `current_epoch`/`current_epoch_key` and succeeds.
+    engine_arc.notify_dirty();
+
     // 10. Return DTO with the invite's name + kind so the caller can
     // render the new community without re-decoding the URL or
     // round-tripping. ZEB-265.

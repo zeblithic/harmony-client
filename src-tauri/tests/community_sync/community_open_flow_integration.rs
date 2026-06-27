@@ -1154,3 +1154,378 @@ async fn open_community_two_node_wire_convergence_no_preseed() {
     engine_a.shutdown().await.expect("shutdown a");
     engine_b.shutdown().await.expect("shutdown b");
 }
+
+/// ZEB-526 Fix 1: invite-only self-Join admission must converge over the WIRE.
+///
+/// This is the peering-free integration proof of the invite-only deferred
+/// self-Join admission. The co-located e2e (s10) cannot prove it because its
+/// plain `redeem_invite` path is not zenoh-peered — the joiner's PendingJoin
+/// reaches the admin only over the state-root publish, which is exactly the
+/// path this test exercises.
+///
+/// Topology mirrors the open-community `open_community_two_node_wire_convergence_no_preseed`
+/// test but for an INVITE-ONLY community, with the publisher/receiver roles
+/// chosen to match the production fix:
+///   * engine A = ADMIN + RECEIVER. It holds only its own bootstrap Join and
+///     is NOT pre-seeded with B's PendingJoin (the whole point — A must admit
+///     B's join straight off the wire).
+///   * engine B = JOINER + PUBLISHER. It mints a self-authorizing PendingJoin
+///     (admin-signed `InviteToken` + its EnrollmentCert) via `mint_redemption`
+///     and publishes its state-root.
+///
+/// Pre-fix, A rejected B's publish outright (`publisher_not_joined`,
+/// pre-decode) because B was an entirely-unknown publisher in an invite-only
+/// community. Post-fix, A DEFERS, decodes the blob, salvages B's PendingJoin
+/// via `bootstrap_admit_invite_only_publisher`, verifies the root publisher
+/// signature against B's enrolled keys, and the authoritative merge inserts
+/// the PendingJoin — firing the admin's auto-counter-sign, which materializes
+/// B from PendingJoin to **Joined** in A's own CommunityState.
+///
+/// B IS pre-seeded with A's bootstrap Join: for invite-only communities this
+/// seed remains correctness-required (the joiner legitimately learns the admin
+/// from the invite payload; the `InviteToken`'s admin-signer key must resolve
+/// from the admin's own Join when verifying B's PendingJoin). See the note at
+/// `open_community_create_redeem_leave_round_trip` lines ~248-262.
+#[tokio::test]
+async fn invite_only_admin_admits_joiner_pending_join_over_wire() {
+    use ed25519_dalek::Signer;
+    use harmony_app::community_invite::{canonical_invite_token_bytes, InviteToken};
+    use harmony_app::community_membership::MemberStatus;
+
+    let owner_a_test = harmony_app::community_membership::mint_test_owner(0x7A);
+    let owner_b_test = harmony_app::community_membership::mint_test_owner(0x7B);
+    let owner_a = owner_a_test.owner;
+    let owner_b = owner_b_test.owner;
+    let signing_a = owner_a_test.device_key.clone();
+    let signing_b = owner_b_test.device_key.clone();
+
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
+        a: (owner_a, [0u8; 64]),
+        b: (owner_b, [0u8; 64]),
+    });
+
+    // INVITE-ONLY-specific: a PendingJoin renders as PendingJoin only while it is
+    // within the 30-day `MATERIALIZE_PENDING_EXPIRY_MS` window relative to the
+    // materialization `now` (an un-countersigned, expired pending is hidden). The
+    // receiver materializes B's publish at the WIRE root HLC, which the engine
+    // derives from the real wall clock. So unlike the open test, these Join /
+    // PendingJoin HLCs must sit near the present, not at synthetic small values —
+    // otherwise B's PendingJoin is born already-expired and never admits.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_millis() as u64;
+    let admin_join_ms = now_ms - 60_000;
+    let token_minted_ms = now_ms - 55_000;
+    let pending_join_ms = now_ms - 50_000;
+
+    // Shared in-memory CAS (mirrors the open wire-convergence test).
+    let cas: Arc<Mutex<HashMap<harmony_content::cid::ContentId, Vec<u8>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel(64);
+    let cas_for_servicer = Arc::clone(&cas);
+    tokio::spawn(async move {
+        while let Some(op) = cas_op_rx.recv().await {
+            match op {
+                CasOp::PutLocal {
+                    cid, blob, reply, ..
+                } => {
+                    cas_for_servicer.lock().await.insert(cid, blob);
+                    if let Some(r) = reply {
+                        let _ = r.send(Ok(()));
+                    }
+                }
+                CasOp::GetOrFetch {
+                    cid,
+                    timeout: _,
+                    reply,
+                } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(Ok(v));
+                }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
+                }
+                CasOp::AllowServeSubtree { reply, .. } => {
+                    let _ = reply.send(Ok(0));
+                }
+            }
+        }
+    });
+
+    // Bidirectional wire forwarders: A's publisher → B's subscriber and
+    // B's publisher → A's subscriber. The load-bearing direction here is
+    // B → A (the joiner's state-root publish reaching the admin).
+    let (a_out_tx, mut a_out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (a_in_tx, a_in_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_out_tx, mut b_out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_in_tx, b_in_rx) = mpsc::channel::<Vec<u8>>(64);
+    let a_in_for_fwd = a_in_tx.clone();
+    tokio::spawn(async move {
+        while let Some(bytes) = b_out_rx.recv().await {
+            let _ = a_in_for_fwd.send(bytes).await;
+        }
+    });
+    let b_in_for_fwd = b_in_tx.clone();
+    tokio::spawn(async move {
+        while let Some(bytes) = a_out_rx.recv().await {
+            let _ = b_in_for_fwd.send(bytes).await;
+        }
+    });
+
+    // A mints an INVITE-ONLY community + its bootstrap Join (admin = owner_a).
+    let minted_a = mint_community_creation(
+        "InviteOnlyWireConvergence",
+        true, // is_invite_only
+        owner_a,
+        &signing_a,
+        &owner_a_test.cert,
+        Hlc {
+            wall_ms: admin_join_ms,
+            logical: 0,
+            device_id: "a-dev".to_string(),
+        },
+    )
+    .expect("mint create");
+    let community_id = minted_a.community_id;
+
+    let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx.clone(),
+        Duration::from_secs(2),
+    ));
+    let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx.clone(),
+        Duration::from_secs(2),
+    ));
+
+    let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
+    let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
+    let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let (delta_a_tx, mut _delta_a_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
+    let (delta_b_tx, mut _delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
+    let tmp_a = tempfile::tempdir().expect("tmp a");
+    let tmp_b = tempfile::tempdir().expect("tmp b");
+
+    let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: minted_a.membership_key.clone(),
+        admin_addr: owner_a,
+        is_invite_only: true,
+        device_id: "a-dev".into(),
+        self_owner: owner_a,
+        signing_key: Arc::new(signing_a.clone()),
+        state: Arc::clone(&state_a),
+        tracker: Arc::clone(&tracker_a),
+        content_store: cs_a,
+        publisher_tx: a_out_tx,
+        subscriber_rx: a_in_rx,
+        paths: PersistPaths {
+            crdt: tmp_a.path().join("crdt.cbor"),
+            replay: tmp_a.path().join("replay.cbor"),
+        },
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        identity_resolver: Some(Arc::clone(&resolver)),
+        error_tx: None,
+        delta_tx: Some(delta_a_tx),
+        pending_redemptions: None,
+        crdt_state: None,
+        admin_identity_pub: None,
+        nav_emitter: None,
+        root_serve_rx: None,
+    });
+    let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: minted_a.membership_key.clone(),
+        admin_addr: owner_a,
+        is_invite_only: true,
+        device_id: "b-dev".into(),
+        self_owner: owner_b,
+        signing_key: Arc::new(signing_b.clone()),
+        state: Arc::clone(&state_b),
+        tracker: Arc::clone(&tracker_b),
+        content_store: cs_b,
+        publisher_tx: b_out_tx,
+        subscriber_rx: b_in_rx,
+        paths: PersistPaths {
+            crdt: tmp_b.path().join("crdt.cbor"),
+            replay: tmp_b.path().join("replay.cbor"),
+        },
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        identity_resolver: Some(Arc::clone(&resolver)),
+        error_tx: None,
+        delta_tx: Some(delta_b_tx),
+        pending_redemptions: None,
+        crdt_state: None,
+        admin_identity_pub: None,
+        nav_emitter: None,
+        root_serve_rx: None,
+    });
+
+    // A inserts its own bootstrap Join (community creation) → publishes.
+    engine_a
+        .insert_local_event(minted_a.bootstrap_join.clone())
+        .await
+        .expect("A bootstrap insert");
+
+    // B is pre-seeded with A's bootstrap Join. Unlike the OPEN path, this seed
+    // is correctness-required for invite-only: B's PendingJoin carries an
+    // admin-signed `InviteToken` whose signer key must resolve from A's own
+    // Join when verify_event runs. Production reconstructs this from the invite
+    // payload's `admin_bootstrap`; here we insert it directly.
+    engine_b
+        .insert_local_event(minted_a.bootstrap_join.clone())
+        .await
+        .expect("B pre-seed A's bootstrap Join (invite-only correctness-required)");
+
+    // Build a real admin-signed InviteToken (signed by A's enrolled device key)
+    // and seal the epoch key to B's enrolled X25519 key, exactly as production's
+    // targeted invite-only invite does (cf. pkarr_iroh_redeem_full_integration).
+    let token_minted_at = Hlc {
+        wall_ms: token_minted_ms,
+        logical: 0,
+        device_id: "a-dev".into(),
+    };
+    let invite_token_unsigned = InviteToken {
+        inviter: owner_a,
+        invitee_hint: Some(owner_b),
+        minted_at: token_minted_at.clone(),
+        expires_at: None,
+        sig: [0u8; 64],
+    };
+    let token_bytes =
+        canonical_invite_token_bytes(&invite_token_unsigned).expect("canonical token bytes");
+    let token_sig: [u8; 64] = signing_a.sign(&token_bytes).to_bytes();
+    let invite_token = InviteToken {
+        inviter: owner_a,
+        invitee_hint: Some(owner_b),
+        minted_at: token_minted_at,
+        expires_at: None,
+        sig: token_sig,
+    };
+
+    // Seal the epoch key to B's enrolled device key's X25519 pub.
+    // mint_redemption decrypts it via ed25519_priv_to_x25519(signing_b).
+    let b_x25519_pub = {
+        let verifying_bytes = signing_b.verifying_key().to_bytes();
+        harmony_app::dm_signing::ed25519_pub_to_x25519(&verifying_bytes)
+            .expect("B ed25519 → x25519")
+    };
+    let sealed_epoch_key =
+        harmony_app::dm_signing::seal_to_owner(&b_x25519_pub, minted_a.membership_key.as_bytes())
+            .expect("seal epoch key to B");
+
+    let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
+        community_id,
+        epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
+            epoch: 0,
+            // Targeted invite shape: per-device sealed envelope in
+            // sealed_epoch_keys, sealed_epoch_key empty.
+            sealed_epoch_key: Vec::new(),
+            sealed_epoch_keys: vec![sealed_epoch_key],
+            state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(),
+        },
+        admin_addr: owner_a,
+        community_name: "InviteOnlyWireConvergence".into(),
+        is_invite_only: true,
+        expires_at: None,
+        invite_token: Some(invite_token),
+        admin_bootstrap: Some(minted_a.bootstrap_join.clone()),
+        admin_identity_pub: None,
+        forked_from: None,
+        pre_fork_snapshot: None,
+        // Invite-only payloads require the inviter's EnrollmentCert so the
+        // InviteToken signer key binds to the admin actor.
+        inviter_enrollment: Some(owner_a_test.cert.clone()),
+        untargeted_decrypt_key: None,
+    };
+
+    // B mints its self-authorizing PendingJoin and inserts it locally → its
+    // state-root (admin Join + B's PendingJoin) publishes over the wire to A.
+    let minted_b = mint_redemption(
+        &invite_payload,
+        owner_b,
+        &signing_b,
+        &owner_b_test.cert,
+        Hlc {
+            wall_ms: pending_join_ms,
+            logical: 0,
+            device_id: "b-dev".to_string(),
+        },
+    )
+    .expect("mint redeem (invite-only PendingJoin)");
+    engine_b
+        .insert_local_event(minted_b.bootstrap_join.clone())
+        .await
+        .expect("B PendingJoin insert");
+
+    // A must ADMIT B's PendingJoin straight off the wire (no pre-seed of B in
+    // A). Pre-fix this never happens — A rejects B's publish pre-decode. We
+    // first confirm B reaches A's materialized membership AT ALL (the load-
+    // bearing thing the fix enables), then that A's auto-counter-sign drives B
+    // all the way to Joined.
+    let b_reached_a = wait_until(
+        || async {
+            let s = state_a.lock().await;
+            let mat = harmony_app::community_membership::materialize(
+                &s.events.values().cloned().collect::<Vec<_>>(),
+                owner_a,
+            );
+            matches!(
+                mat.members.get(&owner_b).map(|m| m.status),
+                Some(MemberStatus::PendingJoin) | Some(MemberStatus::Joined)
+            )
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        b_reached_a,
+        "A must admit B's PendingJoin off the wire (the ZEB-526 Fix 1 invariant; \
+         pre-fix A rejected B's publish pre-decode)"
+    );
+
+    // Strongest true condition: A's auto-counter-sign fires (A is a Joined
+    // admin with power ≥ the invite threshold), materializing B to Joined.
+    let b_joined_on_a = wait_until(
+        || async {
+            let s = state_a.lock().await;
+            let mat = harmony_app::community_membership::materialize(
+                &s.events.values().cloned().collect::<Vec<_>>(),
+                owner_a,
+            );
+            matches!(
+                mat.members.get(&owner_b).map(|m| m.status),
+                Some(MemberStatus::Joined)
+            )
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        b_joined_on_a,
+        "A's auto-counter-sign must materialize B to Joined (PendingJoin → JoinCountersign → Joined)"
+    );
+
+    // Roster sanity: A now holds exactly {admin (Joined), joiner (Joined)}.
+    let dto_a = member_info_for(&state_a.lock().await.materialize_now(owner_a));
+    assert_eq!(dto_a.len(), 2, "A roster = admin + joiner");
+    let a_row = dto_a
+        .iter()
+        .find(|d| d.addr == hex::encode(owner_a.0))
+        .expect("admin in A's roster");
+    assert_eq!(a_row.status, MemberStatusDto::Joined);
+    let b_row = dto_a
+        .iter()
+        .find(|d| d.addr == hex::encode(owner_b.0))
+        .expect("joiner admitted into A's roster off the wire");
+    assert_eq!(
+        b_row.status,
+        MemberStatusDto::Joined,
+        "joiner materializes to Joined on the admin after auto-counter-sign"
+    );
+
+    engine_a.shutdown().await.expect("shutdown a");
+    engine_b.shutdown().await.expect("shutdown b");
+}
