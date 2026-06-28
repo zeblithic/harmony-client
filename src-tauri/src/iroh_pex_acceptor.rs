@@ -163,12 +163,13 @@ impl IrohFriendPexAcceptor {
             .await
             .map_err(|_| "io timeout reading length-prefix".to_string())?
             .map_err(|e| format!("read length-prefix: {e}"))?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > PEX_MAX_PACKET_LEN {
-            return Err(format!(
-                "length-prefix out of bounds: len={len} max={PEX_MAX_PACKET_LEN}"
-            ));
-        }
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            PEX_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("length-prefix out of bounds: len={} max={}", e.len, e.max))?;
         let mut body = vec![0u8; len];
         tokio::time::timeout(self.config.io_deadline, recv.read_exact(&mut body))
             .await
@@ -213,22 +214,19 @@ impl IrohFriendPexAcceptor {
         }; // guard dropped here — owner-state lock released before the write.
 
         let resp = encode_referral_catalog(&cat).map_err(|e| format!("encode catalog: {e}"))?;
-        if resp.len() > PEX_MAX_PACKET_LEN {
-            return Err(format!(
-                "response too large: len={} max={PEX_MAX_PACKET_LEN}",
-                resp.len()
-            ));
-        }
-        let resp_len = resp.len() as u32;
+        let resp_prefix = crate::iroh_framing::encode_len_prefix(
+            resp.len(),
+            PEX_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("response too large: len={} max={}", e.len, e.max))?;
 
         // Write [u32 LE length-prefix][catalog CBOR] then finish().
-        tokio::time::timeout(
-            self.config.io_deadline,
-            send.write_all(&resp_len.to_le_bytes()),
-        )
-        .await
-        .map_err(|_| "io timeout writing length-prefix".to_string())?
-        .map_err(|e| format!("write length-prefix: {e}"))?;
+        tokio::time::timeout(self.config.io_deadline, send.write_all(&resp_prefix))
+            .await
+            .map_err(|_| "io timeout writing length-prefix".to_string())?
+            .map_err(|e| format!("write length-prefix: {e}"))?;
         tokio::time::timeout(self.config.io_deadline, send.write_all(&resp))
             .await
             .map_err(|_| "io timeout writing body".to_string())?
