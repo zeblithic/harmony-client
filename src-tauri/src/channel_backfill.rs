@@ -370,14 +370,18 @@ const BACKFILL_DRIVER_MIN_WAIT_MS: u64 = 250;
 ///   retries running; returns on Idle only if resync is also disabled)
 ///   instead of exiting mid-latch.
 /// - `resync_interval_ms = Some(ms)` arms the ZEB-425 anti-entropy floor:
-///   a satisfied latch re-arms every `ms` even with NO epoch bump,
-///   re-reading the verified watermark exactly like the epoch path. It
-///   only acts when the edge-triggered re-arm never fires (router-only
-///   holders, late-matching queryables, same-zid reconnects). No cooldown
-///   — the interval is itself the rate limit (a re-armed latch with
-///   still-no-holders backs off via `WaitUntil`, never straight back to
-///   Idle, so the floor cannot storm). `None` disables it (production
-///   passes [`PERIODIC_RESYNC_FLOOR_MS`]).
+///   a satisfied latch re-arms every `ms` even with NO epoch bump. ZEB-584:
+///   the floor re-arms with a FULL reconcile (`since = None`), NOT the
+///   incremental watermark — the scalar `current_watermark()` high-water
+///   mark can't recover a peer's offline-window entry whose HLC sorts below
+///   the returning member's max (the incremental catch-up's blind spot), so
+///   the periodic floor re-pulls from scratch. It only acts when the
+///   edge-triggered re-arm never fires (router-only holders, late-matching
+///   queryables, same-zid reconnects) or when the incremental watermark hides
+///   a sub-max gap. No cooldown — the interval is itself the rate limit (a
+///   re-armed latch with still-no-holders backs off via `WaitUntil`, never
+///   straight back to Idle, so the floor cannot storm). `None` disables it
+///   (production passes [`PERIODIC_RESYNC_FLOOR_MS`]).
 /// - `now_ms` injects the wall clock (dm_outhold_apply testability
 ///   precedent): production passes a `SystemTime`-based closure;
 ///   tests pair a `tokio::time::Instant`-based closure with paused
@@ -424,13 +428,26 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         latch.reset(current_watermark().await);
                     }
                     _ = resync_tick(resync_interval_ms) => {
-                        // ZEB-425 anti-entropy floor: re-arm regardless of
-                        // epoch bumps, re-reading the verified watermark
-                        // exactly like the epoch path. No cooldown — see the
-                        // `resync_interval_ms` doc (the interval is the rate
-                        // limit; a re-armed no-holder latch backs off via
-                        // WaitUntil, never straight back to Idle).
-                        latch.reset(current_watermark().await);
+                        // ZEB-425 anti-entropy floor + ZEB-584 full reconcile:
+                        // re-arm with `since = None` (pull from scratch), NOT
+                        // the incremental `current_watermark()`. A scalar HLC
+                        // high-water mark is not a completeness certificate —
+                        // `max_hlc = M` only means "the latest event I hold is
+                        // M," not "I hold every event ≤ M." A returning member
+                        // that was offline while a peer authored an entry whose
+                        // HLC sorts below M never refetches it on the
+                        // incremental path (the responder serves only
+                        // `hlc > since`). The periodic floor closes that blind
+                        // spot by re-pulling from the start. (Heals any sub-max
+                        // gap that fits within one backfill page; full
+                        // multi-page diff reconciliation — per-peer watermarks
+                        // or prolly-tree/CAS range sync — is ZEB-585.) The
+                        // edge-triggered epoch re-arm stays incremental — see
+                        // the `WaitUntil`/`Idle` epoch arms above. No cooldown:
+                        // the interval is the rate limit (a re-armed no-holder
+                        // latch backs off via WaitUntil, never straight back to
+                        // Idle).
+                        latch.reset(None);
                     }
                     changed = shutdown_rx.changed() => {
                         // Err = sender dropped (registry entry gone):
@@ -1875,6 +1892,74 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(requests.load(Ordering::SeqCst), 3);
+        driver.abort();
+    }
+
+    /// ZEB-584: the periodic anti-entropy floor must re-arm with a FULL
+    /// reconcile (`since = None`), NOT the incremental log watermark. A
+    /// returning member seeds the latch with `Some(max_hlc)` (efficient
+    /// reconnect catch-up), but a scalar high-water mark can't recover a
+    /// peer's offline-window entry whose HLC sorts below that max — the
+    /// responder serves only `hlc > since`. The floor's from-scratch re-pull
+    /// closes the gap. (The epoch-bump re-arm stays incremental — see
+    /// `backfill_driver_rearms_on_epoch_bump_with_fresh_watermark`.)
+    #[tokio::test(start_paused = true)]
+    async fn backfill_periodic_resync_rearms_with_full_reconcile_none() {
+        const RESYNC_MS: u64 = 200_000;
+        // Capture the `since` of every request the driver issues.
+        let sinces: Arc<std::sync::Mutex<Vec<Option<Hlc>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&sinces);
+        let request_page = move |since: Option<Hlc>| {
+            let captured = Arc::clone(&captured);
+            async move {
+                captured.lock().unwrap().push(since);
+                // Clean empty page → satisfied, so the ONLY thing that can
+                // re-issue a request here is the periodic floor.
+                PageFetch::Completed(0, 256)
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        // A returning member: non-empty reloaded log → watermark Some(M).
+        let watermark = hlc(500);
+        let wm = watermark.clone();
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(Some(watermark.clone())),
+            request_page,
+            // current_watermark stays Some(M): re-pulling old/dup events
+            // never raises a returning member's log max, which is exactly
+            // why the incremental path can't page below it.
+            move || {
+                let wm = wm.clone();
+                async move { Some(wm) }
+            },
+            shutdown_rx,
+            None, // epoch_rx None: ONLY the periodic floor can re-arm.
+            Some(RESYNC_MS),
+            move || start.elapsed().as_millis() as u64,
+        ));
+        // Req #1: the initial reconnect catch-up uses the incremental
+        // watermark.
+        while sinces.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sinces.lock().unwrap()[0],
+            Some(watermark.clone()),
+            "the initial reconnect request uses the incremental watermark"
+        );
+        // Cross the floor → the re-arm must request a FULL reconcile.
+        tokio::time::advance(Duration::from_millis(RESYNC_MS + 1)).await;
+        while sinces.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sinces.lock().unwrap()[1],
+            None,
+            "ZEB-584: the periodic floor must re-arm with since=None (full \
+             reconcile) so a sub-max-HLC offline-window entry is re-fetched"
+        );
         driver.abort();
     }
 
