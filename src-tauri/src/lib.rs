@@ -23576,6 +23576,48 @@ pub(crate) async fn create_community_impl(
         }
     }
 
+    // ZEB-582: invite-only communities auto-enable this owner's relay opt-in at
+    // creation. An invite-redeem delivers membership over the iroh relay, but
+    // the follow-on channel-bearing state-root/epoch sync depends on a post-join
+    // zenoh dial to the admin — which dies cross-WAN behind a hard NAT/CGNAT, so
+    // a remote joiner converges membership yet silently never receives channels.
+    // Opting the founder's fleet in to relay gives remote joiners a relay-backed
+    // pull path for the (ciphertext, epoch-sealed) state-root, closing that
+    // footgun by default. Open communities land channel config inline in the
+    // admitted snapshot, so they don't need this. Best-effort: the community
+    // already committed durably above, so a relay-optin failure (e.g. the
+    // relay-optin engine isn't installed in this boot) must NOT fail the create
+    // — it is logged, and the admin can still toggle relay in community settings.
+    if is_invite_only {
+        // Bound the await (Qodo PR #357; precedent #226/#159 + the
+        // fence_owner_state_flush above): set_community_relay_opt_in_impl ends
+        // in an unbounded relay_optin_sync.flush_now().await, so a wedged
+        // relay-optin engine could otherwise hang the create indefinitely —
+        // contradicting "best-effort." The opt-in is written to the in-memory
+        // doc BEFORE that flush (the relay gate reads the in-memory doc, so the
+        // opt-in is already effective), and notify_dirty re-arms the persist
+        // retry, so a timeout here only forgoes the synchronous durability/
+        // sibling-sync — never the opt-in itself.
+        match tokio::time::timeout(
+            OWNER_STATE_FENCE_TIMEOUT,
+            set_community_relay_opt_in_impl(state, community_id.clone(), true),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                error = %e,
+                community_id = %community_id,
+                "create_community: auto relay opt-in for invite-only community failed (non-fatal)"
+            ),
+            Err(_elapsed) => tracing::warn!(
+                community_id = %community_id,
+                "create_community: auto relay opt-in for invite-only community timed out (non-fatal); \
+                 opt-in is set in-memory, persist retries via the dirty latch"
+            ),
+        }
+    }
+
     // durable-seal-targets: wake the reachability publisher so this device
     // emits a per-community `ReachabilityAnnounce` (carrying its durable
     // butler-set) for the just-created community NOW, rather than after the

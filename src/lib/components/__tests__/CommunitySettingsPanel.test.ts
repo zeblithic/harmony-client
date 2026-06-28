@@ -408,4 +408,185 @@ describe('CommunitySettingsPanel', () => {
     // The resolved name must reach the DOM (end-to-end through the props chain).
     expect(getByText(/Resolved Descendant Name/)).toBeTruthy();
   });
+
+  // ── ZEB-582: per-community relay opt-in toggle ────────────────────────────
+
+  it('relay_toggle_reflects_get_community_relay_status', async () => {
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'get_community_relay_status') return Promise.resolve(true);
+      return Promise.resolve([]);
+    });
+    const { getByLabelText } = render(CommunitySettingsPanel, { props: baseProps });
+    // The async status read flips the checkbox checked once it resolves.
+    await waitFor(() => {
+      const cb = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(cb.checked).toBe(true);
+    });
+  });
+
+  it('relay_toggle_invokes_set_community_relay_opt_in_with_camelCase_args', async () => {
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    const calls: Array<[string, unknown]> = [];
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string, args?: unknown) => {
+      calls.push([cmd, args]);
+      // Start opted-out so a click sets it ON.
+      if (cmd === 'get_community_relay_status') return Promise.resolve(false);
+      return Promise.resolve([]);
+    });
+    const { getByLabelText } = render(CommunitySettingsPanel, { props: baseProps });
+    // Wait for the initial status read to settle (toggle enabled, unchecked).
+    const cb = await waitFor(() => {
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(el.disabled).toBe(false);
+      expect(el.checked).toBe(false);
+      return el;
+    });
+    await fireEvent.click(cb);
+    // The setter must be called with the backend's snake_case→camelCase arg
+    // names (communityIdHex / optedIn) — a wrong key silently arrives undefined.
+    await waitFor(() => {
+      const setCall = calls.find(([c]) => c === 'set_community_relay_opt_in');
+      expect(setCall).toBeTruthy();
+      expect(setCall![1]).toEqual({ communityIdHex: baseProps.communityId, optedIn: true });
+    });
+  });
+
+  it('relay_toggle_stale_completion_does_not_clobber_after_community_switch', async () => {
+    // CodeRabbit PR #357: switching communities while a set is in flight must
+    // not let the old community's completion mutate the new community's toggle.
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    // A `deferred` object (not a `let`) so TS doesn't narrow the
+    // closure-assigned reject handle to `never` at the call site.
+    const deferred: { reject?: (e: unknown) => void } = {};
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'get_community_relay_status') return Promise.resolve(false);
+      if (cmd === 'set_community_relay_opt_in') {
+        // Community A's set stays pending until we reject it below.
+        return new Promise((_resolve, reject) => {
+          deferred.reject = reject;
+        });
+      }
+      return Promise.resolve([]);
+    });
+    const { getByLabelText, queryByText, rerender } = render(CommunitySettingsPanel, {
+      props: baseProps,
+    });
+    const cbA = await waitFor(() => {
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(el.disabled).toBe(false);
+      return el;
+    });
+    await fireEvent.click(cbA); // community A: set now in flight (pending)
+    // The set must actually be in flight before we reject it — otherwise this
+    // test could pass for the wrong reason (no error ever had a chance to
+    // surface). Wait for the pending call to be observed (CodeRabbit #357).
+    await waitFor(() => expect(deferred.reject).toBeDefined());
+    // Switch to community B before A's set resolves.
+    await rerender({ ...baseProps, communityId: '11'.repeat(32) });
+    await waitFor(() => {
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      // B's fresh status read cleared A's pending → toggle usable, unchecked.
+      expect(el.disabled).toBe(false);
+      expect(el.checked).toBe(false);
+    });
+    // Fail community A's stale set — its error must NOT surface on community B.
+    deferred.reject!(new Error('stale-A-failure'));
+    // Flush the rejection through the microtask + timer queue so the `.catch`
+    // actually runs before we assert its effect was dropped — a bare waitFor
+    // could pass before the handler executes.
+    await new Promise((r) => setTimeout(r, 0));
+    await waitFor(() => {
+      expect(queryByText(/stale-A-failure/)).toBeNull();
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(el.disabled).toBe(false);
+    });
+  });
+
+  it('relay_failed_status_load_does_not_show_previous_community_value', async () => {
+    // CodeRabbit PR #357 (Major): if the new community's status read REJECTS,
+    // the checkbox must not keep showing the prior community's opted-in value.
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    let failNext = false;
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'get_community_relay_status') {
+        // Community A reads opted-in (true); community B's read fails.
+        return failNext
+          ? Promise.reject(new Error('relay-status-unavailable'))
+          : Promise.resolve(true);
+      }
+      return Promise.resolve([]);
+    });
+    const { getByLabelText, rerender } = render(CommunitySettingsPanel, { props: baseProps });
+    // A: opted-in → checkbox checked.
+    await waitFor(() => {
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(el.checked).toBe(true);
+    });
+    // Switch to B; its status read will reject.
+    failNext = true;
+    await rerender({ ...baseProps, communityId: '22'.repeat(32) });
+    await waitFor(() => {
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      // Load finished (error path) → checkbox re-enabled, but must show B's
+      // neutral default (false), NOT A's stale `true`.
+      expect(el.disabled).toBe(false);
+      expect(el.checked).toBe(false);
+    });
+  });
+
+  it('relay_toggle_stale_completion_dropped_after_A_B_A_roundtrip', async () => {
+    // CodeRabbit PR #357 (Major): community-id alone can't tell apart an
+    // A → B → A round-trip. The original A set, completing after we've returned
+    // to A, must still be dropped (relayStatusSeq generation guard), not
+    // clobber the re-entered A's fresh state.
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    const deferred: { reject?: (e: unknown) => void } = {};
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      // Every community reads opted-in (true) so the checkbox is checked.
+      if (cmd === 'get_community_relay_status') return Promise.resolve(true);
+      if (cmd === 'set_community_relay_opt_in') {
+        return new Promise((_resolve, reject) => {
+          deferred.reject = reject;
+        });
+      }
+      return Promise.resolve([]);
+    });
+    const idA = baseProps.communityId;
+    const { getByLabelText, queryByText, rerender } = render(CommunitySettingsPanel, {
+      props: baseProps,
+    });
+    const cbA = await waitFor(() => {
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(el.disabled).toBe(false);
+      expect(el.checked).toBe(true);
+      return el;
+    });
+    await fireEvent.click(cbA); // A: toggle OFF, set now in flight (pending)
+    await waitFor(() => expect(deferred.reject).toBeDefined());
+    // A → B …
+    await rerender({ ...baseProps, communityId: '11'.repeat(32) });
+    await waitFor(() => {
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(el.disabled).toBe(false);
+    });
+    // … → A (same id, but a NEW load generation).
+    await rerender({ ...baseProps, communityId: idA });
+    await waitFor(() => {
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(el.disabled).toBe(false);
+      expect(el.checked).toBe(true); // re-entered A's fresh value
+    });
+    // The ORIGINAL A set finally fails. Without the generation guard, its
+    // `cid === communityId` (A === A) check would pass and surface the error /
+    // roll back the re-entered A. It must be dropped.
+    deferred.reject!(new Error('stale-original-A-failure'));
+    await new Promise((r) => setTimeout(r, 0));
+    await waitFor(() => {
+      expect(queryByText(/stale-original-A-failure/)).toBeNull();
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(el.disabled).toBe(false);
+      expect(el.checked).toBe(true); // unclobbered
+    });
+  });
 });
