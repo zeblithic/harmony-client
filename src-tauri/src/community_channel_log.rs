@@ -2193,7 +2193,11 @@ mod tests {
 
     #[test]
     fn watermark_vector_seal_open_round_trips() {
-        let key = derive_channel_key(&fixture_mk(), &fixture_community(0xc0), &fixture_channel(0x01));
+        let key = derive_channel_key(
+            &fixture_mk(),
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+        );
         let mut v: WatermarkVector = BTreeMap::new();
         v.insert("dev-a".to_string(), (100, 3));
         v.insert("dev-b".to_string(), (250, 0));
@@ -2204,7 +2208,11 @@ mod tests {
 
     #[test]
     fn watermark_vector_open_rejects_oversize_before_decode() {
-        let key = derive_channel_key(&fixture_mk(), &fixture_community(0xc0), &fixture_channel(0x01));
+        let key = derive_channel_key(
+            &fixture_mk(),
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+        );
         let too_big = vec![0u8; MAX_WATERMARK_VECTOR_BYTES + 1];
         let err = open_watermark_vector(&key, &too_big).expect_err("must reject oversize");
         assert!(
@@ -2215,7 +2223,11 @@ mod tests {
 
     #[test]
     fn watermark_vector_open_rejects_tampered() {
-        let key = derive_channel_key(&fixture_mk(), &fixture_community(0xc0), &fixture_channel(0x01));
+        let key = derive_channel_key(
+            &fixture_mk(),
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+        );
         let mut v: WatermarkVector = BTreeMap::new();
         v.insert("dev-a".to_string(), (100, 3));
         let mut sealed = seal_watermark_vector(&key, &v).expect("seal");
@@ -2229,8 +2241,16 @@ mod tests {
 
     #[test]
     fn watermark_vector_open_rejects_wrong_key() {
-        let key = derive_channel_key(&fixture_mk(), &fixture_community(0xc0), &fixture_channel(0x01));
-        let other = derive_channel_key(&EpochKey::new([0x44; 32]), &fixture_community(0xc0), &fixture_channel(0x01));
+        let key = derive_channel_key(
+            &fixture_mk(),
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+        );
+        let other = derive_channel_key(
+            &EpochKey::new([0x44; 32]),
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+        );
         let mut v: WatermarkVector = BTreeMap::new();
         v.insert("dev-a".to_string(), (100, 3));
         let sealed = seal_watermark_vector(&key, &v).expect("seal");
@@ -2262,15 +2282,23 @@ mod tests {
             },
         );
         // Seal a 2-event segment from dev-a: (100,0) then (150,2).
-        log.append(fixture_signed_event(100, 0, "dev-a")).expect("append");
-        log.append(fixture_signed_event(150, 2, "dev-a")).expect("append");
+        log.append(fixture_signed_event(100, 0, "dev-a"))
+            .expect("append");
+        log.append(fixture_signed_event(150, 2, "dev-a"))
+            .expect("append");
         log.seal_and_persist().expect("seal");
         // Tail: a sub-max dev-b event + a newer dev-a event.
-        log.append(fixture_signed_event(120, 0, "dev-b")).expect("append");
-        log.append(fixture_signed_event(200, 0, "dev-a")).expect("append");
+        log.append(fixture_signed_event(120, 0, "dev-b"))
+            .expect("append");
+        log.append(fixture_signed_event(200, 0, "dev-a"))
+            .expect("append");
 
         let v = log.watermark_vector();
-        assert_eq!(v.get("dev-a"), Some(&(200, 0)), "dev-a max spans segment + tail");
+        assert_eq!(
+            v.get("dev-a"),
+            Some(&(200, 0)),
+            "dev-a max spans segment + tail"
+        );
         assert_eq!(v.get("dev-b"), Some(&(120, 0)));
         assert_eq!(v.len(), 2);
 

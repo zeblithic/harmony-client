@@ -21,11 +21,10 @@ use tokio::task::JoinHandle;
 use crate::community_channel_log::{
     decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, open_watermark_vector,
     read_segment_at, seal_watermark_vector, sign_channel_event, verify_channel_event,
-    ChannelAttachment,
-    ChannelEventError, ChannelKey, ChannelLog, ChannelLogConfig, ChannelLogPersistError,
-    ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc, MessageId, SegmentDescriptor,
-    SignedChannelEvent, WatermarkVector, MAX_ATTACHMENTS, MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
-    MAX_WATERMARK_VECTOR_BYTES,
+    ChannelAttachment, ChannelEventError, ChannelKey, ChannelLog, ChannelLogConfig,
+    ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc,
+    MessageId, SegmentDescriptor, SignedChannelEvent, WatermarkVector, MAX_ATTACHMENTS,
+    MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS, MAX_WATERMARK_VECTOR_BYTES,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -2992,7 +2991,11 @@ mod tests {
         };
         // dev-a posts (100) then (200); dev-b posts (50) — a sub-max wall_ms
         // from a device the requester has never seen.
-        let events = vec![mk(100, "dev-a", "a1"), mk(200, "dev-a", "a2"), mk(50, "dev-b", "b1")];
+        let events = vec![
+            mk(100, "dev-a", "a1"),
+            mk(200, "dev-a", "a2"),
+            mk(50, "dev-b", "b1"),
+        ];
         {
             let mut log = fix.engine.log_for_test().lock().await;
             for ev in &events {
@@ -3019,12 +3022,18 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(bodies.contains(&"a2".to_string()), "dev-a tail beyond (150,0) served");
+        assert!(
+            bodies.contains(&"a2".to_string()),
+            "dev-a tail beyond (150,0) served"
+        );
         assert!(
             bodies.contains(&"b1".to_string()),
             "never-seen dev-b served even though its HLC (50) sorts below the requester's global max"
         );
-        assert!(!bodies.contains(&"a1".to_string()), "dev-a (100,0) <= (150,0) filtered out");
+        assert!(
+            !bodies.contains(&"a1".to_string()),
+            "dev-a (100,0) <= (150,0) filtered out"
+        );
     }
 
     /// ZEB-270 Phase 3 Task 5: pub `event_to_dto` accessor.
@@ -4469,7 +4478,10 @@ mod tests {
             &sealed,
         )
         .expect("open");
-        assert_eq!(opened, expected, "sealed vector opens to the engine's current vector");
+        assert_eq!(
+            opened, expected,
+            "sealed vector opens to the engine's current vector"
+        );
 
         // since=None → no vector (full reconcile).
         let (tx2, _rx2) = tokio::sync::oneshot::channel::<BackfillPageReport>();

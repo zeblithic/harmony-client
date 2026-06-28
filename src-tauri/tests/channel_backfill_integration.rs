@@ -792,8 +792,21 @@ async fn returning_member_recovers_unseen_device_sub_max_hlc_event() {
         )
         .await;
     }
-    wait_for_count(&engine_a, 4, Duration::from_secs(10), "holder offline-phase log").await;
-    wait_until_serving(&session, &community_id, &channel_id, 4, Duration::from_secs(15)).await;
+    wait_for_count(
+        &engine_a,
+        4,
+        Duration::from_secs(10),
+        "holder offline-phase log",
+    )
+    .await;
+    wait_until_serving(
+        &session,
+        &community_id,
+        &channel_id,
+        4,
+        Duration::from_secs(15),
+    )
+    .await;
 
     // ── B reconnects: the reloaded watermark vector is {live-dev:(2000,0)}
     //    (no entry for skew-dev) → the catch-up GET seals it, A serves all
