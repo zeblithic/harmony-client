@@ -850,6 +850,19 @@ pub fn open_watermark_vector(
         .map_err(|e| ChannelEventError::CborDecode(e.to_string()))
 }
 
+/// ZEB-585: raise a watermark-vector entry to cover `at` (no-op when the
+/// existing entry already dominates). Shared by `ChannelLog::append` and
+/// `ChannelLog::rebuild_device_watermarks` so maintenance and rebuild use
+/// one rule. Per-device the HLC order is just `(wall_ms, logical)` since
+/// `device_id` is constant within a device's stream.
+fn raise_watermark(idx: &mut WatermarkVector, at: &Hlc) {
+    let entry = idx.entry(at.device_id.clone()).or_insert((0, 0));
+    let cand = (at.wall_ms, at.logical);
+    if cand > *entry {
+        *entry = cand;
+    }
+}
+
 /// Per-(channel, author, device) HLC monotonicity check. Records the
 /// highest `Hlc` seen for each triple; rejects any new event whose
 /// HLC is not strictly greater (by sort-key).
@@ -1473,6 +1486,12 @@ pub struct ChannelLog {
     /// ZEB-536: derived LWW reaction view. Maintained in `append`;
     /// rebuilt from the persisted log in `reload`.
     reaction_index: ReactionIndex,
+    /// ZEB-585: derived per-author (per authoring-device) catch-up
+    /// watermark — `device_id -> max (wall_ms, logical)`. Maintained in
+    /// `append`; rebuilt from the persisted log in `reload` (mirrors
+    /// `reaction_index`). Keeps `watermark_vector()` O(devices), not an
+    /// O(history) rescan per catch-up query.
+    device_watermarks: WatermarkVector,
 }
 
 /// On-disk index of sealed segments + the path to the active tail.
@@ -1553,6 +1572,7 @@ impl ChannelLog {
             config,
             root,
             reaction_index: ReactionIndex::default(),
+            device_watermarks: WatermarkVector::new(),
         }
     }
 
@@ -1591,6 +1611,9 @@ impl ChannelLog {
         if matches!(&event, SignedChannelEvent::React { .. }) {
             self.reaction_index.apply(&event);
         }
+        // ZEB-585: advance the per-device catch-up watermark before the
+        // event is moved into the tail.
+        raise_watermark(&mut self.device_watermarks, event.at());
         self.tail.push(event);
         Ok(self.tail.len() >= self.config.seal_threshold_events)
     }
@@ -1891,8 +1914,10 @@ impl ChannelLog {
             config,
             root,
             reaction_index: ReactionIndex::default(),
+            device_watermarks: WatermarkVector::new(),
         };
         log.rebuild_reaction_index();
+        log.rebuild_device_watermarks();
         Ok((log, total))
     }
 
@@ -1997,6 +2022,41 @@ impl ChannelLog {
             idx.apply(ev);
         }
         self.reaction_index = idx;
+    }
+
+    /// ZEB-585: snapshot the per-device catch-up watermark.
+    pub fn watermark_vector(&self) -> WatermarkVector {
+        self.device_watermarks.clone()
+    }
+
+    /// Rebuild the per-device watermark index from the persisted log.
+    /// Same one-time boot cost + non-fatal segment-read handling as
+    /// `rebuild_reaction_index` (an unreadable old segment is skipped with
+    /// a warn; the channel still loads — a stale-low watermark only costs
+    /// a wasteful re-fetch the periodic floor heals).
+    fn rebuild_device_watermarks(&mut self) {
+        let mut idx: WatermarkVector = WatermarkVector::new();
+        for seg in &self.manifest.segments {
+            match self.read_segment(seg) {
+                Ok(events) => {
+                    for ev in &events {
+                        raise_watermark(&mut idx, ev.at());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        zeb = "ZEB-585",
+                        segment = ?seg.handle,
+                        error = %e,
+                        "rebuild_device_watermarks: skipping unreadable segment"
+                    );
+                }
+            }
+        }
+        for ev in &self.tail {
+            raise_watermark(&mut idx, ev.at());
+        }
+        self.device_watermarks = idx;
     }
 }
 
@@ -2185,6 +2245,47 @@ mod tests {
         // A sealed vector must NOT open as a reply packet and vice-versa —
         // distinct AAD makes the AEAD reject cross-use even under one key.
         assert_ne!(WATERMARK_VECTOR_AAD, CHANNEL_PACKET_AAD);
+    }
+
+    #[test]
+    fn watermark_vector_tracks_per_device_max_and_survives_reload() {
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            root.clone(),
+            ChannelLogConfig {
+                seal_threshold_events: 2,
+            },
+        );
+        // Seal a 2-event segment from dev-a: (100,0) then (150,2).
+        log.append(fixture_signed_event(100, 0, "dev-a")).expect("append");
+        log.append(fixture_signed_event(150, 2, "dev-a")).expect("append");
+        log.seal_and_persist().expect("seal");
+        // Tail: a sub-max dev-b event + a newer dev-a event.
+        log.append(fixture_signed_event(120, 0, "dev-b")).expect("append");
+        log.append(fixture_signed_event(200, 0, "dev-a")).expect("append");
+
+        let v = log.watermark_vector();
+        assert_eq!(v.get("dev-a"), Some(&(200, 0)), "dev-a max spans segment + tail");
+        assert_eq!(v.get("dev-b"), Some(&(120, 0)));
+        assert_eq!(v.len(), 2);
+
+        // Reload rebuilds the index identically from segment + tail.
+        log.flush_tail().expect("flush");
+        let (reloaded, _total) = ChannelLog::reload(
+            cid,
+            chid,
+            root,
+            ChannelLogConfig {
+                seal_threshold_events: 2,
+            },
+        )
+        .expect("reload");
+        assert_eq!(reloaded.watermark_vector(), v);
     }
 
     fn fixture_owner_addr(byte: u8) -> OwnerAddr {
