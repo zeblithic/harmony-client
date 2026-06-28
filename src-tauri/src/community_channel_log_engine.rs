@@ -23,7 +23,7 @@ use crate::community_channel_log::{
     sign_channel_event, verify_channel_event, ChannelAttachment, ChannelEventError, ChannelKey,
     ChannelLog, ChannelLogConfig, ChannelLogPersistError, ChannelLogReplayTracker,
     ChannelPostPayload, CommunityStateAtHlc, MessageId, SegmentDescriptor, SignedChannelEvent,
-    MAX_ATTACHMENTS, MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
+    WatermarkVector, MAX_ATTACHMENTS, MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -754,6 +754,92 @@ impl ChannelLogEngine {
         Ok(out)
     }
 
+    /// ZEB-585: per-device serve predicate for the watermark-vector
+    /// catch-up. Serve an event when the requester has no entry for its
+    /// authoring device (never seen it → send all) or the event exceeds
+    /// the requester's per-device max. Per-device the HLC order reduces to
+    /// `(wall_ms, logical)` (constant `device_id`).
+    fn vector_serves(vector: &WatermarkVector, ev: &SignedChannelEvent) -> bool {
+        let at = ev.at();
+        match vector.get(&at.device_id) {
+            None => true,
+            Some(&(w, l)) => (at.wall_ms, at.logical) > (w, l),
+        }
+    }
+
+    /// ZEB-585: vector backing for `list_messages_vector` /
+    /// `list_post_events_vector`. Same segment-then-tail HLC walk as
+    /// `collect_events`, but filters per authoring-device against the
+    /// requester's watermark vector. Unlike the scalar path there is NO
+    /// global-range segment skip — a never-seen device's events may sit in
+    /// any segment, so every segment is scanned. Wire cost stays O(diff)
+    /// (only matching events are returned); the O(history) disk read is the
+    /// accepted Part-A cost (ZEB-585 §A.6; Part B's segment fingerprints
+    /// bound it).
+    async fn collect_events_vector(
+        &self,
+        vector: &WatermarkVector,
+        limit: usize,
+        keep: impl Fn(&SignedChannelEvent) -> bool,
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogEngineError> {
+        let effective_limit = if limit == 0 {
+            self.config.backfill_default_limit
+        } else {
+            limit
+        };
+
+        let log = self.log.lock().await;
+        let mut out: Vec<SignedChannelEvent> = Vec::new();
+
+        for seg in &log.manifest.segments {
+            let events = log
+                .read_segment(seg)
+                .map_err(ChannelLogEngineError::Persist)?;
+            for ev in events {
+                if !Self::vector_serves(vector, &ev) || !keep(&ev) {
+                    continue;
+                }
+                out.push(ev);
+                if out.len() >= effective_limit {
+                    return Ok(out);
+                }
+            }
+        }
+
+        for ev in &log.tail {
+            if !Self::vector_serves(vector, ev) || !keep(ev) {
+                continue;
+            }
+            out.push(ev.clone());
+            if out.len() >= effective_limit {
+                return Ok(out);
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// ZEB-585: watermark-vector counterpart of `list_messages`.
+    pub async fn list_messages_vector(
+        &self,
+        vector: &WatermarkVector,
+        limit: usize,
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogEngineError> {
+        self.collect_events_vector(vector, limit, |_| true).await
+    }
+
+    /// ZEB-585: watermark-vector counterpart of `list_post_events`.
+    pub async fn list_post_events_vector(
+        &self,
+        vector: &WatermarkVector,
+        limit: usize,
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogEngineError> {
+        self.collect_events_vector(vector, limit, |ev| {
+            matches!(ev, SignedChannelEvent::Post { .. })
+        })
+        .await
+    }
+
     /// ZEB-539: returns the first verified `ChannelAttachment` in this
     /// channel's log whose CID matches `cid`, or `None`.
     ///
@@ -829,6 +915,12 @@ impl ChannelLogEngine {
     /// replies can't advance the driver's `since` cursor.
     pub async fn log_max_hlc(&self) -> Option<Hlc> {
         self.log.lock().await.max_hlc()
+    }
+
+    /// ZEB-585: snapshot the per-device catch-up watermark vector from the
+    /// verified log. Counterpart of `log_max_hlc` for the vector path.
+    pub async fn log_watermark_vector(&self) -> WatermarkVector {
+        self.log.lock().await.watermark_vector()
     }
 
     /// IPC entry: mint a Post event, sign it with self, encrypt with
@@ -2841,6 +2933,60 @@ mod tests {
         for (got, want) in listed.iter().zip(events.iter()) {
             assert_eq!(extract_id(got), extract_id(want));
         }
+    }
+
+    #[tokio::test]
+    async fn collect_events_vector_serves_unseen_device_and_per_device_tail() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let mk = |wall: u64, dev: &str, body: &str| {
+            make_signed_event(
+                fix.community_id,
+                fix.channel_id,
+                fix.self_owner,
+                Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: dev.to_string(),
+                },
+                body,
+                &fix.signing_key,
+            )
+        };
+        // dev-a posts (100) then (200); dev-b posts (50) — a sub-max wall_ms
+        // from a device the requester has never seen.
+        let events = vec![mk(100, "dev-a", "a1"), mk(200, "dev-a", "a2"), mk(50, "dev-b", "b1")];
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            for ev in &events {
+                log.append(ev.clone()).expect("append");
+            }
+        }
+
+        // log_watermark_vector reflects the per-device maxes.
+        let wv = fix.engine.log_watermark_vector().await;
+        assert_eq!(wv.get("dev-a"), Some(&(200, 0)));
+        assert_eq!(wv.get("dev-b"), Some(&(50, 0)));
+
+        // Requester has dev-a up to (150,0); has NEVER seen dev-b.
+        let mut v: WatermarkVector = std::collections::BTreeMap::new();
+        v.insert("dev-a".to_string(), (150, 0));
+        let bodies: Vec<String> = fix
+            .engine
+            .list_messages_vector(&v, 1000)
+            .await
+            .expect("list_vector")
+            .into_iter()
+            .filter_map(|ev| match ev {
+                SignedChannelEvent::Post { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert!(bodies.contains(&"a2".to_string()), "dev-a tail beyond (150,0) served");
+        assert!(
+            bodies.contains(&"b1".to_string()),
+            "never-seen dev-b served even though its HLC (50) sorts below the requester's global max"
+        );
+        assert!(!bodies.contains(&"a1".to_string()), "dev-a (100,0) <= (150,0) filtered out");
     }
 
     /// ZEB-270 Phase 3 Task 5: pub `event_to_dto` accessor.
