@@ -1,7 +1,7 @@
 // src/lib/voice-session.test.ts
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { get } from 'svelte/store';
-import { VoiceSession, classifyMicError } from './voice-session';
+import { VoiceSession, classifyMicError, getVoiceSession } from './voice-session';
 
 function deps() {
   const invoke = vi.fn().mockResolvedValue(undefined);
@@ -504,5 +504,38 @@ describe('VoiceSession moderation (ZEB-358)', () => {
       mutedOwners: [], kickedOwners: ['aa'.repeat(16)], powers: {}, selfPower: 0, selfModMuted: false, selfKicked: true });
     expect(get(s.state).selfKicked).toBe(true);
     expect(get(s.state).muted).toBe(true);
+  });
+});
+
+// ZEB-354: getVoiceSession must be a PER-IDENTITY singleton (mirror
+// getCallSession / getGroupCallSession), so a stop_node/start_node identity
+// switch rebuilds the session instead of keeping the previous identity's keys/
+// adapter/IPC handles.
+describe('getVoiceSession identity-switch singleton', () => {
+  function vsDeps(selfOwnerHex: string) {
+    const d = deps();
+    return {
+      invoke: d.invoke,
+      listen: d.listen,
+      selfOwnerHex,
+      selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      ...d.factories,
+    };
+  }
+
+  it('returns a new instance and destroys the old on identity switch', () => {
+    const first = getVoiceSession(vsDeps('aa'.repeat(16)));
+    const destroySpy = vi.spyOn(first, 'destroy');
+
+    // Same identity ⇒ cached instance, not destroyed.
+    const same = getVoiceSession(vsDeps('aa'.repeat(16)));
+    expect(same).toBe(first);
+    expect(destroySpy).not.toHaveBeenCalled();
+
+    // Different identity ⇒ new instance, the old one destroyed.
+    const second = getVoiceSession(vsDeps('fe'.repeat(16)));
+    expect(second).not.toBe(first);
+    expect(destroySpy).toHaveBeenCalled();
   });
 });
