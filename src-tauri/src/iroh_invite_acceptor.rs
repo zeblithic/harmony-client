@@ -315,13 +315,16 @@ where
                 deadline_ms: self.config.io_deadline.as_millis() as u64,
             })?
             .map_err(|e| HandshakeAcceptError::ReadPrefix(e.to_string()))?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > HANDSHAKE_MAX_PACKET_LEN {
-            return Err(HandshakeAcceptError::PrefixOutOfBounds {
-                len,
-                max: HANDSHAKE_MAX_PACKET_LEN,
-            });
-        }
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            HANDSHAKE_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| HandshakeAcceptError::PrefixOutOfBounds {
+            len: e.len,
+            max: e.max,
+        })?;
         let mut packet_bytes = vec![0u8; len];
         tokio::time::timeout(self.config.io_deadline, recv.read_exact(&mut packet_bytes))
             .await
@@ -457,24 +460,24 @@ where
         send: &mut iroh::endpoint::SendStream,
         response_bytes: &[u8],
     ) -> Result<(), HandshakeAcceptError> {
-        if response_bytes.len() > HANDSHAKE_MAX_PACKET_LEN {
-            return Err(HandshakeAcceptError::ResponseTooLarge {
-                len: response_bytes.len(),
-                max: HANDSHAKE_MAX_PACKET_LEN,
-            });
-        }
-        let response_len = response_bytes.len() as u32;
-
-        tokio::time::timeout(
-            self.config.io_deadline,
-            send.write_all(&response_len.to_le_bytes()),
+        let response_prefix = crate::iroh_framing::encode_len_prefix(
+            response_bytes.len(),
+            HANDSHAKE_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
         )
-        .await
-        .map_err(|_| HandshakeAcceptError::IoTimeout {
-            step: "write length-prefix",
-            deadline_ms: self.config.io_deadline.as_millis() as u64,
-        })?
-        .map_err(|e| HandshakeAcceptError::WritePrefix(e.to_string()))?;
+        .map_err(|e| HandshakeAcceptError::ResponseTooLarge {
+            len: e.len,
+            max: e.max,
+        })?;
+
+        tokio::time::timeout(self.config.io_deadline, send.write_all(&response_prefix))
+            .await
+            .map_err(|_| HandshakeAcceptError::IoTimeout {
+                step: "write length-prefix",
+                deadline_ms: self.config.io_deadline.as_millis() as u64,
+            })?
+            .map_err(|e| HandshakeAcceptError::WritePrefix(e.to_string()))?;
         tokio::time::timeout(self.config.io_deadline, send.write_all(response_bytes))
             .await
             .map_err(|_| HandshakeAcceptError::IoTimeout {

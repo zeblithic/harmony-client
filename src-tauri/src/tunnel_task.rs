@@ -507,11 +507,19 @@ async fn write_length_prefixed(
     stream: &mut SendStream,
     data: &[u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut frame = Vec::with_capacity(4 + data.len());
-    frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    frame.extend_from_slice(data);
-    stream.write_all(&frame).await?;
-    Ok(())
+    // The write side is caller-bounded (handshake messages), so cap at the
+    // wire-representable max (u32::MAX): preserves the historical "always
+    // write" behavior while keeping the prefix u32-safe. BE + allow-empty
+    // matches this protocol's shipped wire format exactly.
+    crate::iroh_framing::write_len_prefixed(
+        stream,
+        data,
+        u32::MAX as usize,
+        crate::iroh_framing::Endian::Be,
+        true,
+    )
+    .await
+    .map_err(Into::into)
 }
 
 /// Read a length-prefixed message: `[4 bytes big-endian length][payload]`.
@@ -523,15 +531,18 @@ async fn read_length_prefixed(
     stream: &mut RecvStream,
     max_bytes: usize,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > max_bytes {
-        return Err(format!("message too large: {len} bytes (max {max_bytes})").into());
-    }
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(buf)
+    // BE + allow-empty: this protocol accepts zero-length frames (the cap is
+    // read-side only). Preserve the exact "message too large" error text.
+    crate::iroh_framing::read_len_prefixed(stream, max_bytes, crate::iroh_framing::Endian::Be, true)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            match e {
+                crate::iroh_framing::FramingError::OutOfBounds(f) => {
+                    format!("message too large: {} bytes (max {})", f.len, f.max).into()
+                }
+                crate::iroh_framing::FramingError::Io(io) => Box::new(io),
+            }
+        })
 }
 
 /// Monotonic milliseconds since first call (process-global epoch). Used for

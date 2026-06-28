@@ -25,7 +25,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::owner_state_crypto::{
     canonical_cbor_decode, canonical_cbor_encode, sealed::CanonicalPayloadSealed, CanonicalPayload,
@@ -192,6 +192,20 @@ pub enum DepositWireError {
     Decode(String),
 }
 
+impl From<crate::iroh_framing::FramingError> for DepositWireError {
+    fn from(e: crate::iroh_framing::FramingError) -> Self {
+        match e {
+            crate::iroh_framing::FramingError::OutOfBounds(f) => {
+                DepositWireError::FrameOutOfBounds {
+                    len: f.len,
+                    max: f.max,
+                }
+            }
+            crate::iroh_framing::FramingError::Io(io) => DepositWireError::Io(io),
+        }
+    }
+}
+
 /// The single shared signature construction for deposit frames:
 /// `BUTLER_DEPOSIT_SIG_DOMAIN ‖ recipient_owner ‖ sealed_blob`. Both the
 /// sender (signer) and the butler (verifier) MUST build the signed bytes
@@ -257,17 +271,15 @@ pub async fn write_length_prefixed_with_max<W: AsyncWrite + Unpin>(
     body: &[u8],
     max: usize,
 ) -> Result<(), DepositWireError> {
-    if body.is_empty() || body.len() > max {
-        return Err(DepositWireError::FrameOutOfBounds {
-            len: body.len(),
-            max,
-        });
-    }
-    // Cast is lossless: body.len() <= max <= u32::MAX (callers pass caps far
-    // below u32::MAX).
-    writer.write_all(&(body.len() as u32).to_le_bytes()).await?;
-    writer.write_all(body).await?;
-    Ok(())
+    crate::iroh_framing::write_len_prefixed(
+        writer,
+        body,
+        max,
+        crate::iroh_framing::Endian::Le,
+        false,
+    )
+    .await
+    .map_err(DepositWireError::from)
 }
 
 /// Read a `[u32 LE length-prefix][body]` frame. A prefix of zero or
@@ -289,15 +301,9 @@ pub async fn read_length_prefixed_with_max<R: AsyncRead + Unpin>(
     reader: &mut R,
     max: usize,
 ) -> Result<Vec<u8>, DepositWireError> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf).await?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 || len > max {
-        return Err(DepositWireError::FrameOutOfBounds { len, max });
-    }
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body).await?;
-    Ok(body)
+    crate::iroh_framing::read_len_prefixed(reader, max, crate::iroh_framing::Endian::Le, false)
+        .await
+        .map_err(DepositWireError::from)
 }
 
 // =====================================================================

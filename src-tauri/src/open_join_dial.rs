@@ -256,9 +256,18 @@ pub async fn open_join_after_resolve(
     let wire = encode_packet(&packet).map_err(|e| format!("encode_packet: {e}"))?;
 
     // 8. Write [u32 LE len][wire] then finish(), each bounded by write_timeout.
-    let wire_len = wire.len() as u32;
     let write_prefix = async {
-        send.write_all(&wire_len.to_le_bytes())
+        // Caller-bounded packet; no historical write cap, so cap at the wire-
+        // representable max (u32::MAX) — preserves behavior, keeps the prefix
+        // u32-safe, and unifies byte order.
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            wire.len(),
+            u32::MAX as usize,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("length-prefix out of bounds: {e}"))?;
+        send.write_all(&prefix)
             .await
             .map_err(|e| format!("write length-prefix: {e}"))
     };
@@ -311,14 +320,13 @@ pub async fn open_join_after_resolve(
         recv.read_exact(&mut len_buf)
             .await
             .map_err(|e| format!("read length-prefix: {e}"))?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN {
-            return Err(format!(
-                "response length out of bounds: len={} max={}",
-                len,
-                crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN
-            ));
-        }
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("response length out of bounds: len={} max={}", e.len, e.max))?;
         let mut body = vec![0u8; len];
         recv.read_exact(&mut body)
             .await
