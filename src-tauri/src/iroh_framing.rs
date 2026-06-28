@@ -19,6 +19,8 @@
 //! order); the little-endian variant exists only for backward wire-compat with
 //! already-deployed peers.
 
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
 /// Byte order of the 4-byte `u32` length prefix. A parameter (not a constant)
 /// because shipped protocols disagree and their on-the-wire bytes must be
 /// preserved.
@@ -86,6 +88,53 @@ pub fn decode_len_prefix(
         return Err(FrameLenError { len, max });
     }
     Ok(len)
+}
+
+/// An error from the async framing wrappers: either the body length was out of
+/// bounds (the cap guard fired, before any I/O on the body) or the underlying
+/// stream returned an I/O error.
+#[derive(Debug, thiserror::Error)]
+pub enum FramingError {
+    #[error(transparent)]
+    OutOfBounds(#[from] FrameLenError),
+    #[error("frame I/O: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Write a `[u32 prefix][body]` frame. The bound check ([`encode_len_prefix`])
+/// runs first, so an out-of-bounds body is rejected before anything is written.
+/// Prefix and body go out in a single buffer so a partial write can't leave the
+/// peer's reader stuck mid-frame.
+pub async fn write_len_prefixed<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    body: &[u8],
+    max: usize,
+    endian: Endian,
+    allow_empty: bool,
+) -> Result<(), FramingError> {
+    let prefix = encode_len_prefix(body.len(), max, endian, allow_empty)?;
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&prefix);
+    frame.extend_from_slice(body);
+    w.write_all(&frame).await?;
+    Ok(())
+}
+
+/// Read a `[u32 prefix][body]` frame. The prefix is decoded and bound-checked
+/// ([`decode_len_prefix`]) before the body is allocated or read, so an
+/// attacker-supplied prefix never drives an allocation past `max`.
+pub async fn read_len_prefixed<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max: usize,
+    endian: Endian,
+    allow_empty: bool,
+) -> Result<Vec<u8>, FramingError> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf).await?;
+    let len = decode_len_prefix(len_buf, max, endian, allow_empty)?;
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).await?;
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -177,5 +226,80 @@ mod core_tests {
             decode_len_prefix(le, usize::MAX, Endian::Le, false).unwrap(),
             len
         );
+    }
+}
+
+#[cfg(test)]
+mod wrapper_tests {
+    use super::*;
+
+    const MAX: usize = 1024;
+
+    #[tokio::test]
+    async fn round_trip_le_nonempty() {
+        let body = b"hello frame".to_vec();
+        let mut buf = Vec::new();
+        write_len_prefixed(&mut buf, &body, MAX, Endian::Le, false)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..4], &(body.len() as u32).to_le_bytes());
+        let mut reader = buf.as_slice();
+        let got = read_len_prefixed(&mut reader, MAX, Endian::Le, false)
+            .await
+            .unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[tokio::test]
+    async fn round_trip_be_allow_empty_zero_length() {
+        let mut buf = Vec::new();
+        write_len_prefixed(&mut buf, &[], MAX, Endian::Be, true)
+            .await
+            .unwrap();
+        assert_eq!(buf, vec![0, 0, 0, 0]);
+        let mut reader = buf.as_slice();
+        let got = read_len_prefixed(&mut reader, MAX, Endian::Be, true)
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_rejects_oversize_before_body() {
+        // Prefix only, no body: an honest reader would block/EOF on the body.
+        // The cap guard must reject from the prefix alone (OutOfBounds, not Io).
+        let prefix_only = ((MAX + 1) as u32).to_le_bytes().to_vec();
+        let mut reader = prefix_only.as_slice();
+        let err = read_len_prefixed(&mut reader, MAX, Endian::Le, false)
+            .await
+            .expect_err("oversize prefix must be rejected");
+        assert!(
+            matches!(err, FramingError::OutOfBounds(FrameLenError { len, max }) if len == MAX + 1 && max == MAX),
+            "expected OutOfBounds rejected before body read, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_oversize_writes_nothing() {
+        let body = vec![0u8; MAX + 1];
+        let mut buf = Vec::new();
+        let err = write_len_prefixed(&mut buf, &body, MAX, Endian::Le, false)
+            .await
+            .expect_err("oversize body must be rejected");
+        assert!(matches!(err, FramingError::OutOfBounds(_)));
+        assert!(buf.is_empty(), "nothing should be written on rejection");
+    }
+
+    #[tokio::test]
+    async fn write_rejects_empty_when_disallowed() {
+        let mut buf = Vec::new();
+        let err = write_len_prefixed(&mut buf, &[], MAX, Endian::Le, false)
+            .await
+            .expect_err("empty body must be rejected when not allowed");
+        assert!(matches!(
+            err,
+            FramingError::OutOfBounds(FrameLenError { len: 0, .. })
+        ));
+        assert!(buf.is_empty());
     }
 }
