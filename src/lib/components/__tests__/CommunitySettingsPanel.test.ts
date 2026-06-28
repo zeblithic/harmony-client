@@ -451,4 +451,47 @@ describe('CommunitySettingsPanel', () => {
       expect(setCall![1]).toEqual({ communityIdHex: baseProps.communityId, optedIn: true });
     });
   });
+
+  it('relay_toggle_stale_completion_does_not_clobber_after_community_switch', async () => {
+    // CodeRabbit PR #357: switching communities while a set is in flight must
+    // not let the old community's completion mutate the new community's toggle.
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    // A `deferred` object (not a `let`) so TS doesn't narrow the
+    // closure-assigned reject handle to `never` at the call site.
+    const deferred: { reject?: (e: unknown) => void } = {};
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'get_community_relay_status') return Promise.resolve(false);
+      if (cmd === 'set_community_relay_opt_in') {
+        // Community A's set stays pending until we reject it below.
+        return new Promise((_resolve, reject) => {
+          deferred.reject = reject;
+        });
+      }
+      return Promise.resolve([]);
+    });
+    const { getByLabelText, queryByText, rerender } = render(CommunitySettingsPanel, {
+      props: baseProps,
+    });
+    const cbA = await waitFor(() => {
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(el.disabled).toBe(false);
+      return el;
+    });
+    await fireEvent.click(cbA); // community A: set now in flight (pending)
+    // Switch to community B before A's set resolves.
+    await rerender({ ...baseProps, communityId: '11'.repeat(32) });
+    await waitFor(() => {
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      // B's fresh status read cleared A's pending → toggle usable, unchecked.
+      expect(el.disabled).toBe(false);
+      expect(el.checked).toBe(false);
+    });
+    // Fail community A's stale set — its error must NOT surface on community B.
+    deferred.reject?.(new Error('stale-A-failure'));
+    await waitFor(() => {
+      expect(queryByText(/stale-A-failure/)).toBeNull();
+      const el = getByLabelText(/Relay this community for offline members/i) as HTMLInputElement;
+      expect(el.disabled).toBe(false);
+    });
+  });
 });

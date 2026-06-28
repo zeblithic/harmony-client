@@ -199,6 +199,11 @@
     void communityId;
     const mySeq = ++relayStatusSeq;
     relayLoading = true;
+    // A new community starts fresh: clear any in-flight toggle state from the
+    // prior community so its pending/error can't bleed across (the toggle
+    // handler also drops its own stale completions, below).
+    relayPending = false;
+    relayError = null;
     invoke<boolean>('get_community_relay_status', { communityIdHex: communityId })
       .then((v) => {
         if (mySeq !== relayStatusSeq) return; // superseded
@@ -223,21 +228,30 @@
     // shared-in-profile toggle below).
     const target = e.currentTarget as HTMLInputElement;
     const next = target.checked;
+    // Bind this completion to the community it was clicked on. If the user
+    // switches communities while the set is in flight, the stale completion
+    // must NOT touch the new community's toggle state (CodeRabbit PR #357) —
+    // otherwise community A's failure could roll back B's UI or leave B's
+    // toggle stuck disabled. The $effect above clears pending/error on switch,
+    // so dropping the stale completion here is sufficient.
+    const cid = communityId;
     relayOptedIn = next; // optimistic
     relayPending = true;
     try {
       await invoke('set_community_relay_opt_in', {
-        communityIdHex: communityId,
+        communityIdHex: cid,
         optedIn: next,
       });
+      if (cid !== communityId) return; // switched mid-flight — drop
       relayError = null;
     } catch (err) {
+      if (cid !== communityId) return; // switched mid-flight — drop
       // Roll back both the model and the DOM checkbox on failure.
       relayOptedIn = !next;
       target.checked = !next;
       relayError = err instanceof Error ? err.message : String(err);
     } finally {
-      relayPending = false;
+      if (cid === communityId) relayPending = false;
     }
   }
 
