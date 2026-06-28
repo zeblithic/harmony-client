@@ -2857,7 +2857,7 @@
   />
 {/if}
 
-<BackupStalenessWarning onExportRequested={handleExportRequested} />
+<BackupStalenessWarning ownerId={selfOwnerId} onExportRequested={handleExportRequested} />
 
 <div class="app-shell">
 {#if ownerIdentityState === 'present'}

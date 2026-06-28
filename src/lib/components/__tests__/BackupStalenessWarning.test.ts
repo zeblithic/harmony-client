@@ -1,4 +1,5 @@
 import { render, fireEvent, screen, waitFor } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import BackupStalenessWarning from '../BackupStalenessWarning.svelte';
 
@@ -9,6 +10,8 @@ vi.mock('../../backup-service', () => ({
 }));
 
 import { getBackupStaleness, dismissForDays } from '../../backup-service';
+
+const OWNER = 'aaaa0000aaaa0000aaaa0000aaaa0000';
 
 describe('BackupStalenessWarning', () => {
   beforeEach(() => {
@@ -21,8 +24,10 @@ describe('BackupStalenessWarning', () => {
       isStale: true,
       daysSince: 23,
     });
-    render(BackupStalenessWarning, { props: {} });
+    render(BackupStalenessWarning, { props: { ownerId: OWNER } });
     expect(await screen.findByText(/Your backup is 23 days old/i)).toBeTruthy();
+    // ZEB-589: the staleness check is scoped to this owner.
+    expect(getBackupStaleness).toHaveBeenCalledWith(OWNER);
   });
 
   it('does NOT render when isStale is false', async () => {
@@ -33,11 +38,34 @@ describe('BackupStalenessWarning', () => {
       isStale: false,
       daysSince: 0,
     });
-    const { container } = render(BackupStalenessWarning, { props: {} });
+    const { container } = render(BackupStalenessWarning, { props: { ownerId: OWNER } });
     await waitFor(() => {
       expect(getBackupStaleness).toHaveBeenCalled();
     });
     expect(container.querySelector('[data-testid="backup-staleness-banner"]')).toBeNull();
+  });
+
+  it('does NOT query staleness before the owner identity resolves (null)', async () => {
+    render(BackupStalenessWarning, { props: { ownerId: null } });
+    await tick(); // let the reactive effect flush
+    expect(getBackupStaleness).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('backup-staleness-banner')).toBeNull();
+  });
+
+  it('clears the previous owner banner on owner change, before the new lookup resolves', async () => {
+    const OTHER = 'bbbb1111bbbb1111bbbb1111bbbb1111';
+    const mock = getBackupStaleness as ReturnType<typeof vi.fn>;
+    // First owner: stale. Second owner: a lookup that stays pending so we can
+    // assert the old banner is gone DURING the in-flight window (the reset).
+    mock.mockResolvedValueOnce({ isStale: true, daysSince: 23 });
+    mock.mockImplementationOnce(() => new Promise(() => {}));
+    const { rerender } = render(BackupStalenessWarning, { props: { ownerId: OWNER } });
+    expect(await screen.findByText(/Your backup is 23 days old/i)).toBeTruthy();
+    await rerender({ ownerId: OTHER });
+    await tick();
+    // OTHER's lookup is still pending; OWNER's banner must not linger.
+    expect(screen.queryByText(/Your backup is 23 days old/i)).toBeNull();
+    expect(screen.queryByTestId('backup-staleness-banner')).toBeNull();
   });
 
   it('hides the banner after Dismiss for 7 days clicked', async () => {
@@ -49,10 +77,11 @@ describe('BackupStalenessWarning', () => {
       isStale: true,
       daysSince: 30,
     });
-    render(BackupStalenessWarning, { props: {} });
+    render(BackupStalenessWarning, { props: { ownerId: OWNER } });
     const btn = await screen.findByRole('button', { name: /dismiss/i });
     await fireEvent.click(btn);
-    expect(dismissForDays).toHaveBeenCalledWith(7);
+    // ZEB-589: the snooze is recorded for this owner only.
+    expect(dismissForDays).toHaveBeenCalledWith(7, OWNER);
     // After dismiss the banner should disappear in-place.
     await waitFor(() => {
       expect(screen.queryByText(/Your backup is/i)).toBeNull();
@@ -65,7 +94,7 @@ describe('BackupStalenessWarning', () => {
       daysSince: 30,
     });
     const onExportRequested = vi.fn();
-    render(BackupStalenessWarning, { props: { onExportRequested } });
+    render(BackupStalenessWarning, { props: { ownerId: OWNER, onExportRequested } });
     const btn = await screen.findByRole('button', { name: /export new backup/i });
     await fireEvent.click(btn);
     expect(onExportRequested).toHaveBeenCalledTimes(1);

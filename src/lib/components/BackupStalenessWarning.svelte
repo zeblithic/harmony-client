@@ -1,28 +1,47 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import { getBackupStaleness, dismissForDays } from '../backup-service';
 
   interface Props {
+    /** Current owner identity hex, or null until get_owner_state resolves.
+     *  The staleness check + dismiss snooze are owner-scoped (ZEB-589); a null
+     *  owner stays inert (this banner mounts before the owner resolves). */
+    ownerId: string | null;
     onExportRequested?: () => void;
   }
-  let { onExportRequested }: Props = $props();
+  let { ownerId, onExportRequested }: Props = $props();
 
   let isStale = $state(false);
   let daysSince = $state(0);
 
-  onMount(async () => {
-    try {
-      const r = await getBackupStaleness();
-      isStale = r.isStale;
-      daysSince = r.daysSince;
-    } catch {
-      // Best-effort — never block UI on staleness check failure.
-      isStale = false;
-    }
+  // Re-check whenever the owner identity resolves/changes (the banner mounts
+  // outside the owner-present gate). Cancellation drops a superseded fetch so a
+  // prior owner's result can't clobber the current owner's.
+  $effect(() => {
+    const owner = ownerId;
+    // Clear any prior owner's banner BEFORE the next lookup resolves, so a
+    // dismiss during the in-flight window can't snooze the NEW owner using the
+    // old banner's displayed state (CodeRabbit).
+    isStale = false;
+    daysSince = 0;
+    if (!owner) return;
+    let cancelled = false;
+    void getBackupStaleness(owner)
+      .then((r) => {
+        if (cancelled) return;
+        isStale = r.isStale;
+        daysSince = r.daysSince;
+      })
+      .catch(() => {
+        // Best-effort — never block UI on staleness check failure.
+        if (!cancelled) isStale = false;
+      });
+    return () => {
+      cancelled = true;
+    };
   });
 
   function dismiss() {
-    dismissForDays(7);
+    if (ownerId) dismissForDays(7, ownerId);
     isStale = false;
   }
 
