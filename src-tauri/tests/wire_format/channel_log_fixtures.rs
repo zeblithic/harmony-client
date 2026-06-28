@@ -41,7 +41,10 @@ use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 // `--features test-fixtures` skips just the backfill-packet pin and
 // leaves the SignedChannelEvent CBOR pin running.
 #[cfg(feature = "test-fixtures")]
-use harmony_app::community_channel_log::{derive_channel_key, encrypt_channel_packet_with_nonce};
+use harmony_app::community_channel_log::{
+    derive_channel_key, encrypt_channel_packet_with_nonce, seal_watermark_vector_with_nonce,
+    WatermarkVector,
+};
 #[cfg(feature = "test-fixtures")]
 use harmony_app::owner_state_types::EpochKey;
 
@@ -220,6 +223,38 @@ fn backfill_reply_packet_wire_bytes_pinned() {
     assert_eq!(
         actual_hex, expected_hex,
         "backfill reply wire format drifted; re-pin via \
+         UPDATE_BACKFILL_FIXTURE=1 (see file header for procedure)"
+    );
+}
+
+/// ZEB-585: wire-format pin for a sealed `WatermarkVector`. Asserts the
+/// AEAD-sealed catch-up watermark payload is byte-stable under fixed
+/// inputs (channel key + deterministic nonce + a 2-lane vector keyed by
+/// `(author, device)`) so a future CBOR/AAD/nonce-layout change is caught
+/// immediately. Mirrors `backfill_reply_packet_wire_bytes_pinned`; re-pin
+/// the same way (`UPDATE_BACKFILL_FIXTURE=1`).
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn watermark_vector_sealed_wire_bytes_pinned() {
+    let community_id = SpaceId([0xc0; 16]);
+    let channel_id = ChannelId([0x01; 16]);
+    let mk = EpochKey::new([0x77; 32]);
+    let key = derive_channel_key(&mk, &community_id, &channel_id);
+
+    let mut v: WatermarkVector = WatermarkVector::new();
+    v.insert((OwnerAddr([0xa1; 16]), "a-dev".to_string()), (100_000, 0));
+    v.insert((OwnerAddr([0xb2; 16]), "b-dev".to_string()), (250_000, 7));
+    let sealed = seal_watermark_vector_with_nonce(&key, &v, [0u8; 12]).expect("seal");
+    let actual_hex = hex::encode(&sealed);
+
+    if std::env::var("UPDATE_BACKFILL_FIXTURE").is_ok() {
+        eprintln!("UPDATE_WMV_FIXTURE: {actual_hex}");
+    }
+
+    let expected_hex = "0000000000000000000000009ef36239b9993c1e45dcd02f571243de613f70de2cfe539acb930022d646b5e42dbec4aed13bdd9e4e6621d8cf5cda314fc8cc73838a97a86d9ad09c6ade8ff67ad93fcc41ee712754759ad15d4636";
+    assert_eq!(
+        actual_hex, expected_hex,
+        "watermark-vector wire format drifted; re-pin via \
          UPDATE_BACKFILL_FIXTURE=1 (see file header for procedure)"
     );
 }

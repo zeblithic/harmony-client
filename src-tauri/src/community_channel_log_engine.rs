@@ -19,11 +19,13 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::community_channel_log::{
-    decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, read_segment_at,
-    sign_channel_event, verify_channel_event, ChannelAttachment, ChannelEventError, ChannelKey,
-    ChannelLog, ChannelLogConfig, ChannelLogPersistError, ChannelLogReplayTracker,
-    ChannelPostPayload, CommunityStateAtHlc, MessageId, SegmentDescriptor, SignedChannelEvent,
-    MAX_ATTACHMENTS, MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
+    decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, open_watermark_vector,
+    read_segment_at, seal_watermark_vector, sign_channel_event, verify_channel_event,
+    ChannelAttachment, ChannelEventError, ChannelKey, ChannelLog, ChannelLogConfig,
+    ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc,
+    MessageId, SegmentDescriptor, SignedChannelEvent, WatermarkVector, MAX_ATTACHMENTS,
+    MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS, MAX_WATERMARK_VECTOR_BYTES,
+    MAX_WATERMARK_VECTOR_ENTRIES,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -410,6 +412,13 @@ pub struct BackfillQueryRequest {
     /// instead, so the receiver observes a closed channel). `None` →
     /// existing fire-and-forget behaviour (IPC path unchanged).
     pub outcome_tx: Option<tokio::sync::oneshot::Sender<BackfillPageReport>>,
+    /// ZEB-585: an AEAD-sealed per-author [`WatermarkVector`] for a normal
+    /// catch-up (`since == Some`). `None` for a full reconcile
+    /// (`since == None`) or when sealing/cap degraded to the key-expr
+    /// scalar path. The requester-side GET driver forwards these opaque
+    /// bytes as the GET payload; the responder opens them with the channel
+    /// key (it has no key on the requester side).
+    pub watermark_sealed: Option<Vec<u8>>,
 }
 
 /// Bundles per-instance dependencies + I/O channel endpoints + the
@@ -754,6 +763,95 @@ impl ChannelLogEngine {
         Ok(out)
     }
 
+    /// ZEB-585: per-author-lane serve predicate for the watermark-vector
+    /// catch-up. Serve an event when the requester has no entry for its
+    /// `(author, device)` lane (never seen it → send all) or the event
+    /// exceeds the requester's per-lane max. Keying by the full lane (not
+    /// `device_id` alone) prevents one author's watermark from suppressing
+    /// another author who shares the same `device_id`. Within a lane the
+    /// HLC order reduces to `(wall_ms, logical)`.
+    fn vector_serves(vector: &WatermarkVector, ev: &SignedChannelEvent) -> bool {
+        let at = ev.at();
+        let lane = (*ev.author(), at.device_id.clone());
+        match vector.get(&lane) {
+            None => true,
+            Some(&(w, l)) => (at.wall_ms, at.logical) > (w, l),
+        }
+    }
+
+    /// ZEB-585: vector backing for `list_messages_vector` /
+    /// `list_post_events_vector`. Same segment-then-tail HLC walk as
+    /// `collect_events`, but filters per authoring-device against the
+    /// requester's watermark vector. Unlike the scalar path there is NO
+    /// global-range segment skip — a never-seen device's events may sit in
+    /// any segment, so every segment is scanned. Wire cost stays O(diff)
+    /// (only matching events are returned); the O(history) disk read is the
+    /// accepted Part-A cost (ZEB-585 §A.6; Part B's segment fingerprints
+    /// bound it).
+    async fn collect_events_vector(
+        &self,
+        vector: &WatermarkVector,
+        limit: usize,
+        keep: impl Fn(&SignedChannelEvent) -> bool,
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogEngineError> {
+        let effective_limit = if limit == 0 {
+            self.config.backfill_default_limit
+        } else {
+            limit
+        };
+
+        let log = self.log.lock().await;
+        let mut out: Vec<SignedChannelEvent> = Vec::new();
+
+        for seg in &log.manifest.segments {
+            let events = log
+                .read_segment(seg)
+                .map_err(ChannelLogEngineError::Persist)?;
+            for ev in events {
+                if !Self::vector_serves(vector, &ev) || !keep(&ev) {
+                    continue;
+                }
+                out.push(ev);
+                if out.len() >= effective_limit {
+                    return Ok(out);
+                }
+            }
+        }
+
+        for ev in &log.tail {
+            if !Self::vector_serves(vector, ev) || !keep(ev) {
+                continue;
+            }
+            out.push(ev.clone());
+            if out.len() >= effective_limit {
+                return Ok(out);
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// ZEB-585: watermark-vector counterpart of `list_messages`.
+    pub async fn list_messages_vector(
+        &self,
+        vector: &WatermarkVector,
+        limit: usize,
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogEngineError> {
+        self.collect_events_vector(vector, limit, |_| true).await
+    }
+
+    /// ZEB-585: watermark-vector counterpart of `list_post_events`.
+    pub async fn list_post_events_vector(
+        &self,
+        vector: &WatermarkVector,
+        limit: usize,
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogEngineError> {
+        self.collect_events_vector(vector, limit, |ev| {
+            matches!(ev, SignedChannelEvent::Post { .. })
+        })
+        .await
+    }
+
     /// ZEB-539: returns the first verified `ChannelAttachment` in this
     /// channel's log whose CID matches `cid`, or `None`.
     ///
@@ -829,6 +927,12 @@ impl ChannelLogEngine {
     /// replies can't advance the driver's `since` cursor.
     pub async fn log_max_hlc(&self) -> Option<Hlc> {
         self.log.lock().await.max_hlc()
+    }
+
+    /// ZEB-585: snapshot the per-device catch-up watermark vector from the
+    /// verified log. Counterpart of `log_max_hlc` for the vector path.
+    pub async fn log_watermark_vector(&self) -> WatermarkVector {
+        self.log.lock().await.watermark_vector()
     }
 
     /// IPC entry: mint a Post event, sign it with self, encrypt with
@@ -1053,11 +1157,33 @@ impl ChannelLogEngine {
         since: Option<Hlc>,
         outcome_tx: Option<tokio::sync::oneshot::Sender<BackfillPageReport>>,
     ) -> Result<(), ChannelLogEngineError> {
+        // ZEB-585: attach a per-author watermark vector for a normal
+        // catch-up (since=Some). since=None is a full reconcile (periodic
+        // floor / fresh join) — no vector, serve everything, exactly as
+        // today. Sealed engine-side because the requester-side GET driver
+        // holds no channel key. Over the byte cap or a seal error → no
+        // vector (degrade to the key-expr scalar `since` + periodic floor).
+        let watermark_sealed = if since.is_some() {
+            let vector = self.log_watermark_vector().await;
+            // Bound the lane count BEFORE materializing the CBOR + AEAD —
+            // the byte cap only guards the responder's open path.
+            if vector.len() > MAX_WATERMARK_VECTOR_ENTRIES {
+                None
+            } else {
+                match seal_watermark_vector(self.channel_key_ref(), &vector) {
+                    Ok(bytes) if bytes.len() <= MAX_WATERMARK_VECTOR_BYTES => Some(bytes),
+                    _ => None,
+                }
+            }
+        } else {
+            None
+        };
         self.query_request_tx
             .send(BackfillQueryRequest {
                 since,
                 limit: 0,
                 outcome_tx,
+                watermark_sealed,
             })
             .await
             .map_err(|e| ChannelLogEngineError::BackfillFailed(e.to_string()))
@@ -2147,13 +2273,26 @@ impl ChannelLogRegistry {
         let read_for_query =
             Arc::new(
                 move |since: Option<Hlc>,
-                      limit: usize|
+                      limit: usize,
+                      watermark_sealed: Option<Vec<u8>>|
                       -> std::pin::Pin<
                     Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>,
                 > {
                     let me = Arc::clone(&engine_for_query);
                     Box::pin(async move {
-                        let events = match me.list_messages(since, limit).await {
+                        // ZEB-585: a sealed watermark vector selects the
+                        // per-device diff path; absent (or undecryptable)
+                        // falls back to the scalar `since` path.
+                        let events = match watermark_sealed {
+                            Some(bytes) => {
+                                match open_watermark_vector(me.channel_key_ref(), &bytes) {
+                                    Ok(vector) => me.list_messages_vector(&vector, limit).await,
+                                    Err(_) => me.list_messages(since, limit).await,
+                                }
+                            }
+                            None => me.list_messages(since, limit).await,
+                        };
+                        let events = match events {
                             Ok(v) => v,
                             Err(_) => return Vec::new(),
                         };
@@ -2841,6 +2980,142 @@ mod tests {
         for (got, want) in listed.iter().zip(events.iter()) {
             assert_eq!(extract_id(got), extract_id(want));
         }
+    }
+
+    #[tokio::test]
+    async fn collect_events_vector_serves_unseen_device_and_per_device_tail() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let mk = |wall: u64, dev: &str, body: &str| {
+            make_signed_event(
+                fix.community_id,
+                fix.channel_id,
+                fix.self_owner,
+                Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: dev.to_string(),
+                },
+                body,
+                &fix.signing_key,
+            )
+        };
+        // dev-a posts (100) then (200); dev-b posts (50) — a sub-max wall_ms
+        // from a device the requester has never seen.
+        let events = vec![
+            mk(100, "dev-a", "a1"),
+            mk(200, "dev-a", "a2"),
+            mk(50, "dev-b", "b1"),
+        ];
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            for ev in &events {
+                log.append(ev.clone()).expect("append");
+            }
+        }
+
+        // log_watermark_vector reflects the per-lane maxes (one author here).
+        let wv = fix.engine.log_watermark_vector().await;
+        assert_eq!(
+            wv.get(&(fix.self_owner, "dev-a".to_string())),
+            Some(&(200, 0))
+        );
+        assert_eq!(
+            wv.get(&(fix.self_owner, "dev-b".to_string())),
+            Some(&(50, 0))
+        );
+
+        // Requester has the (self, dev-a) lane up to (150,0); has NEVER seen
+        // the (self, dev-b) lane.
+        let mut v: WatermarkVector = std::collections::BTreeMap::new();
+        v.insert((fix.self_owner, "dev-a".to_string()), (150, 0));
+        let bodies: Vec<String> = fix
+            .engine
+            .list_messages_vector(&v, 1000)
+            .await
+            .expect("list_vector")
+            .into_iter()
+            .filter_map(|ev| match ev {
+                SignedChannelEvent::Post { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            bodies.contains(&"a2".to_string()),
+            "dev-a tail beyond (150,0) served"
+        );
+        assert!(
+            bodies.contains(&"b1".to_string()),
+            "never-seen dev-b served even though its HLC (50) sorts below the requester's global max"
+        );
+        assert!(
+            !bodies.contains(&"a1".to_string()),
+            "dev-a (100,0) <= (150,0) filtered out"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_does_not_collapse_two_authors_sharing_a_device_id() {
+        // CodeRabbit ZEB-585: keying the watermark by device alone would let
+        // author A's high lane watermark suppress author B's events on the
+        // SAME device_id. The lane key is (author, device), so B's unseen
+        // lane is still served. (ChannelLog::append checks only channel
+        // binding, so a second author can be injected directly.)
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let author_a = fix.self_owner;
+        let author_b = OwnerAddr([0xBB; 16]);
+        let ev_a = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            author_a,
+            Hlc {
+                wall_ms: 300,
+                logical: 0,
+                device_id: "shared-dev".to_string(),
+            },
+            "a-on-shared",
+            &fix.signing_key,
+        );
+        let ev_b = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            author_b,
+            Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "shared-dev".to_string(),
+            },
+            "b-on-shared",
+            &fix.signing_key,
+        );
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            log.append(ev_a).expect("append a");
+            log.append(ev_b).expect("append b");
+        }
+        // Requester has the (A, shared-dev) lane up to (300,0); has NEVER
+        // seen the (B, shared-dev) lane.
+        let mut v: WatermarkVector = std::collections::BTreeMap::new();
+        v.insert((author_a, "shared-dev".to_string()), (300, 0));
+        let bodies: Vec<String> = fix
+            .engine
+            .list_messages_vector(&v, 1000)
+            .await
+            .expect("list_vector")
+            .into_iter()
+            .filter_map(|ev| match ev {
+                SignedChannelEvent::Post { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            bodies.contains(&"b-on-shared".to_string()),
+            "author B's event on the shared device (HLC 100, below A's 300) \
+             must NOT be suppressed by A's lane watermark"
+        );
+        assert!(
+            !bodies.contains(&"a-on-shared".to_string()),
+            "author A's (300,0) <= requester's (300,0) → filtered"
+        );
     }
 
     /// ZEB-270 Phase 3 Task 5: pub `event_to_dto` accessor.
@@ -4234,6 +4509,75 @@ mod tests {
         assert!(
             req.outcome_tx.is_some(),
             "with_outcome variant must carry the oneshot through"
+        );
+    }
+
+    #[tokio::test]
+    async fn since_some_seals_vector_since_none_does_not() {
+        let mut fix = build_engine_fixture(8, 250, 1000).await;
+        // One event so the watermark vector is non-empty.
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            log.append(make_signed_event(
+                fix.community_id,
+                fix.channel_id,
+                fix.self_owner,
+                Hlc {
+                    wall_ms: 500,
+                    logical: 0,
+                    device_id: "dev-x".to_string(),
+                },
+                "x1",
+                &fix.signing_key,
+            ))
+            .expect("append");
+        }
+        let expected = fix.engine.log_watermark_vector().await;
+        assert!(!expected.is_empty());
+
+        // since=Some → a sealed vector is attached and opens to the engine's vector.
+        let (tx, _rx) = tokio::sync::oneshot::channel::<BackfillPageReport>();
+        Arc::clone(&fix.engine)
+            .request_backfill_with_outcome(
+                Some(Hlc {
+                    wall_ms: 500,
+                    logical: 0,
+                    device_id: "dev-x".to_string(),
+                }),
+                tx,
+            )
+            .await
+            .expect("backfill some");
+        let req = tokio::time::timeout(Duration::from_millis(500), fix.query_request_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("rx open");
+        let sealed = req
+            .watermark_sealed
+            .expect("since=Some must seal a watermark vector");
+        let opened = crate::community_channel_log::open_watermark_vector(
+            fix.engine.channel_key_ref(),
+            &sealed,
+        )
+        .expect("open");
+        assert_eq!(
+            opened, expected,
+            "sealed vector opens to the engine's current vector"
+        );
+
+        // since=None → no vector (full reconcile).
+        let (tx2, _rx2) = tokio::sync::oneshot::channel::<BackfillPageReport>();
+        Arc::clone(&fix.engine)
+            .request_backfill_with_outcome(None, tx2)
+            .await
+            .expect("backfill none");
+        let req2 = tokio::time::timeout(Duration::from_millis(500), fix.query_request_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("rx open");
+        assert!(
+            req2.watermark_sealed.is_none(),
+            "since=None must NOT seal a vector (full reconcile)"
         );
     }
 
