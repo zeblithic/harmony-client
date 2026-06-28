@@ -1,4 +1,5 @@
 import { render, fireEvent, screen, waitFor } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import BackupStalenessWarning from '../BackupStalenessWarning.svelte';
 
@@ -46,11 +47,24 @@ describe('BackupStalenessWarning', () => {
 
   it('does NOT query staleness before the owner identity resolves (null)', async () => {
     render(BackupStalenessWarning, { props: { ownerId: null } });
-    await waitFor(() => {
-      // give the effect a chance to (not) run
-      expect(true).toBe(true);
-    });
+    await tick(); // let the reactive effect flush
     expect(getBackupStaleness).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('backup-staleness-banner')).toBeNull();
+  });
+
+  it('clears the previous owner banner on owner change, before the new lookup resolves', async () => {
+    const OTHER = 'bbbb1111bbbb1111bbbb1111bbbb1111';
+    const mock = getBackupStaleness as ReturnType<typeof vi.fn>;
+    // First owner: stale. Second owner: a lookup that stays pending so we can
+    // assert the old banner is gone DURING the in-flight window (the reset).
+    mock.mockResolvedValueOnce({ isStale: true, daysSince: 23 });
+    mock.mockImplementationOnce(() => new Promise(() => {}));
+    const { rerender } = render(BackupStalenessWarning, { props: { ownerId: OWNER } });
+    expect(await screen.findByText(/Your backup is 23 days old/i)).toBeTruthy();
+    await rerender({ ownerId: OTHER });
+    await tick();
+    // OTHER's lookup is still pending; OWNER's banner must not linger.
+    expect(screen.queryByText(/Your backup is 23 days old/i)).toBeNull();
     expect(screen.queryByTestId('backup-staleness-banner')).toBeNull();
   });
 

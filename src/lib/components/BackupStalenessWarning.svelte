@@ -18,10 +18,12 @@
   // prior owner's result can't clobber the current owner's.
   $effect(() => {
     const owner = ownerId;
-    if (!owner) {
-      isStale = false;
-      return;
-    }
+    // Clear any prior owner's banner BEFORE the next lookup resolves, so a
+    // dismiss during the in-flight window can't snooze the NEW owner using the
+    // old banner's displayed state (CodeRabbit).
+    isStale = false;
+    daysSince = 0;
+    if (!owner) return;
     let cancelled = false;
     void getBackupStaleness(owner)
       .then((r) => {

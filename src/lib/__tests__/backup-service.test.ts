@@ -10,6 +10,7 @@ import {
   BACKUP_DISMISS_KEY,
   readDismissUntilMs,
   dismissForDays,
+  clearDismiss,
 } from '../backup-service';
 
 const OWNER = 'aaaa0000aaaa0000aaaa0000aaaa0000';
@@ -52,6 +53,20 @@ describe('backup-service (owner-scoped, ZEB-589)', () => {
   it('dismissForDays without an owner is a no-op (writes no shared key)', () => {
     dismissForDays(7);
     expect(localStorage.length).toBe(0);
+  });
+
+  it('clearDismiss only clears the requested owner', () => {
+    localStorage.setItem(dismissKey(OWNER), '1000');
+    localStorage.setItem(dismissKey(OTHER), '2000');
+    clearDismiss(OWNER);
+    expect(localStorage.getItem(dismissKey(OWNER))).toBeNull();
+    expect(localStorage.getItem(dismissKey(OTHER))).toBe('2000');
+  });
+
+  it('clearDismiss without an owner is a no-op', () => {
+    localStorage.setItem(dismissKey(OWNER), '1000');
+    clearDismiss();
+    expect(localStorage.getItem(dismissKey(OWNER))).toBe('1000');
   });
 
   it('normalizes errors via instanceof Error', async () => {
