@@ -44371,9 +44371,17 @@ where
     // CONNECTION_CLOSE for symmetry with the other timeout branches
     // above. `send.finish()` is non-async (just signals end-of-stream
     // locally on iroh 0.98); no timeout needed for it.
-    let wire_len = wire.len() as u32;
     let write_prefix = async {
-        send.write_all(&wire_len.to_le_bytes())
+        // Caller-bounded packet; no historical write cap (max = usize::MAX) so
+        // wire behavior is unchanged. The shared encoder unifies byte order.
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            wire.len(),
+            usize::MAX,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("length-prefix out of bounds: {e}"))?;
+        send.write_all(&prefix)
             .await
             .map_err(|e| format!("write length-prefix: {e}"))
     };
@@ -44467,14 +44475,13 @@ where
         recv.read_exact(&mut len_buf)
             .await
             .map_err(|e| format!("read length-prefix: {e}"))?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN {
-            return Err(format!(
-                "response length out of bounds: len={} max={}",
-                len,
-                crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN
-            ));
-        }
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("response length out of bounds: len={} max={}", e.len, e.max))?;
         let mut body = vec![0u8; len];
         recv.read_exact(&mut body)
             .await
@@ -45015,11 +45022,18 @@ pub async fn connectivity_link_friend_iroh_inner(
         pq_kem_pubkey: req_bundle.pq_kem_pubkey,
     };
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
-    let wire_len = wire.len() as u32;
-
     // Write [u32 LE length-prefix][body], each bounded by write_timeout.
     let write_prefix = async {
-        send.write_all(&wire_len.to_le_bytes())
+        // Caller-bounded packet; no historical write cap (max = usize::MAX) so
+        // wire behavior is unchanged. The shared encoder unifies byte order.
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            wire.len(),
+            usize::MAX,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("length-prefix out of bounds: {e}"))?;
+        send.write_all(&prefix)
             .await
             .map_err(|e| format!("write length-prefix: {e}"))
     };
@@ -45062,12 +45076,13 @@ pub async fn connectivity_link_friend_iroh_inner(
         recv.read_exact(&mut len_buf)
             .await
             .map_err(|e| format!("read length-prefix: {e}"))?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > FRIEND_MAX_PACKET_LEN {
-            return Err(format!(
-                "response length out of bounds: len={len} max={FRIEND_MAX_PACKET_LEN}"
-            ));
-        }
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            FRIEND_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("response length out of bounds: len={} max={}", e.len, e.max))?;
         let mut body = vec![0u8; len];
         recv.read_exact(&mut body)
             .await
@@ -46713,10 +46728,17 @@ async fn browse_friend_referrals(
     );
     let wire = crate::referral_catalog::encode_catalog_request(&req)
         .map_err(|e| format!("encode catalog request: {e:?}"))?;
-    let wire_len = wire.len() as u32;
-
     let write_prefix = async {
-        send.write_all(&wire_len.to_le_bytes())
+        // Caller-bounded packet; no historical write cap (max = usize::MAX) so
+        // wire behavior is unchanged. The shared encoder unifies byte order.
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            wire.len(),
+            usize::MAX,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("length-prefix out of bounds: {e}"))?;
+        send.write_all(&prefix)
             .await
             .map_err(|e| format!("write length-prefix: {e}"))
     };
@@ -46758,13 +46780,13 @@ async fn browse_friend_referrals(
         recv.read_exact(&mut len_buf)
             .await
             .map_err(|e| format!("read length-prefix: {e}"))?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > crate::referral_catalog::PEX_MAX_PACKET_LEN {
-            return Err(format!(
-                "response length out of bounds: len={len} max={}",
-                crate::referral_catalog::PEX_MAX_PACKET_LEN
-            ));
-        }
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            crate::referral_catalog::PEX_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("response length out of bounds: len={} max={}", e.len, e.max))?;
         let mut body = vec![0u8; len];
         recv.read_exact(&mut body)
             .await
@@ -47432,10 +47454,17 @@ pub async fn connectivity_add_friend_by_key_inner(
         pq_kem_pubkey: req_bundle.pq_kem_pubkey,
     };
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
-    let wire_len = wire.len() as u32;
-
     let write_prefix = async {
-        send.write_all(&wire_len.to_le_bytes())
+        // Caller-bounded packet; no historical write cap (max = usize::MAX) so
+        // wire behavior is unchanged. The shared encoder unifies byte order.
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            wire.len(),
+            usize::MAX,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("length-prefix out of bounds: {e}"))?;
+        send.write_all(&prefix)
             .await
             .map_err(|e| format!("write length-prefix: {e}"))
     };
@@ -47477,12 +47506,13 @@ pub async fn connectivity_add_friend_by_key_inner(
         recv.read_exact(&mut len_buf)
             .await
             .map_err(|e| format!("read length-prefix: {e}"))?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > FRIEND_MAX_PACKET_LEN {
-            return Err(format!(
-                "response length out of bounds: len={len} max={FRIEND_MAX_PACKET_LEN}"
-            ));
-        }
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            FRIEND_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("response length out of bounds: len={} max={}", e.len, e.max))?;
         let mut body = vec![0u8; len];
         recv.read_exact(&mut body)
             .await
