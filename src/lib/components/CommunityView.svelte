@@ -4,6 +4,7 @@
   import type { CommunityService, ChannelInfo, PreForkSnapshotDto } from '../community-service';
   import type { ChannelMessageService } from '../channel-message-service';
   import type { CommunityMember } from '../types';
+  import { resolveMentionLabel } from '../mention-render';
   import type { TrustService } from '../trust-service';
   import type { NavService } from '../nav-service';
   import ChannelSubSidebar from './ChannelSubSidebar.svelte';
@@ -475,6 +476,10 @@
           {resolveCard}
           {resolveNickname}
           {onOpenCard}
+          mentionCandidates={members.map((m) => ({
+            ownerId: m.address,
+            label: resolveMentionLabel(m.address, resolveNickname, resolveCard),
+          }))}
         />
       {/if}
     {:else}

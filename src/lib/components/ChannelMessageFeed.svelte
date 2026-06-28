@@ -17,6 +17,15 @@
   import type { ResolvedCard } from '../member-card-service';
   import { nonEmpty } from '../display-label';
   import { tokenizeBody, resolveMentionLabel } from '../mention-render';
+  import {
+    detectMentionTrigger,
+    applyMentionPick,
+    filterCandidates,
+    reconcileCompose,
+    type MentionCandidate,
+    type TrackedMention,
+  } from '../mention-compose';
+  import MentionAutocomplete from './MentionAutocomplete.svelte';
 
   let {
     communityId,
@@ -49,6 +58,10 @@
     resolveNickname,
     /** ZEB-341: open the owner_id card popover for a message author. */
     onOpenCard,
+    /** ZEB-588: roster for the @-mention autocomplete — {ownerId, label} with
+     *  the label pre-resolved via the shared ladder by the parent. Empty/absent
+     *  → the autocomplete never opens (feature degrades to plain text). */
+    mentionCandidates = [],
   }: {
     communityId: string;
     channelId: string;
@@ -75,6 +88,7 @@
       },
       ev: MouseEvent,
     ) => void;
+    mentionCandidates?: MentionCandidate[];
   } = $props();
 
   // Local mirror of service.byChannel cache for this channel.
@@ -105,6 +119,43 @@
 
   let scrollEl: HTMLDivElement | undefined = $state();
   let composeEl: HTMLTextAreaElement | undefined = $state();
+
+  // ── ZEB-588: @-mention compose state ──────────────────────────────────────
+  // `tracked` records each picked mention so reconcileCompose can rewrite the
+  // still-intact `@Label`s into `<@ownerId>` wire tokens on send. `trigger` is
+  // the active `@query` at the caret (null when not mentioning).
+  let tracked = $state<TrackedMention[]>([]);
+  let trigger = $state<{ query: string; atIndex: number } | null>(null);
+  let acIndex = $state(0);
+  const acCandidates = $derived(trigger ? filterCandidates(mentionCandidates, trigger.query) : []);
+  const acOpen = $derived(acCandidates.length > 0);
+
+  // Re-detect the trigger from the LIVE DOM value/caret (not the bound state,
+  // which can lag the input event). Reset the active row on every change.
+  function refreshTrigger() {
+    const el = composeEl;
+    if (!el) {
+      trigger = null;
+      return;
+    }
+    trigger = detectMentionTrigger(el.value, el.selectionStart ?? el.value.length);
+    acIndex = 0;
+  }
+
+  function pickMention(c: MentionCandidate) {
+    const el = composeEl;
+    if (!el || !trigger) return;
+    const caret = el.selectionStart ?? el.value.length;
+    const r = applyMentionPick(el.value, trigger.atIndex, caret, c);
+    composeText = r.text;
+    tracked = [...tracked, r.tracked];
+    trigger = null;
+    // Restore focus + caret after Svelte flushes the new bound value.
+    queueMicrotask(() => {
+      el.focus();
+      el.setSelectionRange(r.caret, r.caret);
+    });
+  }
   let unsubChannel: (() => void) | null = null;
   let prevOnBackfillProgress: typeof channelMessageService.onBackfillProgress | undefined;
   let scrollAtTopTimer: ReturnType<typeof setTimeout> | null = null;
@@ -316,23 +367,50 @@
   }
 
   async function handleCompose(e: KeyboardEvent) {
+    // ZEB-588: while the @-autocomplete is open, the navigation keys drive it
+    // instead of the composer (Enter picks the active row rather than sending).
+    if (acOpen) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        acIndex = (acIndex + 1) % acCandidates.length;
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        acIndex = (acIndex - 1 + acCandidates.length) % acCandidates.length;
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        pickMention(acCandidates[acIndex]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        trigger = null;
+        return;
+      }
+    }
     if (e.key !== 'Enter') return;
     if (e.shiftKey) return; // newline; let browser handle
     e.preventDefault();
-    const text = composeText.trim();
-    if ((!text && pendingAttachments.length === 0) || posting || ingesting) return;
+    // ZEB-588: rewrite picked @Labels into <@id> tokens + the mentions array.
+    const { body, mentions } = reconcileCompose(composeText, tracked);
+    const trimmedBody = body.trim();
+    if ((!trimmedBody && pendingAttachments.length === 0) || posting || ingesting) return;
     posting = true;
     composeError = null;
     try {
       await channelMessageService.postMessage(
         communityId,
         channelId,
-        text,
+        trimmedBody,
         undefined,
-        undefined,
+        mentions,
         pendingAttachments.length > 0 ? pendingAttachments : undefined,
       );
       composeText = '';
+      tracked = [];
       pendingAttachments = [];
     } catch (e) {
       composeError = e instanceof Error ? e.message : String(e);
@@ -1042,12 +1120,18 @@
         bind:this={composeEl}
         bind:value={composeText}
         onkeydown={handleCompose}
+        oninput={refreshTrigger}
+        onkeyup={refreshTrigger}
+        onclick={refreshTrigger}
         class="compose-input"
         placeholder={ingesting ? 'Finishing upload…' : `Message #${channelName}`}
         rows="2"
         aria-label="Channel message"
         disabled={posting}
       ></textarea>
+      {#if acOpen}
+        <MentionAutocomplete candidates={acCandidates} activeIndex={acIndex} onPick={pickMention} />
+      {/if}
     </div>
   </div>
 </div>
@@ -1385,7 +1469,7 @@
     margin-left: 4px;
     white-space: nowrap;
   }
-  .compose-row { display: flex; align-items: flex-end; gap: 8px; }
+  .compose-row { display: flex; align-items: flex-end; gap: 8px; position: relative; }
   .attach-btn {
     flex: 0 0 auto;
     background: var(--bg-tertiary);
