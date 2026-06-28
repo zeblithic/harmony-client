@@ -211,6 +211,7 @@ pub struct ChannelLogAdapterRequest {
         dyn Fn(
                 Option<crate::owner_state_types::Hlc>,
                 usize,
+                Option<Vec<u8>>,
             )
                 -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
             + Send
@@ -7699,6 +7700,7 @@ where
     F: Fn(
             Option<crate::owner_state_types::Hlc>,
             usize,
+            Option<Vec<u8>>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
         + Send
         + Sync
@@ -7880,7 +7882,27 @@ where
                         } else {
                             limit_raw.min(CHANNEL_BACKFILL_MAX_LIMIT)
                         };
-                        let packets = (read_for_query_qbl)(since, limit).await;
+                        // ZEB-585: an optional AEAD-sealed watermark vector
+                        // rides as the GET request payload. Cap-before-alloc
+                        // on the ZBytes length (mirrors the pairing-scope
+                        // guard); over cap → ignore it and serve the
+                        // key-expr scalar `since`.
+                        let watermark_sealed = query.payload().and_then(|p| {
+                            if p.len()
+                                > crate::community_channel_log::MAX_WATERMARK_VECTOR_BYTES
+                            {
+                                tracing::debug!(
+                                    %qkey,
+                                    len = p.len(),
+                                    "channel-log watermark vector over cap; serving scalar"
+                                );
+                                None
+                            } else {
+                                Some(p.to_bytes().to_vec())
+                            }
+                        });
+                        let packets =
+                            (read_for_query_qbl)(since, limit, watermark_sealed).await;
                         for packet in packets {
                             if let Err(e) = query
                                 .reply(query.key_expr(), packet)
@@ -7948,11 +7970,18 @@ where
                         // source key, dropping every event but one.
                         // Mirrors the `mailbox_get_first_value` shape at
                         // `event_loop.rs:1903`.
-                        let receiver = match session_qr
+                        // ZEB-585: forward the engine-sealed per-author
+                        // watermark vector (if any) as the GET request
+                        // payload; the queryable opens it with the channel
+                        // key. Old responders ignore the payload and use the
+                        // key-expr scalar `since` — no wire break.
+                        let mut get_builder = session_qr
                             .get(&key)
-                            .consolidation(zenoh::query::ConsolidationMode::None)
-                            .await
-                        {
+                            .consolidation(zenoh::query::ConsolidationMode::None);
+                        if let Some(bytes) = req.watermark_sealed.take() {
+                            get_builder = get_builder.payload(bytes);
+                        }
+                        let receiver = match get_builder.await {
                             Ok(r) => r,
                             Err(e) => {
                                 if !closing_qr.load(Ordering::SeqCst) {
@@ -8396,7 +8425,9 @@ mod channel_log_adapter_tests {
             mpsc::channel::<crate::community_channel_log_engine::BackfillQueryRequest>(2);
 
         let read_for_query = Arc::new(
-            |_since: Option<crate::owner_state_types::Hlc>, _limit: usize| {
+            |_since: Option<crate::owner_state_types::Hlc>,
+             _limit: usize,
+             _watermark: Option<Vec<u8>>| {
                 Box::pin(async move { Vec::<Vec<u8>>::new() })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
             },
@@ -8502,7 +8533,9 @@ mod channel_log_adapter_tests {
         // The queryable answers every backfill query with three
         // packets.
         let read_for_query = Arc::new(
-            |_since: Option<crate::owner_state_types::Hlc>, _limit: usize| {
+            |_since: Option<crate::owner_state_types::Hlc>,
+             _limit: usize,
+             _watermark: Option<Vec<u8>>| {
                 Box::pin(async move { vec![vec![0xA1_u8], vec![0xA2], vec![0xA3]] })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
             },

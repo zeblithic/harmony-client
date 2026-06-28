@@ -19,8 +19,9 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::community_channel_log::{
-    decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, read_segment_at,
-    seal_watermark_vector, sign_channel_event, verify_channel_event, ChannelAttachment,
+    decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, open_watermark_vector,
+    read_segment_at, seal_watermark_vector, sign_channel_event, verify_channel_event,
+    ChannelAttachment,
     ChannelEventError, ChannelKey, ChannelLog, ChannelLogConfig, ChannelLogPersistError,
     ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc, MessageId, SegmentDescriptor,
     SignedChannelEvent, WatermarkVector, MAX_ATTACHMENTS, MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
@@ -2263,13 +2264,26 @@ impl ChannelLogRegistry {
         let read_for_query =
             Arc::new(
                 move |since: Option<Hlc>,
-                      limit: usize|
+                      limit: usize,
+                      watermark_sealed: Option<Vec<u8>>|
                       -> std::pin::Pin<
                     Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>,
                 > {
                     let me = Arc::clone(&engine_for_query);
                     Box::pin(async move {
-                        let events = match me.list_messages(since, limit).await {
+                        // ZEB-585: a sealed watermark vector selects the
+                        // per-device diff path; absent (or undecryptable)
+                        // falls back to the scalar `since` path.
+                        let events = match watermark_sealed {
+                            Some(bytes) => {
+                                match open_watermark_vector(me.channel_key_ref(), &bytes) {
+                                    Ok(vector) => me.list_messages_vector(&vector, limit).await,
+                                    Err(_) => me.list_messages(since, limit).await,
+                                }
+                            }
+                            None => me.list_messages(since, limit).await,
+                        };
+                        let events = match events {
                             Ok(v) => v,
                             Err(_) => return Vec::new(),
                         };

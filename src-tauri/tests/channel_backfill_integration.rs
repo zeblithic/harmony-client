@@ -682,6 +682,161 @@ async fn reconnect_catch_up_fetches_exactly_missed_events() {
     b.registry.shutdown_all().await.expect("shutdown B");
 }
 
+/// ZEB-585: a returning member recovers a NEVER-SEEN authoring device's
+/// offline-window message whose HLC sorts BELOW the member's global max,
+/// via the per-author watermark vector. The pre-ZEB-585 scalar `since`
+/// path filters it out forever (`max_hlc` is not a completeness
+/// certificate); the periodic full-reconcile floor (~1 h) does not fire
+/// inside this window, so delivery here is proof of the vector path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn returning_member_recovers_unseen_device_sub_max_hlc_event() {
+    let session = Arc::new(
+        zenoh::open(zenoh::Config::default())
+            .await
+            .expect("zenoh open"),
+    );
+
+    let community_id = SpaceId([0xA3; 16]);
+    let channel_id = ChannelId([0xB3; 16]);
+    let membership_key = EpochKey::new([0x88; 32]);
+    let channel_key = derive_channel_key(&membership_key, &community_id, &channel_id);
+
+    let a = build_registry(&session, 0xAA, "device-a");
+    let b = build_registry(&session, 0xBB, "device-b");
+
+    // A is the only member; every served event (incl. the skew-device one)
+    // is A-authored so it verifies on B. Distinct HLC device_ids model A
+    // posting from multiple devices.
+    let state: Arc<dyn CommunityStateAtHlc + Send + Sync> = Arc::new(MembersJoinedState {
+        channel_id,
+        members: vec![(a.owner, a.signing.verifying_key().to_bytes())],
+    });
+
+    let engine_a = spawn_channel(&a, community_id, channel_id, &channel_key, &state).await;
+    let engine_b = spawn_channel(&b, community_id, channel_id, &channel_key, &state).await;
+
+    // ── Live phase: B sees two posts on "live-dev" (global max = 2000) ──
+    let live1 = make_signed_event(
+        community_id,
+        channel_id,
+        a.owner,
+        hlc(1_000, "live-dev"),
+        "live-1",
+        &a.signing,
+        0x01,
+    );
+    let live2 = make_signed_event(
+        community_id,
+        channel_id,
+        a.owner,
+        hlc(2_000, "live-dev"),
+        "live-2",
+        &a.signing,
+        0x02,
+    );
+    for (ev, body) in [(&live1, "live-1"), (&live2, "live-2")] {
+        let packet = encrypt_channel_packet(&channel_key, ev).expect("encrypt");
+        put_until_in_logs(
+            &session,
+            &community_id,
+            &channel_id,
+            &packet,
+            body,
+            &[&engine_a, &engine_b],
+            Duration::from_secs(15),
+        )
+        .await;
+    }
+    wait_for_count(&engine_b, 2, Duration::from_secs(10), "joiner live phase").await;
+
+    // ── B disconnects ───────────────────────────────────────────────
+    b.registry
+        .stop(&community_id, &channel_id)
+        .await
+        .expect("stop B");
+
+    // ── While B is offline, A logs (into A only):
+    //    skew-1: a NEVER-SEEN device "skew-dev" at wall 1500 — BELOW B's
+    //            global max 2000 (the gap the scalar path loses forever).
+    //    new-1:  a normal "live-dev" post at 3000 — above the max (both
+    //            paths serve this; included to show the normal catch-up
+    //            still works alongside the gap recovery). ───────────────
+    let skew1 = make_signed_event(
+        community_id,
+        channel_id,
+        a.owner,
+        hlc(1_500, "skew-dev"),
+        "skew-1",
+        &a.signing,
+        0x03,
+    );
+    let new1 = make_signed_event(
+        community_id,
+        channel_id,
+        a.owner,
+        hlc(3_000, "live-dev"),
+        "new-1",
+        &a.signing,
+        0x04,
+    );
+    for (ev, body) in [(&skew1, "skew-1"), (&new1, "new-1")] {
+        let packet = encrypt_channel_packet(&channel_key, ev).expect("encrypt");
+        put_until_in_logs(
+            &session,
+            &community_id,
+            &channel_id,
+            &packet,
+            body,
+            &[&engine_a],
+            Duration::from_secs(15),
+        )
+        .await;
+    }
+    wait_for_count(&engine_a, 4, Duration::from_secs(10), "holder offline-phase log").await;
+    wait_until_serving(&session, &community_id, &channel_id, 4, Duration::from_secs(15)).await;
+
+    // ── B reconnects: the reloaded watermark vector is {live-dev:(2000,0)}
+    //    (no entry for skew-dev) → the catch-up GET seals it, A serves all
+    //    of the unseen skew-dev plus live-dev's tail. ────────────────────
+    let engine_b2 = spawn_channel(&b, community_id, channel_id, &channel_key, &state).await;
+    wait_for_count(
+        &engine_b2,
+        4,
+        Duration::from_secs(20),
+        "vector catch-up backfill",
+    )
+    .await;
+    assert_count_stays(
+        &engine_b2,
+        4,
+        Duration::from_millis(600),
+        "post-catch-up stability",
+    )
+    .await;
+
+    let bodies = list_bodies(&engine_b2).await;
+    assert!(
+        bodies.contains(&"skew-1".to_string()),
+        "the never-seen skew-dev event (HLC 1500, below B's max 2000) must arrive \
+         via the watermark vector; the scalar path would lose it. got {bodies:?}"
+    );
+    assert_eq!(
+        bodies,
+        vec!["live-1", "live-2", "skew-1", "new-1"],
+        "list_messages is in append/arrival order — the live phase first, then \
+         the reconnect catch-up batch (A serves skew-1 then new-1 in its stored \
+         order); skew-1's low HLC does not re-sort it ahead of live-2"
+    );
+    let events = engine_b2
+        .list_messages(None, 1000)
+        .await
+        .expect("final list");
+    assert_unique_message_ids(&events);
+
+    a.registry.shutdown_all().await.expect("shutdown A");
+    b.registry.shutdown_all().await.expect("shutdown B");
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Scenario 3 (spec §8, DOCUMENTED DEVIATION — see module doc): the
 // latch retry path is unreachable over real zenoh (a GET with no
