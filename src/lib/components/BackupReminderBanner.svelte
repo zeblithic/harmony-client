@@ -51,6 +51,21 @@
     isBackupReminderVisible(ownerId) && !dismissedThisSession && !backedUpThisSession,
   );
 
+  // Tie the per-session overrides to the owner that set them. If the owner prop
+  // changes while this component stays mounted (e.g. the owner resolves after
+  // mount), reset transient UI so one identity's dismiss/backup/half-typed
+  // passphrase can't carry into another's reminder (ZEB-587 — CodeRabbit).
+  let overrideOwnerId: string | null = ownerId;
+  $effect(() => {
+    if (overrideOwnerId === ownerId) return;
+    overrideOwnerId = ownerId;
+    dismissedThisSession = false;
+    backedUpThisSession = false;
+    showPassphrase = false;
+    passphrase = '';
+    error = null;
+  });
+
   function dismiss() {
     if (ownerId) markBannerDismissed(ownerId);
     dismissedThisSession = true;
@@ -62,6 +77,10 @@
   }
 
   async function save() {
+    // Capture the initiating owner up front: the export below has several awaits
+    // and `ownerId` could change underneath us, but the backed-up flag must name
+    // the identity the user actually backed up.
+    const backupOwnerId = ownerId;
     if ([...passphrase].length < MIN_RECOVERY_PASSPHRASE_LEN) {
       error = `Passphrase must be at least ${MIN_RECOVERY_PASSPHRASE_LEN} characters.`;
       return;
@@ -80,7 +99,7 @@
         return; // user cancelled — finally resets inFlight
       }
       await svc.exportRecoveryFile(token, pathToken, passphrase, null);
-      if (ownerId) markRecoveryBackedUp(ownerId);
+      if (backupOwnerId) markRecoveryBackedUp(backupOwnerId);
       passphrase = '';
       backedUpThisSession = true;
     } catch (e) {

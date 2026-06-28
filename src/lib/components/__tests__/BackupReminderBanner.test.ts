@@ -86,6 +86,20 @@ describe('BackupReminderBanner visibility (owner-scoped, ZEB-587)', () => {
     expect(queryByTestId('backup-reminder-banner')).toBeNull();
   });
 
+  it('a per-session dismiss does not carry across an owner change', async () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    localStorage.setItem(skippedKey(OTHER), 'true');
+    const { queryByTestId, getByTestId, rerender } = render(BackupReminderBanner, {
+      props: { ownerId: OWNER },
+    });
+    await fireEvent.click(getByTestId('backup-reminder-dismiss'));
+    expect(queryByTestId('backup-reminder-banner')).toBeNull();
+    // The owner prop resolves to a different identity while still mounted: the
+    // first owner's dismiss must not suppress the new owner's reminder.
+    await rerender({ ownerId: OTHER });
+    await vi.waitFor(() => expect(queryByTestId('backup-reminder-banner')).toBeTruthy());
+  });
+
   it('back up now runs export flow and marks owner-scoped backed-up on success', async () => {
     localStorage.setItem(skippedKey(OWNER), 'true');
     issueRecoveryTokenMock.mockResolvedValue('tok');

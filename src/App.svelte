@@ -1883,6 +1883,11 @@
               const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
               if (ownerState !== null) {
                 selfOwnerId = ownerState.ownerId;
+                // ZEB-586: this is the third owner-resolution path (owner loads
+                // after start_node). Like the other two, load the owner-scoped
+                // profile before seeding/publishing so tryBootPublishCard can't
+                // broadcast the pre-owner default for the resolved owner.
+                myProfile = loadProfile(ownerState.ownerId);
                 memberCardService.seedSelf(ownerState.ownerId, {
                   displayName: myProfile.displayName,
                   statusText: myProfile.statusText ?? '',

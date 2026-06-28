@@ -26,12 +26,19 @@ const SKIPPED = 'harmony.onboarding.backupSkipped';
 const BACKED_UP = 'harmony.onboarding.recoveryArtifactBackedUp';
 const DISMISSED = 'harmony.onboarding.backupBannerDismissed';
 
+type StoreKind = 'local' | 'session';
+
 function ownerKey(base: string, ownerId: string): string {
   return `${base}:owner-${ownerId}`;
 }
 
-function readFlag(store: Storage, base: string, ownerId: string): boolean {
+// Resolve the storage global INSIDE the try: merely accessing
+// `localStorage`/`sessionStorage` can throw (e.g. a sandboxed WebView with
+// storage disabled), so passing the global in as an argument would let that
+// throw escape before any try/catch here could handle it.
+function readFlag(kind: StoreKind, base: string, ownerId: string): boolean {
   try {
+    const store = kind === 'local' ? localStorage : sessionStorage;
     return store.getItem(ownerKey(base, ownerId)) === 'true';
   } catch {
     // storage unavailable → safest is to treat the flag as unset
@@ -39,8 +46,9 @@ function readFlag(store: Storage, base: string, ownerId: string): boolean {
   }
 }
 
-function writeFlag(store: Storage, base: string, ownerId: string): void {
+function writeFlag(kind: StoreKind, base: string, ownerId: string): void {
   try {
+    const store = kind === 'local' ? localStorage : sessionStorage;
     store.setItem(ownerKey(base, ownerId), 'true');
   } catch (e) {
     console.debug('[zeb-587] onboarding flag write failed:', e instanceof Error ? e.message : String(e));
@@ -49,29 +57,29 @@ function writeFlag(store: Storage, base: string, ownerId: string): void {
 
 /** Record that this owner skipped the onboarding backup (durable). */
 export function markBackupSkipped(ownerId: string): void {
-  writeFlag(localStorage, SKIPPED, ownerId);
+  writeFlag('local', SKIPPED, ownerId);
 }
 
 /** Record that this owner exported a recovery artifact (durable). */
 export function markRecoveryBackedUp(ownerId: string): void {
-  writeFlag(localStorage, BACKED_UP, ownerId);
+  writeFlag('local', BACKED_UP, ownerId);
 }
 
 /** Snooze the reminder banner for this owner for the current session only. */
 export function markBannerDismissed(ownerId: string): void {
-  writeFlag(sessionStorage, DISMISSED, ownerId);
+  writeFlag('session', DISMISSED, ownerId);
 }
 
 export function isBackupSkipped(ownerId: string): boolean {
-  return readFlag(localStorage, SKIPPED, ownerId);
+  return readFlag('local', SKIPPED, ownerId);
 }
 
 export function isRecoveryBackedUp(ownerId: string): boolean {
-  return readFlag(localStorage, BACKED_UP, ownerId);
+  return readFlag('local', BACKED_UP, ownerId);
 }
 
 export function isBannerDismissed(ownerId: string): boolean {
-  return readFlag(sessionStorage, DISMISSED, ownerId);
+  return readFlag('session', DISMISSED, ownerId);
 }
 
 /**
