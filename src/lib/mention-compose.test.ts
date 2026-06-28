@@ -86,6 +86,34 @@ describe('reconcileCompose', () => {
       mentions: [],
     });
   });
+  it('does NOT tokenize a pick extended at the right edge (@JakeX)', () => {
+    // Right-boundary guard: appending chars to a picked label must not corrupt
+    // the body into "<@id>X" (Qodo bug / CodeRabbit).
+    expect(reconcileCompose('@JakeX', [{ ownerId: ID_A, label: 'Jake' }])).toEqual({
+      body: '@JakeX',
+      mentions: [],
+    });
+    expect(reconcileCompose('@Jake2 hi', [{ ownerId: ID_A, label: 'Jake' }])).toEqual({
+      body: '@Jake2 hi',
+      mentions: [],
+    });
+  });
+  it('does NOT tokenize a label merged into a word/email (left boundary)', () => {
+    expect(reconcileCompose('mail a@Jake', [{ ownerId: ID_A, label: 'Jake' }])).toEqual({
+      body: 'mail a@Jake',
+      mentions: [],
+    });
+  });
+  it('tokenizes a mention followed immediately by whitespace or end', () => {
+    expect(reconcileCompose('@Jake', [{ ownerId: ID_A, label: 'Jake' }])).toEqual({
+      body: `<@${ID_A}>`,
+      mentions: [ID_A],
+    });
+    expect(reconcileCompose('@Jake\n', [{ ownerId: ID_A, label: 'Jake' }])).toEqual({
+      body: `<@${ID_A}>\n`,
+      mentions: [ID_A],
+    });
+  });
   it('longest label wins over a prefix label', () => {
     const tracked = [
       { ownerId: ID_A, label: 'Jake' },

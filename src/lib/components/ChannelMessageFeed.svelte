@@ -179,6 +179,12 @@
     channelMessageService.selfOwnerId = ownAddress;
     // Fresh local mirror per channel switch.
     messages = [];
+    // ZEB-588 (CodeRabbit): drop any in-progress @-mention picks on a channel/
+    // community switch so a label picked in the previous channel can't be
+    // rewritten into a stale owner id when sending here.
+    tracked = [];
+    trigger = null;
+    acIndex = 0;
     // ZEB-536: close any open reaction picker so it doesn't linger across a
     // channel switch (and its Escape/outside-click window listeners unwind).
     pickerOpenFor = null;
@@ -382,7 +388,10 @@
       }
       if (e.key === 'Enter') {
         e.preventDefault();
-        pickMention(acCandidates[acIndex]);
+        // Guard a stale index (the roster can change while the menu is open).
+        const candidate = acCandidates[acIndex];
+        if (candidate) pickMention(candidate);
+        else acIndex = 0;
         return;
       }
       if (e.key === 'Escape') {
@@ -411,6 +420,8 @@
       );
       composeText = '';
       tracked = [];
+      trigger = null;
+      acIndex = 0;
       pendingAttachments = [];
     } catch (e) {
       composeError = e instanceof Error ? e.message : String(e);

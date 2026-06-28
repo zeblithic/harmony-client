@@ -40,14 +40,15 @@ The wire format and backend are already built; this feature only wires the two m
 
 A message body is UTF-8 text that may contain stable inline mention tokens:
 
-```
+```text
 <@<ownerIdHex>>      e.g.  <@a1f2c3d4e5f60718a9b0c1d2e3f40516>
 ```
 
 - `ownerIdHex` = 32 lowercase hex chars (16-byte OwnerAddr). Matching regex:
   `/<@([0-9a-f]{32})>/g`.
 - Angle-bracket sentinel → effectively zero collision with hand-typed text; the user never
-  types it (the autocomplete inserts it on send).
+  types it directly (compose inserts the human-facing `@label`; send-time reconciliation
+  emits the `<@ownerIdHex>` wire token).
 - The `ChannelMessageDto.mentions` array = the set of owner-ids referenced by the tokens.
   The body tokens carry *position* (for rendering); the array is the denormalized set the
   backend already uses for "mentions me". On send we produce both from one reconcile pass,
@@ -178,7 +179,7 @@ nickname/card maps already wired into the feed — no new fetch path.
 
 ## Data flow
 
-```
+```text
 type '@jak'  → detectMentionTrigger → MentionAutocomplete(candidates filtered by 'jak')
    ↓ pick "Jake (Koya)"
 applyMentionPick → composeText "hey @Jake (Koya) ", tracked += {id, "Jake (Koya)"}

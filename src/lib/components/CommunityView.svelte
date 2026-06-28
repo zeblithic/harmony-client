@@ -476,10 +476,12 @@
           {resolveCard}
           {resolveNickname}
           {onOpenCard}
-          mentionCandidates={members.map((m) => ({
-            ownerId: m.address,
-            label: resolveMentionLabel(m.address, resolveNickname, resolveCard),
-          }))}
+          mentionCandidates={members
+            .filter((m) => m.status === 'joined')
+            .map((m) => ({
+              ownerId: m.address,
+              label: resolveMentionLabel(m.address, resolveNickname, resolveCard),
+            }))}
         />
       {/if}
     {:else}

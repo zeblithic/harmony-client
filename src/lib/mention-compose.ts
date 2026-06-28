@@ -93,10 +93,18 @@ export function reconcileCompose(
     let pick = -1;
     for (const idx of order) {
       if (consumed[idx]) continue;
-      if (text.startsWith(`@${tracked[idx].label}`, i)) {
-        pick = idx;
-        break;
-      }
+      const label = tracked[idx].label;
+      if (!text.startsWith(`@${label}`, i)) continue;
+      // Left boundary: the '@' must start the text or follow whitespace, so a
+      // mention merged into a word/email ("a@Jake") is never rewritten.
+      if (i !== 0 && !/\s/.test(text[i - 1])) continue;
+      // Right boundary: the char after the label must be end-of-text or
+      // whitespace, so an edited pick ("@JakeX" / "@Jake2") degrades to plain
+      // text instead of corrupting the body with "<@id>X" (Qodo/CodeRabbit).
+      const j = i + 1 + label.length;
+      if (j !== text.length && !/\s/.test(text[j])) continue;
+      pick = idx;
+      break;
     }
     if (pick >= 0) {
       consumed[pick] = true;
