@@ -751,14 +751,16 @@ pub fn decrypt_channel_packet(
         .map_err(|e| ChannelEventError::CborDecode(e.to_string()))
 }
 
-/// ZEB-585: per-author (per authoring-device) catch-up watermark. Maps
-/// each `Hlc.device_id` to that device's max `(wall_ms, logical)` in the
-/// local log. Sealed onto a catch-up GET so the responder serves, per
-/// device, only what the requester is missing — closing the cross-author
-/// sub-max-HLC gap a scalar `since` leaves open. `(wall_ms, logical)`
-/// (not full `Hlc`) suffices: within one device's stream `device_id` is
-/// constant, so the HLC sort-order collapses to that pair.
-pub type WatermarkVector = BTreeMap<String, (u64, u32)>;
+/// ZEB-585: per-author-lane catch-up watermark. Keyed by the
+/// `(author, device_id)` lane — the SAME lane identity the replay tracker
+/// uses (see `replay_tracker_independent_lanes_per_author`): two authors
+/// may legitimately share a `device_id`, so keying by device alone would
+/// collapse their lanes and let one author's high watermark suppress the
+/// other's events — re-creating the very cross-author gap this closes.
+/// Maps each lane to its max `(wall_ms, logical)` in the local log; within
+/// one lane `device_id` is constant, so the HLC sort-order collapses to
+/// that pair.
+pub type WatermarkVector = BTreeMap<(OwnerAddr, String), (u64, u32)>;
 
 /// Static AAD for sealed watermark vectors. Domain-separated from
 /// `CHANNEL_PACKET_AAD` so a reply packet can never be opened as a vector
@@ -772,6 +774,14 @@ pub const WATERMARK_VECTOR_AAD: &[u8] = b"harmony-channel-wmv-v1";
 /// pathological or malicious vector. Over cap → responder ignores the
 /// payload and serves via the key-expr scalar `since`.
 pub const MAX_WATERMARK_VECTOR_BYTES: usize = 64 * 1024;
+
+/// Coarse pre-seal guard on the number of `(author, device)` lanes, checked
+/// BEFORE the requester materializes the CBOR + AEAD (the byte cap above
+/// only guards `open`, on the responder). A channel's real lane count is
+/// bounded by membership × enrolled devices; this only fires on a
+/// pathological local log. The byte cap stays the authoritative on-wire
+/// bound.
+pub const MAX_WATERMARK_VECTOR_ENTRIES: usize = 4096;
 
 /// Deterministic-nonce variant of [`seal_watermark_vector`] for the
 /// wire-format pin tests. Same nonce-reuse footgun rationale +
@@ -850,13 +860,14 @@ pub fn open_watermark_vector(
         .map_err(|e| ChannelEventError::CborDecode(e.to_string()))
 }
 
-/// ZEB-585: raise a watermark-vector entry to cover `at` (no-op when the
-/// existing entry already dominates). Shared by `ChannelLog::append` and
-/// `ChannelLog::rebuild_device_watermarks` so maintenance and rebuild use
-/// one rule. Per-device the HLC order is just `(wall_ms, logical)` since
-/// `device_id` is constant within a device's stream.
-fn raise_watermark(idx: &mut WatermarkVector, at: &Hlc) {
-    let entry = idx.entry(at.device_id.clone()).or_insert((0, 0));
+/// ZEB-585: raise a watermark-vector lane entry to cover `at` (no-op when
+/// the existing entry already dominates). Shared by `ChannelLog::append`
+/// and `ChannelLog::rebuild_device_watermarks` so maintenance and rebuild
+/// use one rule. The lane is `(author, device_id)` — see
+/// [`WatermarkVector`]. Within a lane the HLC order is just
+/// `(wall_ms, logical)`.
+fn raise_watermark(idx: &mut WatermarkVector, author: &OwnerAddr, at: &Hlc) {
+    let entry = idx.entry((*author, at.device_id.clone())).or_insert((0, 0));
     let cand = (at.wall_ms, at.logical);
     if cand > *entry {
         *entry = cand;
@@ -1611,9 +1622,9 @@ impl ChannelLog {
         if matches!(&event, SignedChannelEvent::React { .. }) {
             self.reaction_index.apply(&event);
         }
-        // ZEB-585: advance the per-device catch-up watermark before the
-        // event is moved into the tail.
-        raise_watermark(&mut self.device_watermarks, event.at());
+        // ZEB-585: advance the per-(author, device) catch-up watermark
+        // before the event is moved into the tail.
+        raise_watermark(&mut self.device_watermarks, event.author(), event.at());
         self.tail.push(event);
         Ok(self.tail.len() >= self.config.seal_threshold_events)
     }
@@ -2040,7 +2051,7 @@ impl ChannelLog {
             match self.read_segment(seg) {
                 Ok(events) => {
                     for ev in &events {
-                        raise_watermark(&mut idx, ev.at());
+                        raise_watermark(&mut idx, ev.author(), ev.at());
                     }
                 }
                 Err(e) => {
@@ -2054,7 +2065,7 @@ impl ChannelLog {
             }
         }
         for ev in &self.tail {
-            raise_watermark(&mut idx, ev.at());
+            raise_watermark(&mut idx, ev.author(), ev.at());
         }
         self.device_watermarks = idx;
     }
@@ -2199,8 +2210,8 @@ mod tests {
             &fixture_channel(0x01),
         );
         let mut v: WatermarkVector = BTreeMap::new();
-        v.insert("dev-a".to_string(), (100, 3));
-        v.insert("dev-b".to_string(), (250, 0));
+        v.insert((OwnerAddr([0xa1; 16]), "dev-a".to_string()), (100, 3));
+        v.insert((OwnerAddr([0xa1; 16]), "dev-b".to_string()), (250, 0));
         let sealed = seal_watermark_vector(&key, &v).expect("seal");
         let opened = open_watermark_vector(&key, &sealed).expect("open");
         assert_eq!(opened, v);
@@ -2229,7 +2240,7 @@ mod tests {
             &fixture_channel(0x01),
         );
         let mut v: WatermarkVector = BTreeMap::new();
-        v.insert("dev-a".to_string(), (100, 3));
+        v.insert((OwnerAddr([0xa1; 16]), "dev-a".to_string()), (100, 3));
         let mut sealed = seal_watermark_vector(&key, &v).expect("seal");
         let last = sealed.len() - 1;
         sealed[last] ^= 0xff; // flip a Poly1305 tag byte
@@ -2252,7 +2263,7 @@ mod tests {
             &fixture_channel(0x01),
         );
         let mut v: WatermarkVector = BTreeMap::new();
-        v.insert("dev-a".to_string(), (100, 3));
+        v.insert((OwnerAddr([0xa1; 16]), "dev-a".to_string()), (100, 3));
         let sealed = seal_watermark_vector(&key, &v).expect("seal");
         assert!(matches!(
             open_watermark_vector(&other, &sealed),
@@ -2294,12 +2305,14 @@ mod tests {
             .expect("append");
 
         let v = log.watermark_vector();
+        // fixture_signed_event authors every event as fixture_identity(0xa1).
+        let (_, author, _) = fixture_identity(0xa1);
         assert_eq!(
-            v.get("dev-a"),
+            v.get(&(author, "dev-a".to_string())),
             Some(&(200, 0)),
-            "dev-a max spans segment + tail"
+            "dev-a lane max spans segment + tail"
         );
-        assert_eq!(v.get("dev-b"), Some(&(120, 0)));
+        assert_eq!(v.get(&(author, "dev-b".to_string())), Some(&(120, 0)));
         assert_eq!(v.len(), 2);
 
         // Reload rebuilds the index identically from segment + tail.

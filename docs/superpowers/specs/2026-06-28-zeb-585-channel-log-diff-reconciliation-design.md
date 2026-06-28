@@ -31,7 +31,7 @@ The periodic full-reconcile floor stays **as-is** (Jake's call) as the within-au
 
 ## A.1 Core change
 
-`since` becomes a **watermark vector**: `{ device_id → (wall_ms, logical) }` — the member's max HLC **per authoring device** (`Hlc.device_id`, the device that stamped the event).
+`since` becomes a **watermark vector** keyed by the **`(author, device_id)` lane**: `{ (author, device_id) → (wall_ms, logical) }` — the member's max HLC per authoring lane. The lane key matches the replay tracker's lane identity (`replay_tracker_independent_lanes_per_author`): two authors may legitimately share a `device_id`, so keying by device alone would collapse their lanes and let one author's watermark suppress the other's events.
 
 The responder serves an event when, for its `at.device_id`, the requester's vector either:
 - has **no entry** (requester has nothing from that device → serve all of it), or
@@ -86,8 +86,8 @@ Mirror the established precedent at `event_loop.rs:5626` (the `MAX_PAIRING_WIRE_
 ## A.7 Components & files
 
 - **`community_channel_log.rs`** —
-  - `WatermarkVector` type (`BTreeMap<String, (u64, u32)>`, canonical CBOR).
-  - an **in-memory `device_watermarks` index** on `ChannelLog` (`BTreeMap<String,(u64,u32)>`), maintained in `append` (raise the entry for `ev.at().device_id`) and **rebuilt in `reload`** by scanning — mirrors the existing `reaction_index` (ZEB-536), so `ChannelLog::watermark_vector()` is O(devices), not an O(history) rescan per query.
+  - `WatermarkVector` type (`BTreeMap<(OwnerAddr, String), (u64, u32)>`, canonical CBOR — keyed by the `(author, device_id)` lane).
+  - an **in-memory `device_watermarks` index** on `ChannelLog` (`BTreeMap<(OwnerAddr, String),(u64,u32)>`), maintained in `append` (raise the entry for the `(ev.author(), ev.at().device_id)` lane) and **rebuilt in `reload`** by scanning — mirrors the existing `reaction_index` (ZEB-536), so `ChannelLog::watermark_vector()` is O(lanes), not an O(history) rescan per query.
   - `seal_watermark_vector(&ChannelKey, &WatermarkVector) -> Result<Vec<u8>>` / `open_watermark_vector(&ChannelKey, &[u8]) -> Result<WatermarkVector>` AEAD helpers (ChaCha20-Poly1305, AAD `b"harmony-channel-wmv-v1"`, wire `[nonce||ct||tag]`), plus `MAX_WATERMARK_VECTOR_BYTES`; `open_*` runs the cap-before-alloc check on the bytes view first.
 - **`community_channel_log_engine.rs`** —
   - `log_watermark_vector()` delegating to `ChannelLog::watermark_vector()`.

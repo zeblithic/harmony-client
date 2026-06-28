@@ -7883,24 +7883,31 @@ where
                             limit_raw.min(CHANNEL_BACKFILL_MAX_LIMIT)
                         };
                         // ZEB-585: an optional AEAD-sealed watermark vector
-                        // rides as the GET request payload. Cap-before-alloc
+                        // rides as the GET request payload. `since == None`
+                        // is the full-reconcile sentinel — IGNORE any payload
+                        // then, so a malformed or hostile peer can't downgrade
+                        // a full reconcile to a partial diff. Cap-before-alloc
                         // on the ZBytes length (mirrors the pairing-scope
-                        // guard); over cap → ignore it and serve the
-                        // key-expr scalar `since`.
-                        let watermark_sealed = query.payload().and_then(|p| {
-                            if p.len()
-                                > crate::community_channel_log::MAX_WATERMARK_VECTOR_BYTES
-                            {
-                                tracing::debug!(
-                                    %qkey,
-                                    len = p.len(),
-                                    "channel-log watermark vector over cap; serving scalar"
-                                );
-                                None
-                            } else {
-                                Some(p.to_bytes().to_vec())
-                            }
-                        });
+                        // guard); over cap → ignore it and serve the key-expr
+                        // scalar `since`.
+                        let watermark_sealed = if since.is_some() {
+                            query.payload().and_then(|p| {
+                                if p.len()
+                                    > crate::community_channel_log::MAX_WATERMARK_VECTOR_BYTES
+                                {
+                                    tracing::debug!(
+                                        %qkey,
+                                        len = p.len(),
+                                        "channel-log watermark vector over cap; serving scalar"
+                                    );
+                                    None
+                                } else {
+                                    Some(p.to_bytes().to_vec())
+                                }
+                            })
+                        } else {
+                            None
+                        };
                         let packets =
                             (read_for_query_qbl)(since, limit, watermark_sealed).await;
                         for packet in packets {

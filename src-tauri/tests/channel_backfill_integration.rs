@@ -748,6 +748,14 @@ async fn returning_member_recovers_unseen_device_sub_max_hlc_event() {
         .await;
     }
     wait_for_count(&engine_b, 2, Duration::from_secs(10), "joiner live phase").await;
+    // Pin B's pre-offline baseline: exactly the two live events, nothing
+    // else — so the skew-1 recovery below can ONLY come from the reconnect
+    // catch-up, never a delayed live delivery masking the test.
+    assert_eq!(
+        list_bodies(&engine_b).await,
+        vec!["live-1", "live-2"],
+        "B must hold exactly the live phase before going offline"
+    );
 
     // ── B disconnects ───────────────────────────────────────────────
     b.registry

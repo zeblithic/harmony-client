@@ -25,6 +25,7 @@ use crate::community_channel_log::{
     ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc,
     MessageId, SegmentDescriptor, SignedChannelEvent, WatermarkVector, MAX_ATTACHMENTS,
     MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS, MAX_WATERMARK_VECTOR_BYTES,
+    MAX_WATERMARK_VECTOR_ENTRIES,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -762,14 +763,17 @@ impl ChannelLogEngine {
         Ok(out)
     }
 
-    /// ZEB-585: per-device serve predicate for the watermark-vector
+    /// ZEB-585: per-author-lane serve predicate for the watermark-vector
     /// catch-up. Serve an event when the requester has no entry for its
-    /// authoring device (never seen it → send all) or the event exceeds
-    /// the requester's per-device max. Per-device the HLC order reduces to
-    /// `(wall_ms, logical)` (constant `device_id`).
+    /// `(author, device)` lane (never seen it → send all) or the event
+    /// exceeds the requester's per-lane max. Keying by the full lane (not
+    /// `device_id` alone) prevents one author's watermark from suppressing
+    /// another author who shares the same `device_id`. Within a lane the
+    /// HLC order reduces to `(wall_ms, logical)`.
     fn vector_serves(vector: &WatermarkVector, ev: &SignedChannelEvent) -> bool {
         let at = ev.at();
-        match vector.get(&at.device_id) {
+        let lane = (*ev.author(), at.device_id.clone());
+        match vector.get(&lane) {
             None => true,
             Some(&(w, l)) => (at.wall_ms, at.logical) > (w, l),
         }
@@ -1161,9 +1165,15 @@ impl ChannelLogEngine {
         // vector (degrade to the key-expr scalar `since` + periodic floor).
         let watermark_sealed = if since.is_some() {
             let vector = self.log_watermark_vector().await;
-            match seal_watermark_vector(self.channel_key_ref(), &vector) {
-                Ok(bytes) if bytes.len() <= MAX_WATERMARK_VECTOR_BYTES => Some(bytes),
-                _ => None,
+            // Bound the lane count BEFORE materializing the CBOR + AEAD —
+            // the byte cap only guards the responder's open path.
+            if vector.len() > MAX_WATERMARK_VECTOR_ENTRIES {
+                None
+            } else {
+                match seal_watermark_vector(self.channel_key_ref(), &vector) {
+                    Ok(bytes) if bytes.len() <= MAX_WATERMARK_VECTOR_BYTES => Some(bytes),
+                    _ => None,
+                }
             }
         } else {
             None
@@ -3003,14 +3013,21 @@ mod tests {
             }
         }
 
-        // log_watermark_vector reflects the per-device maxes.
+        // log_watermark_vector reflects the per-lane maxes (one author here).
         let wv = fix.engine.log_watermark_vector().await;
-        assert_eq!(wv.get("dev-a"), Some(&(200, 0)));
-        assert_eq!(wv.get("dev-b"), Some(&(50, 0)));
+        assert_eq!(
+            wv.get(&(fix.self_owner, "dev-a".to_string())),
+            Some(&(200, 0))
+        );
+        assert_eq!(
+            wv.get(&(fix.self_owner, "dev-b".to_string())),
+            Some(&(50, 0))
+        );
 
-        // Requester has dev-a up to (150,0); has NEVER seen dev-b.
+        // Requester has the (self, dev-a) lane up to (150,0); has NEVER seen
+        // the (self, dev-b) lane.
         let mut v: WatermarkVector = std::collections::BTreeMap::new();
-        v.insert("dev-a".to_string(), (150, 0));
+        v.insert((fix.self_owner, "dev-a".to_string()), (150, 0));
         let bodies: Vec<String> = fix
             .engine
             .list_messages_vector(&v, 1000)
@@ -3033,6 +3050,71 @@ mod tests {
         assert!(
             !bodies.contains(&"a1".to_string()),
             "dev-a (100,0) <= (150,0) filtered out"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_does_not_collapse_two_authors_sharing_a_device_id() {
+        // CodeRabbit ZEB-585: keying the watermark by device alone would let
+        // author A's high lane watermark suppress author B's events on the
+        // SAME device_id. The lane key is (author, device), so B's unseen
+        // lane is still served. (ChannelLog::append checks only channel
+        // binding, so a second author can be injected directly.)
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let author_a = fix.self_owner;
+        let author_b = OwnerAddr([0xBB; 16]);
+        let ev_a = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            author_a,
+            Hlc {
+                wall_ms: 300,
+                logical: 0,
+                device_id: "shared-dev".to_string(),
+            },
+            "a-on-shared",
+            &fix.signing_key,
+        );
+        let ev_b = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            author_b,
+            Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "shared-dev".to_string(),
+            },
+            "b-on-shared",
+            &fix.signing_key,
+        );
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            log.append(ev_a).expect("append a");
+            log.append(ev_b).expect("append b");
+        }
+        // Requester has the (A, shared-dev) lane up to (300,0); has NEVER
+        // seen the (B, shared-dev) lane.
+        let mut v: WatermarkVector = std::collections::BTreeMap::new();
+        v.insert((author_a, "shared-dev".to_string()), (300, 0));
+        let bodies: Vec<String> = fix
+            .engine
+            .list_messages_vector(&v, 1000)
+            .await
+            .expect("list_vector")
+            .into_iter()
+            .filter_map(|ev| match ev {
+                SignedChannelEvent::Post { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            bodies.contains(&"b-on-shared".to_string()),
+            "author B's event on the shared device (HLC 100, below A's 300) \
+             must NOT be suppressed by A's lane watermark"
+        );
+        assert!(
+            !bodies.contains(&"a-on-shared".to_string()),
+            "author A's (300,0) <= requester's (300,0) → filtered"
         );
     }
 
