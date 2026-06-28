@@ -1438,22 +1438,22 @@ where
         send: &mut iroh::endpoint::SendStream,
         resp: &[u8],
     ) -> Result<(), FriendAcceptError> {
-        if resp.len() > FRIEND_MAX_PACKET_LEN {
-            return Err(FriendAcceptError::ResponseTooLarge {
-                len: resp.len(),
-                max: FRIEND_MAX_PACKET_LEN,
-            });
-        }
-        let resp_len = resp.len() as u32;
-        tokio::time::timeout(
-            self.config.io_deadline,
-            send.write_all(&resp_len.to_le_bytes()),
+        let resp_prefix = crate::iroh_framing::encode_len_prefix(
+            resp.len(),
+            FRIEND_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
         )
-        .await
-        .map_err(|_| FriendAcceptError::IoTimeout {
-            step: "write length-prefix",
-        })?
-        .map_err(|e| FriendAcceptError::WritePrefix(e.to_string()))?;
+        .map_err(|e| FriendAcceptError::ResponseTooLarge {
+            len: e.len,
+            max: e.max,
+        })?;
+        tokio::time::timeout(self.config.io_deadline, send.write_all(&resp_prefix))
+            .await
+            .map_err(|_| FriendAcceptError::IoTimeout {
+                step: "write length-prefix",
+            })?
+            .map_err(|e| FriendAcceptError::WritePrefix(e.to_string()))?;
         tokio::time::timeout(self.config.io_deadline, send.write_all(resp))
             .await
             .map_err(|_| FriendAcceptError::IoTimeout { step: "write body" })?
@@ -1550,13 +1550,16 @@ where
                 step: "read length-prefix",
             })?
             .map_err(|e| FriendAcceptError::ReadPrefix(e.to_string()))?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > FRIEND_MAX_PACKET_LEN {
-            return Err(FriendAcceptError::PrefixOutOfBounds {
-                len,
-                max: FRIEND_MAX_PACKET_LEN,
-            });
-        }
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            FRIEND_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| FriendAcceptError::PrefixOutOfBounds {
+            len: e.len,
+            max: e.max,
+        })?;
         let mut body = vec![0u8; len];
         tokio::time::timeout(self.config.io_deadline, recv.read_exact(&mut body))
             .await
