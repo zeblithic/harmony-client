@@ -22,6 +22,12 @@ vi.mock('../../owner-service', () => ({
   extractError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
 }));
 
+const OWNER = 'aaaa0000aaaa0000aaaa0000aaaa0000';
+const OTHER = 'bbbb1111bbbb1111bbbb1111bbbb1111';
+const skippedKey = (id: string) => `harmony.onboarding.backupSkipped:owner-${id}`;
+const backedUpKey = (id: string) => `harmony.onboarding.recoveryArtifactBackedUp:owner-${id}`;
+const dismissedKey = (id: string) => `harmony.onboarding.backupBannerDismissed:owner-${id}`;
+
 beforeEach(() => {
   localStorage.clear();
   sessionStorage.clear();
@@ -30,46 +36,64 @@ beforeEach(() => {
   issueRecoveryTokenMock.mockReset();
 });
 
-describe('BackupReminderBanner visibility', () => {
-  it('mounts when backupSkipped set and no backup flag', () => {
-    localStorage.setItem('harmony.onboarding.backupSkipped', 'true');
-    const { queryByTestId } = render(BackupReminderBanner);
+describe('BackupReminderBanner visibility (owner-scoped, ZEB-587)', () => {
+  it('mounts when this owner skipped and has no backup flag', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    const { queryByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
     expect(queryByTestId('backup-reminder-banner')).toBeTruthy();
   });
 
-  it('does not mount when backup flag set', () => {
-    localStorage.setItem('harmony.onboarding.backupSkipped', 'true');
-    localStorage.setItem('harmony.onboarding.recoveryArtifactBackedUp', 'true');
-    const { queryByTestId } = render(BackupReminderBanner);
+  it('does not mount when this owner backed up', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    localStorage.setItem(backedUpKey(OWNER), 'true');
+    const { queryByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
     expect(queryByTestId('backup-reminder-banner')).toBeNull();
   });
 
   it('does not mount when backup was never skipped', () => {
-    const { queryByTestId } = render(BackupReminderBanner);
+    const { queryByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
     expect(queryByTestId('backup-reminder-banner')).toBeNull();
   });
 
-  it('dismiss hides for session', async () => {
-    localStorage.setItem('harmony.onboarding.backupSkipped', 'true');
-    const { queryByTestId, getByTestId } = render(BackupReminderBanner);
+  it('does not mount before the owner identity resolves (null)', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    const { queryByTestId } = render(BackupReminderBanner, { props: { ownerId: null } });
+    expect(queryByTestId('backup-reminder-banner')).toBeNull();
+  });
+
+  // ── ZEB-587 regression: the data-loss case the smoke test surfaced ──
+  it('reminds an un-backed-up identity even when another identity backed up', () => {
+    localStorage.setItem(backedUpKey(OTHER), 'true'); // a DIFFERENT identity backed up
+    localStorage.setItem(skippedKey(OWNER), 'true'); // this identity skipped, never backed up
+    const { queryByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(queryByTestId('backup-reminder-banner')).toBeTruthy();
+  });
+
+  it('dismiss hides for session and writes the owner-scoped session key', async () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    const { queryByTestId, getByTestId } = render(BackupReminderBanner, {
+      props: { ownerId: OWNER },
+    });
     await fireEvent.click(getByTestId('backup-reminder-dismiss'));
     expect(queryByTestId('backup-reminder-banner')).toBeNull();
-    expect(sessionStorage.getItem('harmony.onboarding.backupBannerDismissed')).toBe('true');
+    expect(sessionStorage.getItem(dismissedKey(OWNER))).toBe('true');
   });
 
   it('does not mount when dismissed this session', () => {
-    localStorage.setItem('harmony.onboarding.backupSkipped', 'true');
-    sessionStorage.setItem('harmony.onboarding.backupBannerDismissed', 'true');
-    const { queryByTestId } = render(BackupReminderBanner);
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    sessionStorage.setItem(dismissedKey(OWNER), 'true');
+    const { queryByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
     expect(queryByTestId('backup-reminder-banner')).toBeNull();
   });
 
-  it('back up now runs export flow and hides on success', async () => {
-    localStorage.setItem('harmony.onboarding.backupSkipped', 'true');
+  it('back up now runs export flow and marks owner-scoped backed-up on success', async () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
     issueRecoveryTokenMock.mockResolvedValue('tok');
     requestExportSavePathMock.mockResolvedValue('path-token');
     exportRecoveryFileMock.mockResolvedValue({ identityHash: 'h', byteLen: 1, path: '/x' });
-    const { queryByTestId, getByTestId } = render(BackupReminderBanner);
+    const { queryByTestId, getByTestId } = render(BackupReminderBanner, {
+      props: { ownerId: OWNER },
+    });
     await fireEvent.click(getByTestId('backup-reminder-backup-now'));
     // passphrase prompt appears inline; fill + submit
     await fireEvent.input(getByTestId('backup-reminder-passphrase'), {
@@ -78,7 +102,7 @@ describe('BackupReminderBanner visibility', () => {
     await fireEvent.click(getByTestId('backup-reminder-save'));
     await Promise.resolve();
     await Promise.resolve();
-    expect(localStorage.getItem('harmony.onboarding.recoveryArtifactBackedUp')).toBe('true');
+    expect(localStorage.getItem(backedUpKey(OWNER))).toBe('true');
     expect(queryByTestId('backup-reminder-banner')).toBeNull();
   });
 });

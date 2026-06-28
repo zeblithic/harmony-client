@@ -40,7 +40,7 @@
    */
   function applyLocalOverlay(view: OwnerStateView | null): OwnerStateView | null {
     if (!view) return null;
-    const ownerName = loadProfile()?.displayName;
+    const ownerName = loadProfile(view.ownerId)?.displayName;
     return {
       ...view,
       ...(ownerName ? { ownerDisplayName: ownerName } : {}),

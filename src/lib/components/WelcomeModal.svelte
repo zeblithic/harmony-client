@@ -16,6 +16,7 @@
   import {
     MIN_RECOVERY_PASSPHRASE_LEN,
   } from '../recovery-policy';
+  import { markBackupSkipped, markRecoveryBackedUp } from '../onboarding-backup-flags';
   import { trapFocus } from '../focus-trap';
   import PairingJoiner from './PairingJoiner.svelte';
   import OwnerRestoreWizard from './OwnerRestoreWizard.svelte';
@@ -98,11 +99,8 @@
         return;
       }
       await svc.exportRecoveryFile(mintResult.recoveryToken, pathToken, backupPassphrase, null);
-      try {
-        localStorage.setItem('harmony.onboarding.recoveryArtifactBackedUp', 'true');
-      } catch (e) {
-        console.debug('[zeb-338] backedUp flag write failed:', extractError(e));
-      }
+      // ZEB-587: owner-scope the flag so it tracks THIS identity's backup state.
+      markRecoveryBackedUp(mintResult.state.ownerId);
       backupPassphrase = '';
       await onMinted(mintResult);
     } catch (e) {
@@ -122,11 +120,9 @@
 
   async function handleSkipConfirm() {
     if (mintResult === null) return;
-    try {
-      localStorage.setItem('harmony.onboarding.backupSkipped', 'true');
-    } catch (e) {
-      console.debug('[zeb-338] backupSkipped flag write failed:', extractError(e));
-    }
+    // ZEB-587: owner-scope the flag so a fresh identity that skips is correctly
+    // reminded later, instead of inheriting another identity's "skipped" state.
+    markBackupSkipped(mintResult.state.ownerId);
     await onMinted(mintResult);
   }
 

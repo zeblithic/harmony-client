@@ -114,7 +114,7 @@ describe('WelcomeModal hard gate + flow', () => {
   });
 
   it('save recovery file calls export with pathToken + passphrase', async () => {
-    mintMock.mockResolvedValue({ state: {}, recoveryToken: 'tok' });
+    mintMock.mockResolvedValue({ state: { ownerId: 'ownerX' }, recoveryToken: 'tok' });
     requestExportSavePathMock.mockResolvedValue('path-token-uuid');
     exportRecoveryFileMock.mockResolvedValue({ identityHash: 'h', byteLen: 1, path: '/x' });
     const onMinted = vi.fn();
@@ -125,7 +125,8 @@ describe('WelcomeModal hard gate + flow', () => {
     await fireEvent.click(getByTestId('welcome-save-backup'));
     await Promise.resolve(); await Promise.resolve();
     expect(exportRecoveryFileMock).toHaveBeenCalledWith('tok', 'path-token-uuid', 'longenoughpass', null);
-    expect(localStorage.getItem('harmony.onboarding.recoveryArtifactBackedUp')).toBe('true');
+    // ZEB-587: the backed-up flag is owner-scoped to the freshly-minted identity.
+    expect(localStorage.getItem('harmony.onboarding.recoveryArtifactBackedUp:owner-ownerX')).toBe('true');
     expect(onMinted).toHaveBeenCalled();
   });
 
@@ -139,7 +140,7 @@ describe('WelcomeModal hard gate + flow', () => {
   });
 
   it('skip → confirm sets backupSkipped and calls onMinted', async () => {
-    mintMock.mockResolvedValue({ state: {}, recoveryToken: 'tok' });
+    mintMock.mockResolvedValue({ state: { ownerId: 'ownerX' }, recoveryToken: 'tok' });
     const onMinted = vi.fn();
     const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted } });
     await fireEvent.click(getByTestId('welcome-create-identity'));
@@ -147,7 +148,8 @@ describe('WelcomeModal hard gate + flow', () => {
     await fireEvent.click(getByTestId('welcome-skip-backup'));
     await fireEvent.click(getByTestId('welcome-skip-confirm'));
     await Promise.resolve();
-    expect(localStorage.getItem('harmony.onboarding.backupSkipped')).toBe('true');
+    // ZEB-587: the skipped flag is owner-scoped to the freshly-minted identity.
+    expect(localStorage.getItem('harmony.onboarding.backupSkipped:owner-ownerX')).toBe('true');
     expect(onMinted).toHaveBeenCalled();
   });
 
