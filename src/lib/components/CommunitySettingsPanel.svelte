@@ -199,9 +199,13 @@
     void communityId;
     const mySeq = ++relayStatusSeq;
     relayLoading = true;
-    // A new community starts fresh: clear any in-flight toggle state from the
-    // prior community so its pending/error can't bleed across (the toggle
-    // handler also drops its own stale completions, below).
+    // A new community starts fresh: clear the in-flight toggle state AND the
+    // displayed value from the prior community so neither bleeds across. The
+    // relayOptedIn reset is load-bearing: without it, a FAILED status read on
+    // the new community would re-enable the checkbox (finally → relayLoading =
+    // false) still showing the prior community's opted-in value (CodeRabbit
+    // PR #357). The toggle handler also drops its own stale completions, below.
+    relayOptedIn = false;
     relayPending = false;
     relayError = null;
     invoke<boolean>('get_community_relay_status', { communityIdHex: communityId })
@@ -228,13 +232,17 @@
     // shared-in-profile toggle below).
     const target = e.currentTarget as HTMLInputElement;
     const next = target.checked;
-    // Bind this completion to the community it was clicked on. If the user
-    // switches communities while the set is in flight, the stale completion
-    // must NOT touch the new community's toggle state (CodeRabbit PR #357) —
-    // otherwise community A's failure could roll back B's UI or leave B's
-    // toggle stuck disabled. The $effect above clears pending/error on switch,
-    // so dropping the stale completion here is sufficient.
+    // Bind this completion to the community AND the load generation it was
+    // clicked on. If the user switches communities while the set is in flight,
+    // the stale completion must NOT touch the new community's toggle state
+    // (CodeRabbit PR #357) — otherwise community A's failure could roll back
+    // B's UI or leave B's toggle stuck disabled. Community id ALONE is not
+    // enough: an A → B → A round-trip returns to the same id, so the original
+    // A set would still pass `cid === communityId` and clobber the re-entered
+    // A's fresh state. relayStatusSeq bumps on every switch (incl. A→B→A), so
+    // pairing it with the id pins this completion to this exact visit.
     const cid = communityId;
+    const mySeq = relayStatusSeq;
     relayOptedIn = next; // optimistic
     relayPending = true;
     try {
@@ -242,16 +250,16 @@
         communityIdHex: cid,
         optedIn: next,
       });
-      if (cid !== communityId) return; // switched mid-flight — drop
+      if (cid !== communityId || mySeq !== relayStatusSeq) return; // switched mid-flight — drop
       relayError = null;
     } catch (err) {
-      if (cid !== communityId) return; // switched mid-flight — drop
+      if (cid !== communityId || mySeq !== relayStatusSeq) return; // switched mid-flight — drop
       // Roll back both the model and the DOM checkbox on failure.
       relayOptedIn = !next;
       target.checked = !next;
       relayError = err instanceof Error ? err.message : String(err);
     } finally {
-      if (cid === communityId) relayPending = false;
+      if (cid === communityId && mySeq === relayStatusSeq) relayPending = false;
     }
   }
 
