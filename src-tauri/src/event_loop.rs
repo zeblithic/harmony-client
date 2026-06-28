@@ -8539,6 +8539,7 @@ mod channel_log_adapter_tests {
                     since: None,
                     limit: 0,
                     outcome_tx: Some(tx),
+                    watermark_sealed: None,
                 })
                 .await
                 .expect("qreq send");

@@ -20,10 +20,11 @@ use tokio::task::JoinHandle;
 
 use crate::community_channel_log::{
     decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, read_segment_at,
-    sign_channel_event, verify_channel_event, ChannelAttachment, ChannelEventError, ChannelKey,
-    ChannelLog, ChannelLogConfig, ChannelLogPersistError, ChannelLogReplayTracker,
-    ChannelPostPayload, CommunityStateAtHlc, MessageId, SegmentDescriptor, SignedChannelEvent,
-    WatermarkVector, MAX_ATTACHMENTS, MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
+    seal_watermark_vector, sign_channel_event, verify_channel_event, ChannelAttachment,
+    ChannelEventError, ChannelKey, ChannelLog, ChannelLogConfig, ChannelLogPersistError,
+    ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc, MessageId, SegmentDescriptor,
+    SignedChannelEvent, WatermarkVector, MAX_ATTACHMENTS, MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
+    MAX_WATERMARK_VECTOR_BYTES,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -410,6 +411,13 @@ pub struct BackfillQueryRequest {
     /// instead, so the receiver observes a closed channel). `None` →
     /// existing fire-and-forget behaviour (IPC path unchanged).
     pub outcome_tx: Option<tokio::sync::oneshot::Sender<BackfillPageReport>>,
+    /// ZEB-585: an AEAD-sealed per-author [`WatermarkVector`] for a normal
+    /// catch-up (`since == Some`). `None` for a full reconcile
+    /// (`since == None`) or when sealing/cap degraded to the key-expr
+    /// scalar path. The requester-side GET driver forwards these opaque
+    /// bytes as the GET payload; the responder opens them with the channel
+    /// key (it has no key on the requester side).
+    pub watermark_sealed: Option<Vec<u8>>,
 }
 
 /// Bundles per-instance dependencies + I/O channel endpoints + the
@@ -1145,11 +1153,27 @@ impl ChannelLogEngine {
         since: Option<Hlc>,
         outcome_tx: Option<tokio::sync::oneshot::Sender<BackfillPageReport>>,
     ) -> Result<(), ChannelLogEngineError> {
+        // ZEB-585: attach a per-author watermark vector for a normal
+        // catch-up (since=Some). since=None is a full reconcile (periodic
+        // floor / fresh join) — no vector, serve everything, exactly as
+        // today. Sealed engine-side because the requester-side GET driver
+        // holds no channel key. Over the byte cap or a seal error → no
+        // vector (degrade to the key-expr scalar `since` + periodic floor).
+        let watermark_sealed = if since.is_some() {
+            let vector = self.log_watermark_vector().await;
+            match seal_watermark_vector(self.channel_key_ref(), &vector) {
+                Ok(bytes) if bytes.len() <= MAX_WATERMARK_VECTOR_BYTES => Some(bytes),
+                _ => None,
+            }
+        } else {
+            None
+        };
         self.query_request_tx
             .send(BackfillQueryRequest {
                 since,
                 limit: 0,
                 outcome_tx,
+                watermark_sealed,
             })
             .await
             .map_err(|e| ChannelLogEngineError::BackfillFailed(e.to_string()))
@@ -4380,6 +4404,72 @@ mod tests {
         assert!(
             req.outcome_tx.is_some(),
             "with_outcome variant must carry the oneshot through"
+        );
+    }
+
+    #[tokio::test]
+    async fn since_some_seals_vector_since_none_does_not() {
+        let mut fix = build_engine_fixture(8, 250, 1000).await;
+        // One event so the watermark vector is non-empty.
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            log.append(make_signed_event(
+                fix.community_id,
+                fix.channel_id,
+                fix.self_owner,
+                Hlc {
+                    wall_ms: 500,
+                    logical: 0,
+                    device_id: "dev-x".to_string(),
+                },
+                "x1",
+                &fix.signing_key,
+            ))
+            .expect("append");
+        }
+        let expected = fix.engine.log_watermark_vector().await;
+        assert!(!expected.is_empty());
+
+        // since=Some → a sealed vector is attached and opens to the engine's vector.
+        let (tx, _rx) = tokio::sync::oneshot::channel::<BackfillPageReport>();
+        Arc::clone(&fix.engine)
+            .request_backfill_with_outcome(
+                Some(Hlc {
+                    wall_ms: 500,
+                    logical: 0,
+                    device_id: "dev-x".to_string(),
+                }),
+                tx,
+            )
+            .await
+            .expect("backfill some");
+        let req = tokio::time::timeout(Duration::from_millis(500), fix.query_request_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("rx open");
+        let sealed = req
+            .watermark_sealed
+            .expect("since=Some must seal a watermark vector");
+        let opened = crate::community_channel_log::open_watermark_vector(
+            fix.engine.channel_key_ref(),
+            &sealed,
+        )
+        .expect("open");
+        assert_eq!(opened, expected, "sealed vector opens to the engine's current vector");
+
+        // since=None → no vector (full reconcile).
+        let (tx2, _rx2) = tokio::sync::oneshot::channel::<BackfillPageReport>();
+        Arc::clone(&fix.engine)
+            .request_backfill_with_outcome(None, tx2)
+            .await
+            .expect("backfill none");
+        let req2 = tokio::time::timeout(Duration::from_millis(500), fix.query_request_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("rx open");
+        assert!(
+            req2.watermark_sealed.is_none(),
+            "since=None must NOT seal a vector (full reconcile)"
         );
     }
 
