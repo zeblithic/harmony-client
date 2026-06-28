@@ -1941,7 +1941,7 @@ mod tests {
         ));
         // Req #1: the initial reconnect catch-up uses the incremental
         // watermark.
-        while sinces.lock().unwrap().len() < 1 {
+        while sinces.lock().unwrap().is_empty() {
             tokio::task::yield_now().await;
         }
         assert_eq!(
