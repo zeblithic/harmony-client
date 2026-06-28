@@ -4,52 +4,71 @@
    * backup during onboarding. Sticky across launches (localStorage) until the
    * user backs up; dismissable for the current session only (sessionStorage).
    *
-   * Visibility (correction #7): backupSkipped === 'true'
-   *   && recoveryArtifactBackedUp !== 'true'
-   *   && backupBannerDismissed !== 'true' (session)
+   * Visibility: backupSkipped && !recoveryArtifactBackedUp && !dismissed,
+   * all read for THIS owner via the owner-scoped flags (ZEB-587). backupSkipped
+   * is set ONLY by WelcomeModal's skip-confirm path, so users who minted +
+   * backed up via the DevicesPanel never see this.
    *
-   * Keys on backupSkipped — set ONLY by WelcomeModal's skip-confirm path — so
-   * users who minted + backed up via the DevicesPanel never see this.
+   * ZEB-587: the flags are owner-scoped (`<base>:owner-<id>`), so a fresh /
+   * recreated identity that skipped is correctly reminded even when another
+   * identity on the same (bundle-shared) localStorage already backed up.
    *
    * Unlike WelcomeModal (which holds a fresh mint token), this banner issues a
    * recovery token on demand via issueRecoveryToken() before exporting.
    */
-  import { onMount } from 'svelte';
   import { OwnerService, extractError } from '../owner-service';
   import { MIN_RECOVERY_PASSPHRASE_LEN } from '../recovery-policy';
+  import {
+    isBackupReminderVisible,
+    markBannerDismissed,
+    markRecoveryBackedUp,
+  } from '../onboarding-backup-flags';
 
-  let visible = $state(false);
+  interface Props {
+    /** Current owner identity hex, or null until get_owner_state resolves.
+     *  Visibility is owner-scoped; a null owner never shows the banner. */
+    ownerId: string | null;
+  }
+  const { ownerId }: Props = $props();
+
   let showPassphrase = $state(false);
   let passphrase = $state('');
   let error = $state<string | null>(null);
   let inFlight = $state(false);
+  // Per-session imperative overrides layered on top of the owner-scoped flags.
+  // Set on dismiss / successful backup so the banner hides immediately; the
+  // persisted flags also update, but localStorage/sessionStorage are not
+  // reactive, so these drive the live recompute.
+  let dismissedThisSession = $state(false);
+  let backedUpThisSession = $state(false);
 
   const svc = new OwnerService();
 
-  const KEY_SKIPPED = 'harmony.onboarding.backupSkipped';
-  const KEY_BACKED_UP = 'harmony.onboarding.recoveryArtifactBackedUp';
-  const KEY_DISMISSED = 'harmony.onboarding.backupBannerDismissed';
+  // $derived (not $effect) so visibility is available synchronously on first
+  // render and recomputes when the owner identity resolves (null → id). Reads
+  // the owner-scoped skip/backed-up/dismissed flags for THIS owner (ZEB-587).
+  const visible = $derived(
+    isBackupReminderVisible(ownerId) && !dismissedThisSession && !backedUpThisSession,
+  );
 
-  onMount(() => {
-    try {
-      const skipped = localStorage.getItem(KEY_SKIPPED) === 'true';
-      const backedUp = localStorage.getItem(KEY_BACKED_UP) === 'true';
-      const dismissed = sessionStorage.getItem(KEY_DISMISSED) === 'true';
-      visible = skipped && !backedUp && !dismissed;
-    } catch (e) {
-      // storage unavailable → safest is to NOT nag (avoids a stuck banner)
-      console.debug('[zeb-338] BackupReminderBanner storage read failed:', extractError(e));
-      visible = false;
-    }
+  // Tie the per-session overrides to the owner that set them. If the owner prop
+  // changes while this component stays mounted (e.g. the owner resolves after
+  // mount), reset transient UI so one identity's dismiss/backup/half-typed
+  // passphrase can't carry into another's reminder (ZEB-587 — CodeRabbit).
+  let overrideOwnerId: string | null = ownerId;
+  $effect(() => {
+    if (overrideOwnerId === ownerId) return;
+    overrideOwnerId = ownerId;
+    dismissedThisSession = false;
+    backedUpThisSession = false;
+    showPassphrase = false;
+    passphrase = '';
+    error = null;
   });
 
   function dismiss() {
-    try {
-      sessionStorage.setItem(KEY_DISMISSED, 'true');
-    } catch (e) {
-      console.debug('[zeb-338] dismiss flag write failed:', extractError(e));
-    }
-    visible = false;
+    if (ownerId) markBannerDismissed(ownerId);
+    dismissedThisSession = true;
   }
 
   function startBackup() {
@@ -58,6 +77,10 @@
   }
 
   async function save() {
+    // Capture the initiating owner up front: the export below has several awaits
+    // and `ownerId` could change underneath us, but the backed-up flag must name
+    // the identity the user actually backed up.
+    const backupOwnerId = ownerId;
     if ([...passphrase].length < MIN_RECOVERY_PASSPHRASE_LEN) {
       error = `Passphrase must be at least ${MIN_RECOVERY_PASSPHRASE_LEN} characters.`;
       return;
@@ -76,13 +99,9 @@
         return; // user cancelled — finally resets inFlight
       }
       await svc.exportRecoveryFile(token, pathToken, passphrase, null);
-      try {
-        localStorage.setItem(KEY_BACKED_UP, 'true');
-      } catch (e) {
-        console.debug('[zeb-338] backedUp flag write failed:', extractError(e));
-      }
+      if (backupOwnerId) markRecoveryBackedUp(backupOwnerId);
       passphrase = '';
-      visible = false;
+      backedUpThisSession = true;
     } catch (e) {
       error = extractError(e);
     } finally {

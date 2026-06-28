@@ -680,7 +680,7 @@
     const sanitized: Profile = profile.avatarUrl?.startsWith('blob:')
       ? { ...profile, avatarUrl: undefined }
       : profile;
-    saveProfile(sanitized);
+    saveProfile(sanitized, selfOwnerId ?? undefined);
     myProfile = profile;
     // Re-seed the card whenever the profile is saved so the name updates
     // immediately without a network round-trip (self-first, ZEB-341 Task 1).
@@ -945,6 +945,11 @@
     // ZEB-341 Task 1: seed the card using the newly-minted owner identity.
     // MintIpcResult.state.ownerId is available from the mint response.
     selfOwnerId = result.state.ownerId;
+    // ZEB-586: re-load the profile under the freshly-minted owner so a prior
+    // identity's cached name can't seed/broadcast from this one. A fresh owner
+    // has no owner-scoped entry → 'Anonymous', which the name prompt below picks
+    // up. (loadProfile is owner-scoped; the global key is no longer read.)
+    myProfile = loadProfile(result.state.ownerId);
     memberCardService.seedSelf(result.state.ownerId, {
       displayName: myProfile.displayName,
       statusText: myProfile.statusText ?? '',
@@ -1696,6 +1701,10 @@
           const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
           if (ownerState !== null) {
             selfOwnerId = ownerState.ownerId;
+            // ZEB-586: load this returning owner's profile from its owner-scoped
+            // cache before seeding/broadcasting the card, so no other identity's
+            // name on this machine can leak into the boot republish below.
+            myProfile = loadProfile(ownerState.ownerId);
             memberCardService.seedSelf(ownerState.ownerId, {
               displayName: myProfile.displayName,
               statusText: myProfile.statusText ?? '',
@@ -1874,6 +1883,11 @@
               const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
               if (ownerState !== null) {
                 selfOwnerId = ownerState.ownerId;
+                // ZEB-586: this is the third owner-resolution path (owner loads
+                // after start_node). Like the other two, load the owner-scoped
+                // profile before seeding/publishing so tryBootPublishCard can't
+                // broadcast the pre-owner default for the resolved owner.
+                myProfile = loadProfile(ownerState.ownerId);
                 memberCardService.seedSelf(ownerState.ownerId, {
                   displayName: myProfile.displayName,
                   statusText: myProfile.statusText ?? '',
@@ -2847,7 +2861,7 @@
 
 <div class="app-shell">
 {#if ownerIdentityState === 'present'}
-  <BackupReminderBanner />
+  <BackupReminderBanner ownerId={selfOwnerId} />
 {/if}
 <Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null} bind:mediaPanelOpen bind:mediaPanelWidth>
   {#snippet nav()}
