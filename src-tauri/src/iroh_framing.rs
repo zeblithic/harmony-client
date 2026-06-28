@@ -70,8 +70,11 @@ pub fn encode_len_prefix(
     if (!allow_empty && body_len == 0) || body_len > max {
         return Err(FrameLenError { len: body_len, max });
     }
-    // Lossless: body_len <= max, and every caller's cap is far below u32::MAX.
-    Ok(endian.encode(body_len as u32))
+    // The wire prefix is a u32: reject (never silently truncate) a body that
+    // can't be represented, so the audited boundary stays safe even when a
+    // caller passes a `max` at/above u32::MAX (the no-cap write sites).
+    let len = u32::try_from(body_len).map_err(|_| FrameLenError { len: body_len, max })?;
+    Ok(endian.encode(len))
 }
 
 /// Decode a 4-byte length prefix into the body length to read next. Rejects a
@@ -103,8 +106,9 @@ pub enum FramingError {
 
 /// Write a `[u32 prefix][body]` frame. The bound check ([`encode_len_prefix`])
 /// runs first, so an out-of-bounds body is rejected before anything is written.
-/// Prefix and body go out in a single buffer so a partial write can't leave the
-/// peer's reader stuck mid-frame.
+/// Prefix then body are written as two `write_all`s (each all-or-error), which
+/// avoids copying the body into a temporary frame buffer — material for the
+/// large-cap relay-pull writer (`RELAY_PULL_MAX_FRAME_BYTES`, 16 MiB).
 pub async fn write_len_prefixed<W: AsyncWrite + Unpin>(
     w: &mut W,
     body: &[u8],
@@ -113,10 +117,8 @@ pub async fn write_len_prefixed<W: AsyncWrite + Unpin>(
     allow_empty: bool,
 ) -> Result<(), FramingError> {
     let prefix = encode_len_prefix(body.len(), max, endian, allow_empty)?;
-    let mut frame = Vec::with_capacity(4 + body.len());
-    frame.extend_from_slice(&prefix);
-    frame.extend_from_slice(body);
-    w.write_all(&frame).await?;
+    w.write_all(&prefix).await?;
+    w.write_all(body).await?;
     Ok(())
 }
 
@@ -173,6 +175,21 @@ mod core_tests {
     #[test]
     fn encode_accepts_at_cap() {
         assert!(encode_len_prefix(MAX, MAX, Endian::Le, false).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn encode_rejects_body_exceeding_u32_even_with_huge_max() {
+        // A body too large for the 4-byte wire prefix is rejected, not
+        // truncated, even when `max` is at/above u32::MAX (the no-cap sites).
+        let too_big = u32::MAX as usize + 1;
+        assert_eq!(
+            encode_len_prefix(too_big, usize::MAX, Endian::Le, false),
+            Err(FrameLenError {
+                len: too_big,
+                max: usize::MAX
+            })
+        );
     }
 
     #[test]

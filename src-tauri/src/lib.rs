@@ -44372,11 +44372,12 @@ where
     // above. `send.finish()` is non-async (just signals end-of-stream
     // locally on iroh 0.98); no timeout needed for it.
     let write_prefix = async {
-        // Caller-bounded packet; no historical write cap (max = usize::MAX) so
-        // wire behavior is unchanged. The shared encoder unifies byte order.
+        // Caller-bounded packet; no historical write cap, so cap at the wire-
+        // representable max (u32::MAX) — preserves behavior, keeps the prefix
+        // u32-safe, and unifies byte order.
         let prefix = crate::iroh_framing::encode_len_prefix(
             wire.len(),
-            usize::MAX,
+            u32::MAX as usize,
             crate::iroh_framing::Endian::Le,
             false,
         )
@@ -45024,11 +45025,12 @@ pub async fn connectivity_link_friend_iroh_inner(
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
     // Write [u32 LE length-prefix][body], each bounded by write_timeout.
     let write_prefix = async {
-        // Caller-bounded packet; no historical write cap (max = usize::MAX) so
-        // wire behavior is unchanged. The shared encoder unifies byte order.
+        // Caller-bounded packet; no historical write cap, so cap at the wire-
+        // representable max (u32::MAX) — preserves behavior, keeps the prefix
+        // u32-safe, and unifies byte order.
         let prefix = crate::iroh_framing::encode_len_prefix(
             wire.len(),
-            usize::MAX,
+            u32::MAX as usize,
             crate::iroh_framing::Endian::Le,
             false,
         )
@@ -46729,11 +46731,12 @@ async fn browse_friend_referrals(
     let wire = crate::referral_catalog::encode_catalog_request(&req)
         .map_err(|e| format!("encode catalog request: {e:?}"))?;
     let write_prefix = async {
-        // Caller-bounded packet; no historical write cap (max = usize::MAX) so
-        // wire behavior is unchanged. The shared encoder unifies byte order.
+        // Caller-bounded packet; no historical write cap, so cap at the wire-
+        // representable max (u32::MAX) — preserves behavior, keeps the prefix
+        // u32-safe, and unifies byte order.
         let prefix = crate::iroh_framing::encode_len_prefix(
             wire.len(),
-            usize::MAX,
+            u32::MAX as usize,
             crate::iroh_framing::Endian::Le,
             false,
         )
@@ -47455,11 +47458,12 @@ pub async fn connectivity_add_friend_by_key_inner(
     };
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
     let write_prefix = async {
-        // Caller-bounded packet; no historical write cap (max = usize::MAX) so
-        // wire behavior is unchanged. The shared encoder unifies byte order.
+        // Caller-bounded packet; no historical write cap, so cap at the wire-
+        // representable max (u32::MAX) — preserves behavior, keeps the prefix
+        // u32-safe, and unifies byte order.
         let prefix = crate::iroh_framing::encode_len_prefix(
             wire.len(),
-            usize::MAX,
+            u32::MAX as usize,
             crate::iroh_framing::Endian::Le,
             false,
         )

@@ -257,11 +257,12 @@ pub async fn open_join_after_resolve(
 
     // 8. Write [u32 LE len][wire] then finish(), each bounded by write_timeout.
     let write_prefix = async {
-        // Caller-bounded packet; no historical write cap (max = usize::MAX) so
-        // wire behavior is unchanged. The shared encoder unifies byte order.
+        // Caller-bounded packet; no historical write cap, so cap at the wire-
+        // representable max (u32::MAX) — preserves behavior, keeps the prefix
+        // u32-safe, and unifies byte order.
         let prefix = crate::iroh_framing::encode_len_prefix(
             wire.len(),
-            usize::MAX,
+            u32::MAX as usize,
             crate::iroh_framing::Endian::Le,
             false,
         )

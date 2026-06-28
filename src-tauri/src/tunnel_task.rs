@@ -507,13 +507,14 @@ async fn write_length_prefixed(
     stream: &mut SendStream,
     data: &[u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // The write side is caller-bounded (handshake messages), so no cap here:
-    // `usize::MAX` preserves the historical "always write" behavior. BE +
-    // allow-empty matches this protocol's shipped wire format exactly.
+    // The write side is caller-bounded (handshake messages), so cap at the
+    // wire-representable max (u32::MAX): preserves the historical "always
+    // write" behavior while keeping the prefix u32-safe. BE + allow-empty
+    // matches this protocol's shipped wire format exactly.
     crate::iroh_framing::write_len_prefixed(
         stream,
         data,
-        usize::MAX,
+        u32::MAX as usize,
         crate::iroh_framing::Endian::Be,
         true,
     )
