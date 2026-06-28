@@ -370,6 +370,116 @@ describe('ChannelMessageFeed', () => {
     expect(container.querySelector('.poll-message')).toBeNull();
   });
 
+  // ── ZEB-588: @-mention rendering ──
+  it('renders a <@id> body token as a resolved styled mention', async () => {
+    const MID = 'a'.repeat(32);
+    const { adapter, container } = await setup({
+      resolveCard: (id: string) => (id === MID ? { displayName: 'Jake', statusText: '' } : undefined),
+    });
+    adapter.listeners.get('channel-message-received')!({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'mentionmsg1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'cc'.repeat(20),
+          at: { wallMs: 4000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode(`hi <@${MID}>`)),
+          mentions: [MID],
+        },
+      },
+    });
+    await waitFor(() => {
+      const mention = container.querySelector('[data-testid="mention"]');
+      expect(mention?.textContent).toBe('@Jake');
+    });
+    // not the viewer → no self emphasis, no row highlight
+    expect(container.querySelector('[data-testid="mention"]')!.classList.contains('self')).toBe(false);
+    expect(container.querySelector('.channel-message')!.classList.contains('mentions-me')).toBe(false);
+    // surrounding text is preserved
+    expect(container.querySelector('.channel-message p.body')?.textContent).toContain('hi @Jake');
+  });
+
+  it('highlights the row and the mention when the viewer is mentioned', async () => {
+    const ME = 'a'.repeat(32);
+    const { adapter, container } = await setup({
+      ownAddress: ME,
+      resolveCard: (id: string) => (id === ME ? { displayName: 'Me', statusText: '' } : undefined),
+    });
+    adapter.listeners.get('channel-message-received')!({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'mentionmsg2',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'cc'.repeat(20),
+          at: { wallMs: 5000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode(`yo <@${ME}>`)),
+          mentions: [ME],
+        },
+      },
+    });
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="mention"]')?.textContent).toBe('@Me');
+    });
+    expect(container.querySelector('[data-testid="mention"]')!.classList.contains('self')).toBe(true);
+    expect(container.querySelector('.channel-message')!.classList.contains('mentions-me')).toBe(true);
+  });
+
+  it('compose: @-autocomplete pick → Enter sends a body token + mentions array', async () => {
+    const ID = 'a'.repeat(32);
+    const { adapter, container } = await setup({ mentionCandidates: [{ ownerId: ID, label: 'Jake' }] });
+    const ta = container.querySelector('.compose-input') as HTMLTextAreaElement;
+    // type "@Ja" with the caret at the end
+    ta.value = '@Ja';
+    ta.selectionStart = 3;
+    ta.selectionEnd = 3;
+    await fireEvent.input(ta);
+    // the autocomplete opens
+    await waitFor(() =>
+      expect(container.querySelector('[data-testid="mention-autocomplete"]')).toBeTruthy(),
+    );
+    // pick "Jake" (mousedown, so the textarea keeps focus/selection)
+    await fireEvent.mouseDown(container.querySelector('[data-testid="mention-option"] button')!);
+    await waitFor(() => expect(ta.value).toContain('@Jake '));
+    // send with Enter (dropdown is closed now → Enter sends, not picks)
+    await fireEvent.keyDown(ta, { key: 'Enter' });
+    await waitFor(() => {
+      const call = (adapter.invoke as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c: unknown[]) => c[0] === 'post_channel_message',
+      );
+      expect(call).toBeTruthy();
+      const body = new TextDecoder().decode(new Uint8Array((call![1] as { body: number[] }).body));
+      expect(body).toContain(`<@${ID}>`);
+      expect((call![1] as { mentions?: string[] }).mentions).toEqual([ID]);
+    });
+  });
+
+  it('compose: a plain message (no picks) sends no mentions', async () => {
+    const { adapter, container } = await setup({
+      mentionCandidates: [{ ownerId: 'a'.repeat(32), label: 'Jake' }],
+    });
+    const ta = container.querySelector('.compose-input') as HTMLTextAreaElement;
+    ta.value = 'hello world';
+    ta.selectionStart = 11;
+    await fireEvent.input(ta);
+    await fireEvent.keyDown(ta, { key: 'Enter' });
+    await waitFor(() => {
+      const call = (adapter.invoke as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c: unknown[]) => c[0] === 'post_channel_message',
+      );
+      expect(call).toBeTruthy();
+      expect(new TextDecoder().decode(new Uint8Array((call![1] as { body: number[] }).body))).toBe(
+        'hello world',
+      );
+      expect((call![1] as { mentions?: string[] }).mentions).toBeUndefined();
+    });
+  });
+
   it('poll-kind message with no matching meta shows "Loading poll…" placeholder', async () => {
     // listActivePolls returns EMPTY → the incoming poll_id has no cache entry.
     const { adapter: votingAdapter, listActivePollsMock } = makeVotingAdapter([]);

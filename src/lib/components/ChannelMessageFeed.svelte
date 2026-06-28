@@ -16,6 +16,16 @@
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
   import type { ResolvedCard } from '../member-card-service';
   import { nonEmpty } from '../display-label';
+  import { tokenizeBody, resolveMentionLabel } from '../mention-render';
+  import {
+    detectMentionTrigger,
+    applyMentionPick,
+    filterCandidates,
+    reconcileCompose,
+    type MentionCandidate,
+    type TrackedMention,
+  } from '../mention-compose';
+  import MentionAutocomplete from './MentionAutocomplete.svelte';
 
   let {
     communityId,
@@ -48,6 +58,10 @@
     resolveNickname,
     /** ZEB-341: open the owner_id card popover for a message author. */
     onOpenCard,
+    /** ZEB-588: roster for the @-mention autocomplete — {ownerId, label} with
+     *  the label pre-resolved via the shared ladder by the parent. Empty/absent
+     *  → the autocomplete never opens (feature degrades to plain text). */
+    mentionCandidates = [],
   }: {
     communityId: string;
     channelId: string;
@@ -74,6 +88,7 @@
       },
       ev: MouseEvent,
     ) => void;
+    mentionCandidates?: MentionCandidate[];
   } = $props();
 
   // Local mirror of service.byChannel cache for this channel.
@@ -104,6 +119,43 @@
 
   let scrollEl: HTMLDivElement | undefined = $state();
   let composeEl: HTMLTextAreaElement | undefined = $state();
+
+  // ── ZEB-588: @-mention compose state ──────────────────────────────────────
+  // `tracked` records each picked mention so reconcileCompose can rewrite the
+  // still-intact `@Label`s into `<@ownerId>` wire tokens on send. `trigger` is
+  // the active `@query` at the caret (null when not mentioning).
+  let tracked = $state<TrackedMention[]>([]);
+  let trigger = $state<{ query: string; atIndex: number } | null>(null);
+  let acIndex = $state(0);
+  const acCandidates = $derived(trigger ? filterCandidates(mentionCandidates, trigger.query) : []);
+  const acOpen = $derived(acCandidates.length > 0);
+
+  // Re-detect the trigger from the LIVE DOM value/caret (not the bound state,
+  // which can lag the input event). Reset the active row on every change.
+  function refreshTrigger() {
+    const el = composeEl;
+    if (!el) {
+      trigger = null;
+      return;
+    }
+    trigger = detectMentionTrigger(el.value, el.selectionStart ?? el.value.length);
+    acIndex = 0;
+  }
+
+  function pickMention(c: MentionCandidate) {
+    const el = composeEl;
+    if (!el || !trigger) return;
+    const caret = el.selectionStart ?? el.value.length;
+    const r = applyMentionPick(el.value, trigger.atIndex, caret, c);
+    composeText = r.text;
+    tracked = [...tracked, r.tracked];
+    trigger = null;
+    // Restore focus + caret after Svelte flushes the new bound value.
+    queueMicrotask(() => {
+      el.focus();
+      el.setSelectionRange(r.caret, r.caret);
+    });
+  }
   let unsubChannel: (() => void) | null = null;
   let prevOnBackfillProgress: typeof channelMessageService.onBackfillProgress | undefined;
   let scrollAtTopTimer: ReturnType<typeof setTimeout> | null = null;
@@ -127,6 +179,12 @@
     channelMessageService.selfOwnerId = ownAddress;
     // Fresh local mirror per channel switch.
     messages = [];
+    // ZEB-588 (CodeRabbit): drop any in-progress @-mention picks on a channel/
+    // community switch so a label picked in the previous channel can't be
+    // rewritten into a stale owner id when sending here.
+    tracked = [];
+    trigger = null;
+    acIndex = 0;
     // ZEB-536: close any open reaction picker so it doesn't linger across a
     // channel switch (and its Escape/outside-click window listeners unwind).
     pickerOpenFor = null;
@@ -315,23 +373,55 @@
   }
 
   async function handleCompose(e: KeyboardEvent) {
+    // ZEB-588: while the @-autocomplete is open, the navigation keys drive it
+    // instead of the composer (Enter picks the active row rather than sending).
+    if (acOpen) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        acIndex = (acIndex + 1) % acCandidates.length;
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        acIndex = (acIndex - 1 + acCandidates.length) % acCandidates.length;
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        // Guard a stale index (the roster can change while the menu is open).
+        const candidate = acCandidates[acIndex];
+        if (candidate) pickMention(candidate);
+        else acIndex = 0;
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        trigger = null;
+        return;
+      }
+    }
     if (e.key !== 'Enter') return;
     if (e.shiftKey) return; // newline; let browser handle
     e.preventDefault();
-    const text = composeText.trim();
-    if ((!text && pendingAttachments.length === 0) || posting || ingesting) return;
+    // ZEB-588: rewrite picked @Labels into <@id> tokens + the mentions array.
+    const { body, mentions } = reconcileCompose(composeText, tracked);
+    const trimmedBody = body.trim();
+    if ((!trimmedBody && pendingAttachments.length === 0) || posting || ingesting) return;
     posting = true;
     composeError = null;
     try {
       await channelMessageService.postMessage(
         communityId,
         channelId,
-        text,
+        trimmedBody,
         undefined,
-        undefined,
+        mentions,
         pendingAttachments.length > 0 ? pendingAttachments : undefined,
       );
       composeText = '';
+      tracked = [];
+      trigger = null;
+      acIndex = 0;
       pendingAttachments = [];
     } catch (e) {
       composeError = e instanceof Error ? e.message : String(e);
@@ -418,11 +508,8 @@
   // hex. Read through both resolvers so the reactive nickname map / card Map
   // re-render the author label automatically.
   function authorLabel(author: string): string {
-    return (
-      nonEmpty(resolveNickname?.(author)) ??
-      nonEmpty(resolveCard?.(author)?.displayName) ??
-      author.slice(0, 8)
-    );
+    // Shared ladder (ZEB-432/ZEB-588): nickname ► profile-card name ► hex.
+    return resolveMentionLabel(author, resolveNickname, resolveCard);
   }
 
   // ZEB-536 — is the local member currently reacting with `emoji` on `msg`?
@@ -803,6 +890,7 @@
           class="channel-message"
           class:self={isSelf(msg.author)}
           class:pre-fork={row.isPreFork}
+          class:mentions-me={msg.mentions?.includes(ownAddress)}
         >
           <div class="avatar-col">
             <Avatar address={msg.author} avatarUrl={resolveCard?.(msg.author)?.avatarUrl} size={32} />
@@ -836,7 +924,10 @@
                 <p class="poll-loading">Loading poll…</p>
               {/if}
             {:else}
-              <p class="body">{bodyToText(msg.body)}</p>
+              <p class="body">{#each tokenizeBody(bodyToText(msg.body)) as seg}{#if seg.type === 'mention'}<span
+                    class="mention"
+                    class:self={seg.ownerId === ownAddress}
+                    data-testid="mention">@{resolveMentionLabel(seg.ownerId, resolveNickname, resolveCard)}</span>{:else}{seg.text}{/if}{/each}</p>
             {/if}
             {#if msg.attachments && msg.attachments.length > 0}
               <MessageAttachments
@@ -1040,12 +1131,18 @@
         bind:this={composeEl}
         bind:value={composeText}
         onkeydown={handleCompose}
+        oninput={refreshTrigger}
+        onkeyup={refreshTrigger}
+        onclick={refreshTrigger}
         class="compose-input"
         placeholder={ingesting ? 'Finishing upload…' : `Message #${channelName}`}
         rows="2"
         aria-label="Channel message"
         disabled={posting}
       ></textarea>
+      {#if acOpen}
+        <MentionAutocomplete candidates={acCandidates} activeIndex={acIndex} onPick={pickMention} />
+      {/if}
     </div>
   </div>
 </div>
@@ -1112,6 +1209,22 @@
   }
   .ts { color: var(--text-secondary); font-size: 0.7rem; }
   .body { margin: 2px 0 0; color: var(--text-primary); white-space: pre-wrap; word-wrap: break-word; }
+  /* ZEB-588: resolved @-mention chip; `.self` = a mention of the viewer. */
+  .mention {
+    color: var(--accent, #5865f2);
+    background: color-mix(in srgb, var(--accent, #5865f2) 15%, transparent);
+    border-radius: 3px;
+    padding: 0 0.15rem;
+    font-weight: 500;
+  }
+  .mention.self {
+    background: color-mix(in srgb, var(--accent, #5865f2) 35%, transparent);
+  }
+  /* ZEB-588: subtle row highlight when the viewer is mentioned in a message. */
+  .channel-message.mentions-me {
+    background: color-mix(in srgb, var(--accent, #5865f2) 8%, transparent);
+    border-left: 2px solid var(--accent, #5865f2);
+  }
   .reactions {
     display: flex;
     flex-wrap: wrap;
@@ -1367,7 +1480,7 @@
     margin-left: 4px;
     white-space: nowrap;
   }
-  .compose-row { display: flex; align-items: flex-end; gap: 8px; }
+  .compose-row { display: flex; align-items: flex-end; gap: 8px; position: relative; }
   .attach-btn {
     flex: 0 0 auto;
     background: var(--bg-tertiary);
