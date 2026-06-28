@@ -452,6 +452,18 @@ export class VoiceSession {
   }
 
   /**
+   * ZEB-354: dispose this session before it is discarded (e.g. on identity
+   * switch, when getVoiceSession rebuilds the singleton). Tears down any live
+   * channel media, timers, and listeners so a replaced instance never leaves the
+   * mic open, drains audio, or holds media bound to a previous identity's IPC
+   * handles. Fire-and-forget (mirrors CallSession / GroupCallSession.destroy);
+   * delegates to leave(), which is a no-op when already idle.
+   */
+  destroy(): void {
+    void this.leave().catch(() => {});
+  }
+
+  /**
    * Dismantle every engine piece, timer, and listener and clear the connection
    * fields. Shared by leave() and the _doJoin() failure path. `invokeLeave`
    * gates the `leave_voice_channel` IPC so the join-failure path only calls it
@@ -618,14 +630,25 @@ export class VoiceSession {
 }
 
 /**
- * App-lifetime singleton. There is at most one active voice session per process
- * (joining a second channel throws while one is connected), so the whole app
- * shares a single VoiceSession built once from the wiring deps. The first caller
- * constructs it with its deps; subsequent calls return the same instance and
- * ignore their deps (identity/adapter are stable for the session).
+ * Per-identity singleton. There is at most one active voice session per process
+ * (joining a second channel throws while one is connected), so the app shares a
+ * single VoiceSession. It is rebuilt when the identity changes (e.g. the user
+ * switches identity via stop_node / start_node without a process restart) so the
+ * session never signs presence/voice packets or holds media bound to a previous
+ * identity's keys, sealed-relay deps, or IPC handles; calls with the same
+ * identity return the cached instance (ZEB-354 — mirrors getCallSession /
+ * getGroupCallSession).
  */
 let _voiceSessionSingleton: VoiceSession | null = null;
+let _voiceSessionIdentity: string | null = null;
 export function getVoiceSession(deps: VoiceSessionDeps): VoiceSession {
-  if (!_voiceSessionSingleton) _voiceSessionSingleton = new VoiceSession(deps);
+  const identity = `${deps.selfOwnerHex}:${deps.selfDeviceHex}`;
+  if (!_voiceSessionSingleton || _voiceSessionIdentity !== identity) {
+    // Tear down the outgoing instance so its media/timers/listeners don't keep
+    // running on the previous identity's handles after the swap.
+    _voiceSessionSingleton?.destroy();
+    _voiceSessionSingleton = new VoiceSession(deps);
+    _voiceSessionIdentity = identity;
+  }
   return _voiceSessionSingleton;
 }
