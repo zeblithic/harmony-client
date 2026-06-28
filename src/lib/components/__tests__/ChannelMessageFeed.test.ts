@@ -370,6 +370,66 @@ describe('ChannelMessageFeed', () => {
     expect(container.querySelector('.poll-message')).toBeNull();
   });
 
+  // ── ZEB-588: @-mention rendering ──
+  it('renders a <@id> body token as a resolved styled mention', async () => {
+    const MID = 'a'.repeat(32);
+    const { adapter, container } = await setup({
+      resolveCard: (id: string) => (id === MID ? { displayName: 'Jake', statusText: '' } : undefined),
+    });
+    adapter.listeners.get('channel-message-received')!({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'mentionmsg1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'cc'.repeat(20),
+          at: { wallMs: 4000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode(`hi <@${MID}>`)),
+          mentions: [MID],
+        },
+      },
+    });
+    await waitFor(() => {
+      const mention = container.querySelector('[data-testid="mention"]');
+      expect(mention?.textContent).toBe('@Jake');
+    });
+    // not the viewer → no self emphasis, no row highlight
+    expect(container.querySelector('[data-testid="mention"]')!.classList.contains('self')).toBe(false);
+    expect(container.querySelector('.channel-message')!.classList.contains('mentions-me')).toBe(false);
+    // surrounding text is preserved
+    expect(container.querySelector('.channel-message p.body')?.textContent).toContain('hi @Jake');
+  });
+
+  it('highlights the row and the mention when the viewer is mentioned', async () => {
+    const ME = 'a'.repeat(32);
+    const { adapter, container } = await setup({
+      ownAddress: ME,
+      resolveCard: (id: string) => (id === ME ? { displayName: 'Me', statusText: '' } : undefined),
+    });
+    adapter.listeners.get('channel-message-received')!({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'mentionmsg2',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'cc'.repeat(20),
+          at: { wallMs: 5000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode(`yo <@${ME}>`)),
+          mentions: [ME],
+        },
+      },
+    });
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="mention"]')?.textContent).toBe('@Me');
+    });
+    expect(container.querySelector('[data-testid="mention"]')!.classList.contains('self')).toBe(true);
+    expect(container.querySelector('.channel-message')!.classList.contains('mentions-me')).toBe(true);
+  });
+
   it('poll-kind message with no matching meta shows "Loading poll…" placeholder', async () => {
     // listActivePolls returns EMPTY → the incoming poll_id has no cache entry.
     const { adapter: votingAdapter, listActivePollsMock } = makeVotingAdapter([]);

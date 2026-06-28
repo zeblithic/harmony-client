@@ -16,6 +16,7 @@
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
   import type { ResolvedCard } from '../member-card-service';
   import { nonEmpty } from '../display-label';
+  import { tokenizeBody, resolveMentionLabel } from '../mention-render';
 
   let {
     communityId,
@@ -418,11 +419,8 @@
   // hex. Read through both resolvers so the reactive nickname map / card Map
   // re-render the author label automatically.
   function authorLabel(author: string): string {
-    return (
-      nonEmpty(resolveNickname?.(author)) ??
-      nonEmpty(resolveCard?.(author)?.displayName) ??
-      author.slice(0, 8)
-    );
+    // Shared ladder (ZEB-432/ZEB-588): nickname ► profile-card name ► hex.
+    return resolveMentionLabel(author, resolveNickname, resolveCard);
   }
 
   // ZEB-536 — is the local member currently reacting with `emoji` on `msg`?
@@ -803,6 +801,7 @@
           class="channel-message"
           class:self={isSelf(msg.author)}
           class:pre-fork={row.isPreFork}
+          class:mentions-me={msg.mentions?.includes(ownAddress)}
         >
           <div class="avatar-col">
             <Avatar address={msg.author} avatarUrl={resolveCard?.(msg.author)?.avatarUrl} size={32} />
@@ -836,7 +835,10 @@
                 <p class="poll-loading">Loading poll…</p>
               {/if}
             {:else}
-              <p class="body">{bodyToText(msg.body)}</p>
+              <p class="body">{#each tokenizeBody(bodyToText(msg.body)) as seg}{#if seg.type === 'mention'}<span
+                    class="mention"
+                    class:self={seg.ownerId === ownAddress}
+                    data-testid="mention">@{resolveMentionLabel(seg.ownerId, resolveNickname, resolveCard)}</span>{:else}{seg.text}{/if}{/each}</p>
             {/if}
             {#if msg.attachments && msg.attachments.length > 0}
               <MessageAttachments
@@ -1112,6 +1114,22 @@
   }
   .ts { color: var(--text-secondary); font-size: 0.7rem; }
   .body { margin: 2px 0 0; color: var(--text-primary); white-space: pre-wrap; word-wrap: break-word; }
+  /* ZEB-588: resolved @-mention chip; `.self` = a mention of the viewer. */
+  .mention {
+    color: var(--accent, #5865f2);
+    background: color-mix(in srgb, var(--accent, #5865f2) 15%, transparent);
+    border-radius: 3px;
+    padding: 0 0.15rem;
+    font-weight: 500;
+  }
+  .mention.self {
+    background: color-mix(in srgb, var(--accent, #5865f2) 35%, transparent);
+  }
+  /* ZEB-588: subtle row highlight when the viewer is mentioned in a message. */
+  .channel-message.mentions-me {
+    background: color-mix(in srgb, var(--accent, #5865f2) 8%, transparent);
+    border-left: 2px solid var(--accent, #5865f2);
+  }
   .reactions {
     display: flex;
     flex-wrap: wrap;

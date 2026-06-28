@@ -9,6 +9,8 @@
  * → short hex.
  */
 
+import { nonEmpty } from './display-label';
+
 export type BodySegment =
   | { type: 'text'; text: string }
   | { type: 'mention'; ownerId: string };
@@ -34,12 +36,9 @@ export function tokenizeBody(text: string): BodySegment[] {
   return segments;
 }
 
-function present(v: string | undefined): string | undefined {
-  return v && v.trim() ? v : undefined;
-}
-
 /** The single shared resolution ladder: local nickname → broadcast profile
- *  displayName → `ownerId.slice(0, 8)`. Empty/whitespace values count as absent.
+ *  displayName → `ownerId.slice(0, 8)`. Empty/whitespace values count as absent
+ *  (via the shared `nonEmpty`, same as `ChannelMessageFeed.authorLabel` — ZEB-432).
  *  Returns the BARE label (no leading '@'); the mention render template adds it. */
 export function resolveMentionLabel(
   ownerId: string,
@@ -47,8 +46,8 @@ export function resolveMentionLabel(
   resolveCard?: (id: string) => { displayName: string } | undefined,
 ): string {
   return (
-    present(resolveNickname?.(ownerId)) ??
-    present(resolveCard?.(ownerId)?.displayName) ??
+    nonEmpty(resolveNickname?.(ownerId)) ??
+    nonEmpty(resolveCard?.(ownerId)?.displayName) ??
     ownerId.slice(0, 8)
   );
 }
