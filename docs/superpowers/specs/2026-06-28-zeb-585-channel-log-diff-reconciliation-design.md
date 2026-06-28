@@ -33,13 +33,13 @@ The periodic full-reconcile floor stays **as-is** (Jake's call) as the within-au
 
 `since` becomes a **watermark vector** keyed by the **`(author, device_id)` lane**: `{ (author, device_id) → (wall_ms, logical) }` — the member's max HLC per authoring lane. The lane key matches the replay tracker's lane identity (`replay_tracker_independent_lanes_per_author`): two authors may legitimately share a `device_id`, so keying by device alone would collapse their lanes and let one author's watermark suppress the other's events.
 
-The responder serves an event when, for its `at.device_id`, the requester's vector either:
-- has **no entry** (requester has nothing from that device → serve all of it), or
+The responder serves an event when, for its `(author, at.device_id)` lane, the requester's vector either:
+- has **no entry** (requester has nothing from that author/device lane → serve all of it), or
 - has an entry the event exceeds: `(ev.wall_ms, ev.logical) > (entry.wall_ms, entry.logical)`.
 
-**Why `(wall_ms, logical)`, not full `Hlc`:** within one device's stream `device_id` is constant, so `Hlc`'s lexicographic order `(wall_ms, logical, device_id)` collapses to `(wall_ms, logical)`. An HLC guarantees a single device's own successive events strictly increase, so a per-device scalar **is** a completeness certificate *within that device's append-only stream*. Storing `(wall_ms, logical)` avoids the redundant device_id in the value (it is the map key).
+**Why `(wall_ms, logical)`, not full `Hlc`:** within one lane both `author` and `device_id` are constant, so `Hlc`'s lexicographic order `(wall_ms, logical, device_id)` collapses to `(wall_ms, logical)`. An HLC guarantees a single device's own successive events strictly increase, so a per-lane scalar **is** a completeness certificate *within that lane's append-only stream*. Storing `(wall_ms, logical)` avoids the redundant device_id in the value (it is part of the map key).
 
-This closes the observed bug: the returning member had **no entry** for the offline-window peer's device, so it now pulls that device's events in full regardless of how their HLC sorts against the member's global max.
+This closes the observed bug: the returning member had **no entry** for the offline-window peer's `(author, device)` lane, so it now pulls that lane's events in full regardless of how their HLC sorts against the member's global max.
 
 ## A.2 Residual gap (documented, backstopped — not fixed here)
 
