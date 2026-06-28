@@ -1,0 +1,23 @@
+{
+  "version": "0.1.2",
+  "notes": "See https://github.com/zeblithic/harmony-client/releases/tag/v0.1.2",
+  "pub_date": "2026-06-28T03:50:05Z",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRd0xIZzRBL2hObWNlb2lneUltZGRvYUdVdzR5TThEUjJpdmUzVEhlcFlSQnZ2MXFHOG5acHluL0xkN2txWWt6SVRRVExybU0wT2hheWpnRmhTYWxSbWZiSlFOQXV0Z2c4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNjE0NTAwCWZpbGU6SGFybW9ueS5hcHAudGFyLmd6CnhPVmtiSHFVN3JQQXBOQU9TeDhsaXUwOXh5Yk52MGM2QSthMHRMaXJYT3EzQ0tkdFh6MVk2NGJ3T2JtaHVOSUpMNS83ZUNZeWZWZEVGZ0xQL1RVZENBPT0K",
+      "url": "https://github.com/zeblithic/harmony-client/releases/download/v0.1.2/Harmony_aarch64-apple-darwin.app.tar.gz"
+    },
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRd0xIZzRBL2hObVU2NDJwRzBKRXhGWHBhR0VsSmloZ3pxWDVBZXFvNWNiTWM0NHlselp1VWVyZ0lYd1cyR2EvY3M2R1BteUlvYkhpWGdHR3IyNFlrUmg3QWpoRWtIWlFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNjE2Mjc3CWZpbGU6SGFybW9ueS5hcHAudGFyLmd6Cm1VVGdwRVc1MU1tblN3bzNiOTlzbFBIUUs0aEhzTTY1ZmtaMmhIVzVBQWpIaFdyRWtKdHZRaG4weWtUV1FZL1JWejY4MmFZUWtjWTFBV2dHZXB3R0FnPT0K",
+      "url": "https://github.com/zeblithic/harmony-client/releases/download/v0.1.2/Harmony_x86_64-apple-darwin.app.tar.gz"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRd0xIZzRBL2hObVVKUURjU3dIV3cwS0V1Q2xBeWZrOXhjQksybWtDKzJOMGdpNjFDOEhITFVQOHV5ckhZTmtmZHN6dGl1VmpKV1VxVmJic3cvSlk1aXdSeDhkQlpweXc0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNjE1MDQ2CWZpbGU6SGFybW9ueV8wLjEuMl94NjQtc2V0dXAubnNpcy56aXAKNWZkRE9jeVp0dkNSLzV0cS9FVGJZTWNFWXB4S1VhRFU0cndaZUVlVVQ4UXJzS2V0SUJpRmJNYnBKL3BEOTdaaVAxdFgwK1JGRDZwNVBzcjdPSXFvRHc9PQo=",
+      "url": "https://github.com/zeblithic/harmony-client/releases/download/v0.1.2/Harmony_0.1.2_x64-setup.nsis.zip"
+    },
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRd0xIZzRBL2hObWJKcnNSQkZadDVlMzVNSURuNkU1RVhseTg1V0VsaHpLMFR1QXBhd28vTVgxbGROVnRrUnF1YUVzNTl0cHFWWW84T3luWE5iMzYxSzRtaU16ZFIxSmdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNjE0NTAwCWZpbGU6SGFybW9ueV8wLjEuMl9hbWQ2NC5BcHBJbWFnZS50YXIuZ3oKR0U4eFZwdWl0SElzcTFaMVA2SWFwTEZGM0xaZ2d0MlUxZU15bGl2bU80QmpvU1VYcEVpSW5IUW5MMGp2TGs4eVI3eURNcFkrNFpZMjdyK2tuRGdlQWc9PQo=",
+      "url": "https://github.com/zeblithic/harmony-client/releases/download/v0.1.2/Harmony_0.1.2_amd64.AppImage.tar.gz"
+    }
+  }
+}
