@@ -128,6 +128,7 @@ fn spawn_adapter_bridge_drainer(
                 req.backfill_progress_interval,
                 req.backfill_default_limit,
                 req.closing,
+                req.rbsr_hooks,
             );
             // JoinHandle dropped — adapter task is fire-and-forget;
             // closing flag (held by registry) signals shutdown.

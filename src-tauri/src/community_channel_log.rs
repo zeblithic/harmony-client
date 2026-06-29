@@ -2273,10 +2273,7 @@ impl ChannelLog {
     /// for inline `Have` transfer. Reads only the segments whose `wall_ms` range
     /// overlaps the requested keys' span (plus the tail), so a small leaf range
     /// touches at most a couple of segments.
-    // ZEB-592: called by `rbsr_respond`; both reach production when the
-    // `rbsr/**` transport queryable is wired (plan Task 12). `allow(dead_code)`
-    // until then (kept in the binary, exercised by tests).
-    #[allow(dead_code)]
+    // ZEB-593: reaches production via `rbsr_respond` ← the `rbsr/**` queryable.
     pub(crate) fn events_for_keys(
         &self,
         keys: &[ReconcileKey],
