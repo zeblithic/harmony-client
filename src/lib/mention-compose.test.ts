@@ -109,15 +109,10 @@ describe('reconcileCompose', () => {
       reconcileCompose('@Jake\n', [{ ownerId: ID_A, label: 'Jake', start: 0 }]),
     ).toEqual({ body: `<@${ID_A}>\n`, mentions: [ID_A] });
   });
-  it('longest label wins over a prefix label', () => {
-    const tracked = [
-      { ownerId: ID_A, label: 'Jake', start: 0 },
-      { ownerId: ID_B, label: 'Jake (Koya)', start: 0 },
-    ];
-    expect(reconcileCompose('@Jake (Koya)', tracked)).toEqual({
-      body: `<@${ID_B}>`,
-      mentions: [ID_B],
-    });
+  it('tokenizes a full multi-word label as one span', () => {
+    expect(
+      reconcileCompose('@Jake (Koya)', [{ ownerId: ID_B, label: 'Jake (Koya)', start: 0 }]),
+    ).toEqual({ body: `<@${ID_B}>`, mentions: [ID_B] });
   });
   it('two same-label distinct ids map left-to-right', () => {
     const tracked = [
@@ -138,6 +133,14 @@ describe('reconcileCompose', () => {
       body: `<@${ID_A}> <@${ID_A}>`,
       mentions: [ID_A],
     });
+  });
+  it('tokenizes only the pick at its anchored offset, not an identical label elsewhere', () => {
+    // The real pick is at offset 6; the user also typed a bare "@Jake" at
+    // offset 0. Label-rescan would claim the offset-0 one (wrong); position
+    // anchoring tokenizes only the actual pick (ZEB-590).
+    expect(
+      reconcileCompose('@Jake @Jake', [{ ownerId: ID_A, label: 'Jake', start: 6 }]),
+    ).toEqual({ body: `@Jake <@${ID_A}>`, mentions: [ID_A] });
   });
 });
 

@@ -117,51 +117,41 @@ export function filterCandidates(
   return [...prefix, ...rest].slice(0, limit);
 }
 
-/** Reconcile the textarea text + picks into the wire payload. Single
- *  left-to-right scan; at each index, among UNCONSUMED tracked entries whose
- *  '@<label>' matches there, take the longest label (prefix safety), tie-broken
- *  by insertion order (FIFO → same-label entries map left-to-right). Unmatched
- *  picks degrade to plain text; the mentions array dedupes in first-seen order. */
+/** Reconcile the textarea text + picks into the wire payload. Each pick owns the
+ *  exact offset where its '@label' was inserted (`start`), so we match a pick
+ *  ONLY at its anchor — a manually-retyped identical label elsewhere is never
+ *  claimed. Boundary guards are retained as defense-in-depth: a span left
+ *  adjacent to appended text (e.g. "@JakeX") still degrades to plain text rather
+ *  than corrupting the body. Unmatched picks degrade to plain text; the mentions
+ *  array dedupes in first-seen order. */
 export function reconcileCompose(
   text: string,
   tracked: TrackedMention[],
 ): { body: string; mentions: string[] } {
-  const consumed = new Array(tracked.length).fill(false);
-  const order = tracked
-    .map((_, idx) => idx)
-    .sort((a, b) => {
-      const d = tracked[b].label.length - tracked[a].label.length;
-      return d !== 0 ? d : a - b; // longer first; original order tiebreak
-    });
+  const byStart = new Map<number, TrackedMention>();
+  for (const m of tracked) {
+    if (!byStart.has(m.start)) byStart.set(m.start, m); // first-wins on a dup start
+  }
   let body = '';
   const mentions: string[] = [];
   let i = 0;
   while (i < text.length) {
-    let pick = -1;
-    for (const idx of order) {
-      if (consumed[idx]) continue;
-      const label = tracked[idx].label;
-      if (!text.startsWith(`@${label}`, i)) continue;
-      // Left boundary: the '@' must start the text or follow whitespace, so a
-      // mention merged into a word/email ("a@Jake") is never rewritten.
-      if (i !== 0 && !/\s/.test(text[i - 1])) continue;
-      // Right boundary: the char after the label must be end-of-text or
-      // whitespace, so an edited pick ("@JakeX" / "@Jake2") degrades to plain
-      // text instead of corrupting the body with "<@id>X" (Qodo/CodeRabbit).
-      const j = i + 1 + label.length;
-      if (j !== text.length && !/\s/.test(text[j])) continue;
-      pick = idx;
-      break;
+    const m = byStart.get(i);
+    if (m && text.startsWith(`@${m.label}`, i)) {
+      // Left boundary: '@' must start the text or follow whitespace.
+      const leftOk = i === 0 || /\s/.test(text[i - 1]);
+      // Right boundary: end-of-text or whitespace after the label.
+      const j = i + 1 + m.label.length;
+      const rightOk = j === text.length || /\s/.test(text[j]);
+      if (leftOk && rightOk) {
+        body += `<@${m.ownerId}>`;
+        if (!mentions.includes(m.ownerId)) mentions.push(m.ownerId);
+        i = j;
+        continue;
+      }
     }
-    if (pick >= 0) {
-      consumed[pick] = true;
-      body += `<@${tracked[pick].ownerId}>`;
-      if (!mentions.includes(tracked[pick].ownerId)) mentions.push(tracked[pick].ownerId);
-      i += tracked[pick].label.length + 1; // skip '@' + label
-    } else {
-      body += text[i];
-      i++;
-    }
+    body += text[i];
+    i++;
   }
   return { body, mentions };
 }
