@@ -213,3 +213,31 @@ Two-engine integration test (extends `channel_backfill_integration.rs`):
 - `prollytree` — reference for CDC rolling-hash boundary logic.
 - Reused in-tree: `harmony-content` (FastCDC chunker, CAS/DAG, Zenoh CID routing), `derive_channel_key` / `encrypt_channel_packet` (existing channel crypto).
 - Prior art: `harmony-db::prolly` (ZEB-98/106/109) — surveyed, not reused (per-insert rebuild, CAS-coupled, wrong shape for an append log).
+
+---
+
+# As-built reconciliation (2026-06-29)
+
+The implementation refined the design in four ways. This section is authoritative where it differs from the sections above.
+
+## AB.1 Delivery split into two PRs
+
+The RBSR **core** (this PR) ships everything except the live Zenoh wiring: the pure protocol (`channel_rbsr.rs`), the content-defined chunk index (`channel_chunk_index.rs`), the AEAD seal/open, `ChannelLogEngine::rbsr_respond`, `ChannelLog: RangeReconcileSource`, the backfill reconcile-mode helpers, the in-process acceptance test, and the wire pins — fully tested and CI-green. The **live Zenoh transport** (`rbsr/**` queryable + GET driver + backfill-driver RBSR path + Zenoh integration test) is split to **ZEB-593** because it is one atomic ~300–500-line change across the generic `spawn_channel_log_zenoh_adapter` signature (4 `read_for_query` call sites + the adapter request type + registry construction) with no incrementally-CI-green intermediate state. Until ZEB-593 lands, `rbsr_respond` / `events_for_keys` carry `#[allow(dead_code)]` (present in the binary for the transport to call). ZEB-592 closes when ZEB-593 merges.
+
+## AB.2 Convergence: full ordered partition + Skip-coalescing
+
+§1.4's state machine is realized with both sides emitting a **full ordered partition** of the universe each round (resolved/matching spans echoed as `Skip`, not dropped) so the receiver's positional lower-bound chain (`lo` advancing by each range's `upper`) stays aligned — dropping resolved ranges desyncs the chain and prevents convergence. Adjacent `Skip` ranges are **coalesced** so the resolved prefix/suffix collapse, keeping a message O(diff·log n), not O(total leaves explored). `process_reply` returns `None` (converged) only when no range mismatches.
+
+## AB.3 Bisection via `split_key` (disk-bounded)
+
+The responder picks its bisection split via a `split_key(lo, hi) -> Option<ReconcileKey>` trait method rather than materializing `keys_in_range` — so a wide early range never scans the whole history to find a median. `keys_in_range` is used only at the `≤ LEAF_THRESHOLD` leaf (`Have` wholesale).
+
+## AB.4 Slice 2 is a local accelerator; CDC determinism is unnecessary
+
+§2.1–2.2's emphasis on **content-defined chunk boundaries being identical across peers** turned out to be unneeded: chunk boundaries are never sent on the wire (only `range_fingerprint` *results* over bisection-chosen ranges are), so the chunk index is a purely **local** acceleration structure. Dropping the cross-peer-determinism requirement let the boundaries stay content-defined-but-local and **insert-stable** (no min/max caps), making incremental `append` maintenance a bounded single-chunk window rebuild.
+
+As-built, `ChannelLog` holds an in-memory **`reconcile_entries`** (sorted `(ReconcileKey, element_hash)` mirror of the whole log) **plus** a `ChunkIndex` built over it. `range_fingerprint` is served from the chunk summaries (boundary chunks folded from the in-memory entries) — **disk-free**, eliminating the per-query O(history) segment rescan the watermark-vector path paid (§A.6). `range_count` / `keys_in_range` / `split_key` read the in-memory entries directly. This costs **O(n) memory** per channel (the entries mirror); the memory-frugal variant — chunk summaries only, with boundary events read from disk on demand (no full entries mirror) — is deferred as **Slice 2b**. The headline disk goal is met (queries are disk-free); the memory-frugality is the follow-up.
+
+## AB.5 Acceptance proven in-process; Zenoh-level test deferred
+
+The ticket's bar — a within-one-device out-of-order hole (hold `X@5`, missing `X@3`) recovered with ~O(gap) transfer — is proven by `rbsr_recovers_within_device_out_of_order_hole_over_real_logs`, which reconciles two real `ChannelLog`s through the full protocol + engine path (transferred = gap only). The end-to-end Zenoh-transport integration test is deferred to ZEB-593 (it needs the transport).
