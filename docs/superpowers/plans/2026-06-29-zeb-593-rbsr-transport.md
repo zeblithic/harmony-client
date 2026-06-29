@@ -49,7 +49,7 @@
 
 **Files:** New `fn drive_rbsr_rounds(...)` in `event_loop.rs` (adapter module) or a small helper module; tests with in-memory fakes.
 
-**Interfaces — Consumes:** `rbsr_get: impl Fn(u32, Vec<u8>) -> Fut<Vec<Vec<u8>>>` (round, sealed_request → reply frames); `rbsr_initial: impl Fn() -> Fut<Vec<u8>>`; `rbsr_ingest_and_next: impl Fn(Vec<Vec<u8>>) -> Fut<RbsrStep>`. **Produces:** `enum RbsrStep { Converged, Continue(Vec<u8>), Failed }` and `async fn drive_rbsr_rounds(...) -> ReconcileMode`.
+**Interfaces — Consumes:** `rbsr_get: impl Fn(u32, Vec<u8>) -> Fut<Vec<Vec<u8>>>` (round, sealed_request → reply frames); `rbsr_initial: impl Fn() -> Fut<Vec<u8>>`; `rbsr_ingest_and_next: impl Fn(Vec<Vec<u8>>) -> Fut<RbsrStep>`. **Produces:** `enum RbsrStep { Converged { ingested: usize }, Continue { ingested: usize, next: Vec<u8> }, Failed }` (the success variants carry the round's ingested Have-packet count so the driver reports real progress, not the raw frame count) and `async fn drive_rbsr_rounds(...) -> (ReconcileMode, usize)` (the `usize` is the total transferred, for the backfill-progress tick).
 
 Driver logic (uses committed `ReconcileMode` helpers):
 ```rust
@@ -99,7 +99,7 @@ ReconcileMode::FullReconcile
 
 - [ ] Add `rbsr_respond_query`, `rbsr_initial`, `rbsr_ingest_and_next` fields to `ChannelLogAdapterRequest` and the generic `spawn_channel_log_zenoh_adapter` params (mirror `read_for_query` trait-object/`Arc` shape; keep the `#[allow(clippy::type_complexity)]`).
 - [ ] Register a second queryable on `format!("harmony/channels/{cid}/{ch}/rbsr/**")`. Handler: `parse_rbsr_key` (drop non-matching); cap-check `query.payload()` vs `MAX_RBSR_MESSAGE_BYTES` before `.to_bytes()`; `(rbsr_respond_query)(payload).await`; on `Some((sealed, packets))` `query.reply(key, sealed)` then one `query.reply` per packet; on `None` reply nothing.
-- [ ] Wire the requester: in the adapter, build the `rbsr_get` closure (`session.get(format_rbsr_key(..)).payload(sealed).consolidation(ConsolidationMode::None).timeout(Duration::from_secs(10))`, drain `recv_async` frames until stream close) and call `drive_rbsr_rounds(rbsr_get, rbsr_initial, rbsr_ingest_and_next)`.
+- [ ] Wire the requester: in the adapter, build the `rbsr_get` closure (`session.get(format_rbsr_key(..)).payload(sealed).allowed_destination(Locality::Remote).consolidation(ConsolidationMode::None).timeout(Duration::from_secs(10))`, drain `recv_async` frames until stream close, enforcing a per-round buffer cap) and call `drive_rbsr_rounds(rbsr_get, rbsr_initial, rbsr_ingest_and_next)`. **`Locality::Remote` is load-bearing** — the requester also declares an `rbsr/**` queryable, so without it the GET draws the requester's own all-`Skip` self-reply and may converge prematurely.
 - [ ] `cargo check -p harmony-app --lib` clean.
 - [ ] Commit.
 

@@ -8713,6 +8713,10 @@ where
 /// of thousands of small event packets) yet bounds the worst case — over the cap,
 /// the round aborts and the driver drops to the paged vector path.
 const MAX_RBSR_ROUND_BYTES: usize = 16 * 1024 * 1024;
+/// Per-frame overhead charged toward [`MAX_RBSR_ROUND_BYTES`] so that a flood of
+/// tiny/empty frames is bounded by frame *count* too (~256k frames at this rate),
+/// not just total payload bytes.
+const RBSR_FRAME_OVERHEAD: usize = 64;
 
 /// ZEB-593: issue one RBSR round GET and drain its reply frames. The 10s
 /// per-round timeout is mandatory (the `since/**` GET has none — fine for a
@@ -8753,7 +8757,11 @@ async fn rbsr_get_frames(
                 let Ok(reply) = res else { break; };
                 if let Ok(sample) = reply.into_result() {
                     let frame = sample.payload().to_bytes().to_vec();
-                    total_bytes = total_bytes.saturating_add(frame.len());
+                    // Charge a fixed per-frame overhead on top of the payload so
+                    // a flood of tiny/empty frames (which would grow the `Vec`
+                    // without moving a payload-only byte count) also hits the cap.
+                    total_bytes =
+                        total_bytes.saturating_add(frame.len().saturating_add(RBSR_FRAME_OVERHEAD));
                     if total_bytes > MAX_RBSR_ROUND_BYTES {
                         // Over the per-round buffer cap → abandon this round's
                         // buffer and let the driver fall back to the paged

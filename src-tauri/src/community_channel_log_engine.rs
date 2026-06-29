@@ -1822,19 +1822,27 @@ impl ChannelLogEngine {
         use crate::event_loop::RbsrStep;
         let key = self.channel_key_ref();
         let mut reply: Option<crate::channel_rbsr::RbsrMessage> = None;
+        let mut saw_extra_reply = false;
         let mut have_packets: Vec<Vec<u8>> = Vec::new();
         for frame in frames {
             match crate::community_channel_log::open_rbsr_message(key, &frame) {
-                // A sealed RBSR reply. Keep the first; ignore additional holders'
-                // replies (their `Have` packets below still get ingested).
                 Ok(msg) if reply.is_none() => reply = Some(msg),
-                Ok(_) => {}
+                // A second sealed reply means a second remote holder answered.
+                Ok(_) => saw_extra_reply = true,
                 // Not an RBSR message → an inline `Have` channel packet.
                 Err(_) => have_packets.push(frame),
             }
         }
         // No responder reply this round → fall back.
         let Some(reply) = reply else {
+            return RbsrStep::Failed;
+        };
+        // Multiple holders answered with different logs: a later holder may hold
+        // ranges this (possibly all-`Skip`) first reply doesn't, so converging
+        // on one reply could end catch-up with events still missing. Fall back
+        // to the dedup-tolerant `since/**` vector path, which handles multiple
+        // holders safely. (Common reconnect = a single holder → RBSR proceeds.)
+        if saw_extra_reply {
             return RbsrStep::Failed;
         };
         let ingested = have_packets.len();
@@ -3265,11 +3273,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rbsr_ingest_tolerates_multiple_responder_replies() {
+    async fn rbsr_ingest_falls_back_on_multiple_responder_replies() {
         // A ConsolidationMode::None GET can draw frames from MORE than one remote
         // holder: multiple sealed reply messages interleaved with Have packets.
-        // The engine must ingest only the real Have packets (never feed an extra
-        // reply message to process_inbound_packet) and count only those.
+        // Converging on one reply could miss events a different holder still
+        // holds, so the engine falls back (Failed → vector path) the moment it
+        // sees a second sealed reply — and ingests nothing this round.
         let responder = build_engine_fixture(8, 250, 1000).await;
         let requester = build_engine_fixture(8, 250, 1000).await;
         let mut events = Vec::new();
@@ -3315,24 +3324,17 @@ mod tests {
         }
         frames.push(sealed_reply); // a second responder's reply frame
         let step = requester.engine.rbsr_ingest_and_next(frames).await;
-        match step {
-            crate::event_loop::RbsrStep::Converged { ingested }
-            | crate::event_loop::RbsrStep::Continue { ingested, .. } => {
-                assert_eq!(
-                    ingested, 3,
-                    "extra reply frame must NOT inflate the ingested count",
-                );
-            }
-            crate::event_loop::RbsrStep::Failed => {
-                panic!("must not fail on multi-responder frames")
-            }
-        }
+        assert!(
+            matches!(step, crate::event_loop::RbsrStep::Failed),
+            "a second sealed reply (second holder) must fall back, not converge",
+        );
+        // Nothing is ingested on the fall-back path — the vector path re-fetches.
         let msgs = requester
             .engine
             .list_messages(None, 100)
             .await
             .expect("list");
-        assert_eq!(msgs.len(), 3, "all real Have events recovered");
+        assert_eq!(msgs.len(), 0, "no events ingested when falling back");
     }
 
     #[tokio::test]
