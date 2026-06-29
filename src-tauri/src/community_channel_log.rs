@@ -3159,6 +3159,91 @@ mod tests {
     }
 
     #[test]
+    fn rbsr_recovers_within_device_out_of_order_hole_over_real_logs() {
+        use crate::channel_rbsr::{
+            initial_request, max_key, min_key, process_reply, respond, RangeReconcileSource,
+            MAX_RBSR_ROUNDS,
+        };
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let mk = || {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let log = ChannelLog::new(
+                cid,
+                chid,
+                tmp.path().to_path_buf(),
+                ChannelLogConfig {
+                    seal_threshold_events: 4,
+                },
+            );
+            (log, tmp)
+        };
+        let (mut a, _ta) = mk();
+        let (mut b, _tb) = mk();
+
+        // Common backlog held by BOTH (across seal threshold → real segments).
+        let common: Vec<_> = (0..10u64)
+            .map(|i| fixture_signed_event(1000 + i * 100, 0, "dev-a"))
+            .collect();
+        for e in &common {
+            if a.append(e.clone()).expect("a append") {
+                a.seal_and_persist().expect("seal a");
+            }
+            if b.append(e.clone()).expect("b append") {
+                b.seal_and_persist().expect("seal b");
+            }
+        }
+        // Both hold dev-x's HIGH event (the per-device max).
+        let x_high = fixture_signed_event(2500, 0, "dev-x");
+        if a.append(x_high.clone()).expect("a") {
+            a.seal_and_persist().expect("seal a");
+        }
+        if b.append(x_high.clone()).expect("b") {
+            b.seal_and_persist().expect("seal b");
+        }
+        // Only A holds dev-x's LOW event — the within-one-device out-of-order
+        // hole (B's per-device watermark is 2500, so a scalar/vector catch-up
+        // filters this 1500 event out forever; only RBSR's range fingerprint
+        // detects the mismatch).
+        let x_low = fixture_signed_event(1500, 0, "dev-x");
+        if a.append(x_low.clone()).expect("a") {
+            a.seal_and_persist().expect("seal a");
+        }
+
+        let b_before = b.range_count(&min_key(), &max_key());
+
+        // Drive RBSR rounds: A is the responder (holds the gap), B the
+        // requester. Ingest the events B is missing each round.
+        let mut request = initial_request(&b);
+        let mut transferred = 0usize;
+        let mut rounds = 0u32;
+        loop {
+            rounds += 1;
+            assert!(rounds <= MAX_RBSR_ROUNDS, "must converge within the round cap");
+            let reply = respond(&request, &a);
+            let (missing, next) = process_reply(&reply, &b);
+            let events = a.events_for_keys(&missing);
+            transferred += events.len();
+            for e in events {
+                let _ = b.append(e).expect("ingest");
+            }
+            match next {
+                None => break,
+                Some(n) => request = n,
+            }
+        }
+
+        let b_after = b.range_count(&min_key(), &max_key());
+        assert_eq!(b_after, b_before + 1, "B recovered exactly the missing hole event");
+        assert!(transferred <= 4, "O(gap) transfer, not full history: {transferred}");
+        assert_eq!(
+            a.range_fingerprint(&min_key(), &max_key()).finalize(),
+            b.range_fingerprint(&min_key(), &max_key()).finalize(),
+            "logs converged after RBSR"
+        );
+    }
+
+    #[test]
     fn aead_round_trip() {
         let mk = fixture_mk();
         let cid = fixture_community(0xc0);
