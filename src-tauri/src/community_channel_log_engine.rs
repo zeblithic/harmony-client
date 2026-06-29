@@ -697,7 +697,7 @@ impl ChannelLogEngine {
         &self,
         since: Option<Hlc>,
         limit: usize,
-        keep: impl Fn(&SignedChannelEvent) -> bool,
+        keep: impl Fn(&SignedChannelEvent) -> bool + Send + 'static,
     ) -> Result<Vec<SignedChannelEvent>, ChannelLogEngineError> {
         let effective_limit = if limit == 0 {
             self.config.backfill_default_limit
@@ -705,30 +705,60 @@ impl ChannelLogEngine {
             limit
         };
 
-        let log = self.log.lock().await;
+        // ZEB-591: snapshot the segment descriptors + in-memory tail + root
+        // path UNDER the lock, then drop the lock and read the sealed segments
+        // off the async executor via `spawn_blocking` (they use synchronous
+        // `std::fs::read`). Mirrors `find_attachment` so a large catch-up no
+        // longer stalls concurrent log ops (e.g. live `append`) for the
+        // duration of the disk reads. The tail is bounded by
+        // `seal_threshold_events`, so the under-lock clone is cheap.
+        let (segments, tail, root): (Vec<SegmentDescriptor>, Vec<SignedChannelEvent>, _) = {
+            let log = self.log.lock().await;
+            (
+                log.manifest.segments.clone(),
+                log.tail.clone(),
+                log.root().to_path_buf(),
+            )
+        };
 
-        // Phase 2 stores events in `log.tail` (newest, in-memory) +
-        // sealed segments referenced by `log.manifest.segments` (older,
-        // on-disk; sorted ascending by `range.0`). For correct HLC-
-        // order iteration we walk segments first, then tail.
-        let mut out: Vec<SignedChannelEvent> = Vec::new();
-
-        for seg in &log.manifest.segments {
-            if let Some(since_hlc) = &since {
-                // Phase 2's SegmentDescriptor.range = (first_hlc, last_hlc).
-                // Skip segments entirely older-than-or-equal-to `since` —
-                // they have no events strictly newer than `since` to
-                // contribute. (No is_strictly_older_than method on Hlc;
-                // express via !is_strictly_newer_than on the last-event
-                // bound.)
-                if !seg.range.1.is_strictly_newer_than(since_hlc) {
-                    continue;
+        // Phase 2 stores events in the tail (newest, in-memory) + sealed
+        // segments (older, on-disk; sorted ascending by `range.0`). For correct
+        // HLC-order iteration we walk segments first, then tail. Counting ONLY
+        // kept events toward `limit` means a filtered-out run (e.g. a long
+        // reaction streak) can't exhaust the budget before later kept events
+        // (CodeRabbit PR #314).
+        tokio::task::spawn_blocking(move || {
+            let mut out: Vec<SignedChannelEvent> = Vec::new();
+            for seg in &segments {
+                if let Some(since_hlc) = &since {
+                    // SegmentDescriptor.range = (first_hlc, last_hlc). Skip
+                    // segments entirely older-than-or-equal-to `since` — they
+                    // have no events strictly newer than `since` to contribute.
+                    // (No is_strictly_older_than on Hlc; express via
+                    // !is_strictly_newer_than on the last-event bound.)
+                    if !seg.range.1.is_strictly_newer_than(since_hlc) {
+                        continue;
+                    }
+                }
+                let events = read_segment_at(&root, seg)?;
+                for ev in events {
+                    if let Some(since_hlc) = &since {
+                        if !ev.at().is_strictly_newer_than(since_hlc) {
+                            continue;
+                        }
+                    }
+                    if !keep(&ev) {
+                        continue;
+                    }
+                    out.push(ev);
+                    if out.len() >= effective_limit {
+                        return Ok(out);
+                    }
                 }
             }
-            let events = log
-                .read_segment(seg)
-                .map_err(ChannelLogEngineError::Persist)?;
-            for ev in events {
+
+            // Then the in-memory tail (already snapshotted; no I/O).
+            for ev in tail {
                 if let Some(since_hlc) = &since {
                     if !ev.at().is_strictly_newer_than(since_hlc) {
                         continue;
@@ -742,25 +772,16 @@ impl ChannelLogEngine {
                     return Ok(out);
                 }
             }
-        }
 
-        // Then walk the in-memory tail.
-        for ev in &log.tail {
-            if let Some(since_hlc) = &since {
-                if !ev.at().is_strictly_newer_than(since_hlc) {
-                    continue;
-                }
-            }
-            if !keep(ev) {
-                continue;
-            }
-            out.push(ev.clone());
-            if out.len() >= effective_limit {
-                return Ok(out);
-            }
-        }
-
-        Ok(out)
+            Ok(out)
+        })
+        .await
+        .map_err(|e| {
+            ChannelLogEngineError::Persist(ChannelLogPersistError::Io(format!(
+                "collect_events segment-read task panicked: {e}"
+            )))
+        })?
+        .map_err(ChannelLogEngineError::Persist)
     }
 
     /// ZEB-585: per-author-lane serve predicate for the watermark-vector
@@ -792,7 +813,7 @@ impl ChannelLogEngine {
         &self,
         vector: &WatermarkVector,
         limit: usize,
-        keep: impl Fn(&SignedChannelEvent) -> bool,
+        keep: impl Fn(&SignedChannelEvent) -> bool + Send + 'static,
     ) -> Result<Vec<SignedChannelEvent>, ChannelLogEngineError> {
         let effective_limit = if limit == 0 {
             self.config.backfill_default_limit
@@ -800,15 +821,38 @@ impl ChannelLogEngine {
             limit
         };
 
-        let log = self.log.lock().await;
-        let mut out: Vec<SignedChannelEvent> = Vec::new();
+        // ZEB-591: same off-lock snapshot+read as `collect_events`. The vector
+        // path has NO `since` segment skip (a never-seen lane may sit in any
+        // segment), so it reads every segment — which is exactly where holding
+        // the lock across the disk I/O hurts most. `vector` is cloned into the
+        // blocking task.
+        let (segments, tail, root): (Vec<SegmentDescriptor>, Vec<SignedChannelEvent>, _) = {
+            let log = self.log.lock().await;
+            (
+                log.manifest.segments.clone(),
+                log.tail.clone(),
+                log.root().to_path_buf(),
+            )
+        };
+        let vector = vector.clone();
 
-        for seg in &log.manifest.segments {
-            let events = log
-                .read_segment(seg)
-                .map_err(ChannelLogEngineError::Persist)?;
-            for ev in events {
-                if !Self::vector_serves(vector, &ev) || !keep(&ev) {
+        tokio::task::spawn_blocking(move || {
+            let mut out: Vec<SignedChannelEvent> = Vec::new();
+            for seg in &segments {
+                let events = read_segment_at(&root, seg)?;
+                for ev in events {
+                    if !Self::vector_serves(&vector, &ev) || !keep(&ev) {
+                        continue;
+                    }
+                    out.push(ev);
+                    if out.len() >= effective_limit {
+                        return Ok(out);
+                    }
+                }
+            }
+
+            for ev in tail {
+                if !Self::vector_serves(&vector, &ev) || !keep(&ev) {
                     continue;
                 }
                 out.push(ev);
@@ -816,19 +860,16 @@ impl ChannelLogEngine {
                     return Ok(out);
                 }
             }
-        }
 
-        for ev in &log.tail {
-            if !Self::vector_serves(vector, ev) || !keep(ev) {
-                continue;
-            }
-            out.push(ev.clone());
-            if out.len() >= effective_limit {
-                return Ok(out);
-            }
-        }
-
-        Ok(out)
+            Ok(out)
+        })
+        .await
+        .map_err(|e| {
+            ChannelLogEngineError::Persist(ChannelLogPersistError::Io(format!(
+                "collect_events_vector segment-read task panicked: {e}"
+            )))
+        })?
+        .map_err(ChannelLogEngineError::Persist)
     }
 
     /// ZEB-585: watermark-vector counterpart of `list_messages`.
