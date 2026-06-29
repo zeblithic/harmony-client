@@ -3482,6 +3482,157 @@ mod tests {
         );
     }
 
+    /// ZEB-591: characterization test for the scalar `collect_events` off-lock
+    /// segment read. Pins oldest-first ordering, retained-event paging, and the
+    /// `since` segment-skip across the 2-sealed-segments + tail layout — the
+    /// exact path that now snapshots under the lock and reads via
+    /// `spawn_blocking`. Behavior must be byte-identical to the under-lock walk.
+    #[tokio::test]
+    async fn collect_events_offlock_order_paging_and_since_across_segments() {
+        // seal_threshold=4, 10 events => seg0 [msg-0..3], seg1 [msg-4..7],
+        // tail [msg-8, msg-9].
+        let fix = build_engine_fixture(4, 250, 1000).await;
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            for i in 0..10u64 {
+                let ev = make_signed_event(
+                    fix.community_id,
+                    fix.channel_id,
+                    fix.self_owner,
+                    Hlc {
+                        wall_ms: 100 + i,
+                        logical: 0,
+                        device_id: "test-device".to_string(),
+                    },
+                    &format!("msg-{i}"),
+                    &fix.signing_key,
+                );
+                log.append(ev).expect("append");
+                if (i + 1) % 4 == 0 {
+                    log.seal_and_persist().expect("seal");
+                }
+            }
+            assert_eq!(log.manifest.segments.len(), 2, "expected 2 sealed segments");
+            assert_eq!(log.tail.len(), 2, "expected 2 tail events");
+        }
+
+        let bodies = |evs: Vec<SignedChannelEvent>| -> Vec<String> {
+            evs.into_iter()
+                .filter_map(|ev| match ev {
+                    SignedChannelEvent::Post { body, .. } => Some(body),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Full oldest-first walk across both segments + tail.
+        let all = bodies(fix.engine.list_messages(None, 1000).await.expect("list"));
+        assert_eq!(
+            all,
+            (0..10).map(|i| format!("msg-{i}")).collect::<Vec<_>>(),
+            "oldest-first ordering preserved across segments + tail"
+        );
+
+        // Limit counts retained events and cuts INSIDE the second segment
+        // (msg-0..3 from seg0, msg-4,5 from seg1).
+        let capped = bodies(fix.engine.list_messages(None, 6).await.expect("list"));
+        assert_eq!(
+            capped,
+            (0..6).map(|i| format!("msg-{i}")).collect::<Vec<_>>(),
+            "limit early-exit cuts mid-segment"
+        );
+
+        // `since` = msg-3's HLC (wall 103): seg0.range.1 == (103,0) is NOT
+        // strictly-newer-than `since`, so seg0 is skipped wholesale; seg1 + tail
+        // contribute msg-4..msg-9.
+        let since = Hlc {
+            wall_ms: 103,
+            logical: 0,
+            device_id: "test-device".to_string(),
+        };
+        let after = bodies(
+            fix.engine
+                .list_messages(Some(since), 1000)
+                .await
+                .expect("list"),
+        );
+        assert_eq!(
+            after,
+            (4..10).map(|i| format!("msg-{i}")).collect::<Vec<_>>(),
+            "since skips the fully-older first segment and filters within"
+        );
+    }
+
+    /// ZEB-591: characterization test for the vector `collect_events_vector`
+    /// off-lock segment read. The vector path scans ALL segments (no `since`
+    /// skip) — proves a never-seen `(author, device)` lane event sitting in the
+    /// OLDEST sealed segment is still served after the read moves off-lock.
+    #[tokio::test]
+    async fn collect_events_vector_offlock_serves_unseen_lane_from_sealed_segment() {
+        let fix = build_engine_fixture(4, 250, 1000).await;
+        let mk = |wall: u64, dev: &str, body: &str| {
+            make_signed_event(
+                fix.community_id,
+                fix.channel_id,
+                fix.self_owner,
+                Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: dev.to_string(),
+                },
+                body,
+                &fix.signing_key,
+            )
+        };
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            // seg0 (sealed): a never-seen dev-b event buried among seen dev-a.
+            for ev in [
+                mk(100, "dev-a", "a1"),
+                mk(50, "dev-b", "b-unseen"),
+                mk(150, "dev-a", "a2"),
+                mk(160, "dev-a", "a3"),
+            ] {
+                log.append(ev).expect("append");
+            }
+            log.seal_and_persist().expect("seal");
+            // tail: another seen dev-a + a never-seen dev-b.
+            for ev in [mk(170, "dev-a", "a4"), mk(60, "dev-b", "b-unseen2")] {
+                log.append(ev).expect("append");
+            }
+            assert_eq!(log.manifest.segments.len(), 1, "expected 1 sealed segment");
+            assert_eq!(log.tail.len(), 2, "expected 2 tail events");
+        }
+
+        // Requester knows the (self, dev-a) lane up to (200,0); has never seen
+        // the (self, dev-b) lane.
+        let mut v: WatermarkVector = std::collections::BTreeMap::new();
+        v.insert((fix.self_owner, "dev-a".to_string()), (200, 0));
+        let bodies: Vec<String> = fix
+            .engine
+            .list_messages_vector(&v, 1000)
+            .await
+            .expect("list_vector")
+            .into_iter()
+            .filter_map(|ev| match ev {
+                SignedChannelEvent::Post { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            bodies.contains(&"b-unseen".to_string()),
+            "never-seen lane event served from the OLDEST sealed segment (off-lock scan reads all segments)"
+        );
+        assert!(
+            bodies.contains(&"b-unseen2".to_string()),
+            "never-seen lane event served from the tail"
+        );
+        assert!(
+            !bodies.iter().any(|b| b.starts_with('a')),
+            "all seen dev-a events (<= (200,0)) filtered out, segment and tail alike"
+        );
+    }
+
     #[tokio::test]
     async fn vector_does_not_collapse_two_authors_sharing_a_device_id() {
         // CodeRabbit ZEB-585: keying the watermark by device alone would let
