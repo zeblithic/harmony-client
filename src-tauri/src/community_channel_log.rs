@@ -2228,7 +2228,7 @@ impl ChannelLog {
         let key = reconcile_key(event);
         let hash = key.3;
         let pos = self.reconcile_entries.partition_point(|x| x.0 < key);
-        if self.reconcile_entries.get(pos).map_or(false, |x| x.0 == key) {
+        if self.reconcile_entries.get(pos).is_some_and(|x| x.0 == key) {
             return; // idempotent re-append
         }
         let mut idx = std::mem::take(&mut self.chunk_index);

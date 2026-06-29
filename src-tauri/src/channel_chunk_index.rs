@@ -17,6 +17,10 @@
 
 use crate::channel_rbsr::{RangeFingerprint, ReconcileKey};
 
+/// Reads a chunk's events for its inclusive `[first, last]` span — supplied by
+/// the caller (the log reads segments/tail; tests read an in-memory vec).
+type ChunkEventReader<'a> = dyn FnMut(&ReconcileKey, &ReconcileKey) -> Vec<(ReconcileKey, [u8; 32])> + 'a;
+
 /// Average chunk size ≈ `2^CHUNK_MASK_BITS` events. A boundary falls on an
 /// element whose hash's low `CHUNK_MASK_BITS` bits are zero.
 pub const CHUNK_MASK_BITS: u32 = 8;
@@ -94,7 +98,7 @@ impl ChunkIndex {
         &self,
         lo: &ReconcileKey,
         hi: &ReconcileKey,
-        boundary_events: &mut dyn FnMut(&ReconcileKey, &ReconcileKey) -> Vec<(ReconcileKey, [u8; 32])>,
+        boundary_events: &mut ChunkEventReader<'_>,
     ) -> RangeFingerprint {
         let mut agg = RangeFingerprint::zero();
         for c in &self.chunks {

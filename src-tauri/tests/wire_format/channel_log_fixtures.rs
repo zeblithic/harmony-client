@@ -28,6 +28,9 @@ use harmony_app::community_channel_log::{
     sign_channel_event, sign_channel_react, ChannelAttachment, ChannelPostPayload,
     ChannelReactPayload, MessageId, SignedChannelEvent,
 };
+use harmony_app::channel_rbsr::{
+    encode_message, RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION,
+};
 use harmony_app::community_membership::ChannelId;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 
@@ -42,8 +45,8 @@ use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 // leaves the SignedChannelEvent CBOR pin running.
 #[cfg(feature = "test-fixtures")]
 use harmony_app::community_channel_log::{
-    derive_channel_key, encrypt_channel_packet_with_nonce, seal_watermark_vector_with_nonce,
-    WatermarkVector,
+    derive_channel_key, encrypt_channel_packet_with_nonce, seal_rbsr_message_with_nonce,
+    seal_watermark_vector_with_nonce, WatermarkVector,
 };
 #[cfg(feature = "test-fixtures")]
 use harmony_app::owner_state_types::EpochKey;
@@ -256,6 +259,64 @@ fn watermark_vector_sealed_wire_bytes_pinned() {
         actual_hex, expected_hex,
         "watermark-vector wire format drifted; re-pin via \
          UPDATE_BACKFILL_FIXTURE=1 (see file header for procedure)"
+    );
+}
+
+/// ZEB-592: a fixed RBSR message for the wire-format pins below.
+fn fixed_rbsr_message() -> RbsrMessage {
+    let k = |w: u64, b: u8| (w, 0u32, "dev".to_string(), [b; 32]);
+    RbsrMessage {
+        version: RBSR_PROTOCOL_VERSION,
+        ranges: vec![
+            RbsrRange {
+                upper: k(100, 1),
+                mode: RbsrMode::Skip,
+            },
+            RbsrRange {
+                upper: k(200, 2),
+                mode: RbsrMode::Fingerprint([7u8; 16]),
+            },
+            RbsrRange {
+                upper: k(300, 3),
+                mode: RbsrMode::Have(vec![k(210, 9), k(220, 9)]),
+            },
+        ],
+    }
+}
+
+/// ZEB-592: canonical-CBOR pin for an RBSR message. Locks the wire encoding
+/// against a field reorder / serde-rename. Re-pin via UPDATE_BACKFILL_FIXTURE=1.
+#[test]
+fn rbsr_message_canonical_cbor_pinned() {
+    let actual_hex = hex::encode(encode_message(&fixed_rbsr_message()));
+    if std::env::var("UPDATE_BACKFILL_FIXTURE").is_ok() {
+        eprintln!("UPDATE_RBSR_CBOR: {actual_hex}");
+    }
+    let expected_hex = "a2617601617283a26175841864006364657698200101010101010101010101010101010101010101010101010101010101010101616d6173a261758418c8006364657698200202020202020202020202020202020202020202020202020202020202020202616da161669007070707070707070707070707070707a261758419012c006364657698200303030303030303030303030303030303030303030303030303030303030303616da16168828418d20063646576982009090909090909090909090909090909090909090909090909090909090909098418dc006364657698200909090909090909090909090909090909090909090909090909090909090909";
+    assert_eq!(
+        actual_hex, expected_hex,
+        "RBSR message CBOR drifted; re-pin via UPDATE_BACKFILL_FIXTURE=1"
+    );
+}
+
+/// ZEB-592: AEAD-sealed wire pin for an RBSR message (deterministic nonce).
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn rbsr_sealed_wire_bytes_pinned() {
+    let community_id = SpaceId([0xc0; 16]);
+    let channel_id = ChannelId([0x01; 16]);
+    let mk = EpochKey::new([0x77; 32]);
+    let key = derive_channel_key(&mk, &community_id, &channel_id);
+    let sealed =
+        seal_rbsr_message_with_nonce(&key, &fixed_rbsr_message(), [0u8; 12]).expect("seal");
+    let actual_hex = hex::encode(&sealed);
+    if std::env::var("UPDATE_BACKFILL_FIXTURE").is_ok() {
+        eprintln!("UPDATE_RBSR_SEALED: {actual_hex}");
+    }
+    let expected_hex = "0000000000000000000000009e104499794a1e1d8508f59692b3811ba5e8499b4cd236febc101b23d6c114e5aeef771d62886e2dfdd5926b7cef6982fc7ba810cf8393ad4de1a51ba286886e77e674cfc7ba9386da1260634d21878f379d9c4cd19a3b6f9c44204f50eea9a489b87c8c4e2012c19f9e02040df22c1286612156609d1df43055d06efa06cff781a383e8fac9062534da55db1bead4795709f2375ef59cd2af18c1925e2776cd013e2373474a3c4d02801fa2f7eec0cfa0a52cbfabe0e2878d477892616ab55c938d0c1aaafdfd55e6a462d3e02333d061984044f1274249481a075a559260907e523e82f952097d8370fc652f45073e767bbdfef9e46bc9e01874d251e1ed27dda30770756bc24c16163445e70044b55ec898";
+    assert_eq!(
+        actual_hex, expected_hex,
+        "RBSR sealed wire format drifted; re-pin via UPDATE_BACKFILL_FIXTURE=1"
     );
 }
 
