@@ -184,6 +184,7 @@ fn spawn_adapter_bridge_drainer(
                 req.backfill_progress_interval,
                 req.backfill_default_limit,
                 req.closing,
+                req.rbsr_hooks,
             );
         }
     })
@@ -1070,6 +1071,138 @@ async fn backfilled_event_from_non_member_at_hlc_is_rejected() {
     assert!(
         !bodies.iter().any(|b| b == "from-mallory"),
         "non-member-at-HLC event must be absent from the joiner's log"
+    );
+
+    a.registry.shutdown_all().await.expect("shutdown A");
+    b.registry.shutdown_all().await.expect("shutdown B");
+}
+
+/// Probe the live `rbsr/**` queryable as an EMPTY requester: seal a round-0
+/// request over an empty source and count the encrypted Have packets the holder
+/// ships back. The sealed reply frame uses the RBSR AAD, so it won't decrypt as
+/// a channel packet and is naturally excluded from the count. Polls until the
+/// holder serves exactly `expected` (its queryable declaration is async).
+async fn probe_rbsr_have_count(
+    session: &Arc<zenoh::Session>,
+    community_id: &SpaceId,
+    channel_id: &ChannelId,
+    channel_key: &ChannelKey,
+    expected: usize,
+    timeout: Duration,
+) {
+    let empty = harmony_app::channel_rbsr::SliceSource::from_unsorted(Vec::new());
+    let sealed = harmony_app::community_channel_log::seal_rbsr_message(
+        channel_key,
+        &harmony_app::channel_rbsr::initial_request(&empty),
+    )
+    .expect("seal rbsr initial request");
+    let key = format!(
+        "harmony/channels/{}/{}/rbsr/0",
+        hex::encode(community_id.0),
+        hex::encode(channel_id.0)
+    );
+    let deadline = Instant::now() + timeout;
+    loop {
+        let receiver = session
+            .get(&key)
+            .payload(sealed.clone())
+            .consolidation(zenoh::query::ConsolidationMode::None)
+            .timeout(Duration::from_secs(5))
+            .await
+            .expect("rbsr get");
+        let mut have = 0usize;
+        while let Ok(reply) = receiver.recv_async().await {
+            if let Ok(sample) = reply.into_result() {
+                let bytes = sample.payload().to_bytes().to_vec();
+                if harmony_app::community_channel_log::decrypt_channel_packet(channel_key, &bytes)
+                    .is_ok()
+                {
+                    have += 1;
+                }
+            }
+        }
+        if have == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rbsr probe: expected {expected} Have packets within {timeout:?}, last saw {have}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// ZEB-593: the live rbsr/** transport reconciles history end-to-end and the
+// legacy since/** (watermark-vector) path stays intact alongside it.
+// ─────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rbsr_transport_recovers_history_and_vector_path_intact() {
+    let session = Arc::new(
+        zenoh::open(zenoh::Config::default())
+            .await
+            .expect("zenoh open"),
+    );
+
+    let community_id = SpaceId([0xA9; 16]);
+    let channel_id = ChannelId([0xB9; 16]);
+    let membership_key = EpochKey::new([0x77; 32]);
+    let channel_key = derive_channel_key(&membership_key, &community_id, &channel_id);
+
+    let a = build_registry(&session, 0xAA, "device-a");
+    let b = build_registry(&session, 0xBB, "device-b");
+
+    let state: Arc<dyn CommunityStateAtHlc + Send + Sync> = Arc::new(MembersJoinedState {
+        channel_id,
+        members: vec![(a.owner, a.signing.verifying_key().to_bytes())],
+    });
+
+    // A posts 6 events (≤ LEAF_THRESHOLD → RBSR ships them wholesale, round 0).
+    let engine_a = spawn_channel(&a, community_id, channel_id, &channel_key, &state).await;
+    for body in ["m1", "m2", "m3", "m4", "m5", "m6"] {
+        Arc::clone(&engine_a)
+            .publish(body.as_bytes().to_vec(), None, None, None)
+            .await
+            .expect("publish");
+    }
+    wait_for_count(&engine_a, 6, Duration::from_secs(10), "holder local log").await;
+
+    // Backward-compat: the legacy since/** queryable still serves all 6.
+    wait_until_serving(
+        &session,
+        &community_id,
+        &channel_id,
+        6,
+        Duration::from_secs(15),
+    )
+    .await;
+
+    // Live RBSR transport: an empty requester pulls exactly the 6-event diff
+    // from the holder's rbsr/** queryable (O(diff), not O(history-of-nothing)).
+    probe_rbsr_have_count(
+        &session,
+        &community_id,
+        &channel_id,
+        &channel_key,
+        6,
+        Duration::from_secs(15),
+    )
+    .await;
+
+    // End-to-end: B spawns empty; its auto-backfill driver reconciles via RBSR
+    // (drive_rbsr_rounds → rbsr/** → process_inbound_packet) and recovers all 6.
+    let engine_b = spawn_channel(&b, community_id, channel_id, &channel_key, &state).await;
+    wait_for_count(
+        &engine_b,
+        6,
+        Duration::from_secs(20),
+        "joiner RBSR catch-up",
+    )
+    .await;
+    assert_eq!(
+        list_bodies(&engine_b).await,
+        vec!["m1", "m2", "m3", "m4", "m5", "m6"],
+        "RBSR-recovered history must match the holder's bodies in order"
     );
 
     a.registry.shutdown_all().await.expect("shutdown A");

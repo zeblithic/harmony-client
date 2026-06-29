@@ -2413,13 +2413,7 @@ impl ChannelLogRegistry {
         let engine_rbsr_ingest = Arc::clone(&engine);
         let rbsr_hooks = Some(crate::event_loop::RbsrAdapterHooks {
             respond: Arc::new(
-                move |sealed: Vec<u8>| -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<
-                                Output = Option<(Vec<u8>, Vec<Vec<u8>>)>,
-                            > + Send,
-                    >,
-                > {
+                move |sealed: Vec<u8>| -> crate::event_loop::RbsrRespondFut {
                     let me = Arc::clone(&engine_rbsr_respond);
                     Box::pin(async move {
                         let (sealed_reply, have_events) = me.rbsr_respond(&sealed).await?;
@@ -2437,16 +2431,12 @@ impl ChannelLogRegistry {
                     })
                 },
             ),
-            initial: Arc::new(
-                move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>> {
-                    let me = Arc::clone(&engine_rbsr_initial);
-                    Box::pin(async move { me.rbsr_build_initial().await })
-                },
-            ),
+            initial: Arc::new(move || -> crate::event_loop::RbsrInitialFut {
+                let me = Arc::clone(&engine_rbsr_initial);
+                Box::pin(async move { me.rbsr_build_initial().await })
+            }),
             ingest: Arc::new(
-                move |frames: Vec<Vec<u8>>| -> std::pin::Pin<
-                    Box<dyn std::future::Future<Output = crate::event_loop::RbsrStep> + Send>,
-                > {
+                move |frames: Vec<Vec<u8>>| -> crate::event_loop::RbsrIngestFut {
                     let me = Arc::clone(&engine_rbsr_ingest);
                     Box::pin(async move { me.rbsr_ingest_and_next(frames).await })
                 },
@@ -3224,7 +3214,11 @@ mod tests {
             .rbsr_respond(&req)
             .await
             .expect("responder replies");
-        assert_eq!(have_events.len(), 3, "small leaf ships all events wholesale");
+        assert_eq!(
+            have_events.len(),
+            3,
+            "small leaf ships all events wholesale"
+        );
 
         // Assemble the wire frames the adapter would deliver: the sealed reply
         // followed by one encrypted channel packet per Have event.

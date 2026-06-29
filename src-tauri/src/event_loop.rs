@@ -266,24 +266,21 @@ pub struct ChannelLogAdapterRequest {
 // bundled so the whole feature threads as one value. Each closes over the same
 // `Arc<ChannelLogEngine>` (the engine holds the channel key + reconcile source);
 // the adapter only shuttles opaque sealed bytes and owns the Zenoh session.
-type RbsrRespondClosure = dyn Fn(
-        Vec<u8>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<(Vec<u8>, Vec<Vec<u8>>)>> + Send>,
-    > + Send
-    + Sync
-    + 'static;
-type RbsrInitialClosure = dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
-    + Send
-    + Sync
-    + 'static;
-type RbsrIngestClosure = dyn Fn(
-        Vec<Vec<u8>>,
-    )
-        -> std::pin::Pin<Box<dyn std::future::Future<Output = RbsrStep> + Send>>
-    + Send
-    + Sync
-    + 'static;
+//
+// The boxed-future return types are public aliases so the engine-side closure
+// constructors (registry) can annotate their return type without tripping
+// `clippy::type_complexity`.
+/// Boxed future returned by the RBSR responder closure.
+pub type RbsrRespondFut =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<(Vec<u8>, Vec<Vec<u8>>)>> + Send>>;
+/// Boxed future returned by the RBSR round-0 request closure.
+pub type RbsrInitialFut = std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>;
+/// Boxed future returned by the RBSR ingest-and-advance closure.
+pub type RbsrIngestFut = std::pin::Pin<Box<dyn std::future::Future<Output = RbsrStep> + Send>>;
+
+type RbsrRespondClosure = dyn Fn(Vec<u8>) -> RbsrRespondFut + Send + Sync + 'static;
+type RbsrInitialClosure = dyn Fn() -> RbsrInitialFut + Send + Sync + 'static;
+type RbsrIngestClosure = dyn Fn(Vec<Vec<u8>>) -> RbsrIngestFut + Send + Sync + 'static;
 
 /// Bundle of the engine-side RBSR closures threaded to the adapter.
 pub struct RbsrAdapterHooks {
@@ -8616,8 +8613,10 @@ fn parse_rbsr_key(key: &str) -> Option<u32> {
 
 /// One requester-side RBSR step outcome, returned by the engine's
 /// ingest-and-advance step after a round's reply frames are processed.
+/// `pub` because it surfaces through the `pub` [`RbsrAdapterHooks::ingest`]
+/// closure type that crosses the adapter bridge.
 #[derive(Debug)]
-pub(crate) enum RbsrStep {
+pub enum RbsrStep {
     /// The reconcile converged — no ranges mismatch; catch-up is complete.
     Converged,
     /// More rounds needed; carries the next round's sealed request message.
@@ -9028,9 +9027,17 @@ mod channel_log_adapter_tests {
         assert_eq!(parse_rbsr_key(&since_key), None, "since key is not rbsr");
         // Non-numeric round.
         let bad_round = format!("harmony/channels/{cid}/{ch}/rbsr/notanumber");
-        assert_eq!(parse_rbsr_key(&bad_round), None, "non-numeric round rejected");
+        assert_eq!(
+            parse_rbsr_key(&bad_round),
+            None,
+            "non-numeric round rejected"
+        );
         // Too few segments.
-        assert_eq!(parse_rbsr_key("harmony/channels/aa/bb"), None, "short key rejected");
+        assert_eq!(
+            parse_rbsr_key("harmony/channels/aa/bb"),
+            None,
+            "short key rejected"
+        );
     }
 
     #[tokio::test]
