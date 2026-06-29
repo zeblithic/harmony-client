@@ -639,6 +639,52 @@ pub enum LocalInsertError {
     /// (first passed). Neither event was inserted — atomicity preserved.
     #[error("pair rejected at second event pre-validation: {0}")]
     SecondPreValidationFailed(String),
+    /// ZEB-583: a local channel-create insert was rejected by its same-lock
+    /// name-uniqueness precheck — a live (non-tombstoned) channel already
+    /// carries this normalized name. Returned BEFORE any state mutation
+    /// (nothing was inserted). This is a LOCAL fast-fail only: remote/sync
+    /// events are never prechecked, because a receive-order-dependent
+    /// verify-time name gate would diverge the log across replicas. The
+    /// Display text is the user-facing IPC message.
+    #[error("a channel named '{display}' already exists in this community")]
+    DuplicateChannelName { display: String },
+}
+
+/// ZEB-583: an optional check run under the SAME `state` lock guard as the
+/// append in `insert_event_with_resolved_pubs`, IMMEDIATELY before
+/// `insert_event`. Binding the check and the commit to one lock acquisition
+/// makes them atomic, so two concurrent local `create_channel` IPC calls
+/// can't both observe "no duplicate" and both succeed (a TOCTOU the older
+/// check-then-insert-in-separate-locks guard left open). Used only by local
+/// IPC inserts that must fail-fast on a precondition the CRDT itself
+/// deliberately does NOT enforce. Remote/sync inserts pass `None`.
+enum LocalInsertPrecheck {
+    /// Reject if a live (non-tombstoned) channel already has `normalized`
+    /// (its name `trim().to_lowercase()`-ed) as its name. `display` is the
+    /// trimmed name carried for the error message.
+    UniqueLiveChannelName { normalized: String, display: String },
+}
+
+impl LocalInsertPrecheck {
+    fn run(&self, state: &CommunityState, admin_addr: OwnerAddr) -> Result<(), LocalInsertError> {
+        match self {
+            LocalInsertPrecheck::UniqueLiveChannelName {
+                normalized,
+                display,
+            } => {
+                let materialized = state.materialized(admin_addr);
+                let dup = materialized.channels.values().any(|ch| {
+                    ch.deleted_at.is_none() && ch.name.trim().to_lowercase() == *normalized
+                });
+                if dup {
+                    return Err(LocalInsertError::DuplicateChannelName {
+                        display: display.clone(),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Per-publisher-device latest-accepted HLC, namespaced by publisher
@@ -1283,7 +1329,7 @@ impl CommunitySyncEngine {
         // `owner_id` actors (its cache is keyed by Reticulum device-hash,
         // not owner_id), wrongly rejecting them as unresolved actors. The
         // slim VerifyContext below carries no caller-resolved pubs.
-        self.insert_event_with_resolved_pubs(event).await
+        self.insert_event_with_resolved_pubs(event, None).await
     }
 
     /// ZEB-339 Task 9: retained as a thin wrapper for the invite-only
@@ -1306,7 +1352,40 @@ impl CommunitySyncEngine {
                 got: event.community_id,
             });
         }
-        self.insert_event_with_resolved_pubs(event).await
+        self.insert_event_with_resolved_pubs(event, None).await
+    }
+
+    /// ZEB-583: local channel-create insert with an atomic name-uniqueness
+    /// precheck. The check — reject a duplicate LIVE (non-tombstoned)
+    /// normalized name — runs under the SAME `state` lock as the append, so
+    /// two concurrent local `create_channel` IPC calls can't both pass it and
+    /// both append a same-named channel. This is a local fast-fail (like the
+    /// empty/length checks at the IPC boundary), NOT a CRDT/verify gate:
+    /// `verify_event` deliberately accepts duplicate channel names because a
+    /// receive-order-dependent rejection would diverge the log across replicas.
+    /// `normalized_name` is the candidate's `trim().to_lowercase()`;
+    /// `display_name` is the trimmed name used in the error message. A
+    /// duplicate surfaces as `LocalInsertError::DuplicateChannelName`.
+    pub async fn insert_local_channel_create(
+        &self,
+        event: crate::community_membership::SignedMembershipEvent,
+        normalized_name: String,
+        display_name: String,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
+        if event.community_id != self.community_id {
+            return Err(LocalInsertError::WrongCommunity {
+                expected: self.community_id,
+                got: event.community_id,
+            });
+        }
+        self.insert_event_with_resolved_pubs(
+            event,
+            Some(LocalInsertPrecheck::UniqueLiveChannelName {
+                normalized: normalized_name,
+                display: display_name,
+            }),
+        )
+        .await
     }
 
     /// Shared body for `insert_local_event` and
@@ -1316,6 +1395,7 @@ impl CommunitySyncEngine {
     async fn insert_event_with_resolved_pubs(
         &self,
         event: crate::community_membership::SignedMembershipEvent,
+        precheck: Option<LocalInsertPrecheck>,
     ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
         // Bind expected_community_id to the engine's configured value,
         // NOT the (caller-controlled) event payload. Without this, a
@@ -1336,6 +1416,15 @@ impl CommunitySyncEngine {
 
         let outcome = {
             let mut state_g = self.state.lock().await;
+            // ZEB-583: run the optional precheck under the SAME lock guard,
+            // immediately before the append, so the check + commit are atomic
+            // (closes the create_channel TOCTOU where two concurrent local IPC
+            // calls both observe "no duplicate"). Local-only — remote events
+            // never carry a precheck (a verify-time name gate would diverge
+            // replicas).
+            if let Some(check) = &precheck {
+                check.run(&state_g, self.admin_addr)?;
+            }
             state_g.insert_event(event.clone(), &ctx)
         };
 
