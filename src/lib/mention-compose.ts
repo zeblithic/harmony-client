@@ -15,6 +15,11 @@ export interface MentionCandidate {
 export interface TrackedMention {
   ownerId: string;
   label: string;
+  /** Offset of the '@' of this pick's inserted "@label" in the current compose
+   *  text. Span = [start, start + 1 + label.length), matching "@label" exactly
+   *  (the trailing space is a boundary). Maintained by shiftTrackedSpans across
+   *  edits; reconcileCompose matches by this offset, not by label rescan. */
+  start: number;
 }
 
 /** Detect an active @-trigger at the caret. The '@' must be at start-of-text or
@@ -51,8 +56,50 @@ export function applyMentionPick(
   return {
     text: newText,
     caret: atIndex + insert.length,
-    tracked: { ownerId: candidate.ownerId, label: candidate.label },
+    tracked: { ownerId: candidate.ownerId, label: candidate.label, start: atIndex },
   };
+}
+
+/** Maintain tracked-mention spans across a single compose edit.
+ *
+ * Derives the one contiguous edit between `prevText` and `nextText` (longest
+ * common prefix `p` + capped common suffix `s`), then for each span
+ * [start, start + 1 + label.length):
+ *   1. edit entirely at/after the span (p >= end)           → keep unchanged
+ *   2. edit entirely before the span (prevLen - s <= start) → shift by delta
+ *   3. edit overlaps the span                               → drop (invalidate)
+ * Order is preserved. Fail-safe: an edit that touches a span removes it, so the
+ * span can never be matched against text it no longer covers. */
+export function shiftTrackedSpans(
+  prevText: string,
+  nextText: string,
+  tracked: TrackedMention[],
+): TrackedMention[] {
+  if (prevText === nextText) return tracked;
+  const prevLen = prevText.length;
+  const nextLen = nextText.length;
+  // Longest common prefix.
+  let p = 0;
+  const maxP = Math.min(prevLen, nextLen);
+  while (p < maxP && prevText[p] === nextText[p]) p++;
+  // Longest common suffix, capped so prefix and suffix don't overlap.
+  let s = 0;
+  const maxS = Math.min(prevLen - p, nextLen - p);
+  while (s < maxS && prevText[prevLen - 1 - s] === nextText[nextLen - 1 - s]) s++;
+  const delta = nextLen - prevLen;
+  const editEnd = prevLen - s; // exclusive end of the edited region in prevText
+  const out: TrackedMention[] = [];
+  for (const m of tracked) {
+    const end = m.start + 1 + m.label.length;
+    if (p >= end) {
+      out.push(m); // case 1: edit at/after the span
+    } else if (editEnd <= m.start) {
+      const shifted = m.start + delta; // case 2: edit before the span
+      if (shifted >= 0) out.push({ ...m, start: shifted });
+    }
+    // else: case 3 — overlap → drop
+  }
+  return out;
 }
 
 /** Filter+rank the roster: case-insensitive substring on label; prefix matches
