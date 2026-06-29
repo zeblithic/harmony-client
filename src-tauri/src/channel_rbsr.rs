@@ -151,7 +151,10 @@ impl SliceSource {
     fn slice(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> &[(ReconcileKey, [u8; 32])] {
         let s = self.entries.partition_point(|x| &x.0 < lo);
         let e = self.entries.partition_point(|x| &x.0 < hi);
-        &self.entries[s..e]
+        // `e.max(s)` keeps an inverted (`lo > hi`) range a harmless empty slice
+        // rather than a panic — defense-in-depth; `validate_message` rejects such
+        // ranges at the trust boundary upstream.
+        &self.entries[s..e.max(s)]
     }
 }
 
@@ -224,6 +227,9 @@ pub struct RbsrMessage {
 #[derive(Debug, PartialEq, Eq)]
 pub enum RbsrError {
     Decode,
+    InvalidVersion(u8),
+    InvalidPartition,
+    KeyOutOfRange,
 }
 
 pub fn encode_message(m: &RbsrMessage) -> Vec<u8> {
@@ -234,6 +240,43 @@ pub fn encode_message(m: &RbsrMessage) -> Vec<u8> {
 
 pub fn decode_message(bytes: &[u8]) -> Result<RbsrMessage, RbsrError> {
     ciborium::from_reader(bytes).map_err(|_| RbsrError::Decode)
+}
+
+/// Validate that a decoded message satisfies the partition invariant the state
+/// machine assumes, BEFORE running it. Called at the trust boundary (on every
+/// opened message). Rejects a wrong version, an empty / non-monotonic range
+/// list, a partition that doesn't cover `[min_key, max_key)`, or a `Have` key
+/// outside its range — any of which a malformed (but channel-key-sealed)
+/// message could otherwise use to drive `lo > hi` slicing or a falsely-
+/// converged catch-up that silently skips a suffix.
+pub fn validate_message(m: &RbsrMessage) -> Result<(), RbsrError> {
+    if m.version != RBSR_PROTOCOL_VERSION {
+        return Err(RbsrError::InvalidVersion(m.version));
+    }
+    if m.ranges.is_empty() {
+        return Err(RbsrError::InvalidPartition);
+    }
+    let last = m.ranges.len() - 1;
+    let mut prev = min_key();
+    for (i, r) in m.ranges.iter().enumerate() {
+        // Each range `[prev, upper)` must be non-empty → strictly ascending uppers.
+        if r.upper <= prev {
+            return Err(RbsrError::InvalidPartition);
+        }
+        if let RbsrMode::Have(keys) = &r.mode {
+            for k in keys {
+                if *k < prev || *k >= r.upper {
+                    return Err(RbsrError::KeyOutOfRange);
+                }
+            }
+        }
+        // The partition must close the universe exactly at `max_key()`.
+        if i == last && r.upper != max_key() {
+            return Err(RbsrError::InvalidPartition);
+        }
+        prev = r.upper.clone();
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +551,65 @@ mod tests {
     #[test]
     fn decode_rejects_garbage() {
         assert_eq!(decode_message(&[0xff, 0x00, 0x13]), Err(RbsrError::Decode));
+    }
+
+    #[test]
+    fn validate_accepts_protocol_messages_and_rejects_malformed() {
+        let s = src(&[(10, 1), (20, 2), (30, 3)]);
+        // Every message the protocol itself emits is a valid partition.
+        let req = initial_request(&s);
+        assert_eq!(validate_message(&req), Ok(()));
+        assert_eq!(validate_message(&respond(&req, &s)), Ok(()));
+
+        // wrong version
+        let mut bad_ver = req.clone();
+        bad_ver.version = 9;
+        assert_eq!(validate_message(&bad_ver), Err(RbsrError::InvalidVersion(9)));
+        // empty range list
+        assert_eq!(
+            validate_message(&RbsrMessage { version: RBSR_PROTOCOL_VERSION, ranges: vec![] }),
+            Err(RbsrError::InvalidPartition)
+        );
+        // does not close at max_key()
+        assert_eq!(
+            validate_message(&RbsrMessage {
+                version: RBSR_PROTOCOL_VERSION,
+                ranges: vec![RbsrRange { upper: key(10, 1), mode: RbsrMode::Skip }],
+            }),
+            Err(RbsrError::InvalidPartition)
+        );
+        // non-ascending uppers
+        assert_eq!(
+            validate_message(&RbsrMessage {
+                version: RBSR_PROTOCOL_VERSION,
+                ranges: vec![
+                    RbsrRange { upper: key(20, 2), mode: RbsrMode::Skip },
+                    RbsrRange { upper: key(10, 1), mode: RbsrMode::Skip },
+                    RbsrRange { upper: max_key(), mode: RbsrMode::Skip },
+                ],
+            }),
+            Err(RbsrError::InvalidPartition)
+        );
+        // Have key outside its range (key(10) < prev=key(20))
+        assert_eq!(
+            validate_message(&RbsrMessage {
+                version: RBSR_PROTOCOL_VERSION,
+                ranges: vec![
+                    RbsrRange { upper: key(20, 2), mode: RbsrMode::Skip },
+                    RbsrRange { upper: max_key(), mode: RbsrMode::Have(vec![key(10, 1)]) },
+                ],
+            }),
+            Err(RbsrError::KeyOutOfRange)
+        );
+    }
+
+    #[test]
+    fn slice_is_panic_safe_on_inverted_range() {
+        let s = src(&[(10, 1), (20, 2)]);
+        // lo > hi must not panic (validation prevents this upstream; this is the net).
+        assert_eq!(s.range_count(&key(30, 3), &key(10, 1)), 0);
+        assert!(s.keys_in_range(&key(30, 3), &key(10, 1)).is_empty());
+        assert_eq!(s.split_key(&key(30, 3), &key(10, 1)), None);
     }
 
     // ---- Tasks 6 & 7: protocol ----

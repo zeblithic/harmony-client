@@ -1775,7 +1775,17 @@ impl ChannelLogEngine {
                 _ => Vec::new(),
             })
             .collect();
-        let have_events = log.events_for_keys(&have_keys);
+        let have_events = match log.events_for_keys(&have_keys) {
+            Ok(events) if events.len() == have_keys.len() => events,
+            // A segment read failed, or a Have key couldn't be resolved to its
+            // body → don't advertise keys we can't back with events. Fail so the
+            // requester falls back (vector path / retry) instead of treating the
+            // range as resolved and silently losing those events.
+            _ => {
+                drop(log);
+                return None;
+            }
+        };
         drop(log);
         let sealed = crate::community_channel_log::seal_rbsr_message(key, &reply).ok()?;
         Some((sealed, have_events))

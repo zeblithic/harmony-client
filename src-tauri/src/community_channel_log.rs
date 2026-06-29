@@ -922,6 +922,12 @@ fn seal_rbsr_message_inner(
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
+    if out.len() > MAX_RBSR_MESSAGE_BYTES {
+        // Fail locally rather than emit a packet the peer will reject on `open`
+        // (symmetric with `open_rbsr_message`'s cap) — keeps the fallback path
+        // predictable instead of surfacing as a peer-side decode failure.
+        return Err(ChannelEventError::MalformedPacket(out.len()));
+    }
     Ok(out)
 }
 
@@ -956,8 +962,14 @@ pub fn open_rbsr_message(
             },
         )
         .map_err(|e| ChannelEventError::AeadDecrypt(e.to_string()))?;
-    crate::channel_rbsr::decode_message(&plaintext)
-        .map_err(|_| ChannelEventError::CborDecode("rbsr message".into()))
+    let msg = crate::channel_rbsr::decode_message(&plaintext)
+        .map_err(|_| ChannelEventError::CborDecode("rbsr message".into()))?;
+    // Validate the partition invariant at the trust boundary BEFORE the state
+    // machine runs — a malformed (but correctly-sealed) message must not be able
+    // to drive `lo > hi` slicing or a falsely-converged catch-up.
+    crate::channel_rbsr::validate_message(&msg)
+        .map_err(|_| ChannelEventError::CborDecode("rbsr message: invalid partition".into()))?;
+    Ok(msg)
 }
 
 /// ZEB-585: raise a watermark-vector lane entry to cover `at` (no-op when
@@ -2249,9 +2261,12 @@ impl ChannelLog {
     // `rbsr/**` transport queryable is wired (plan Task 12). `allow(dead_code)`
     // until then (kept in the binary, exercised by tests).
     #[allow(dead_code)]
-    pub(crate) fn events_for_keys(&self, keys: &[ReconcileKey]) -> Vec<SignedChannelEvent> {
+    pub(crate) fn events_for_keys(
+        &self,
+        keys: &[ReconcileKey],
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogPersistError> {
         if keys.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let wanted: std::collections::HashSet<ReconcileKey> = keys.iter().cloned().collect();
         let lo = keys.iter().map(|k| k.0).min().unwrap();
@@ -2262,11 +2277,13 @@ impl ChannelLog {
             if seg.range.1.wall_ms < lo || seg.range.0.wall_ms > hi {
                 continue;
             }
-            if let Ok(events) = self.read_segment(seg) {
-                for ev in events {
-                    if wanted.contains(&reconcile_key(&ev)) {
-                        out.push(ev);
-                    }
+            // Propagate read errors: silently skipping a segment would let the
+            // sealed reply advertise `Have` keys whose event bodies are missing,
+            // and the requester treats `Have` as resolved — losing those events.
+            let events = self.read_segment(seg)?;
+            for ev in events {
+                if wanted.contains(&reconcile_key(&ev)) {
+                    out.push(ev);
                 }
             }
         }
@@ -2275,7 +2292,7 @@ impl ChannelLog {
                 out.push(ev.clone());
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -2297,20 +2314,20 @@ impl RangeReconcileSource for ChannelLog {
             .range_fingerprint(lo, hi, &mut |first, last| {
                 let s = self.reconcile_entries.partition_point(|x| &x.0 < first);
                 let e = self.reconcile_entries.partition_point(|x| &x.0 <= last);
-                self.reconcile_entries[s..e].to_vec()
+                self.reconcile_entries[s..e.max(s)].to_vec()
             })
     }
 
     fn range_count(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> u64 {
         let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
         let e = self.reconcile_entries.partition_point(|x| &x.0 < hi);
-        (e - s) as u64
+        e.saturating_sub(s) as u64
     }
 
     fn keys_in_range(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Vec<ReconcileKey> {
         let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
         let e = self.reconcile_entries.partition_point(|x| &x.0 < hi);
-        self.reconcile_entries[s..e]
+        self.reconcile_entries[s..e.max(s)]
             .iter()
             .map(|x| x.0.clone())
             .collect()
@@ -2319,7 +2336,7 @@ impl RangeReconcileSource for ChannelLog {
     fn split_key(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Option<ReconcileKey> {
         let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
         let e = self.reconcile_entries.partition_point(|x| &x.0 < hi);
-        if e - s < 2 {
+        if e.saturating_sub(s) < 2 {
             None
         } else {
             Some(self.reconcile_entries[s + (e - s) / 2].0.clone())
@@ -3107,6 +3124,28 @@ mod tests {
     }
 
     #[test]
+    fn rbsr_open_rejects_malformed_partition() {
+        use crate::channel_rbsr::{RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION};
+        let mk = fixture_mk();
+        let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
+        // Structurally valid CBOR, but the ranges do not cover [min_key, max_key)
+        // — a peer holding the channel key could seal this; `open` must reject it
+        // at the trust boundary rather than feed it to the state machine.
+        let bad = RbsrMessage {
+            version: RBSR_PROTOCOL_VERSION,
+            ranges: vec![RbsrRange {
+                upper: (10, 0, "d".into(), [1u8; 32]),
+                mode: RbsrMode::Skip,
+            }],
+        };
+        let sealed = seal_rbsr_message(&key, &bad).expect("seal");
+        assert!(
+            open_rbsr_message(&key, &sealed).is_err(),
+            "an invalid partition must be rejected on open"
+        );
+    }
+
+    #[test]
     fn rbsr_log_source_fingerprint_matches_naive_and_survives_reload() {
         use crate::channel_rbsr::{max_key, min_key, RangeReconcileSource, SliceSource};
         let cid = fixture_community(0xc0);
@@ -3245,7 +3284,7 @@ mod tests {
             );
             let reply = respond(&request, &a);
             let (missing, next) = process_reply(&reply, &b);
-            let events = a.events_for_keys(&missing);
+            let events = a.events_for_keys(&missing).expect("read events for keys");
             transferred += events.len();
             for e in events {
                 let _ = b.append(e).expect("ingest");
