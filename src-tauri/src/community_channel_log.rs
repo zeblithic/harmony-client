@@ -2269,6 +2269,10 @@ impl ChannelLog {
             return Ok(Vec::new());
         }
         let wanted: std::collections::HashSet<ReconcileKey> = keys.iter().cloned().collect();
+        // Track DISTINCT resolved keys so a duplicate body (same key seen twice)
+        // can't mask another advertised-but-missing key when `rbsr_respond`
+        // count-checks `events.len() == have_keys.len()`.
+        let mut found: std::collections::HashSet<ReconcileKey> = std::collections::HashSet::new();
         let lo = keys.iter().map(|k| k.0).min().unwrap();
         let hi = keys.iter().map(|k| k.0).max().unwrap();
         let mut out = Vec::new();
@@ -2282,13 +2286,15 @@ impl ChannelLog {
             // and the requester treats `Have` as resolved — losing those events.
             let events = self.read_segment(seg)?;
             for ev in events {
-                if wanted.contains(&reconcile_key(&ev)) {
+                let key = reconcile_key(&ev);
+                if wanted.contains(&key) && found.insert(key) {
                     out.push(ev);
                 }
             }
         }
         for ev in &self.tail {
-            if wanted.contains(&reconcile_key(ev)) {
+            let key = reconcile_key(ev);
+            if wanted.contains(&key) && found.insert(key) {
                 out.push(ev.clone());
             }
         }
