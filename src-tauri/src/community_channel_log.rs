@@ -2240,6 +2240,39 @@ impl ChannelLog {
         self.chunk_index = idx;
         self.reconcile_entries.insert(pos, (key, hash));
     }
+
+    /// ZEB-592: resolve a set of RBSR `ReconcileKey`s back to their full events
+    /// for inline `Have` transfer. Reads only the segments whose `wall_ms` range
+    /// overlaps the requested keys' span (plus the tail), so a small leaf range
+    /// touches at most a couple of segments.
+    pub(crate) fn events_for_keys(&self, keys: &[ReconcileKey]) -> Vec<SignedChannelEvent> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let wanted: std::collections::HashSet<ReconcileKey> = keys.iter().cloned().collect();
+        let lo = keys.iter().map(|k| k.0).min().unwrap();
+        let hi = keys.iter().map(|k| k.0).max().unwrap();
+        let mut out = Vec::new();
+        for seg in &self.manifest.segments {
+            // Skip segments whose wall_ms span is entirely outside [lo, hi].
+            if seg.range.1.wall_ms < lo || seg.range.0.wall_ms > hi {
+                continue;
+            }
+            if let Ok(events) = self.read_segment(seg) {
+                for ev in events {
+                    if wanted.contains(&reconcile_key(&ev)) {
+                        out.push(ev);
+                    }
+                }
+            }
+        }
+        for ev in &self.tail {
+            if wanted.contains(&reconcile_key(ev)) {
+                out.push(ev.clone());
+            }
+        }
+        out
+    }
 }
 
 /// ZEB-592: canonical RBSR set-element key for an event —
