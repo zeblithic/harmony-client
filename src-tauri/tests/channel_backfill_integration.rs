@@ -1138,19 +1138,22 @@ async fn probe_rbsr_have_count(
 // ─────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rbsr_transport_recovers_history_and_vector_path_intact() {
-    let session = Arc::new(
-        zenoh::open(zenoh::Config::default())
-            .await
-            .expect("zenoh open"),
-    );
+    // TWO sessions (not the shared-session pattern the other tests use): RBSR
+    // excludes the requester's OWN queryable (Locality::Remote), so A must be a
+    // genuinely remote responder for the live RBSR path to run. Default-config
+    // sessions discover each other over localhost scouting; the polling helpers
+    // below absorb the discovery delay.
+    let cfg = zenoh::Config::default();
+    let session_a = Arc::new(zenoh::open(cfg.clone()).await.expect("session A"));
+    let session_b = Arc::new(zenoh::open(cfg).await.expect("session B"));
 
     let community_id = SpaceId([0xA9; 16]);
     let channel_id = ChannelId([0xB9; 16]);
     let membership_key = EpochKey::new([0x77; 32]);
     let channel_key = derive_channel_key(&membership_key, &community_id, &channel_id);
 
-    let a = build_registry(&session, 0xAA, "device-a");
-    let b = build_registry(&session, 0xBB, "device-b");
+    let a = build_registry(&session_a, 0xAA, "device-a");
+    let b = build_registry(&session_b, 0xBB, "device-b");
 
     let state: Arc<dyn CommunityStateAtHlc + Send + Sync> = Arc::new(MembersJoinedState {
         channel_id,
@@ -1168,24 +1171,27 @@ async fn rbsr_transport_recovers_history_and_vector_path_intact() {
     wait_for_count(&engine_a, 6, Duration::from_secs(10), "holder local log").await;
 
     // Backward-compat: the legacy since/** queryable still serves all 6.
+    // Backward-compat: A's legacy since/** queryable still serves all 6 (probed
+    // from B's session, which also proves the two sessions have discovered each
+    // other before the RBSR probe below).
     wait_until_serving(
-        &session,
+        &session_b,
         &community_id,
         &channel_id,
         6,
-        Duration::from_secs(15),
+        Duration::from_secs(20),
     )
     .await;
 
     // Live RBSR transport: an empty requester pulls exactly the 6-event diff
     // from the holder's rbsr/** queryable (O(diff), not O(history-of-nothing)).
     probe_rbsr_have_count(
-        &session,
+        &session_b,
         &community_id,
         &channel_id,
         &channel_key,
         6,
-        Duration::from_secs(15),
+        Duration::from_secs(20),
     )
     .await;
 

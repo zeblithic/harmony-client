@@ -3254,6 +3254,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rbsr_multi_round_bisection_recovers_large_set_in_process() {
+        // Repro for the deep-bisection path (count ≫ LEAF_THRESHOLD): drive the
+        // full requester↔responder round loop in-process (no Zenoh) and assert
+        // the empty requester recovers EVERY responder event. This is the path
+        // the 150-event reconnect integration test exercises over the wire.
+        const N: u64 = 150;
+        let responder = build_engine_fixture(8, 250, 1000).await;
+        let requester = build_engine_fixture(8, 250, 1000).await;
+        {
+            let mut log = responder.engine.log_for_test().lock().await;
+            for i in 0..N {
+                let hlc = Hlc {
+                    wall_ms: 1_000 + i,
+                    logical: 0,
+                    device_id: "test-device".to_string(),
+                };
+                log.append(make_signed_event(
+                    responder.community_id,
+                    responder.channel_id,
+                    responder.self_owner,
+                    hlc,
+                    "x",
+                    &responder.signing_key,
+                ))
+                .expect("append");
+            }
+        }
+
+        // Drive rounds: responder is stateless per request; requester ingests
+        // each reply (Have packets → process_inbound_packet) and narrows.
+        let mut sealed = requester.engine.rbsr_build_initial().await;
+        let mut rounds = 0u32;
+        loop {
+            rounds += 1;
+            assert!(
+                rounds <= crate::channel_rbsr::MAX_RBSR_ROUNDS,
+                "exceeded round cap"
+            );
+            let (sealed_reply, have_events) = responder
+                .engine
+                .rbsr_respond(&sealed)
+                .await
+                .expect("responder replies");
+            let mut frames = vec![sealed_reply];
+            for ev in &have_events {
+                frames.push(
+                    crate::community_channel_log::encrypt_channel_packet(
+                        requester.engine.channel_key_ref(),
+                        ev,
+                    )
+                    .expect("encrypt"),
+                );
+            }
+            match requester.engine.rbsr_ingest_and_next(frames).await {
+                crate::event_loop::RbsrStep::Converged => break,
+                crate::event_loop::RbsrStep::Continue(next) => sealed = next,
+                crate::event_loop::RbsrStep::Failed => panic!("ingest failed mid-reconcile"),
+            }
+        }
+
+        let msgs = requester
+            .engine
+            .list_messages(None, 1000)
+            .await
+            .expect("list");
+        assert_eq!(
+            msgs.len() as u64,
+            N,
+            "multi-round bisection must recover every event (got {})",
+            msgs.len()
+        );
+    }
+
+    #[tokio::test]
     async fn collect_events_vector_serves_unseen_device_and_per_device_tail() {
         let fix = build_engine_fixture(8, 250, 1000).await;
         let mk = |wall: u64, dev: &str, body: &str| {

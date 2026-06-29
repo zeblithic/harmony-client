@@ -8107,7 +8107,7 @@ where
                             let cid_rb = community_id_hex_qr.clone();
                             let ch_rb = channel_id_hex_qr.clone();
                             let closing_rb = Arc::clone(&closing_qr);
-                            let mode = drive_rbsr_rounds(
+                            let (mode, transferred) = drive_rbsr_rounds(
                                 || (initial)(),
                                 move |round, sealed| {
                                     let session = Arc::clone(&session_rb);
@@ -8122,6 +8122,14 @@ where
                             .await;
                             match mode {
                                 crate::channel_backfill::ReconcileMode::Done => {
+                                    // The RBSR path bypasses the since-drain
+                                    // progress emitter; fire one terminal tick
+                                    // so §14.2 (≥1 backfill-progress event) holds
+                                    // and the UI sees the transferred count.
+                                    (emit_backfill_progress_qr)(
+                                        transferred as u32,
+                                        Some(transferred as u32),
+                                    );
                                     if let Some(tx) = req.outcome_tx.take() {
                                         let _ = tx.send(
                                             crate::community_channel_log_engine::BackfillPageReport {
@@ -8639,11 +8647,16 @@ pub enum RbsrStep {
 /// - a reply fails to open/process → `VectorFallback` (AEAD authenticity gives
 ///   malformed/tampered fallback for free).
 /// - the round cap is reached without converging → `FullReconcile`.
+///
+/// Returns `(mode, transferred)` where `transferred` is the count of inline
+/// `Have` event packets pulled across all rounds (the reply-message frame per
+/// round is excluded) — the caller uses it to emit a backfill-progress event,
+/// since the RBSR path bypasses the `since/**` drain loop that normally counts.
 async fn drive_rbsr_rounds<InitFut, GetFut, NextFut>(
     rbsr_initial: impl Fn() -> InitFut,
     rbsr_get: impl Fn(u32, Vec<u8>) -> GetFut,
     rbsr_ingest_and_next: impl Fn(Vec<Vec<u8>>) -> NextFut,
-) -> crate::channel_backfill::ReconcileMode
+) -> (crate::channel_backfill::ReconcileMode, usize)
 where
     InitFut: std::future::Future<Output = Vec<u8>>,
     GetFut: std::future::Future<Output = Vec<Vec<u8>>>,
@@ -8653,30 +8666,33 @@ where
         reconcile_mode_after_round, reconcile_mode_after_round0, ReconcileMode,
     };
     let mut sealed = rbsr_initial().await;
+    let mut transferred = 0usize;
     for round in 0..crate::channel_rbsr::MAX_RBSR_ROUNDS {
         let frames = rbsr_get(round, sealed).await;
         if round == 0 && reconcile_mode_after_round0(frames.len()) == ReconcileMode::VectorFallback
         {
-            return ReconcileMode::VectorFallback;
+            return (ReconcileMode::VectorFallback, transferred);
         }
+        // Frame 0 is the sealed reply message; the rest are inline Have packets.
+        transferred += frames.len().saturating_sub(1);
         let step = rbsr_ingest_and_next(frames).await;
         let converged = match &step {
-            RbsrStep::Failed => return ReconcileMode::VectorFallback,
+            RbsrStep::Failed => return (ReconcileMode::VectorFallback, transferred),
             RbsrStep::Converged => true,
             RbsrStep::Continue(_) => false,
         };
         if reconcile_mode_after_round(round, converged) == ReconcileMode::Done {
-            return ReconcileMode::Done;
+            return (ReconcileMode::Done, transferred);
         }
         sealed = match step {
             RbsrStep::Continue(next) => next,
             // Converged was already turned into `Done` above; fall back rather
             // than panic if the policy ever changes out from under this.
-            _ => return ReconcileMode::Done,
+            _ => return (ReconcileMode::Done, transferred),
         };
     }
     // Exhausted the round cap without converging → full-reconcile safety net.
-    ReconcileMode::FullReconcile
+    (ReconcileMode::FullReconcile, transferred)
 }
 
 /// ZEB-593: issue one RBSR round GET and drain its reply frames. The 10s
@@ -8693,6 +8709,14 @@ async fn rbsr_get_frames(
     let receiver = match session
         .get(key)
         .payload(sealed)
+        // Reconcile only against REMOTE responders: the requester also declares
+        // an `rbsr/**` queryable, and its own all-`Skip` self-reply (it built
+        // the request over its own log) would otherwise race into `frames[0]`
+        // and force premature convergence. Excluding self also makes "zero
+        // replies on round 0" cleanly mean "no remote responder" → vector
+        // fallback. Unlike the dedup-tolerant `since/**` path, RBSR's stateful
+        // per-round reply cannot absorb a self-reply.
+        .allowed_destination(zenoh::sample::Locality::Remote)
         .consolidation(zenoh::query::ConsolidationMode::None)
         .timeout(std::time::Duration::from_secs(10))
         .await
@@ -9043,7 +9067,7 @@ mod channel_log_adapter_tests {
     #[tokio::test]
     async fn drive_rbsr_rounds_round0_no_reply_falls_back_to_vector() {
         // An old peer with no rbsr/** queryable draws zero replies on round 0.
-        let mode = drive_rbsr_rounds(
+        let (mode, _transferred) = drive_rbsr_rounds(
             || async { b"init".to_vec() },
             |_round, _sealed| async { Vec::<Vec<u8>>::new() },
             |_frames| async { RbsrStep::Continue(b"unused".to_vec()) },
@@ -9057,7 +9081,7 @@ mod channel_log_adapter_tests {
         use std::cell::{Cell, RefCell};
         let seen: RefCell<Vec<(u32, Vec<u8>)>> = RefCell::new(Vec::new());
         let ingest_calls = Cell::new(0u32);
-        let mode = drive_rbsr_rounds(
+        let (mode, _transferred) = drive_rbsr_rounds(
             || async { b"init".to_vec() },
             |round, sealed| {
                 seen.borrow_mut().push((round, sealed));
@@ -9088,7 +9112,7 @@ mod channel_log_adapter_tests {
     async fn drive_rbsr_rounds_hits_cap_returns_full_reconcile() {
         use std::cell::Cell;
         let gets = Cell::new(0u32);
-        let mode = drive_rbsr_rounds(
+        let (mode, _transferred) = drive_rbsr_rounds(
             || async { b"init".to_vec() },
             |_round, _sealed| {
                 gets.set(gets.get() + 1);
@@ -9107,7 +9131,7 @@ mod channel_log_adapter_tests {
 
     #[tokio::test]
     async fn drive_rbsr_rounds_ingest_failure_falls_back_to_vector() {
-        let mode = drive_rbsr_rounds(
+        let (mode, _transferred) = drive_rbsr_rounds(
             || async { b"init".to_vec() },
             |_round, _sealed| async { vec![vec![0xAAu8]] },
             |_frames| async { RbsrStep::Failed },
