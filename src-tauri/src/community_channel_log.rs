@@ -28,6 +28,9 @@ use chacha20poly1305::{AeadCore, ChaCha20Poly1305, KeyInit};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+
+use crate::channel_chunk_index::ChunkIndex;
+use crate::channel_rbsr::{RangeFingerprint, RangeReconcileSource, ReconcileKey};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -1600,6 +1603,15 @@ pub struct ChannelLog {
     /// `reaction_index`). Keeps `watermark_vector()` O(devices), not an
     /// O(history) rescan per catch-up query.
     device_watermarks: WatermarkVector,
+    /// ZEB-592: in-memory canonical-order `(ReconcileKey, element_hash)` mirror
+    /// of the whole log + a content-defined-chunk fingerprint index over it.
+    /// Built in `reload`, maintained in `append`. Lets RBSR range fingerprints
+    /// be served from memory — the per-query O(history) segment rescan the
+    /// watermark-vector path pays (ZEB-585 §A.6) is gone. (A memory-frugal
+    /// chunk-summary-only variant that reads boundary events from disk is a
+    /// documented Slice 2b follow-up.)
+    reconcile_entries: Vec<(ReconcileKey, [u8; 32])>,
+    chunk_index: ChunkIndex,
 }
 
 /// On-disk index of sealed segments + the path to the active tail.
@@ -1681,6 +1693,8 @@ impl ChannelLog {
             root,
             reaction_index: ReactionIndex::default(),
             device_watermarks: WatermarkVector::new(),
+            reconcile_entries: Vec::new(),
+            chunk_index: ChunkIndex::new(),
         }
     }
 
@@ -1722,6 +1736,8 @@ impl ChannelLog {
         // ZEB-585: advance the per-(author, device) catch-up watermark
         // before the event is moved into the tail.
         raise_watermark(&mut self.device_watermarks, event.author(), event.at());
+        // ZEB-592: maintain the RBSR reconcile index before the event moves.
+        self.maintain_reconcile_index(&event);
         self.tail.push(event);
         Ok(self.tail.len() >= self.config.seal_threshold_events)
     }
@@ -2023,9 +2039,12 @@ impl ChannelLog {
             root,
             reaction_index: ReactionIndex::default(),
             device_watermarks: WatermarkVector::new(),
+            reconcile_entries: Vec::new(),
+            chunk_index: ChunkIndex::new(),
         };
         log.rebuild_reaction_index();
         log.rebuild_device_watermarks();
+        log.rebuild_reconcile_index();
         Ok((log, total))
     }
 
@@ -2165,6 +2184,100 @@ impl ChannelLog {
             raise_watermark(&mut idx, ev.author(), ev.at());
         }
         self.device_watermarks = idx;
+    }
+
+    /// ZEB-592: rebuild the in-memory reconcile index (sorted entries + chunk
+    /// index) from the persisted log. Same one-time boot cost + non-fatal
+    /// segment-read handling as `rebuild_device_watermarks`.
+    fn rebuild_reconcile_index(&mut self) {
+        let mut entries: Vec<(ReconcileKey, [u8; 32])> = Vec::new();
+        for seg in &self.manifest.segments {
+            match self.read_segment(seg) {
+                Ok(events) => {
+                    for ev in &events {
+                        let k = reconcile_key(ev);
+                        let h = k.3;
+                        entries.push((k, h));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        zeb = "ZEB-592",
+                        segment = ?seg.handle,
+                        error = %e,
+                        "rebuild_reconcile_index: skipping unreadable segment"
+                    );
+                }
+            }
+        }
+        for ev in &self.tail {
+            let k = reconcile_key(ev);
+            let h = k.3;
+            entries.push((k, h));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|a, b| a.0 == b.0);
+        self.chunk_index = ChunkIndex::build_from_sorted(&entries);
+        self.reconcile_entries = entries;
+    }
+
+    /// ZEB-592: fold one event into the reconcile index at the `append` choke
+    /// point. `mem::take` lets the chunk index read the (pre-insert) entries
+    /// without a self-field borrow split.
+    fn maintain_reconcile_index(&mut self, event: &SignedChannelEvent) {
+        let key = reconcile_key(event);
+        let hash = key.3;
+        let pos = self.reconcile_entries.partition_point(|x| x.0 < key);
+        if self.reconcile_entries.get(pos).map_or(false, |x| x.0 == key) {
+            return; // idempotent re-append
+        }
+        let mut idx = std::mem::take(&mut self.chunk_index);
+        idx.insert(key.clone(), hash, |lo, hi| {
+            let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
+            let e = self.reconcile_entries.partition_point(|x| &x.0 <= hi);
+            self.reconcile_entries[s..e].to_vec()
+        });
+        self.chunk_index = idx;
+        self.reconcile_entries.insert(pos, (key, hash));
+    }
+}
+
+/// ZEB-592: canonical RBSR set-element key for an event —
+/// `(wall_ms, logical, device_id, element_hash)`.
+fn reconcile_key(e: &SignedChannelEvent) -> ReconcileKey {
+    let at = e.at();
+    (at.wall_ms, at.logical, at.device_id.clone(), event_element_hash(e))
+}
+
+impl RangeReconcileSource for ChannelLog {
+    fn range_fingerprint(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> RangeFingerprint {
+        self.chunk_index.range_fingerprint(lo, hi, &mut |first, last| {
+            let s = self.reconcile_entries.partition_point(|x| &x.0 < first);
+            let e = self.reconcile_entries.partition_point(|x| &x.0 <= last);
+            self.reconcile_entries[s..e].to_vec()
+        })
+    }
+
+    fn range_count(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> u64 {
+        let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
+        let e = self.reconcile_entries.partition_point(|x| &x.0 < hi);
+        (e - s) as u64
+    }
+
+    fn keys_in_range(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Vec<ReconcileKey> {
+        let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
+        let e = self.reconcile_entries.partition_point(|x| &x.0 < hi);
+        self.reconcile_entries[s..e].iter().map(|x| x.0.clone()).collect()
+    }
+
+    fn split_key(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Option<ReconcileKey> {
+        let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
+        let e = self.reconcile_entries.partition_point(|x| &x.0 < hi);
+        if e - s < 2 {
+            None
+        } else {
+            Some(self.reconcile_entries[s + (e - s) / 2].0.clone())
+        }
     }
 }
 
@@ -2940,6 +3053,76 @@ mod tests {
             "a wmv-AAD payload must not open as an RBSR message"
         );
         assert_ne!(RBSR_AAD, WATERMARK_VECTOR_AAD);
+    }
+
+    #[test]
+    fn rbsr_log_source_fingerprint_matches_naive_and_survives_reload() {
+        use crate::channel_rbsr::{max_key, min_key, RangeReconcileSource, SliceSource};
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            root.clone(),
+            ChannelLogConfig {
+                seal_threshold_events: 3,
+            },
+        );
+        // Across devices, with sub-max stragglers (90 after 150, 130 after 220)
+        // landing out of HLC order → exercises the canonical sort + segments.
+        let specs = [
+            (100u64, 0u32, "dev-a"),
+            (150, 0, "dev-a"),
+            (120, 0, "dev-b"),
+            (200, 0, "dev-a"),
+            (90, 0, "dev-c"),
+            (210, 0, "dev-b"),
+            (220, 0, "dev-a"),
+            (130, 0, "dev-c"),
+        ];
+        let events: Vec<_> = specs
+            .iter()
+            .map(|&(w, l, d)| fixture_signed_event(w, l, d))
+            .collect();
+        for e in &events {
+            if log.append(e.clone()).expect("append") {
+                log.seal_and_persist().expect("seal");
+            }
+        }
+        let all: Vec<_> = events
+            .iter()
+            .map(|e| {
+                let k = reconcile_key(e);
+                let h = k.3;
+                (k, h)
+            })
+            .collect();
+        let naive = SliceSource::from_unsorted(all);
+        let want = naive.range_fingerprint(&min_key(), &max_key()).finalize();
+
+        assert_eq!(
+            log.range_fingerprint(&min_key(), &max_key()).finalize(),
+            want,
+            "log-backed source must match naive over the same events"
+        );
+
+        log.flush_tail().expect("flush");
+        let (reloaded, _total) = ChannelLog::reload(
+            cid,
+            chid,
+            root,
+            ChannelLogConfig {
+                seal_threshold_events: 3,
+            },
+        )
+        .expect("reload");
+        assert_eq!(
+            reloaded.range_fingerprint(&min_key(), &max_key()).finalize(),
+            want,
+            "reload rebuilds the reconcile index identically"
+        );
     }
 
     #[test]

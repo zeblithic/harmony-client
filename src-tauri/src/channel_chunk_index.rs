@@ -38,7 +38,7 @@ pub struct ChunkSummary {
 
 /// A sorted list of [`ChunkSummary`]s partitioning the event set in canonical
 /// order.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ChunkIndex {
     chunks: Vec<ChunkSummary>,
 }
