@@ -90,7 +90,7 @@ pub const INBOX_PER_SENDER_CAP: usize = 64;
 /// as [`INBOX_PER_SENDER_CAP`].
 pub const INBOX_GLOBAL_CAP: usize = 1024;
 
-/// ZEB-423: inbound Zenoh size cap for `dm-inbox-v1` full-doc CRDT-sync frames,
+/// ZEB-423: inbound Zenoh size cap for `dm-inbox-v1` full-doc fleet-sync frames,
 /// the missing parity to the gate PR #222 added to the sibling P2 datasets
 /// (`dm-outhold-v1` / `fleet-net-v1`) on the shared
 /// `spawn_dataset_sync_zenoh_adapter` helper. Every inbound sample on this
@@ -98,29 +98,26 @@ pub const INBOX_GLOBAL_CAP: usize = 1024;
 /// gate — attacker-driven allocation before the FleetSync engine could reject
 /// the frame.
 ///
-/// The dataset replicates the WHOLE [`crate::dm_inbox_crdt::DmInboxDoc`] per
-/// frame, so unlike dm-outhold's flat 16 MiB the gate is sized to the *enforced
-/// inbox quota*: at most [`INBOX_GLOBAL_CAP`] live entries, each re-serializing
-/// at most one [`DEPOSIT_MAX_FRAME_BYTES`] deposit frame (its CidNotify +
-/// storage blob + optional invite were all carried in a single such frame).
-/// Sizing to the quota — rather than copying dm-outhold's 16 MiB, which assumes
-/// only ~64 blobs and is 16× too small for a full 1024-entry inbox — keeps the
-/// DoS gate from silently dropping a legitimate full-inbox fleet sync (which
-/// would diverge the owner's own fleet). Anything larger than the quota permits
-/// is malformed or hostile and is dropped before the owned copy. Scales
-/// automatically with the quota constants.
-pub const DM_INBOX_DATASET_MAX_BYTES: usize = INBOX_GLOBAL_CAP * DEPOSIT_MAX_FRAME_BYTES;
+/// Sized to MATCH the sibling [`crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES`]
+/// (16 MiB = 64 deposit frames), deliberately NOT the dm-inbox quota's
+/// theoretical max. The dataset replicates the WHOLE
+/// [`crate::dm_inbox_crdt::DmInboxDoc`] per frame, and [`INBOX_GLOBAL_CAP`]
+/// (1024) would put that max near 256 MiB — but the whole *point* of this gate
+/// is to bound attacker-driven allocation, and a 256 MiB cap over the 64-deep
+/// inbound channel is itself a multi-GB OOM vector (Qodo, PR #370). A cap that
+/// large would not bound the DoS it exists to prevent. Whole-doc fleet-sync also
+/// can't practically carry a frame that big, so an inbox exceeding 16 MiB is the
+/// pre-existing whole-doc-replication scaling limit (fail-safe: the oversize
+/// frame is dropped before allocation and the fleet re-publishes) — shared with
+/// dm-outhold and best addressed by delta/chunked replication, not by raising
+/// this gate into OOM range.
+pub const DM_INBOX_DATASET_MAX_BYTES: usize = 64 * DEPOSIT_MAX_FRAME_BYTES;
 
-// ZEB-423: compile-time floor. The gate MUST admit the largest doc the enforced
-// inbox quota can legitimately produce — else a full-inbox fleet sync is dropped
-// before allocation and the owner's own devices silently diverge. If anyone
-// shrinks the cap below the quota (e.g. by copying dm-outhold's flat 16 MiB),
-// this fails the build rather than surfacing as a hard-to-trace sync gap.
-const _: () = assert!(DM_INBOX_DATASET_MAX_BYTES >= INBOX_GLOBAL_CAP * DEPOSIT_MAX_FRAME_BYTES);
-// And it must materially exceed dm-outhold's flat 16 MiB: dm-inbox's 1024-entry
-// global cap is 16x dm-outhold's ~64-blob assumption, which is exactly why this
-// dataset cannot reuse that value.
-const _: () = assert!(DM_INBOX_DATASET_MAX_BYTES > crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES);
+// Deliberate parity with the sibling dm-outhold dataset (same DM-blob payloads,
+// same whole-doc-replication memory profile). Pin the equality so any future
+// divergence is a conscious decision rather than silent drift.
+const _: () =
+    assert!(DM_INBOX_DATASET_MAX_BYTES == crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES);
 
 /// GC TTL for un-ingested dm-inbox deposits (spec §5): an entry is removed
 /// once `deposited_at.wall_ms + INBOX_TTL_MS < now`, regardless of how many
