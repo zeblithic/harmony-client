@@ -564,17 +564,26 @@ mod tests {
         // wrong version
         let mut bad_ver = req.clone();
         bad_ver.version = 9;
-        assert_eq!(validate_message(&bad_ver), Err(RbsrError::InvalidVersion(9)));
+        assert_eq!(
+            validate_message(&bad_ver),
+            Err(RbsrError::InvalidVersion(9))
+        );
         // empty range list
         assert_eq!(
-            validate_message(&RbsrMessage { version: RBSR_PROTOCOL_VERSION, ranges: vec![] }),
+            validate_message(&RbsrMessage {
+                version: RBSR_PROTOCOL_VERSION,
+                ranges: vec![]
+            }),
             Err(RbsrError::InvalidPartition)
         );
         // does not close at max_key()
         assert_eq!(
             validate_message(&RbsrMessage {
                 version: RBSR_PROTOCOL_VERSION,
-                ranges: vec![RbsrRange { upper: key(10, 1), mode: RbsrMode::Skip }],
+                ranges: vec![RbsrRange {
+                    upper: key(10, 1),
+                    mode: RbsrMode::Skip
+                }],
             }),
             Err(RbsrError::InvalidPartition)
         );
@@ -583,9 +592,18 @@ mod tests {
             validate_message(&RbsrMessage {
                 version: RBSR_PROTOCOL_VERSION,
                 ranges: vec![
-                    RbsrRange { upper: key(20, 2), mode: RbsrMode::Skip },
-                    RbsrRange { upper: key(10, 1), mode: RbsrMode::Skip },
-                    RbsrRange { upper: max_key(), mode: RbsrMode::Skip },
+                    RbsrRange {
+                        upper: key(20, 2),
+                        mode: RbsrMode::Skip
+                    },
+                    RbsrRange {
+                        upper: key(10, 1),
+                        mode: RbsrMode::Skip
+                    },
+                    RbsrRange {
+                        upper: max_key(),
+                        mode: RbsrMode::Skip
+                    },
                 ],
             }),
             Err(RbsrError::InvalidPartition)
@@ -595,8 +613,14 @@ mod tests {
             validate_message(&RbsrMessage {
                 version: RBSR_PROTOCOL_VERSION,
                 ranges: vec![
-                    RbsrRange { upper: key(20, 2), mode: RbsrMode::Skip },
-                    RbsrRange { upper: max_key(), mode: RbsrMode::Have(vec![key(10, 1)]) },
+                    RbsrRange {
+                        upper: key(20, 2),
+                        mode: RbsrMode::Skip
+                    },
+                    RbsrRange {
+                        upper: max_key(),
+                        mode: RbsrMode::Have(vec![key(10, 1)])
+                    },
                 ],
             }),
             Err(RbsrError::KeyOutOfRange)
