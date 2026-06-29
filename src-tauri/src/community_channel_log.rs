@@ -591,7 +591,22 @@ pub fn sign_channel_react(
 /// The single source of truth for what bytes the signature covers — used
 /// by both sign functions (via a placeholder-sig event) and
 /// `verify_channel_event` (on the deserialized event).
-fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, ChannelEventError> {
+/// ZEB-592: stable 32-byte RBSR set-element identity for an event — the
+/// SHA-256 of its canonical signed-set CBOR (the exact bytes the signature
+/// covers). Content+id-derived, so two peers compute the identical hash for
+/// the same event regardless of how its HLC sorts or when it arrived.
+pub(crate) fn event_element_hash(event: &SignedChannelEvent) -> [u8; 32] {
+    use sha2::Digest;
+    // A validated in-memory event always canonically serializes (the `Vec`
+    // writer is infallible), so the `Result` here is ceremonial.
+    let canon = signed_set_canonical_cbor(event)
+        .expect("validated channel event must canonically serialize");
+    sha2::Sha256::digest(canon).into()
+}
+
+pub(crate) fn signed_set_canonical_cbor(
+    event: &SignedChannelEvent,
+) -> Result<Vec<u8>, ChannelEventError> {
     let mut canon = Vec::with_capacity(256);
     match event {
         SignedChannelEvent::Post {
@@ -2787,6 +2802,23 @@ mod tests {
         let canon_a = signed_set_canonical_cbor(&signed).expect("canon a");
         let canon_b = signed_set_canonical_cbor(&signed).expect("canon b");
         assert_eq!(canon_a, canon_b);
+    }
+
+    #[test]
+    fn element_hash_matches_sha256_of_canonical_cbor_and_is_deterministic() {
+        use sha2::Digest;
+        let (payload, key) = fixture_payload("hello");
+        let ev = sign_channel_event(&payload, &key).expect("sign");
+        // deterministic: re-hashing the same event yields the same bytes
+        assert_eq!(event_element_hash(&ev), event_element_hash(&ev));
+        // equals SHA-256 of the canonical signed-set CBOR
+        let expect: [u8; 32] =
+            sha2::Sha256::digest(signed_set_canonical_cbor(&ev).expect("canon")).into();
+        assert_eq!(event_element_hash(&ev), expect);
+        // a different event hashes differently
+        let (payload2, key2) = fixture_payload("world");
+        let ev2 = sign_channel_event(&payload2, &key2).expect("sign");
+        assert_ne!(event_element_hash(&ev), event_element_hash(&ev2));
     }
 
     #[test]
