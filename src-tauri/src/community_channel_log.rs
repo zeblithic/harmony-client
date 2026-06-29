@@ -909,6 +909,16 @@ fn seal_rbsr_message_inner(
     nonce: [u8; 12],
 ) -> Result<Vec<u8>, ChannelEventError> {
     let plaintext = crate::channel_rbsr::encode_message(msg);
+    // True cap-before-alloc on the seal path (parity with `open_rbsr_message`'s
+    // pre-decrypt cap): the sealed packet is exactly NONCE_LEN + plaintext.len()
+    // + TAG_LEN bytes (ChaCha20-Poly1305 appends a 16-byte tag), so reject an
+    // oversize message on the plaintext length BEFORE spending the AEAD encrypt
+    // and ciphertext allocation. Failing locally also keeps the fallback path
+    // predictable instead of surfacing as a peer-side decode failure on `open`.
+    let sealed_len = NONCE_LEN + plaintext.len() + TAG_LEN;
+    if sealed_len > MAX_RBSR_MESSAGE_BYTES {
+        return Err(ChannelEventError::MalformedPacket(sealed_len));
+    }
     let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
     let ciphertext = cipher
         .encrypt(
@@ -922,12 +932,11 @@ fn seal_rbsr_message_inner(
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
-    if out.len() > MAX_RBSR_MESSAGE_BYTES {
-        // Fail locally rather than emit a packet the peer will reject on `open`
-        // (symmetric with `open_rbsr_message`'s cap) — keeps the fallback path
-        // predictable instead of surfacing as a peer-side decode failure.
-        return Err(ChannelEventError::MalformedPacket(out.len()));
-    }
+    debug_assert_eq!(
+        out.len(),
+        sealed_len,
+        "AEAD output length must match the pre-checked cap (nonce + plaintext + tag)"
+    );
     Ok(out)
 }
 
@@ -1622,6 +1631,13 @@ pub struct ChannelLog {
     /// watermark-vector path pays (ZEB-585 §A.6) is gone. (A memory-frugal
     /// chunk-summary-only variant that reads boundary events from disk is a
     /// documented Slice 2b follow-up.)
+    ///
+    /// Invariant: `entry.1 == entry.0.3` — the second field always equals the
+    /// `ReconcileKey`'s element-hash (its fourth tuple field). The duplication
+    /// is intentional: [`ChunkIndex`] folds whatever hash it is handed and never
+    /// assumes `hash == key.3`, which keeps that module hash-agnostic and its
+    /// fingerprint algebra testable in isolation. Dropping the in-memory hash
+    /// entirely belongs to the Slice 2b chunk-summary-only rework, not here.
     reconcile_entries: Vec<(ReconcileKey, [u8; 32])>,
     chunk_index: ChunkIndex,
 }
@@ -3113,6 +3129,32 @@ mod tests {
         assert!(
             matches!(open_rbsr_message(&key, &big), Err(ChannelEventError::MalformedPacket(n)) if n == MAX_RBSR_MESSAGE_BYTES + 1),
             "oversize rejected before decrypt"
+        );
+    }
+
+    #[test]
+    fn seal_rbsr_message_rejects_oversize_before_encrypt() {
+        use crate::channel_rbsr::{
+            max_key, RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION,
+        };
+        let mk = fixture_mk();
+        let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
+        // A Have list whose CBOR plaintext exceeds the 64 KiB cap — exercises the
+        // cap-before-alloc guard on the seal path (only `open` was covered before).
+        let keys: Vec<_> = (0..4000u64)
+            .map(|i| (i, 0u32, "d".to_string(), [0u8; 32]))
+            .collect();
+        let msg = RbsrMessage {
+            version: RBSR_PROTOCOL_VERSION,
+            ranges: vec![RbsrRange {
+                upper: max_key(),
+                mode: RbsrMode::Have(keys),
+            }],
+        };
+        let err = seal_rbsr_message(&key, &msg).expect_err("oversize seal must be rejected");
+        assert!(
+            matches!(err, ChannelEventError::MalformedPacket(n) if n > MAX_RBSR_MESSAGE_BYTES),
+            "oversize seal must reject as MalformedPacket(> cap) before encrypt, got {err:?}"
         );
     }
 

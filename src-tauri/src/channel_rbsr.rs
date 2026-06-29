@@ -230,6 +230,11 @@ pub enum RbsrError {
     InvalidVersion(u8),
     InvalidPartition,
     KeyOutOfRange,
+    /// A `Have` list whose keys are not strictly ascending (a duplicate or an
+    /// out-of-canonical-order key). A legitimate responder emits Have keys from
+    /// `keys_in_range` — sorted and unique — so this only fires on a malformed
+    /// (but channel-key-sealed) message.
+    NonCanonicalHave,
 }
 
 pub fn encode_message(m: &RbsrMessage) -> Vec<u8> {
@@ -264,10 +269,23 @@ pub fn validate_message(m: &RbsrMessage) -> Result<(), RbsrError> {
             return Err(RbsrError::InvalidPartition);
         }
         if let RbsrMode::Have(keys) = &r.mode {
+            // Keys within a Have list must be strictly ascending in canonical
+            // order. Rejecting duplicates / out-of-order here closes the gap
+            // where a buggy or hostile (but channel-key-sealed) peer pads a Have
+            // list with repeats: `events_for_keys` dedupes by key, so
+            // `rbsr_respond`'s `events.len() == have_keys.len()` invariant would
+            // then come up short and force a spurious vector-path fallback.
+            let mut prev_have: Option<&ReconcileKey> = None;
             for k in keys {
                 if *k < prev || *k >= r.upper {
                     return Err(RbsrError::KeyOutOfRange);
                 }
+                if let Some(p) = prev_have {
+                    if k <= p {
+                        return Err(RbsrError::NonCanonicalHave);
+                    }
+                }
+                prev_have = Some(k);
             }
         }
         // The partition must close the universe exactly at `max_key()`.
@@ -624,6 +642,52 @@ mod tests {
                 ],
             }),
             Err(RbsrError::KeyOutOfRange)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_have_keys() {
+        // A repeated key in a Have list is in-range but breaks the
+        // `events.len() == have_keys.len()` invariant downstream; reject it here.
+        assert_eq!(
+            validate_message(&RbsrMessage {
+                version: RBSR_PROTOCOL_VERSION,
+                ranges: vec![RbsrRange {
+                    upper: max_key(),
+                    mode: RbsrMode::Have(vec![key(10, 1), key(10, 1)]),
+                }],
+            }),
+            Err(RbsrError::NonCanonicalHave)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_out_of_order_have_keys() {
+        // Keys must be strictly ascending within a Have list, not merely in-range.
+        assert_eq!(
+            validate_message(&RbsrMessage {
+                version: RBSR_PROTOCOL_VERSION,
+                ranges: vec![RbsrRange {
+                    upper: max_key(),
+                    mode: RbsrMode::Have(vec![key(20, 2), key(10, 1)]),
+                }],
+            }),
+            Err(RbsrError::NonCanonicalHave)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_ascending_have_keys() {
+        // The legitimate shape `keys_in_range` produces must still pass.
+        assert_eq!(
+            validate_message(&RbsrMessage {
+                version: RBSR_PROTOCOL_VERSION,
+                ranges: vec![RbsrRange {
+                    upper: max_key(),
+                    mode: RbsrMode::Have(vec![key(10, 1), key(20, 2), key(30, 3)]),
+                }],
+            }),
+            Ok(())
         );
     }
 
