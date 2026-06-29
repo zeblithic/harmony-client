@@ -221,6 +221,126 @@ pub fn decode_message(bytes: &[u8]) -> Result<RbsrMessage, RbsrError> {
     ciborium::from_reader(bytes).map_err(|_| RbsrError::Decode)
 }
 
+// ---------------------------------------------------------------------------
+// Protocol state machine (pull-only)
+// ---------------------------------------------------------------------------
+
+/// Append a range to a message under construction, coalescing adjacent `Skip`
+/// spans into one. Both `respond` and `process_reply` emit a **full ordered
+/// partition** of the universe so the receiver's positional lower-bound chain
+/// (`lo` advancing by each range's `upper`) stays aligned; coalescing keeps the
+/// resolved prefix/suffix from bloating the message, bounding it to
+/// O(diff · log n).
+fn push_range(out: &mut Vec<RbsrRange>, upper: ReconcileKey, mode: RbsrMode) {
+    if mode == RbsrMode::Skip {
+        if let Some(last) = out.last_mut() {
+            if last.mode == RbsrMode::Skip {
+                last.upper = upper;
+                return;
+            }
+        }
+    }
+    out.push(RbsrRange { upper, mode });
+}
+
+/// Round 0: one `Fingerprint` over the whole universe `[min_key, max_key)`.
+pub fn initial_request(source: &impl RangeReconcileSource) -> RbsrMessage {
+    RbsrMessage {
+        version: RBSR_PROTOCOL_VERSION,
+        ranges: vec![RbsrRange {
+            upper: max_key(),
+            mode: RbsrMode::Fingerprint(source.range_fingerprint(&min_key(), &max_key()).finalize()),
+        }],
+    }
+}
+
+/// Responder half. For each incoming `Fingerprint` range: `Skip` if it matches
+/// the responder's own fingerprint, else bisect (above the leaf threshold) or
+/// ship the responder's keys wholesale via `Have`. Already-resolved ranges
+/// (`Skip`/`Have` in the request) are echoed as `Skip` to preserve the
+/// partition.
+pub fn respond(request: &RbsrMessage, source: &impl RangeReconcileSource) -> RbsrMessage {
+    let mut out: Vec<RbsrRange> = Vec::new();
+    let mut lo = min_key();
+    for range in &request.ranges {
+        let hi = range.upper.clone();
+        match &range.mode {
+            RbsrMode::Fingerprint(their_fp) => {
+                let mine = source.range_fingerprint(&lo, &hi).finalize();
+                if &mine == their_fp {
+                    push_range(&mut out, hi.clone(), RbsrMode::Skip);
+                } else if source.range_count(&lo, &hi) <= LEAF_THRESHOLD {
+                    push_range(&mut out, hi.clone(), RbsrMode::Have(source.keys_in_range(&lo, &hi)));
+                } else {
+                    let keys = source.keys_in_range(&lo, &hi);
+                    let mid = keys[keys.len() / 2].clone();
+                    push_range(
+                        &mut out,
+                        mid.clone(),
+                        RbsrMode::Fingerprint(source.range_fingerprint(&lo, &mid).finalize()),
+                    );
+                    push_range(
+                        &mut out,
+                        hi.clone(),
+                        RbsrMode::Fingerprint(source.range_fingerprint(&mid, &hi).finalize()),
+                    );
+                }
+            }
+            RbsrMode::Skip | RbsrMode::Have(_) => {
+                push_range(&mut out, hi.clone(), RbsrMode::Skip);
+            }
+        }
+        lo = hi;
+    }
+    RbsrMessage { version: RBSR_PROTOCOL_VERSION, ranges: out }
+}
+
+/// Requester half. Ingest `Have` keys we lack, recompute our own fingerprint
+/// over each still-`Fingerprint` sub-range, and emit the next full partition
+/// (matched/resolved ranges → `Skip`). Returns `(keys_we_are_missing,
+/// next_request)`; `next_request` is `None` once nothing mismatches (converged).
+pub fn process_reply(
+    reply: &RbsrMessage,
+    source: &impl RangeReconcileSource,
+) -> (Vec<ReconcileKey>, Option<RbsrMessage>) {
+    let mut missing = Vec::new();
+    let mut next: Vec<RbsrRange> = Vec::new();
+    let mut any_mismatch = false;
+    let mut lo = min_key();
+    for range in &reply.ranges {
+        let hi = range.upper.clone();
+        match &range.mode {
+            RbsrMode::Skip => push_range(&mut next, hi.clone(), RbsrMode::Skip),
+            RbsrMode::Have(keys) => {
+                let local: std::collections::HashSet<ReconcileKey> =
+                    source.keys_in_range(&lo, &hi).into_iter().collect();
+                for k in keys {
+                    if !local.contains(k) {
+                        missing.push(k.clone());
+                    }
+                }
+                push_range(&mut next, hi.clone(), RbsrMode::Skip); // resolved after ingest
+            }
+            RbsrMode::Fingerprint(their_fp) => {
+                let mine = source.range_fingerprint(&lo, &hi).finalize();
+                if &mine == their_fp {
+                    push_range(&mut next, hi.clone(), RbsrMode::Skip);
+                } else {
+                    any_mismatch = true;
+                    push_range(&mut next, hi.clone(), RbsrMode::Fingerprint(mine));
+                }
+            }
+        }
+        lo = hi;
+    }
+    let next = if any_mismatch {
+        Some(RbsrMessage { version: RBSR_PROTOCOL_VERSION, ranges: next })
+    } else {
+        None
+    };
+    (missing, next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +446,105 @@ mod tests {
     #[test]
     fn decode_rejects_garbage() {
         assert_eq!(decode_message(&[0xff, 0x00, 0x13]), Err(RbsrError::Decode));
+    }
+
+    // ---- Tasks 6 & 7: protocol ----
+
+    fn src(ws: &[(u64, u8)]) -> SliceSource {
+        SliceSource::from_unsorted(
+            ws.iter()
+                .map(|&(w, b)| {
+                    let k = key(w, b);
+                    let hash = k.3;
+                    (k, hash)
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn matching_whole_range_returns_skip() {
+        let s = src(&[(10, 1), (20, 2), (30, 3)]);
+        let reply = respond(&initial_request(&s), &s);
+        assert_eq!(reply.ranges.len(), 1);
+        assert_eq!(reply.ranges[0].mode, RbsrMode::Skip);
+    }
+
+    #[test]
+    fn small_mismatch_returns_have_wholesale() {
+        let responder = src(&[(10, 1), (20, 2), (30, 3)]);
+        let requester = src(&[(10, 1), (30, 3)]);
+        let reply = respond(&initial_request(&requester), &responder);
+        let have: Vec<ReconcileKey> = reply
+            .ranges
+            .iter()
+            .filter_map(|r| if let RbsrMode::Have(ks) = &r.mode { Some(ks.clone()) } else { None })
+            .flatten()
+            .collect();
+        assert!(have.contains(&key(20, 2)), "responder ships its events wholesale at the leaf");
+    }
+
+    #[test]
+    fn large_mismatch_bisects_into_fingerprints() {
+        let resp: Vec<(u64, u8)> = (0..40u64).map(|i| (i * 10, i as u8)).collect();
+        let responder = src(&resp);
+        let mut req_set = resp.clone();
+        req_set.remove(20);
+        let requester = src(&req_set);
+        let reply = respond(&initial_request(&requester), &responder);
+        assert!(reply.ranges.len() >= 2, "bisected: {:?}", reply.ranges.len());
+        assert!(reply
+            .ranges
+            .iter()
+            .all(|r| matches!(r.mode, RbsrMode::Fingerprint(_) | RbsrMode::Skip)));
+    }
+
+    /// Drive requester ↔ responder to convergence; return (rounds, keys acquired).
+    fn reconcile(req: &SliceSource, resp: &SliceSource) -> (u32, usize) {
+        let mut request = initial_request(req);
+        let mut acquired: Vec<ReconcileKey> = Vec::new();
+        let mut rounds = 0u32;
+        loop {
+            rounds += 1;
+            assert!(rounds <= MAX_RBSR_ROUNDS, "must converge within the round cap");
+            let reply = respond(&request, resp);
+            let (missing, next) = process_reply(&reply, req);
+            acquired.extend(missing);
+            match next {
+                None => break,
+                Some(n) => request = n,
+            }
+        }
+        (rounds, acquired.len())
+    }
+
+    #[test]
+    fn converges_and_transfers_only_the_gap() {
+        let full: Vec<(u64, u8)> = (0..100u64).map(|i| (i, (i % 251) as u8)).collect();
+        let resp = src(&full);
+        let mut miss = full.clone();
+        for idx in [70usize, 40, 5] {
+            miss.remove(idx);
+        }
+        let req = src(&miss);
+        let (rounds, have) = reconcile(&req, &resp);
+        assert!(rounds <= MAX_RBSR_ROUNDS, "rounds {rounds}");
+        assert!(have >= 3 && have < 40, "transferred ~gap not history: {have}");
+    }
+
+    #[test]
+    fn identical_sets_converge_in_one_round_with_no_transfer() {
+        let s = src(&[(1, 1), (2, 2), (3, 3)]);
+        assert_eq!(reconcile(&s, &s), (1, 0));
+    }
+
+    #[test]
+    fn requester_with_extra_events_still_converges_pull_only() {
+        // requester holds events the responder lacks; pull-only → no transfer, converges.
+        let responder = src(&[(10, 1), (30, 3)]);
+        let requester = src(&[(10, 1), (20, 2), (30, 3), (40, 4)]);
+        let (rounds, have) = reconcile(&requester, &responder);
+        assert!(rounds <= MAX_RBSR_ROUNDS);
+        assert_eq!(have, 0, "requester already holds everything the responder has");
     }
 }
