@@ -1793,13 +1793,61 @@ impl ChannelLogEngine {
 
     /// Test helper: seal an RBSR round-0 request built over this engine's own
     /// log (a self-reconcile, which must converge to all-`Skip`).
-    #[cfg(test)]
-    pub(crate) async fn rbsr_self_request_sealed(&self) -> Vec<u8> {
-        let log = self.log.lock().await;
-        let req = crate::channel_rbsr::initial_request(&*log);
-        drop(log);
+    /// ZEB-593 (requester half): build + seal this round-0 RBSR request — one
+    /// `Fingerprint` over the whole canonical universe — under the channel key.
+    /// Sealing a small fixed-shape message is effectively infallible; on the
+    /// off chance it fails, an empty payload makes the responder's `open` fail
+    /// and the driver falls back to the vector path (no panic on the hot path).
+    pub(crate) async fn rbsr_build_initial(&self) -> Vec<u8> {
+        let req = {
+            let log = self.log.lock().await;
+            crate::channel_rbsr::initial_request(&*log)
+        };
         crate::community_channel_log::seal_rbsr_message(self.channel_key_ref(), &req)
-            .expect("seal initial rbsr request")
+            .unwrap_or_default()
+    }
+
+    /// ZEB-593 (requester half): ingest one round's reply frames and advance the
+    /// reconcile. `frames[0]` is the sealed `RbsrMessage` reply; `frames[1..]`
+    /// are encrypted channel-event packets (the responder's `Have` events).
+    /// Those route through the **same** [`Self::process_inbound_packet`]
+    /// signature-verify + replay-check + append + flush path as live gossip —
+    /// RBSR is a different *delivery* path, not a different *trust* path. After
+    /// ingesting, recompute our fingerprints over the now-updated source and
+    /// emit the next round's narrowed request, or signal convergence.
+    pub(crate) async fn rbsr_ingest_and_next(
+        self: &Arc<Self>,
+        frames: Vec<Vec<u8>>,
+    ) -> crate::event_loop::RbsrStep {
+        use crate::event_loop::RbsrStep;
+        let key = self.channel_key_ref();
+        let mut frames = frames.into_iter();
+        // Frame 0 is always the sealed reply message; its absence means no
+        // responder answered this round → fall back.
+        let reply = match frames.next() {
+            Some(bytes) => match crate::community_channel_log::open_rbsr_message(key, &bytes) {
+                Ok(msg) => msg,
+                Err(_) => return RbsrStep::Failed,
+            },
+            None => return RbsrStep::Failed,
+        };
+        // Ingest the inline `Have` event packets exactly like live broadcast.
+        for packet in frames {
+            self.process_inbound_packet(packet).await;
+        }
+        // Recompute our own fingerprints over the (now-updated) log and narrow.
+        let next = {
+            let log = self.log.lock().await;
+            let (_missing, next) = crate::channel_rbsr::process_reply(&reply, &*log);
+            next
+        };
+        match next {
+            None => RbsrStep::Converged,
+            Some(msg) => match crate::community_channel_log::seal_rbsr_message(key, &msg) {
+                Ok(sealed) => RbsrStep::Continue(sealed),
+                Err(_) => RbsrStep::Failed,
+            },
+        }
     }
 
     /// ZEB-350: clone the `Arc<ChannelKey>` so the voice relay can hold the key
@@ -3063,7 +3111,7 @@ mod tests {
 
         // A request built over the engine's own log must reconcile to all-Skip
         // with nothing to transfer.
-        let sealed_req = fix.engine.rbsr_self_request_sealed().await;
+        let sealed_req = fix.engine.rbsr_build_initial().await;
         let (sealed_reply, have) = fix
             .engine
             .rbsr_respond(&sealed_req)
@@ -3087,6 +3135,79 @@ mod tests {
         // Oversize payload → None (cap-before-alloc; caller falls back).
         let oversize = vec![0u8; crate::community_channel_log::MAX_RBSR_MESSAGE_BYTES + 1];
         assert!(fix.engine.rbsr_respond(&oversize).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rbsr_ingest_and_next_recovers_missing_events_via_inbound_path() {
+        // Two fixtures share the same deterministic channel key (fixed
+        // epoch/community/channel), so a responder's sealed reply + encrypted
+        // Have packets open and verify on the requester.
+        let responder = build_engine_fixture(8, 250, 1000).await;
+        let requester = build_engine_fixture(8, 250, 1000).await;
+
+        let mut events = Vec::new();
+        for i in 0..3u64 {
+            let hlc = Hlc {
+                wall_ms: 1_000 + i,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            };
+            events.push(make_signed_event(
+                responder.community_id,
+                responder.channel_id,
+                responder.self_owner,
+                hlc,
+                "x",
+                &responder.signing_key,
+            ));
+        }
+        {
+            let mut log = responder.engine.log_for_test().lock().await;
+            for ev in &events {
+                log.append(ev.clone()).expect("append");
+            }
+        }
+
+        // Requester drives round 0: build initial → responder replies.
+        let req = requester.engine.rbsr_build_initial().await;
+        let (sealed_reply, have_events) = responder
+            .engine
+            .rbsr_respond(&req)
+            .await
+            .expect("responder replies");
+        assert_eq!(have_events.len(), 3, "small leaf ships all events wholesale");
+
+        // Assemble the wire frames the adapter would deliver: the sealed reply
+        // followed by one encrypted channel packet per Have event.
+        let mut frames = vec![sealed_reply];
+        for ev in &have_events {
+            frames.push(
+                crate::community_channel_log::encrypt_channel_packet(
+                    requester.engine.channel_key_ref(),
+                    ev,
+                )
+                .expect("encrypt have packet"),
+            );
+        }
+
+        let step = requester.engine.rbsr_ingest_and_next(frames).await;
+        assert!(
+            !matches!(step, crate::event_loop::RbsrStep::Failed),
+            "ingest of a well-formed reply must not fail",
+        );
+
+        // The previously-missing events are now in the requester's log, having
+        // flowed through the same inbound verify + append path as live gossip.
+        let msgs = requester
+            .engine
+            .list_messages(None, 100)
+            .await
+            .expect("list requester messages");
+        assert_eq!(
+            msgs.len(),
+            3,
+            "requester recovered every responder event via process_inbound_packet",
+        );
     }
 
     #[tokio::test]

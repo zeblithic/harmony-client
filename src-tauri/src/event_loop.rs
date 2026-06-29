@@ -8432,12 +8432,9 @@ fn parse_rbsr_key(key: &str) -> Option<u32> {
 }
 
 /// One requester-side RBSR step outcome, returned by the engine's
-/// ingest-and-advance closure after a round's reply frames are processed.
-// ZEB-593: the `#[allow(dead_code)]` is removed once `drive_rbsr_rounds` is
-// wired into the adapter's requester path (this file, Task 4).
-#[allow(dead_code)]
+/// ingest-and-advance step after a round's reply frames are processed.
 #[derive(Debug)]
-enum RbsrStep {
+pub(crate) enum RbsrStep {
     /// The reconcile converged — no ranges mismatch; catch-up is complete.
     Converged,
     /// More rounds needed; carries the next round's sealed request message.
