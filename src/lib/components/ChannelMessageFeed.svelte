@@ -158,8 +158,14 @@
     const caret = el.selectionStart ?? el.value.length;
     const r = applyMentionPick(el.value, trigger.atIndex, caret, c);
     composeText = r.text;
-    tracked = [...tracked, r.tracked];
-    // ZEB-590: the next user edit must diff against the post-insert text.
+    // ZEB-590: applyMentionPick is a programmatic edit (it replaces the active
+    // "@query" with "@Label "), so rebase existing tracked spans across that edit
+    // BEFORE appending the new pick — otherwise a mention sitting after the
+    // insertion point keeps a stale `start` and fails position-anchored
+    // reconcile. refreshTrigger only shifts on user `input`, which this path
+    // bypasses. (Qodo PR #369.)
+    tracked = [...shiftTrackedSpans(el.value, r.text, tracked), r.tracked];
+    // The next user edit must diff against the post-insert text.
     prevComposeText = r.text;
     trigger = null;
     // Restore focus + caret after Svelte flushes the new bound value.

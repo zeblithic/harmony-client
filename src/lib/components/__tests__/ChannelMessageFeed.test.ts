@@ -480,6 +480,55 @@ describe('ChannelMessageFeed', () => {
     });
   });
 
+  it('compose: picking a second mention BEFORE an existing one keeps both (span rebase on pick)', async () => {
+    // ZEB-590 regression (Qodo PR #369): pickMention is a programmatic edit, so
+    // it must rebase existing tracked spans across the insertion. Otherwise an
+    // earlier-tracked mention that now sits AFTER the new pick keeps a stale
+    // `start` and silently degrades to plain text under position-anchored
+    // reconcile.
+    const ALICE = 'a'.repeat(32);
+    const BOB = 'b'.repeat(32);
+    const { adapter, container } = await setup({
+      mentionCandidates: [
+        { ownerId: ALICE, label: 'Alice' },
+        { ownerId: BOB, label: 'Bob' },
+      ],
+    });
+    const ta = container.querySelector('.compose-input') as HTMLTextAreaElement;
+    // 1) type "hi @Al" and pick Alice → "hi @Alice " (Alice tracked at offset 3)
+    ta.value = 'hi @Al';
+    ta.selectionStart = 6;
+    ta.selectionEnd = 6;
+    await fireEvent.input(ta);
+    await waitFor(() =>
+      expect(container.querySelector('[data-testid="mention-autocomplete"]')).toBeTruthy(),
+    );
+    await fireEvent.mouseDown(container.querySelector('[data-testid="mention-option"] button')!);
+    await waitFor(() => expect(ta.value).toBe('hi @Alice '));
+    // 2) jump to the start and type "@B" (caret right after "@B") to mention Bob
+    //    FIRST — this shifts Alice's span; pickMention must rebase it.
+    ta.value = '@Bhi @Alice ';
+    ta.selectionStart = 2;
+    ta.selectionEnd = 2;
+    await fireEvent.input(ta);
+    await waitFor(() =>
+      expect(container.querySelector('[data-testid="mention-autocomplete"]')).toBeTruthy(),
+    );
+    await fireEvent.mouseDown(container.querySelector('[data-testid="mention-option"] button')!);
+    await waitFor(() => expect(ta.value).toBe('@Bob hi @Alice '));
+    // 3) send — BOTH mentions must tokenize, in document order
+    await fireEvent.keyDown(ta, { key: 'Enter' });
+    await waitFor(() => {
+      const call = (adapter.invoke as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c: unknown[]) => c[0] === 'post_channel_message',
+      );
+      expect(call).toBeTruthy();
+      const body = new TextDecoder().decode(new Uint8Array((call![1] as { body: number[] }).body));
+      expect(body).toBe(`<@${BOB}> hi <@${ALICE}>`);
+      expect((call![1] as { mentions?: string[] }).mentions).toEqual([BOB, ALICE]);
+    });
+  });
+
   it('poll-kind message with no matching meta shows "Loading poll…" placeholder', async () => {
     // listActivePolls returns EMPTY → the incoming poll_id has no cache entry.
     const { adapter: votingAdapter, listActivePollsMock } = makeVotingAdapter([]);
