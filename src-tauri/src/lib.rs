@@ -112,6 +112,7 @@ mod app_tracing;
 pub mod backup_state;
 pub mod butler_deposit;
 pub mod channel_backfill;
+pub mod channel_chunk_index;
 pub mod channel_rbsr;
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
