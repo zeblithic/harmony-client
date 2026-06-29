@@ -22,6 +22,7 @@
     applyMentionPick,
     filterCandidates,
     reconcileCompose,
+    shiftTrackedSpans,
     type MentionCandidate,
     type TrackedMention,
   } from '../mention-compose';
@@ -104,6 +105,10 @@
   let backfillInFlight = $state(false);
   let backfillProgress = $state<{ fetched: number; totalEstimate?: number } | null>(null);
   let composeText = $state('');
+  // ZEB-590: last compose text the span-shifter has seen. Kept in lockstep with
+  // composeText so shiftTrackedSpans can diff each edit. A plain (non-$state)
+  // shadow: it's never read in the template, only by the input handler.
+  let prevComposeText = '';
   let composeError = $state<string | null>(null);
   let loadError = $state<string | null>(null);
   let posting = $state(false);
@@ -138,6 +143,11 @@
       trigger = null;
       return;
     }
+    // ZEB-590: realign / invalidate tracked spans against the just-applied edit
+    // BEFORE re-detecting the trigger, so a deleted-then-retyped label can't be
+    // reclaimed by a stale pick.
+    tracked = shiftTrackedSpans(prevComposeText, el.value, tracked);
+    prevComposeText = el.value;
     trigger = detectMentionTrigger(el.value, el.selectionStart ?? el.value.length);
     acIndex = 0;
   }
@@ -148,7 +158,15 @@
     const caret = el.selectionStart ?? el.value.length;
     const r = applyMentionPick(el.value, trigger.atIndex, caret, c);
     composeText = r.text;
-    tracked = [...tracked, r.tracked];
+    // ZEB-590: applyMentionPick is a programmatic edit (it replaces the active
+    // "@query" with "@Label "), so rebase existing tracked spans across that edit
+    // BEFORE appending the new pick — otherwise a mention sitting after the
+    // insertion point keeps a stale `start` and fails position-anchored
+    // reconcile. refreshTrigger only shifts on user `input`, which this path
+    // bypasses. (Qodo PR #369.)
+    tracked = [...shiftTrackedSpans(el.value, r.text, tracked), r.tracked];
+    // The next user edit must diff against the post-insert text.
+    prevComposeText = r.text;
     trigger = null;
     // Restore focus + caret after Svelte flushes the new bound value.
     queueMicrotask(() => {
@@ -182,6 +200,9 @@
     // ZEB-588 (CodeRabbit): drop any in-progress @-mention picks on a channel/
     // community switch so a label picked in the previous channel can't be
     // rewritten into a stale owner id when sending here.
+    // ZEB-590: prevComposeText is intentionally NOT reset here — composeText is a
+    // preserved draft across switches, so the shadow stays paired with it; tracked
+    // is empty here regardless, so no span can be mis-shifted.
     tracked = [];
     trigger = null;
     acIndex = 0;
@@ -419,6 +440,7 @@
         pendingAttachments.length > 0 ? pendingAttachments : undefined,
       );
       composeText = '';
+      prevComposeText = '';
       tracked = [];
       trigger = null;
       acIndex = 0;
