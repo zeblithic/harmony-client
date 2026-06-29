@@ -8408,6 +8408,100 @@ fn format_hlc_hex(hlc: &crate::owner_state_types::Hlc) -> String {
     out
 }
 
+/// Build the RBSR query key `"harmony/channels/{cid}/{ch}/rbsr/{round}"`.
+/// `{round}` is a routing/trace hint only — every RBSR round parameter rides
+/// in the GET payload (the sealed `RbsrMessage`).
+fn format_rbsr_key(cid_hex: &str, ch_hex: &str, round: u32) -> String {
+    format!("harmony/channels/{cid_hex}/{ch_hex}/rbsr/{round}")
+}
+
+/// Parse the `{round}` out of an RBSR query key, returning `None` when the
+/// selector is not a well-formed `…/rbsr/{round}` key. cid/ch are not
+/// re-validated here — Zenoh already routed the query by the registered
+/// per-channel `…/rbsr/**` key expression; this only guards the literal and a
+/// numeric round so a malformed (or wrong-family, e.g. `…/since/…`) key is
+/// skipped rather than mis-served.
+fn parse_rbsr_key(key: &str) -> Option<u32> {
+    // harmony / channels / {cid} / {ch_id} / rbsr / {round}
+    //    0         1          2       3        4       5
+    let parts: Vec<&str> = key.split('/').collect();
+    if parts.len() < 6 || parts[4] != "rbsr" {
+        return None;
+    }
+    parts[5].parse::<u32>().ok()
+}
+
+/// One requester-side RBSR step outcome, returned by the engine's
+/// ingest-and-advance closure after a round's reply frames are processed.
+// ZEB-593: the `#[allow(dead_code)]` is removed once `drive_rbsr_rounds` is
+// wired into the adapter's requester path (this file, Task 4).
+#[allow(dead_code)]
+#[derive(Debug)]
+enum RbsrStep {
+    /// The reconcile converged — no ranges mismatch; catch-up is complete.
+    Converged,
+    /// More rounds needed; carries the next round's sealed request message.
+    Continue(Vec<u8>),
+    /// The reply could not be opened/processed (decrypt/decode failure or a
+    /// resolution shortfall) — abandon RBSR and fall back to the vector path.
+    Failed,
+}
+
+/// Drive the multi-round, requester-pull RBSR catch-up to a terminal
+/// [`crate::channel_backfill::ReconcileMode`]. The three closures keep the two
+/// trust domains apart: the **engine** seals/opens/ingests (it holds the
+/// channel key + the reconcile source) via `rbsr_initial` / `rbsr_ingest_and_next`;
+/// the **adapter** performs the network round-trip (it holds the Zenoh session)
+/// via `rbsr_get`. This function only shuttles opaque sealed bytes between them
+/// and applies the committed reconcile-mode policy:
+///
+/// - round 0 draws zero replies → `VectorFallback` (no `rbsr/**` responder).
+/// - a round reports converged → `Done`.
+/// - a reply fails to open/process → `VectorFallback` (AEAD authenticity gives
+///   malformed/tampered fallback for free).
+/// - the round cap is reached without converging → `FullReconcile`.
+// ZEB-593: `#[allow(dead_code)]` removed in Task 4 when the adapter calls this.
+#[allow(dead_code)]
+async fn drive_rbsr_rounds<InitFut, GetFut, NextFut>(
+    rbsr_initial: impl Fn() -> InitFut,
+    rbsr_get: impl Fn(u32, Vec<u8>) -> GetFut,
+    rbsr_ingest_and_next: impl Fn(Vec<Vec<u8>>) -> NextFut,
+) -> crate::channel_backfill::ReconcileMode
+where
+    InitFut: std::future::Future<Output = Vec<u8>>,
+    GetFut: std::future::Future<Output = Vec<Vec<u8>>>,
+    NextFut: std::future::Future<Output = RbsrStep>,
+{
+    use crate::channel_backfill::{
+        reconcile_mode_after_round, reconcile_mode_after_round0, ReconcileMode,
+    };
+    let mut sealed = rbsr_initial().await;
+    for round in 0..crate::channel_rbsr::MAX_RBSR_ROUNDS {
+        let frames = rbsr_get(round, sealed).await;
+        if round == 0 && reconcile_mode_after_round0(frames.len()) == ReconcileMode::VectorFallback
+        {
+            return ReconcileMode::VectorFallback;
+        }
+        let step = rbsr_ingest_and_next(frames).await;
+        let converged = match &step {
+            RbsrStep::Failed => return ReconcileMode::VectorFallback,
+            RbsrStep::Converged => true,
+            RbsrStep::Continue(_) => false,
+        };
+        if reconcile_mode_after_round(round, converged) == ReconcileMode::Done {
+            return ReconcileMode::Done;
+        }
+        sealed = match step {
+            RbsrStep::Continue(next) => next,
+            // Converged was already turned into `Done` above; fall back rather
+            // than panic if the policy ever changes out from under this.
+            _ => return ReconcileMode::Done,
+        };
+    }
+    // Exhausted the round cap without converging → full-reconcile safety net.
+    ReconcileMode::FullReconcile
+}
+
 #[cfg(test)]
 mod channel_log_adapter_tests {
     use super::*;
@@ -8690,6 +8784,110 @@ mod channel_log_adapter_tests {
                 panic!("malformed HLC field must surface as Invalid, not silently widen to full backfill");
             }
         }
+    }
+
+    #[test]
+    fn parse_rbsr_key_round_trips() {
+        let cid = "aa".repeat(16);
+        let ch = "bb".repeat(16);
+        for round in [0u32, 5, crate::channel_rbsr::MAX_RBSR_ROUNDS] {
+            let key = format_rbsr_key(&cid, &ch, round);
+            assert_eq!(
+                parse_rbsr_key(&key),
+                Some(round),
+                "round {round} must round-trip through format/parse"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rbsr_key_rejects_wrong_family_and_malformed() {
+        let cid = "aa".repeat(16);
+        let ch = "bb".repeat(16);
+        // A `since/**` key is a different family — must not parse as RBSR.
+        let since_key = format!("harmony/channels/{cid}/{ch}/since/0/100");
+        assert_eq!(parse_rbsr_key(&since_key), None, "since key is not rbsr");
+        // Non-numeric round.
+        let bad_round = format!("harmony/channels/{cid}/{ch}/rbsr/notanumber");
+        assert_eq!(parse_rbsr_key(&bad_round), None, "non-numeric round rejected");
+        // Too few segments.
+        assert_eq!(parse_rbsr_key("harmony/channels/aa/bb"), None, "short key rejected");
+    }
+
+    #[tokio::test]
+    async fn drive_rbsr_rounds_round0_no_reply_falls_back_to_vector() {
+        // An old peer with no rbsr/** queryable draws zero replies on round 0.
+        let mode = drive_rbsr_rounds(
+            || async { b"init".to_vec() },
+            |_round, _sealed| async { Vec::<Vec<u8>>::new() },
+            |_frames| async { RbsrStep::Continue(b"unused".to_vec()) },
+        )
+        .await;
+        assert_eq!(mode, crate::channel_backfill::ReconcileMode::VectorFallback);
+    }
+
+    #[tokio::test]
+    async fn drive_rbsr_rounds_converges_and_threads_sealed_requests() {
+        use std::cell::{Cell, RefCell};
+        let seen: RefCell<Vec<(u32, Vec<u8>)>> = RefCell::new(Vec::new());
+        let ingest_calls = Cell::new(0u32);
+        let mode = drive_rbsr_rounds(
+            || async { b"init".to_vec() },
+            |round, sealed| {
+                seen.borrow_mut().push((round, sealed));
+                async { vec![vec![0xAAu8]] }
+            },
+            |_frames| {
+                let n = ingest_calls.get();
+                ingest_calls.set(n + 1);
+                async move {
+                    if n == 0 {
+                        RbsrStep::Continue(b"round1".to_vec())
+                    } else {
+                        RbsrStep::Converged
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(mode, crate::channel_backfill::ReconcileMode::Done);
+        assert_eq!(
+            seen.into_inner(),
+            vec![(0u32, b"init".to_vec()), (1u32, b"round1".to_vec())],
+            "each round's sealed request is the prior round's `Continue` payload",
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_rbsr_rounds_hits_cap_returns_full_reconcile() {
+        use std::cell::Cell;
+        let gets = Cell::new(0u32);
+        let mode = drive_rbsr_rounds(
+            || async { b"init".to_vec() },
+            |_round, _sealed| {
+                gets.set(gets.get() + 1);
+                async { vec![vec![0xAAu8]] }
+            },
+            |_frames| async { RbsrStep::Continue(b"more".to_vec()) },
+        )
+        .await;
+        assert_eq!(mode, crate::channel_backfill::ReconcileMode::FullReconcile);
+        assert_eq!(
+            gets.get(),
+            crate::channel_rbsr::MAX_RBSR_ROUNDS,
+            "issues exactly the round cap's worth of GETs before falling back",
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_rbsr_rounds_ingest_failure_falls_back_to_vector() {
+        let mode = drive_rbsr_rounds(
+            || async { b"init".to_vec() },
+            |_round, _sealed| async { vec![vec![0xAAu8]] },
+            |_frames| async { RbsrStep::Failed },
+        )
+        .await;
+        assert_eq!(mode, crate::channel_backfill::ReconcileMode::VectorFallback);
     }
 }
 
