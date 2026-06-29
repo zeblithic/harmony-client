@@ -128,6 +128,12 @@ pub trait RangeReconcileSource {
     fn range_fingerprint(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> RangeFingerprint;
     fn range_count(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> u64;
     fn keys_in_range(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Vec<ReconcileKey>;
+    /// An interior split point strictly inside `(lo, hi)` that roughly halves
+    /// the range, or `None` when the range has fewer than two elements. The
+    /// real (chunk-indexed) source answers this from cached summaries without
+    /// reading the whole range — this is what keeps the responder's bisection
+    /// disk-bounded.
+    fn split_key(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Option<ReconcileKey>;
 }
 
 /// In-memory [`RangeReconcileSource`] over a sorted `(key, element_hash)` list.
@@ -164,6 +170,15 @@ impl RangeReconcileSource for SliceSource {
 
     fn keys_in_range(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Vec<ReconcileKey> {
         self.slice(lo, hi).iter().map(|x| x.0.clone()).collect()
+    }
+
+    fn split_key(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Option<ReconcileKey> {
+        let s = self.slice(lo, hi);
+        if s.len() < 2 {
+            None
+        } else {
+            Some(s[s.len() / 2].0.clone())
+        }
     }
 }
 
@@ -272,18 +287,24 @@ pub fn respond(request: &RbsrMessage, source: &impl RangeReconcileSource) -> Rbs
                 } else if source.range_count(&lo, &hi) <= LEAF_THRESHOLD {
                     push_range(&mut out, hi.clone(), RbsrMode::Have(source.keys_in_range(&lo, &hi)));
                 } else {
-                    let keys = source.keys_in_range(&lo, &hi);
-                    let mid = keys[keys.len() / 2].clone();
-                    push_range(
-                        &mut out,
-                        mid.clone(),
-                        RbsrMode::Fingerprint(source.range_fingerprint(&lo, &mid).finalize()),
-                    );
-                    push_range(
-                        &mut out,
-                        hi.clone(),
-                        RbsrMode::Fingerprint(source.range_fingerprint(&mid, &hi).finalize()),
-                    );
+                    match source.split_key(&lo, &hi) {
+                        // Bisect at an interior split point sourced without
+                        // scanning the whole range (chunk-indexed on the log).
+                        Some(mid) if mid > lo && mid < hi => {
+                            push_range(
+                                &mut out,
+                                mid.clone(),
+                                RbsrMode::Fingerprint(source.range_fingerprint(&lo, &mid).finalize()),
+                            );
+                            push_range(
+                                &mut out,
+                                hi.clone(),
+                                RbsrMode::Fingerprint(source.range_fingerprint(&mid, &hi).finalize()),
+                            );
+                        }
+                        // Small or unsplittable range → ship wholesale at the leaf.
+                        _ => push_range(&mut out, hi.clone(), RbsrMode::Have(source.keys_in_range(&lo, &hi))),
+                    }
                 }
             }
             RbsrMode::Skip | RbsrMode::Have(_) => {
