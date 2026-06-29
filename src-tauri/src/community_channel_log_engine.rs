@@ -1755,10 +1755,8 @@ impl ChannelLogEngine {
     /// path), computes the reply against the local log, resolves any `Have`
     /// keys to their events for inline transfer (under the same log lock), and
     /// seals the reply. Returns `(sealed_reply, have_events)`.
-    // ZEB-592: the production caller is the `rbsr/**` Zenoh queryable, wired
-    // when the RBSR transport lands (plan Task 12). Kept in the binary and
-    // exercised by tests; `allow(dead_code)` only until that queryable calls it.
-    #[allow(dead_code)]
+    // ZEB-593: called by the `rbsr/**` Zenoh queryable (via the registry's
+    // `RbsrAdapterHooks::respond` closure).
     pub(crate) async fn rbsr_respond(
         &self,
         sealed_request: &[u8],
@@ -2405,6 +2403,56 @@ impl ChannelLogRegistry {
                 },
             );
 
+        // ZEB-593: engine-side RBSR closures, bundled for the adapter. Each
+        // captures its own `Arc<engine>` clone (same no-cycle reasoning as
+        // `read_for_query`). The engine holds the channel key + reconcile
+        // source; the adapter owns the Zenoh session and only shuttles sealed
+        // bytes between these closures and the wire.
+        let engine_rbsr_respond = Arc::clone(&engine);
+        let engine_rbsr_initial = Arc::clone(&engine);
+        let engine_rbsr_ingest = Arc::clone(&engine);
+        let rbsr_hooks = Some(crate::event_loop::RbsrAdapterHooks {
+            respond: Arc::new(
+                move |sealed: Vec<u8>| -> std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = Option<(Vec<u8>, Vec<Vec<u8>>)>,
+                            > + Send,
+                    >,
+                > {
+                    let me = Arc::clone(&engine_rbsr_respond);
+                    Box::pin(async move {
+                        let (sealed_reply, have_events) = me.rbsr_respond(&sealed).await?;
+                        // Encrypt each Have event into a wire packet; bail to
+                        // `None` (→ requester falls back) rather than advertise
+                        // a Have we can't back with a packet.
+                        let mut packets = Vec::with_capacity(have_events.len());
+                        for ev in &have_events {
+                            match encrypt_channel_packet(me.channel_key_ref(), ev) {
+                                Ok(p) => packets.push(p),
+                                Err(_) => return None,
+                            }
+                        }
+                        Some((sealed_reply, packets))
+                    })
+                },
+            ),
+            initial: Arc::new(
+                move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>> {
+                    let me = Arc::clone(&engine_rbsr_initial);
+                    Box::pin(async move { me.rbsr_build_initial().await })
+                },
+            ),
+            ingest: Arc::new(
+                move |frames: Vec<Vec<u8>>| -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::event_loop::RbsrStep> + Send>,
+                > {
+                    let me = Arc::clone(&engine_rbsr_ingest);
+                    Box::pin(async move { me.rbsr_ingest_and_next(frames).await })
+                },
+            ),
+        });
+
         let closing = Arc::new(AtomicBool::new(false));
         // ZEB-418 P3a: lifecycle signal for the backfill driver
         // spawned below. The sender lives in the `EngineEntry` next to
@@ -2513,6 +2561,7 @@ impl ChannelLogRegistry {
                     backfill_progress_interval,
                     backfill_default_limit,
                     closing: Arc::clone(&closing),
+                    rbsr_hooks,
                 })
         {
             tracing::warn!(
@@ -4908,6 +4957,7 @@ mod tests {
                     req.backfill_progress_interval,
                     req.backfill_default_limit,
                     req.closing,
+                    req.rbsr_hooks,
                 );
                 // JoinHandle dropped — adapter task is fire-and-forget;
                 // closing flag (held by registry) signals shutdown.

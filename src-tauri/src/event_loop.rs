@@ -253,6 +253,48 @@ pub struct ChannelLogAdapterRequest {
     /// own teardown path and is freshly allocated at engine-construction
     /// time (see `ChannelLogRegistry::spawn`).
     pub closing: Arc<AtomicBool>,
+    /// ZEB-593: engine-side RBSR closures (responder + requester halves), or
+    /// `None` to run catch-up on the legacy `since/**` path only. When `Some`,
+    /// the adapter declares a second `rbsr/**` queryable and tries RBSR before
+    /// each watermark GET; when `None` (e.g. unit tests) RBSR is fully disabled.
+    pub rbsr_hooks: Option<RbsrAdapterHooks>,
+}
+
+// ── ZEB-593 RBSR adapter hooks ──────────────────────────────────────────────
+//
+// The three engine-side closures the adapter needs to run RBSR catch-up,
+// bundled so the whole feature threads as one value. Each closes over the same
+// `Arc<ChannelLogEngine>` (the engine holds the channel key + reconcile source);
+// the adapter only shuttles opaque sealed bytes and owns the Zenoh session.
+type RbsrRespondClosure = dyn Fn(
+        Vec<u8>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<(Vec<u8>, Vec<Vec<u8>>)>> + Send>,
+    > + Send
+    + Sync
+    + 'static;
+type RbsrInitialClosure = dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
+    + Send
+    + Sync
+    + 'static;
+type RbsrIngestClosure = dyn Fn(
+        Vec<Vec<u8>>,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = RbsrStep> + Send>>
+    + Send
+    + Sync
+    + 'static;
+
+/// Bundle of the engine-side RBSR closures threaded to the adapter.
+pub struct RbsrAdapterHooks {
+    /// Responder: open a sealed request, compute the reply, resolve + encrypt
+    /// its `Have` events → `Some((sealed_reply, have_packets))`; `None` replies
+    /// nothing (the requester then falls back).
+    pub respond: Arc<RbsrRespondClosure>,
+    /// Requester: seal this round-0 request over the local reconcile source.
+    pub initial: Arc<RbsrInitialClosure>,
+    /// Requester: ingest a round's reply frames and advance or converge.
+    pub ingest: Arc<RbsrIngestClosure>,
 }
 
 /// A publish request sent from the Tauri command thread into the event loop.
@@ -5346,6 +5388,7 @@ pub async fn run(
                     req.backfill_progress_interval,
                     req.backfill_default_limit,
                     req.closing,
+                    req.rbsr_hooks,
                 );
                 // JoinHandle dropped — adapter task is fire-and-forget.
                 // The registry-held closing flag drives shutdown.
@@ -7690,6 +7733,7 @@ pub fn spawn_channel_log_zenoh_adapter<F>(
     backfill_progress_interval: usize,
     backfill_default_limit: usize,
     closing: Arc<AtomicBool>,
+    rbsr_hooks: Option<RbsrAdapterHooks>,
 ) -> tokio::task::JoinHandle<()>
 where
     // `?Sized` so callers can pass `Arc<dyn Fn(...) + Send + Sync>`
@@ -7715,6 +7759,18 @@ where
         "harmony/channels/{}/{}/since/**",
         community_id_hex, channel_id_hex
     );
+    // ZEB-593: a dedicated query family, declared only when RBSR hooks are
+    // present. Kept separate from `since/**` (that queryable strips the GET
+    // payload on the `since=None` branch, which would break RBSR's payload).
+    let rbsr_queryable_prefix = format!(
+        "harmony/channels/{}/{}/rbsr/**",
+        community_id_hex, channel_id_hex
+    );
+    // Split the hooks into the responder half (queryable task) and the
+    // requester halves (query-request driver).
+    let rbsr_respond_qbl = rbsr_hooks.as_ref().map(|h| Arc::clone(&h.respond));
+    let rbsr_initial_qr = rbsr_hooks.as_ref().map(|h| Arc::clone(&h.initial));
+    let rbsr_ingest_qr = rbsr_hooks.as_ref().map(|h| Arc::clone(&h.ingest));
 
     tokio::spawn(async move {
         // Spawn-stop race fast path: if closing was flipped after the
@@ -7931,6 +7987,85 @@ where
             }
         });
 
+        // ── RBSR queryable task (ZEB-593) ──────────────────────────
+        // Declared only when RBSR hooks are present. Answers GETs on
+        // `…/rbsr/**`: opens the sealed request, computes the reply, and streams
+        // `[sealed_reply, have_packet, …]` under ConsolidationMode::None.
+        // Stateless per-GET — the round number in the key is a trace hint; all
+        // state rides in the payload.
+        if let Some(rbsr_respond) = rbsr_respond_qbl {
+            let session_rbsr = Arc::clone(&session);
+            let key_rbsr = rbsr_queryable_prefix.clone();
+            let closing_rbsr = Arc::clone(&closing);
+            let _rbsr_qbl_handle = tokio::spawn(async move {
+                let qbl = match session_rbsr.declare_queryable(&key_rbsr).await {
+                    Ok(q) => q,
+                    Err(e) => {
+                        if !closing_rbsr.load(Ordering::SeqCst) {
+                            tracing::error!(
+                                prefix = %key_rbsr,
+                                error = %e,
+                                "failed to declare rbsr queryable"
+                            );
+                        }
+                        return;
+                    }
+                };
+                loop {
+                    tokio::select! {
+                        biased;
+                        res = qbl.recv_async() => {
+                            let Ok(query) = res else { break; };
+                            let qkey = query.key_expr().to_string();
+                            if parse_rbsr_key(&qkey).is_none() {
+                                tracing::debug!(%qkey, "ignoring malformed rbsr selector");
+                                continue;
+                            }
+                            // Cap-before-alloc on the request payload (mirrors
+                            // open_rbsr_message's pre-decrypt cap).
+                            let sealed_request = match query.payload() {
+                                Some(p)
+                                    if p.len()
+                                        <= crate::community_channel_log::MAX_RBSR_MESSAGE_BYTES =>
+                                {
+                                    p.to_bytes().to_vec()
+                                }
+                                Some(p) => {
+                                    tracing::debug!(%qkey, len = p.len(), "rbsr request over cap; ignoring");
+                                    continue;
+                                }
+                                // RBSR requires a payload; a payload-less GET is
+                                // not a valid round → reply nothing.
+                                None => continue,
+                            };
+                            if let Some((sealed_reply, have_packets)) =
+                                (rbsr_respond)(sealed_request).await
+                            {
+                                let mut frames = Vec::with_capacity(1 + have_packets.len());
+                                frames.push(sealed_reply);
+                                frames.extend(have_packets);
+                                for frame in frames {
+                                    if let Err(e) = query.reply(query.key_expr(), frame).await {
+                                        tracing::warn!(
+                                            prefix = %key_rbsr,
+                                            error = %e,
+                                            "rbsr queryable reply failed"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            // `None` → reply nothing; the requester sees zero
+                            // frames and falls back to the vector path.
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                            if closing_rbsr.load(Ordering::SeqCst) { break; }
+                        }
+                    }
+                }
+            });
+        }
+
         // ── Query-request driver ───────────────────────────────────
         let session_qr = Arc::clone(&session);
         let community_id_hex_qr = community_id_hex.clone();
@@ -7961,6 +8096,54 @@ where
                         } else {
                             req.limit.min(CHANNEL_BACKFILL_MAX_LIMIT)
                         };
+                        // ZEB-593: RBSR-first. When hooks are present, attempt a
+                        // multi-round RBSR reconcile before the watermark GET.
+                        // Done → events already ingested via the inbound path;
+                        // report a 0-event completed page so the backfill driver
+                        // stops paging. VectorFallback (no rbsr/** responder) →
+                        // proceed with the watermark GET as-is. FullReconcile
+                        // (round cap) → force a full `since=None` reconcile.
+                        if let (Some(initial), Some(ingest)) =
+                            (&rbsr_initial_qr, &rbsr_ingest_qr)
+                        {
+                            let session_rb = Arc::clone(&session_qr);
+                            let cid_rb = community_id_hex_qr.clone();
+                            let ch_rb = channel_id_hex_qr.clone();
+                            let closing_rb = Arc::clone(&closing_qr);
+                            let mode = drive_rbsr_rounds(
+                                || (initial)(),
+                                move |round, sealed| {
+                                    let session = Arc::clone(&session_rb);
+                                    let key = format_rbsr_key(&cid_rb, &ch_rb, round);
+                                    let closing = Arc::clone(&closing_rb);
+                                    async move {
+                                        rbsr_get_frames(&session, &key, sealed, &closing).await
+                                    }
+                                },
+                                |frames| (ingest)(frames),
+                            )
+                            .await;
+                            match mode {
+                                crate::channel_backfill::ReconcileMode::Done => {
+                                    if let Some(tx) = req.outcome_tx.take() {
+                                        let _ = tx.send(
+                                            crate::community_channel_log_engine::BackfillPageReport {
+                                                replies: 0,
+                                                limit,
+                                            },
+                                        );
+                                    }
+                                    continue;
+                                }
+                                crate::channel_backfill::ReconcileMode::FullReconcile => {
+                                    req.since = None;
+                                    req.watermark_sealed = None;
+                                }
+                                // VectorFallback (or the never-returned
+                                // RbsrContinue) → use the watermark GET below.
+                                _ => {}
+                            }
+                        }
                         let since_hex = match &req.since {
                             Some(h) => format_hlc_hex(h),
                             None => "0".to_string(),
@@ -8457,8 +8640,6 @@ pub(crate) enum RbsrStep {
 /// - a reply fails to open/process → `VectorFallback` (AEAD authenticity gives
 ///   malformed/tampered fallback for free).
 /// - the round cap is reached without converging → `FullReconcile`.
-// ZEB-593: `#[allow(dead_code)]` removed in Task 4 when the adapter calls this.
-#[allow(dead_code)]
 async fn drive_rbsr_rounds<InitFut, GetFut, NextFut>(
     rbsr_initial: impl Fn() -> InitFut,
     rbsr_get: impl Fn(u32, Vec<u8>) -> GetFut,
@@ -8497,6 +8678,45 @@ where
     }
     // Exhausted the round cap without converging → full-reconcile safety net.
     ReconcileMode::FullReconcile
+}
+
+/// ZEB-593: issue one RBSR round GET and drain its reply frames. The 10s
+/// per-round timeout is mandatory (the `since/**` GET has none — fine for a
+/// one-shot, fatal if a peer answers round 0 then hangs round 1). Returns the
+/// reply frames in order (`frames[0]` = sealed reply, `frames[1..]` = Have
+/// packets); an empty vec means no responder answered → the driver falls back.
+async fn rbsr_get_frames(
+    session: &zenoh::Session,
+    key: &str,
+    sealed: Vec<u8>,
+    closing: &AtomicBool,
+) -> Vec<Vec<u8>> {
+    let receiver = match session
+        .get(key)
+        .payload(sealed)
+        .consolidation(zenoh::query::ConsolidationMode::None)
+        .timeout(std::time::Duration::from_secs(10))
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut frames = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            res = receiver.recv_async() => {
+                let Ok(reply) = res else { break; };
+                if let Ok(sample) = reply.into_result() {
+                    frames.push(sample.payload().to_bytes().to_vec());
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                if closing.load(Ordering::SeqCst) { break; }
+            }
+        }
+    }
+    frames
 }
 
 #[cfg(test)]
@@ -8549,6 +8769,7 @@ mod channel_log_adapter_tests {
             16,
             CHANNEL_BACKFILL_DEFAULT_LIMIT,
             Arc::clone(&closing),
+            None,
         );
 
         // Wait for the Zenoh subscriber to come online by round-tripping
@@ -8655,6 +8876,7 @@ mod channel_log_adapter_tests {
             16,
             TEST_DEFAULT_LIMIT,
             Arc::clone(&closing),
+            None,
         );
 
         // The queryable declaration is async; a GET that fires before
