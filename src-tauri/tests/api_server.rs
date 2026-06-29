@@ -558,7 +558,10 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
 
     // ── Phase 6g: create_channel → channel id ───────────────────────────
     // Args mirror CreateChannelArgs exactly: communityId, name, writePower,
-    // kind (optional, "text").
+    // kind (optional, "text"). ZEB-583: use a non-"general" name — the
+    // community already auto-seeds #general, and create_channel now rejects a
+    // duplicate live name; this phase exercises the create→post RPC plumbing,
+    // not dedup.
     let r = rpc(
         &http,
         &base,
@@ -566,7 +569,7 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
         "create_channel",
         serde_json::json!({
             "communityId": community_id,
-            "name": "general",
+            "name": "team-chat",
             "writePower": 0,
             "kind": "text"
         }),
