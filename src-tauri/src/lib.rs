@@ -20095,6 +20095,13 @@ pub(crate) async fn create_channel_impl(
         crate::community_membership::ChannelId(buf)
     };
 
+    // ZEB-583: capture the (trimmed) display + normalized channel name before
+    // `name` is moved into the mint below. The uniqueness guard (after engine
+    // resolution) compares the normalized form against the community's live
+    // channels; the error message uses the trimmed display form.
+    let display_name = name.trim().to_string();
+    let normalized_name = display_name.to_lowercase();
+
     // ZEB-267: atomic HLC reservation.
     let hlc =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
@@ -20145,10 +20152,33 @@ pub(crate) async fn create_channel_impl(
                 hex::encode(space_id.0)
             )
         })?;
-    let outcome = engine_arc
-        .insert_local_event(event.clone())
+
+    // ZEB-583: name-uniqueness guard. `create_community` auto-seeds a default
+    // `#general`, so an explicit `create_channel("general")` would otherwise
+    // append a SECOND same-named channel (`ChannelCreate` dedups only by random
+    // `channel_id`, never by name). `insert_local_channel_create` rejects a
+    // duplicate LIVE (non-tombstoned) normalized name (trim + lowercase) under
+    // the SAME state lock as the append, so two concurrent local creates can't
+    // both observe "no duplicate" and both append (TOCTOU-free). This is a
+    // local IPC fast-fail (like the length check at the top of this fn), NOT a
+    // CRDT verify gate: `verify_event`'s `ChannelCreate` arm deliberately
+    // accepts duplicates because a receive-order-dependent verify-time rejection
+    // would diverge the log across replicas. A rare concurrent cross-device
+    // same-name create still materializes as a cosmetic dup — a convergent
+    // materialize-time fix is a deferred follow-up.
+    let outcome = match engine_arc
+        .insert_local_channel_create(event.clone(), normalized_name, display_name)
         .await
-        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+    {
+        Ok(o) => o,
+        // The precheck's Display IS the user-facing message; surface it bare
+        // (no "engine.insert_local_event:" prefix) so the JS caller shows the
+        // clean "already exists" text.
+        Err(e @ crate::community_state_sync::LocalInsertError::DuplicateChannelName { .. }) => {
+            return Err(e.to_string());
+        }
+        Err(e) => return Err(format!("engine.insert_local_event: {e}")),
+    };
     if matches!(
         outcome,
         crate::community_state_crdt::InsertOutcome::Rejected(_)
@@ -24112,6 +24142,181 @@ mod create_community_inner_tests {
                 .is_some(),
             "the newly-created channel's log engine must be registered immediately so an \
              immediate post_channel_message finds it instead of returning 500"
+        );
+    }
+
+    /// ZEB-583: `create_channel` must reject a duplicate channel name. A
+    /// community auto-seeds `#general` at creation, so an explicit
+    /// `create_channel("general")` — or any case/whitespace variant — must
+    /// `Err` instead of appending a second same-named channel. A distinct name
+    /// still succeeds. Finally, the guard carves out tombstoned channels
+    /// (`deleted_at.is_none()`), so a deleted channel's name is reusable —
+    /// pinned here by deleting `team-chat` and re-creating it. (IPC-level
+    /// fast-fail guard; not a CRDT verify gate.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_channel_rejects_duplicate_live_name() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "dup-name-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        // #general is auto-seeded; wait for its engine so the community is fully
+        // stood up (the membership CRDT the guard reads is updated synchronously).
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned"
+        );
+
+        // Owner-loaded NodeState for create_channel_impl (mirrors the eager-spawn
+        // test; the dm_outbox signing key must match the community's enrolled key).
+        let retic = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let device_hash = crate::owner_state_types::DeviceIdentityHash(retic.identity.address_hash);
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                fixture.device_id.clone(),
+                fixture.self_owner,
+                device_hash,
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x11; 32])),
+                std::sync::Arc::new(retic),
+                std::sync::Arc::clone(&fixture.signing_key),
+                fixture.enrollment_cert.clone(),
+            ),
+        ));
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(std::sync::Arc::clone(&dm_outbox)),
+            ..NodeState::default()
+        });
+
+        // Exact-name duplicate of the auto-seeded #general is rejected.
+        let err = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "general".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect_err("duplicate #general must be rejected");
+        assert!(
+            err.contains("already exists"),
+            "error should explain the name collision; got: {err}"
+        );
+
+        // Normalized (case + surrounding whitespace) duplicate is also rejected.
+        let err = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "  GENERAL  ".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect_err("case/whitespace variant of #general must be rejected");
+        assert!(
+            err.contains("already exists"),
+            "normalized duplicate should be rejected; got: {err}"
+        );
+
+        // A distinct name still creates successfully.
+        let ok = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "team-chat".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("a distinct channel name must still create");
+        assert_eq!(ok.len(), 32, "returns a 32-hex channel id");
+
+        // Deleted-name reuse: tombstone `team-chat`, then re-create it. The
+        // guard's carve-out is `deleted_at.is_none()`, so a deleted channel's
+        // name must be reusable (pins that behavior — CodeRabbit PR #368).
+        let id_bytes: [u8; 16] = hex::decode(&community_id_hex)
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let space_id = crate::owner_state_types::SpaceId(id_bytes);
+        let ch_bytes: [u8; 16] = hex::decode(&ok).unwrap().as_slice().try_into().unwrap();
+        let team_chat_id = crate::community_membership::ChannelId(ch_bytes);
+
+        let wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let del_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+            &fixture.hlc_tracker,
+            &fixture.device_id,
+            wall_now_ms,
+        )
+        .await;
+        let delete_event = mint_channel_delete_event(
+            space_id,
+            fixture.self_owner,
+            team_chat_id,
+            &fixture.signing_key,
+            del_hlc,
+        )
+        .expect("mint channel-delete event");
+        let engine_arc = fixture
+            .community_registry
+            .engine_arc(&space_id)
+            .await
+            .expect("engine for community must exist");
+        let del_outcome = engine_arc
+            .insert_local_event(delete_event)
+            .await
+            .expect("channel-delete must insert");
+        assert!(
+            matches!(
+                del_outcome,
+                crate::community_state_crdt::InsertOutcome::Inserted
+            ),
+            "tombstone must be a fresh insert; got {del_outcome:?}"
+        );
+
+        // The freed name now creates successfully (fresh channel id).
+        let reused = create_channel_impl(
+            &node_state,
+            community_id_hex,
+            "team-chat".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("a deleted channel's name must be reusable");
+        assert_eq!(reused.len(), 32, "reused name returns a 32-hex channel id");
+        assert_ne!(
+            reused, ok,
+            "re-created channel gets a new id, not the tombstoned one"
         );
     }
 
