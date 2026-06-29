@@ -875,6 +875,88 @@ pub fn open_watermark_vector(
         .map_err(|e| ChannelEventError::CborDecode(e.to_string()))
 }
 
+/// Static AAD for sealed RBSR messages (ZEB-592). Domain-separated from
+/// `WATERMARK_VECTOR_AAD` and `CHANNEL_PACKET_AAD` so a message of one kind can
+/// never be opened as another even under the same `ChannelKey`.
+pub const RBSR_AAD: &[u8] = b"harmony-channel-rbsr-v1";
+
+/// Hard cap on a sealed RBSR message, checked on the bytes view BEFORE
+/// decrypt/decode (cap-before-alloc; mirrors `MAX_WATERMARK_VECTOR_BYTES`).
+/// Over cap → the responder ignores the payload / the caller falls back.
+pub const MAX_RBSR_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Deterministic-nonce variant of [`seal_rbsr_message`] for the wire-format pin
+/// tests. Same nonce-reuse footgun + `test-fixtures` gating as the other
+/// `*_with_nonce` helpers; production MUST use [`seal_rbsr_message`].
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub fn seal_rbsr_message_with_nonce(
+    key: &ChannelKey,
+    msg: &crate::channel_rbsr::RbsrMessage,
+    nonce: [u8; 12],
+) -> Result<Vec<u8>, ChannelEventError> {
+    seal_rbsr_message_inner(key, msg, nonce)
+}
+
+/// Internal seal helper — both `seal_rbsr_message` and the pin-test variant
+/// route through this single AEAD-call site so the wire format stays in sync.
+fn seal_rbsr_message_inner(
+    key: &ChannelKey,
+    msg: &crate::channel_rbsr::RbsrMessage,
+    nonce: [u8; 12],
+) -> Result<Vec<u8>, ChannelEventError> {
+    let plaintext = crate::channel_rbsr::encode_message(msg);
+    let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
+    let ciphertext = cipher
+        .encrypt(
+            (&nonce).into(),
+            Payload {
+                msg: &plaintext,
+                aad: RBSR_AAD,
+            },
+        )
+        .map_err(|e| ChannelEventError::AeadEncrypt(e.to_string()))?;
+    let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// AEAD-seal an RBSR message with a random nonce (production path).
+/// Wire: `[12B nonce][ChaCha20-Poly1305(key, cbor(msg), RBSR_AAD)]`.
+pub fn seal_rbsr_message(
+    key: &ChannelKey,
+    msg: &crate::channel_rbsr::RbsrMessage,
+) -> Result<Vec<u8>, ChannelEventError> {
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    seal_rbsr_message_inner(key, msg, nonce.into())
+}
+
+/// Open a sealed RBSR message. Rejects an oversize (or structurally too-short)
+/// payload on the bytes view BEFORE any AEAD work or allocation (cap-before-
+/// alloc), then AEAD-decrypts under `RBSR_AAD` and canonical-CBOR decodes.
+pub fn open_rbsr_message(
+    key: &ChannelKey,
+    packet: &[u8],
+) -> Result<crate::channel_rbsr::RbsrMessage, ChannelEventError> {
+    if packet.len() > MAX_RBSR_MESSAGE_BYTES || packet.len() < MIN_PACKET_LEN {
+        return Err(ChannelEventError::MalformedPacket(packet.len()));
+    }
+    let (nonce_bytes, ciphertext) = packet.split_at(NONCE_LEN);
+    let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
+    let plaintext = cipher
+        .decrypt(
+            nonce_bytes.into(),
+            Payload {
+                msg: ciphertext,
+                aad: RBSR_AAD,
+            },
+        )
+        .map_err(|e| ChannelEventError::AeadDecrypt(e.to_string()))?;
+    crate::channel_rbsr::decode_message(&plaintext)
+        .map_err(|_| ChannelEventError::CborDecode("rbsr message".into()))
+}
+
 /// ZEB-585: raise a watermark-vector lane entry to cover `at` (no-op when
 /// the existing entry already dominates). Shared by `ChannelLog::append`
 /// and `ChannelLog::rebuild_device_watermarks` so maintenance and rebuild
@@ -2819,6 +2901,45 @@ mod tests {
         let (payload2, key2) = fixture_payload("world");
         let ev2 = sign_channel_event(&payload2, &key2).expect("sign");
         assert_ne!(event_element_hash(&ev), event_element_hash(&ev2));
+    }
+
+    #[test]
+    fn rbsr_seal_round_trips_and_rejects_tamper_wrongkey_oversize() {
+        use crate::channel_rbsr::{max_key, RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION};
+        let mk = fixture_mk();
+        let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
+        let other = derive_channel_key(&mk, &fixture_community(0xc1), &fixture_channel(0x01));
+        let msg = RbsrMessage {
+            version: RBSR_PROTOCOL_VERSION,
+            ranges: vec![RbsrRange {
+                upper: max_key(),
+                mode: RbsrMode::Fingerprint([3u8; 16]),
+            }],
+        };
+        let sealed = seal_rbsr_message(&key, &msg).unwrap();
+        assert_eq!(open_rbsr_message(&key, &sealed).unwrap(), msg);
+        assert!(open_rbsr_message(&other, &sealed).is_err(), "wrong key rejected");
+        let mut t = sealed.clone();
+        *t.last_mut().unwrap() ^= 0x01;
+        assert!(open_rbsr_message(&key, &t).is_err(), "tamper rejected");
+        let big = vec![0u8; MAX_RBSR_MESSAGE_BYTES + 1];
+        assert!(
+            matches!(open_rbsr_message(&key, &big), Err(ChannelEventError::MalformedPacket(n)) if n == MAX_RBSR_MESSAGE_BYTES + 1),
+            "oversize rejected before decrypt"
+        );
+    }
+
+    #[test]
+    fn rbsr_aad_is_domain_separated_from_wmv() {
+        let mk = fixture_mk();
+        let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
+        let wmv = WatermarkVector::new();
+        let wmv_sealed = seal_watermark_vector(&key, &wmv).unwrap();
+        assert!(
+            open_rbsr_message(&key, &wmv_sealed).is_err(),
+            "a wmv-AAD payload must not open as an RBSR message"
+        );
+        assert_ne!(RBSR_AAD, WATERMARK_VECTOR_AAD);
     }
 
     #[test]
