@@ -264,7 +264,9 @@ pub fn initial_request(source: &impl RangeReconcileSource) -> RbsrMessage {
         version: RBSR_PROTOCOL_VERSION,
         ranges: vec![RbsrRange {
             upper: max_key(),
-            mode: RbsrMode::Fingerprint(source.range_fingerprint(&min_key(), &max_key()).finalize()),
+            mode: RbsrMode::Fingerprint(
+                source.range_fingerprint(&min_key(), &max_key()).finalize(),
+            ),
         }],
     }
 }
@@ -285,7 +287,11 @@ pub fn respond(request: &RbsrMessage, source: &impl RangeReconcileSource) -> Rbs
                 if &mine == their_fp {
                     push_range(&mut out, hi.clone(), RbsrMode::Skip);
                 } else if source.range_count(&lo, &hi) <= LEAF_THRESHOLD {
-                    push_range(&mut out, hi.clone(), RbsrMode::Have(source.keys_in_range(&lo, &hi)));
+                    push_range(
+                        &mut out,
+                        hi.clone(),
+                        RbsrMode::Have(source.keys_in_range(&lo, &hi)),
+                    );
                 } else {
                     match source.split_key(&lo, &hi) {
                         // Bisect at an interior split point sourced without
@@ -294,16 +300,24 @@ pub fn respond(request: &RbsrMessage, source: &impl RangeReconcileSource) -> Rbs
                             push_range(
                                 &mut out,
                                 mid.clone(),
-                                RbsrMode::Fingerprint(source.range_fingerprint(&lo, &mid).finalize()),
+                                RbsrMode::Fingerprint(
+                                    source.range_fingerprint(&lo, &mid).finalize(),
+                                ),
                             );
                             push_range(
                                 &mut out,
                                 hi.clone(),
-                                RbsrMode::Fingerprint(source.range_fingerprint(&mid, &hi).finalize()),
+                                RbsrMode::Fingerprint(
+                                    source.range_fingerprint(&mid, &hi).finalize(),
+                                ),
                             );
                         }
                         // Small or unsplittable range → ship wholesale at the leaf.
-                        _ => push_range(&mut out, hi.clone(), RbsrMode::Have(source.keys_in_range(&lo, &hi))),
+                        _ => push_range(
+                            &mut out,
+                            hi.clone(),
+                            RbsrMode::Have(source.keys_in_range(&lo, &hi)),
+                        ),
                     }
                 }
             }
@@ -313,7 +327,10 @@ pub fn respond(request: &RbsrMessage, source: &impl RangeReconcileSource) -> Rbs
         }
         lo = hi;
     }
-    RbsrMessage { version: RBSR_PROTOCOL_VERSION, ranges: out }
+    RbsrMessage {
+        version: RBSR_PROTOCOL_VERSION,
+        ranges: out,
+    }
 }
 
 /// Requester half. Ingest `Have` keys we lack, recompute our own fingerprint
@@ -355,7 +372,10 @@ pub fn process_reply(
         lo = hi;
     }
     let next = if any_mismatch {
-        Some(RbsrMessage { version: RBSR_PROTOCOL_VERSION, ranges: next })
+        Some(RbsrMessage {
+            version: RBSR_PROTOCOL_VERSION,
+            ranges: next,
+        })
     } else {
         None
     };
@@ -396,7 +416,11 @@ mod tests {
         let mut b = RangeFingerprint::zero();
         b.fold(&hashes[2]);
         b.fold(&hashes[3]);
-        assert_eq!(a.combine(&b).finalize(), all.finalize(), "combine == fold all");
+        assert_eq!(
+            a.combine(&b).finalize(),
+            all.finalize(),
+            "combine == fold all"
+        );
         assert_eq!(a.combine(&b).count, 4);
     }
 
@@ -408,7 +432,11 @@ mod tests {
         two.fold(&h(2));
         two.fold(&h(3)); // 2 + 3 == 5 in the first byte → raw_sum collides
         assert_eq!(one.raw_sum, two.raw_sum, "raw sums collide by construction");
-        assert_ne!(one.finalize(), two.finalize(), "count fold must distinguish them");
+        assert_ne!(
+            one.finalize(),
+            two.finalize(),
+            "count fold must distinguish them"
+        );
     }
 
     // ---- Task 3: source ----
@@ -428,7 +456,11 @@ mod tests {
     #[test]
     fn range_count_and_keys_are_half_open() {
         let s = sample();
-        assert_eq!(s.range_count(&key(10, 1), &key(40, 4)), 3, "[10,40) excludes 40");
+        assert_eq!(
+            s.range_count(&key(10, 1), &key(40, 4)),
+            3,
+            "[10,40) excludes 40"
+        );
         assert_eq!(
             s.keys_in_range(&key(10, 1), &key(30, 3)),
             vec![key(10, 1), key(20, 2)]
@@ -455,9 +487,18 @@ mod tests {
         let m = RbsrMessage {
             version: RBSR_PROTOCOL_VERSION,
             ranges: vec![
-                RbsrRange { upper: key(10, 1), mode: RbsrMode::Skip },
-                RbsrRange { upper: key(20, 2), mode: RbsrMode::Fingerprint([7u8; 16]) },
-                RbsrRange { upper: key(30, 3), mode: RbsrMode::Have(vec![key(21, 9), key(22, 9)]) },
+                RbsrRange {
+                    upper: key(10, 1),
+                    mode: RbsrMode::Skip,
+                },
+                RbsrRange {
+                    upper: key(20, 2),
+                    mode: RbsrMode::Fingerprint([7u8; 16]),
+                },
+                RbsrRange {
+                    upper: key(30, 3),
+                    mode: RbsrMode::Have(vec![key(21, 9), key(22, 9)]),
+                },
             ],
         };
         let bytes = encode_message(&m);
@@ -499,10 +540,19 @@ mod tests {
         let have: Vec<ReconcileKey> = reply
             .ranges
             .iter()
-            .filter_map(|r| if let RbsrMode::Have(ks) = &r.mode { Some(ks.clone()) } else { None })
+            .filter_map(|r| {
+                if let RbsrMode::Have(ks) = &r.mode {
+                    Some(ks.clone())
+                } else {
+                    None
+                }
+            })
             .flatten()
             .collect();
-        assert!(have.contains(&key(20, 2)), "responder ships its events wholesale at the leaf");
+        assert!(
+            have.contains(&key(20, 2)),
+            "responder ships its events wholesale at the leaf"
+        );
     }
 
     #[test]
@@ -513,7 +563,11 @@ mod tests {
         req_set.remove(20);
         let requester = src(&req_set);
         let reply = respond(&initial_request(&requester), &responder);
-        assert!(reply.ranges.len() >= 2, "bisected: {:?}", reply.ranges.len());
+        assert!(
+            reply.ranges.len() >= 2,
+            "bisected: {:?}",
+            reply.ranges.len()
+        );
         assert!(reply
             .ranges
             .iter()
@@ -527,7 +581,10 @@ mod tests {
         let mut rounds = 0u32;
         loop {
             rounds += 1;
-            assert!(rounds <= MAX_RBSR_ROUNDS, "must converge within the round cap");
+            assert!(
+                rounds <= MAX_RBSR_ROUNDS,
+                "must converge within the round cap"
+            );
             let reply = respond(&request, resp);
             let (missing, next) = process_reply(&reply, req);
             acquired.extend(missing);
@@ -550,7 +607,10 @@ mod tests {
         let req = src(&miss);
         let (rounds, have) = reconcile(&req, &resp);
         assert!(rounds <= MAX_RBSR_ROUNDS, "rounds {rounds}");
-        assert!(have >= 3 && have < 40, "transferred ~gap not history: {have}");
+        assert!(
+            (3..40).contains(&have),
+            "transferred ~gap not history: {have}"
+        );
     }
 
     #[test]
@@ -566,6 +626,9 @@ mod tests {
         let requester = src(&[(10, 1), (20, 2), (30, 3), (40, 4)]);
         let (rounds, have) = reconcile(&requester, &responder);
         assert!(rounds <= MAX_RBSR_ROUNDS);
-        assert_eq!(have, 0, "requester already holds everything the responder has");
+        assert_eq!(
+            have, 0,
+            "requester already holds everything the responder has"
+        );
     }
 }

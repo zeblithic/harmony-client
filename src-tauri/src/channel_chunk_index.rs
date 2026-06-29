@@ -19,7 +19,8 @@ use crate::channel_rbsr::{RangeFingerprint, ReconcileKey};
 
 /// Reads a chunk's events for its inclusive `[first, last]` span — supplied by
 /// the caller (the log reads segments/tail; tests read an in-memory vec).
-type ChunkEventReader<'a> = dyn FnMut(&ReconcileKey, &ReconcileKey) -> Vec<(ReconcileKey, [u8; 32])> + 'a;
+type ChunkEventReader<'a> =
+    dyn FnMut(&ReconcileKey, &ReconcileKey) -> Vec<(ReconcileKey, [u8; 32])> + 'a;
 
 /// Average chunk size ≈ `2^CHUNK_MASK_BITS` events. A boundary falls on an
 /// element whose hash's low `CHUNK_MASK_BITS` bits are zero.
@@ -178,7 +179,11 @@ mod tests {
         s2.sort_by(|x, y| x.0.cmp(&y.0));
         let b = ChunkIndex::build_from_sorted(&s2);
         assert_eq!(a.boundaries(), b.boundaries());
-        assert!(a.chunks.len() > 1, "expected multiple chunks, got {}", a.chunks.len());
+        assert!(
+            a.chunks.len() > 1,
+            "expected multiple chunks, got {}",
+            a.chunks.len()
+        );
     }
 
     #[test]
@@ -187,7 +192,10 @@ mod tests {
         let idx = ChunkIndex::build_from_sorted(&s);
         let naive = SliceSource::from_unsorted(s.clone());
         let mut lookup = |lo: &ReconcileKey, hi: &ReconcileKey| -> Vec<(ReconcileKey, [u8; 32])> {
-            s.iter().filter(|(k, _)| k >= lo && k <= hi).cloned().collect()
+            s.iter()
+                .filter(|(k, _)| k >= lo && k <= hi)
+                .cloned()
+                .collect()
         };
         let lo = s[300].0.clone();
         let hi = s[1700].0.clone();
@@ -196,7 +204,8 @@ mod tests {
             naive.range_fingerprint(&lo, &hi).finalize()
         );
         assert_eq!(
-            idx.range_fingerprint(&min_key(), &max_key(), &mut lookup).finalize(),
+            idx.range_fingerprint(&min_key(), &max_key(), &mut lookup)
+                .finalize(),
             naive.range_fingerprint(&min_key(), &max_key()).finalize()
         );
     }
@@ -213,7 +222,11 @@ mod tests {
         for (k, h) in pulled.iter().cloned() {
             let snapshot = running.clone();
             idx.insert(k.clone(), h, |lo, hi| {
-                snapshot.iter().filter(|(kk, _)| kk >= lo && kk <= hi).cloned().collect()
+                snapshot
+                    .iter()
+                    .filter(|(kk, _)| kk >= lo && kk <= hi)
+                    .cloned()
+                    .collect()
             });
             let pos = running.partition_point(|(kk, _)| kk < &k);
             running.insert(pos, (k, h));
@@ -225,13 +238,23 @@ mod tests {
         full.dedup_by(|a, b| a.0 == b.0);
         let rebuilt = ChunkIndex::build_from_sorted(&full);
 
-        assert_eq!(idx.boundaries(), rebuilt.boundaries(), "insert path must equal rebuild");
+        assert_eq!(
+            idx.boundaries(),
+            rebuilt.boundaries(),
+            "insert path must equal rebuild"
+        );
         let mut lk = |lo: &ReconcileKey, hi: &ReconcileKey| {
-            full.iter().filter(|(k, _)| k >= lo && k <= hi).cloned().collect::<Vec<_>>()
+            full.iter()
+                .filter(|(k, _)| k >= lo && k <= hi)
+                .cloned()
+                .collect::<Vec<_>>()
         };
         assert_eq!(
-            idx.range_fingerprint(&min_key(), &max_key(), &mut lk).finalize(),
-            rebuilt.range_fingerprint(&min_key(), &max_key(), &mut lk).finalize()
+            idx.range_fingerprint(&min_key(), &max_key(), &mut lk)
+                .finalize(),
+            rebuilt
+                .range_fingerprint(&min_key(), &max_key(), &mut lk)
+                .finalize()
         );
     }
 }

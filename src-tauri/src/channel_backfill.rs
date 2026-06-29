@@ -98,7 +98,10 @@ mod reconcile_mode_tests {
 
     #[test]
     fn round0_zero_replies_selects_vector_fallback() {
-        assert_eq!(reconcile_mode_after_round0(0), ReconcileMode::VectorFallback);
+        assert_eq!(
+            reconcile_mode_after_round0(0),
+            ReconcileMode::VectorFallback
+        );
         assert_eq!(reconcile_mode_after_round0(1), ReconcileMode::RbsrContinue);
         assert_eq!(reconcile_mode_after_round0(7), ReconcileMode::RbsrContinue);
     }
@@ -110,7 +113,10 @@ mod reconcile_mode_tests {
             ReconcileMode::FullReconcile
         );
         assert_eq!(reconcile_mode_after_round(3, true), ReconcileMode::Done);
-        assert_eq!(reconcile_mode_after_round(3, false), ReconcileMode::RbsrContinue);
+        assert_eq!(
+            reconcile_mode_after_round(3, false),
+            ReconcileMode::RbsrContinue
+        );
     }
 }
 

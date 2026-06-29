@@ -1755,6 +1755,10 @@ impl ChannelLogEngine {
     /// path), computes the reply against the local log, resolves any `Have`
     /// keys to their events for inline transfer (under the same log lock), and
     /// seals the reply. Returns `(sealed_reply, have_events)`.
+    // ZEB-592: the production caller is the `rbsr/**` Zenoh queryable, wired
+    // when the RBSR transport lands (plan Task 12). Kept in the binary and
+    // exercised by tests; `allow(dead_code)` only until that queryable calls it.
+    #[allow(dead_code)]
     pub(crate) async fn rbsr_respond(
         &self,
         sealed_request: &[u8],
@@ -1779,7 +1783,7 @@ impl ChannelLogEngine {
 
     /// Test helper: seal an RBSR round-0 request built over this engine's own
     /// log (a self-reconcile, which must converge to all-`Skip`).
-    #[cfg(any(test, feature = "test-fixtures"))]
+    #[cfg(test)]
     pub(crate) async fn rbsr_self_request_sealed(&self) -> Vec<u8> {
         let log = self.log.lock().await;
         let req = crate::channel_rbsr::initial_request(&*log);
@@ -3050,7 +3054,11 @@ mod tests {
         // A request built over the engine's own log must reconcile to all-Skip
         // with nothing to transfer.
         let sealed_req = fix.engine.rbsr_self_request_sealed().await;
-        let (sealed_reply, have) = fix.engine.rbsr_respond(&sealed_req).await.expect("responds");
+        let (sealed_reply, have) = fix
+            .engine
+            .rbsr_respond(&sealed_req)
+            .await
+            .expect("responds");
         let reply = crate::community_channel_log::open_rbsr_message(
             fix.engine.channel_key_ref(),
             &sealed_reply,

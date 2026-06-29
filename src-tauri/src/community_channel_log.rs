@@ -2245,6 +2245,10 @@ impl ChannelLog {
     /// for inline `Have` transfer. Reads only the segments whose `wall_ms` range
     /// overlaps the requested keys' span (plus the tail), so a small leaf range
     /// touches at most a couple of segments.
+    // ZEB-592: called by `rbsr_respond`; both reach production when the
+    // `rbsr/**` transport queryable is wired (plan Task 12). `allow(dead_code)`
+    // until then (kept in the binary, exercised by tests).
+    #[allow(dead_code)]
     pub(crate) fn events_for_keys(&self, keys: &[ReconcileKey]) -> Vec<SignedChannelEvent> {
         if keys.is_empty() {
             return Vec::new();
@@ -2279,16 +2283,22 @@ impl ChannelLog {
 /// `(wall_ms, logical, device_id, element_hash)`.
 fn reconcile_key(e: &SignedChannelEvent) -> ReconcileKey {
     let at = e.at();
-    (at.wall_ms, at.logical, at.device_id.clone(), event_element_hash(e))
+    (
+        at.wall_ms,
+        at.logical,
+        at.device_id.clone(),
+        event_element_hash(e),
+    )
 }
 
 impl RangeReconcileSource for ChannelLog {
     fn range_fingerprint(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> RangeFingerprint {
-        self.chunk_index.range_fingerprint(lo, hi, &mut |first, last| {
-            let s = self.reconcile_entries.partition_point(|x| &x.0 < first);
-            let e = self.reconcile_entries.partition_point(|x| &x.0 <= last);
-            self.reconcile_entries[s..e].to_vec()
-        })
+        self.chunk_index
+            .range_fingerprint(lo, hi, &mut |first, last| {
+                let s = self.reconcile_entries.partition_point(|x| &x.0 < first);
+                let e = self.reconcile_entries.partition_point(|x| &x.0 <= last);
+                self.reconcile_entries[s..e].to_vec()
+            })
     }
 
     fn range_count(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> u64 {
@@ -2300,7 +2310,10 @@ impl RangeReconcileSource for ChannelLog {
     fn keys_in_range(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Vec<ReconcileKey> {
         let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
         let e = self.reconcile_entries.partition_point(|x| &x.0 < hi);
-        self.reconcile_entries[s..e].iter().map(|x| x.0.clone()).collect()
+        self.reconcile_entries[s..e]
+            .iter()
+            .map(|x| x.0.clone())
+            .collect()
     }
 
     fn split_key(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Option<ReconcileKey> {
@@ -3051,7 +3064,9 @@ mod tests {
 
     #[test]
     fn rbsr_seal_round_trips_and_rejects_tamper_wrongkey_oversize() {
-        use crate::channel_rbsr::{max_key, RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION};
+        use crate::channel_rbsr::{
+            max_key, RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION,
+        };
         let mk = fixture_mk();
         let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
         let other = derive_channel_key(&mk, &fixture_community(0xc1), &fixture_channel(0x01));
@@ -3064,7 +3079,10 @@ mod tests {
         };
         let sealed = seal_rbsr_message(&key, &msg).unwrap();
         assert_eq!(open_rbsr_message(&key, &sealed).unwrap(), msg);
-        assert!(open_rbsr_message(&other, &sealed).is_err(), "wrong key rejected");
+        assert!(
+            open_rbsr_message(&other, &sealed).is_err(),
+            "wrong key rejected"
+        );
         let mut t = sealed.clone();
         *t.last_mut().unwrap() ^= 0x01;
         assert!(open_rbsr_message(&key, &t).is_err(), "tamper rejected");
@@ -3152,7 +3170,9 @@ mod tests {
         )
         .expect("reload");
         assert_eq!(
-            reloaded.range_fingerprint(&min_key(), &max_key()).finalize(),
+            reloaded
+                .range_fingerprint(&min_key(), &max_key())
+                .finalize(),
             want,
             "reload rebuilds the reconcile index identically"
         );
@@ -3219,7 +3239,10 @@ mod tests {
         let mut rounds = 0u32;
         loop {
             rounds += 1;
-            assert!(rounds <= MAX_RBSR_ROUNDS, "must converge within the round cap");
+            assert!(
+                rounds <= MAX_RBSR_ROUNDS,
+                "must converge within the round cap"
+            );
             let reply = respond(&request, &a);
             let (missing, next) = process_reply(&reply, &b);
             let events = a.events_for_keys(&missing);
@@ -3234,8 +3257,15 @@ mod tests {
         }
 
         let b_after = b.range_count(&min_key(), &max_key());
-        assert_eq!(b_after, b_before + 1, "B recovered exactly the missing hole event");
-        assert!(transferred <= 4, "O(gap) transfer, not full history: {transferred}");
+        assert_eq!(
+            b_after,
+            b_before + 1,
+            "B recovered exactly the missing hole event"
+        );
+        assert!(
+            transferred <= 4,
+            "O(gap) transfer, not full history: {transferred}"
+        );
         assert_eq!(
             a.range_fingerprint(&min_key(), &max_key()).finalize(),
             b.range_fingerprint(&min_key(), &max_key()).finalize(),

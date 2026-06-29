@@ -24,12 +24,12 @@
 //! 3. Replace the `expected_hex` literal in the assertion below.
 //! 4. Re-run without the env var to confirm the pin holds.
 
+use harmony_app::channel_rbsr::{
+    encode_message, RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION,
+};
 use harmony_app::community_channel_log::{
     sign_channel_event, sign_channel_react, ChannelAttachment, ChannelPostPayload,
     ChannelReactPayload, MessageId, SignedChannelEvent,
-};
-use harmony_app::channel_rbsr::{
-    encode_message, RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION,
 };
 use harmony_app::community_membership::ChannelId;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
