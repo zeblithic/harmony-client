@@ -1749,6 +1749,59 @@ impl ChannelLogEngine {
         self.channel_key.as_ref()
     }
 
+    /// ZEB-592: respond to one RBSR reconciliation round. Opens the sealed
+    /// request (cap-before-alloc + AEAD inside `open_rbsr_message`; returns
+    /// `None` on cap/decrypt failure so the caller falls back to the legacy
+    /// path), computes the reply against the local log, resolves any `Have`
+    /// keys to their events for inline transfer (under the same log lock), and
+    /// seals the reply. Returns `(sealed_reply, have_events)`.
+    // ZEB-592: the production caller is the `rbsr/**` Zenoh queryable, wired
+    // when the RBSR transport lands (plan Task 12). Kept in the binary and
+    // exercised by tests; `allow(dead_code)` only until that queryable calls it.
+    #[allow(dead_code)]
+    pub(crate) async fn rbsr_respond(
+        &self,
+        sealed_request: &[u8],
+    ) -> Option<(Vec<u8>, Vec<SignedChannelEvent>)> {
+        let key = self.channel_key_ref();
+        let request = crate::community_channel_log::open_rbsr_message(key, sealed_request).ok()?;
+        let log = self.log.lock().await;
+        let reply = crate::channel_rbsr::respond(&request, &*log);
+        let have_keys: Vec<crate::channel_rbsr::ReconcileKey> = reply
+            .ranges
+            .iter()
+            .flat_map(|r| match &r.mode {
+                crate::channel_rbsr::RbsrMode::Have(ks) => ks.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let have_events = match log.events_for_keys(&have_keys) {
+            Ok(events) if events.len() == have_keys.len() => events,
+            // A segment read failed, or a Have key couldn't be resolved to its
+            // body → don't advertise keys we can't back with events. Fail so the
+            // requester falls back (vector path / retry) instead of treating the
+            // range as resolved and silently losing those events.
+            _ => {
+                drop(log);
+                return None;
+            }
+        };
+        drop(log);
+        let sealed = crate::community_channel_log::seal_rbsr_message(key, &reply).ok()?;
+        Some((sealed, have_events))
+    }
+
+    /// Test helper: seal an RBSR round-0 request built over this engine's own
+    /// log (a self-reconcile, which must converge to all-`Skip`).
+    #[cfg(test)]
+    pub(crate) async fn rbsr_self_request_sealed(&self) -> Vec<u8> {
+        let log = self.log.lock().await;
+        let req = crate::channel_rbsr::initial_request(&*log);
+        drop(log);
+        crate::community_channel_log::seal_rbsr_message(self.channel_key_ref(), &req)
+            .expect("seal initial rbsr request")
+    }
+
     /// ZEB-350: clone the `Arc<ChannelKey>` so the voice relay can hold the key
     /// for the lifetime of a join without borrowing the engine.
     pub(crate) fn channel_key_arc(&self) -> std::sync::Arc<ChannelKey> {
@@ -2980,6 +3033,60 @@ mod tests {
         for (got, want) in listed.iter().zip(events.iter()) {
             assert_eq!(extract_id(got), extract_id(want));
         }
+    }
+
+    #[tokio::test]
+    async fn rbsr_respond_self_reconcile_all_skip_and_rejects_oversize() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let mut events = Vec::new();
+        for i in 0..5u64 {
+            let hlc = Hlc {
+                wall_ms: 1_000 + i,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            };
+            events.push(make_signed_event(
+                fix.community_id,
+                fix.channel_id,
+                fix.self_owner,
+                hlc,
+                "x",
+                &fix.signing_key,
+            ));
+        }
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            for ev in &events {
+                log.append(ev.clone()).expect("append");
+            }
+        }
+
+        // A request built over the engine's own log must reconcile to all-Skip
+        // with nothing to transfer.
+        let sealed_req = fix.engine.rbsr_self_request_sealed().await;
+        let (sealed_reply, have) = fix
+            .engine
+            .rbsr_respond(&sealed_req)
+            .await
+            .expect("responds");
+        let reply = crate::community_channel_log::open_rbsr_message(
+            fix.engine.channel_key_ref(),
+            &sealed_reply,
+        )
+        .expect("open reply");
+        assert!(
+            reply
+                .ranges
+                .iter()
+                .all(|r| matches!(r.mode, crate::channel_rbsr::RbsrMode::Skip)),
+            "self-reconcile must converge to all-Skip: {:?}",
+            reply.ranges
+        );
+        assert!(have.is_empty(), "no events transferred on self-reconcile");
+
+        // Oversize payload → None (cap-before-alloc; caller falls back).
+        let oversize = vec![0u8; crate::community_channel_log::MAX_RBSR_MESSAGE_BYTES + 1];
+        assert!(fix.engine.rbsr_respond(&oversize).await.is_none());
     }
 
     #[tokio::test]

@@ -28,6 +28,9 @@ use chacha20poly1305::{AeadCore, ChaCha20Poly1305, KeyInit};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+
+use crate::channel_chunk_index::ChunkIndex;
+use crate::channel_rbsr::{RangeFingerprint, RangeReconcileSource, ReconcileKey};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -591,7 +594,22 @@ pub fn sign_channel_react(
 /// The single source of truth for what bytes the signature covers — used
 /// by both sign functions (via a placeholder-sig event) and
 /// `verify_channel_event` (on the deserialized event).
-fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, ChannelEventError> {
+/// ZEB-592: stable 32-byte RBSR set-element identity for an event — the
+/// SHA-256 of its canonical signed-set CBOR (the exact bytes the signature
+/// covers). Content+id-derived, so two peers compute the identical hash for
+/// the same event regardless of how its HLC sorts or when it arrived.
+pub(crate) fn event_element_hash(event: &SignedChannelEvent) -> [u8; 32] {
+    use sha2::Digest;
+    // A validated in-memory event always canonically serializes (the `Vec`
+    // writer is infallible), so the `Result` here is ceremonial.
+    let canon = signed_set_canonical_cbor(event)
+        .expect("validated channel event must canonically serialize");
+    sha2::Sha256::digest(canon).into()
+}
+
+pub(crate) fn signed_set_canonical_cbor(
+    event: &SignedChannelEvent,
+) -> Result<Vec<u8>, ChannelEventError> {
     let mut canon = Vec::with_capacity(256);
     match event {
         SignedChannelEvent::Post {
@@ -858,6 +876,109 @@ pub fn open_watermark_vector(
         .map_err(|e| ChannelEventError::AeadDecrypt(e.to_string()))?;
     ciborium::from_reader(plaintext.as_slice())
         .map_err(|e| ChannelEventError::CborDecode(e.to_string()))
+}
+
+/// Static AAD for sealed RBSR messages (ZEB-592). Domain-separated from
+/// `WATERMARK_VECTOR_AAD` and `CHANNEL_PACKET_AAD` so a message of one kind can
+/// never be opened as another even under the same `ChannelKey`.
+pub const RBSR_AAD: &[u8] = b"harmony-channel-rbsr-v1";
+
+/// Hard cap on a sealed RBSR message, checked on the bytes view BEFORE
+/// decrypt/decode (cap-before-alloc; mirrors `MAX_WATERMARK_VECTOR_BYTES`).
+/// Over cap → the responder ignores the payload / the caller falls back.
+pub const MAX_RBSR_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Deterministic-nonce variant of [`seal_rbsr_message`] for the wire-format pin
+/// tests. Same nonce-reuse footgun + `test-fixtures` gating as the other
+/// `*_with_nonce` helpers; production MUST use [`seal_rbsr_message`].
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub fn seal_rbsr_message_with_nonce(
+    key: &ChannelKey,
+    msg: &crate::channel_rbsr::RbsrMessage,
+    nonce: [u8; 12],
+) -> Result<Vec<u8>, ChannelEventError> {
+    seal_rbsr_message_inner(key, msg, nonce)
+}
+
+/// Internal seal helper — both `seal_rbsr_message` and the pin-test variant
+/// route through this single AEAD-call site so the wire format stays in sync.
+fn seal_rbsr_message_inner(
+    key: &ChannelKey,
+    msg: &crate::channel_rbsr::RbsrMessage,
+    nonce: [u8; 12],
+) -> Result<Vec<u8>, ChannelEventError> {
+    let plaintext = crate::channel_rbsr::encode_message(msg);
+    // True cap-before-alloc on the seal path (parity with `open_rbsr_message`'s
+    // pre-decrypt cap): the sealed packet is exactly NONCE_LEN + plaintext.len()
+    // + TAG_LEN bytes (ChaCha20-Poly1305 appends a 16-byte tag), so reject an
+    // oversize message on the plaintext length BEFORE spending the AEAD encrypt
+    // and ciphertext allocation. Failing locally also keeps the fallback path
+    // predictable instead of surfacing as a peer-side decode failure on `open`.
+    let sealed_len = NONCE_LEN + plaintext.len() + TAG_LEN;
+    if sealed_len > MAX_RBSR_MESSAGE_BYTES {
+        return Err(ChannelEventError::MalformedPacket(sealed_len));
+    }
+    let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
+    let ciphertext = cipher
+        .encrypt(
+            (&nonce).into(),
+            Payload {
+                msg: &plaintext,
+                aad: RBSR_AAD,
+            },
+        )
+        .map_err(|e| ChannelEventError::AeadEncrypt(e.to_string()))?;
+    let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    debug_assert_eq!(
+        out.len(),
+        sealed_len,
+        "AEAD output length must match the pre-checked cap (nonce + plaintext + tag)"
+    );
+    Ok(out)
+}
+
+/// AEAD-seal an RBSR message with a random nonce (production path).
+/// Wire: `[12B nonce][ChaCha20-Poly1305(key, cbor(msg), RBSR_AAD)]`.
+pub fn seal_rbsr_message(
+    key: &ChannelKey,
+    msg: &crate::channel_rbsr::RbsrMessage,
+) -> Result<Vec<u8>, ChannelEventError> {
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    seal_rbsr_message_inner(key, msg, nonce.into())
+}
+
+/// Open a sealed RBSR message. Rejects an oversize (or structurally too-short)
+/// payload on the bytes view BEFORE any AEAD work or allocation (cap-before-
+/// alloc), then AEAD-decrypts under `RBSR_AAD` and canonical-CBOR decodes.
+pub fn open_rbsr_message(
+    key: &ChannelKey,
+    packet: &[u8],
+) -> Result<crate::channel_rbsr::RbsrMessage, ChannelEventError> {
+    if packet.len() > MAX_RBSR_MESSAGE_BYTES || packet.len() < MIN_PACKET_LEN {
+        return Err(ChannelEventError::MalformedPacket(packet.len()));
+    }
+    let (nonce_bytes, ciphertext) = packet.split_at(NONCE_LEN);
+    let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
+    let plaintext = cipher
+        .decrypt(
+            nonce_bytes.into(),
+            Payload {
+                msg: ciphertext,
+                aad: RBSR_AAD,
+            },
+        )
+        .map_err(|e| ChannelEventError::AeadDecrypt(e.to_string()))?;
+    let msg = crate::channel_rbsr::decode_message(&plaintext)
+        .map_err(|_| ChannelEventError::CborDecode("rbsr message".into()))?;
+    // Validate the partition invariant at the trust boundary BEFORE the state
+    // machine runs — a malformed (but correctly-sealed) message must not be able
+    // to drive `lo > hi` slicing or a falsely-converged catch-up.
+    crate::channel_rbsr::validate_message(&msg)
+        .map_err(|_| ChannelEventError::CborDecode("rbsr message: invalid partition".into()))?;
+    Ok(msg)
 }
 
 /// ZEB-585: raise a watermark-vector lane entry to cover `at` (no-op when
@@ -1503,6 +1624,22 @@ pub struct ChannelLog {
     /// `reaction_index`). Keeps `watermark_vector()` O(devices), not an
     /// O(history) rescan per catch-up query.
     device_watermarks: WatermarkVector,
+    /// ZEB-592: in-memory canonical-order `(ReconcileKey, element_hash)` mirror
+    /// of the whole log + a content-defined-chunk fingerprint index over it.
+    /// Built in `reload`, maintained in `append`. Lets RBSR range fingerprints
+    /// be served from memory — the per-query O(history) segment rescan the
+    /// watermark-vector path pays (ZEB-585 §A.6) is gone. (A memory-frugal
+    /// chunk-summary-only variant that reads boundary events from disk is a
+    /// documented Slice 2b follow-up.)
+    ///
+    /// Invariant: `entry.1 == entry.0.3` — the second field always equals the
+    /// `ReconcileKey`'s element-hash (its fourth tuple field). The duplication
+    /// is intentional: [`ChunkIndex`] folds whatever hash it is handed and never
+    /// assumes `hash == key.3`, which keeps that module hash-agnostic and its
+    /// fingerprint algebra testable in isolation. Dropping the in-memory hash
+    /// entirely belongs to the Slice 2b chunk-summary-only rework, not here.
+    reconcile_entries: Vec<(ReconcileKey, [u8; 32])>,
+    chunk_index: ChunkIndex,
 }
 
 /// On-disk index of sealed segments + the path to the active tail.
@@ -1584,6 +1721,8 @@ impl ChannelLog {
             root,
             reaction_index: ReactionIndex::default(),
             device_watermarks: WatermarkVector::new(),
+            reconcile_entries: Vec::new(),
+            chunk_index: ChunkIndex::new(),
         }
     }
 
@@ -1625,6 +1764,8 @@ impl ChannelLog {
         // ZEB-585: advance the per-(author, device) catch-up watermark
         // before the event is moved into the tail.
         raise_watermark(&mut self.device_watermarks, event.author(), event.at());
+        // ZEB-592: maintain the RBSR reconcile index before the event moves.
+        self.maintain_reconcile_index(&event);
         self.tail.push(event);
         Ok(self.tail.len() >= self.config.seal_threshold_events)
     }
@@ -1926,9 +2067,12 @@ impl ChannelLog {
             root,
             reaction_index: ReactionIndex::default(),
             device_watermarks: WatermarkVector::new(),
+            reconcile_entries: Vec::new(),
+            chunk_index: ChunkIndex::new(),
         };
         log.rebuild_reaction_index();
         log.rebuild_device_watermarks();
+        log.rebuild_reconcile_index();
         Ok((log, total))
     }
 
@@ -2068,6 +2212,157 @@ impl ChannelLog {
             raise_watermark(&mut idx, ev.author(), ev.at());
         }
         self.device_watermarks = idx;
+    }
+
+    /// ZEB-592: rebuild the in-memory reconcile index (sorted entries + chunk
+    /// index) from the persisted log. Same one-time boot cost + non-fatal
+    /// segment-read handling as `rebuild_device_watermarks`.
+    fn rebuild_reconcile_index(&mut self) {
+        let mut entries: Vec<(ReconcileKey, [u8; 32])> = Vec::new();
+        for seg in &self.manifest.segments {
+            match self.read_segment(seg) {
+                Ok(events) => {
+                    for ev in &events {
+                        let k = reconcile_key(ev);
+                        let h = k.3;
+                        entries.push((k, h));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        zeb = "ZEB-592",
+                        segment = ?seg.handle,
+                        error = %e,
+                        "rebuild_reconcile_index: skipping unreadable segment"
+                    );
+                }
+            }
+        }
+        for ev in &self.tail {
+            let k = reconcile_key(ev);
+            let h = k.3;
+            entries.push((k, h));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|a, b| a.0 == b.0);
+        self.chunk_index = ChunkIndex::build_from_sorted(&entries);
+        self.reconcile_entries = entries;
+    }
+
+    /// ZEB-592: fold one event into the reconcile index at the `append` choke
+    /// point. `mem::take` lets the chunk index read the (pre-insert) entries
+    /// without a self-field borrow split.
+    fn maintain_reconcile_index(&mut self, event: &SignedChannelEvent) {
+        let key = reconcile_key(event);
+        let hash = key.3;
+        let pos = self.reconcile_entries.partition_point(|x| x.0 < key);
+        if self.reconcile_entries.get(pos).is_some_and(|x| x.0 == key) {
+            return; // idempotent re-append
+        }
+        let mut idx = std::mem::take(&mut self.chunk_index);
+        idx.insert(key.clone(), hash, |lo, hi| {
+            let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
+            let e = self.reconcile_entries.partition_point(|x| &x.0 <= hi);
+            self.reconcile_entries[s..e].to_vec()
+        });
+        self.chunk_index = idx;
+        self.reconcile_entries.insert(pos, (key, hash));
+    }
+
+    /// ZEB-592: resolve a set of RBSR `ReconcileKey`s back to their full events
+    /// for inline `Have` transfer. Reads only the segments whose `wall_ms` range
+    /// overlaps the requested keys' span (plus the tail), so a small leaf range
+    /// touches at most a couple of segments.
+    // ZEB-592: called by `rbsr_respond`; both reach production when the
+    // `rbsr/**` transport queryable is wired (plan Task 12). `allow(dead_code)`
+    // until then (kept in the binary, exercised by tests).
+    #[allow(dead_code)]
+    pub(crate) fn events_for_keys(
+        &self,
+        keys: &[ReconcileKey],
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogPersistError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: std::collections::HashSet<ReconcileKey> = keys.iter().cloned().collect();
+        // Track DISTINCT resolved keys so a duplicate body (same key seen twice)
+        // can't mask another advertised-but-missing key when `rbsr_respond`
+        // count-checks `events.len() == have_keys.len()`.
+        let mut found: std::collections::HashSet<ReconcileKey> = std::collections::HashSet::new();
+        let lo = keys.iter().map(|k| k.0).min().unwrap();
+        let hi = keys.iter().map(|k| k.0).max().unwrap();
+        let mut out = Vec::new();
+        for seg in &self.manifest.segments {
+            // Skip segments whose wall_ms span is entirely outside [lo, hi].
+            if seg.range.1.wall_ms < lo || seg.range.0.wall_ms > hi {
+                continue;
+            }
+            // Propagate read errors: silently skipping a segment would let the
+            // sealed reply advertise `Have` keys whose event bodies are missing,
+            // and the requester treats `Have` as resolved — losing those events.
+            let events = self.read_segment(seg)?;
+            for ev in events {
+                let key = reconcile_key(&ev);
+                if wanted.contains(&key) && found.insert(key) {
+                    out.push(ev);
+                }
+            }
+        }
+        for ev in &self.tail {
+            let key = reconcile_key(ev);
+            if wanted.contains(&key) && found.insert(key) {
+                out.push(ev.clone());
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// ZEB-592: canonical RBSR set-element key for an event —
+/// `(wall_ms, logical, device_id, element_hash)`.
+fn reconcile_key(e: &SignedChannelEvent) -> ReconcileKey {
+    let at = e.at();
+    (
+        at.wall_ms,
+        at.logical,
+        at.device_id.clone(),
+        event_element_hash(e),
+    )
+}
+
+impl RangeReconcileSource for ChannelLog {
+    fn range_fingerprint(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> RangeFingerprint {
+        self.chunk_index
+            .range_fingerprint(lo, hi, &mut |first, last| {
+                let s = self.reconcile_entries.partition_point(|x| &x.0 < first);
+                let e = self.reconcile_entries.partition_point(|x| &x.0 <= last);
+                self.reconcile_entries[s..e.max(s)].to_vec()
+            })
+    }
+
+    fn range_count(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> u64 {
+        let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
+        let e = self.reconcile_entries.partition_point(|x| &x.0 < hi);
+        e.saturating_sub(s) as u64
+    }
+
+    fn keys_in_range(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Vec<ReconcileKey> {
+        let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
+        let e = self.reconcile_entries.partition_point(|x| &x.0 < hi);
+        self.reconcile_entries[s..e.max(s)]
+            .iter()
+            .map(|x| x.0.clone())
+            .collect()
+    }
+
+    fn split_key(&self, lo: &ReconcileKey, hi: &ReconcileKey) -> Option<ReconcileKey> {
+        let s = self.reconcile_entries.partition_point(|x| &x.0 < lo);
+        let e = self.reconcile_entries.partition_point(|x| &x.0 < hi);
+        if e.saturating_sub(s) < 2 {
+            None
+        } else {
+            Some(self.reconcile_entries[s + (e - s) / 2].0.clone())
+        }
     }
 }
 
@@ -2787,6 +3082,282 @@ mod tests {
         let canon_a = signed_set_canonical_cbor(&signed).expect("canon a");
         let canon_b = signed_set_canonical_cbor(&signed).expect("canon b");
         assert_eq!(canon_a, canon_b);
+    }
+
+    #[test]
+    fn element_hash_matches_sha256_of_canonical_cbor_and_is_deterministic() {
+        use sha2::Digest;
+        let (payload, key) = fixture_payload("hello");
+        let ev = sign_channel_event(&payload, &key).expect("sign");
+        // deterministic: re-hashing the same event yields the same bytes
+        assert_eq!(event_element_hash(&ev), event_element_hash(&ev));
+        // equals SHA-256 of the canonical signed-set CBOR
+        let expect: [u8; 32] =
+            sha2::Sha256::digest(signed_set_canonical_cbor(&ev).expect("canon")).into();
+        assert_eq!(event_element_hash(&ev), expect);
+        // a different event hashes differently
+        let (payload2, key2) = fixture_payload("world");
+        let ev2 = sign_channel_event(&payload2, &key2).expect("sign");
+        assert_ne!(event_element_hash(&ev), event_element_hash(&ev2));
+    }
+
+    #[test]
+    fn rbsr_seal_round_trips_and_rejects_tamper_wrongkey_oversize() {
+        use crate::channel_rbsr::{
+            max_key, RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION,
+        };
+        let mk = fixture_mk();
+        let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
+        let other = derive_channel_key(&mk, &fixture_community(0xc1), &fixture_channel(0x01));
+        let msg = RbsrMessage {
+            version: RBSR_PROTOCOL_VERSION,
+            ranges: vec![RbsrRange {
+                upper: max_key(),
+                mode: RbsrMode::Fingerprint([3u8; 16]),
+            }],
+        };
+        let sealed = seal_rbsr_message(&key, &msg).unwrap();
+        assert_eq!(open_rbsr_message(&key, &sealed).unwrap(), msg);
+        assert!(
+            open_rbsr_message(&other, &sealed).is_err(),
+            "wrong key rejected"
+        );
+        let mut t = sealed.clone();
+        *t.last_mut().unwrap() ^= 0x01;
+        assert!(open_rbsr_message(&key, &t).is_err(), "tamper rejected");
+        let big = vec![0u8; MAX_RBSR_MESSAGE_BYTES + 1];
+        assert!(
+            matches!(open_rbsr_message(&key, &big), Err(ChannelEventError::MalformedPacket(n)) if n == MAX_RBSR_MESSAGE_BYTES + 1),
+            "oversize rejected before decrypt"
+        );
+    }
+
+    #[test]
+    fn seal_rbsr_message_rejects_oversize_before_encrypt() {
+        use crate::channel_rbsr::{
+            max_key, RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION,
+        };
+        let mk = fixture_mk();
+        let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
+        // A Have list whose CBOR plaintext exceeds the 64 KiB cap — exercises the
+        // cap-before-alloc guard on the seal path (only `open` was covered before).
+        let keys: Vec<_> = (0..4000u64)
+            .map(|i| (i, 0u32, "d".to_string(), [0u8; 32]))
+            .collect();
+        let msg = RbsrMessage {
+            version: RBSR_PROTOCOL_VERSION,
+            ranges: vec![RbsrRange {
+                upper: max_key(),
+                mode: RbsrMode::Have(keys),
+            }],
+        };
+        let err = seal_rbsr_message(&key, &msg).expect_err("oversize seal must be rejected");
+        assert!(
+            matches!(err, ChannelEventError::MalformedPacket(n) if n > MAX_RBSR_MESSAGE_BYTES),
+            "oversize seal must reject as MalformedPacket(> cap) before encrypt, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rbsr_aad_is_domain_separated_from_wmv() {
+        let mk = fixture_mk();
+        let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
+        let wmv = WatermarkVector::new();
+        let wmv_sealed = seal_watermark_vector(&key, &wmv).unwrap();
+        assert!(
+            open_rbsr_message(&key, &wmv_sealed).is_err(),
+            "a wmv-AAD payload must not open as an RBSR message"
+        );
+        assert_ne!(RBSR_AAD, WATERMARK_VECTOR_AAD);
+    }
+
+    #[test]
+    fn rbsr_open_rejects_malformed_partition() {
+        use crate::channel_rbsr::{RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION};
+        let mk = fixture_mk();
+        let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
+        // Structurally valid CBOR, but the ranges do not cover [min_key, max_key)
+        // — a peer holding the channel key could seal this; `open` must reject it
+        // at the trust boundary rather than feed it to the state machine.
+        let bad = RbsrMessage {
+            version: RBSR_PROTOCOL_VERSION,
+            ranges: vec![RbsrRange {
+                upper: (10, 0, "d".into(), [1u8; 32]),
+                mode: RbsrMode::Skip,
+            }],
+        };
+        let sealed = seal_rbsr_message(&key, &bad).expect("seal");
+        assert!(
+            open_rbsr_message(&key, &sealed).is_err(),
+            "an invalid partition must be rejected on open"
+        );
+    }
+
+    #[test]
+    fn rbsr_log_source_fingerprint_matches_naive_and_survives_reload() {
+        use crate::channel_rbsr::{max_key, min_key, RangeReconcileSource, SliceSource};
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            root.clone(),
+            ChannelLogConfig {
+                seal_threshold_events: 3,
+            },
+        );
+        // Across devices, with sub-max stragglers (90 after 150, 130 after 220)
+        // landing out of HLC order → exercises the canonical sort + segments.
+        let specs = [
+            (100u64, 0u32, "dev-a"),
+            (150, 0, "dev-a"),
+            (120, 0, "dev-b"),
+            (200, 0, "dev-a"),
+            (90, 0, "dev-c"),
+            (210, 0, "dev-b"),
+            (220, 0, "dev-a"),
+            (130, 0, "dev-c"),
+        ];
+        let events: Vec<_> = specs
+            .iter()
+            .map(|&(w, l, d)| fixture_signed_event(w, l, d))
+            .collect();
+        for e in &events {
+            if log.append(e.clone()).expect("append") {
+                log.seal_and_persist().expect("seal");
+            }
+        }
+        let all: Vec<_> = events
+            .iter()
+            .map(|e| {
+                let k = reconcile_key(e);
+                let h = k.3;
+                (k, h)
+            })
+            .collect();
+        let naive = SliceSource::from_unsorted(all);
+        let want = naive.range_fingerprint(&min_key(), &max_key()).finalize();
+
+        assert_eq!(
+            log.range_fingerprint(&min_key(), &max_key()).finalize(),
+            want,
+            "log-backed source must match naive over the same events"
+        );
+
+        log.flush_tail().expect("flush");
+        let (reloaded, _total) = ChannelLog::reload(
+            cid,
+            chid,
+            root,
+            ChannelLogConfig {
+                seal_threshold_events: 3,
+            },
+        )
+        .expect("reload");
+        assert_eq!(
+            reloaded
+                .range_fingerprint(&min_key(), &max_key())
+                .finalize(),
+            want,
+            "reload rebuilds the reconcile index identically"
+        );
+    }
+
+    #[test]
+    fn rbsr_recovers_within_device_out_of_order_hole_over_real_logs() {
+        use crate::channel_rbsr::{
+            initial_request, max_key, min_key, process_reply, respond, RangeReconcileSource,
+            MAX_RBSR_ROUNDS,
+        };
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let mk = || {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let log = ChannelLog::new(
+                cid,
+                chid,
+                tmp.path().to_path_buf(),
+                ChannelLogConfig {
+                    seal_threshold_events: 4,
+                },
+            );
+            (log, tmp)
+        };
+        let (mut a, _ta) = mk();
+        let (mut b, _tb) = mk();
+
+        // Common backlog held by BOTH (across seal threshold → real segments).
+        let common: Vec<_> = (0..10u64)
+            .map(|i| fixture_signed_event(1000 + i * 100, 0, "dev-a"))
+            .collect();
+        for e in &common {
+            if a.append(e.clone()).expect("a append") {
+                a.seal_and_persist().expect("seal a");
+            }
+            if b.append(e.clone()).expect("b append") {
+                b.seal_and_persist().expect("seal b");
+            }
+        }
+        // Both hold dev-x's HIGH event (the per-device max).
+        let x_high = fixture_signed_event(2500, 0, "dev-x");
+        if a.append(x_high.clone()).expect("a") {
+            a.seal_and_persist().expect("seal a");
+        }
+        if b.append(x_high.clone()).expect("b") {
+            b.seal_and_persist().expect("seal b");
+        }
+        // Only A holds dev-x's LOW event — the within-one-device out-of-order
+        // hole (B's per-device watermark is 2500, so a scalar/vector catch-up
+        // filters this 1500 event out forever; only RBSR's range fingerprint
+        // detects the mismatch).
+        let x_low = fixture_signed_event(1500, 0, "dev-x");
+        if a.append(x_low.clone()).expect("a") {
+            a.seal_and_persist().expect("seal a");
+        }
+
+        let b_before = b.range_count(&min_key(), &max_key());
+
+        // Drive RBSR rounds: A is the responder (holds the gap), B the
+        // requester. Ingest the events B is missing each round.
+        let mut request = initial_request(&b);
+        let mut transferred = 0usize;
+        let mut rounds = 0u32;
+        loop {
+            rounds += 1;
+            assert!(
+                rounds <= MAX_RBSR_ROUNDS,
+                "must converge within the round cap"
+            );
+            let reply = respond(&request, &a);
+            let (missing, next) = process_reply(&reply, &b);
+            let events = a.events_for_keys(&missing).expect("read events for keys");
+            transferred += events.len();
+            for e in events {
+                let _ = b.append(e).expect("ingest");
+            }
+            match next {
+                None => break,
+                Some(n) => request = n,
+            }
+        }
+
+        let b_after = b.range_count(&min_key(), &max_key());
+        assert_eq!(
+            b_after,
+            b_before + 1,
+            "B recovered exactly the missing hole event"
+        );
+        assert!(
+            transferred <= 4,
+            "O(gap) transfer, not full history: {transferred}"
+        );
+        assert_eq!(
+            a.range_fingerprint(&min_key(), &max_key()).finalize(),
+            b.range_fingerprint(&min_key(), &max_key()).finalize(),
+            "logs converged after RBSR"
+        );
     }
 
     #[test]

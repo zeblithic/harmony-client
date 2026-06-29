@@ -52,6 +52,74 @@ pub const BACKFILL_RETRY_BASE_MS: u64 = 30_000;
 /// the latch retries forever at this cadence until answered.
 pub const BACKFILL_RETRY_CAP_MS: u64 = 600_000;
 
+/// ZEB-592: which catch-up strategy the backfill driver follows after probing
+/// for an RBSR responder. The driver tries RBSR first; an old peer (no
+/// `rbsr/**` queryable) draws zero replies on round 0 and the driver falls back
+/// to the watermark-vector path. A reconcile that fails to converge inside the
+/// round cap falls back to a full reconcile (`since = None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileMode {
+    /// Keep running RBSR rounds.
+    RbsrContinue,
+    /// No `rbsr/**` responder answered round 0 → use the legacy watermark GET.
+    VectorFallback,
+    /// Round cap hit without convergence → fall back to a full reconcile.
+    FullReconcile,
+    /// Difference drained — catch-up complete.
+    Done,
+}
+
+/// Decide the mode after RBSR round 0 by how many replies the GET drew. Zero
+/// replies means no `rbsr/**` responder was online (old peer or none) → fall
+/// back to the watermark-vector path; any reply means an RBSR peer answered.
+pub fn reconcile_mode_after_round0(rbsr_replies: usize) -> ReconcileMode {
+    if rbsr_replies == 0 {
+        ReconcileMode::VectorFallback
+    } else {
+        ReconcileMode::RbsrContinue
+    }
+}
+
+/// Decide the mode after an RBSR round: converged → `Done`; at/over the round
+/// cap → `FullReconcile`; otherwise keep running rounds.
+pub fn reconcile_mode_after_round(round: u32, converged: bool) -> ReconcileMode {
+    if converged {
+        ReconcileMode::Done
+    } else if round >= crate::channel_rbsr::MAX_RBSR_ROUNDS {
+        ReconcileMode::FullReconcile
+    } else {
+        ReconcileMode::RbsrContinue
+    }
+}
+
+#[cfg(test)]
+mod reconcile_mode_tests {
+    use super::*;
+
+    #[test]
+    fn round0_zero_replies_selects_vector_fallback() {
+        assert_eq!(
+            reconcile_mode_after_round0(0),
+            ReconcileMode::VectorFallback
+        );
+        assert_eq!(reconcile_mode_after_round0(1), ReconcileMode::RbsrContinue);
+        assert_eq!(reconcile_mode_after_round0(7), ReconcileMode::RbsrContinue);
+    }
+
+    #[test]
+    fn round_cap_falls_back_to_full_reconcile() {
+        assert_eq!(
+            reconcile_mode_after_round(crate::channel_rbsr::MAX_RBSR_ROUNDS, false),
+            ReconcileMode::FullReconcile
+        );
+        assert_eq!(reconcile_mode_after_round(3, true), ReconcileMode::Done);
+        assert_eq!(
+            reconcile_mode_after_round(3, false),
+            ReconcileMode::RbsrContinue
+        );
+    }
+}
+
 /// What the driver should do next, as decided by [`BackfillLatch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackfillAction {
