@@ -8613,7 +8613,9 @@ fn parse_rbsr_key(key: &str) -> Option<u32> {
     // harmony / channels / {cid} / {ch_id} / rbsr / {round}
     //    0         1          2       3        4       5
     let parts: Vec<&str> = key.split('/').collect();
-    if parts.len() < 6 || parts[4] != "rbsr" {
+    // Exactly 6 segments — reject trailing junk (`…/rbsr/0/extra`) so the
+    // queryable never answers an unintended selector.
+    if parts.len() != 6 || parts[4] != "rbsr" {
         return None;
     }
     parts[5].parse::<u32>().ok()
@@ -8622,13 +8624,16 @@ fn parse_rbsr_key(key: &str) -> Option<u32> {
 /// One requester-side RBSR step outcome, returned by the engine's
 /// ingest-and-advance step after a round's reply frames are processed.
 /// `pub` because it surfaces through the `pub` [`RbsrAdapterHooks::ingest`]
-/// closure type that crosses the adapter bridge.
+/// closure type that crosses the adapter bridge. The success variants carry
+/// `ingested` — the count of `Have` event packets actually ingested this round
+/// — so the driver's progress accounting reflects real transfers, not the raw
+/// frame count (which a multi-responder GET inflates with extra reply frames).
 #[derive(Debug)]
 pub enum RbsrStep {
     /// The reconcile converged — no ranges mismatch; catch-up is complete.
-    Converged,
+    Converged { ingested: usize },
     /// More rounds needed; carries the next round's sealed request message.
-    Continue(Vec<u8>),
+    Continue { ingested: usize, next: Vec<u8> },
     /// The reply could not be opened/processed (decrypt/decode failure or a
     /// resolution shortfall) — abandon RBSR and fall back to the vector path.
     Failed,
@@ -8673,33 +8678,48 @@ where
         {
             return (ReconcileMode::VectorFallback, transferred);
         }
-        // Frame 0 is the sealed reply message; the rest are inline Have packets.
-        transferred += frames.len().saturating_sub(1);
-        let step = rbsr_ingest_and_next(frames).await;
-        let converged = match &step {
+        // The engine classifies frames (reply vs Have packets), so `ingested`
+        // is the real count of events pulled this round — not the raw frame
+        // count (which a multi-responder GET inflates with extra reply frames).
+        let (converged, next) = match rbsr_ingest_and_next(frames).await {
             RbsrStep::Failed => return (ReconcileMode::VectorFallback, transferred),
-            RbsrStep::Converged => true,
-            RbsrStep::Continue(_) => false,
+            RbsrStep::Converged { ingested } => {
+                transferred += ingested;
+                (true, None)
+            }
+            RbsrStep::Continue { ingested, next } => {
+                transferred += ingested;
+                (false, Some(next))
+            }
         };
         if reconcile_mode_after_round(round, converged) == ReconcileMode::Done {
             return (ReconcileMode::Done, transferred);
         }
-        sealed = match step {
-            RbsrStep::Continue(next) => next,
+        sealed = match next {
+            Some(next) => next,
             // Converged was already turned into `Done` above; fall back rather
             // than panic if the policy ever changes out from under this.
-            _ => return (ReconcileMode::Done, transferred),
+            None => return (ReconcileMode::Done, transferred),
         };
     }
     // Exhausted the round cap without converging → full-reconcile safety net.
     (ReconcileMode::FullReconcile, transferred)
 }
 
+/// Per-round buffer ceiling for the RBSR requester. Under `ConsolidationMode::None`
+/// a round can draw frames from multiple remote holders; the 10s timeout bounds
+/// *time*, not *memory*, so a buggy/malicious peer could otherwise force a large
+/// allocation before ingest. 16 MiB is generous for any legitimate round (tens
+/// of thousands of small event packets) yet bounds the worst case — over the cap,
+/// the round aborts and the driver drops to the paged vector path.
+const MAX_RBSR_ROUND_BYTES: usize = 16 * 1024 * 1024;
+
 /// ZEB-593: issue one RBSR round GET and drain its reply frames. The 10s
 /// per-round timeout is mandatory (the `since/**` GET has none — fine for a
-/// one-shot, fatal if a peer answers round 0 then hangs round 1). Returns the
-/// reply frames in order (`frames[0]` = sealed reply, `frames[1..]` = Have
-/// packets); an empty vec means no responder answered → the driver falls back.
+/// one-shot, fatal if a peer answers round 0 then hangs round 1). Frames are
+/// returned unordered (the engine classifies each as the sealed reply vs a
+/// `Have` packet — see `rbsr_ingest_and_next`); an empty vec means no responder
+/// answered (or the per-round byte cap was hit) → the driver falls back.
 async fn rbsr_get_frames(
     session: &zenoh::Session,
     key: &str,
@@ -8711,8 +8731,8 @@ async fn rbsr_get_frames(
         .payload(sealed)
         // Reconcile only against REMOTE responders: the requester also declares
         // an `rbsr/**` queryable, and its own all-`Skip` self-reply (it built
-        // the request over its own log) would otherwise race into `frames[0]`
-        // and force premature convergence. Excluding self also makes "zero
+        // the request over its own log) would otherwise be mixed into the round
+        // and could force premature convergence. Excluding self also makes "zero
         // replies on round 0" cleanly mean "no remote responder" → vector
         // fallback. Unlike the dedup-tolerant `since/**` path, RBSR's stateful
         // per-round reply cannot absorb a self-reply.
@@ -8725,13 +8745,23 @@ async fn rbsr_get_frames(
         Err(_) => return Vec::new(),
     };
     let mut frames = Vec::new();
+    let mut total_bytes = 0usize;
     loop {
         tokio::select! {
             biased;
             res = receiver.recv_async() => {
                 let Ok(reply) = res else { break; };
                 if let Ok(sample) = reply.into_result() {
-                    frames.push(sample.payload().to_bytes().to_vec());
+                    let frame = sample.payload().to_bytes().to_vec();
+                    total_bytes = total_bytes.saturating_add(frame.len());
+                    if total_bytes > MAX_RBSR_ROUND_BYTES {
+                        // Over the per-round buffer cap → abandon this round's
+                        // buffer and let the driver fall back to the paged
+                        // vector path rather than hold an unbounded allocation.
+                        tracing::debug!(%key, total_bytes, "rbsr round exceeded buffer cap; falling back");
+                        return Vec::new();
+                    }
+                    frames.push(frame);
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
@@ -9062,6 +9092,9 @@ mod channel_log_adapter_tests {
             None,
             "short key rejected"
         );
+        // Trailing junk past the round must be rejected (strict, exactly 6).
+        let trailing = format!("harmony/channels/{cid}/{ch}/rbsr/0/extra");
+        assert_eq!(parse_rbsr_key(&trailing), None, "trailing segment rejected");
     }
 
     #[tokio::test]
@@ -9070,7 +9103,12 @@ mod channel_log_adapter_tests {
         let (mode, _transferred) = drive_rbsr_rounds(
             || async { b"init".to_vec() },
             |_round, _sealed| async { Vec::<Vec<u8>>::new() },
-            |_frames| async { RbsrStep::Continue(b"unused".to_vec()) },
+            |_frames| async {
+                RbsrStep::Continue {
+                    ingested: 0,
+                    next: b"unused".to_vec(),
+                }
+            },
         )
         .await;
         assert_eq!(mode, crate::channel_backfill::ReconcileMode::VectorFallback);
@@ -9081,7 +9119,7 @@ mod channel_log_adapter_tests {
         use std::cell::{Cell, RefCell};
         let seen: RefCell<Vec<(u32, Vec<u8>)>> = RefCell::new(Vec::new());
         let ingest_calls = Cell::new(0u32);
-        let (mode, _transferred) = drive_rbsr_rounds(
+        let (mode, transferred) = drive_rbsr_rounds(
             || async { b"init".to_vec() },
             |round, sealed| {
                 seen.borrow_mut().push((round, sealed));
@@ -9092,15 +9130,22 @@ mod channel_log_adapter_tests {
                 ingest_calls.set(n + 1);
                 async move {
                     if n == 0 {
-                        RbsrStep::Continue(b"round1".to_vec())
+                        RbsrStep::Continue {
+                            ingested: 2,
+                            next: b"round1".to_vec(),
+                        }
                     } else {
-                        RbsrStep::Converged
+                        RbsrStep::Converged { ingested: 3 }
                     }
                 }
             },
         )
         .await;
         assert_eq!(mode, crate::channel_backfill::ReconcileMode::Done);
+        assert_eq!(
+            transferred, 5,
+            "transferred accumulates each step's ingested count (2 + 3)",
+        );
         assert_eq!(
             seen.into_inner(),
             vec![(0u32, b"init".to_vec()), (1u32, b"round1".to_vec())],
@@ -9118,7 +9163,12 @@ mod channel_log_adapter_tests {
                 gets.set(gets.get() + 1);
                 async { vec![vec![0xAAu8]] }
             },
-            |_frames| async { RbsrStep::Continue(b"more".to_vec()) },
+            |_frames| async {
+                RbsrStep::Continue {
+                    ingested: 0,
+                    next: b"more".to_vec(),
+                }
+            },
         )
         .await;
         assert_eq!(mode, crate::channel_backfill::ReconcileMode::FullReconcile);

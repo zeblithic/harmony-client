@@ -38,9 +38,9 @@
 
 **Files:** Modify `event_loop.rs` (near `parse_channel_backfill_key:8363`); test inline `#[cfg(test)]`.
 
-**Interfaces — Produces:** `fn parse_rbsr_key(key: &str, cid_hex: &str, ch_hex: &str) -> Option<u32>` (returns `{round}`; `None` on non-rbsr / malformed); `fn format_rbsr_key(cid_hex, ch_hex, round: u32) -> String` → `harmony/channels/{cid}/{ch}/rbsr/{round}`.
+**Interfaces — Produces:** `fn parse_rbsr_key(key: &str) -> Option<u32>` (returns `{round}`; `None` on non-rbsr / malformed; cid/ch scoping is left to Zenoh routing, mirroring `parse_channel_backfill_key`); `fn format_rbsr_key(cid_hex, ch_hex, round: u32) -> String` → `harmony/channels/{cid}/{ch}/rbsr/{round}`.
 
-- [ ] Write failing tests: round-trip `format`→`parse` for rounds `0`, `5`, `MAX_RBSR_ROUNDS`; reject a `since/**` key; reject wrong cid/ch; reject non-numeric round.
+- [ ] Write failing tests: round-trip `format`→`parse` for rounds `0`, `5`, `MAX_RBSR_ROUNDS`; reject a `since/**` key; reject non-numeric round; reject trailing junk (exactly 6 segments).
 - [ ] Implement both helpers mirroring `parse_channel_backfill_key`'s selector split.
 - [ ] `cargo nextest run -p harmony-app --lib -E 'test(rbsr_key)'` → PASS.
 - [ ] Commit.
@@ -52,7 +52,7 @@
 **Interfaces — Consumes:** `rbsr_get: impl Fn(u32, Vec<u8>) -> Fut<Vec<Vec<u8>>>` (round, sealed_request → reply frames); `rbsr_initial: impl Fn() -> Fut<Vec<u8>>`; `rbsr_ingest_and_next: impl Fn(Vec<Vec<u8>>) -> Fut<RbsrStep>`. **Produces:** `enum RbsrStep { Converged, Continue(Vec<u8>), Failed }` and `async fn drive_rbsr_rounds(...) -> ReconcileMode`.
 
 Driver logic (uses committed `ReconcileMode` helpers):
-```
+```rust
 let mut sealed = rbsr_initial().await;
 for round in 0..MAX_RBSR_ROUNDS {
     let frames = rbsr_get(round, sealed).await;

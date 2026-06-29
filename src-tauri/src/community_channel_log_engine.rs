@@ -1789,8 +1789,6 @@ impl ChannelLogEngine {
         Some((sealed, have_events))
     }
 
-    /// Test helper: seal an RBSR round-0 request built over this engine's own
-    /// log (a self-reconcile, which must converge to all-`Skip`).
     /// ZEB-593 (requester half): build + seal this round-0 RBSR request — one
     /// `Fingerprint` over the whole canonical universe — under the channel key.
     /// Sealing a small fixed-shape message is effectively infallible; on the
@@ -1806,31 +1804,41 @@ impl ChannelLogEngine {
     }
 
     /// ZEB-593 (requester half): ingest one round's reply frames and advance the
-    /// reconcile. `frames[0]` is the sealed `RbsrMessage` reply; `frames[1..]`
-    /// are encrypted channel-event packets (the responder's `Have` events).
-    /// Those route through the **same** [`Self::process_inbound_packet`]
-    /// signature-verify + replay-check + append + flush path as live gossip —
-    /// RBSR is a different *delivery* path, not a different *trust* path. After
-    /// ingesting, recompute our fingerprints over the now-updated source and
-    /// emit the next round's narrowed request, or signal convergence.
+    /// reconcile. The GET runs under `ConsolidationMode::None`, so a round can
+    /// draw frames from **more than one** remote holder; the frames are NOT
+    /// positional. Each frame is classified by trying to open it as a sealed
+    /// `RbsrMessage` (the reply, our AAD) — anything else is an encrypted
+    /// channel-event packet (a responder's inline `Have`, the channel-packet
+    /// AAD). All `Have` packets route through the **same**
+    /// [`Self::process_inbound_packet`] verify/replay/append/flush path as live
+    /// gossip (RBSR is a different *delivery* path, not a different *trust* path;
+    /// dedup makes overlapping sends from multiple holders harmless). One reply
+    /// message drives the next round's narrowing. Returns the count of `Have`
+    /// packets actually ingested this round.
     pub(crate) async fn rbsr_ingest_and_next(
         self: &Arc<Self>,
         frames: Vec<Vec<u8>>,
     ) -> crate::event_loop::RbsrStep {
         use crate::event_loop::RbsrStep;
         let key = self.channel_key_ref();
-        let mut frames = frames.into_iter();
-        // Frame 0 is always the sealed reply message; its absence means no
-        // responder answered this round → fall back.
-        let reply = match frames.next() {
-            Some(bytes) => match crate::community_channel_log::open_rbsr_message(key, &bytes) {
-                Ok(msg) => msg,
-                Err(_) => return RbsrStep::Failed,
-            },
-            None => return RbsrStep::Failed,
+        let mut reply: Option<crate::channel_rbsr::RbsrMessage> = None;
+        let mut have_packets: Vec<Vec<u8>> = Vec::new();
+        for frame in frames {
+            match crate::community_channel_log::open_rbsr_message(key, &frame) {
+                // A sealed RBSR reply. Keep the first; ignore additional holders'
+                // replies (their `Have` packets below still get ingested).
+                Ok(msg) if reply.is_none() => reply = Some(msg),
+                Ok(_) => {}
+                // Not an RBSR message → an inline `Have` channel packet.
+                Err(_) => have_packets.push(frame),
+            }
+        }
+        // No responder reply this round → fall back.
+        let Some(reply) = reply else {
+            return RbsrStep::Failed;
         };
-        // Ingest the inline `Have` event packets exactly like live broadcast.
-        for packet in frames {
+        let ingested = have_packets.len();
+        for packet in have_packets {
             self.process_inbound_packet(packet).await;
         }
         // Recompute our own fingerprints over the (now-updated) log and narrow.
@@ -1840,9 +1848,12 @@ impl ChannelLogEngine {
             next
         };
         match next {
-            None => RbsrStep::Converged,
+            None => RbsrStep::Converged { ingested },
             Some(msg) => match crate::community_channel_log::seal_rbsr_message(key, &msg) {
-                Ok(sealed) => RbsrStep::Continue(sealed),
+                Ok(sealed) => RbsrStep::Continue {
+                    ingested,
+                    next: sealed,
+                },
                 Err(_) => RbsrStep::Failed,
             },
         }
@@ -3254,6 +3265,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rbsr_ingest_tolerates_multiple_responder_replies() {
+        // A ConsolidationMode::None GET can draw frames from MORE than one remote
+        // holder: multiple sealed reply messages interleaved with Have packets.
+        // The engine must ingest only the real Have packets (never feed an extra
+        // reply message to process_inbound_packet) and count only those.
+        let responder = build_engine_fixture(8, 250, 1000).await;
+        let requester = build_engine_fixture(8, 250, 1000).await;
+        let mut events = Vec::new();
+        for i in 0..3u64 {
+            let hlc = Hlc {
+                wall_ms: 1_000 + i,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            };
+            events.push(make_signed_event(
+                responder.community_id,
+                responder.channel_id,
+                responder.self_owner,
+                hlc,
+                "x",
+                &responder.signing_key,
+            ));
+        }
+        {
+            let mut log = responder.engine.log_for_test().lock().await;
+            for ev in &events {
+                log.append(ev.clone()).expect("append");
+            }
+        }
+        let req = requester.engine.rbsr_build_initial().await;
+        let (sealed_reply, have_events) = responder
+            .engine
+            .rbsr_respond(&req)
+            .await
+            .expect("responder replies");
+        // Build frames with TWO sealed reply messages (a 2nd holder) plus the
+        // Have packets, in a non-frame-0 order to confirm classification (not
+        // position) drives parsing.
+        let mut frames = vec![sealed_reply.clone()];
+        for ev in &have_events {
+            frames.push(
+                crate::community_channel_log::encrypt_channel_packet(
+                    requester.engine.channel_key_ref(),
+                    ev,
+                )
+                .expect("encrypt"),
+            );
+        }
+        frames.push(sealed_reply); // a second responder's reply frame
+        let step = requester.engine.rbsr_ingest_and_next(frames).await;
+        match step {
+            crate::event_loop::RbsrStep::Converged { ingested }
+            | crate::event_loop::RbsrStep::Continue { ingested, .. } => {
+                assert_eq!(
+                    ingested, 3,
+                    "extra reply frame must NOT inflate the ingested count",
+                );
+            }
+            crate::event_loop::RbsrStep::Failed => {
+                panic!("must not fail on multi-responder frames")
+            }
+        }
+        let msgs = requester
+            .engine
+            .list_messages(None, 100)
+            .await
+            .expect("list");
+        assert_eq!(msgs.len(), 3, "all real Have events recovered");
+    }
+
+    #[tokio::test]
     async fn rbsr_multi_round_bisection_recovers_large_set_in_process() {
         // Repro for the deep-bisection path (count ≫ LEAF_THRESHOLD): drive the
         // full requester↔responder round loop in-process (no Zenoh) and assert
@@ -3308,8 +3390,8 @@ mod tests {
                 );
             }
             match requester.engine.rbsr_ingest_and_next(frames).await {
-                crate::event_loop::RbsrStep::Converged => break,
-                crate::event_loop::RbsrStep::Continue(next) => sealed = next,
+                crate::event_loop::RbsrStep::Converged { .. } => break,
+                crate::event_loop::RbsrStep::Continue { next, .. } => sealed = next,
                 crate::event_loop::RbsrStep::Failed => panic!("ingest failed mid-reconcile"),
             }
         }
