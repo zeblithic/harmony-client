@@ -7000,18 +7000,41 @@ pub async fn start_node_inner(
                         ));
 
                     // Wire case-C fallback into the ReachabilityResolver.
-                    // The contexts_fn is a STUB returning empty Vec for now —
-                    // full implementation requires mapping OwnerAddr → identity_pub
-                    // across all shared communities, which needs a richer community-state
-                    // lookup path. TODO ZEB-323 §4.4: implement contexts_fn by walking
-                    // the community registry and resolving the target's identity_pub
-                    // from the per-community member map.
+                    // ZEB-596: the contexts closure walks the community registry
+                    // live (async) — for each community the target peer is a
+                    // Joined member of, it produces (community_id, our current
+                    // EpochKey, the target's identity_pub) so the adapter can
+                    // derive the per-member case-C pkarr key (spec §5.3/§7.4).
+                    // The walk reads the CURRENT EpochKey (rotates per epoch,
+                    // ZEB-249) rather than a snapshot, and returns all contexts
+                    // before the adapter does any relay IO.
+                    let contexts_registry = std::sync::Arc::clone(&registry);
+                    let contexts_crdt = std::sync::Arc::clone(&crdt_state);
+                    let contexts_self_owner = self_owner;
+                    let contexts_self_id_pub = identity_pub_64;
                     let contexts_fn: pkarr_resolver_adapter::ContextsFn = std::sync::Arc::new(
-                        |_target_addr: &crate::owner_state_types::OwnerAddr| {
-                            // TODO ZEB-323 §4.4: resolve peer → community contexts.
-                            // Return empty vec until the member-identity-pub lookup
-                            // path is implemented.
-                            Vec::new()
+                        move |target_addr: crate::owner_state_types::OwnerAddr| {
+                            let registry = std::sync::Arc::clone(&contexts_registry);
+                            let crdt = std::sync::Arc::clone(&contexts_crdt);
+                            let resolver =
+                                crate::community_state_sync::OwnerDeviceCacheResolver::new(
+                                    std::sync::Arc::clone(&contexts_crdt),
+                                    contexts_self_owner,
+                                    contexts_self_id_pub,
+                                );
+                            Box::pin(async move {
+                                pkarr_resolver_adapter::community_contexts_for_target(
+                                    &registry,
+                                    &crdt,
+                                    &resolver,
+                                    target_addr,
+                                )
+                                .await
+                            })
+                                as futures::future::BoxFuture<
+                                    'static,
+                                    Vec<pkarr_resolver_adapter::PkarrCommunityContext>,
+                                >
                         },
                     );
                     let adapter =

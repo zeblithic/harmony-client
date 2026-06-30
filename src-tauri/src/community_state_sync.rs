@@ -2610,7 +2610,7 @@ async fn internal_task(mut ctx: InternalCtx) {
 ///   missing or incomplete we surface `LiveEpochKeyMissing` rather than
 ///   silently using the spawn-time key, which would reopen the §10.6
 ///   backward-secrecy gap.
-async fn live_epoch_key(
+pub(crate) async fn live_epoch_key(
     community_id: SpaceId,
     crdt_state: Option<&Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
     fallback: &EpochKey,

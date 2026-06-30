@@ -84,8 +84,8 @@ async fn case_c_community_fallback_resolve_and_warm_cache() {
         // by NodeState; here we hardcode a closure that tests the code path.
         let pkarr_resolver = Arc::new(PkarrResolver::new(Arc::clone(&client)));
         let contexts_fn: harmony_app::pkarr_resolver_adapter::ContextsFn =
-            Arc::new(move |addr: &OwnerAddr| {
-                if *addr == alice_owner_addr {
+            Arc::new(move |addr: OwnerAddr| {
+                let ctxs = if addr == alice_owner_addr {
                     vec![PkarrCommunityContext {
                         community_id,
                         epoch_key,
@@ -93,7 +93,9 @@ async fn case_c_community_fallback_resolve_and_warm_cache() {
                     }]
                 } else {
                     vec![]
-                }
+                };
+                Box::pin(async move { ctxs })
+                    as futures::future::BoxFuture<'static, Vec<PkarrCommunityContext>>
             });
         // ZEB-595: capture fallback probe telemetry so we can assert the
         // Network Health panel would see this real cross-engine hit.
