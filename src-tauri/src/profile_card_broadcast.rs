@@ -290,6 +290,25 @@ impl ProfileCardCache {
             profile_page_root: c.profile_page_root.map(hex::encode),
         })
     }
+
+    /// The display name of the most-recent verified card for `owner`, across
+    /// all subscription slots (newest by HLC wins). Used by the Network Health
+    /// snapshot to label peers; None if no verified card for that owner is
+    /// cached.
+    pub async fn display_name_for_owner(&self, owner: &[u8; 16]) -> Option<String> {
+        let g = self.slots.lock().await;
+        g.values()
+            .filter_map(|slot| slot.latest.as_ref())
+            .filter(|c| &c.owner_id == owner)
+            .max_by(|a, b| {
+                if a.shared_at.is_strictly_newer_than(&b.shared_at) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            })
+            .map(|c| c.display_name.clone())
+    }
 }
 
 /// Sign a card, canonical-CBOR-encode it, and publish to its owner_id topic.
@@ -749,6 +768,36 @@ mod tests {
         .unwrap();
         cache.insert_verified(3, &b_card).await; // owner_id == B != expected A -> ignored
         assert_eq!(cache.get_cached(3).await, None);
+    }
+
+    #[tokio::test]
+    async fn display_name_for_owner_returns_cached_name() {
+        let cache = ProfileCardCache::default();
+        let a = crate::community_membership::mint_test_owner(0x71);
+        cache.register(7, a.owner.0).await;
+        let card = sign_card(
+            &a.device_key,
+            a.owner.0,
+            "Alice".into(),
+            "".into(),
+            None,
+            None,
+            a.cert.clone(),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        cache.insert_verified(7, &card).await;
+        assert_eq!(
+            cache.display_name_for_owner(&a.owner.0).await,
+            Some("Alice".to_string())
+        );
+        // Unknown owner → None.
+        let b = crate::community_membership::mint_test_owner(0x72);
+        assert_eq!(cache.display_name_for_owner(&b.owner.0).await, None);
     }
 
     #[test]

@@ -49450,7 +49450,7 @@ async fn network_health_snapshot(
 pub(crate) async fn network_health_snapshot_impl(
     state: &std::sync::Mutex<NodeState>,
 ) -> Result<crate::network_health::NetworkHealthSnapshot, String> {
-    let (svc, settings_path, relay_client, transport_disabled_reason) = {
+    let (svc, settings_path, relay_client, transport_disabled_reason, profile_card_cache) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -49460,9 +49460,11 @@ pub(crate) async fn network_health_snapshot_impl(
             g.pkarr_relay_client.clone(),
             // ZEB-450: surface a boot-time transport failure to the UI.
             g.transport_disabled_reason.clone(),
+            // ZEB-595: profile-card cache for peer display-name enrichment.
+            g.profile_card_cache.clone(),
         )
     };
-    let snap = match svc {
+    let mut snap = match svc {
         Some(s) => s.snapshot().await,
         None => {
             // No NetworkHealthService wired (iroh bind failed / no owner
@@ -49483,6 +49485,19 @@ pub(crate) async fn network_health_snapshot_impl(
             snap
         }
     };
+    // ZEB-595: enrich peer display names from the profile-card cache (local
+    // lookup, no network). owner-addr hex → owner bytes → cached card name.
+    if let Some(cache) = profile_card_cache.as_ref() {
+        for peer in &mut snap.peers {
+            if let Ok(bytes) = hex::decode(&peer.owner_addr) {
+                if let Ok(owner) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                    if let Some(name) = cache.display_name_for_owner(&owner).await {
+                        peer.display_name = Some(name);
+                    }
+                }
+            }
+        }
+    }
     // ZEB-450: stamp the boot-time transport-disabled reason onto BOTH paths
     // (live service = always None; service-absent/disabled = the actual reason).
     Ok(crate::network_health::stamp_transport_status(
