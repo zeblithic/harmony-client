@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use harmony_app::network_health::PkarrFallbackTelemetry;
 use harmony_app::owner_state_types::{OwnerAddr, SpaceId};
 use harmony_app::pkarr_community_publisher::PkarrCommunityPublisher;
 use harmony_app::pkarr_resolver_adapter::{PkarrCommunityContext, PkarrResolverAdapter};
@@ -94,9 +95,13 @@ async fn case_c_community_fallback_resolve_and_warm_cache() {
                     vec![]
                 }
             });
+        // ZEB-595: capture fallback probe telemetry so we can assert the
+        // Network Health panel would see this real cross-engine hit.
+        let fallback_telemetry = Arc::new(PkarrFallbackTelemetry::new());
         let adapter = Arc::new(PkarrResolverAdapter::new(
             Arc::clone(&pkarr_resolver),
             contexts_fn,
+            Arc::clone(&fallback_telemetry),
         ));
 
         // --- Wire adapter into Phase 1's ReachabilityResolver ---
@@ -119,6 +124,17 @@ async fn case_c_community_fallback_resolve_and_warm_cache() {
             !resolved.is_empty(),
             "adapter must return at least one payload within 5s"
         );
+
+        // ZEB-595: the successful fallback probe must have been recorded as a
+        // HIT for alice's (peer, community) — short-form (first 4 bytes) only.
+        let events = fallback_telemetry.recent();
+        assert!(
+            events.iter().any(|e| e.hit
+                && e.peer_addr_short == "22222222"
+                && e.community_id_short == "33333333"),
+            "fallback telemetry must record a hit for alice; got {events:?}"
+        );
+
         let payload = &resolved[0];
         assert_eq!(
             payload.iroh_node_id, alice_iroh_node_id,

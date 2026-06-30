@@ -3844,6 +3844,13 @@ pub async fn start_node_inner(
         // `NetworkHealthService`'s `ProdDialSnapshot` (constructed in the
         // install block). The driver writes; the snapshot reads.
         let dial_telemetry = std::sync::Arc::new(crate::network_health::DialTelemetry::new());
+        // ZEB-595: shared Case-C pkarr fallback telemetry. Same threading model
+        // as `dial_telemetry`: the SAME Arc is cloned into the
+        // `PkarrResolverAdapter` (writer, set as the resolver's fallback source
+        // below) and the production `ProdPkarrSnapshot` (reader, in the install
+        // block). Created here so both ends share one ring for this session.
+        let pkarr_fallback_telemetry =
+            std::sync::Arc::new(crate::network_health::PkarrFallbackTelemetry::new());
         // ZEB-450: set in the boot Err arms below when the iroh transport can't
         // come up this session, then stashed into NodeState so the
         // `network_health_snapshot` IPC surfaces it as a UI banner — instead of
@@ -7011,6 +7018,9 @@ pub async fn start_node_inner(
                         std::sync::Arc::new(pkarr_resolver_adapter::PkarrResolverAdapter::new(
                             std::sync::Arc::clone(&pkarr_resolver_arc),
                             contexts_fn,
+                            // ZEB-595: writer end of the shared fallback ring;
+                            // ProdPkarrSnapshot below reads the same Arc.
+                            std::sync::Arc::clone(&pkarr_fallback_telemetry),
                         ));
                     reachability_resolver.set_fallback_source(adapter);
 
@@ -9315,6 +9325,9 @@ pub async fn start_node_inner(
                             > = if let Some(pub_arc) = guard.pkarr_publisher.as_ref() {
                                 std::sync::Arc::new(crate::network_health::ProdPkarrSnapshot::new(
                                     std::sync::Arc::clone(pub_arc),
+                                    // ZEB-595: reader end of the shared fallback
+                                    // ring written by the PkarrResolverAdapter.
+                                    std::sync::Arc::clone(&pkarr_fallback_telemetry),
                                 ))
                             } else {
                                 // No pkarr publisher (no owner identity

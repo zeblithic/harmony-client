@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use harmony_pkarr::{derive_ephemeral_key, epoch_tolerance_window, PkarrCase, PkarrResolver};
 use std::sync::Arc;
 
+use crate::network_health::PkarrFallbackTelemetry;
 use crate::owner_state_types::{OwnerAddr, SpaceId};
 use crate::reachability_record::ReachabilityAnnouncePayload;
 use crate::reachability_resolver::ReachabilityFallback;
@@ -34,11 +35,23 @@ pub struct PkarrCommunityContext {
 pub struct PkarrResolverAdapter {
     pkarr: Arc<PkarrResolver>,
     contexts: ContextsFn,
+    /// ZEB-595: records one (peer, community) probe outcome per community
+    /// context tried, surfaced by the Network Health panel via
+    /// `ProdPkarrSnapshot::recent_fallback_events`.
+    fallback_telemetry: Arc<PkarrFallbackTelemetry>,
 }
 
 impl PkarrResolverAdapter {
-    pub fn new(pkarr: Arc<PkarrResolver>, contexts: ContextsFn) -> Self {
-        Self { pkarr, contexts }
+    pub fn new(
+        pkarr: Arc<PkarrResolver>,
+        contexts: ContextsFn,
+        fallback_telemetry: Arc<PkarrFallbackTelemetry>,
+    ) -> Self {
+        Self {
+            pkarr,
+            contexts,
+            fallback_telemetry,
+        }
     }
 }
 
@@ -60,6 +73,10 @@ impl ReachabilityFallback for PkarrResolverAdapter {
         // collect successful records. First valid response per community wins.
         let mut payloads = Vec::new();
         for ctx in ctxs {
+            // ZEB-595: track whether THIS community context yielded a valid
+            // routing payload so the Network Health panel can show a per-peer,
+            // per-community hit/miss breakdown.
+            let mut ctx_hit = false;
             'epoch_loop: for epoch in epoch_window {
                 let mut info = Vec::with_capacity(64 + 8);
                 info.extend_from_slice(&ctx.target_member_identity_pub);
@@ -87,10 +104,13 @@ impl ReachabilityFallback for PkarrResolverAdapter {
                         rec.routing_blob.as_slice(),
                     ) {
                         payloads.push(payload);
+                        ctx_hit = true;
                         break 'epoch_loop; // First valid per community
                     }
                 }
             }
+            self.fallback_telemetry
+                .record(&addr.0, &ctx.community_id.0, ctx_hit);
         }
         payloads
     }
@@ -108,9 +128,52 @@ mod tests {
         let pool = RelayPool::new(vec![relay.base_url.clone()]);
         let client = Arc::new(RelayClient::new(pool));
         let pkarr = Arc::new(PkarrResolver::new(client));
-        let adapter = PkarrResolverAdapter::new(pkarr, Arc::new(|_addr| Vec::new()));
+        let telemetry = Arc::new(PkarrFallbackTelemetry::new());
+        let adapter =
+            PkarrResolverAdapter::new(pkarr, Arc::new(|_addr| Vec::new()), Arc::clone(&telemetry));
         let result = adapter.resolve(&OwnerAddr([0u8; 16])).await;
         assert!(result.is_empty());
+        // ZEB-595: no community context to probe -> nothing recorded. The ring
+        // must not fill with meaningless "no-context" entries on every resolve.
+        assert!(
+            telemetry.recent().is_empty(),
+            "empty contexts must record no fallback events"
+        );
+    }
+
+    #[tokio::test]
+    async fn records_miss_when_no_record_published() {
+        // ZEB-595: a non-empty community context whose pkarr lookup finds
+        // nothing must record exactly one MISS for that (peer, community).
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let pkarr = Arc::new(PkarrResolver::new(client));
+        let telemetry = Arc::new(PkarrFallbackTelemetry::new());
+
+        let target_addr = OwnerAddr([0x22u8; 16]);
+        let community_id = SpaceId([0x33u8; 16]);
+        let contexts: ContextsFn = Arc::new(move |addr: &OwnerAddr| {
+            if *addr == target_addr {
+                vec![PkarrCommunityContext {
+                    community_id,
+                    epoch_key: [0xBBu8; 32],
+                    target_member_identity_pub: [0u8; 64],
+                }]
+            } else {
+                vec![]
+            }
+        });
+        let adapter = PkarrResolverAdapter::new(pkarr, contexts, Arc::clone(&telemetry));
+
+        let out = adapter.resolve(&target_addr).await;
+        assert!(out.is_empty(), "nothing published -> no payloads");
+
+        let events = telemetry.recent();
+        assert_eq!(events.len(), 1, "one probe -> one recorded event");
+        assert!(!events[0].hit, "no record published -> miss");
+        assert_eq!(events[0].peer_addr_short, "22222222");
+        assert_eq!(events[0].community_id_short, "33333333");
     }
 
     #[allow(dead_code)]
