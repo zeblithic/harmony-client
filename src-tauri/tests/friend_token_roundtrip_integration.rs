@@ -27,8 +27,11 @@
 //! owner_id; A's owner-state has `FriendEntry{B, Active, Token}` keyed on B's
 //! owner_id; A unregistered the `friend:{token.sig}` handle on consume.
 //!
-//! Run serially (`-j 1`) to dodge the known UDP-port-4242 contention flake
-//! (ZEB-347), and wrapped in a generous `tokio::time::timeout`.
+//! ZEB-446 made the Reticulum bind degradable (a 4242 collision now warns and
+//! falls back to an ephemeral loopback port instead of erroring), so this no
+//! longer needs serial (`-j 1`) execution — it runs fine under parallel nextest
+//! (ZEB-165 / ZEB-383). The end-to-end handshake is still wrapped in a generous
+//! `tokio::time::timeout`.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
