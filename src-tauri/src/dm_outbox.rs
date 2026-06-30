@@ -250,10 +250,16 @@ impl DmTransport for RuntimeUnicastTransport {
             space_id: entry.space_id,
             message_cid: entry.message_cid,
             sender_owner_addr: self.self_owner,
-            // Phase 3b: single-device sender_devices (just the signer).
-            // Cross-device piggyback (sender lists ALL bound devices) is
-            // a documented follow-up — see spec §"Public-key storage on
-            // OwnerDeviceCache".
+            // `RuntimeUnicastTransport` is test-only (no production `::new`
+            // call site — the Reticulum direct path it served was torn out in
+            // ZEB-474). The production CidNotify builders — the deposit path
+            // (`build_cidnotify_packet_bytes`) and the live tunnel
+            // (`IrohTunnelDmTransport::send`) — carry the sender's FULL cached
+            // device set via `resolve_sender_devices` (ZEB-506) so the
+            // recipient's LWW-replace cache refresh never shrinks a multi-device
+            // sender. This synthetic transport keeps the bare singleton: it has
+            // no `OwnerState` to resolve against, and tests that need a
+            // multi-device set seed the receiver cache directly.
             sender_devices: vec![self.our_signing_device_hash],
             signing_device_hash: self.our_signing_device_hash,
         };
@@ -377,7 +383,8 @@ pub(crate) fn build_dm_packet_with_blob(
 /// Behavior-preserving extraction of `add_space_dm_inner`'s prior inline logic:
 /// the cache stores `devices` already sorted+deduped, so the common branch
 /// returns it as-is; only the (rare) fallback that must append the signing hash
-/// re-sorts.
+/// re-sorts and re-caps to `MAX_DEVICES_PER_OWNER` (ZEB-506: the decoder rejects
+/// an over-cap `sender_devices`, so appending the signer must never overflow).
 pub(crate) fn resolve_sender_devices(
     state: &OwnerState,
     self_owner: OwnerAddr,
@@ -396,6 +403,24 @@ pub(crate) fn resolve_sender_devices(
         combined.push(our_signing_device_hash);
         combined.sort();
         combined.dedup();
+        // ZEB-506 (Qodo): the cached set is already capped at
+        // MAX_DEVICES_PER_OWNER, so appending a missing signer can push this to
+        // MAX + 1. The CidNotify / Invite decoder rejects any packet whose
+        // `sender_devices.len() > MAX_DEVICES_PER_OWNER` AND requires the signer
+        // to be present — so re-cap by evicting the largest NON-signer
+        // device(s), never the signer. (Removing from a sorted Vec preserves
+        // the sort, so no re-sort is needed.)
+        while combined.len() > crate::owner_state_types::MAX_DEVICES_PER_OWNER {
+            match combined.iter().rposition(|d| *d != our_signing_device_hash) {
+                Some(pos) => {
+                    combined.remove(pos);
+                }
+                // Unreachable after dedup (the signer appears at most once, so a
+                // list longer than 1 always has a non-signer to evict); break
+                // rather than loop forever if that invariant ever changes.
+                None => break,
+            }
+        }
         combined
     }
 }
@@ -1450,18 +1475,29 @@ impl DmOutbox {
         (outcome, deposit_candidates)
     }
 
-    /// ZEB-418 P1 Task 8: build the signed CidNotify wire bytes for a
-    /// deposit — the IDENTICAL construction `RuntimeUnicastTransport::send`
-    /// produces for the direct path (same `sender_devices`, same
-    /// `signing_device_hash`, signed by the same Reticulum device key), so
-    /// the butler's inner verification and the recipient's eventual
-    /// ingestion see exactly what a direct arrival would carry.
-    fn build_cidnotify_packet_bytes(&self, entry: &OutboxEntry) -> Result<Vec<u8>, String> {
+    /// ZEB-418 P1 Task 8 / ZEB-506: build the signed CidNotify wire bytes for a
+    /// deposit. Carries the sender's FULL cached device set via
+    /// [`resolve_sender_devices`] (NOT a bare singleton): the recipient's
+    /// ingestion refreshes its `OwnerDeviceCache` for this sender from
+    /// `sender_devices` through the LWW-REPLACE `apply_owner_device_update`, so a
+    /// singleton here would shrink a multi-device sender's cached set down to the
+    /// signing device and drop later messages signed by the others
+    /// (`UnknownSigningKey`). This is the same fix the invite builders received
+    /// in PR #302 — see [`resolve_sender_devices`].
+    fn build_cidnotify_packet_bytes(
+        &self,
+        state: &OwnerState,
+        entry: &OutboxEntry,
+    ) -> Result<Vec<u8>, String> {
         let signed = crate::dm_envelope::DmCidNotifySigned {
             space_id: entry.space_id,
             message_cid: entry.message_cid,
             sender_owner_addr: self.self_owner,
-            sender_devices: vec![self.our_signing_device_hash],
+            sender_devices: resolve_sender_devices(
+                state,
+                self.self_owner,
+                self.our_signing_device_hash,
+            ),
             signing_device_hash: self.our_signing_device_hash,
         };
         build_dm_packet(signed, &self.signing_key)
@@ -1540,7 +1576,7 @@ impl DmOutbox {
                 return;
             }
         };
-        match self.build_cidnotify_packet_bytes(entry) {
+        match self.build_cidnotify_packet_bytes(state, entry) {
             Ok(cidnotify_packet) => out.push(crate::butler_deposit::ButlerDepositRequest {
                 entry_id,
                 recipient_owner: recipient,
@@ -5291,7 +5327,9 @@ mod tests {
                 assert_eq!(
                     signed.sender_devices,
                     vec![our_device],
-                    "Phase 3b ships single-device sender_devices"
+                    "the test-only RuntimeUnicastTransport ships a single-device \
+                     sender_devices (it has no OwnerState to resolve against); the \
+                     production builders carry the full cached set — see ZEB-506"
                 );
                 // Signature must verify against our identity_pub +
                 // claimed device hash.
@@ -5305,6 +5343,138 @@ mod tests {
             }
             other => panic!("expected CidNotify, got {other:?}"),
         }
+    }
+
+    /// ZEB-506: a deposit CidNotify must carry the sender's FULL cached device
+    /// set (via `resolve_sender_devices`), NOT a bare singleton. The recipient's
+    /// ingestion refreshes its `OwnerDeviceCache` for the sender from
+    /// `sender_devices` through the LWW-REPLACE `apply_owner_device_update`, so a
+    /// singleton would shrink a multi-device sender's cached set down to the
+    /// signing device and drop later messages signed by its other devices
+    /// (`UnknownSigningKey`). Regression guard for the deposit builder; the
+    /// live-tunnel builder (`IrohTunnelDmTransport::send`) shares the same
+    /// `resolve_sender_devices` call.
+    #[tokio::test]
+    async fn build_cidnotify_carries_full_device_set_not_singleton() {
+        use crate::owner_state_crdt::OwnerState;
+
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let outbox = make_outbox_synthetic("dev", alice);
+        let self_owner = outbox.self_owner;
+
+        // Alice is multi-device: the signer plus two siblings, as a friend
+        // handshake would have populated on the receiver side.
+        let d_signer = outbox.our_signing_device_hash;
+        let d2 = DeviceIdentityHash([0xd2; 16]);
+        let d3 = DeviceIdentityHash([0xd3; 16]);
+        let mut full_set = vec![d_signer, d2, d3];
+        let apply = state.apply_owner_device_update(
+            self_owner,
+            full_set.clone(),
+            vec![None, None, None],
+            Vec::new(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "seed".into(),
+            },
+        );
+        assert!(
+            !matches!(apply, crate::owner_state_crdt::ApplyOutcome::Rejected(_)),
+            "seeding the multi-device cache must succeed: {apply:?}"
+        );
+
+        let entry = OutboxEntry {
+            id: OutboxEntryId([0xab; 16]),
+            space_id: SpaceId([0xcc; 16]),
+            recipient_owners: vec![OwnerAddr([1; 16])],
+            message_cid: ContentId::from_bytes([0xee; 32]),
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            delivered_to: BTreeSet::new(),
+            delivery_status: DeliveryStatus::Pending,
+        };
+
+        let wire = outbox
+            .build_cidnotify_packet_bytes(&state, &entry)
+            .expect("build cidnotify");
+        match crate::dm_envelope::decode_packet(&wire).unwrap() {
+            crate::dm_envelope::DmPacket::CidNotify { signed, .. } => {
+                full_set.sort();
+                assert_eq!(
+                    signed.sender_devices, full_set,
+                    "deposit CidNotify must carry alice's full multi-device set, not a singleton"
+                );
+            }
+            other => panic!("expected CidNotify, got {other:?}"),
+        }
+    }
+
+    /// ZEB-506 (Qodo): when the cached device set is already at
+    /// `MAX_DEVICES_PER_OWNER` and does NOT contain the signing device,
+    /// `resolve_sender_devices` must still cap the result at MAX — the CidNotify
+    /// / Invite decoder rejects `sender_devices.len() > MAX_DEVICES_PER_OWNER`
+    /// (the packet would be silently dropped) — WHILE keeping the signer, since
+    /// the decoder also requires `signer ∈ sender_devices`. The signer here is
+    /// chosen to sort ABOVE every cached device, so a naive `truncate(MAX)`
+    /// would evict it: this proves we evict a non-signer instead.
+    #[test]
+    fn resolve_sender_devices_caps_at_max_keeping_signer_when_signer_missing() {
+        use crate::owner_state_crdt::OwnerState;
+        use crate::owner_state_types::MAX_DEVICES_PER_OWNER;
+
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        // Signer sorts above all cached devices (0xff..) and is NOT in the cache.
+        let signer = DeviceIdentityHash([0xff; 16]);
+        let devices: Vec<DeviceIdentityHash> = (0..MAX_DEVICES_PER_OWNER)
+            .map(|i| DeviceIdentityHash([i as u8; 16]))
+            .collect();
+        let apply = state.apply_owner_device_update(
+            alice,
+            devices.clone(),
+            vec![None; devices.len()],
+            Vec::new(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "seed".into(),
+            },
+        );
+        assert!(
+            !matches!(apply, crate::owner_state_crdt::ApplyOutcome::Rejected(_)),
+            "seeding a full (MAX) device cache must succeed: {apply:?}"
+        );
+        let cached = &state
+            .owner_device_cache
+            .devices
+            .get(&alice)
+            .unwrap()
+            .devices;
+        assert_eq!(
+            cached.len(),
+            MAX_DEVICES_PER_OWNER,
+            "precondition: cache at MAX"
+        );
+        assert!(
+            !cached.contains(&signer),
+            "precondition: signer absent from cache"
+        );
+
+        let resolved = resolve_sender_devices(&state, alice, signer);
+        assert!(
+            resolved.len() <= MAX_DEVICES_PER_OWNER,
+            "must re-cap to MAX (decoder rejects len > MAX), got {}",
+            resolved.len()
+        );
+        assert!(
+            resolved.contains(&signer),
+            "signer must survive the cap (decoder requires signer ∈ sender_devices)"
+        );
     }
 
     /// Empty `destinations` → `TransportError::Transient` so drain bumps

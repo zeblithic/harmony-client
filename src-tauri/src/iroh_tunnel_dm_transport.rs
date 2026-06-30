@@ -309,11 +309,28 @@ impl DmTransport for IrohTunnelDmTransport {
                     // rather than before the semaphore avoids signing/encoding
                     // work under the owner-state lock for shed attempts (CodeAnt).
                     let invite_wire = self.build_bootstrap_invite(entry, recipient).await;
+                    // ZEB-506: carry the sender's FULL cached device set (a cheap
+                    // cache lookup under a brief owner-state lock — no CasOp here,
+                    // so no drain deadlock) instead of a bare singleton. The
+                    // recipient's ingestion refreshes its OwnerDeviceCache for
+                    // this sender from `sender_devices` via the LWW-REPLACE
+                    // `apply_owner_device_update`, so a singleton would shrink a
+                    // multi-device sender's set and drop later messages signed by
+                    // its other devices. Mirrors the deposit path + the PR #302
+                    // invite fix (`resolve_sender_devices`).
+                    let sender_devices = {
+                        let state = self.crdt_state.lock().await;
+                        crate::dm_outbox::resolve_sender_devices(
+                            &state,
+                            self.self_owner,
+                            self.our_signing_device_hash,
+                        )
+                    };
                     let signed = crate::dm_envelope::DmCidNotifySigned {
                         space_id: entry.space_id,
                         message_cid: entry.message_cid,
                         sender_owner_addr: self.self_owner,
-                        sender_devices: vec![self.our_signing_device_hash],
+                        sender_devices,
                         signing_device_hash: self.our_signing_device_hash,
                     };
                     // ZEB-485: SPAWN the blob build + tunnel `send_dm`, do NOT
