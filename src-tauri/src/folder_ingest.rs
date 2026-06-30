@@ -634,9 +634,24 @@ mod tests {
         assert!(!should_filter_name("My Documents"));
     }
 
+    /// Build a walk-root tempdir with a NON-dot prefix.
+    ///
+    /// `tempfile::tempdir()` defaults to a `.tmp<rand>` basename; the deny-list
+    /// in `should_filter_name` rejects any `.`-prefixed name — including the walk
+    /// root itself (see the root guard at ~line 291) — so a default tempdir root
+    /// is filtered out wholesale and the walk sees zero files (ZEB-332 / ZEB-306).
+    /// Production roots are user-chosen and never dot-prefixed, so this is purely
+    /// a test-scaffolding concern; the production filter is intentionally unchanged.
+    fn walk_root_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("ingest-test")
+            .tempdir()
+            .expect("tempdir")
+    }
+
     #[test]
     fn pre_walk_counts_only_non_filtered_leaves() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = walk_root_tempdir();
         std::fs::write(dir.path().join("a.txt"), b"a").expect("write");
         std::fs::write(dir.path().join("b.txt"), b"b").expect("write");
         std::fs::write(dir.path().join(".hidden"), b"x").expect("write");
@@ -709,7 +724,7 @@ mod tests {
         let index = fresh_content_index();
         let registry: CancelRegistry = Arc::new(Mutex::new(Default::default()));
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = walk_root_tempdir();
         std::fs::write(dir.path().join("cat.jpg"), b"meow").expect("write cat");
         std::fs::write(dir.path().join("dog.jpg"), b"woof").expect("write dog");
 
@@ -763,7 +778,7 @@ mod tests {
             tokio::sync::mpsc::channel::<crate::event_loop::ContentVerbRequest>(8);
         let index = fresh_content_index();
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = walk_root_tempdir();
         std::fs::write(dir.path().join("a.txt"), b"a").expect("write a");
         std::fs::write(dir.path().join("b.txt"), b"b").expect("write b");
 

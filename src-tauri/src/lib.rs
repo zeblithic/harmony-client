@@ -50498,6 +50498,53 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
     ])
 }
 
+/// Build a mock Tauri [`tauri::Context`] whose runtime authority pre-allows
+/// the given `commands`, so [`tauri::test::get_ipc_response`] can drive those
+/// app IPCs in a test without the Tauri 2.11 ACL gate rejecting them.
+///
+/// `tauri::test::mock_context(noop_assets())` ships an empty resolved ACL;
+/// under Tauri 2.11 the webview IPC gate (`RuntimeAuthority::resolve_access`)
+/// then rejects any app command that isn't explicitly pre-allowed, surfacing
+/// as `"<cmd> not allowed. Plugin not found"`. This helper inserts an
+/// allow-entry for each named command (matching any window) so the command
+/// body actually runs. Pass the snake_case Rust fn names the test invokes
+/// (the same identifiers registered via [`add_dm_ipc_handlers`]).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn mock_context_with_full_acl(commands: &[&str]) -> tauri::Context<tauri::test::MockRuntime> {
+    let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+    for command in commands {
+        // `__allow_command` is doc-hidden but public; it registers a
+        // ResolvedCommand for the command with `windows: ["*"]`. The
+        // `ExecutionContext` defaults to `Local`, matching the local-origin
+        // mock webview used by `get_ipc_response`.
+        context
+            .runtime_authority_mut()
+            .__allow_command((*command).to_string(), Default::default());
+    }
+    context
+}
+
+/// The webview origin URL a test must send so Tauri 2.11 treats an IPC as a
+/// local (same-origin) call. `is_local_url` only returns `Origin::Local` when
+/// the request URL matches the app's tauri protocol URL: `tauri://localhost`
+/// on Linux/macOS, `http://tauri.localhost` on Windows/Android. Using the wrong
+/// one makes the runtime treat the call as a remote origin, which the ACL gate
+/// denies even after [`mock_context_with_full_acl`] allows the command — so
+/// pair this with that helper when building an `InvokeRequest` for
+/// `tauri::test::get_ipc_response`.
+#[cfg(all(
+    any(test, feature = "test-fixtures"),
+    not(any(windows, target_os = "android"))
+))]
+pub const LOCAL_IPC_URL: &str = "tauri://localhost";
+
+/// See [`LOCAL_IPC_URL`] — Windows/Android use the `http://<name>.localhost` form.
+#[cfg(all(
+    any(test, feature = "test-fixtures"),
+    any(windows, target_os = "android")
+))]
+pub const LOCAL_IPC_URL: &str = "http://tauri.localhost";
+
 #[cfg(test)]
 mod tests {
     use super::*;

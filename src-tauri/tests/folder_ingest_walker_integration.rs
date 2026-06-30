@@ -63,6 +63,21 @@ fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
     Arc::new(Mutex::new(idx))
 }
 
+/// Build a walk-root tempdir with a NON-dot prefix.
+///
+/// `tempfile::tempdir()` defaults to a `.tmp<rand>` basename, which the walker
+/// rejects at the root guard (`should_filter_name` denies any `.`-prefixed
+/// name) with "Cannot ingest hidden/system folder as root" — so the walk sees
+/// nothing and every assertion below fails (ZEB-332 / ZEB-306). Production
+/// roots are user-chosen and never dot-prefixed; this is purely a
+/// test-scaffolding concern. Mirrors `folder_ingest::tests::walk_root_tempdir`.
+fn walk_root_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("ingest-test")
+        .tempdir()
+        .expect("tempdir")
+}
+
 /// Bag of channels + state every test needs. Held by name so individual
 /// scenarios can reach in for the recorded ingest log or the index.
 struct WalkerHarness {
@@ -159,7 +174,7 @@ fn parse_root_manifest(log: &IngestLog, root_bundle_cid_hex: &str) -> Vec<folder
 
 #[tokio::test]
 async fn flat_dir_three_leaves_sorted_alphabetically() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = walk_root_tempdir();
     // Write in non-alphabetical order so the assertion proves the walker
     // sorts (not just preserves insertion order, which happens to be the
     // OS-dependent read_dir order).
@@ -220,7 +235,7 @@ async fn flat_dir_three_leaves_sorted_alphabetically() {
 
 #[tokio::test]
 async fn nested_two_level_tree_builds_bottom_up_with_single_sidecar() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = walk_root_tempdir();
     std::fs::create_dir(dir.path().join("sub")).expect("mkdir sub");
     let leaf_bytes = b"nested-leaf-data";
     std::fs::write(dir.path().join("sub").join("leaf.bin"), leaf_bytes).expect("write leaf");
@@ -291,7 +306,7 @@ async fn nested_two_level_tree_builds_bottom_up_with_single_sidecar() {
 
 #[tokio::test]
 async fn empty_subdir_appears_in_root_manifest_as_folder_with_no_leaves() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = walk_root_tempdir();
     std::fs::create_dir(dir.path().join("empty_sub")).expect("mkdir empty_sub");
 
     let h = fresh_harness();
@@ -325,7 +340,7 @@ async fn empty_subdir_appears_in_root_manifest_as_folder_with_no_leaves() {
 
 #[tokio::test]
 async fn deny_list_skips_ds_store_thumbs_db_and_dotfiles() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = walk_root_tempdir();
     // Real leaf survivors so the manifest has a non-empty positive shape.
     std::fs::write(dir.path().join("keeper.txt"), b"keep").expect("write keeper");
     // The 3 spec-listed junk names plus a .git directory whose HEAD must
@@ -367,7 +382,7 @@ async fn deny_list_skips_ds_store_thumbs_db_and_dotfiles() {
 async fn symlink_to_file_is_skipped() {
     use std::os::unix::fs::symlink;
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = walk_root_tempdir();
     let real = dir.path().join("real.txt");
     std::fs::write(&real, b"real-data").expect("write real");
     let link = dir.path().join("link.txt");
@@ -413,7 +428,7 @@ async fn symlink_to_directory_is_not_followed() {
     std::fs::write(outside.path().join("inside_target.txt"), outside_leaf_bytes)
         .expect("write outside leaf");
 
-    let dir = tempfile::tempdir().expect("walk-root tempdir");
+    let dir = walk_root_tempdir();
     // A real leaf survivor so the manifest isn't empty.
     std::fs::write(dir.path().join("plain.txt"), b"plain").expect("write plain");
     let link_dir = dir.path().join("link_to_outside");
@@ -470,7 +485,7 @@ async fn symlink_to_directory_is_not_followed() {
 /// mid-iteration.
 #[tokio::test]
 async fn cancel_mid_walk_settles_with_cancelled_true_and_no_root_sidecar() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = walk_root_tempdir();
     // 5 files is plenty: the gated handler stalls on file #1, so we have
     // 4 more children plus the root-manifest build still pending when the
     // cancel flag fires. The exact count > 1 is the only contract.
@@ -610,7 +625,7 @@ async fn per_leaf_io_error_is_recorded_and_walk_continues() {
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = walk_root_tempdir();
     std::fs::write(dir.path().join("survivor.txt"), b"survive").expect("write survivor");
     let unreadable = dir.path().join("locked.bin");
     std::fs::write(&unreadable, b"forbidden").expect("write locked");
@@ -688,7 +703,7 @@ async fn root_walk_failure_message_is_surfaced_in_failed_list() {
     let index = fresh_content_index();
     let registry: CancelRegistry = Arc::new(Mutex::new(Default::default()));
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = walk_root_tempdir();
     // Empty root — the only ingest sends are for the root manifest
     // book + bundle. Both fail at the closed channel.
     let result = folder_ingest::ingest_folder_tree(
