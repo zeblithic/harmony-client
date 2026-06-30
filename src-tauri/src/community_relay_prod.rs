@@ -389,8 +389,44 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
     }
 
     async fn ingest_recovered(&self, payload: DepositPayload) -> Result<(), String> {
+        // ZEB-505: an invite-only recovered deposit (no CidNotify) bootstraps
+        // the DM Space from the invite ALONE — no blob, no message, no emit.
+        // Admission gating happened at deposit time; `apply_invite` verifies the
+        // invite signature (binding inviter_identity_pub ↔ the signing device),
+        // so a relay can't forge a Space for an owner that didn't sign it.
+        let Some(cidnotify_bytes) = payload.cidnotify_packet.as_deref() else {
+            let invite = payload
+                .invite_packet
+                .as_deref()
+                .ok_or("ZEB-505: invite-only deposit missing invite_packet")?;
+            let inv_packet = crate::dm_envelope::decode_packet(invite)
+                .map_err(|e| format!("decode invite: {e}"))?;
+            let crate::dm_envelope::DmPacket::Invite {
+                signed,
+                signature,
+                signed_bytes,
+            } = inv_packet
+            else {
+                return Err("ZEB-505: invite-only deposit packet is not an Invite".into());
+            };
+            let expected_inviter = signed.inviter;
+            let mut state = self.crdt_state.lock().await;
+            crate::dm_outbox::apply_invite(
+                &mut state,
+                self.self_owner,
+                &self.device_id,
+                signed,
+                signature,
+                &signed_bytes,
+                now_epoch_ms(),
+                Some(expected_inviter),
+                false,
+            )
+            .map_err(|e| format!("apply_invite: {e:?}"))?;
+            return Ok(());
+        };
         // 1. Decode the recovered packet — must be a signed CidNotify.
-        let packet = crate::dm_envelope::decode_packet(&payload.cidnotify_packet)
+        let packet = crate::dm_envelope::decode_packet(cidnotify_bytes)
             .map_err(|e| format!("decode_packet: {e}"))?;
         let crate::dm_envelope::DmPacket::CidNotify {
             signed,
@@ -825,9 +861,14 @@ impl crate::community_relay::CommunityRelayDepositClient for ProdCommunityRelayD
 
         // 3. Fetch the storage blob (only after a target + a shared community
         //    are confirmed — no CAS work for a no-op rung). Miss/err → false.
-        let storage_blob = match self.cas.get(&req.message_cid).await {
-            Ok(Some(blob)) => blob,
-            Ok(None) | Err(_) => return false,
+        //    ZEB-505: an invite-only deposit (no message_cid) carries the invite
+        //    alone — there is no blob to fetch.
+        let storage_blob = match req.message_cid {
+            Some(message_cid) => match self.cas.get(&message_cid).await {
+                Ok(Some(blob)) => blob,
+                Ok(None) | Err(_) => return false,
+            },
+            None => Vec::new(),
         };
         let payload = DepositPayload {
             cidnotify_packet: req.cidnotify_packet.clone(),

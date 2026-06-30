@@ -309,75 +309,94 @@ impl DmTransport for IrohTunnelDmTransport {
                     // rather than before the semaphore avoids signing/encoding
                     // work under the owner-state lock for shed attempts (CodeAnt).
                     let invite_wire = self.build_bootstrap_invite(entry, recipient).await;
-                    // ZEB-506: carry the sender's FULL cached device set (a cheap
-                    // cache lookup under a brief owner-state lock — no CasOp here,
-                    // so no drain deadlock) instead of a bare singleton. The
-                    // recipient's ingestion refreshes its OwnerDeviceCache for
-                    // this sender from `sender_devices` via the LWW-REPLACE
-                    // `apply_owner_device_update`, so a singleton would shrink a
-                    // multi-device sender's set and drop later messages signed by
-                    // its other devices. Mirrors the deposit path + the PR #302
-                    // invite fix (`resolve_sender_devices`).
-                    let sender_devices = {
-                        let state = self.crdt_state.lock().await;
-                        crate::dm_outbox::resolve_sender_devices(
-                            &state,
-                            self.self_owner,
-                            self.our_signing_device_hash,
-                        )
-                    };
-                    let signed = crate::dm_envelope::DmCidNotifySigned {
-                        space_id: entry.space_id,
-                        message_cid: entry.message_cid,
-                        sender_owner_addr: self.self_owner,
-                        sender_devices,
-                        signing_device_hash: self.our_signing_device_hash,
-                    };
-                    // ZEB-485: SPAWN the blob build + tunnel `send_dm`, do NOT
-                    // await it inline. `build_tunnel_dm_packet` reads the local
-                    // CAS via `CasOp::GetLocal`, which is serviced by the SAME
-                    // event loop that drives this outbox drain inline (its timer
-                    // tick does `drain_lifted(...).await`). Awaiting `get_local`
-                    // here deadlocks: the loop is blocked on the drain and can
-                    // never reply to its own `GetLocal`. Spawning frees the loop
-                    // to service `GetLocal`; we return `Transient` immediately and
-                    // the deposit rung carries durability regardless. (Resolving
-                    // targets above only locks `crdt_state` — not the CasOp bridge
-                    // — so it stays inline.)
                     let mgr = std::sync::Arc::clone(&self.mgr);
-                    let cas = std::sync::Arc::clone(&self.cas);
-                    let signing_key = std::sync::Arc::clone(&self.signing_key);
-                    let message_cid = entry.message_cid;
-                    tokio::spawn(async move {
-                        // Hold the permit for the task's lifetime; releasing it on
-                        // completion lets the next backlogged DM attempt the tunnel.
-                        let _permit = permit;
-                        // ZEB-484: inline the encrypted blob when it fits; else bare CidNotify.
-                        match build_tunnel_dm_packet(&cas, &signed, &signing_key, message_cid).await
-                        {
-                            Ok(packet) => {
-                                for (node_id, contact) in &targets {
-                                    // ZEB-504: send the bootstrap invite FIRST so
-                                    // the recipient creates the Space before the
-                                    // CidNotify is admitted (else `SpaceNotFound`).
-                                    // The tunnel's in-order FIFO preserves this
-                                    // ordering per peer; `invite_wire` is `None`
-                                    // once the recipient has acked (Space exists).
-                                    if let Some(inv) = &invite_wire {
+                    // ZEB-485: SPAWN the tunnel `send_dm`s, do NOT await inline.
+                    // `build_tunnel_dm_packet` reads the local CAS via
+                    // `CasOp::GetLocal`, serviced by the SAME event loop that drives
+                    // this drain inline — awaiting it here would deadlock. Spawning
+                    // frees the loop; we return `Transient` immediately and the
+                    // deposit rung carries durability regardless.
+                    match entry.message_cid {
+                        // ZEB-505: invite-only entry — send the rebuilt bootstrap
+                        // invite ALONE (no CidNotify; there is no message). The
+                        // deposit rung carries durability exactly as for messages.
+                        None => {
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Some(inv) = &invite_wire {
+                                    for (node_id, contact) in &targets {
                                         mgr.send_dm(*node_id, contact, inv.clone());
                                     }
-                                    mgr.send_dm(*node_id, contact, packet.clone());
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    recipient = ?recipient,
-                                    error = %e,
-                                    "ZEB-484: tunnel DM packet build failed; deposit rung still covers this DM"
-                                );
-                            }
+                            });
                         }
-                    });
+                        // Message entry — send the invite (if still needed) ahead of
+                        // the CidNotify so the recipient creates the Space first.
+                        Some(message_cid) => {
+                            // ZEB-506: carry the sender's FULL cached device set (a
+                            // cheap cache lookup under a brief owner-state lock — no
+                            // CasOp here, so no drain deadlock) instead of a bare
+                            // singleton. The recipient's ingestion refreshes its
+                            // OwnerDeviceCache from `sender_devices` via the
+                            // LWW-REPLACE `apply_owner_device_update`, so a singleton
+                            // would shrink a multi-device sender's set and drop later
+                            // messages signed by its other devices. Mirrors the
+                            // deposit path + the PR #302 invite fix.
+                            let sender_devices = {
+                                let state = self.crdt_state.lock().await;
+                                crate::dm_outbox::resolve_sender_devices(
+                                    &state,
+                                    self.self_owner,
+                                    self.our_signing_device_hash,
+                                )
+                            };
+                            let signed = crate::dm_envelope::DmCidNotifySigned {
+                                space_id: entry.space_id,
+                                message_cid,
+                                sender_owner_addr: self.self_owner,
+                                sender_devices,
+                                signing_device_hash: self.our_signing_device_hash,
+                            };
+                            let cas = std::sync::Arc::clone(&self.cas);
+                            let signing_key = std::sync::Arc::clone(&self.signing_key);
+                            tokio::spawn(async move {
+                                // Hold the permit for the task's lifetime; releasing
+                                // it lets the next backlogged DM attempt the tunnel.
+                                let _permit = permit;
+                                // ZEB-484: inline the encrypted blob when it fits; else bare CidNotify.
+                                match build_tunnel_dm_packet(
+                                    &cas,
+                                    &signed,
+                                    &signing_key,
+                                    message_cid,
+                                )
+                                .await
+                                {
+                                    Ok(packet) => {
+                                        for (node_id, contact) in &targets {
+                                            // ZEB-504: send the bootstrap invite FIRST
+                                            // so the recipient creates the Space before
+                                            // the CidNotify is admitted (else
+                                            // `SpaceNotFound`). The tunnel's in-order
+                                            // FIFO preserves this per peer; `invite_wire`
+                                            // is `None` once the recipient has acked.
+                                            if let Some(inv) = &invite_wire {
+                                                mgr.send_dm(*node_id, contact, inv.clone());
+                                            }
+                                            mgr.send_dm(*node_id, contact, packet.clone());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            recipient = ?recipient,
+                                            error = %e,
+                                            "ZEB-484: tunnel DM packet build failed; deposit rung still covers this DM"
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
                 }
                 Err(_) => {
                     tracing::debug!(

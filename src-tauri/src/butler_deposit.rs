@@ -55,6 +55,12 @@ pub const DEPOSIT_MAX_FRAME_BYTES: usize = 256 * 1024;
 /// malicious sender from inflating butler/relay storage via the invite field.
 pub const MAX_DEPOSIT_INVITE_BYTES: usize = 4096;
 
+/// ZEB-505: the `DepositAck.message_cid` echoed for a standalone invite-only
+/// deposit (no message). A fixed non-cid marker the client and acceptor agree
+/// on — it can't collide with a real `message_cid` (always 32 bytes), so it
+/// binds the ack without inventing a fake content id.
+pub const INVITE_ONLY_DEPOSIT_MARKER: &[u8] = b"zeb505-invite-only";
+
 /// Maximum number of [`crate::reachability_record::ButlerSetEntry`]s carried
 /// in the pkarr routing blob's butler set (spec §3: ordered priority list,
 /// max 2 in v1). Readers truncate anything longer (defence against oversized
@@ -177,10 +183,20 @@ pub struct DepositAck {
 /// exactly what the recipient's normal DM receive path consumes on ingestion.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DepositPayload {
-    /// Full signed CidNotify packet bytes (discriminant+body+sig).
-    #[serde(rename = "cn", with = "serde_bytes")]
-    pub cidnotify_packet: Vec<u8>,
-    /// The CAS storage blob ([ver][nonce][ct][tag]).
+    /// Signed CidNotify packet bytes (discriminant+body+sig). `None` for a
+    /// ZEB-505 standalone durable DM *invite* deposit (no message) — then
+    /// `invite_packet` is the sole payload and `storage_blob` is empty.
+    /// Symmetric to `invite_packet`/`iv`; backward-compatible since legacy
+    /// payloads always carry `cn` (decoding to `Some`).
+    #[serde(
+        rename = "cn",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub cidnotify_packet: Option<Vec<u8>>,
+    /// The CAS storage blob ([ver][nonce][ct][tag]). Empty for an invite-only
+    /// deposit (`cidnotify_packet` is `None`).
     #[serde(rename = "pl", with = "serde_bytes")]
     pub storage_blob: Vec<u8>,
     /// ZEB-483: optional signed DmInvite packet bytes (a `DmPacket::Invite`),
@@ -350,12 +366,16 @@ pub struct ButlerDepositRequest {
     pub entry_id: OutboxEntryId,
     pub recipient_owner: OwnerAddr,
     pub space_id: SpaceId,
-    pub message_cid: ContentId,
-    /// Full signed CidNotify packet bytes (discriminant+body+sig).
-    pub cidnotify_packet: Vec<u8>,
+    /// ZEB-505: `None` for a standalone durable invite deposit (no message).
+    pub message_cid: Option<ContentId>,
+    /// Signed CidNotify packet bytes (discriminant+body+sig). ZEB-505: `None`
+    /// for a standalone durable invite deposit — then `invite_packet` is the
+    /// sole payload.
+    pub cidnotify_packet: Option<Vec<u8>>,
     /// ZEB-483: signed DmInvite packet bytes for the recipient to bootstrap the
     /// DM Space from the deposit rung; `None` for non-DM Spaces. Copied verbatim
-    /// into the sealed `DepositPayload` by each deposit client.
+    /// into the sealed `DepositPayload` by each deposit client. ZEB-505: MUST be
+    /// `Some` when `cidnotify_packet` is `None` (an invite-only deposit).
     pub invite_packet: Option<Vec<u8>>,
     /// Wall-clock now (ms) at candidacy time — drives the `bs_at` freshness
     /// check against the resolved routing blob.
@@ -584,16 +604,28 @@ impl ButlerDepositClient for IrohButlerDepositClient {
             return DepositRungOutcome::SkippedNoFreshButlerSet;
         }
 
-        // 2. The deposit payload carries BOTH the CidNotify packet and the
-        // CAS storage blob (the butler re-derives the packet's message_cid
-        // from the blob via ContentId::for_book). Fetched only after a
-        // fresh butler set is confirmed — no CAS work for a skipped rung.
-        let storage_blob = match self.cas.get(&req.message_cid).await {
-            Ok(Some(blob)) => blob,
-            Ok(None) => {
-                return DepositRungOutcome::Failed("storage blob missing from CAS".to_string())
+        // 2. Build the deposit payload. A message deposit fetches the CAS
+        // storage blob (the butler re-derives message_cid via for_book) and
+        // binds the ack to that cid. A ZEB-505 invite-only deposit (no
+        // message_cid) carries the invite alone — no blob to fetch — and binds
+        // the ack to a fixed invite marker instead. (`push_deposit_candidate`
+        // guarantees `invite_packet` is Some when `message_cid` is None.)
+        // Fetched only after a fresh butler set is confirmed — no CAS work for a
+        // skipped rung.
+        let (storage_blob, expect_cid): (Vec<u8>, Vec<u8>) = match req.message_cid {
+            Some(message_cid) => {
+                let blob = match self.cas.get(&message_cid).await {
+                    Ok(Some(blob)) => blob,
+                    Ok(None) => {
+                        return DepositRungOutcome::Failed(
+                            "storage blob missing from CAS".to_string(),
+                        )
+                    }
+                    Err(e) => return DepositRungOutcome::Failed(format!("CAS get: {e}")),
+                };
+                (blob, message_cid.to_bytes().to_vec())
             }
-            Err(e) => return DepositRungOutcome::Failed(format!("CAS get: {e}")),
+            None => (Vec::new(), INVITE_ONLY_DEPOSIT_MARKER.to_vec()),
         };
         let payload = DepositPayload {
             cidnotify_packet: req.cidnotify_packet.clone(),
@@ -604,7 +636,6 @@ impl ButlerDepositClient for IrohButlerDepositClient {
         // 3. Priority order, first ack wins. The frame is rebuilt per
         // entry: the sealed blob targets THAT entry's device key, and the
         // sig binds to the sealed bytes.
-        let expect_cid = req.message_cid.to_bytes();
         let mut last_err = "no butler entries attempted".to_string();
         for entry in &entries {
             let frame = match build_deposit_frame(

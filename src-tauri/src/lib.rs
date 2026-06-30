@@ -10947,7 +10947,9 @@ async fn decrypt_inbox_entries(
         // 'delivered'). One linear scan over the snapshot serves both.
         let (delivery_state, message_id) = if is_self_outbound {
             let hit = outbox_snapshot.iter().find_map(|(id, e)| {
-                if e.space_id == entry.space_id && e.message_cid == entry.message_cid {
+                // ZEB-505: a self-outbound message correlates to its message
+                // entry; invite-only entries (None message_cid) never match.
+                if e.space_id == entry.space_id && e.message_cid == Some(entry.message_cid) {
                     Some((*id, e.delivery_status))
                 } else {
                     None

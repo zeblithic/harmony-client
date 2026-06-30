@@ -14,10 +14,20 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct DmInboxEntry {
     #[serde(rename = "so")]
     pub sender_owner: [u8; 16],
-    /// Full signed CidNotify packet bytes (discriminant+body+sig).
-    #[serde(rename = "cn", with = "serde_bytes")]
-    pub cidnotify_packet: Vec<u8>,
-    /// The CAS storage blob ([ver][nonce][ct][tag]).
+    /// Signed CidNotify packet bytes (discriminant+body+sig). ZEB-505: `None`
+    /// for a standalone durable DM *invite* deposit (no message) — then
+    /// `invite_packet` is the sole payload and `storage_blob` is empty.
+    /// Symmetric to `invite_packet`/`iv`; backward-compatible since legacy
+    /// deposits always carry `cn` (decoding to `Some`).
+    #[serde(
+        rename = "cn",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub cidnotify_packet: Option<Vec<u8>>,
+    /// The CAS storage blob ([ver][nonce][ct][tag]). Empty for an invite-only
+    /// deposit (`cidnotify_packet` is `None`).
     #[serde(rename = "pl", with = "serde_bytes")]
     pub storage_blob: Vec<u8>,
     /// ZEB-483: optional signed DmInvite packet bytes, carried through from the
@@ -57,6 +67,13 @@ impl CanonicalPayload for DmInboxDoc {}
 impl DmInboxDoc {
     pub fn key(space_id: &[u8; 16], message_cid: &[u8]) -> String {
         format!("{}:{}", hex::encode(space_id), hex::encode(message_cid))
+    }
+
+    /// ZEB-505: deposit key for a standalone invite-only entry (no message).
+    /// The `:invite` suffix can't collide with a message key, whose second
+    /// half is always 64 hex chars — so one standalone invite per space.
+    pub fn invite_key(space_id: &[u8; 16]) -> String {
+        format!("{}:invite", hex::encode(space_id))
     }
 
     /// Insert-once + ig-union merge. Same key redeposited carries identical

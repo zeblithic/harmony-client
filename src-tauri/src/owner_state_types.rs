@@ -2293,6 +2293,15 @@ pub enum DeliveryStatus {
 /// satisfied. `delivered_to` is `BTreeSet` so canonical CBOR encoding
 /// is deterministic (BTreeSet serializes in `K::Ord` order which is
 /// bytewise for `OwnerAddr` since it's a `bstr(16)`).
+///
+/// ZEB-505: `message_cid` is `Option<ContentId>`. `Some(cid)` = a normal
+/// sent-message entry; `None` = a standalone durable DM *invite* with no
+/// following message (minted by `add_space` so the bootstrap invite gets the
+/// same retry + deposit durability a message rides on, instead of the old
+/// best-effort fire-and-forget). Wire-compatible by construction: ciborium
+/// encodes `Some(cid)` transparently as the bare `cid`, so existing persisted
+/// entries stay byte-identical; `#[serde(default)]` lets an absent `mc` decode
+/// to `None`; a `None` entry encodes `mc: null`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxEntry {
     #[serde(rename = "id")]
@@ -2301,8 +2310,8 @@ pub struct OutboxEntry {
     pub space_id: SpaceId,
     #[serde(rename = "rc")]
     pub recipient_owners: Vec<OwnerAddr>,
-    #[serde(rename = "mc")]
-    pub message_cid: ContentId,
+    #[serde(rename = "mc", default)]
+    pub message_cid: Option<ContentId>,
     #[serde(rename = "ca")]
     pub created_at: Hlc,
     #[serde(rename = "dl")]

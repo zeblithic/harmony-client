@@ -96,6 +96,14 @@ pub trait DmInboxIngestCtx: Send + Sync {
     /// retried on every sweep until it verifies or the TTL GC removes it.
     async fn verify(&self, entry: &DmInboxEntry) -> Result<VerifiedDmDeposit, String>;
 
+    /// ZEB-505: apply a recovered INVITE-ONLY deposit (`cidnotify_packet` is
+    /// `None`) — bootstrap the DM Space from the deposited invite ALONE (no
+    /// message). Verifies the invite (signature + `inviter` bound to the
+    /// deposit entry's `sender_owner`) and applies it pinned to that sender,
+    /// without refreshing the OwnerDeviceCache (deposit-recover semantics). An
+    /// `Err` leaves the entry PENDING for retry, like `verify`.
+    async fn apply_invite_only(&self, entry: &DmInboxEntry) -> Result<(), String>;
+
     /// `OwnerState::apply_inbox` under the owner-state lock (idempotent on
     /// `(space_id, message_cid)`). Returns `true` iff the entry was NEWLY
     /// inserted (`ApplyOutcome::Inserted`) — the `dm-received` emit gate,
@@ -153,6 +161,25 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
 
     for (key, entry) in doc.entries.iter_mut() {
         if entry.ingested_by.contains(&self_id) {
+            continue;
+        }
+        // ZEB-505: invite-only entry (no CidNotify) — apply the bootstrap
+        // invite ALONE (no blob, no message), then mark ingested. A failure
+        // leaves it pending for retry, like the message path below.
+        if entry.cidnotify_packet.is_none() {
+            match ctx.apply_invite_only(entry).await {
+                Ok(()) => {
+                    entry.ingested_by.insert(self_id.clone());
+                    changed = true;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        key = %key,
+                        "ZEB-505 ingest: invite-only apply failed; left pending for retry"
+                    );
+                }
+            }
             continue;
         }
         // 1. CAS-put FIRST so the message blob is fetchable exactly like a
@@ -706,8 +733,14 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
     }
 
     async fn verify(&self, entry: &DmInboxEntry) -> Result<VerifiedDmDeposit, String> {
-        // 1. Decode the deposited packet — must be a CidNotify.
-        let packet = crate::dm_envelope::decode_packet(&entry.cidnotify_packet)
+        // 1. Decode the deposited packet — must be a CidNotify. (ZEB-505
+        //    invite-only entries are applied by `apply_invite_only` and never
+        //    reach here.)
+        let cidnotify = entry
+            .cidnotify_packet
+            .as_deref()
+            .ok_or("verify called on an invite-only deposit (no CidNotify)")?;
+        let packet = crate::dm_envelope::decode_packet(cidnotify)
             .map_err(|e| format!("decode_packet: {e}"))?;
         let crate::dm_envelope::DmPacket::CidNotify {
             signed,
@@ -787,6 +820,44 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
             mime_type: payload.mime_type,
             sent_at: payload.sent_at,
         })
+    }
+
+    async fn apply_invite_only(&self, entry: &DmInboxEntry) -> Result<(), String> {
+        let invite = entry
+            .invite_packet
+            .as_deref()
+            .ok_or("ZEB-505: invite-only deposit missing invite_packet")?;
+        let packet =
+            crate::dm_envelope::decode_packet(invite).map_err(|e| format!("decode invite: {e}"))?;
+        let crate::dm_envelope::DmPacket::Invite {
+            signed,
+            signature,
+            signed_bytes,
+        } = packet
+        else {
+            return Err("ZEB-505: invite-only deposit packet is not an Invite".into());
+        };
+        // Bind the invite's claimed inviter to the deposit entry's verified
+        // sender (mirrors the message path's sender-consistency check).
+        if signed.inviter.0 != entry.sender_owner {
+            return Err("ZEB-505: invite inviter does not match deposit entry sender".into());
+        }
+        let mut state = self.crdt_state.lock().await;
+        crate::dm_outbox::apply_invite(
+            &mut state,
+            self.self_owner,
+            &self.self_device_id(),
+            signed,
+            signature,
+            &signed_bytes,
+            self.now_ms(),
+            Some(crate::owner_state_types::OwnerAddr(entry.sender_owner)),
+            // Deposit-recover: never refresh the OwnerDeviceCache from a
+            // deposited invite (it would let an untrusted invite seed cache rows).
+            false,
+        )
+        .map(|_| ())
+        .map_err(|e| format!("apply_invite: {e:?}"))
     }
 
     async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
@@ -946,12 +1017,12 @@ mod tests {
                 return Err("simulated verification failure".into());
             }
             // Parse the probe packet layout: [space_id(16) ‖ cid(32)].
-            let space: [u8; 16] = entry.cidnotify_packet[..16]
-                .try_into()
-                .expect("probe packet space_id");
-            let cid: [u8; 32] = entry.cidnotify_packet[16..48]
-                .try_into()
-                .expect("probe packet cid");
+            let cn = entry
+                .cidnotify_packet
+                .as_deref()
+                .expect("probe message entry has cidnotify_packet");
+            let space: [u8; 16] = cn[..16].try_into().expect("probe packet space_id");
+            let cid: [u8; 32] = cn[16..48].try_into().expect("probe packet cid");
             Ok(VerifiedDmDeposit {
                 space_id: SpaceId(space),
                 message_cid: ContentId::from_bytes(cid),
@@ -959,6 +1030,11 @@ mod tests {
                 mime_type: "text/plain".into(),
                 sent_at: hlc(42),
             })
+        }
+
+        async fn apply_invite_only(&self, _entry: &DmInboxEntry) -> Result<(), String> {
+            self.calls.lock().unwrap().push("apply_invite_only".into());
+            Ok(())
         }
 
         async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
