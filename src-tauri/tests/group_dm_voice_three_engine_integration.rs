@@ -335,7 +335,38 @@ async fn run_inner() {
         .declare_subscriber(&media_sub_key)
         .await
         .expect("declare DM media subscriber on C");
-    tokio::time::sleep(Duration::from_secs(1)).await; // settle
+    // ZEB-502: deterministically wait until A's session has discovered C's REMOTE
+    // media subscriber before the one-shot put, rather than a fixed 1s settle. The
+    // frame goes out live (no replay); a put that races C's subscriber declaration
+    // is silently dropped and the recv loop below stalls to its 10s ceiling. A
+    // concrete-key publisher on `…/{deviceA}` intersects C's wildcard subscriber, so
+    // a `matching_status(Locality::Remote)` barrier is well-defined (mirrors
+    // `voice_presence_two_engine_integration.rs`).
+    {
+        let media_ready_pub = session_a
+            .declare_publisher(
+                zenoh::key_expr::KeyExpr::try_from(media_topic_a.clone()).expect("media topic key"),
+            )
+            .allowed_destination(zenoh::sample::Locality::Remote)
+            .await
+            .expect("declare media readiness publisher");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if media_ready_pub
+                .matching_status()
+                .await
+                .expect("media matching_status query failed")
+                .matching()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "A never matched C's remote media subscriber within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 
     let original_frame: Vec<u8> = (0u8..40).collect();
     let sealed_frame =
