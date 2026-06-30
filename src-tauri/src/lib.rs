@@ -7015,6 +7015,7 @@ pub async fn start_node_inner(
                     let contexts_fn: pkarr_resolver_adapter::ContextsFn = std::sync::Arc::new(
                         move |target_addr: crate::owner_state_types::OwnerAddr| {
                             let registry = std::sync::Arc::clone(&contexts_registry);
+                            let crdt = std::sync::Arc::clone(&contexts_crdt);
                             let resolver =
                                 crate::community_state_sync::OwnerDeviceCacheResolver::new(
                                     std::sync::Arc::clone(&contexts_crdt),
@@ -7024,6 +7025,7 @@ pub async fn start_node_inner(
                             Box::pin(async move {
                                 pkarr_resolver_adapter::community_contexts_for_target(
                                     &registry,
+                                    &crdt,
                                     &resolver,
                                     target_addr,
                                 )

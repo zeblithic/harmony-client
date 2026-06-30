@@ -1,40 +1,41 @@
-//! ZEB-596 coverage for the newly-public
+//! ZEB-596 coverage for the public
 //! `pkarr_resolver_adapter::community_contexts_for_target`.
 //!
-//! `community_contexts_for_target` walks the live `CommunitySyncRegistry`,
-//! and for every community where the queried `target` is a currently-`Joined`
-//! member AND whose 64-byte harmony identity_pub the supplied resolver can
-//! resolve, yields one `PkarrCommunityContext { community_id, epoch_key,
-//! target_member_identity_pub }`. It SKIPS communities where the target is not
-//! Joined, and SKIPS communities where `resolver.resolve(target)` returns
-//! `None` (without the identity_pub the case-C HKDF key can't be derived).
+//! The function resolves the target's 64-byte identity_pub ONCE up front (a
+//! `None` short-circuits to an empty Vec), then walks the live
+//! `CommunitySyncRegistry`. For every community where the target is a
+//! currently-`Joined` member AND whose live epoch key is present in the
+//! owner-state CRDT (`spaces[cid].current_epoch_key` + `current_epoch` both
+//! `Some`, read via `live_epoch_key`), it yields one `PkarrCommunityContext`.
+//! Communities where the target isn't Joined, or whose live epoch key is
+//! missing, are skipped.
 //!
-//! These three tests build a real registry + spawned community engine (the
-//! same harness shape as `community_sync/community_sync_integration.rs`), drive
-//! genuine cert-bearing `Join` events into the per-community CRDT so the
-//! materialized membership shows the target as Joined, and exercise the
-//! function against a real `OwnerDeviceCacheResolver` reading a real
-//! owner-device cache:
+//! Each test builds a real registry + spawned community engine, drives genuine
+//! cert-bearing `Join` events into the per-community CRDT, and shares ONE
+//! `Arc<Mutex<OwnerState>>` between the resolver (reads `owner_device_cache`)
+//! and the `crdt_state` arg (reads `spaces[cid].current_epoch_key`) — mirroring
+//! production's single owner-state CRDT.
 //!
-//!   1. happy path — target Joined + identity_pub cached -> exactly one
-//!      context, with the engine's epoch_key and the target's cached
-//!      identity_pub.
-//!   2. non-member skipped — querying a never-joined owner -> empty Vec (even
-//!      though that owner's pub IS in the cache, proving the skip is
-//!      membership-driven).
-//!   3. unknown identity — target IS Joined but the resolver can't resolve its
-//!      identity_pub (empty cache) -> empty Vec.
+//! Cases:
+//! - happy path: Joined + identity cached + live key present -> one context
+//!   carrying the LIVE `Space.current_epoch_key` (deliberately different from
+//!   the engine's spawn-time `membership_key`, proving the live key is used).
+//! - rotation: resolve, mutate `spaces[cid].current_epoch_key`, resolve again
+//!   -> the context carries the NEW key (live read on each call).
+//! - non-member: target not Joined (identity still cached) -> empty.
+//! - unresolvable identity: Joined + live key present, identity not cached ->
+//!   empty via the hoisted-resolve early return.
 //!
 //! FIXTURE NOTE (identity_pub): members are minted via `mint_test_owner`, whose
-//! `OwnerAddr` is the master *signing-material* hash (not `SHA256(composite)`),
-//! so the 64-byte composite we cache for a member (`[0;32] || master_ed25519`,
-//! mirroring `mint_test_owner`'s master `PubKeyBundle` layout) is a faithful,
-//! deterministic stand-in rather than a hash-consistent identity. The path under
-//! test never re-derives the `OwnerAddr <-> composite` relationship (and
-//! `lookup_pubkey_for_device` matches purely by device-hash presence), so this
-//! is a genuine end-to-end exercise of the real `OwnerDeviceCacheResolver`.
+//! `OwnerAddr` is the master signing-material hash (not `SHA256(composite)`),
+//! so the 64-byte composite we cache (`[0;32] || master_ed25519`, mirroring
+//! `mint_test_owner`'s master `PubKeyBundle` layout) is a faithful,
+//! deterministic stand-in rather than a hash-consistent identity. The path
+//! under test never re-derives that relationship and `lookup_pubkey_for_device`
+//! matches purely by device-hash presence, so this stays a genuine end-to-end
+//! exercise of the real `OwnerDeviceCacheResolver`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,7 +51,7 @@ use harmony_app::community_state_sync::{
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_types::{
-    DeviceIdentityHash, EpochKey, Hlc, OwnerAddr, OwnerDeviceEntry, SpaceId,
+    DeviceIdentityHash, EpochKey, Hlc, OwnerAddr, OwnerDeviceEntry, Space, SpaceId, SpaceKind,
 };
 use harmony_app::pkarr_resolver_adapter::community_contexts_for_target;
 use tokio::sync::{mpsc, Mutex};
@@ -82,8 +83,8 @@ fn master_identity_pub(seed: u8) -> [u8; 64] {
 /// Build a cert-bearing self-`Join` event for `owner`. The enrollment cert is
 /// attached (as the production `sign_event_with_identity` does for
 /// identity-introducing events) so `verify_event` can resolve the signer's
-/// enrolled device key from the carried cert and admit the Join into an
-/// open (non-invite-only) community.
+/// enrolled device key from the carried cert and admit the Join into an open
+/// (non-invite-only) community.
 fn cert_bearing_join(
     owner: &TestOwner,
     community_id: SpaceId,
@@ -105,6 +106,39 @@ fn cert_bearing_join(
     let mut ev = sign_event(&payload, &owner.device_key).expect("sign join");
     ev.enrollment = Some(owner.cert.clone());
     ev
+}
+
+/// Minimal valid Community `Space` carrying a live epoch key/counter — the
+/// pair `live_epoch_key` reads to source the per-community case-C key.
+fn community_space(cid: SpaceId, admin: OwnerAddr, live_key: [u8; 32], epoch: u64) -> Space {
+    let at = Hlc {
+        wall_ms: 100,
+        logical: 0,
+        device_id: "space-dev".into(),
+    };
+    Space {
+        id: cid,
+        kind: SpaceKind::Community,
+        parent: None,
+        community_id: None, // a community Space IS the community
+        name: "ctx-test-community".into(),
+        transport: None,
+        members: vec![],
+        custom_name: None,
+        notification_pref: None,
+        left_at: None,
+        created_at: at.clone(),
+        updated_at: at,
+        content_key: None,
+        prior_content_keys: vec![],
+        current_epoch: Some(epoch),
+        current_epoch_key: Some(EpochKey::new(live_key)),
+        old_epoch_keys: BTreeMap::new(),
+        admin_addr: Some(admin),
+        is_invite_only: Some(false),
+        shared_in_profile: false,
+        pending_join_at: None,
+    }
 }
 
 /// In-memory CAS servicer shared by the engine's `RuntimeContentStore`. The
@@ -143,11 +177,10 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
     tx
 }
 
-/// Everything a test needs after standing up a one-community registry. The
-/// underscore-prefixed fields are keep-alive handles (the tempdir the engine
-/// persists into, the CAS servicer sender, and the engine's publisher-receiver
-/// / subscriber-sender) that must outlive the function-under-test call so the
-/// engine task doesn't latch shut on a closed channel.
+/// Keep-alive handles for a standing one-community registry. The underscore-
+/// prefixed fields (tempdir the engine persists into, CAS servicer sender,
+/// engine publisher-receiver / subscriber-sender) must outlive the
+/// function-under-test call so the engine task doesn't latch shut.
 struct Setup {
     registry: CommunitySyncRegistry,
     community_id: SpaceId,
@@ -267,15 +300,16 @@ async fn setup_one_community(
     }
 }
 
-/// Build an `OwnerDeviceCacheResolver` over a cache that maps each
-/// `(owner, identity_pub)` pair so `resolve(owner)` returns that pub.
-fn resolver_with_cached(
-    self_owner: OwnerAddr,
-    entries: &[(OwnerAddr, [u8; 64])],
-) -> OwnerDeviceCacheResolver {
-    let mut owner_state = OwnerState::default();
-    for (owner, pub64) in entries {
-        owner_state.owner_device_cache.devices.insert(
+/// Build ONE shared owner-state CRDT holding both the resolver's device-cache
+/// entries and the community `Space`s (with live epoch keys). The SAME Arc is
+/// handed to `OwnerDeviceCacheResolver` and passed as the `crdt_state` arg.
+fn build_shared_state(
+    cache: &[(OwnerAddr, [u8; 64])],
+    spaces: &[(SpaceId, OwnerAddr, [u8; 32], u64)],
+) -> Arc<Mutex<OwnerState>> {
+    let mut os = OwnerState::default();
+    for (owner, pub64) in cache {
+        os.owner_device_cache.devices.insert(
             *owner,
             OwnerDeviceEntry {
                 devices: vec![DeviceIdentityHash(owner.0)],
@@ -289,46 +323,56 @@ fn resolver_with_cached(
             },
         );
     }
-    OwnerDeviceCacheResolver::new(Arc::new(Mutex::new(owner_state)), self_owner, [0u8; 64])
+    for (cid, admin, live_key, epoch) in spaces {
+        os.spaces
+            .insert(*cid, community_space(*cid, *admin, *live_key, *epoch));
+    }
+    Arc::new(Mutex::new(os))
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Happy path: a community where both the admin and "bob" are Joined and bob's
-/// identity_pub is present in the owner-device cache the resolver reads. The
-/// function must return exactly one context whose `community_id` is the
-/// community, `epoch_key` is the engine's membership key, and
-/// `target_member_identity_pub` is bob's cached 64-byte identity_pub.
+/// Happy path: admin + bob Joined, bob's identity_pub cached, and the
+/// community's live `Space.current_epoch_key` is set to a key DELIBERATELY
+/// different from the engine's spawn-time `membership_key` (`mk`). The function
+/// must return exactly one context whose `epoch_key` is the LIVE key (not `mk`)
+/// and whose `target_member_identity_pub` is bob's cached pub.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn happy_path_returns_one_context_with_epoch_key_and_identity_pub() {
+async fn happy_path_uses_live_epoch_key_not_spawn_membership_key() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let admin = mint_test_owner(0xA1);
         let bob = mint_test_owner(0xB2);
         let bob_pub = master_identity_pub(0xB2);
 
-        let s = setup_one_community(&admin, &[&bob], [0x42u8; 32], [0x11u8; 16]).await;
+        let mk_bytes = [0x42u8; 32];
+        let live_key = [0x77u8; 32]; // != mk on purpose
+        let s = setup_one_community(&admin, &[&bob], mk_bytes, [0x11u8; 16]).await;
 
-        // Genuine resolver over a real owner-device cache holding bob's pub.
-        let resolver = resolver_with_cached(admin.owner, &[(bob.owner, bob_pub)]);
+        let shared = build_shared_state(
+            &[(bob.owner, bob_pub)],
+            &[(s.community_id, admin.owner, live_key, 3)],
+        );
+        let resolver = OwnerDeviceCacheResolver::new(Arc::clone(&shared), admin.owner, [0u8; 64]);
 
-        let ctxs = community_contexts_for_target(&s.registry, &resolver, bob.owner).await;
+        let ctxs = community_contexts_for_target(&s.registry, &shared, &resolver, bob.owner).await;
 
         assert_eq!(
             ctxs.len(),
             1,
-            "exactly one community has bob Joined with a resolvable identity_pub"
+            "exactly one Joined community with a live key"
         );
         let ctx = &ctxs[0];
-        assert_eq!(
-            ctx.community_id, s.community_id,
-            "context must carry the community bob is Joined in"
+        assert_eq!(ctx.community_id, s.community_id);
+        assert_ne!(
+            live_key,
+            *s.mk.as_bytes(),
+            "test misconfigured: live key must differ from the spawn-time mk"
         );
         assert_eq!(
-            ctx.epoch_key,
-            *s.mk.as_bytes(),
-            "epoch_key must equal the engine's membership_key bytes"
+            ctx.epoch_key, live_key,
+            "epoch_key must be the LIVE Space.current_epoch_key, not the engine's mk"
         );
         assert_eq!(
             ctx.target_member_identity_pub, bob_pub,
@@ -339,9 +383,59 @@ async fn happy_path_returns_one_context_with_epoch_key_and_identity_pub() {
     .expect("happy_path timed out at 30s");
 }
 
-/// Non-member skipped: querying an owner who is NOT a Joined member of any known
-/// community yields an empty Vec — even though that owner's identity_pub IS in
-/// the cache, proving the skip is driven by membership, not by resolution.
+/// Rotation: the walk reads the live key on EVERY call. Resolve once (live key
+/// A), then mutate `spaces[cid].current_epoch_key` to a third value (simulating
+/// an epoch rotation) and resolve again — the new context must carry the NEW
+/// key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_reflects_updated_live_epoch_key() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let admin = mint_test_owner(0xA1);
+        let bob = mint_test_owner(0xB2);
+        let bob_pub = master_identity_pub(0xB2);
+
+        let key_a = [0x77u8; 32];
+        let key_b = [0x99u8; 32];
+        let s = setup_one_community(&admin, &[&bob], [0x42u8; 32], [0x44u8; 16]).await;
+
+        let shared = build_shared_state(
+            &[(bob.owner, bob_pub)],
+            &[(s.community_id, admin.owner, key_a, 3)],
+        );
+        let resolver = OwnerDeviceCacheResolver::new(Arc::clone(&shared), admin.owner, [0u8; 64]);
+
+        let before =
+            community_contexts_for_target(&s.registry, &shared, &resolver, bob.owner).await;
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].epoch_key, key_a, "first resolve uses epoch key A");
+
+        // Simulate an epoch rotation: bump the live key + counter in place.
+        {
+            let mut g = shared.lock().await;
+            let space = g.spaces.get_mut(&s.community_id).expect("space present");
+            space.current_epoch_key = Some(EpochKey::new(key_b));
+            space.current_epoch = Some(4);
+        }
+
+        let after = community_contexts_for_target(&s.registry, &shared, &resolver, bob.owner).await;
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].epoch_key, key_b,
+            "after rotation the context must carry the NEW live epoch key"
+        );
+        assert_ne!(
+            after[0].epoch_key, before[0].epoch_key,
+            "the live key must actually have changed between calls"
+        );
+    })
+    .await
+    .expect("rotation timed out at 30s");
+}
+
+/// Non-member skipped: querying an owner who is NOT a Joined member yields an
+/// empty Vec — even though that owner's identity_pub IS cached (so the hoisted
+/// resolve succeeds) and the community has a live key, proving the skip is
+/// driven by the membership gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_member_target_yields_empty() {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -352,15 +446,20 @@ async fn non_member_target_yields_empty() {
 
         let s = setup_one_community(&admin, &[&bob], [0x42u8; 32], [0x22u8; 16]).await;
 
-        // Carol's pub IS resolvable — so an empty result can only mean the
-        // function correctly skipped her on the not-Joined gate.
-        let resolver = resolver_with_cached(admin.owner, &[(carol.owner, carol_pub)]);
+        // Carol's pub IS resolvable and the community has a live key — so an
+        // empty result can only mean the not-Joined gate fired.
+        let shared = build_shared_state(
+            &[(carol.owner, carol_pub)],
+            &[(s.community_id, admin.owner, [0x77u8; 32], 3)],
+        );
+        let resolver = OwnerDeviceCacheResolver::new(Arc::clone(&shared), admin.owner, [0u8; 64]);
 
-        let ctxs = community_contexts_for_target(&s.registry, &resolver, carol.owner).await;
+        let ctxs =
+            community_contexts_for_target(&s.registry, &shared, &resolver, carol.owner).await;
 
         assert!(
             ctxs.is_empty(),
-            "a non-member target must produce no contexts; got {} ",
+            "a non-member target must produce no contexts; got {}",
             ctxs.len()
         );
     })
@@ -368,9 +467,10 @@ async fn non_member_target_yields_empty() {
     .expect("non_member timed out at 30s");
 }
 
-/// Unknown identity skipped: the target IS a Joined member, but the resolver
-/// cannot resolve its identity_pub (empty cache, target != resolver-self), so
-/// the community is skipped and the result is empty.
+/// Unresolvable identity: the target IS Joined and the community has a live
+/// key, but the target's identity_pub is NOT cached, so the hoisted
+/// `resolver.resolve` returns `None` and the function returns empty before
+/// walking any community.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn joined_but_unresolvable_identity_yields_empty() {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -379,9 +479,8 @@ async fn joined_but_unresolvable_identity_yields_empty() {
 
         let s = setup_one_community(&admin, &[&bob], [0x42u8; 32], [0x33u8; 16]).await;
 
-        // Sanity: bob really is Joined in the materialized membership, so the
-        // empty result below is provably caused by the None-resolution skip and
-        // not by missing membership.
+        // Sanity: bob really is Joined, so the empty result below is provably
+        // caused by the None-resolution early return, not missing membership.
         {
             let state = s
                 .registry
@@ -393,14 +492,15 @@ async fn joined_but_unresolvable_identity_yields_empty() {
             assert_eq!(
                 members.get(&bob.owner).map(|m| m.status),
                 Some(MemberStatus::Joined),
-                "bob must be Joined for this test to exercise the None-resolution skip"
+                "bob must be Joined for this test to exercise the None-resolution path"
             );
         }
 
-        // Empty cache + self_owner = admin => resolve(bob) is None.
-        let resolver = resolver_with_cached(admin.owner, &[]);
+        // Live key present, but bob's identity_pub is absent from the cache.
+        let shared = build_shared_state(&[], &[(s.community_id, admin.owner, [0x77u8; 32], 3)]);
+        let resolver = OwnerDeviceCacheResolver::new(Arc::clone(&shared), admin.owner, [0u8; 64]);
 
-        let ctxs = community_contexts_for_target(&s.registry, &resolver, bob.owner).await;
+        let ctxs = community_contexts_for_target(&s.registry, &shared, &resolver, bob.owner).await;
 
         assert!(
             ctxs.is_empty(),

@@ -156,21 +156,37 @@ impl ReachabilityFallback for PkarrResolverAdapter {
 
 /// ZEB-596: build the case-C community contexts for a target peer by walking
 /// every community this device is in (spec §7.4). For each community where
-/// `target` is a currently-`Joined` member and whose 64-byte harmony
-/// identity_pub we can resolve, yields `(community_id, our EpochKey, target
-/// identity_pub)`. Communities where the target isn't Joined — or whose
-/// identity_pub we can't yet resolve from our owner-device cache — are skipped
-/// (without the target's identity_pub the case-C HKDF key can't be derived).
+/// `target` is a currently-`Joined` member, yields `(community_id, the
+/// community's live EpochKey, target identity_pub)`.
 ///
-/// This reads the **current** EpochKey directly (it rotates per epoch, ZEB-249)
-/// rather than a snapshot, and gathers all contexts before returning — the
-/// caller (`PkarrResolverAdapter::resolve`) only issues pkarr relay round-trips
-/// after this returns, so no engine / owner-state lock is held across network IO.
+/// Two skip conditions:
+/// * the target's 64-byte harmony identity_pub must resolve from our
+///   owner-device cache — without it the case-C HKDF key can't be derived, and
+///   since identity_pub is a single global per-owner value it is resolved
+///   ONCE up front (a `None` means no contexts at all);
+/// * the community's live epoch key must be present in the owner-state CRDT —
+///   a community whose `Space.current_epoch_key` we haven't synced is skipped
+///   rather than probed with a guessed key.
+///
+/// The epoch key comes from `live_epoch_key` (`Space.current_epoch_key`), the
+/// SAME source the engine's own encrypt/decrypt uses — NOT the engine's
+/// spawn-time `membership_key`, which goes stale after an epoch rotation
+/// (ZEB-249 backward secrecy) and differs across devices/sessions (Qodo #378).
+/// All contexts are gathered before returning — the caller
+/// (`PkarrResolverAdapter::resolve`) only issues pkarr relay round-trips after
+/// this returns, so no engine / owner-state lock is held across network IO.
 pub async fn community_contexts_for_target(
     registry: &CommunitySyncRegistry,
+    crdt_state: &Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     resolver: &(dyn IdentityResolver + Send + Sync),
     target: OwnerAddr,
 ) -> Vec<PkarrCommunityContext> {
+    // identity_pub is a single global per-owner value — resolve it once rather
+    // than re-locking the owner-state mutex per shared community (Qodo #378).
+    let Some(identity_pub) = resolver.resolve(&target).await else {
+        return Vec::new();
+    };
+
     let mut out = Vec::new();
     let community_ids = registry.known_ids().await;
     for cid in &community_ids {
@@ -192,16 +208,23 @@ pub async fn community_contexts_for_target(
         if !target_joined {
             continue;
         }
-        let epoch_key = *engine.membership_key().as_bytes();
-        // Need the target's 64-byte identity_pub to derive their case-C key;
-        // skip the community if our device cache hasn't learned it yet.
-        if let Some(identity_pub) = resolver.resolve(&target).await {
-            out.push(PkarrCommunityContext {
-                community_id: *cid,
-                epoch_key,
-                target_member_identity_pub: identity_pub,
-            });
-        }
+        // The community's LIVE epoch key (Space.current_epoch_key), per
+        // community. `membership_key()` is only the spawn-time fallback (used
+        // when crdt_state is None); a missing/incomplete Space surfaces as Err
+        // and we skip rather than probe with a stale key.
+        let fallback = engine.membership_key();
+        let epoch_key =
+            match crate::community_state_sync::live_epoch_key(*cid, Some(crdt_state), &fallback)
+                .await
+            {
+                Ok((k, _epoch)) => *k.as_bytes(),
+                Err(_) => continue,
+            };
+        out.push(PkarrCommunityContext {
+            community_id: *cid,
+            epoch_key,
+            target_member_identity_pub: identity_pub,
+        });
     }
     out
 }
