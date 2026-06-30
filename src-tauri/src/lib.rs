@@ -11395,10 +11395,12 @@ pub fn add_space_dm_inner(
     //       that attempt is lost and the recipient never learns the Space. This
     //       entry (`message_cid: None`) makes the outbox drain re-send the
     //       invite alone and the butler/community-relay deposit rung carry
-    //       durability — exactly like a message entry. A later message in this
-    //       DM supersedes it (the send path drops the still-pending invite-only
-    //       entry; see `send_dm`). A Rejected outcome is logged but does not
-    //       fail Space creation — the live fan-out still fires.
+    //       durability — exactly like a message entry. There is intentionally NO
+    //       dedup against a later message: the first message's deposit also
+    //       piggybacks the invite, but `apply_invite` is idempotent (dedups by
+    //       Space on the recipient), so the invite-only entry and any message
+    //       entry resolve + GC independently. A Rejected outcome is logged but
+    //       does not fail Space creation — the live fan-out still fires.
     let invite_entry = crate::owner_state_types::OutboxEntry {
         id: crate::owner_state_types::OutboxEntryId(ulid::Ulid::new().to_bytes()),
         space_id: canonical_space_id,

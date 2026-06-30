@@ -2302,6 +2302,18 @@ pub enum DeliveryStatus {
 /// encodes `Some(cid)` transparently as the bare `cid`, so existing persisted
 /// entries stay byte-identical; `#[serde(default)]` lets an absent `mc` decode
 /// to `None`; a `None` entry encodes `mc: null`.
+///
+/// Forward-compat caveat (Greptile): a *pre-ZEB-505* paired device decodes
+/// `message_cid` as a MANDATORY `ContentId` and so cannot decode an invite-only
+/// entry (`mc: null`). Because a fleet root publish is decoded as one atomic
+/// `OwnerState` blob, such a device drops the WHOLE publish that carries an
+/// invite-only entry until it upgrades. This is a transient multi-device
+/// upgrade-window degradation ONLY: it never affects the originating device's
+/// own durability or the recipient's invite delivery (that device deposits
+/// regardless), and it self-heals once both devices run ZEB-505. Filtering
+/// invite-only entries out of the published root would avoid it, at the cost of
+/// fleet-failover redundancy for the invite — a tradeoff deferred while the
+/// originating device's durability is sufficient.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxEntry {
     #[serde(rename = "id")]
