@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use harmony_app::network_health::PkarrFallbackTelemetry;
+use harmony_app::network_health::{PkarrFallbackOutcome, PkarrFallbackTelemetry};
 use harmony_app::owner_state_types::{OwnerAddr, SpaceId};
 use harmony_app::pkarr_community_publisher::PkarrCommunityPublisher;
 use harmony_app::pkarr_resolver_adapter::{PkarrCommunityContext, PkarrResolverAdapter};
@@ -129,7 +129,7 @@ async fn case_c_community_fallback_resolve_and_warm_cache() {
         // HIT for alice's (peer, community) — short-form (first 4 bytes) only.
         let events = fallback_telemetry.recent();
         assert!(
-            events.iter().any(|e| e.hit
+            events.iter().any(|e| e.outcome == PkarrFallbackOutcome::Hit
                 && e.peer_addr_short == "22222222"
                 && e.community_id_short == "33333333"),
             "fallback telemetry must record a hit for alice; got {events:?}"

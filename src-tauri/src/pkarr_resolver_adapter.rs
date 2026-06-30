@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use harmony_pkarr::{derive_ephemeral_key, epoch_tolerance_window, PkarrCase, PkarrResolver};
 use std::sync::Arc;
 
-use crate::network_health::PkarrFallbackTelemetry;
+use crate::network_health::{PkarrFallbackOutcome, PkarrFallbackTelemetry};
 use crate::owner_state_types::{OwnerAddr, SpaceId};
 use crate::reachability_record::ReachabilityAnnouncePayload;
 use crate::reachability_resolver::ReachabilityFallback;
@@ -73,44 +73,65 @@ impl ReachabilityFallback for PkarrResolverAdapter {
         // collect successful records. First valid response per community wins.
         let mut payloads = Vec::new();
         for ctx in ctxs {
-            // ZEB-595: track whether THIS community context yielded a valid
-            // routing payload so the Network Health panel can show a per-peer,
-            // per-community hit/miss breakdown.
+            // ZEB-595: classify this community context's probe so the Network
+            // Health panel can distinguish a clean "no record here" (Miss) from
+            // a probe that couldn't produce a trustworthy answer (Error) — the
+            // two must not be conflated during incident triage (Qodo #377).
             let mut ctx_hit = false;
+            let mut ctx_error = false;
             'epoch_loop: for epoch in epoch_window {
                 let mut info = Vec::with_capacity(64 + 8);
                 info.extend_from_slice(&ctx.target_member_identity_pub);
                 info.extend_from_slice(&epoch.to_be_bytes());
                 let signing = derive_ephemeral_key(PkarrCase::Community, &ctx.epoch_key, &info);
                 let verifying = signing.verifying_key();
-                if let Ok(Some(rec)) = self.pkarr.resolve(&verifying).await {
-                    // RPK2: verify inner sig.
-                    if rec.verify_inner_sig().is_err() {
-                        continue;
+                match self.pkarr.resolve(&verifying).await {
+                    Ok(Some(rec)) => {
+                        // RPK2/RPK3: a record is present but its inner signature
+                        // or identity binding doesn't check out — corrupt or
+                        // spoofed, not a clean miss.
+                        if rec.verify_inner_sig().is_err()
+                            || rec
+                                .verify_identity_match(&ctx.target_member_identity_pub)
+                                .is_err()
+                        {
+                            ctx_error = true;
+                            continue;
+                        }
+                        // RPK4: stale/expired record (future-strict + signed
+                        // TTL). The peer's record simply lapsed — a legitimate
+                        // "no current record", i.e. a Miss, not an Error.
+                        if rec.verify_freshness(now_ms).is_err() {
+                            continue;
+                        }
+                        // Decode routing_blob into harmony-client's ReachabilityAnnouncePayload.
+                        match ciborium::from_reader::<ReachabilityAnnouncePayload, _>(
+                            rec.routing_blob.as_slice(),
+                        ) {
+                            Ok(payload) => {
+                                payloads.push(payload);
+                                ctx_hit = true;
+                                break 'epoch_loop; // First valid per community
+                            }
+                            // Present but undecodable routing blob — anomalous.
+                            Err(_) => ctx_error = true,
+                        }
                     }
-                    // RPK3: verify identity match.
-                    if rec
-                        .verify_identity_match(&ctx.target_member_identity_pub)
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    // RPK4: verify freshness (future-strict + signed TTL).
-                    if rec.verify_freshness(now_ms).is_err() {
-                        continue;
-                    }
-                    // Decode routing_blob into harmony-client's ReachabilityAnnouncePayload.
-                    if let Ok(payload) = ciborium::from_reader::<ReachabilityAnnouncePayload, _>(
-                        rec.routing_blob.as_slice(),
-                    ) {
-                        payloads.push(payload);
-                        ctx_hit = true;
-                        break 'epoch_loop; // First valid per community
-                    }
+                    // Relay reachable, nothing published at this key — clean miss.
+                    Ok(None) => {}
+                    // Resolver/transport failure — the probe couldn't complete.
+                    Err(_) => ctx_error = true,
                 }
             }
+            let outcome = if ctx_hit {
+                PkarrFallbackOutcome::Hit
+            } else if ctx_error {
+                PkarrFallbackOutcome::Error
+            } else {
+                PkarrFallbackOutcome::Miss
+            };
             self.fallback_telemetry
-                .record(&addr.0, &ctx.community_id.0, ctx_hit);
+                .record(&addr.0, &ctx.community_id.0, outcome);
         }
         payloads
     }
@@ -171,7 +192,13 @@ mod tests {
 
         let events = telemetry.recent();
         assert_eq!(events.len(), 1, "one probe -> one recorded event");
-        assert!(!events[0].hit, "no record published -> miss");
+        // Relay reachable, nothing published (Ok(None)) -> a clean MISS, NOT an
+        // Error. This is the distinction Qodo #377 asked for.
+        assert_eq!(
+            events[0].outcome,
+            PkarrFallbackOutcome::Miss,
+            "no record published is a miss, not an error"
+        );
         assert_eq!(events[0].peer_addr_short, "22222222");
         assert_eq!(events[0].community_id_short, "33333333");
     }
