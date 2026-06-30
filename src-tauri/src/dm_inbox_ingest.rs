@@ -1104,6 +1104,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_routes_invite_only_entry_to_apply_invite_only_not_verify() {
+        // ZEB-505: an entry with `cidnotify_packet: None` is a standalone
+        // invite-only deposit. The sweep must route it to `apply_invite_only`
+        // (bootstrap the Space from the invite ALONE) and SKIP the message
+        // pipeline entirely — no CAS-put, no verify, no apply_inbox, no emit.
+        let key = DmInboxDoc::invite_key(&[1; 16]);
+        let entry = DmInboxEntry {
+            sender_owner: SENDER_OWNER,
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: Some(vec![0xAA, 0xBB, 0xCC]),
+            deposited_at: hlc(500),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        };
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+        let ctx = ProbeCtx::new();
+
+        let changed = ingest_pending(&mut doc, &ctx).await;
+        assert!(changed, "invite-only ingest mutated the doc (ig growth)");
+
+        // Routed to apply_invite_only ONLY — the message pipeline is skipped.
+        assert_eq!(ctx.calls(), vec!["apply_invite_only"]);
+        assert!(
+            ctx.applied().is_empty(),
+            "no message apply_inbox on invite-only"
+        );
+        assert!(
+            ctx.emitted().is_empty(),
+            "no dm-received emit on invite-only"
+        );
+
+        // Self added to the grow-only ig set: the entry is marked ingested.
+        assert!(doc.entries[&key].ingested_by.contains(SELF_ID));
+    }
+
+    #[tokio::test]
     async fn ingest_is_idempotent_for_already_ingested() {
         // (a) Entry whose ig already contains self: untouched, zero calls.
         let (key, entry) = make_entry([1; 16], [2; 32], 500, &[SELF_ID]);

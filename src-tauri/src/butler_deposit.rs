@@ -815,6 +815,24 @@ mod tests {
         assert_eq!(decoded.cidnotify_packet, Some(vec![1]));
     }
 
+    #[test]
+    fn deposit_payload_invite_only_cidnotify_none_round_trips() {
+        // ZEB-505: a standalone invite-only deposit carries the bootstrap
+        // invite ALONE — no CidNotify, no storage blob. `cidnotify_packet: None`
+        // must survive the wire round-trip: `skip_serializing_if` omits the `cn`
+        // key on encode, and an absent `cn` decodes back to None via `default`.
+        let invite_only = DepositPayload {
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        };
+        let bytes = encode_deposit_payload(&invite_only).expect("encode invite-only");
+        assert_eq!(
+            decode_deposit_payload(&bytes).expect("decode invite-only"),
+            invite_only
+        );
+    }
+
     /// The sealed envelope round-trips under the butler info string, and is
     /// domain-separated from ZEB-249: the same ciphertext MUST NOT open
     /// under the epoch-key-seal info (different HKDF info → different AEAD

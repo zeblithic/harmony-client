@@ -2634,6 +2634,62 @@ mod outbox_tests {
         let recovered: OutboxEntry = ciborium::from_reader(&bytes[..]).unwrap();
         assert_eq!(e, recovered);
     }
+
+    #[test]
+    fn outbox_entry_invite_only_message_cid_none_round_trips() {
+        // ZEB-505: a durable invite-only entry has no message. `message_cid:
+        // None` must survive the persisted-CRDT round-trip and come back None.
+        let mut e = entry(vec![1, 2, 3], vec![]);
+        e.message_cid = None;
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&e, &mut bytes).unwrap();
+        let recovered: OutboxEntry = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(e, recovered);
+        assert_eq!(recovered.message_cid, None);
+    }
+
+    #[test]
+    fn outbox_entry_legacy_bare_message_cid_decodes_as_some() {
+        // ZEB-505 migration: a pre-change OutboxEntry encoded `mc` as a BARE
+        // mandatory ContentId. Under the new `Option<ContentId>` with
+        // `#[serde(default)]`, those already-persisted bytes must still load —
+        // the bare value decoding to `Some(cid)` — so existing on-disk owner
+        // outbox state survives the format change (ciborium encodes `Some(x)`
+        // transparently as bare `x`, so new MESSAGE entries are also
+        // byte-identical to the legacy encoding).
+        #[derive(serde::Serialize)]
+        struct LegacyOutboxEntry {
+            #[serde(rename = "id")]
+            id: OutboxEntryId,
+            #[serde(rename = "sp")]
+            space_id: SpaceId,
+            #[serde(rename = "rc")]
+            recipient_owners: Vec<OwnerAddr>,
+            #[serde(rename = "mc")]
+            message_cid: ContentId,
+            #[serde(rename = "ca")]
+            created_at: Hlc,
+            #[serde(rename = "dl")]
+            delivered_to: BTreeSet<OwnerAddr>,
+            #[serde(rename = "ds")]
+            delivery_status: DeliveryStatus,
+        }
+        let cid = ContentId::from_bytes([7u8; 32]);
+        let legacy = LegacyOutboxEntry {
+            id: OutboxEntryId([1u8; 16]),
+            space_id: SpaceId([2u8; 16]),
+            recipient_owners: vec![OwnerAddr([3u8; 16])],
+            message_cid: cid,
+            created_at: hlc(100),
+            delivered_to: BTreeSet::new(),
+            delivery_status: DeliveryStatus::Pending,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&legacy, &mut bytes).unwrap();
+        let recovered: OutboxEntry = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(recovered.message_cid, Some(cid));
+        assert_eq!(recovered.space_id, SpaceId([2u8; 16]));
+    }
 }
 
 #[cfg(test)]

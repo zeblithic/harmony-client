@@ -335,4 +335,24 @@ mod tests {
         let back: DmInboxDoc = canonical_cbor_decode(&bytes).expect("decode");
         assert_eq!(back, d);
     }
+
+    #[test]
+    fn dm_inbox_entry_invite_only_cidnotify_none_round_trips() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+        // ZEB-505: a fleet-replicated invite-only deposit carries the bootstrap
+        // invite ALONE — `cidnotify_packet: None`, no storage blob — keyed by
+        // `invite_key`. None must survive the canonical-CBOR round-trip
+        // (skip_serializing_if omits `cn`; absent → None via default).
+        let mut e = entry(hlc(1, "A"), "dev-a", &["dev-1"]);
+        e.cidnotify_packet = None;
+        e.storage_blob = Vec::new();
+        e.invite_packet = Some(vec![0xAA, 0xBB, 0xCC]);
+        let mut d = DmInboxDoc::default();
+        let k = DmInboxDoc::invite_key(&[1u8; 16]);
+        d.entries.insert(k.clone(), e);
+        let bytes = canonical_cbor_encode(&d).expect("encode");
+        let back: DmInboxDoc = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(back, d);
+        assert_eq!(back.entries[&k].cidnotify_packet, None);
+    }
 }
