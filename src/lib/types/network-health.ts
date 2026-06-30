@@ -31,10 +31,15 @@ export interface PeerHealth {
   reachabilityRecordAgeMs: number | null;
 }
 
+// ZEB-595: three-state so the panel can distinguish a clean "not published
+// here" (miss) from a probe that couldn't produce a trustworthy answer
+// (error) — they must not be conflated during incident triage.
+export type PkarrFallbackOutcome = 'hit' | 'miss' | 'error';
+
 export interface PkarrFallbackHit {
   peerAddrShort: string;
   communityIdShort: string;
-  hit: boolean;
+  outcome: PkarrFallbackOutcome;
   capturedAtMs: number;
 }
 

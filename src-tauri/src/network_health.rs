@@ -88,12 +88,32 @@ pub struct PkarrHealthSummary {
     pub relays: Vec<RelayHealthWire>,
 }
 
+/// ZEB-595: outcome of a single Case-C in-community pkarr fallback probe.
+/// Three-state (not a bare bool) so the panel can distinguish a clean
+/// "peer hasn't published a current record here" from a probe that could not
+/// produce a trustworthy answer — the two must not be conflated during
+/// incident triage (Qodo #377).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PkarrFallbackOutcome {
+    /// A fresh, verified, decodable routing record was found.
+    Hit,
+    /// The relay answered cleanly but had no usable current record — `Ok(None)`,
+    /// or a record that was stale/expired or for a different identity. A
+    /// legitimate "not (currently) published here".
+    Miss,
+    /// The probe could not produce a trustworthy answer: a resolver/transport
+    /// `Err`, or a record that was present but failed signature/identity
+    /// verification or CBOR decode (corrupt/anomalous). Distinct from `Miss`.
+    Error,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PkarrFallbackHit {
     pub peer_addr_short: String,
     pub community_id_short: String,
-    pub hit: bool,
+    pub outcome: PkarrFallbackOutcome,
     pub captured_at_ms: u64,
 }
 
@@ -232,6 +252,55 @@ impl DialTelemetry {
                 .cloned()
                 .collect(),
         }
+    }
+}
+
+const PKARR_FALLBACK_RING_CAP: usize = 32;
+
+/// ZEB-595: process-lifetime bounded ring of recent Case-C in-community pkarr
+/// fallback probe outcomes. Shared (`Arc`) between `PkarrResolverAdapter`
+/// (writer) and `network_health_snapshot` via `ProdPkarrSnapshot` (reader) —
+/// the exact mirror of `DialTelemetry` (ZEB-373).
+///
+/// One entry per (peer, community) probe: a single `resolve()` over N community
+/// contexts records N entries (hit or miss each). Truncation to the 8-hex
+/// `*_short` form happens here, at the writer, so the panel's short-only
+/// redaction invariant (ZEB-329) is enforced where data enters — never relying
+/// on a downstream caller to redact.
+#[derive(Debug, Default)]
+pub struct PkarrFallbackTelemetry {
+    recent: Mutex<VecDeque<PkarrFallbackHit>>,
+}
+
+impl PkarrFallbackTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one community-context probe outcome. `peer`/`community` are the
+    /// full 16-byte ids; only the first 4 bytes (8 hex chars) are retained.
+    pub fn record(&self, peer: &[u8; 16], community: &[u8; 16], outcome: PkarrFallbackOutcome) {
+        let entry = PkarrFallbackHit {
+            peer_addr_short: hex::encode(&peer[..4]),
+            community_id_short: hex::encode(&community[..4]),
+            outcome,
+            captured_at_ms: now_ms(),
+        };
+        let mut ring = self.recent.lock().expect("pkarr fallback ring lock");
+        if ring.len() == PKARR_FALLBACK_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(entry);
+    }
+
+    /// Snapshot of the ring, oldest-first.
+    pub fn recent(&self) -> Vec<PkarrFallbackHit> {
+        self.recent
+            .lock()
+            .expect("pkarr fallback ring lock")
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -831,17 +900,22 @@ pub fn format_export_markdown(
         "communityPublishCount: {}",
         snapshot.pkarr_status.community_publish_count
     );
-    for hit in &snapshot.pkarr_status.recent_fallback_events {
+    for ev in &snapshot.pkarr_status.recent_fallback_events {
         // Defense-in-depth: route through `r()` even though the field
         // names imply upstream pre-redaction. A future bug populating
         // these with full hex must not slip past the [0-9a-f]{32,}
         // regex guard exercised by the redaction tests.
+        let outcome = match ev.outcome {
+            PkarrFallbackOutcome::Hit => "hit",
+            PkarrFallbackOutcome::Miss => "miss",
+            PkarrFallbackOutcome::Error => "error",
+        };
         let _ = writeln!(
             out,
             "fallback {} in {} -> {}",
-            r(&hit.peer_addr_short),
-            r(&hit.community_id_short),
-            if hit.hit { "hit" } else { "miss" }
+            r(&ev.peer_addr_short),
+            r(&ev.community_id_short),
+            outcome
         );
     }
     for relay in &snapshot.pkarr_status.relays {
@@ -1584,11 +1658,20 @@ impl NotifyEmitter for ProdNotifyEmitter {
 /// last-publish wall-clock of its own.
 pub struct ProdPkarrSnapshot {
     publisher: std::sync::Arc<harmony_pkarr::PkarrPublisher>,
+    /// ZEB-595: the SAME ring the `PkarrResolverAdapter` writes Case-C fallback
+    /// probe outcomes into. Read-only here.
+    fallback_telemetry: std::sync::Arc<PkarrFallbackTelemetry>,
 }
 
 impl ProdPkarrSnapshot {
-    pub fn new(publisher: std::sync::Arc<harmony_pkarr::PkarrPublisher>) -> Self {
-        Self { publisher }
+    pub fn new(
+        publisher: std::sync::Arc<harmony_pkarr::PkarrPublisher>,
+        fallback_telemetry: std::sync::Arc<PkarrFallbackTelemetry>,
+    ) -> Self {
+        Self {
+            publisher,
+            fallback_telemetry,
+        }
     }
 }
 
@@ -1616,10 +1699,12 @@ impl PkarrSnapshot for ProdPkarrSnapshot {
         }
     }
     fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
-        // TODO(zeb-329-followup): wire a ring buffer of recent
-        // `PkarrFallback` invocations (see `pkarr_resolver_adapter`).
-        // Phase 1 returns an empty Vec — the panel hides the section.
-        Vec::new()
+        // ZEB-595: read the bounded ring written by `PkarrResolverAdapter`
+        // (Case-C in-community pkarr fallback). Empty until the resolver's
+        // `contexts_fn` is implemented (ZEB-323 §4.4) and the fallback
+        // actually probes — at which point the panel lights up with no
+        // further Network Health changes.
+        self.fallback_telemetry.recent()
     }
 }
 
@@ -2135,7 +2220,7 @@ mod tests {
             .push(PkarrFallbackHit {
                 peer_addr_short: "deadbeef".repeat(4),    // 32 chars hex
                 community_id_short: "cafef00d".repeat(4), // 32 chars hex
-                hit: true,
+                outcome: PkarrFallbackOutcome::Hit,
                 captured_at_ms: 1_700_000_000_000,
             });
         let md = format_export_markdown(&snap, None, false);
@@ -3054,7 +3139,10 @@ mod tests {
             });
             publisher.register((*h).to_string(), kb, b).await;
         }
-        ProdPkarrSnapshot::new(publisher)
+        ProdPkarrSnapshot::new(
+            publisher,
+            std::sync::Arc::new(PkarrFallbackTelemetry::new()),
+        )
     }
 
     #[tokio::test]
@@ -3171,6 +3259,51 @@ mod tests {
         let snap = NetworkHealthSnapshot::empty();
         assert_eq!(snap.dial_status.attempts, 0);
         assert!(snap.dial_status.recent.is_empty());
+    }
+
+    // ── ZEB-595: PkarrFallbackTelemetry tests ───────────────────────
+
+    #[test]
+    fn pkarr_fallback_telemetry_records_short_form_and_order() {
+        let t = PkarrFallbackTelemetry::new();
+        t.record(&[0x22; 16], &[0x33; 16], PkarrFallbackOutcome::Hit);
+        t.record(&[0x44; 16], &[0x55; 16], PkarrFallbackOutcome::Error);
+        let events = t.recent();
+        assert_eq!(events.len(), 2);
+        // Oldest-first, and only the first 4 bytes (8 hex chars) are retained —
+        // never the full 16-byte id (short-only redaction invariant).
+        assert_eq!(events[0].peer_addr_short, "22222222");
+        assert_eq!(events[0].community_id_short, "33333333");
+        assert_eq!(events[0].outcome, PkarrFallbackOutcome::Hit);
+        assert_eq!(events[1].peer_addr_short, "44444444");
+        assert_eq!(events[1].community_id_short, "55555555");
+        // Error must stay distinct from Miss — that's the whole point.
+        assert_eq!(events[1].outcome, PkarrFallbackOutcome::Error);
+    }
+
+    #[test]
+    fn pkarr_fallback_ring_evicts_oldest_past_cap() {
+        let t = PkarrFallbackTelemetry::new();
+        // Push one more than the cap; the oldest must be evicted (FIFO).
+        for i in 0..(PKARR_FALLBACK_RING_CAP + 1) {
+            let mut peer = [0u8; 16];
+            peer[0] = i as u8;
+            t.record(&peer, &[0x33; 16], PkarrFallbackOutcome::Hit);
+        }
+        let events = t.recent();
+        assert_eq!(events.len(), PKARR_FALLBACK_RING_CAP, "ring stays at cap");
+        let newest_short = hex::encode([PKARR_FALLBACK_RING_CAP as u8, 0, 0, 0]);
+        assert_eq!(
+            events.last().map(|h| h.peer_addr_short.clone()),
+            Some(newest_short),
+            "newest entry retained at the back"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|h| h.peer_addr_short != hex::encode([0u8, 0, 0, 0])),
+            "oldest entry evicted"
+        );
     }
 
     // ── ZEB-380: RelaySnapshot tests ────────────────────────────────
