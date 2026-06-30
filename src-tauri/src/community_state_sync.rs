@@ -2638,6 +2638,30 @@ pub(crate) async fn live_epoch_key(
     }
 }
 
+/// The epoch-key bytes the case-C pkarr **publisher** should publish under
+/// for `community_id`: the LIVE `Space.current_epoch_key` when available
+/// (so published routing records track ZEB-249 epoch rotation, matching
+/// what seekers read on resolve via [`live_epoch_key`] — ZEB-596), else the
+/// spawn-time `fallback` (the engine's `membership_key`).
+///
+/// The Err handling is deliberately the MIRROR of the seeker's: the seeker
+/// (`community_contexts_for_target`) SKIPS a community when the live key is
+/// missing — better to not probe than probe under a stale key — but the
+/// publisher DEGRADES to the spawn-time key so it still publishes something.
+/// In the common case (engine spawned at the current epoch, no mid-session
+/// rotation) live == spawn-time, so this is a strict improvement over the
+/// prior unconditional spawn-time key and never worse. ZEB-597.
+pub(crate) async fn community_publish_epoch_key(
+    community_id: SpaceId,
+    crdt_state: &Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
+    fallback: &EpochKey,
+) -> [u8; 32] {
+    match live_epoch_key(community_id, Some(crdt_state), fallback).await {
+        Ok((k, _epoch)) => *k.as_bytes(),
+        Err(_) => *fallback.as_bytes(),
+    }
+}
+
 /// Build one complete state-root wire packet: epoch-stable snapshot,
 /// blob encrypt + CAS pin (put_serveable), signed payload with a
 /// strictly-newer HLC, wire-envelope encrypt. Shared by the debounced
@@ -7176,6 +7200,74 @@ mod envelope_tests {
             shared_in_profile: false,
             pending_join_at: None,
         }
+    }
+
+    /// ZEB-597: the case-C publisher must key on the LIVE current_epoch_key
+    /// (so published records track epoch rotation, matching what seekers read
+    /// via `live_epoch_key` in ZEB-596) — not the spawn-time fallback.
+    #[tokio::test]
+    async fn community_publish_epoch_key_prefers_live_over_fallback() {
+        let cid = SpaceId([0xaa; 16]);
+        let live = [0x77u8; 32];
+        let fallback = EpochKey::new([0x42u8; 32]);
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        os.spaces
+            .insert(cid, build_test_community_space(3, EpochKey::new(live)));
+        let crdt = Arc::new(Mutex::new(os));
+        let key = community_publish_epoch_key(cid, &crdt, &fallback).await;
+        assert_eq!(
+            key, live,
+            "must publish under the LIVE epoch key, not the spawn-time fallback"
+        );
+    }
+
+    /// ZEB-597: re-reading after the Space's current_epoch_key rotates must
+    /// yield the NEW key — the regression guard for the spawn-time-key bug
+    /// (a captured spawn-time key would stay frozen at the old value here).
+    #[tokio::test]
+    async fn community_publish_epoch_key_tracks_rotation() {
+        let cid = SpaceId([0xaa; 16]);
+        let fallback = EpochKey::new([0x42u8; 32]);
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        os.spaces.insert(
+            cid,
+            build_test_community_space(3, EpochKey::new([0x77u8; 32])),
+        );
+        let crdt = Arc::new(Mutex::new(os));
+        assert_eq!(
+            community_publish_epoch_key(cid, &crdt, &fallback).await,
+            [0x77u8; 32]
+        );
+        // Rotate the live key (a ZEB-249 epoch advance).
+        {
+            let mut g = crdt.lock().await;
+            g.spaces
+                .get_mut(&cid)
+                .expect("space present")
+                .current_epoch_key = Some(EpochKey::new([0x99u8; 32]));
+        }
+        assert_eq!(
+            community_publish_epoch_key(cid, &crdt, &fallback).await,
+            [0x99u8; 32],
+            "publisher key must advance with the live epoch key after rotation"
+        );
+    }
+
+    /// ZEB-597: when the live key is unavailable (Space absent / incomplete),
+    /// degrade to the spawn-time fallback so the publisher still publishes
+    /// SOMETHING — strict improvement over the prior unconditional spawn-time
+    /// key, never worse. (Contrast the seeker — ZEB-596 — which SKIPS the
+    /// community in this case rather than probe a stale key.)
+    #[tokio::test]
+    async fn community_publish_epoch_key_falls_back_when_space_missing() {
+        let cid = SpaceId([0xaa; 16]);
+        let fallback = EpochKey::new([0x42u8; 32]);
+        let crdt = Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
+        let key = community_publish_epoch_key(cid, &crdt, &fallback).await;
+        assert_eq!(
+            key, [0x42u8; 32],
+            "missing Space must degrade to the spawn-time fallback key"
+        );
     }
 
     #[test]

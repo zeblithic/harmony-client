@@ -3524,6 +3524,18 @@ pub async fn start_node_inner(
         // and threaded into event_loop::run for the periodic
         // BUTLER_SET_REFRESH_MS tick. None when no owner identity is loaded.
         let mut routing_republish_opt: Option<std::sync::Arc<dyn Fn() + Send + Sync>> = None;
+        // ZEB-597: late-populated handle to `routing_republish`, read by the
+        // on_epoch_event delta hook so a freshly-applied EpochRotation/
+        // EpochCatchup re-registers the case-C pkarr publications PROMPTLY under
+        // the new live epoch key (instead of waiting up to BUTLER_SET_REFRESH_MS
+        // for the periodic re-publish). The hook is built before the pkarr block
+        // that creates `routing_republish`, so — like `network_health_hook_cell`
+        // — it captures this `OnceLock` and boot `.set()`s it once below. A None
+        // read (delta arrives pre-wiring) is a graceful no-op; the periodic tick
+        // is the safety net.
+        let routing_republish_epoch_cell: std::sync::Arc<
+            std::sync::OnceLock<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        > = std::sync::Arc::new(std::sync::OnceLock::new());
         // ZEB-225 Sub-B Phase 2: lift the per-identity handles SyncEngine
         // depends on (device_id, self_owner, crdt_state, tracker,
         // content_store) out of the `if let Some(seed)` block so the
@@ -5474,6 +5486,12 @@ pub async fn start_node_inner(
                                 // iroh-bind-failed).
                                 let network_health_for_hook =
                                     std::sync::Arc::clone(&network_health_hook_cell);
+                                // ZEB-597: capture the late-populated
+                                // routing-republish handle so an applied epoch
+                                // event can prompt a case-C re-register under the
+                                // new live key.
+                                let routing_republish_epoch_for_hook =
+                                    std::sync::Arc::clone(&routing_republish_epoch_cell);
                                 // ZEB-329: clone the membership-projection handle
                                 // into the hook so per-invocation clones can feed it.
                                 let membership_projection_for_hook = membership_projection.clone();
@@ -5607,6 +5625,10 @@ pub async fn start_node_inner(
                                     // the inner Arc to fire notify().
                                     let network_health_cell =
                                         std::sync::Arc::clone(&network_health_for_hook);
+                                    // ZEB-597: per-invocation clone of the
+                                    // routing-republish cell (async block moves it).
+                                    let routing_republish_epoch_cell =
+                                        std::sync::Arc::clone(&routing_republish_epoch_for_hook);
                                     // ZEB-329: per-invocation clones for the
                                     // membership-projection update (the async block
                                     // moves them). `projection_registry` is a SEPARATE
@@ -5818,6 +5840,32 @@ pub async fn start_node_inner(
                                             local_addr_epoch,
                                         )
                                         .await;
+
+                                        // ZEB-597: an EpochRotation/EpochCatchup
+                                        // just advanced this community's
+                                        // current_epoch_key (the apply above wrote
+                                        // it). The case-C pkarr publisher keys on
+                                        // the LIVE key, so prompt a re-register
+                                        // under the new key rather than waiting up
+                                        // to BUTLER_SET_REFRESH_MS for the periodic
+                                        // re-publish. Fired AFTER the apply so the
+                                        // re-register (which re-reads crdt_state)
+                                        // sees the updated key. Reuses the shared
+                                        // fire-and-forget routing-republish trigger
+                                        // (spawns its own task; re-registers every
+                                        // joined community under its current live
+                                        // key). A non-epoch-relevant catchup may
+                                        // fire a redundant — but idempotent —
+                                        // republish; epoch events are infrequent.
+                                        if matches!(
+                                            event.kind,
+                                            crate::community_membership::MembershipEventKind::EpochRotation { .. }
+                                                | crate::community_membership::MembershipEventKind::EpochCatchup { .. }
+                                        ) {
+                                            if let Some(rp) = routing_republish_epoch_cell.get() {
+                                                rp();
+                                            }
+                                        }
                                         self_heal_community_observer(
                                             delta.community_id,
                                             registry,
@@ -7283,10 +7331,20 @@ pub async fn start_node_inner(
                         let community_ids = registry.known_ids().await;
                         for cid in &community_ids {
                             if let Some(engine) = registry.engine_arc(cid).await {
-                                let mk = engine.membership_key();
-                                pkarr_community_pub
-                                    .on_community_joined(*cid, *mk.as_bytes())
-                                    .await;
+                                // ZEB-597: publish under the LIVE epoch key
+                                // (Space.current_epoch_key), NOT the spawn-time
+                                // membership_key, so records track ZEB-249
+                                // rotation and stay resolvable to seekers
+                                // (ZEB-596). Degrades to membership_key only when
+                                // the live key is unavailable.
+                                let fallback = engine.membership_key();
+                                let key = crate::community_state_sync::community_publish_epoch_key(
+                                    *cid,
+                                    &crdt_state,
+                                    &fallback,
+                                )
+                                .await;
+                                pkarr_community_pub.on_community_joined(*cid, key).await;
                             }
                         }
                         if !community_ids.is_empty() {
@@ -7430,13 +7488,24 @@ pub async fn start_node_inner(
                                 if identity_discoverable {
                                     identity_pub.enable().await;
                                 }
-                                // 3. Community (case C).
+                                // 3. Community (case C) — re-register under the
+                                //    LIVE epoch key so a post-rotation re-publish
+                                //    advertises the current key (ZEB-597). This is
+                                //    also the periodic safety net that bounds
+                                //    post-rotation staleness to one refresh
+                                //    interval even if the prompt epoch-event
+                                //    re-trigger is missed.
                                 for cid in registry.known_ids().await {
                                     if let Some(engine) = registry.engine_arc(&cid).await {
-                                        let mk = engine.membership_key();
-                                        community_pub
-                                            .on_community_joined(cid, *mk.as_bytes())
+                                        let fallback = engine.membership_key();
+                                        let key =
+                                            crate::community_state_sync::community_publish_epoch_key(
+                                                cid,
+                                                &crdt_state,
+                                                &fallback,
+                                            )
                                             .await;
+                                        community_pub.on_community_joined(cid, key).await;
                                     }
                                 }
                                 // 4. Friend (case D) — snapshot under the
@@ -7464,6 +7533,11 @@ pub async fn start_node_inner(
                         })
                     };
                     routing_republish_opt = Some(std::sync::Arc::clone(&routing_republish));
+                    // ZEB-597: hand the trigger to the on_epoch_event hook so an
+                    // applied epoch rotation can prompt a case-C re-register under
+                    // the new live key. Set-once; the hook reads it via the cell.
+                    let _ =
+                        routing_republish_epoch_cell.set(std::sync::Arc::clone(&routing_republish));
 
                     // ── ZEB-418 P2 Task 7: fleet-net snapshot refresh task ──
                     //
