@@ -6506,7 +6506,14 @@ pub async fn start_node_inner(
                                 crate::community_relay_announce::CommunityRelayAnnouncePayload,
                                 crate::owner_state_types::Hlc,
                             )> = Vec::new();
-                            {
+                            // ZEB-329: the projection seed for this community is the
+                            // block's tail value — computed UNDER the engine lock,
+                            // applied AFTER it's released (the projection's contract).
+                            // Some(set) = local Joined with these members; None =
+                            // local not Joined → remove the community.
+                            let seed_joined_members: Option<
+                                std::collections::BTreeSet<crate::owner_state_types::OwnerAddr>,
+                            > = {
                                 let st = state_arc.lock().await;
                                 let current = st.materialized(engine.admin_addr());
                                 let is_joined = |actor: &crate::owner_state_types::OwnerAddr| {
@@ -6534,13 +6541,12 @@ pub async fn start_node_inner(
                                         _ => {}
                                     }
                                 }
-                                // ZEB-329: seed the membership projection from the
-                                // just-loaded community membership so the Network
-                                // Health peer list is scoped immediately on restart
-                                // (the on_epoch_event hook only fires on NEW deltas).
-                                // Sync write, no await — safe under the state lock.
-                                if is_joined(&self_owner) {
-                                    let joined: std::collections::BTreeSet<_> = current
+                                // ZEB-329: tail value — the seed for THIS community
+                                // (the Network Health peer list is scoped immediately
+                                // on restart; the on_epoch_event hook only fires on
+                                // NEW deltas). Applied below after the guard drops.
+                                is_joined(&self_owner).then(|| {
+                                    current
                                         .members
                                         .iter()
                                         .filter(|(_, s)| {
@@ -6548,11 +6554,15 @@ pub async fn start_node_inner(
                                                 == crate::community_membership::MemberStatus::Joined
                                         })
                                         .map(|(addr, _)| *addr)
-                                        .collect();
-                                    membership_projection.set_community_members(*cid, joined);
-                                } else {
-                                    membership_projection.remove_community(cid);
+                                        .collect::<std::collections::BTreeSet<_>>()
+                                })
+                            };
+                            // Apply the seed now that the engine guard is dropped.
+                            match seed_joined_members {
+                                Some(joined) => {
+                                    membership_projection.set_community_members(*cid, joined)
                                 }
+                                None => membership_projection.remove_community(cid),
                             }
                             for (actor, payload, hlc) in to_replay {
                                 reachability_resolver.update(actor, payload, hlc);

@@ -1643,33 +1643,35 @@ impl MembershipProjection {
     }
 
     /// The local node IS `Joined` in `community`; replace its recorded
-    /// joined-member set. Callers must drop any async lock guard before
-    /// calling — writers never hold this guard across an `.await`.
+    /// joined-member set. Callers should drop any async lock guard before
+    /// calling (the on-epoch and boot-replay paths both do) to keep the
+    /// engine critical section short. A poisoned lock is RECOVERED rather
+    /// than treated as a no-op: the critical sections are panic-free map
+    /// ops, so one panic-while-holding elsewhere must not permanently
+    /// disable peer scoping (matches the ZEB-495 dedupe-lock recovery).
     pub fn set_community_members(
         &self,
         community: crate::owner_state_types::SpaceId,
         joined: std::collections::BTreeSet<crate::owner_state_types::OwnerAddr>,
     ) {
-        if let Ok(mut g) = self.inner.write() {
-            g.insert(community, joined);
-        }
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        g.insert(community, joined);
     }
 
     /// The local node is NOT (or no longer) `Joined` in `community`;
-    /// drop it entirely so no peer matches through it.
+    /// drop it entirely so no peer matches through it. Poisoned lock
+    /// recovered (see `set_community_members`).
     pub fn remove_community(&self, community: &crate::owner_state_types::SpaceId) {
-        if let Ok(mut g) = self.inner.write() {
-            g.remove(community);
-        }
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        g.remove(community);
     }
 
-    /// Communities (lowercase hex, ascending) the local node shares
-    /// with `peer`. Synchronous: no `.await` on the read path.
+    /// Communities (lowercase hex, ascending) the local node shares with
+    /// `peer`. Synchronous: no `.await` on the read path. A poisoned lock
+    /// is recovered rather than read as an (incorrect) empty set.
     pub fn communities_shared_with(&self, peer: &[u8; 16]) -> Vec<String> {
         let needle = crate::owner_state_types::OwnerAddr(*peer);
-        let Ok(g) = self.inner.read() else {
-            return Vec::new();
-        };
+        let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
         g.iter()
             .filter(|(_, members)| members.contains(&needle))
             .map(|(cid, _)| hex::encode(cid.0))
