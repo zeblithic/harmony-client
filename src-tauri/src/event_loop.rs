@@ -1454,132 +1454,30 @@ pub async fn run(
         }
     }
 
-    // ── ZEB-418 SP2 P1: dm-inbox fleet-sync Zenoh adapter for ds/dm-inbox-v1 ─
-    // Mirrors the notes wiring above site-for-site (including the
-    // backoff-resubscribe inbound loop): outbound bytes from the dm-inbox
-    // FleetSyncEngine's publish path → Zenoh put; inbound bytes from Zenoh →
-    // the engine's subscriber path. `None` when no owner identity is loaded.
+    // ── ZEB-418 SP2 P1 / ZEB-423: dm-inbox fleet-sync Zenoh adapter ─
+    // Behaviourally identical to the P2 datasets below, so it now routes
+    // through the shared `spawn_dataset_sync_zenoh_adapter` helper instead of
+    // an open-coded copy of the same outbound-drain + backoff-resubscribe
+    // inbound loop. The migration's payoff (ZEB-423) is the helper's
+    // `max_payload_bytes` size gate: this peer-fed topic previously copied
+    // every inbound sample into an owned `Vec<u8>` with no cap, so an oversize
+    // frame was attacker-driven allocation before the FleetSync engine could
+    // reject it. `None` when no owner identity is loaded.
     if let Some(handles) = dm_inbox_sync_handles.take() {
-        let topic = format!("harmony/owner/{}/ds/dm-inbox-v1", handles.addr_hex);
-        let emit_dm_inbox_degraded = |reason: &str| {
-            crate::node_event_sink::emit_ser(
-                app.as_ref(),
-                "dm-inbox-sync-degraded",
-                &serde_json::json!({
-                    "reason": reason,
-                    "topic": &topic,
-                }),
-            );
-        };
-        match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
-            Ok(key_expr) => {
-                // Outbound: drain dm-inbox engine publisher → Zenoh put.
-                let session_pub = session.clone();
-                let key_pub = key_expr.clone();
-                let mut outbound_rx = handles.outbound_rx;
-                let closing_pub = Arc::clone(&closing);
-                tokio::spawn(async move {
-                    while let Some(bytes) = outbound_rx.recv().await {
-                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
-                            if !closing_pub.load(Ordering::SeqCst) {
-                                tracing::warn!(error = %e, "dm-inbox-root publish failed");
-                            }
-                        }
-                    }
-                });
-
-                // Inbound: Zenoh subscriber → dm-inbox engine subscriber_rx.
-                // On transient recv_async errors, re-declare the subscriber
-                // with exponential backoff. The only terminal condition is
-                // `closing` becoming true (node shutdown) or `inbound_tx.send`
-                // failing (engine dropped its receiver).
-                match session.declare_subscriber(&key_expr).await {
-                    Ok(sub) => {
-                        let inbound_tx = handles.inbound_tx;
-                        let closing_sub = Arc::clone(&closing);
-                        let app_late = app.clone();
-                        let topic_late = topic.clone();
-                        let session_sub = session.clone();
-                        let key_expr_sub = key_expr.clone();
-                        tokio::spawn(async move {
-                            let mut current_sub = sub;
-                            let mut backoff_ms: u64 = 100;
-                            'outer: loop {
-                                loop {
-                                    match current_sub.recv_async().await {
-                                        Ok(sample) => {
-                                            backoff_ms = 100; // reset on success
-                                            let bytes: Vec<u8> =
-                                                sample.payload().to_bytes().to_vec();
-                                            if inbound_tx.send(bytes).await.is_err() {
-                                                // Engine dropped its receiver — clean shutdown.
-                                                break 'outer;
-                                            }
-                                        }
-                                        Err(_) => {
-                                            if closing_sub.load(Ordering::SeqCst) {
-                                                break 'outer;
-                                            }
-                                            tracing::warn!(
-                                                backoff_ms,
-                                                "dm-inbox-root subscriber closed unexpectedly; \
-                                                 will re-declare after backoff"
-                                            );
-                                            crate::node_event_sink::emit_ser(
-                                                app_late.as_ref(),
-                                                "dm-inbox-sync-degraded",
-                                                &serde_json::json!({
-                                                    "reason": "subscriber_closed",
-                                                    "topic": &topic_late,
-                                                }),
-                                            );
-                                            break; // break inner, retry outer
-                                        }
-                                    }
-                                }
-                                if closing_sub.load(Ordering::SeqCst) {
-                                    break 'outer;
-                                }
-                                // Exponential backoff before re-declaring.
-                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                                backoff_ms = (backoff_ms * 2).min(30_000);
-                                match session_sub.declare_subscriber(&key_expr_sub).await {
-                                    Ok(new_sub) => {
-                                        tracing::info!(
-                                            "dm-inbox-root subscriber re-declared successfully"
-                                        );
-                                        current_sub = new_sub;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            backoff_ms,
-                                            "dm-inbox-root subscriber re-declare failed; retrying"
-                                        );
-                                        // Don't reset backoff — keep backing off.
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "failed to declare dm-inbox-root subscriber"
-                        );
-                        emit_dm_inbox_degraded("declare_subscriber_failed");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    %topic,
-                    "dm-inbox-root key_expr invalid; dm-inbox FleetSyncEngine Zenoh adapter skipped"
-                );
-                emit_dm_inbox_degraded("key_expr_invalid");
-            }
-        }
+        spawn_dataset_sync_zenoh_adapter(
+            &session,
+            &app,
+            &closing,
+            DatasetSyncHandles {
+                addr_hex: handles.addr_hex,
+                outbound_rx: handles.outbound_rx,
+                inbound_tx: handles.inbound_tx,
+            },
+            "dm-inbox-v1",
+            "dm-inbox-sync-degraded",
+            crate::butler_deposit::DM_INBOX_DATASET_MAX_BYTES,
+        )
+        .await;
     }
 
     // ── ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync Zenoh adapters ─

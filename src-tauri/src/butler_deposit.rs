@@ -90,6 +90,35 @@ pub const INBOX_PER_SENDER_CAP: usize = 64;
 /// as [`INBOX_PER_SENDER_CAP`].
 pub const INBOX_GLOBAL_CAP: usize = 1024;
 
+/// ZEB-423: inbound Zenoh size cap for `dm-inbox-v1` full-doc fleet-sync frames,
+/// the missing parity to the gate PR #222 added to the sibling P2 datasets
+/// (`dm-outhold-v1` / `fleet-net-v1`) on the shared
+/// `spawn_dataset_sync_zenoh_adapter` helper. Every inbound sample on this
+/// peer-fed topic was previously copied into an owned `Vec<u8>` with no size
+/// gate — attacker-driven allocation before the FleetSync engine could reject
+/// the frame.
+///
+/// Sized to MATCH the sibling [`crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES`]
+/// (16 MiB = 64 deposit frames), deliberately NOT the dm-inbox quota's
+/// theoretical max. The dataset replicates the WHOLE
+/// [`crate::dm_inbox_crdt::DmInboxDoc`] per frame, and [`INBOX_GLOBAL_CAP`]
+/// (1024) would put that max near 256 MiB — but the whole *point* of this gate
+/// is to bound attacker-driven allocation, and a 256 MiB cap over the 64-deep
+/// inbound channel is itself a multi-GB OOM vector (Qodo, PR #370). A cap that
+/// large would not bound the DoS it exists to prevent. Whole-doc fleet-sync also
+/// can't practically carry a frame that big, so an inbox exceeding 16 MiB is the
+/// pre-existing whole-doc-replication scaling limit (fail-safe: the oversize
+/// frame is dropped before allocation and the fleet re-publishes) — shared with
+/// dm-outhold and best addressed by delta/chunked replication, not by raising
+/// this gate into OOM range.
+pub const DM_INBOX_DATASET_MAX_BYTES: usize = 64 * DEPOSIT_MAX_FRAME_BYTES;
+
+// Deliberate parity with the sibling dm-outhold dataset (same DM-blob payloads,
+// same whole-doc-replication memory profile). Pin the equality so any future
+// divergence is a conscious decision rather than silent drift.
+const _: () =
+    assert!(DM_INBOX_DATASET_MAX_BYTES == crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES);
+
 /// GC TTL for un-ingested dm-inbox deposits (spec §5): an entry is removed
 /// once `deposited_at.wall_ms + INBOX_TTL_MS < now`, regardless of how many
 /// enrolled devices have ingested it. 30 days, deliberately equal to
